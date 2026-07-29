@@ -65,6 +65,7 @@ fn job_stop_reasons_are_distinct() {
             "\"legacy_unknown\"",
             "\"lost_containment\"",
             "\"operator_input_required\"",
+            "\"semantic_revise\"",
             "\"semantic_unavailable\"",
             "\"semantic_uncertain\"",
             "\"spend_cap\"",

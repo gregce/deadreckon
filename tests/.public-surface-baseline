@@ -409,11 +409,16 @@ crate: deadreckon-runtime
   semantic_judge::build_semantic_evidence
   semantic_judge::build_semantic_evidence_against_source
   semantic_judge::EvidenceItem
+  semantic_judge::persist_semantic_judgment
   semantic_judge::run_semantic_judge
   semantic_judge::run_semantic_judge_against_source
+  semantic_judge::run_semantic_judge_against_source_with_budget
+  semantic_judge::run_semantic_judge_with_budget
   semantic_judge::SEMANTIC_JUDGMENT_PATH
   semantic_judge::semantic_judgment_path
+  semantic_judge::SemanticBudgetExhaustion
   semantic_judge::SemanticEvidencePack
+  semantic_judge::SemanticJudgeBudget
   semantic_judge::SemanticJudgeResult
   turn_loop::NarratorConfig
   turn_loop::run_deterministic_completion_gate

@@ -2155,7 +2155,8 @@ fn list_default_is_compact_and_points_to_show_for_details() {
     assert_success(&help);
     let help_stdout = stdout(&help);
     assert!(help_stdout.contains("deadreckon show <short-id>"));
-    assert!(help_stdout.contains("runs and plans"));
+    assert!(help_stdout.contains("durable Jobs"));
+    assert!(help_stdout.contains("legacy runs, plans, and chains"));
     assert!(help_stdout.contains("--full"));
     assert!(compact_stdout.contains("deadreckon show <id>"));
     assert!(!compact_stdout.contains("deadreckon list --full"));

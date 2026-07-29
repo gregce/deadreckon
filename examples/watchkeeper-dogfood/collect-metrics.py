@@ -92,6 +92,82 @@ def load_review(observation_dir: Path, job_id: str) -> dict[str, Any] | None:
     return review
 
 
+def load_job_report(
+    observation_dir: Path, job_id: str, missing: list[str]
+) -> dict[str, Any] | None:
+    path = observation_dir / "job-report.json"
+    if not path.is_file():
+        missing.append(str(path))
+        return None
+    report = read_json(path)
+    if report.get("id") != job_id:
+        raise ValueError(f"{path} belongs to a different job")
+    return report
+
+
+def load_operator_run(
+    observation_dir: Path, job_id: str, missing: list[str]
+) -> dict[str, Any] | None:
+    path = observation_dir / "operator-run.json"
+    if not path.is_file():
+        missing.append(str(path))
+        return None
+    record = read_json(path)
+    if record.get("job_id") != job_id:
+        raise ValueError(f"{path} belongs to a different job")
+    return record
+
+
+def report_proves_verified_completion(
+    report: dict[str, Any] | None, job_id: str
+) -> bool:
+    if report is None:
+        return False
+    receipt = report.get("receipt")
+    if not isinstance(receipt, dict):
+        return False
+    validated = receipt.get("receipt")
+    return (
+        report.get("id") == job_id
+        and report.get("phase") == "terminal"
+        and report.get("outcome") == "verified"
+        and report.get("stop_reason") == "verified"
+        and receipt.get("status") == "valid"
+        and receipt.get("contained") is True
+        and receipt.get("sandbox_backend") not in (None, "none")
+        and receipt.get("signature_validation_error") is None
+        and isinstance(validated, dict)
+        and validated.get("job_id") == job_id
+        and validated.get("proof_kind") == "two_key_completion"
+    )
+
+
+def operator_proves_successful_finish(
+    record: dict[str, Any] | None, job_id: str
+) -> bool:
+    if record is None:
+        return False
+    public_commands = record.get("public_commands")
+    return (
+        record.get("job_id") == job_id
+        and record.get("terminal_outcome") == "verified"
+        and record.get("terminal_stop_reason") == "verified"
+        and isinstance(public_commands, list)
+        and "report" in public_commands
+        and "finish" in public_commands
+        and record.get("report_attempted") is True
+        and record.get("report_exit_status") == 0
+        and record.get("report_succeeded") is True
+        and record.get("receipt_validation_attempted") is True
+        and record.get("receipt_validation_source") == "deadreckon report --json"
+        and record.get("receipt_validation_exit_status") == 0
+        and record.get("receipt_validated") is True
+        and record.get("finish_attempted") is True
+        and record.get("finish_exit_status") == 0
+        and record.get("finish_succeeded") is True
+    )
+
+
 def collect(home: Path, observations: Path) -> dict[str, Any]:
     outcome_counts: collections.Counter[str] = collections.Counter()
     stop_counts: collections.Counter[str] = collections.Counter()
@@ -136,12 +212,8 @@ def collect(home: Path, observations: Path) -> dict[str, Any]:
         job_dir = home / "jobs" / job_id
         events, invalid = read_events(job_dir / "job-events.jsonl")
         invalid_event_rows += invalid
-        receipt_path = job_dir / "receipt.json"
-        receipt = read_json(receipt_path) if receipt_path.is_file() else None
-        if receipt is None:
-            missing.append(str(receipt_path))
-        elif receipt.get("job_id") != job_id:
-            raise ValueError(f"{receipt_path} belongs to a different job")
+        report = load_job_report(status_path.parent, job_id, missing)
+        operator_run = load_operator_run(status_path.parent, job_id, missing)
 
         phase = projection.get("phase")
         outcome = projection.get("outcome")
@@ -153,12 +225,13 @@ def collect(home: Path, observations: Path) -> dict[str, Any]:
         if phase == "terminal":
             terminal_jobs += 1
 
-        receipt_verified = (
-            receipt is not None
-            and receipt.get("outcome") == "verified"
-            and receipt.get("proof_kind") == "two_key_completion"
+        verified = (
+            phase == "terminal"
+            and outcome == "verified"
+            and stop_reason == "verified"
+            and report_proves_verified_completion(report, job_id)
+            and operator_proves_successful_finish(operator_run, job_id)
         )
-        verified = outcome == "verified" and receipt_verified
         if verified:
             verified_jobs += 1
 
@@ -189,10 +262,18 @@ def collect(home: Path, observations: Path) -> dict[str, Any]:
         if duration is not None:
             supervisor_elapsed_seconds += duration
 
-        if receipt is not None:
-            backend = str(receipt.get("sandbox_backend", "unknown"))
-            confined = "contained" if receipt.get("contained") is True else "uncontained"
-            confinement_counts[f"{confined}:{backend}"] += 1
+        if report is not None:
+            receipt = report.get("receipt")
+            if isinstance(receipt, dict) and receipt.get("status") == "valid":
+                backend = str(receipt.get("sandbox_backend", "unknown"))
+                confined = (
+                    "contained" if receipt.get("contained") is True else "uncontained"
+                )
+                confinement_counts[f"{confined}:{backend}"] += 1
+            elif isinstance(receipt, dict):
+                confinement_counts[
+                    f"unvalidated:{receipt.get('status', 'unknown')}"
+                ] += 1
 
         review = load_review(status_path.parent, job_id)
         job_review_interventions = 0
@@ -217,8 +298,9 @@ def collect(home: Path, observations: Path) -> dict[str, Any]:
         "generated_at": generated_at,
         "basis": [
             "public status --json JobView observations",
+            "public report --json output with authoritative receipt validation",
+            "operator-run.json recording successful public finish",
             "$DEADRECKON_HOME/jobs/<id>/job-events.jsonl",
-            "$DEADRECKON_HOME/jobs/<id>/receipt.json",
             "proofs/semantic-judgment.json when cited by an attempt",
             "structured human-review.json when supplied",
         ],

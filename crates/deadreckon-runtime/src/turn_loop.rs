@@ -694,6 +694,16 @@ pub async fn run_turn_loop(
                     )?;
                     return Ok(RunLoopOutcome::Failed);
                 }
+                SemanticCompletionDisposition::BudgetExhausted => {
+                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                    save_state(state)?;
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::PausedAtCap,
+                    )?;
+                    return Ok(RunLoopOutcome::PausedAtCap);
+                }
             }
             promote_if_ready(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
@@ -1081,6 +1091,16 @@ pub async fn run_turn_loop(
                             RunLoopOutcome::Failed,
                         )?;
                         return Ok(RunLoopOutcome::Failed);
+                    }
+                    SemanticCompletionDisposition::BudgetExhausted => {
+                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                        save_state(state)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::PausedAtCap,
+                        )?;
+                        return Ok(RunLoopOutcome::PausedAtCap);
                     }
                 }
                 promote_if_ready(state)?;
@@ -2210,6 +2230,7 @@ enum SemanticCompletionDisposition {
     Achieved,
     Revise,
     NeedsReview,
+    BudgetExhausted,
 }
 
 async fn semantic_completion_disposition(
@@ -2237,12 +2258,31 @@ async fn semantic_completion_disposition(
         )?;
         return Ok(SemanticCompletionDisposition::NeedsReview);
     }
+    let budget_reason = if state.total_spend_usd >= job.policy.max_spend_usd {
+        Some("spend cap reached before semantic judge")
+    } else if state.total_wall_seconds >= job.policy.max_wall_seconds as f64 {
+        Some("wall-clock cap reached before semantic judge")
+    } else {
+        None
+    };
+    if let Some(reason) = budget_reason {
+        state.pause_reason = Some(reason.to_string());
+        state.failure_reason = Some(reason.to_string());
+        save_state(state)?;
+        return Ok(SemanticCompletionDisposition::BudgetExhausted);
+    }
 
-    let semantic_run = match crate::semantic_judge::run_semantic_judge(
+    let semantic_run = match crate::semantic_judge::run_semantic_judge_with_budget(
         state,
         marker,
         router,
         config.sandbox_backend,
+        crate::semantic_judge::SemanticJudgeBudget {
+            remaining_spend_usd: Some(job.policy.max_spend_usd - state.total_spend_usd),
+            remaining_wall_seconds: Some(
+                job.policy.max_wall_seconds as f64 - state.total_wall_seconds,
+            ),
+        },
     )
     .await
     {
@@ -2258,6 +2298,39 @@ async fn semantic_completion_disposition(
         }
     };
     record_semantic_judge_accounting(state, turn, config, &semantic_run)?;
+    let overrun_reason = match semantic_run.budget_exhaustion {
+        Some(crate::semantic_judge::SemanticBudgetExhaustion::Spend) => {
+            Some("semantic judge exhausted the approved spend cap")
+        }
+        Some(crate::semantic_judge::SemanticBudgetExhaustion::Wall) => {
+            Some("semantic judge exhausted the approved wall-time cap")
+        }
+        None if state.total_spend_usd > job.policy.max_spend_usd => {
+            Some("semantic judge exceeded the approved spend cap")
+        }
+        None if state.total_wall_seconds > job.policy.max_wall_seconds as f64 => {
+            Some("semantic judge exceeded the approved wall-time cap")
+        }
+        None => None,
+    };
+    if let Some(reason) = overrun_reason {
+        state.pause_reason = Some(reason.to_string());
+        state.failure_reason = Some(reason.to_string());
+        save_state(state)?;
+        return Ok(SemanticCompletionDisposition::BudgetExhausted);
+    }
+    if let Some(judgment) = semantic_run.result.judgment()
+        && let Err(error) =
+            crate::semantic_judge::persist_semantic_judgment(&state.run_root, judgment)
+    {
+        record_needs_review(
+            state,
+            turn,
+            history,
+            &format!("strict semantic judgment could not be persisted after accounting: {error}"),
+        )?;
+        return Ok(SemanticCompletionDisposition::NeedsReview);
+    }
     match semantic_run.result {
         crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
             let seal_result = (|| -> Result<()> {
@@ -2402,7 +2475,8 @@ fn record_semantic_judge_accounting(
                 "reason": reason,
             }),
         },
-    )
+    )?;
+    save_state(state)
 }
 
 fn record_needs_review(
@@ -2691,6 +2765,42 @@ mod tests {
         (paths, state)
     }
 
+    fn write_required_semantic_job(
+        paths: &DeadreckonPaths,
+        state: &PipelineState,
+        max_spend_usd: f64,
+        max_wall_seconds: u64,
+    ) {
+        use chrono::Utc;
+        use deadreckon_core::write_job;
+        use deadreckon_protocol::{
+            Job, JobId, JobPolicy, JobSchemaVersion, JobShape, SemanticJudgeMode,
+        };
+
+        write_job(
+            paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(state.run_id.clone()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: state.cwd.clone(),
+                launch_plan_sha256: "sha256:launch".to_string(),
+                authority_sha256: "sha256:authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd,
+                    max_wall_seconds,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                },
+            },
+        )
+        .expect("job");
+    }
+
     fn create_direct_api_run(temp: &TempDir, goal: &str) -> (DeadreckonPaths, PipelineState) {
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let cwd = temp.path().join("cwd");
@@ -2716,7 +2826,7 @@ mod tests {
     #[test]
     fn semantic_judge_spend_and_time_are_durable_even_when_unavailable() {
         let temp = TempDir::new().expect("tempdir");
-        let (_paths, mut state) = create_smoke_run(&temp, "judge accounting");
+        let (paths, mut state) = create_smoke_run(&temp, "judge accounting");
         let semantic_run = crate::semantic_judge::SemanticJudgeRun {
             result: crate::semantic_judge::SemanticJudgeResult::Unavailable(
                 "malformed semantic output".to_string(),
@@ -2731,6 +2841,7 @@ mod tests {
                 wall_time_seconds: 1.5,
                 sandbox_backend: Some("sandbox-exec".to_string()),
             },
+            budget_exhaustion: None,
         };
         let config = RunLoopConfig {
             max_spend_usd: Some(2.0),
@@ -2743,6 +2854,9 @@ mod tests {
 
         assert_eq!(state.total_spend_usd, 0.25);
         assert_eq!(state.total_wall_seconds, 1.5);
+        let reloaded = deadreckon_core::load_run(&paths, &state.run_id).expect("durable state");
+        assert_eq!(reloaded.total_spend_usd, 0.25);
+        assert_eq!(reloaded.total_wall_seconds, 1.5);
         let spend = std::fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
         let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
         assert!(spend.contains("\"kind\":\"semantic_judge\""), "{spend}");
@@ -2842,6 +2956,110 @@ mod tests {
                 .is_some_and(|reason| reason.contains("receipt could not be sealed"))
         );
         assert_eq!(state.status, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn semantic_judge_does_not_start_at_the_single_job_spend_cap() {
+        use chrono::Utc;
+        use deadreckon_core::{AcceptanceMarker, AcceptanceProofKind};
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "budgeted semantic result");
+        write_required_semantic_job(&paths, &state, 1.0, 60);
+        state.total_spend_usd = 1.0;
+        let marker = AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "passed".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 0,
+            checks: Vec::new(),
+        };
+
+        let disposition = semantic_completion_disposition(
+            &mut state,
+            &ProviderRouter::smoke(),
+            &base_run_loop_config(),
+            1,
+            &marker,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("semantic disposition");
+
+        assert_eq!(disposition, SemanticCompletionDisposition::BudgetExhausted);
+        assert_eq!(
+            state.pause_reason.as_deref(),
+            Some("spend cap reached before semantic judge")
+        );
+        assert!(
+            !state
+                .run_root
+                .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON)
+                .exists()
+        );
+        let traces =
+            std::fs::read_to_string(state.run_root.join("traces.jsonl")).unwrap_or_default();
+        assert!(!traces.contains("semantic_judge."), "{traces}");
+    }
+
+    #[tokio::test]
+    async fn semantic_judge_does_not_start_at_the_single_job_wall_cap() {
+        use chrono::Utc;
+        use deadreckon_core::{AcceptanceMarker, AcceptanceProofKind};
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "wall-budgeted semantic result");
+        write_required_semantic_job(&paths, &state, 10.0, 60);
+        state.total_wall_seconds = 60.0;
+        let marker = AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "passed".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 0,
+            checks: Vec::new(),
+        };
+
+        let disposition = semantic_completion_disposition(
+            &mut state,
+            &ProviderRouter::smoke(),
+            &base_run_loop_config(),
+            1,
+            &marker,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("semantic disposition");
+
+        assert_eq!(disposition, SemanticCompletionDisposition::BudgetExhausted);
+        assert_eq!(
+            state.pause_reason.as_deref(),
+            Some("wall-clock cap reached before semantic judge")
+        );
+        assert!(
+            !state
+                .run_root
+                .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON)
+                .exists()
+        );
+        let traces =
+            std::fs::read_to_string(state.run_root.join("traces.jsonl")).unwrap_or_default();
+        assert!(!traces.contains("semantic_judge."), "{traces}");
     }
 
     fn write_seams_config(paths: &DeadreckonPaths, raw: &str) -> PathBuf {

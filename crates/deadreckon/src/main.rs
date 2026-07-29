@@ -1735,7 +1735,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         display: "attach",
         clap_name: Some("attach"),
-        purpose: "watch and understand a run, chain, or plan",
+        purpose: "watch a durable Job or legacy work",
         audience: CommandAudience::Primary,
         top_group: Some(TopHelpGroup::StartWatchKeep),
         all_group: Some(HelpAllGroup::ProductionFlow),
@@ -1743,7 +1743,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         display: "status",
         clap_name: Some("status"),
-        purpose: "see the latest run and next action",
+        purpose: "see the latest Job or legacy work item",
         audience: CommandAudience::Primary,
         top_group: Some(TopHelpGroup::StartWatchKeep),
         all_group: Some(HelpAllGroup::ProductionFlow),
@@ -1751,7 +1751,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         display: "list",
         clap_name: Some("list"),
-        purpose: "find runs and plans",
+        purpose: "find Jobs and legacy work",
         audience: CommandAudience::Primary,
         top_group: Some(TopHelpGroup::StartWatchKeep),
         all_group: Some(HelpAllGroup::ProductionFlow),
@@ -2239,7 +2239,7 @@ fn print_top_help() {
     print_top_help_group("Find more:", TopHelpGroup::FindMore);
     println!();
     println!(
-        "{} Run, chain, and plan ids accept unique prefixes where that command accepts the kind. {} means the newest item for the current project.",
+        "{} Job, run, chain, plan, and campaign ids accept unique prefixes where that command accepts the kind. {} means the newest item for the current project.",
         ui_heading("Note:"),
         ui_command("latest")
     );

@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use deadreckon_protocol::{
-    CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, JobAuthority, JobOutcome,
-    JobSchemaVersion, SemanticDecision, SemanticJudgment, StopReason,
+    CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, GoalCoverageStatus,
+    JobAuthority, JobOutcome, JobSchemaVersion, SemanticDecision, SemanticJudgment, StopReason,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -56,6 +56,7 @@ pub fn seal_completion_receipt(
             "semantic judgment is not an achieved decision for this job and run",
         ));
     }
+    validate_achieved_judgment(judgment, state.run_id.as_str())?;
 
     let authority_path = paths.job_authority(authority.job_id.as_ref());
     let launch_path = paths.job_launch_plan(authority.job_id.as_ref());
@@ -161,6 +162,7 @@ pub fn validate_completion_receipt(
             "semantic judgment no longer records achieved for this job",
         ));
     }
+    validate_achieved_judgment(&judgment, &state.run_id)?;
     let marker = validate_acceptance_marker(state)?;
     if !marker.is_native_gate_proof()
         || marker.contained != receipt.contained
@@ -180,6 +182,21 @@ pub fn validate_completion_receipt(
     let key = read_gate_key(paths, &state.run_id)?;
     verify_receipt_signature(&receipt, &key)?;
     Ok(receipt)
+}
+
+fn validate_achieved_judgment(judgment: &SemanticJudgment, run_id: &str) -> Result<()> {
+    if judgment.goal_coverage.is_empty()
+        || !judgment.missing.is_empty()
+        || judgment.goal_coverage.iter().any(|coverage| {
+            coverage.status != GoalCoverageStatus::Met || coverage.evidence.is_empty()
+        })
+    {
+        return Err(completion_error(
+            run_id,
+            "semantic achieved judgment lacks complete evidence-backed goal coverage",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_authority_inputs(
@@ -533,6 +550,32 @@ mod tests {
             validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
             receipt
         );
+    }
+
+    #[test]
+    fn achieved_without_evidence_backed_coverage_cannot_be_sealed() {
+        let fixture = fixture();
+        let mut unsupported = fixture.judgment.clone();
+        unsupported.goal_coverage.clear();
+        atomic_write_json(
+            &fixture.state.run_root.join(super::SEMANTIC_JUDGMENT_JSON),
+            &unsupported,
+        )
+        .expect("unsupported judgment");
+
+        assert!(
+            seal_completion_receipt(
+                &fixture.paths,
+                &fixture.state,
+                &fixture.authority,
+                &fixture.marker,
+                &unsupported,
+            )
+            .expect_err("semantic parser invariant is repeated at receipt sealing")
+            .to_string()
+            .contains("lacks complete evidence-backed goal coverage")
+        );
+        assert!(!fixture.paths.job_receipt("job-1").exists());
     }
 
     #[test]

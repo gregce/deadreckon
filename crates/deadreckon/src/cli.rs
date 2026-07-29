@@ -171,15 +171,16 @@ Lifecycle:
   deadreckon orchestrate full-plan --goal-file docs/goal.md --planner-provider cli:codex --provider cli:claude-code --yes
   deadreckon orchestrate @docs/goal.md
   deadreckon orchestrate \"build the thing\"
-  deadreckon attach <plan-id>
-  deadreckon merge <plan-id>
-  deadreckon finish <plan-id>
+  deadreckon attach <job-id>
+  deadreckon status <job-id>
+  deadreckon finish <job-id>
 
-Orchestrate is the one-command multi-agent wrapper. Review mode is a coder
-provider route followed by a fresh reviewer/fixer provider route. Full-plan
-mode asks a planner provider route for child work before fork and merge. Merge
-repair is automatic by default; --no-repair is only for debugging raw conflict
-bundles.";
+Approved direct execution queues one durable Graph Job and returns its Job ID.
+The supervisor owns its internal plan, children, merge, parent verification and
+receipt. Review mode is a coder provider route followed by a fresh
+reviewer/fixer provider route. Full-plan mode asks a planner provider route for
+child work before fork and merge. Merge repair is automatic by default;
+--no-repair is only for debugging raw conflict bundles.";
 
 const PLAN_HELP: &str = "\
 Advanced orchestration building block. Most users should begin with
@@ -324,8 +325,8 @@ Lifecycle:
   deadreckon finish <short-id>
 
 The default view is compact and scoped to the current project. It includes
-normal runs and plans. Use `show` for full run details or
-`attach <plan-id>` for orchestration progress.";
+durable Jobs alongside legacy runs, plans, and chains. Use `show` for full
+details or `attach <job-id>` for durable execution progress.";
 
 const LIBRARY_HELP: &str = "\
 Advanced artifact inspection. `deadreckon finish <id>` is the normal way to
@@ -342,11 +343,13 @@ Lifecycle:
 const FINISH_HELP: &str = "\
 Lifecycle:
   deadreckon finish latest
+  deadreckon finish <job-id>
   deadreckon finish <plan-id>
   deadreckon finish latest --autostash --cleanup
   deadreckon finish latest --dest ./finished-project
 
-Finish chooses the right completed-run action:
+Finish chooses the right completed-work action:
+  verified Job -> validate its two-key receipt, then apply or export its result
   worktree run -> apply
   fresh/copy run -> export
   completed plan -> apply to source git, or export with --dest / non-git source
@@ -428,6 +431,7 @@ Docs can be regenerated with a provider-backed polish pass:
 const ATTACH_HELP: &str = "\
 Lifecycle:
   deadreckon attach latest
+  deadreckon attach <job-id>
   deadreckon attach latest --view narrative
   deadreckon attach <plan-id> --view narrative --visual agents
   deadreckon attach <chain-id>
@@ -436,7 +440,10 @@ Lifecycle:
   deadreckon status latest
   deadreckon finish latest
 
-Attach opens the live TUI for a run, chain, or plan. The default activity view keeps raw logs visible; `--view narrative` shows cited prose plus an evidence-backed visual map. `q`, Esc, and Ctrl-D detach without killing the work.";
+Attach watches a durable Job or a legacy run, chain, plan, or campaign.
+The default activity view keeps raw logs visible.
+`--view narrative` shows cited prose plus an evidence-backed visual map.
+`q`, Esc, and Ctrl-D detach without killing the work.";
 
 const STEER_HELP: &str = "\
 Lifecycle:
@@ -490,10 +497,21 @@ Show prints run, plan, or plan-child state, mode, lineage, traces, provenance, d
 const STATUS_HELP: &str = "\
 Lifecycle:
   deadreckon status
+  deadreckon status <job-id>
   deadreckon attach latest
   deadreckon finish latest
 
-Status explains the latest run or plan and what to do next. `next` is an alias.";
+Status explains the latest durable Job or legacy run, plan, chain, or campaign
+and what to do next. `next` is an alias.";
+
+const REPORT_HELP: &str = "\
+Lifecycle:
+  deadreckon report <job-id>
+  deadreckon report <job-id> --json
+  deadreckon report <run-id>
+
+A Job report combines lifecycle, contract, checks, semantic judgment, resource,
+revision, and receipt facts. A legacy run report uses the RunView projection.";
 
 const IMPORT_HELP: &str = "\
 Lifecycle:
@@ -891,7 +909,7 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Run Lifecycle",
-        about = "Plan, fork, and merge a multi-agent run",
+        about = "Queue and supervise a durable multi-agent Job",
         after_help = ORCHESTRATE_HELP
     )]
     Orchestrate {
@@ -1349,13 +1367,13 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "runs",
-        about = "Show runs for the current project by default",
+        about = "Show durable Jobs and legacy work for the current project",
         after_help = LIST_HELP
     )]
     List {
         #[arg(long, help = "Filter to a specific scope key")]
         scope: Option<String>,
-        #[arg(long, help = "Show runs from all project scopes")]
+        #[arg(long, help = "Show Jobs and legacy work from all project scopes")]
         all: bool,
         #[arg(long, help = "Use the table layout (default; kept for compatibility)")]
         full: bool,
@@ -1377,11 +1395,14 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Completed Run Actions",
-        about = "Route a completed run to the right finish action",
+        about = "Deliver a verified Job or completed legacy result",
         after_help = FINISH_HELP
     )]
     Finish {
-        #[arg(help = "Run id, plan id, unique prefix, or latest")]
+        #[arg(
+            value_name = "ID",
+            help = "Job id, run id, plan id, chain id, unique prefix, or latest"
+        )]
         run_id: Option<String>,
         #[arg(long, help = "Destination directory for fresh/copy exports")]
         dest: Option<PathBuf>,
@@ -1616,11 +1637,14 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "watch",
-        about = "Attach the live terminal UI to a run, chain, or plan",
+        about = "Watch a durable Job or legacy run, chain, plan, or campaign",
         after_help = ATTACH_HELP
     )]
     Attach {
-        #[arg(help = "Run id, chain id, plan id, plan-id:task-id, unique prefix, or latest")]
+        #[arg(
+            value_name = "ID",
+            help = "Job id, run id, chain id, plan id, campaign id, plan-id:task-id, unique prefix, or latest"
+        )]
         run_id: String,
         #[arg(
             long,
@@ -1790,10 +1814,14 @@ pub(crate) enum Commands {
     },
     #[command(
         next_help_heading = "Inspect And Import",
-        about = "Write a static run report from the shared RunView model"
+        about = "Write a static evidence report for a durable Job or legacy run",
+        after_help = REPORT_HELP
     )]
     Report {
-        #[arg(help = "Run id, unique prefix, or latest")]
+        #[arg(
+            value_name = "ID",
+            help = "Job id, run id, plan-child id, unique prefix, or latest"
+        )]
         run_id: String,
         #[arg(long, help = "Write a self-contained HTML report instead of Markdown")]
         html: bool,
@@ -1801,10 +1829,7 @@ pub(crate) enum Commands {
         dest: Option<PathBuf>,
         #[arg(long, help = "Open the written report (interactive only)")]
         open: bool,
-        #[arg(
-            long,
-            help = "Emit RunView JSON (schema: docs/schemas/projections/run-view.schema.json)"
-        )]
+        #[arg(long, help = "Emit machine-readable Job report or legacy RunView JSON")]
         json: bool,
         #[arg(long, help = "Plain output without ANSI affordances")]
         plain: bool,
@@ -1856,17 +1881,20 @@ pub(crate) enum Commands {
     #[command(
         next_help_heading = "Run Lifecycle",
         visible_alias = "next",
-        about = "Explain the current project's latest run and next action",
+        about = "Explain the current project's latest Job or legacy work item",
         after_help = STATUS_HELP
     )]
     Status {
-        #[arg(help = "Optional run id, unique prefix, or latest")]
+        #[arg(
+            value_name = "ID",
+            help = "Optional Job, run, plan, chain, or campaign id, unique prefix, or latest"
+        )]
         run_id: Option<String>,
         #[arg(
             long,
             long = "global",
             alias = "all",
-            help = "Use the global latest run instead of the current project"
+            help = "Use the global latest item instead of the current project"
         )]
         all: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]

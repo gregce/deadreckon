@@ -164,6 +164,7 @@ pub enum JobOutcome {
 
 pub enum StopReason {
     Verified,
+    SemanticRevise,
     SemanticUncertain,
     SemanticUnavailable,
     OperatorInputRequired,

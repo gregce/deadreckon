@@ -22,6 +22,9 @@ fn dogfood_harness_uses_public_start_status_finish_and_receipt() {
     let status = source
         .find("\"$deadreckon_bin\" status")
         .expect("public status");
+    let report = source
+        .find("\"$deadreckon_bin\" report")
+        .expect("public report");
     let receipt = source
         .find("jobs/$job_id/receipt.json")
         .expect("durable receipt");
@@ -30,13 +33,15 @@ fn dogfood_harness_uses_public_start_status_finish_and_receipt() {
         .expect("public finish");
 
     assert!(start < status);
-    assert!(status < receipt);
+    assert!(status < report);
+    assert!(report < receipt);
     assert!(receipt < finish);
     assert!(source.contains("DEADRECKON_DOGFOOD_EXECUTE"));
     assert!(source.contains("--quiet"));
     assert!(source.contains("\"contained\": True"));
     assert!(source.contains("\"proof_kind\": \"two_key_completion\""));
     assert!(source.contains("\"terminal_outcome\": projection.get(\"outcome\")"));
+    assert!(source.contains("\"receipt_validation_source\""));
     assert!(source.contains("\"receipt_validation_exit_status\""));
     assert!(source.contains("\"finish_exit_status\""));
 }
@@ -268,6 +273,8 @@ esac
             .expect("operator observation JSON");
     assert_eq!(observation["terminal_outcome"], "retry_exhausted");
     assert_eq!(observation["terminal_stop_reason"], "attempt_limit");
+    assert_eq!(observation["report_attempted"], true);
+    assert_eq!(observation["report_succeeded"], false);
     assert_eq!(observation["receipt_validation_attempted"], true);
     assert_eq!(observation["receipt_validated"], false);
     assert_ne!(observation["receipt_validation_exit_status"], 0);
@@ -329,6 +336,48 @@ fn metrics_are_derived_from_job_view_not_narrative() {
         .expect("receipt JSON"),
     )
     .expect("receipt");
+    fs::write(
+        observations.join("job-report.json"),
+        serde_json::to_vec_pretty(&json!({
+            "id": "job-1",
+            "phase": "terminal",
+            "outcome": "verified",
+            "stop_reason": "verified",
+            "receipt": {
+                "status": "valid",
+                "contained": true,
+                "sandbox_backend": "sandbox-exec",
+                "signature_validation_error": null,
+                "receipt": {
+                    "job_id": "job-1",
+                    "proof_kind": "two_key_completion"
+                }
+            }
+        }))
+        .expect("report JSON"),
+    )
+    .expect("report");
+    fs::write(
+        observations.join("operator-run.json"),
+        serde_json::to_vec_pretty(&json!({
+            "job_id": "job-1",
+            "terminal_outcome": "verified",
+            "terminal_stop_reason": "verified",
+            "public_commands": ["start", "status", "report", "finish"],
+            "report_attempted": true,
+            "report_exit_status": 0,
+            "report_succeeded": true,
+            "receipt_validation_attempted": true,
+            "receipt_validation_source": "deadreckon report --json",
+            "receipt_validation_exit_status": 0,
+            "receipt_validated": true,
+            "finish_attempted": true,
+            "finish_exit_status": 0,
+            "finish_succeeded": true
+        }))
+        .expect("operator run JSON"),
+    )
+    .expect("operator run");
     let events = [
         json!({
             "timestamp": "2026-07-29T00:00:00Z",

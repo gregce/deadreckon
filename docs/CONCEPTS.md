@@ -77,12 +77,13 @@ check results. The runtime then asks a fresh read-only model to assess the
 goal's meaning. The check marker is necessary but no longer sufficient: the
 supervisor issues a verified receipt only when both decisions agree.
 
-This stronger completion contract belongs to guided `deadreckon start`.
-Review and full-plan work merges at the end, then becomes a same-ID Graph
-parent result. Campaign completion also revalidates the worst-of leaf roll-up.
-Both paths then run the native parent gate, ask a fresh read-only semantic
-judge, validate the parent receipt and promote. Direct `deadreckon run`,
-`orchestrate`, `chain`, and `campaign` retain their historical process-owned
+This stronger completion contract belongs to durable Jobs created through
+guided `deadreckon start` and the ordinary direct execution verbs. Review and
+full-plan work merges at the end, then becomes a same-ID Graph parent result.
+Campaign completion also revalidates the worst-of leaf roll-up. Both paths
+then run the native parent gate, ask a fresh read-only semantic judge, validate
+the parent receipt and promote. Preview, explicit uncontained/in-place runs,
+historical `chain run|resume`, and `extend` retain process-owned compatibility
 behavior; their artifacts must not be described as two-key Job receipts.
 
 If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present). Supported check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. Full reference, packs, and the compiled YAML format: [HOWTO § Done Criteria](../HOWTO.md#done-criteria).
@@ -104,12 +105,13 @@ Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns t
 Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 
 - **Your checkout is never touched.** Runs default to an isolated `git worktree` on a `dr/...` branch; your real checkout changes only when you `deadreckon apply`. Copy, fresh, and explicit in-place modes are available too.
-- **Durable at two levels.** All runs persist state. Guided Jobs created by
-  `start` also have an append-only lifecycle, a fenced renewable lease, process
-  group metadata, and a detached supervisor. The optional user service adds
-  restart-at-login posture. Guided graphs and campaigns wrap their established
-  conductor under that lease and verify the parent after merge. Direct
-  advanced commands remain process-owned.
+- **Durable at two levels.** All runs persist state. Jobs created by `start`,
+  ordinary `run`/`orchestrate`, new `chain`/`campaign`, and stored-plan `fork`
+  also have an append-only lifecycle, a fenced renewable lease, process-group
+  metadata, and a detached supervisor. The optional user service adds
+  restart-at-login posture. Graphs and campaigns wrap their established
+  conductor under that lease and verify the parent after merge. Explicit
+  compatibility modes remain process-owned.
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
 - **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo <id> --turn 3`), recorded in the run trace, not just a `git reset`. The same verb unwinds a chain's last applied step.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
@@ -150,12 +152,14 @@ promoted artifact           ◄── receipt, narrative, decisions, file lineag
 your branch or library
 ```
 
-For multi-step work, a guided review, full-plan, or campaign start puts its
-existing conductor under one durable parent Job and lease. Child results are
-evidence, not parent authority. The supervisor verifies the same-ID merged
-parent and promotes it only after a valid two-key receipt. A semantic request
-to revise that parent stops `NEEDS_REVIEW`; deterministic parent gate failure
-stops `FAILED`. Direct plan, chain and campaign verbs remain process-owned.
+For multi-step work, guided or direct review/full-plan orchestration, new
+chains, stored-plan `fork`, and campaigns put the established conductor under
+one durable parent Job and lease. Child results are evidence, not parent
+authority. The supervisor verifies the same-ID merged parent and promotes it
+only after a valid two-key receipt. A semantic request to revise that parent
+stops `NEEDS_REVIEW`; deterministic parent gate failure stops `FAILED`.
+Historical and explicitly uncontained compatibility paths remain
+process-owned.
 
 ## Compared with agentic coding CLIs
 

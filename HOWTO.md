@@ -101,7 +101,7 @@ without invoking the host service manager in the test suite. A live
 machine-restart drill is still an operator acceptance step; do not infer that
 it ran from a successful unit-rendering test.
 
-Guided Single, Graph and Campaign Jobs use a strict two-key completion rule:
+Durable Single, Graph and Campaign Jobs use a strict two-key completion rule:
 
 1. The frozen deterministic checks pass under a real sandbox and produce a
    valid native `dr-gate` marker.
@@ -114,14 +114,14 @@ Campaign parent, `revise` stops `NEEDS_REVIEW`; safe parent repair is not
 implemented yet. `uncertain`, an unavailable judge, an uncontained gate, or a
 receipt-sealing error also produces `NEEDS_REVIEW`.
 
-Guided review and full-plan work always use at-end delivery. The conductor
+Durable review and full-plan work always use at-end delivery. The conductor
 first merges in isolation. The supervisor then copies the merged result into a
 run with the parent Job ID, runs the native gate, asks a fresh read-only
 semantic judge, validates the receipt and promotes that parent. `finish`
 revalidates the receipt and result-tree digest before exporting the
 receipt-bound parent.
 
-A guided Campaign Job can recover an exactly linked persisted sub-plan. Before
+A durable Campaign Job can recover an exactly linked persisted sub-plan. Before
 parent verification, it rebuilds the campaign's worst-of roll-up from the leaf
 evidence and compares it with the stored roll-up. A refused or changed roll-up
 fails the parent gate and never reaches the semantic judge.
@@ -141,12 +141,13 @@ deadreckon attach latest
 deadreckon finish latest
 ```
 
-`run` is still the canonical power-user command for source-mode flags, spend
-caps, sandbox overrides, and one-run scripting. It is also a compatibility
-path: it persists run state and uses the deterministic gate, but it is driven
-by the invoking process and does not create a Watchkeeper Job, run the
-independent semantic judge, or issue the combined Job receipt. Use
-`deadreckon start --mode run` when the durable Job contract is required.
+`run` is the canonical power-user command for source-mode flags, spend caps,
+sandbox overrides, and one-run scripting. Its ordinary isolated form now
+creates and detaches a durable Single Job with the same independent semantic
+judge and combined receipt as `start --mode run`. Preview, explicit
+`--in-place`, explicit `--sandbox none`, and historical chain-child execution
+remain foreground compatibility paths; they cannot issue a trusted Job
+receipt.
 
 ## Multi-Agent Work
 
@@ -161,15 +162,20 @@ deadreckon finish latest
 ```
 
 `start --mode review` and `start --mode full-plan` route through the same
-orchestration machinery when you want the guided front door first. Guided
-review, full-plan, and campaign launches are durable parent Jobs supervised
-under one lease. Their child graph still uses the established conductor. The
-supervisor verifies, receipts and promotes the same-ID parent result after the
-merge. A semantic `revise` stops `NEEDS_REVIEW`; it does not yet repair and
-rerun the parent graph.
+orchestration machinery when you want the guided front door first. Ordinary
+direct orchestration also creates a durable Graph Job. Its child graph still
+uses the established conductor under one parent lease. The supervisor
+verifies, receipts and promotes the same-ID parent result after the merge. A
+semantic `revise` stops `NEEDS_REVIEW`; it does not yet repair and rerun the
+parent graph. Its typed stop reason is `semantic_revise`, distinct from an
+unavailable judge.
 
-Direct `orchestrate`, `chain`, and `campaign` invocations remain process-owned
-compatibility paths. Direct `run` and `extend` have the same boundary.
+New `chain` execution compiles supported chain policy into a durable linear
+Graph Job; explicit `--sandbox none` and historical `chain run|resume
+<chain-id>` remain untrusted legacy conductors. Direct `campaign` creates a
+durable Campaign Job. Executing a stored plan with `fork` creates a durable
+Graph Job. Preview and internal child modes remain foreground by design.
+`extend` is still process-owned.
 
 ## Build And Install Alias
 

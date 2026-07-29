@@ -35,6 +35,76 @@ const CHILD_METADATA_FILE: &str = "supervised-child.json";
 const SUPERVISOR_STDOUT_FILE: &str = "supervisor.out";
 const SUPERVISOR_STDERR_FILE: &str = "supervisor.err";
 
+/// Keeps fenced ownership alive for the entire claimed operation, including
+/// synchronous source hashing and asynchronous parent verification. Child
+/// monitoring also heartbeats defensively, but it starts too late to protect
+/// pre-attempt authority validation.
+struct LeaseHeartbeatGuard {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    handle:
+        Option<std::thread::JoinHandle<std::result::Result<(), deadreckon_core::DeadreckonError>>>,
+}
+
+impl LeaseHeartbeatGuard {
+    fn start(
+        paths: DeadreckonPaths,
+        token: LeaseToken,
+        interval: Duration,
+        ttl: Duration,
+    ) -> Result<Self> {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread_name = format!(
+            "dr-lease-{}",
+            &token.job_id.as_ref()[..token.job_id.as_ref().len().min(8)]
+        );
+        let handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || {
+                loop {
+                    match stopped.recv_timeout(interval) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Ok(());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            heartbeat_job_lease(&paths, &token, Utc::now(), ttl)?;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            handle: Some(handle),
+        })
+    }
+
+    fn stop_inner(&mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match handle.join() {
+            Ok(result) => result.map_err(CliError::Core),
+            Err(_) => Err(CliError::Core(DeadreckonError::InvalidInput(
+                "lease heartbeat thread panicked".to_string(),
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    fn finish(mut self, operation: Result<()>) -> Result<()> {
+        let heartbeat = self.stop_inner();
+        operation.and(heartbeat)
+    }
+}
+
+impl Drop for LeaseHeartbeatGuard {
+    fn drop(&mut self) {
+        let _ = self.stop_inner();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SupervisorInstance {
     owner: LeaseOwner,
@@ -168,6 +238,8 @@ async fn supervise_one_job(
         LEASE_TTL,
     )?;
     let token = claim.token();
+    let _heartbeat =
+        LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)?;
     let reboot_reclaim = matches!(
         claim.disposition,
         LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
@@ -631,6 +703,11 @@ fn load_launch_inputs(paths: &DeadreckonPaths, job: &Job) -> Result<LaunchInputs
     Ok(LaunchInputs { plan, authority })
 }
 
+#[cfg(test)]
+pub(super) fn validate_launch_inputs_for_test(paths: &DeadreckonPaths, job: &Job) -> Result<()> {
+    load_launch_inputs(paths, job).map(drop)
+}
+
 fn require_authority_digest(job: &Job, label: &str, expected: &str, actual: &str) -> Result<()> {
     if expected == actual {
         Ok(())
@@ -680,6 +757,7 @@ fn spawn_job_driver(
             )));
         }
     };
+    apply_durable_scope_root(&mut command, &launch.plan);
     command
         .current_dir(&job.source_cwd)
         .stdin(Stdio::null())
@@ -699,6 +777,16 @@ fn spawn_job_driver(
         return Err(error.into());
     }
     Ok((child, metadata))
+}
+
+fn apply_durable_scope_root(command: &mut Command, plan: &LaunchPlan) {
+    if let Some(scope_root) = plan
+        .signals
+        .get(super::job::DURABLE_SCOPE_ROOT_SIGNAL)
+        .and_then(|value| serde_json::from_value::<PathBuf>(value.clone()).ok())
+    {
+        command.env("DEADRECKON_SCOPE_ROOT", scope_root);
+    }
 }
 
 fn build_leaf_resume_command(paths: &DeadreckonPaths, job: &Job, executable: &Path) -> Command {
@@ -1213,6 +1301,47 @@ async fn classify_advanced_attempt(
                             )?;
                             Ok(())
                         }
+                        Ok(super::graph_job::ParentCompletion::BudgetExhausted {
+                            reason,
+                            stop_reason,
+                        }) => {
+                            append_control_event(
+                                paths,
+                                token,
+                                JobEventKind::DeterministicGatePassed,
+                                format!("graph-gate-passed:{}", token.epoch),
+                                json!({
+                                    "marker": deadreckon_core::marker_path_for_run_root(
+                                        &load_run(paths, job.job_id.as_ref())?.run_root
+                                    ),
+                                    "merged_run_id": plan.merged_run_id,
+                                }),
+                            )?;
+                            append_attempt_stopped(
+                                paths,
+                                token,
+                                stop_reason,
+                                json!({
+                                    "exit": exit_detail(&exit),
+                                    "artifact": "plan",
+                                    "result_run_id": plan.merged_run_id,
+                                    "reason": reason,
+                                }),
+                            )?;
+                            append_terminal_event(
+                                paths,
+                                token,
+                                JobEventKind::BudgetExhausted,
+                                stop_reason,
+                                json!({
+                                    "reason": reason,
+                                    "artifact": "plan",
+                                    "artifact_id": token.job_id.as_ref(),
+                                    "result_run_id": plan.merged_run_id,
+                                }),
+                            )?;
+                            Ok(())
+                        }
                         Ok(super::graph_job::ParentCompletion::GateFailed(reason)) => {
                             append_control_event(
                                 paths,
@@ -1415,6 +1544,47 @@ async fn classify_advanced_attempt(
                                 paths,
                                 token,
                                 JobEventKind::NeedsReview,
+                                stop_reason,
+                                json!({
+                                    "reason": reason,
+                                    "artifact": "campaign",
+                                    "artifact_id": token.job_id.as_ref(),
+                                    "result_run_id": campaign.merged_run_id,
+                                }),
+                            )?;
+                            Ok(())
+                        }
+                        Ok(super::graph_job::ParentCompletion::BudgetExhausted {
+                            reason,
+                            stop_reason,
+                        }) => {
+                            append_control_event(
+                                paths,
+                                token,
+                                JobEventKind::DeterministicGatePassed,
+                                format!("campaign-gate-passed:{}", token.epoch),
+                                json!({
+                                    "marker": deadreckon_core::marker_path_for_run_root(
+                                        &load_run(paths, job.job_id.as_ref())?.run_root
+                                    ),
+                                    "merged_run_id": campaign.merged_run_id,
+                                }),
+                            )?;
+                            append_attempt_stopped(
+                                paths,
+                                token,
+                                stop_reason,
+                                json!({
+                                    "exit": exit_detail(&exit),
+                                    "artifact": "campaign",
+                                    "result_run_id": campaign.merged_run_id,
+                                    "reason": reason,
+                                }),
+                            )?;
+                            append_terminal_event(
+                                paths,
+                                token,
+                                JobEventKind::BudgetExhausted,
                                 stop_reason,
                                 json!({
                                     "reason": reason,
@@ -1631,11 +1801,8 @@ fn classify_persisted_attempt(
                     json!({ "marker": deadreckon_core::marker_path_for_run_root(&state.run_root) }),
                 )?;
                 let semantic = append_persisted_semantic_event(paths, token, &state)?;
-                let stop_reason = if semantic == Some(SemanticDecision::Uncertain) {
-                    StopReason::SemanticUncertain
-                } else {
-                    StopReason::SemanticUnavailable
-                };
+                let stop_reason = super::graph_job::semantic_decision_stop_reason(semantic)
+                    .unwrap_or(StopReason::SemanticUnavailable);
                 append_attempt_stopped(
                     paths,
                     token,
@@ -1690,11 +1857,8 @@ fn classify_persisted_attempt(
                     json!({ "marker": deadreckon_core::marker_path_for_run_root(&state.run_root) }),
                 )?;
                 let semantic = append_persisted_semantic_event(paths, token, &state)?;
-                let stop_reason = if semantic == Some(SemanticDecision::Uncertain) {
-                    StopReason::SemanticUncertain
-                } else {
-                    StopReason::SemanticUnavailable
-                };
+                let stop_reason = super::graph_job::semantic_decision_stop_reason(semantic)
+                    .unwrap_or(StopReason::SemanticUnavailable);
                 append_attempt_stopped(
                     paths,
                     token,
@@ -1999,7 +2163,9 @@ mod tests {
                 wall_seconds: Some(30),
             },
             contract: CourseContract::default(),
-            signals: Value::Null,
+            signals: json!({
+                super::super::job::DURABLE_SCOPE_ROOT_SIGNAL: &source,
+            }),
             resolution: CourseResolution {
                 source: ResolutionSource::Operator,
                 confidence: 1.0,
@@ -2060,7 +2226,7 @@ mod tests {
         let job = Job {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job_id.clone(),
-            scope: "test-scope".to_string(),
+            scope: deadreckon_core::paths::workspace_scope(&source).expect("fixture scope"),
             goal: plan.goal.clone(),
             shape: JobShape::Single,
             created_at: Utc::now(),
@@ -2103,6 +2269,41 @@ mod tests {
             },
             executable,
         }
+    }
+
+    #[test]
+    fn lease_heartbeat_covers_blocking_pre_attempt_work() {
+        let temp = TempDir::new().expect("temp");
+        let (paths, job) = fixture(&temp, 1);
+        let lease_ttl = Duration::from_millis(500);
+        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
+        let claim =
+            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), lease_ttl).expect("claim");
+        let token = claim.token();
+        let heartbeat = LeaseHeartbeatGuard::start(
+            paths.clone(),
+            token.clone(),
+            Duration::from_millis(50),
+            lease_ttl,
+        )
+        .expect("heartbeat");
+
+        // Model an authority/source-tree validation that takes longer than the
+        // original lease. The fenced attempt event must still be accepted.
+        thread::sleep(Duration::from_millis(1_200));
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "attempt-after-slow-authority-validation".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("attempt remains fenced by a live lease");
+        heartbeat.finish(Ok(())).expect("stop heartbeat");
+
+        let lease = deadreckon_core::load_job_lease(&paths, &job.job_id).expect("lease");
+        assert!(lease.heartbeat_at > lease.acquired_at);
+        assert!(lease.expires_at > Utc::now());
     }
 
     fn executing_attempt(paths: &DeadreckonPaths, job: &Job) {
@@ -2226,6 +2427,8 @@ mod tests {
             plan.merged_run_id = Some("result-run".to_string());
         }
         deadreckon_core::plan::save_plan(&paths, &plan).expect("plan state");
+        super::super::graph_job::record_plan_planner_accounting(&paths, &plan.plan_id, None)
+            .expect("planner accounting");
         super::super::job::write_json_synced(
             &super::super::graph_job::driver_state_path(&paths, job.job_id.as_ref()),
             &super::super::graph_job::DriverState {
@@ -2635,6 +2838,8 @@ mod tests {
 
     #[tokio::test]
     async fn achieved_campaign_receipt_survives_crash_boundary_and_finish_validation() {
+        use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, save_plan};
+
         let temp = TempDir::new().expect("tempdir");
         let (paths, job, mut campaign) =
             campaign_fixture(&temp, deadreckon_core::campaign::CampaignStatus::Merged);
@@ -2670,6 +2875,24 @@ mod tests {
             )
             .expect("leaf complete");
             save_state(&leaf).expect("leaf state");
+            let mut first = PlanTask::new(0, "first", "work", PlanRole::Child, None);
+            first.child_run_id = Some(leaf.run_id.clone());
+            let mut second = PlanTask::new(1, "second", "reuse", PlanRole::Child, None);
+            second.child_run_id = Some(leaf.run_id.clone());
+            let mut subplan = Plan::new(
+                sub.goal.clone(),
+                PlanMode::FullPlan,
+                vec![first, second],
+                PlanProviders::default(),
+                None,
+                "test",
+            )
+            .expect("subplan");
+            subplan.plan_id = format!("campaign-subplan-{index}");
+            save_plan(&paths, &subplan).expect("subplan state");
+            super::super::graph_job::record_plan_planner_accounting(&paths, &subplan.plan_id, None)
+                .expect("subplan planner accounting");
+            sub.sub_plan_id = Some(subplan.plan_id);
             sub.result_run_id = Some(run_id);
         }
         let rollup = deadreckon_core::campaign::build_rollup(&campaign, |run_id| {
@@ -2766,7 +2989,14 @@ mod tests {
             model: "test-model".to_string(),
             decision: SemanticDecision::Achieved,
             summary: "the campaign result satisfies the approved goal".to_string(),
-            goal_coverage: Vec::new(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved campaign goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec![
+                    "approved-goal".to_string(),
+                    "deterministic-gate".to_string(),
+                ],
+            }],
             missing: Vec::new(),
             input_sha256: "sha256:campaign-evidence".to_string(),
             spend_usd: 0.0,
@@ -2903,6 +3133,11 @@ mod tests {
             )
             .expect("merged complete");
         save_state(&merged).expect("merged state");
+        let mut plan = deadreckon_core::load_plan(&paths, job.job_id.as_ref()).expect("graph plan");
+        for task in &mut plan.tasks {
+            task.child_run_id = Some(merged.run_id.clone());
+        }
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("graph accounting links");
 
         let authority_path = paths.job_authority(job.job_id.as_ref());
         let authority: JobAuthority =
@@ -2940,7 +3175,14 @@ mod tests {
             model: "test-model".to_string(),
             decision: SemanticDecision::Achieved,
             summary: "the merged result satisfies the parent goal".to_string(),
-            goal_coverage: Vec::new(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved graph goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec![
+                    "approved-goal".to_string(),
+                    "deterministic-gate".to_string(),
+                ],
+            }],
             missing: Vec::new(),
             input_sha256: "sha256:test-evidence".to_string(),
             spend_usd: 0.0,
@@ -3053,6 +3295,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_achieved_graph_judgment_cannot_seal_over_cap_after_crash() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Merged);
+        let mut merged = create_run(
+            &paths,
+            RunOptions {
+                goal: job.goal.clone(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("result-run".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("merged evidence run");
+        fs::write(merged.working_dir.join("result.txt"), "merged evidence\n")
+            .expect("merged result");
+        merged
+            .set_phase_status(
+                deadreckon_core::PhaseId(60),
+                deadreckon_core::PhaseStatus::Completed,
+            )
+            .expect("merged complete");
+        save_state(&merged).expect("merged state");
+        let mut plan = deadreckon_core::load_plan(&paths, job.job_id.as_ref()).expect("graph plan");
+        for task in &mut plan.tasks {
+            task.child_run_id = Some(merged.run_id.clone());
+        }
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("graph accounting links");
+
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let mut parent =
+            super::super::graph_job::prepare_parent_result_run(&paths, &job, &authority, &merged)
+                .expect("parent");
+        let key = deadreckon_core::read_gate_key(&paths, job.job_id.as_ref()).expect("gate key");
+        deadreckon_core::write_native_acceptance_marker_with_results_and_key(
+            &parent.run_root,
+            parent.run_id.clone(),
+            parent.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "merged result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("native marker");
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job.job_id.clone(),
+            run_id: RunId(job.job_id.as_ref().to_string()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the merged result satisfies the parent goal".to_string(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved graph goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec![
+                    "approved-goal".to_string(),
+                    "deterministic-gate".to_string(),
+                ],
+            }],
+            missing: Vec::new(),
+            input_sha256: "sha256:test-evidence".to_string(),
+            spend_usd: 0.25,
+        };
+        deadreckon_runtime::persist_semantic_judgment(&parent.run_root, &judgment)
+            .expect("judgment");
+        parent.total_spend_usd = job.policy.max_spend_usd + 0.01;
+        save_state(&parent).expect("over-cap accounting");
+
+        let completion =
+            super::super::graph_job::complete_merged_plan_parent(&paths, &job, &authority, &plan)
+                .await
+                .expect("completion");
+
+        let super::super::graph_job::ParentCompletion::BudgetExhausted { stop_reason, .. } =
+            completion
+        else {
+            panic!("over-cap persisted judgment must not seal")
+        };
+        assert_eq!(stop_reason, StopReason::SpendCap);
+        assert!(!paths.job_receipt(job.job_id.as_ref()).exists());
+    }
+
+    #[tokio::test]
     async fn persisted_parent_needs_review_is_reprojected_without_rerunning_the_gate() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Merged);
@@ -3145,7 +3488,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = fixture(&temp, 1);
         let launch = load_launch_inputs(&paths, &job).expect("launch");
-        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let mut command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        apply_durable_scope_root(&mut command, &launch.plan);
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let run_id_position = args
             .iter()
@@ -3169,6 +3513,13 @@ mod tests {
                 .find(|(key, _)| *key == TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV)
                 .and_then(|(_, value)| value),
             Some(expected_launch_plan.as_os_str())
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "DEADRECKON_SCOPE_ROOT")
+                .and_then(|(_, value)| value),
+            Some(job.source_cwd.as_os_str())
         );
     }
 
@@ -3220,6 +3571,32 @@ mod tests {
                 "missing {expected:?} in {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn root_run_replays_the_normalized_copy_source_exactly_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let mut launch = load_launch_inputs(&paths, &job).expect("launch");
+        let mut signals = launch.plan.signals.as_object().cloned().unwrap_or_default();
+        signals.insert(
+            "watchkeeper_source".to_string(),
+            serde_json::to_value(super::super::job::DurableSource {
+                mode: super::super::job::DurableSourceMode::Copy,
+                from: Some(job.source_cwd.clone()),
+                allow_dirty: false,
+            })
+            .expect("source json"),
+        );
+        launch.plan.signals = Value::Object(signals);
+
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let from = args.iter().position(|arg| arg == "--from").expect("--from");
+        assert_eq!(
+            args.get(from + 1),
+            Some(&job.source_cwd.as_os_str().to_os_string())
+        );
     }
 
     #[test]

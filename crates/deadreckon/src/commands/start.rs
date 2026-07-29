@@ -2613,7 +2613,9 @@ async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Resul
         )));
     }
     materialize_start_done_criteria(&mut decision, None).await?;
-    dispatch_start_command(replay_args, &decision, plan).await
+    dispatch_start_command(replay_args, &decision, plan)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
@@ -2793,26 +2795,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     if args.json && args.yes {
         // C-P10: launch JSON parity — dispatch quietly, then emit one
         // machine envelope carrying the plan and what actually launched.
-        let before_runs = start_run_ids(&paths)?;
-        let before_plans = start_plan_ids(&paths)?;
-        let before_jobs = start_job_ids(&paths)?;
         let goal = decision.goal.clone();
         let mode_label = decision.selected_mode.label().to_string();
         let mut quiet_args = args;
         quiet_args.quiet = true;
-        dispatch_start_command(quiet_args, &decision, launch_plan.clone()).await?;
-        let mut dispatched_ids: Vec<String> = Vec::new();
-        if let Some(run) = newest_start_run(&paths, &before_runs, &goal)? {
-            dispatched_ids.push(run.run_id);
-        }
-        if let Some(plan_entry) = newest_start_plan(&paths, &before_plans, &goal)? {
-            dispatched_ids.push(plan_entry.plan_id);
-        }
-        if let Some(job_id) = newest_start_job_id(&paths, &before_jobs, &goal)?
-            && !dispatched_ids.iter().any(|id| id == &job_id)
-        {
-            dispatched_ids.insert(0, job_id);
-        }
+        let dispatched = dispatch_start_command(quiet_args, &decision, launch_plan.clone()).await?;
+        pause_before_json_launch_envelope_for_test();
+        let dispatched_ids = dispatched.ids;
         let next_actions: Vec<String> = dispatched_ids
             .first()
             .map(|id| {
@@ -2840,7 +2829,9 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&envelope)?);
         return Ok(());
     }
-    dispatch_start_command(args, &decision, launch_plan).await
+    dispatch_start_command(args, &decision, launch_plan)
+        .await
+        .map(|_| ())
 }
 
 #[derive(Clone, Copy)]
@@ -2849,6 +2840,32 @@ struct StartAttachFlags {
     quiet: bool,
     preview: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartDispatch {
+    ids: Vec<String>,
+}
+
+impl StartDispatch {
+    fn job(job_id: &deadreckon_protocol::JobId) -> Self {
+        Self {
+            ids: vec![job_id.to_string()],
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn pause_before_json_launch_envelope_for_test() {
+    let Some(milliseconds) = std::env::var_os("DEADRECKON_TEST_START_ENVELOPE_DELAY_MS")
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u64>().ok()))
+    else {
+        return;
+    };
+    std::thread::sleep(std::time::Duration::from_millis(milliseconds.min(5_000)));
+}
+
+#[cfg(not(debug_assertions))]
+fn pause_before_json_launch_envelope_for_test() {}
 
 /// C-P13: start-then-watch. After a successful interactive launch, drop
 /// into attach when `[defaults] start_attach = true`. Best-effort — a
@@ -2881,7 +2898,7 @@ async fn dispatch_start_command(
     args: StartCommandArgs,
     decision: &StartLaunchDecision,
     launch_plan: commands::course::LaunchPlan,
-) -> Result<()> {
+) -> Result<StartDispatch> {
     let args_snapshot = StartAttachFlags {
         json: args.json,
         quiet: args.quiet,
@@ -2946,7 +2963,7 @@ async fn dispatch_start_command(
             if !args_snapshot.json {
                 maybe_start_attach(job.job_id.as_ref(), &args_snapshot).await;
             }
-            Ok(())
+            Ok(StartDispatch::job(&job.job_id))
         }
         StartSelectedMode::Extend => {
             // `extend` still owns a process-bound parent-artifact state
@@ -3004,7 +3021,7 @@ async fn dispatch_advanced_start_job(
     launch_plan: commands::course::LaunchPlan,
     attach_flags: StartAttachFlags,
     kind: commands::graph_job::DriverKind,
-) -> Result<()> {
+) -> Result<StartDispatch> {
     if start_source_flags_present(&args)
         || decision.source_fresh
         || decision.source_from.is_some()
@@ -3113,7 +3130,7 @@ async fn dispatch_advanced_start_job(
     if !attach_flags.json {
         maybe_start_attach(job.job_id.as_ref(), &attach_flags).await;
     }
-    Ok(())
+    Ok(StartDispatch::job(&job.job_id))
 }
 
 fn start_source_flags_present(args: &StartCommandArgs) -> bool {
@@ -3126,78 +3143,6 @@ fn start_orchestration_flags_present(args: &StartCommandArgs) -> bool {
         || !args.child_provider.is_empty()
         || args.coder_provider.is_some()
         || args.reviewer_provider.is_some()
-}
-
-fn start_run_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
-    Ok(list_runs(paths, None)?
-        .into_iter()
-        .map(|run| run.run_id)
-        .collect())
-}
-
-fn start_plan_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
-    Ok(super::inspection::list_plan_entries(paths, None)?
-        .into_iter()
-        .map(|plan| plan.plan_id)
-        .collect())
-}
-
-fn start_job_ids(paths: &DeadreckonPaths) -> Result<BTreeSet<String>> {
-    let entries = match fs::read_dir(paths.jobs_dir()) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(source) => return Err(source.into()),
-    };
-    Ok(entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
-        .filter(|id| paths.job_json(id).is_file())
-        .collect())
-}
-
-fn newest_start_run(
-    paths: &DeadreckonPaths,
-    before: &BTreeSet<String>,
-    goal: &str,
-) -> Result<Option<RunListEntry>> {
-    let mut runs = list_runs(paths, None)?
-        .into_iter()
-        .filter(|run| run.goal == goal && !before.contains(&run.run_id))
-        .collect::<Vec<_>>();
-    runs.sort_by_key(|run| run.updated_at);
-    Ok(runs.pop())
-}
-
-fn newest_start_plan(
-    paths: &DeadreckonPaths,
-    before: &BTreeSet<String>,
-    goal: &str,
-) -> Result<Option<super::inspection::PlanListEntry>> {
-    let mut plans = super::inspection::list_plan_entries(paths, None)?
-        .into_iter()
-        .filter(|plan| plan.goal == goal && !before.contains(&plan.plan_id))
-        .collect::<Vec<_>>();
-    plans.sort_by_key(|plan| plan.updated_at);
-    Ok(plans.pop())
-}
-
-fn newest_start_job_id(
-    paths: &DeadreckonPaths,
-    before: &BTreeSet<String>,
-    goal: &str,
-) -> Result<Option<String>> {
-    let mut jobs = start_job_ids(paths)?
-        .into_iter()
-        .filter(|job_id| !before.contains(job_id))
-        .filter_map(|job_id| {
-            deadreckon_core::load_job(paths, &job_id)
-                .ok()
-                .filter(|job| job.goal == goal)
-                .map(|job| (job.created_at, job_id))
-        })
-        .collect::<Vec<_>>();
-    jobs.sort_by_key(|(created_at, _)| *created_at);
-    Ok(jobs.pop().map(|(_, job_id)| job_id))
 }
 
 /// Whether the work a guided `start` launched is still running (recommend

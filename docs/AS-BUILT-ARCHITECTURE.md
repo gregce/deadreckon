@@ -3948,12 +3948,13 @@ namespacing, and a durable id index.
 ## 58. Watchkeeper: One Durable Job, Two-Key Completion
 
 Watchkeeper adds a durable local Job above the existing run state. Guided
-single, review, full-plan, and campaign starts have one approved, queued,
-leased and supervised parent Job ID. Every guided shape verifies a same-ID
-parent result with a native deterministic gate and a fresh read-only semantic
-judge. The supervisor validates the combined receipt before promotion. Direct
-`run`, `orchestrate`, `chain`, and `campaign` remain callable process-owned
-compatibility paths.
+`start`, ordinary direct `run` and `orchestrate`, new chains, stored-plan
+`fork`, and direct campaigns have one approved, queued, leased and supervised
+parent Job ID. Every durable shape verifies a same-ID parent result with a
+native deterministic gate and a fresh read-only semantic judge. The supervisor
+validates the combined receipt before promotion. Explicit preview,
+in-place/uncontained, historical chain, and continuation paths remain callable
+process-owned compatibility paths.
 
 ### 58.1 Current execution boundary
 
@@ -3962,15 +3963,17 @@ compatibility paths.
 | `deadreckon start --mode run "<goal>"` | Writes a Job before the first turn, then detaches `supervisor serve --once <job-id>` | Contained native gate plus fresh read-only semantic `achieved`, sealed into one two-key receipt | Durable Single Job; survives the launching terminal |
 | `start --mode review|full-plan` | Writes a `Graph` Job, normalizes delivery to `AtEnd`, and supervises the established conductor under the same parent ID | Copies the merged result into the same-ID parent run, then runs the native gate, fresh semantic judge, receipt validation and promotion | Durable and verified Graph parent; `finish` exports the receipt-bound parent |
 | An auto-selected guided campaign | Writes a `LegacyCampaign` Job and supervises the established conductor under the same parent ID | Recovers exact persisted sub-plans, revalidates the worst-of roll-up, then runs the parent gate, semantic judge, receipt validation and promotion | Durable and verified Campaign parent; live recovery drills remain outstanding |
+| Ordinary `deadreckon run "<goal>"` | Freezes direct-run options into a Single Job and detaches the same supervisor path | The same contained native gate, semantic judgment and combined receipt as guided Single | Durable by default; preview, explicit `--in-place`, explicit `--sandbox none`, and historical chain-child execution stay foreground and untrusted |
+| Direct `orchestrate` and stored-plan `fork` | Freeze the graph into a `Graph` Job and supervise the established conductor under the parent lease | At-end same-ID parent gate, semantic judgment, receipt and promotion | Durable by default; preview and trusted internal child execution remain foreground |
+| New `chain` | Compiles supported chain policy into a linear `Graph` Job | Verifies the composed parent once at the end with both completion keys | Durable by default; explicit `--sandbox none`, historical `chain run|resume`, and unsupported conductor-only policies remain labelled untrusted |
+| Direct `campaign` | Writes a `LegacyCampaign` Job before the conductor starts | Rebuilds the worst-of roll-up, then uses the same parent two-key sequence | Durable by default; preview remains foreground and live recovery drills remain outstanding |
 | Installed `deadreckon supervisor` user service | launchd or systemd starts `supervisor serve`, which scans supported nonterminal Jobs | Uses the same shape-specific classifiers and receipt validators as detached one-shot supervision | Conditional restart-at-login posture; live active-service and reboot acceptance remain |
-| `deadreckon run "<goal>"` | Existing `PipelineState`, driven by the invoking process | Historical deterministic marker | Process-bound compatibility/power-user path; no Job receipt |
-| Direct `orchestrate`, `chain`, `campaign` and chain extension | Existing plan/chain/campaign coordinators and child run records | Existing per-run gate and roll-up rules | Useful advanced compatibility paths; not leased as Jobs |
 | Guided automatic continuation | Refuses before creating a Job, run or worker | Prints the exact legacy `deadreckon extend <run-id> "<goal>"` command | Honest boundary until continuation shares the Job lifecycle |
 
 Persisted durability and supervised durability are different claims. Every run
 continues to write state, ledgers, snapshots, and evidence. A Watchkeeper Job
 also has a renewable fenced owner, typed terminal reason, detached process
-group, and immutable authority. Guided Single, Graph and Campaign Jobs also add
+group, and immutable authority. Durable Single, Graph and Campaign Jobs also add
 the combined parent completion receipt. Without the user service, the detached
 supervisor can outlive its launching shell but is not a machine-restart
 guarantee.
@@ -4081,7 +4084,7 @@ Worker sandbox policy denies the key store and makes Job authority, contract,
 receipt, lifecycle, proof, snapshot, and provenance control paths inaccessible
 or read-only across Seatbelt, bubblewrap, Docker, CLI providers, and the Codex
 app-server outer boundary. Symlink and canonical-path cases are covered. A
-strict guided Job receipt refuses `sandbox_backend = none` or
+strict durable Job receipt refuses `sandbox_backend = none` or
 `contained = false`.
 
 These are code and hermetic-test guarantees. Host sandbox availability still
@@ -4090,14 +4093,16 @@ verified strict Job.
 
 ### 58.6 Independent semantic judge
 
-For every guided Job, after deterministic checks pass,
+For every durable Job, after deterministic checks pass,
 `semantic_judge.rs` assembles a bounded
 evidence pack containing the approved goal, frozen contract, check result,
 authority facts, changed-file list, bounded diff, and implementation notes. A
 fresh provider request has no worker session and uses the explicit read-only
 workspace posture. The response schema permits only:
 
-- `achieved`: persist the judgment and attempt receipt sealing;
+- `achieved`: only when coverage is non-empty, every claim is `met`, every
+  claim cites allowed evidence, and `missing` is empty; persist the judgment
+  after accounting and attempt receipt sealing;
 - `revise`: for a Single Job, add bounded findings and continue within the
   remaining budgets; for Graph and Campaign parents, stop `NEEDS_REVIEW`;
 - `uncertain`: stop `NEEDS_REVIEW`.
@@ -4105,16 +4110,21 @@ workspace posture. The response schema permits only:
 An unavailable or malformed strict judge also becomes `NEEDS_REVIEW`. The judge
 is never called after deterministic failure and cannot override it. Judge
 tokens, wall time, route, model, and spend enter the normal spend/trace
-evidence as `semantic_judge`.
+evidence as `semantic_judge`. Single, Graph and Campaign paths reconstruct
+their applicable execution/planner usage before judging, pass the remaining
+wall budget as a cancellation deadline, and refuse receipt sealing when the
+recorded judge response exceeds the remaining spend or wall policy.
 
 ### 58.7 Combined receipt and promotion
 
-For a guided Job, `receipt.json` is supervisor-issued
+For a durable Job, `receipt.json` is supervisor-issued
 `two_key_completion` evidence. Its
 HMAC-SHA-256 signature covers identity, outcome, authority, goal, contract,
 effective policy, launch plan, source tree/revision, canonical result
 tree/revision, deterministic marker, semantic judgment, and confinement.
 Validation recomputes file and result-tree digests; it does not trust mtimes.
+Receipt sealing repeats the evidence-backed `achieved` invariant, so a
+persisted file cannot bypass the semantic response parser during recovery.
 
 New Job promotion calls this validator. Changing the authority, launch plan,
 contract, deterministic marker, semantic judgment, result bytes, containment
@@ -4180,17 +4190,21 @@ crash recovery, service rendering, fault boundaries, and promotion
 enforcement.
 
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
-harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, and a
-human-review template. Every row is `not_run`; the kit is measurement
-infrastructure, not evidence that a live provider trial happened.
+harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
+human-review template, and a credential-free adversarial runner. The committed
+credential-free result records 7 passes, 0 failures, and 5 explicitly
+unproven live/host claims. The sanitized live result records 2 attempts, 22
+not run, and 0 verified.
 
-The repository therefore does not report results from the planned live tasks,
-prove false-acceptance or false-rejection rates, demonstrate a real machine
-restart, demonstrate live Campaign interruption recovery, or put direct
-orchestration and chain execution under the same Job scheduler. The operator
-script in `docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available
-now from open live claims.
+The repository therefore does not report verified completion rates from the
+planned live tasks, prove false-acceptance or false-rejection rates,
+demonstrate a real machine restart, or demonstrate live Campaign interruption
+recovery. Direct run, orchestration, stored-plan fork, supported new chain, and
+campaign launches now share the Job scheduler; historical and explicitly
+untrusted compatibility paths do not. The operator script in
+`docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available now from
+open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

@@ -144,6 +144,7 @@ pub enum JobOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     Verified,
+    SemanticRevise,
     SemanticUncertain,
     SemanticUnavailable,
     OperatorInputRequired,
@@ -161,8 +162,9 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Verified,
+        Self::SemanticRevise,
         Self::SemanticUncertain,
         Self::SemanticUnavailable,
         Self::OperatorInputRequired,

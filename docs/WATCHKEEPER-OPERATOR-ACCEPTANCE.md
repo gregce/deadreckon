@@ -11,15 +11,19 @@ check these boxes automatically.
 
 The current acceptance boundary is:
 
-- guided `start` creates a durable Job before work and returns one parent ID;
-- guided Single, Graph and Campaign Jobs require a contained deterministic
+- guided `start` and ordinary direct execution create a durable Job before work
+  and return one parent ID;
+- durable Single, Graph and Campaign Jobs require a contained deterministic
   pass, semantic `achieved` and a valid parent receipt before promotion;
-- guided Graph work always delivers at the end and verifies the same-ID merged
+- durable Graph work always delivers at the end and verifies the same-ID merged
   parent;
-- guided Campaign work can recover an exactly linked persisted sub-plan and
+- durable Campaign work can recover an exactly linked persisted sub-plan and
   revalidates its worst-of roll-up before parent verification;
-- direct `run`, `orchestrate`, `chain`, and `campaign`, and chain extension,
-  remain process-owned compatibility paths;
+- ordinary direct `run` and `orchestrate`, new supported chains, stored-plan
+  `fork`, and direct campaigns share the durable Job scheduler;
+- previews, explicit in-place/uncontained execution, historical `chain
+  run|resume`, unsupported conductor policies, and chain extension remain
+  process-owned compatibility paths;
 - guided automatic continuation refuses before work and prints the exact
   legacy `extend` command;
 - launchd/systemd definitions and commands exist, but machine recovery becomes
@@ -40,33 +44,42 @@ export WK_REPO_A="/path/to/disposable/deadreckon-clone"
 export WK_REPO_B="/path/to/disposable/fixture-app"
 export WK_PROVIDER_A="cli:codex"
 export WK_PROVIDER_B="cli:claude-code"
+export WK_ARTIFACTS="$WK_STATE/operator-captures/dogfood"
 
 test -x "$WK_BIN"
 test -d "$WK_REPO_A/.git"
 test -d "$WK_REPO_B/.git"
 mkdir -p "$WK_STATE"
+mkdir -p "$WK_ARTIFACTS"
 export DEADRECKON_HOME="$WK_STATE"
 "$WK_BIN" doctor
 ```
 
 Before spending money, confirm both repositories have an approved definition
-of done and the selected sandbox resolves to a real backend:
+of done and the host reports at least one real sandbox backend:
 
 ```bash
 cd "$WK_REPO_A"
 "$WK_BIN" def-done show
 "$WK_BIN" def-done check
+cd "$WK_REPO_B"
+"$WK_BIN" def-done show
+"$WK_BIN" def-done check
+"$WK_BIN" doctor --json
 "$WK_BIN" run --preview "operator acceptance preflight"
 ```
 
-Expected signal: the preview names `sandbox-exec`, `bwrap`, or `docker`, not
-`none`. A strict Job that resolves to `none` is expected to stop for review, not
-verify.
+Expected signal: `doctor --json` reports `sandbox-exec`, `bwrap`, or `docker`
+with `available: true`, and the preview's requested sandbox is `auto` or that
+explicit backend, not `none`. Preview records the request; the supervisor
+records the resolved backend when it runs. A strict Job that resolves to
+`none` is expected to stop for review, not verify.
 
 ## 1. Run the public single-Job journey
 
-The repository includes an operator-only 24-task kit. All matrix rows are
-deliberately `not_run` until a human performs them.
+The repository includes an operator-only 24-task kit. The checked-in sanitized
+results record two unsuccessful operator attempts; 22 rows remain `not_run`.
+Neither attempt produced a receipt or reached `finish`.
 
 ```bash
 cd /path/to/deadreckon
@@ -76,6 +89,7 @@ export DEADRECKON_DOGFOOD_REPO_B="$WK_REPO_B"
 export DEADRECKON_DOGFOOD_PROVIDER_A="$WK_PROVIDER_A"
 export DEADRECKON_DOGFOOD_PROVIDER_B="$WK_PROVIDER_B"
 export DEADRECKON_BIN="$WK_BIN"
+export DEADRECKON_DOGFOOD_ARTIFACTS="$WK_ARTIFACTS"
 
 python3 examples/watchkeeper-dogfood/collect-metrics.py --help
 DEADRECKON_DOGFOOD_EXECUTE=1 \
@@ -110,9 +124,9 @@ rates. Generate the metrics artifact only from captured observations:
 ```bash
 python3 examples/watchkeeper-dogfood/collect-metrics.py \
   --home "$DEADRECKON_HOME" \
-  --observations examples/watchkeeper-dogfood/artifacts \
-  --output examples/watchkeeper-dogfood/artifacts/metrics.json
-python3 -m json.tool examples/watchkeeper-dogfood/artifacts/metrics.json
+  --observations "$WK_ARTIFACTS" \
+  --output "$WK_ARTIFACTS/metrics.json"
+python3 -m json.tool "$WK_ARTIFACTS/metrics.json"
 ```
 
 The collector derives machine facts from `JobView`, Job events, receipts, and
@@ -202,6 +216,8 @@ Accept when:
   `blocked/lost_containment` instead of guessing.
 
 The current code does not promise crash-before-link exactly-once execution.
+Repeat this drill on separate Single, Graph and Campaign Jobs; do not use one
+Job's recovery as evidence for the other shapes.
 
 ## 4. Kill the worker
 
@@ -213,7 +229,11 @@ export WK_CHILD_PID="$(
   "$WK_JOB_DIR/supervised-child.json"
 )"
 kill -TERM "$WK_CHILD_PID"
-"$WK_BIN" status "$WK_JOB_ID" --plain --json
+for WK_POLL in 1 2 3 4 5 6 7 8 9 10; do
+  "$WK_BIN" status "$WK_JOB_ID" --plain --json
+  tail -n 5 "$WK_JOB_DIR/job-events.jsonl"
+  sleep 2
+done
 tail -n 20 "$WK_JOB_DIR/job-events.jsonl"
 ```
 
@@ -232,7 +252,8 @@ For every verified guided Job, inspect:
 ```bash
 find "$DEADRECKON_HOME" \
   -path "*/runs/$WK_JOB_ID/proofs/semantic-judgment.json" \
-  -print
+  -print \
+  -exec python3 -m json.tool {} \;
 python3 -m json.tool "$WK_JOB_DIR/receipt.json"
 ```
 
@@ -276,6 +297,18 @@ Repeat on separate disposable Jobs by changing one artifact at a time and then
 restoring it: `authority.json`, `launch-plan.json`, `acceptance.yaml`, the
 native marker, `proofs/semantic-judgment.json`, and one result file.
 
+Locate the same-ID run before changing run-owned evidence:
+
+```bash
+export WK_RUN_ROOT="$(
+  find "$DEADRECKON_HOME" -type d -path "*/runs/$WK_JOB_ID" -print -quit
+)"
+test -n "$WK_RUN_ROOT"
+test -f "$WK_RUN_ROOT/proofs/turn-acceptance.json"
+test -f "$WK_RUN_ROOT/proofs/semantic-judgment.json"
+printf '%s\n' "$WK_RUN_ROOT"
+```
+
 Accept when:
 
 - [ ] every changed signed input or result is refused by `finish`;
@@ -285,7 +318,7 @@ Accept when:
 - [ ] `sandbox_backend = none`, `contained = false`, and synthetic proof cannot
   seal a strict receipt.
 
-## 7. Confirm guided Graph and Campaign completion
+## 7. Confirm Graph and Campaign completion
 
 Launch a small guided review or full-plan Job:
 
@@ -314,9 +347,11 @@ Accept when:
 - [ ] receipt validation happens before parent promotion;
 - [ ] `finish` delivers the receipt-bound parent output;
 - [ ] semantic `revise` stops `NEEDS_REVIEW`;
+- [ ] its typed stop reason is `semantic_revise`, distinct from judge
+  unavailability;
 - [ ] deterministic parent gate failure stops `FAILED`;
-- [ ] running direct `orchestrate` still behaves as the documented
-  process-owned compatibility path.
+- [ ] running direct `orchestrate` creates a durable Graph Job with the same
+  parent verification boundary.
 
 Run a separate guided Campaign selected by `start`. Accept when:
 
@@ -327,7 +362,8 @@ Run a separate guided Campaign selected by `start`. Accept when:
 - [ ] a refused or changed roll-up stops before the semantic judge;
 - [ ] a clean roll-up proceeds to parent gate, semantic judgment, receipt,
   promotion and `finish`;
-- [ ] direct `campaign` remains a process-owned compatibility path.
+- [ ] direct `campaign` creates a durable Campaign Job with the same roll-up
+  and parent verification boundary.
 
 ## 8. Confirm guided continuation refuses before work
 
@@ -416,7 +452,8 @@ evidence includes:
 - live worker death, supervisor death, network loss, tamper, and machine
   restart results;
 - live guided Campaign recovery and roll-up results;
-- Job parity for direct advanced and chain execution;
+- a live parity sample for direct run, orchestration, stored-plan fork, new
+  chain, and campaign execution;
 - safe Graph and Campaign repair after semantic `revise`.
 
 The implementation and hermetic tests justify trying these drills. They do not

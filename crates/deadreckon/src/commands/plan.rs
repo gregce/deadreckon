@@ -133,26 +133,28 @@ pub(crate) async fn create_orchestration_plan(
         "orchestration",
     )
     .await?;
+    let mut planner_accounting = None;
     let mut tasks = match plan_mode {
         PlanMode::FullPlan => {
             let overrides = parse_child_provider_overrides(&child_provider, n)?;
             providers.children = overrides.clone();
-            match plan_tasks_from_seed(seed_pieces, n, &providers, &overrides) {
-                Some(tasks) => tasks,
-                None => {
-                    build_full_plan_tasks(
-                        &paths,
-                        &goal,
-                        n,
-                        &providers,
-                        &overrides,
-                        &cwd,
-                        plain,
-                        no_hints,
-                        json_output,
-                    )
-                    .await?
-                }
+            if let Some(tasks) = plan_tasks_from_seed(seed_pieces, n, &providers, &overrides) {
+                tasks
+            } else {
+                let built = build_full_plan_tasks_accounted(
+                    &paths,
+                    &goal,
+                    n,
+                    &providers,
+                    &overrides,
+                    &cwd,
+                    plain,
+                    no_hints,
+                    json_output,
+                )
+                .await?;
+                planner_accounting = built.planner_accounting;
+                built.tasks
             }
         }
         PlanMode::Review => build_review_plan_tasks(&goal, &providers),
@@ -193,6 +195,11 @@ pub(crate) async fn create_orchestration_plan(
         write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
     }
     save_plan(&paths, &plan)?;
+    commands::graph_job::record_plan_planner_accounting(
+        &paths,
+        &plan.plan_id,
+        planner_accounting.as_ref(),
+    )?;
     let driver_kind = match plan_mode {
         PlanMode::Review => commands::graph_job::DriverKind::Review,
         PlanMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
@@ -449,6 +456,7 @@ fn attach_subplans(
             write_worker_spec(paths, &child.plan_id, &task.task_id, &spec)?;
         }
         save_plan(paths, &child)?;
+        commands::graph_job::record_plan_planner_accounting(paths, &child.plan_id, None)?;
         append_plan_event(
             paths,
             &child.plan_id,
@@ -526,33 +534,6 @@ fn plan_tasks_from_seed(
     // repaired; the planner fallback is the safer answer.
     deadreckon_core::validate_task_graph(&tasks).ok()?;
     Some(tasks)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn build_full_plan_tasks(
-    paths: &DeadreckonPaths,
-    goal: &str,
-    n: u8,
-    providers: &PlanProviders,
-    overrides: &BTreeMap<u32, String>,
-    cwd: &Path,
-    plain: bool,
-    no_hints: bool,
-    json_output: bool,
-) -> Result<Vec<PlanTask>> {
-    Ok(build_full_plan_tasks_accounted(
-        paths,
-        goal,
-        n,
-        providers,
-        overrides,
-        cwd,
-        plain,
-        no_hints,
-        json_output,
-    )
-    .await?
-    .tasks)
 }
 
 #[allow(clippy::too_many_arguments)]
