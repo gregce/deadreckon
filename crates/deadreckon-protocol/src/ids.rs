@@ -40,3 +40,4 @@ macro_rules! string_id {
 string_id!(RunId);
 string_id!(PlanId);
 string_id!(TurnId);
+string_id!(JobId);

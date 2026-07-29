@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JobAuthority",
+  "description": "Immutable, operator-approved inputs persisted before the first agent turn.",
+  "type": "object",
+  "required": [
+    "accepted_by",
+    "approved_at",
+    "contract_sha256",
+    "effective_policy_sha256",
+    "goal_sha256",
+    "job_id",
+    "launch_plan_sha256",
+    "run_id",
+    "sandbox_requested",
+    "schema_version",
+    "semantic_judge_mode",
+    "source_tree_sha256"
+  ],
+  "properties": {
+    "accepted_by": {
+      "$ref": "#/definitions/AuthorityAcceptedBy"
+    },
+    "approved_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "contract_sha256": {
+      "type": "string"
+    },
+    "effective_policy_sha256": {
+      "type": "string"
+    },
+    "goal_sha256": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "launch_plan_sha256": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sandbox_requested": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "semantic_judge_mode": {
+      "$ref": "#/definitions/SemanticJudgeMode"
+    },
+    "source_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_tree_sha256": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "AuthorityAcceptedBy": {
+      "type": "string",
+      "enum": [
+        "operator",
+        "yes_flag_guardrail"
+      ]
+    },
+    "SemanticJudgeMode": {
+      "type": "string",
+      "enum": [
+        "required",
+        "optional",
+        "disabled"
+      ]
+    }
+  }
+}

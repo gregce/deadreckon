@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Job",
+  "description": "Immutable identity and approved policy persisted in `job.json`.",
+  "type": "object",
+  "required": [
+    "authority_sha256",
+    "created_at",
+    "goal",
+    "job_id",
+    "launch_plan_sha256",
+    "policy",
+    "schema_version",
+    "scope",
+    "shape",
+    "source_cwd"
+  ],
+  "properties": {
+    "authority_sha256": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "goal": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "launch_plan_sha256": {
+      "type": "string"
+    },
+    "policy": {
+      "$ref": "#/definitions/JobPolicy"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "scope": {
+      "type": "string"
+    },
+    "shape": {
+      "$ref": "#/definitions/JobShape"
+    },
+    "source_cwd": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "JobPolicy": {
+      "type": "object",
+      "required": [
+        "max_attempts",
+        "max_spend_usd",
+        "max_wall_seconds",
+        "semantic_judge"
+      ],
+      "properties": {
+        "deadline": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "max_attempts": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "max_spend_usd": {
+          "type": "number",
+          "format": "double"
+        },
+        "max_wall_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "semantic_judge": {
+          "$ref": "#/definitions/SemanticJudgeMode"
+        }
+      }
+    },
+    "JobShape": {
+      "type": "string",
+      "enum": [
+        "single",
+        "graph",
+        "legacy_chain",
+        "legacy_campaign"
+      ]
+    },
+    "SemanticJudgeMode": {
+      "type": "string",
+      "enum": [
+        "required",
+        "optional",
+        "disabled"
+      ]
+    }
+  }
+}

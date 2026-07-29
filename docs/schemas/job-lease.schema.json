@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "JobLease",
+  "description": "Current fenced ownership persisted in `lease.json`.",
+  "type": "object",
+  "required": [
+    "acquired_at",
+    "boot_id",
+    "epoch",
+    "expires_at",
+    "heartbeat_at",
+    "job_id",
+    "owner_id",
+    "pid",
+    "process_group",
+    "schema_version"
+  ],
+  "properties": {
+    "acquired_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "boot_id": {
+      "type": "string"
+    },
+    "child_pid": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "epoch": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "heartbeat_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "owner_id": {
+      "type": "string"
+    },
+    "pid": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "process_group": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    }
+  }
+}
