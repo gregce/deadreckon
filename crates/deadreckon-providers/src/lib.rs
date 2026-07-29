@@ -25,6 +25,7 @@ pub mod taxonomy;
 
 pub use auth_probe::{CliAuthStatus, probe_cli_auth};
 pub use config::{default_config_path, read_config};
+pub use deadreckon_sandbox::WorkspaceAccess;
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
 pub use narrator::{
@@ -47,7 +48,7 @@ mod tests {
     use super::config::builtin_entries;
     use super::{
         ModelCatalogOverride, ModelEntry, Provider, ProviderAdapter, ProviderConfigFile,
-        ProviderEntry, ProviderKind, ProviderRouter, ProviderUsage, read_config,
+        ProviderEntry, ProviderKind, ProviderRouter, ProviderUsage, WorkspaceAccess, read_config,
     };
 
     #[test]
@@ -73,6 +74,14 @@ api_key = "test"
         assert_eq!(router.routes().len(), 2);
         assert_eq!(router.routes()[0].kind(), ProviderKind::OpenAiCompatible);
         assert!(router.routes()[0].has_credential());
+    }
+
+    #[test]
+    fn provider_request_defaults_to_worker_write_access() {
+        assert_eq!(
+            super::ProviderRequest::default().workspace_access,
+            WorkspaceAccess::ReadWrite
+        );
     }
 
     #[test]
@@ -432,6 +441,7 @@ api_key = "anthropic-key"
                 cwd: None,
                 output_path: None,
                 sandbox_backend: None,
+                workspace_access: WorkspaceAccess::ReadWrite,
                 pid_file: None,
                 cancellation_token: None,
                 session_dir: None,
@@ -453,6 +463,7 @@ api_key = "anthropic-key"
                 cwd: None,
                 output_path: None,
                 sandbox_backend: None,
+                workspace_access: WorkspaceAccess::ReadWrite,
                 pid_file: None,
                 cancellation_token: None,
                 session_dir: None,

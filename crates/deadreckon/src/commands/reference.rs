@@ -12,13 +12,14 @@
 use std::path::PathBuf;
 
 use deadreckon_core::campaign::Campaign;
-use deadreckon_core::{Chain, DeadreckonPaths, PipelineState, Plan, PlanTask};
+use deadreckon_core::{Chain, DeadreckonPaths, JobView, PipelineState, Plan, PlanTask};
 
 use super::super::*;
 
 /// What a reference turned out to name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefKind {
+    Job,
     Run,
     PlanChild,
     Plan,
@@ -31,6 +32,7 @@ impl RefKind {
     /// Rust type name.
     pub(crate) const fn noun(self) -> &'static str {
         match self {
+            Self::Job => "job",
             Self::Run => "run",
             Self::PlanChild => "plan child",
             Self::Plan => "plan",
@@ -41,11 +43,12 @@ impl RefKind {
 
     const fn bit(self) -> u8 {
         match self {
-            Self::Run => 1 << 0,
-            Self::PlanChild => 1 << 1,
-            Self::Plan => 1 << 2,
-            Self::Chain => 1 << 3,
-            Self::Campaign => 1 << 4,
+            Self::Job => 1 << 0,
+            Self::Run => 1 << 1,
+            Self::PlanChild => 1 << 2,
+            Self::Plan => 1 << 3,
+            Self::Chain => 1 << 4,
+            Self::Campaign => 1 << 5,
         }
     }
 }
@@ -56,6 +59,7 @@ impl RefKind {
 pub(crate) struct RefKinds(u8);
 
 impl RefKinds {
+    pub(crate) const JOB: Self = Self(RefKind::Job.bit());
     pub(crate) const RUN: Self = Self(RefKind::Run.bit());
     pub(crate) const PLAN_CHILD: Self = Self(RefKind::PlanChild.bit());
     pub(crate) const PLAN: Self = Self(RefKind::Plan.bit());
@@ -64,7 +68,8 @@ impl RefKinds {
     /// Every kind. `status`, `show` and `attach` orient across all of them.
     /// Built from the five constants rather than the bits directly, so adding a
     /// kind without adding it here is a compile-visible omission.
-    pub(crate) const ALL: Self = Self::RUN
+    pub(crate) const ALL: Self = Self::JOB
+        .union(Self::RUN)
         .union(Self::PLAN_CHILD)
         .union(Self::PLAN)
         .union(Self::CHAIN)
@@ -83,6 +88,7 @@ impl RefKinds {
 /// alone is large enough that clippy's `large_enum_variant` fires otherwise.
 #[derive(Debug, Clone)]
 pub(crate) enum ResolvedRef {
+    Job(Box<JobView>),
     Run(Box<PipelineState>),
     PlanChild {
         selection: PlanChildSelection,
@@ -99,6 +105,7 @@ pub(crate) enum ResolvedRef {
 impl ResolvedRef {
     pub(crate) const fn kind(&self) -> RefKind {
         match self {
+            Self::Job(_) => RefKind::Job,
             Self::Run(_) => RefKind::Run,
             Self::PlanChild { .. } => RefKind::PlanChild,
             Self::Plan(_) => RefKind::Plan,
@@ -112,7 +119,8 @@ impl ResolvedRef {
 /// the refusal-table tests to iterate the matrix exhaustively; the resolver
 /// itself matches on `RefKind` and needs no list.
 #[cfg(test)]
-pub(crate) const ALL_REF_KINDS: [RefKind; 5] = [
+pub(crate) const ALL_REF_KINDS: [RefKind; 6] = [
+    RefKind::Job,
     RefKind::Run,
     RefKind::PlanChild,
     RefKind::Plan,
@@ -151,7 +159,10 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     // Finish promotes work; a campaign is inspected, not promoted directly.
     VerbRefSpec {
         verb: "finish",
-        accepts: RUN_LIKE.union(RefKinds::PLAN).union(RefKinds::CHAIN),
+        accepts: RefKinds::JOB
+            .union(RUN_LIKE)
+            .union(RefKinds::PLAN)
+            .union(RefKinds::CHAIN),
     },
     // export/apply accept a plan because they map it onto its merged result run.
     VerbRefSpec {
@@ -177,7 +188,7 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     },
     VerbRefSpec {
         verb: "report",
-        accepts: RUN_LIKE,
+        accepts: RefKinds::JOB.union(RUN_LIKE),
     },
     VerbRefSpec {
         verb: "resume",
@@ -325,16 +336,29 @@ pub(crate) fn resolve_ref(paths: &DeadreckonPaths, query: RefQuery<'_>) -> Resul
     }
 
     let mut matches = Vec::new();
-    if let Some(state) = probe_run(paths, reference)? {
+    let job = probe_job(paths, reference)?;
+    let canonical_job_id = job
+        .as_ref()
+        .map(|view| view.job.job_id.as_ref().to_string());
+    if let Some(job) = job {
+        matches.push(ResolvedRef::Job(Box::new(job)));
+    }
+    if let Some(state) = probe_run(paths, reference)?
+        && canonical_job_id.as_deref() != Some(state.run_id.as_str())
+    {
         matches.push(ResolvedRef::Run(Box::new(state)));
     }
-    if let Some(plan) = probe_plan(paths, reference)? {
+    if let Some(plan) = probe_plan(paths, reference)?
+        && canonical_job_id.as_deref() != Some(plan.plan_id.as_str())
+    {
         matches.push(ResolvedRef::Plan(Box::new(plan)));
     }
     if let Some(chain) = probe_chain(paths, reference, query.all_scopes)? {
         matches.push(ResolvedRef::Chain(Box::new(chain)));
     }
-    if let Some((dir, campaign)) = super::campaign::resolve_campaign(paths, reference)? {
+    if let Some((dir, campaign)) = super::campaign::resolve_campaign(paths, reference)?
+        && canonical_job_id.as_deref() != Some(campaign.campaign_id.as_str())
+    {
         matches.push(ResolvedRef::Campaign {
             dir,
             campaign: Box::new(campaign),
@@ -489,6 +513,9 @@ pub(crate) fn resolve_latest_in_scope(
         return Err(empty_latest(paths, accepts, scope));
     };
     match newest.kind {
+        RefKind::Job => Ok(ResolvedRef::Job(Box::new(JobView::load(
+            paths, &newest.id,
+        )?))),
         RefKind::Run => Ok(ResolvedRef::Run(Box::new(load_run(paths, &newest.id)?))),
         RefKind::Plan => Ok(ResolvedRef::Plan(Box::new(load_plan(paths, &newest.id)?))),
         RefKind::Chain => Ok(ResolvedRef::Chain(Box::new(deadreckon_core::load_chain(
@@ -519,8 +546,25 @@ fn latest_candidates(
     scope: Option<&str>,
 ) -> Result<Vec<LatestCandidate>> {
     let mut candidates = Vec::new();
+    let jobs = super::job::list_jobs(paths, scope)?;
+    let job_ids = jobs
+        .iter()
+        .map(|view| view.job.job_id.as_ref().to_string())
+        .collect::<BTreeSet<_>>();
+    if accepts.contains(RefKind::Job) {
+        for view in jobs {
+            candidates.push(LatestCandidate {
+                kind: RefKind::Job,
+                id: view.job.job_id.as_ref().to_string(),
+                updated_at: view.projection.updated_at.unwrap_or(view.job.created_at),
+            });
+        }
+    }
     if accepts.contains(RefKind::Run) {
         for run in deadreckon_core::list_runs(paths, scope)? {
+            if job_ids.contains(&run.run_id) {
+                continue;
+            }
             candidates.push(LatestCandidate {
                 kind: RefKind::Run,
                 id: run.run_id,
@@ -530,6 +574,9 @@ fn latest_candidates(
     }
     if accepts.contains(RefKind::Plan) {
         for plan in super::inspection::list_plan_entries(paths, scope)? {
+            if job_ids.contains(&plan.plan_id) {
+                continue;
+            }
             candidates.push(LatestCandidate {
                 kind: RefKind::Plan,
                 id: plan.plan_id,
@@ -557,6 +604,9 @@ fn latest_candidates(
     // not asked for one. Narrowing to a scope it cannot claim would be a guess.
     if accepts.contains(RefKind::Campaign) && scope.is_none() {
         for (dir, campaign) in all_campaigns(paths)? {
+            if job_ids.contains(&campaign.campaign_id) {
+                continue;
+            }
             let updated_at =
                 file_mtime(&deadreckon_core::campaign::campaign_path_for_plan_dir(&dir))
                     .unwrap_or_else(|| {
@@ -605,6 +655,37 @@ fn file_mtime(path: &Path) -> Option<DateTime<Utc>> {
         .and_then(|metadata| metadata.modified())
         .map(DateTime::<Utc>::from)
         .ok()
+}
+
+fn probe_job(paths: &DeadreckonPaths, reference: &str) -> Result<Option<JobView>> {
+    let mut ids = job_ids_matching(paths, reference)?;
+    match ids.len() {
+        1 => Ok(Some(JobView::load(paths, &ids.remove(0))?)),
+        0 => Ok(None),
+        _ => Err(ambiguous_within_kind(&format!(
+            "ambiguous job id prefix {reference}; matches {}",
+            ids.join(", ")
+        ))),
+    }
+}
+
+fn job_ids_matching(paths: &DeadreckonPaths, prefix: &str) -> Result<Vec<String>> {
+    let jobs_dir = paths.jobs_dir();
+    if !jobs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut jobs = fs::read_dir(&jobs_dir)
+        .map_err(|source| DeadreckonError::Io {
+            path: jobs_dir.clone(),
+            source,
+        })?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.path().join(deadreckon_core::job::JOB_JSON).is_file())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|job_id| job_id.starts_with(prefix))
+        .collect::<Vec<_>>();
+    jobs.sort();
+    Ok(jobs)
 }
 
 /// An empty scope and an empty machine are different problems. Sending someone
@@ -689,6 +770,9 @@ fn unresolved_reference(paths: &DeadreckonPaths, reference: &str, query: RefQuer
     let has_any_state = deadreckon_core::list_runs(paths, None)
         .map(|runs| !runs.is_empty())
         .unwrap_or(false)
+        || job_ids_matching(paths, "")
+            .map(|jobs| !jobs.is_empty())
+            .unwrap_or(false)
         || plan_ids_matching(paths, "")
             .map(|plans| !plans.is_empty())
             .unwrap_or(false);
@@ -726,6 +810,7 @@ fn ambiguous_across_kinds(reference: &str, matches: &[ResolvedRef]) -> CliError 
 
 pub(crate) fn resolved_id(resolved: &ResolvedRef) -> String {
     match resolved {
+        ResolvedRef::Job(view) => view.job.job_id.as_ref().to_string(),
         ResolvedRef::Run(state) => state.run_id.clone(),
         ResolvedRef::PlanChild { selection, .. } => {
             format!("{}:{}", selection.plan_id, selection.task_id)
@@ -738,6 +823,7 @@ pub(crate) fn resolved_id(resolved: &ResolvedRef) -> String {
 
 fn accepted_nouns(accepts: RefKinds) -> Vec<&'static str> {
     [
+        RefKind::Job,
         RefKind::Run,
         RefKind::Plan,
         RefKind::Chain,

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use deadreckon_core::NetworkCapability;
-use deadreckon_sandbox::SandboxBackend;
+use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 use serde::Deserializer;
 use serde::Serializer;
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,10 @@ pub struct ProviderRequest {
     pub cwd: Option<PathBuf>,
     pub output_path: Option<PathBuf>,
     pub sandbox_backend: Option<SandboxBackend>,
+    /// Filesystem posture for the provider process. Semantic verification uses
+    /// `ReadOnly`; ordinary worker turns retain the backward-compatible
+    /// `ReadWrite` default.
+    pub workspace_access: WorkspaceAccess,
     pub pid_file: Option<PathBuf>,
     pub cancellation_token: Option<CancellationToken>,
     /// Run root holding the per-run `provider-session.json` (Semaphore).
@@ -114,6 +118,7 @@ pub struct CapabilityPosture {
     pub install: bool,
     pub working_dir: PathBuf,
     pub additional_write_roots: Vec<PathBuf>,
+    pub workspace_access: WorkspaceAccess,
 }
 
 impl ProviderRequest {
@@ -134,6 +139,7 @@ impl ProviderRequest {
             install,
             working_dir,
             additional_write_roots,
+            workspace_access: self.workspace_access,
         });
     }
 }

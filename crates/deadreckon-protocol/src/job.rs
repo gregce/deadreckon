@@ -97,6 +97,9 @@ pub struct JobPolicy {
 pub enum JobShape {
     Single,
     Graph,
+    // Reserved compatibility discriminator only. The durable scheduler does
+    // not execute this shape: legacy Chain owns a separate conductor plus
+    // hook/apply/undo side effects that cannot yet be adopted exactly once.
     LegacyChain,
     LegacyCampaign,
 }

@@ -159,6 +159,66 @@ fn campaign_fork_launches_all_subs_and_records_events() {
 }
 
 #[test]
+fn interrupted_campaign_resume_reconciles_linked_plan_without_duplicate_launch() {
+    use deadreckon_core::campaign::{CampaignStatus, SubGoalStatus, SubResult};
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let campaign_dir = tmp.path().join("plans").join("camp-resume");
+    let mut campaign = fixture_campaign();
+    campaign.campaign_id = "camp-resume".to_string();
+    campaign.status = CampaignStatus::Forked;
+    campaign.sub_goals[0].status = SubGoalStatus::Running;
+    campaign.sub_goals[0].sub_plan_id = Some("plan-sub-0".to_string());
+    deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign)
+        .expect("persist interrupted campaign");
+
+    let mut recovered = Vec::new();
+    let mut launched = Vec::new();
+    run_campaign_fork_with_recovery(
+        &campaign_dir,
+        &mut campaign,
+        |sub, _launch_dir| {
+            if sub.sub_plan_id.as_deref() == Some("plan-sub-0") {
+                recovered.push(sub.sub_id.clone());
+                return Ok(Some(SubResult {
+                    schema_version: 1,
+                    sub_id: sub.sub_id.clone(),
+                    plan_id: sub.sub_plan_id.clone(),
+                    result_run_id: Some("run-sub-0".to_string()),
+                    ok: true,
+                }));
+            }
+            Ok(None)
+        },
+        |sub, _launch_dir| {
+            launched.push(sub.sub_id.clone());
+            Ok(SubResult {
+                schema_version: 1,
+                sub_id: sub.sub_id.clone(),
+                plan_id: Some(format!("plan-{}", sub.sub_id)),
+                result_run_id: Some(format!("run-{}", sub.sub_id)),
+                ok: true,
+            })
+        },
+        |_| 1.0,
+    )
+    .expect("resume persisted campaign");
+
+    assert_eq!(campaign.campaign_id, "camp-resume");
+    assert_eq!(recovered, vec!["sub-0"]);
+    assert_eq!(launched, vec!["sub-1"]);
+    assert_eq!(
+        campaign.sub_goals[0].result_run_id.as_deref(),
+        Some("run-sub-0")
+    );
+    assert!(
+        campaign
+            .sub_goals
+            .iter()
+            .all(|sub| sub.status == SubGoalStatus::Merged)
+    );
+}
+
+#[test]
 fn campaign_fork_marks_failed_sub_without_aborting_siblings() {
     use deadreckon_core::campaign::{SubGoalStatus, SubResult};
     let tmp = tempfile::TempDir::new().expect("tempdir");

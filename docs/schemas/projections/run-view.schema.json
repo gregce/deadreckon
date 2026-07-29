@@ -75,10 +75,30 @@
           },
           "type": "array"
         },
+        "contained": {
+          "default": false,
+          "type": "boolean"
+        },
+        "issuer": {
+          "default": "",
+          "type": "string"
+        },
         "produced_by": {
           "type": "string"
         },
+        "proof_kind": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AcceptanceProofKind"
+            }
+          ],
+          "default": "legacy_unknown"
+        },
         "run_id": {
+          "type": "string"
+        },
+        "sandbox_backend": {
+          "default": "",
           "type": "string"
         },
         "schema_version": {
@@ -106,6 +126,15 @@
         "working_dir"
       ],
       "type": "object"
+    },
+    "AcceptanceProofKind": {
+      "enum": [
+        "native_gate",
+        "synthetic_controller",
+        "derived_rollup",
+        "legacy_unknown"
+      ],
+      "type": "string"
     },
     "AcceptanceTamper": {
       "properties": {

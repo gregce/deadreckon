@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -1186,7 +1187,7 @@ fn start_review_preview_creates_no_plan_state() {
 }
 
 #[test]
-fn start_dispatches_explicit_run_to_run() {
+fn start_dispatches_explicit_run_to_single_job() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1207,17 +1208,18 @@ fn start_dispatches_explicit_run_to_run() {
         .expect("start run dispatch");
 
     assert_success(&output);
-    let run = list_runs(&paths, None)
-        .expect("runs")
-        .into_iter()
-        .next()
-        .expect("run");
-    let state = load_run(&paths, &run.run_id).expect("state");
-    assert_eq!(state.goal, "run through guided start");
+    let root = only_job_root(&paths);
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    let plan = read_launch_plan(&root);
+    assert_eq!(job["goal"], "run through guided start", "{job}");
+    assert_eq!(job["shape"], "single", "{job}");
+    assert_eq!(plan["goal"], "run through guided start", "{plan}");
+    assert_eq!(plan["shape"], "single", "{plan}");
 }
 
 #[test]
-fn start_dispatches_explicit_review_to_orchestrate() {
+fn start_dispatches_explicit_review_to_graph_job() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1238,9 +1240,21 @@ fn start_dispatches_explicit_review_to_orchestrate() {
         .expect("start review dispatch");
 
     assert_success(&output);
-    let plan = newest_plan(&paths);
-    assert_eq!(plan.root_goal, "review through guided start");
-    assert_eq!(plan.mode, PlanMode::Review);
+    let root = only_job_root(&paths);
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    let plan = read_launch_plan(&root);
+    assert_eq!(job["goal"], "review through guided start", "{job}");
+    assert_eq!(job["shape"], "graph", "{job}");
+    assert_eq!(plan["goal"], "review through guided start", "{plan}");
+    assert_eq!(
+        plan["signals"]["watchkeeper_driver"]["kind"], "review",
+        "{plan}"
+    );
+    assert_eq!(
+        plan["signals"]["watchkeeper_driver"]["apply"], "at-end",
+        "{plan}"
+    );
 }
 
 #[test]
@@ -1354,7 +1368,7 @@ fn start_quiet_success_obeys_existing_quiet_policy() {
 }
 
 #[test]
-fn start_run_success_prints_attach_status_kill_finish() {
+fn start_run_success_prints_job_lifecycle_commands() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1375,34 +1389,38 @@ fn start_run_success_prints_attach_status_kill_finish() {
 
     assert_success(&output);
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    let run = list_runs(&paths, None)
-        .expect("runs")
-        .into_iter()
-        .find(|run| run.goal == "footer guided run")
-        .expect("run");
-    let run_ref = &run.run_id[..8];
+    let root = only_job_root(&paths);
+    let job_id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("job id");
+    let job_ref = &job_id[..8];
     assert!(text.contains("completed start"), "{text}");
+    assert!(
+        text.contains("launched the guided start path as a job"),
+        "{text}"
+    );
     assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
     assert!(
-        text.contains(&format!("deadreckon attach {run_ref}")),
+        text.contains(&format!("deadreckon attach {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon status {run_ref}")),
+        text.contains(&format!("deadreckon status {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon kill {run_ref}")),
+        text.contains(&format!("deadreckon kill {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon finish {run_ref}")),
+        text.contains(&format!("deadreckon finish {job_ref}")),
         "{text}"
     );
 }
 
 #[test]
-fn start_orchestrate_success_prints_plan_lifecycle_commands() {
+fn start_review_success_prints_same_job_lifecycle_commands() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1423,30 +1441,38 @@ fn start_orchestrate_success_prints_plan_lifecycle_commands() {
 
     assert_success(&output);
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    let plan = newest_plan(&paths);
-    let plan_ref = &plan.plan_id[..8];
+    let root = only_job_root(&paths);
+    let job_id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("job id");
+    let job_ref = &job_id[..8];
     assert!(text.contains("completed start"), "{text}");
+    assert!(
+        text.contains("launched the guided start path as a job"),
+        "{text}"
+    );
     assert_eq!(text.matches("\nRecommended\n").count(), 1, "{text}");
     assert!(
-        text.contains(&format!("deadreckon attach {plan_ref}")),
+        text.contains(&format!("deadreckon attach {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon status {plan_ref}")),
+        text.contains(&format!("deadreckon status {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon kill {plan_ref}")),
+        text.contains(&format!("deadreckon kill {job_ref}")),
         "{text}"
     );
     assert!(
-        text.contains(&format!("deadreckon finish {plan_ref}")),
+        text.contains(&format!("deadreckon finish {job_ref}")),
         "{text}"
     );
 }
 
 #[test]
-fn start_footer_uses_plan_id_for_orchestrated_goal() {
+fn start_footer_uses_parent_job_id_for_orchestrated_goal() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1467,20 +1493,20 @@ fn start_footer_uses_plan_id_for_orchestrated_goal() {
 
     assert_success(&output);
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    let plan = newest_plan(&paths);
-    let plan_ref = &plan.plan_id[..8];
+    let root = only_job_root(&paths);
+    let job_id = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("job id");
+    let job_ref = &job_id[..8];
     assert!(
-        text.contains(&format!("deadreckon attach {plan_ref}")),
+        text.contains(&format!("deadreckon attach {job_ref}")),
         "{text}"
     );
-    for task in &plan.tasks {
-        if let Some(run_id) = task.child_run_id.as_ref() {
-            assert!(
-                !text.contains(&format!("completed start {}\n\nExplanation", &run_id[..8])),
-                "{text}"
-            );
-        }
-    }
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    assert_eq!(job["job_id"], job_id, "{job}");
+    assert_eq!(job["shape"], "graph", "{job}");
 }
 
 #[test]
@@ -6966,8 +6992,49 @@ fn newest_run_root(paths: &DeadreckonPaths) -> std::path::PathBuf {
     last.state_path.parent().expect("run root").to_path_buf()
 }
 
+fn job_roots(paths: &DeadreckonPaths) -> Vec<std::path::PathBuf> {
+    let mut jobs = fs::read_dir(paths.jobs_dir())
+        .expect("jobs directory")
+        .map(|entry| entry.expect("job entry").path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    jobs.sort();
+    jobs
+}
+
+fn only_job_root(paths: &DeadreckonPaths) -> std::path::PathBuf {
+    let jobs = job_roots(paths);
+    assert_eq!(jobs.len(), 1, "expected exactly one durable Job");
+    jobs[0].clone()
+}
+
+fn job_ids(paths: &DeadreckonPaths) -> BTreeSet<String> {
+    job_roots(paths)
+        .into_iter()
+        .map(|root| {
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .expect("utf8 job id")
+                .to_string()
+        })
+        .collect()
+}
+
+fn new_job_root(paths: &DeadreckonPaths, before: &BTreeSet<String>) -> std::path::PathBuf {
+    let new = job_roots(paths)
+        .into_iter()
+        .filter(|root| {
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !before.contains(name))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(new.len(), 1, "expected exactly one new durable Job");
+    new[0].clone()
+}
+
 #[test]
-fn accepted_plan_lands_in_run_root() {
+fn accepted_plan_lands_in_job_root_before_work() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -6980,7 +7047,7 @@ fn accepted_plan_lands_in_run_root() {
         .expect("start run");
 
     assert_success(&output);
-    let plan = read_launch_plan(&newest_run_root(&paths));
+    let plan = read_launch_plan(&only_job_root(&paths));
     assert_eq!(plan["schema"], 1, "{plan}");
     assert_eq!(plan["shape"], "single", "{plan}");
     assert_eq!(plan["goal"], "plan lands in run root", "{plan}");
@@ -6989,7 +7056,7 @@ fn accepted_plan_lands_in_run_root() {
 }
 
 #[test]
-fn plan_shape_dispatches_orchestrate_with_planned_n() {
+fn plan_shape_dispatches_graph_job_with_planned_n() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -7011,14 +7078,20 @@ fn plan_shape_dispatches_orchestrate_with_planned_n() {
         .expect("start full-plan");
 
     assert_success(&output);
-    let dispatched = newest_plan(&paths);
-    let plan = read_launch_plan(&paths.plan_dir(&dispatched.plan_id));
+    let root = only_job_root(&paths);
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    let plan = read_launch_plan(&root);
+    assert_eq!(job["shape"], "graph", "{job}");
     assert_eq!(plan["shape"], "plan", "{plan}");
     assert_eq!(plan["n"], 3, "{plan}");
     assert_eq!(
-        dispatched.tasks.len(),
-        3,
-        "dispatch honored the planned n: {plan}"
+        plan["signals"]["watchkeeper_driver"]["child_count"], 3,
+        "{plan}"
+    );
+    assert_eq!(
+        plan["signals"]["watchkeeper_driver"]["kind"], "full_plan",
+        "{plan}"
     );
 }
 
@@ -7241,13 +7314,16 @@ fn start_plan_replays_identical_shape_and_pieces() {
         .output()
         .expect("first launch");
     assert_success(&output);
-    let first = newest_plan(&paths);
+    let first = only_job_root(&paths);
+    let first_id = first
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("first job id")
+        .to_string();
+    let first_record = read_launch_plan(&first);
     let saved = temp.path().join("saved-launch-plan.json");
-    fs::copy(
-        paths.plan_dir(&first.plan_id).join("launch-plan.json"),
-        &saved,
-    )
-    .expect("copy plan");
+    fs::copy(first.join("launch-plan.json"), &saved).expect("copy plan");
+    let before = job_ids(&paths);
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -7262,15 +7338,26 @@ fn start_plan_replays_identical_shape_and_pieces() {
         .expect("replay");
     assert_success(&output);
 
-    let replayed = newest_plan(&paths);
-    assert_ne!(replayed.plan_id, first.plan_id, "a new plan launched");
-    assert_eq!(replayed.tasks.len(), 3, "same n");
-    let record = read_launch_plan(&paths.plan_dir(&replayed.plan_id));
+    let replayed = new_job_root(&paths, &before);
+    let replayed_id = replayed
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("replayed job id");
+    assert_ne!(replayed_id, first_id, "a new Job launched");
+    let job: Value = serde_json::from_slice(&fs::read(replayed.join("job.json")).expect("job"))
+        .expect("job json");
+    let record = read_launch_plan(&replayed);
+    assert_eq!(job["shape"], "graph", "{job}");
     assert_eq!(record["shape"], "plan", "{record}");
     assert_eq!(record["n"], 3, "{record}");
+    assert_eq!(record["pieces"], first_record["pieces"], "{record}");
     assert_eq!(record["goal"], "replayable goal", "{record}");
     assert_eq!(record["resolution"]["source"], "replay", "{record}");
     assert_eq!(record["accepted_by"], "replay", "{record}");
+    assert_eq!(
+        record["signals"]["watchkeeper_driver"]["child_count"], 3,
+        "{record}"
+    );
 }
 
 #[test]

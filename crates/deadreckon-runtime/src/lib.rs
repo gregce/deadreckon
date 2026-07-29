@@ -9,6 +9,7 @@ pub mod compaction;
 pub mod flight;
 pub mod polish;
 pub mod seam;
+pub mod semantic_judge;
 pub mod turn_loop;
 
 pub use compaction::{
@@ -24,6 +25,12 @@ pub use seam::{
     FailPolicy, SeamCommandConfig, SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam,
     parse_seams_config, read_seams_config, resolve_catalog_override, write_seams_audit,
 };
+pub use semantic_judge::{
+    EvidenceItem, SEMANTIC_JUDGMENT_PATH, SemanticEvidencePack, SemanticJudgeResult,
+    build_semantic_evidence, build_semantic_evidence_against_source, run_semantic_judge,
+    run_semantic_judge_against_source, semantic_judgment_path,
+};
 pub use turn_loop::{
-    NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_turn_loop,
+    NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
+    run_deterministic_completion_gate, run_turn_loop,
 };

@@ -157,7 +157,9 @@ impl ProviderAdapter {
                 retryable: matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504),
             });
         }
-        self.parse_response(&body)
+        let mut parsed = self.parse_response(&body)?;
+        parsed.trace["workspace_access"] = Value::String(request.workspace_access.as_str().into());
+        Ok(parsed)
     }
 
     fn parse_response(&self, body: &str) -> Result<ProviderResponse> {

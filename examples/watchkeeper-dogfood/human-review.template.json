@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "job_id": "replace-with-full-job-id",
+  "reviewed_at": null,
+  "reviewer": null,
+  "false_acceptance": null,
+  "false_rejection": null,
+  "operator_interventions": 0,
+  "time_to_understand_seconds": null,
+  "notes": null
+}

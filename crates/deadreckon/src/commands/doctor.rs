@@ -523,6 +523,7 @@ async fn collect_doctor_provider_ping(
         cwd: None,
         output_path: None,
         sandbox_backend: None,
+        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
         pid_file: None,
         cancellation_token: None,
         session_dir: None,

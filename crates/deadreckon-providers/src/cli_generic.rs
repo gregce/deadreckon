@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 use serde_json::json;
 use which::which;
 
@@ -90,6 +91,8 @@ impl GenericCliProvider {
                 pid_file: request.pid_file.clone(),
                 cancellation_token: request.cancellation_token.clone(),
                 extra_write_allowlist: sandbox_writes.clone(),
+                workspace_access: request.workspace_access,
+                inner_read_only_enforced: false,
             },
         )
         .await?;
@@ -103,25 +106,28 @@ impl GenericCliProvider {
         let spend = self
             .estimate_spend(usage.clone())
             .with_wall_time(wall_time_seconds);
+        let mut trace = json!({
+            "kind": "cli_subagent",
+            "binary": self.binary,
+            "args": args,
+            "stdout_path": request.output_path,
+            "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
+            "exit_code": output.status_code,
+            "pid": output.pid,
+            "workspace_access": request.workspace_access.as_str(),
+            "sandbox_backend": output.sandbox_backend,
+            "sandbox_warning": output.sandbox_warning,
+            "descriptor": self.descriptor.id,
+            "sandbox_write_allowlist": sandbox_writes,
+        });
+        omit_default_workspace_access(&mut trace, request.workspace_access);
         Ok(ProviderResponse {
             provider: self.name.clone(),
             model: self.model.clone(),
             content: output.stdout.clone(),
             usage,
             spend,
-            trace: json!({
-                "kind": "cli_subagent",
-                "binary": self.binary,
-                "args": args,
-                "stdout_path": request.output_path,
-                "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
-                "exit_code": output.status_code,
-                "pid": output.pid,
-                "sandbox_backend": output.sandbox_backend,
-                "sandbox_warning": output.sandbox_warning,
-                "descriptor": self.descriptor.id,
-                "sandbox_write_allowlist": sandbox_writes,
-            }),
+            trace,
         })
     }
 
@@ -138,7 +144,9 @@ impl GenericCliProvider {
             )));
         };
         let resume_capable = probe.active && !section.resume_args.is_empty();
-        let session_dir = request.session_dir.as_deref();
+        let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
+            .then_some(request.session_dir.as_deref())
+            .flatten();
         let session = resume_capable
             .then(|| session_dir.and_then(|dir| ProviderSession::read(dir, &self.descriptor.id)))
             .flatten();
@@ -224,6 +232,7 @@ impl GenericCliProvider {
             "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
             "exit_code": output.status_code,
             "pid": output.pid,
+            "workspace_access": request.workspace_access.as_str(),
             "sandbox_backend": output.sandbox_backend,
             "sandbox_warning": output.sandbox_warning,
             "descriptor": self.descriptor.id,
@@ -246,6 +255,7 @@ impl GenericCliProvider {
                 .map(|value| flight_rows_from(&value.parsed))
                 .unwrap_or_default(),
         });
+        omit_default_workspace_access(&mut trace, request.workspace_access);
         if let Some(message) = probe.caveat.as_deref() {
             add_caveat(&mut trace, "provider.contract.unavailable", message);
         }
@@ -311,6 +321,8 @@ impl GenericCliProvider {
                 pid_file: request.pid_file.clone(),
                 cancellation_token: request.cancellation_token.clone(),
                 extra_write_allowlist: self.sandbox_writes(),
+                workspace_access: request.workspace_access,
+                inner_read_only_enforced: false,
             },
         )
         .await?;
@@ -410,6 +422,14 @@ impl GenericCliProvider {
     }
 }
 
+fn omit_default_workspace_access(trace: &mut serde_json::Value, access: WorkspaceAccess) {
+    if access == WorkspaceAccess::ReadWrite
+        && let Some(trace) = trace.as_object_mut()
+    {
+        trace.remove("workspace_access");
+    }
+}
+
 struct GenericContractAttempt {
     output: CliOutput,
     args: Vec<String>,
@@ -458,16 +478,19 @@ fn persist_session(dir: &std::path::Path, provider: &str, id: &str, reset: bool)
 }
 
 fn render_template_part(part: &str, request: &ProviderRequest) -> String {
-    part.replace("{sandbox}", generic_sandbox_mode(request.sandbox_backend))
-        .replace(
-            "{cwd}",
-            &request
-                .cwd
-                .as_ref()
-                .unwrap_or(&PathBuf::new())
-                .display()
-                .to_string(),
-        )
+    part.replace(
+        "{sandbox}",
+        generic_sandbox_mode(request.sandbox_backend, request.workspace_access),
+    )
+    .replace(
+        "{cwd}",
+        &request
+            .cwd
+            .as_ref()
+            .unwrap_or(&PathBuf::new())
+            .display()
+            .to_string(),
+    )
 }
 
 fn expand_home_path(path: &std::path::Path, home: &std::path::Path) -> PathBuf {
@@ -498,14 +521,20 @@ fn cli_model(model: Option<String>, descriptor: &ProviderDescriptor) -> (String,
     }
 }
 
-fn generic_sandbox_mode(outer_backend: Option<deadreckon_sandbox::SandboxBackend>) -> &'static str {
+fn generic_sandbox_mode(
+    outer_backend: Option<SandboxBackend>,
+    workspace_access: WorkspaceAccess,
+) -> &'static str {
+    if workspace_access == WorkspaceAccess::ReadOnly {
+        return "read-only";
+    }
     match outer_backend {
-        Some(deadreckon_sandbox::SandboxBackend::None) | None => "workspace-write",
+        Some(SandboxBackend::None) | None => "workspace-write",
         Some(
-            deadreckon_sandbox::SandboxBackend::Auto
-            | deadreckon_sandbox::SandboxBackend::SandboxExec
-            | deadreckon_sandbox::SandboxBackend::Bwrap
-            | deadreckon_sandbox::SandboxBackend::Docker,
+            SandboxBackend::Auto
+            | SandboxBackend::SandboxExec
+            | SandboxBackend::Bwrap
+            | SandboxBackend::Docker,
         ) => "danger-full-access",
     }
 }

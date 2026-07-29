@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeadReckon Watchkeeper dogfood metrics",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "basis",
+    "jobs_observed",
+    "persisted_facts",
+    "human_review"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "basis": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "jobs_observed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "persisted_facts": {
+      "type": "object"
+    },
+    "human_review": {
+      "type": "object"
+    },
+    "data_quality": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

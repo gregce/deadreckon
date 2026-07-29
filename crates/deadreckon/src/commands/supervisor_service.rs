@@ -1,0 +1,1266 @@
+//! Per-user service installation for the durable local supervisor.
+//!
+//! Installation and lifecycle changes are always explicit CLI operations.
+//! Rendered units pin the current executable and durable-state home so a
+//! machine restart cannot silently select a different DeadReckon binary or
+//! state directory.
+
+use std::ffi::OsStr;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use deadreckon_core::{DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::super::{CliError, Result};
+
+const LAUNCHD_LABEL: &str = "com.deadreckon.supervisor";
+const SYSTEMD_UNIT: &str = "deadreckon-supervisor.service";
+const MANAGED_MARKER: &str = "deadreckon-managed-supervisor-v1";
+const SERVICE_INSTANCE_SCHEMA: u32 = 1;
+const SERVICE_LOCK_SCOPE: &str = "watchkeeper";
+const SERVICE_LOCK_TASK: &str = "supervisor-service";
+const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
+const SERVICE_INSTANCE_DIR: &str = "supervisor";
+const SERVICE_INSTANCE_FILE: &str = "instance.json";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Both variants are rendered and tested on each supported host.
+enum ServicePlatform {
+    Launchd,
+    Systemd,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceContext {
+    platform: ServicePlatform,
+    binary: PathBuf,
+    deadreckon_home: PathBuf,
+    user_home: PathBuf,
+    path_env: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallDecision {
+    Create,
+    Unchanged,
+    ReplaceManaged,
+    RefuseUnmanaged,
+}
+
+/// Installation posture only. `InstalledCurrent` does not assert that the
+/// user's service manager has loaded or enabled the unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MachineRestartPosture {
+    Unsupported,
+    NotInstalled,
+    UnmanagedUnit,
+    StaleManagedUnit,
+    InstalledCurrent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ServiceInstanceCheckpoint {
+    schema_version: u32,
+    generation: u64,
+    instance_id: String,
+    boot_id: String,
+    pid: u32,
+    started_at: DateTime<Utc>,
+    binary: PathBuf,
+    deadreckon_home: PathBuf,
+}
+
+/// A process-held singleton paired with a durable, replaceable checkpoint.
+///
+/// The lock owner is intentionally stable across process and machine restarts:
+/// the OS file lock is the singleton authority. This avoids a stale PID reused
+/// after reboot preventing the service from coming back. The checkpoint keeps
+/// the changing instance/boot identity for operator evidence.
+#[derive(Debug)]
+pub(crate) struct SupervisorServiceGuard {
+    _lock: LockGuard,
+    #[cfg_attr(not(test), allow(dead_code))]
+    checkpoint: ServiceInstanceCheckpoint,
+}
+
+pub(crate) fn acquire_supervisor_service_guard(
+    paths: &DeadreckonPaths,
+    instance_id: &str,
+    boot_id: &str,
+    binary: &Path,
+) -> Result<SupervisorServiceGuard> {
+    validate_service_value("supervisor instance id", instance_id)?;
+    validate_service_value("supervisor boot id", boot_id)?;
+    let lock = acquire_lock(
+        paths,
+        SERVICE_LOCK_TASK,
+        SERVICE_LOCK_OWNER,
+        SERVICE_LOCK_SCOPE,
+        "serving",
+        Duration::from_secs(30),
+    )?;
+    let checkpoint_path = service_instance_checkpoint_path(paths);
+    let generation = read_service_instance_checkpoint(&checkpoint_path)?
+        .map_or(1, |prior| prior.generation.saturating_add(1));
+    let checkpoint = ServiceInstanceCheckpoint {
+        schema_version: SERVICE_INSTANCE_SCHEMA,
+        generation,
+        instance_id: instance_id.to_string(),
+        boot_id: boot_id.to_string(),
+        pid: std::process::id(),
+        started_at: Utc::now(),
+        binary: binary.to_path_buf(),
+        deadreckon_home: paths.home().to_path_buf(),
+    };
+    fs::create_dir_all(
+        checkpoint_path
+            .parent()
+            .ok_or_else(|| invalid_input("supervisor checkpoint path has no parent"))?,
+    )?;
+    let bytes = serde_json::to_vec_pretty(&checkpoint).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: checkpoint_path.clone(),
+            source,
+        })
+    })?;
+    write_unit_atomically(&checkpoint_path, &bytes)?;
+    Ok(SupervisorServiceGuard {
+        _lock: lock,
+        checkpoint,
+    })
+}
+
+pub(crate) fn supervisor_machine_restart_posture() -> Result<MachineRestartPosture> {
+    let Ok(platform) = service_platform_for_os(std::env::consts::OS) else {
+        return Ok(MachineRestartPosture::Unsupported);
+    };
+    let context = ServiceContext::discover_for_platform(platform)?;
+    machine_restart_posture(&context)
+}
+
+/// Operator-facing durability claims for ordinary Job commands.
+///
+/// A detached one-shot supervisor is always launched for a successful guided
+/// start. A unit file only proves machine-restart configuration; it does not
+/// prove that launchd/systemd currently has the service loaded or active.
+pub(crate) fn guided_durability_labels() -> (&'static str, String) {
+    let process = "detached supervisor continues after the launching shell exits";
+    let machine = match supervisor_machine_restart_posture() {
+        Ok(posture) => machine_restart_posture_label(posture).to_string(),
+        Err(error) => format!(
+            "unknown (service posture could not be read: {error}); check with `deadreckon supervisor status`"
+        ),
+    };
+    (process, machine)
+}
+
+fn machine_restart_posture_label(posture: MachineRestartPosture) -> &'static str {
+    match posture {
+        MachineRestartPosture::InstalledCurrent => {
+            "configured by the current service unit; runtime state is reported by `deadreckon supervisor status`"
+        }
+        MachineRestartPosture::NotInstalled => {
+            "not configured; run `deadreckon supervisor install`, then `deadreckon supervisor start`"
+        }
+        MachineRestartPosture::StaleManagedUnit => {
+            "not configured for this binary; update with `deadreckon supervisor install`"
+        }
+        MachineRestartPosture::UnmanagedUnit => {
+            "not configured by DeadReckon; an unmanaged unit occupies the service path"
+        }
+        MachineRestartPosture::Unsupported => {
+            "unsupported on this platform (macOS launchd and Linux systemd are supported)"
+        }
+    }
+}
+
+pub(crate) fn supervisor_requires_service_singleton(
+    once: bool,
+    requested_job_id: Option<&str>,
+) -> bool {
+    !(once && requested_job_id.is_some())
+}
+
+pub(crate) fn supervisor_service_install_command() -> Result<()> {
+    let context = ServiceContext::discover()?;
+    let unit_path = context.unit_path();
+    let rendered = render_service(&context)?;
+    fs::create_dir_all(context.log_dir())?;
+    fs::create_dir_all(unit_path.parent().ok_or_else(|| {
+        invalid_input(format!(
+            "supervisor service path has no parent: {}",
+            unit_path.display()
+        ))
+    })?)?;
+
+    let outcome = install_rendered_unit(&context, &rendered)?;
+    match context.platform {
+        ServicePlatform::Launchd if outcome == InstallDecision::Create => {
+            let target = format!("{}/{LAUNCHD_LABEL}", launchd_domain()?);
+            run_required(
+                "launchctl",
+                ["disable", target.as_str()],
+                "leave the newly installed supervisor stopped until explicit start",
+            )?;
+        }
+        ServicePlatform::Systemd => {
+            run_required(
+                "systemctl",
+                ["--user", "daemon-reload"],
+                "reload the per-user systemd manager",
+            )?;
+        }
+        ServicePlatform::Launchd => {}
+    }
+
+    let action = match outcome {
+        InstallDecision::Create => "installed",
+        InstallDecision::Unchanged => "already installed",
+        InstallDecision::ReplaceManaged => "updated",
+        InstallDecision::RefuseUnmanaged => {
+            return Err(unmanaged_conflict_error(&unit_path));
+        }
+    };
+    println!(
+        "supervisor service {action}: {}\nnext: deadreckon supervisor start",
+        unit_path.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn supervisor_service_start_command() -> Result<()> {
+    let context = ServiceContext::discover()?;
+    require_current_managed_unit(&context)?;
+    match context.platform {
+        ServicePlatform::Launchd => launchd_start(&context)?,
+        ServicePlatform::Systemd => {
+            run_required(
+                "systemctl",
+                ["--user", "daemon-reload"],
+                "reload the per-user systemd manager",
+            )?;
+            run_required(
+                "systemctl",
+                ["--user", "enable", SYSTEMD_UNIT],
+                "enable the DeadReckon supervisor",
+            )?;
+            run_required(
+                "systemctl",
+                ["--user", "restart", SYSTEMD_UNIT],
+                "start the current DeadReckon supervisor unit",
+            )?;
+        }
+    }
+    println!(
+        "supervisor service started\nstate: {}\nbinary: {}",
+        context.deadreckon_home.display(),
+        context.binary.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn supervisor_service_status_command() -> Result<()> {
+    let posture = supervisor_machine_restart_posture()?;
+    if posture == MachineRestartPosture::Unsupported {
+        println!(
+            "supervisor service: unsupported\nmachine-restart durability is available only on macOS launchd and Linux systemd"
+        );
+        return Ok(());
+    }
+    let context = ServiceContext::discover()?;
+    let unit_path = context.unit_path();
+    let installed = match posture {
+        MachineRestartPosture::NotInstalled => {
+            println!("supervisor service: not installed\nnext: deadreckon supervisor install");
+            return Ok(());
+        }
+        MachineRestartPosture::UnmanagedUnit => {
+            return Err(unmanaged_conflict_error(&unit_path));
+        }
+        MachineRestartPosture::StaleManagedUnit => "stale (run `deadreckon supervisor install`)",
+        MachineRestartPosture::InstalledCurrent => "current",
+        MachineRestartPosture::Unsupported => unreachable!("handled above"),
+    };
+
+    let runtime = match context.platform {
+        ServicePlatform::Launchd => {
+            let domain = launchd_domain()?;
+            let target = format!("{domain}/{LAUNCHD_LABEL}");
+            if command_succeeds("launchctl", ["print", target.as_str()])? {
+                "loaded"
+            } else {
+                "stopped"
+            }
+        }
+        ServicePlatform::Systemd => {
+            let active = run_observational(
+                "systemctl",
+                ["--user", "is-active", SYSTEMD_UNIT],
+                "read the per-user systemd service state",
+            )?;
+            let enabled = run_observational(
+                "systemctl",
+                ["--user", "is-enabled", SYSTEMD_UNIT],
+                "read the per-user systemd enablement state",
+            )?;
+            refuse_unavailable_manager("read the per-user systemd service state", &active)?;
+            refuse_unavailable_manager("read the per-user systemd enablement state", &enabled)?;
+            let active = output_label(&active, "inactive");
+            let enabled = output_label(&enabled, "disabled");
+            return {
+                println!(
+                    "supervisor service: {active}, {enabled}\nunit: {installed}\npath: {}\nstate: {}\nbinary: {}",
+                    unit_path.display(),
+                    context.deadreckon_home.display(),
+                    context.binary.display()
+                );
+                Ok(())
+            };
+        }
+    };
+    println!(
+        "supervisor service: {runtime}\nunit: {installed}\npath: {}\nstate: {}\nbinary: {}",
+        unit_path.display(),
+        context.deadreckon_home.display(),
+        context.binary.display()
+    );
+    Ok(())
+}
+
+pub(crate) fn supervisor_service_stop_command() -> Result<()> {
+    let context = ServiceContext::discover()?;
+    if !require_any_managed_unit(&context)? {
+        println!("supervisor service already stopped (not installed)");
+        return Ok(());
+    }
+    match context.platform {
+        ServicePlatform::Launchd => {
+            let domain = launchd_domain()?;
+            let target = format!("{domain}/{LAUNCHD_LABEL}");
+            run_required(
+                "launchctl",
+                ["disable", target.as_str()],
+                "disable the DeadReckon supervisor",
+            )?;
+            if command_succeeds("launchctl", ["print", target.as_str()])? {
+                run_required(
+                    "launchctl",
+                    ["bootout", target.as_str()],
+                    "unload the DeadReckon supervisor",
+                )?;
+            }
+        }
+        ServicePlatform::Systemd => {
+            let output = run_observational(
+                "systemctl",
+                ["--user", "disable", "--now", SYSTEMD_UNIT],
+                "disable and stop the DeadReckon supervisor",
+            )?;
+            if !output.status.success() && !manager_reports_absent(&output) {
+                return Err(command_failure(
+                    "disable and stop the DeadReckon supervisor",
+                    &output,
+                ));
+            }
+        }
+    }
+    println!(
+        "supervisor service stopped\nunit retained: {}\nrestart: deadreckon supervisor start",
+        context.unit_path().display()
+    );
+    Ok(())
+}
+
+impl ServiceContext {
+    fn discover() -> Result<Self> {
+        let platform = detected_platform()?;
+        Self::discover_for_platform(platform)
+    }
+
+    fn discover_for_platform(platform: ServicePlatform) -> Result<Self> {
+        let binary = absolute_path(std::env::current_exe()?)?;
+        let paths = DeadreckonPaths::discover();
+        let deadreckon_home = absolute_path(paths.home().to_path_buf())?;
+        let user_home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                invalid_input(
+                    "HOME is required to install a per-user supervisor service".to_string(),
+                )
+            })
+            .and_then(absolute_path)?;
+        let path_env = std::env::var("PATH")
+            .map_err(|_| invalid_input("PATH must be valid UTF-8 for service installation"))?;
+        validate_service_value("PATH", &path_env)?;
+        Ok(Self {
+            platform,
+            binary,
+            deadreckon_home,
+            user_home,
+            path_env,
+        })
+    }
+
+    fn unit_path(&self) -> PathBuf {
+        match self.platform {
+            ServicePlatform::Launchd => self
+                .user_home
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{LAUNCHD_LABEL}.plist")),
+            ServicePlatform::Systemd => std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .unwrap_or_else(|| self.user_home.join(".config"))
+                .join("systemd")
+                .join("user")
+                .join(SYSTEMD_UNIT),
+        }
+    }
+
+    fn log_dir(&self) -> PathBuf {
+        self.deadreckon_home.join("logs")
+    }
+}
+
+fn detected_platform() -> Result<ServicePlatform> {
+    service_platform_for_os(std::env::consts::OS)
+}
+
+fn service_platform_for_os(target_os: &str) -> Result<ServicePlatform> {
+    match target_os {
+        "macos" => Ok(ServicePlatform::Launchd),
+        "linux" => Ok(ServicePlatform::Systemd),
+        _ => Err(invalid_input(
+            "per-user supervisor services are supported on macOS launchd and Linux systemd only"
+                .to_string(),
+        )),
+    }
+}
+
+fn machine_restart_posture(context: &ServiceContext) -> Result<MachineRestartPosture> {
+    let unit_path = context.unit_path();
+    match fs::read_to_string(&unit_path) {
+        Ok(existing) if !is_managed_unit(context.platform, &existing) => {
+            Ok(MachineRestartPosture::UnmanagedUnit)
+        }
+        Ok(existing) if existing == render_service(context)? => {
+            Ok(MachineRestartPosture::InstalledCurrent)
+        }
+        Ok(_) => Ok(MachineRestartPosture::StaleManagedUnit),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            Ok(MachineRestartPosture::NotInstalled)
+        }
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn service_instance_checkpoint_path(paths: &DeadreckonPaths) -> PathBuf {
+    paths
+        .home()
+        .join(SERVICE_INSTANCE_DIR)
+        .join(SERVICE_INSTANCE_FILE)
+}
+
+fn read_service_instance_checkpoint(path: &Path) -> Result<Option<ServiceInstanceCheckpoint>> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: path.to_path_buf(),
+                source,
+            })
+        }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let text = path_to_utf8("service path", &path)?;
+    validate_service_value("service path", text)?;
+    Ok(path)
+}
+
+fn render_service(context: &ServiceContext) -> Result<String> {
+    let binary = path_to_utf8("DeadReckon binary", &context.binary)?;
+    let home = path_to_utf8("DEADRECKON_HOME", &context.deadreckon_home)?;
+    let stdout = context.log_dir().join("supervisor-service.out");
+    let stderr = context.log_dir().join("supervisor-service.err");
+    let stdout = path_to_utf8("supervisor stdout log", &stdout)?;
+    let stderr = path_to_utf8("supervisor stderr log", &stderr)?;
+    for (name, value) in [
+        ("DeadReckon binary", binary),
+        ("DEADRECKON_HOME", home),
+        ("PATH", context.path_env.as_str()),
+        ("supervisor stdout log", stdout),
+        ("supervisor stderr log", stderr),
+    ] {
+        validate_service_value(name, value)?;
+    }
+
+    Ok(match context.platform {
+        ServicePlatform::Launchd => format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- {MANAGED_MARKER} -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{binary}</string>
+    <string>supervisor</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DEADRECKON_HOME</key>
+    <string>{home}</string>
+    <key>PATH</key>
+    <string>{path_env}</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>{stdout}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
+</dict>
+</plist>
+"#,
+            binary = xml_escape(binary),
+            home = xml_escape(home),
+            path_env = xml_escape(&context.path_env),
+            stdout = xml_escape(stdout),
+            stderr = xml_escape(stderr),
+        ),
+        ServicePlatform::Systemd => format!(
+            r#"# {MANAGED_MARKER}
+[Unit]
+Description=DeadReckon durable local job supervisor
+
+[Service]
+Type=simple
+ExecStart={} supervisor serve
+Environment={}
+Environment={}
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+StandardOutput={}
+StandardError={}
+
+[Install]
+WantedBy=default.target
+"#,
+            systemd_quote(binary),
+            systemd_quote(&format!("DEADRECKON_HOME={home}")),
+            systemd_quote(&format!("PATH={}", context.path_env)),
+            systemd_quote(&format!("append:{stdout}")),
+            systemd_quote(&format!("append:{stderr}")),
+        ),
+    })
+}
+
+fn install_rendered_unit(context: &ServiceContext, rendered: &str) -> Result<InstallDecision> {
+    let unit_path = context.unit_path();
+    let lock_path = unit_path.with_extension("deadreckon-install.lock");
+    let _lock = InstallLock::acquire(lock_path)?;
+    let existing = match fs::read_to_string(&unit_path) {
+        Ok(existing) => Some(existing),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => return Err(source.into()),
+    };
+    let decision = decide_install(context.platform, existing.as_deref(), rendered);
+    match decision {
+        InstallDecision::Create | InstallDecision::ReplaceManaged => {
+            write_unit_atomically(&unit_path, rendered.as_bytes())?;
+        }
+        InstallDecision::Unchanged => {}
+        InstallDecision::RefuseUnmanaged => return Err(unmanaged_conflict_error(&unit_path)),
+    }
+    Ok(decision)
+}
+
+fn decide_install(
+    platform: ServicePlatform,
+    existing: Option<&str>,
+    expected: &str,
+) -> InstallDecision {
+    match existing {
+        None => InstallDecision::Create,
+        Some(existing) if existing == expected => InstallDecision::Unchanged,
+        Some(existing) if is_managed_unit(platform, existing) => InstallDecision::ReplaceManaged,
+        Some(_) => InstallDecision::RefuseUnmanaged,
+    }
+}
+
+fn is_managed_unit(platform: ServicePlatform, existing: &str) -> bool {
+    match platform {
+        ServicePlatform::Launchd => existing.starts_with(&format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- {MANAGED_MARKER} -->\n"
+        )),
+        ServicePlatform::Systemd => existing.starts_with(&format!("# {MANAGED_MARKER}\n")),
+    }
+}
+
+fn require_current_managed_unit(context: &ServiceContext) -> Result<()> {
+    let unit_path = context.unit_path();
+    let existing = fs::read_to_string(&unit_path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            invalid_input(format!(
+                "supervisor service is not installed at {}; run `deadreckon supervisor install`",
+                unit_path.display()
+            ))
+        } else {
+            CliError::Io(source)
+        }
+    })?;
+    if !is_managed_unit(context.platform, &existing) {
+        return Err(unmanaged_conflict_error(&unit_path));
+    }
+    let expected = render_service(context)?;
+    if existing != expected {
+        return Err(invalid_input(format!(
+            "installed supervisor service is stale; run `deadreckon supervisor install` to pin {} and {}",
+            context.binary.display(),
+            context.deadreckon_home.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_any_managed_unit(context: &ServiceContext) -> Result<bool> {
+    let unit_path = context.unit_path();
+    match fs::read_to_string(&unit_path) {
+        Ok(existing) if is_managed_unit(context.platform, &existing) => Ok(true),
+        Ok(_) => Err(unmanaged_conflict_error(&unit_path)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn launchd_start(context: &ServiceContext) -> Result<()> {
+    let domain = launchd_domain()?;
+    let target = format!("{domain}/{LAUNCHD_LABEL}");
+    run_required(
+        "launchctl",
+        ["enable", target.as_str()],
+        "enable the DeadReckon supervisor",
+    )?;
+    if command_succeeds("launchctl", ["print", target.as_str()])? {
+        run_required(
+            "launchctl",
+            ["bootout", target.as_str()],
+            "reload the current DeadReckon supervisor unit",
+        )?;
+    }
+    let unit_path = context.unit_path();
+    let unit = path_to_utf8("launchd unit", &unit_path)?;
+    run_required(
+        "launchctl",
+        ["bootstrap", domain.as_str(), unit],
+        "load and start the DeadReckon supervisor",
+    )
+}
+
+fn launchd_domain() -> Result<String> {
+    let output = run_observational("id", ["-u"], "resolve the current user id")?;
+    if !output.status.success() {
+        return Err(command_failure("resolve the current user id", &output));
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if uid.is_empty() || !uid.chars().all(|character| character.is_ascii_digit()) {
+        return Err(invalid_input(format!(
+            "`id -u` returned an invalid user id: {uid:?}"
+        )));
+    }
+    Ok(format!("gui/{uid}"))
+}
+
+fn command_succeeds<I, S>(program: &str, args: I) -> Result<bool>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Ok(Command::new(program).args(args).output()?.status.success())
+}
+
+fn run_required<I, S>(program: &str, args: I, action: &str) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|source| {
+            invalid_input(format!(
+                "could not {action}: {source}; this command requires the per-user service manager"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(command_failure(action, &output));
+    }
+    Ok(())
+}
+
+fn run_observational<I, S>(program: &str, args: I, action: &str) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(program).args(args).output().map_err(|source| {
+        invalid_input(format!(
+            "could not {action}: {source}; this command requires the per-user service manager"
+        ))
+    })
+}
+
+fn output_label(output: &Output, fallback: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let label = stdout.trim();
+    if label.is_empty() {
+        fallback.to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+fn manager_reports_absent(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("not loaded")
+        || stderr.contains("not found")
+        || stderr.contains("does not exist")
+}
+
+fn refuse_unavailable_manager(action: &str, output: &Output) -> Result<()> {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("failed to connect")
+        || stderr.contains("cannot connect")
+        || stderr.contains("no medium found")
+    {
+        return Err(command_failure(action, output));
+    }
+    Ok(())
+}
+
+fn command_failure(action: &str, output: &Output) -> CliError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if !stderr.trim().is_empty() {
+        stderr.trim()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim()
+    } else {
+        "service manager returned no diagnostic"
+    };
+    invalid_input(format!(
+        "could not {action} (exit {}): {detail}",
+        output.status
+    ))
+}
+
+fn write_unit_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| invalid_input(format!("invalid service unit path: {}", path.display())))?;
+    let temp_path = path.with_file_name(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let _cleanup = TempPathCleanup(temp_path.clone());
+    let mut temp = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)?;
+    temp.write_all(contents)?;
+    temp.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o644))?;
+    }
+    fs::rename(&temp_path, path)?;
+    Ok(())
+}
+
+struct TempPathCleanup(PathBuf);
+
+impl Drop for TempPathCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+struct InstallLock {
+    path: PathBuf,
+}
+
+impl InstallLock {
+    fn acquire(path: PathBuf) -> Result<Self> {
+        match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(mut file) => {
+                writeln!(
+                    file,
+                    "pid={} started_by=deadreckon-supervisor-install",
+                    std::process::id()
+                )?;
+                Ok(Self { path })
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(invalid_input(format!(
+                    "another supervisor service installation holds {}; retry after it finishes",
+                    path.display()
+                )))
+            }
+            Err(source) => Err(source.into()),
+        }
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn unmanaged_conflict_error(path: &Path) -> CliError {
+    invalid_input(format!(
+        "refusing to overwrite or control unmanaged service unit {}; move it aside or remove it after inspection, then retry",
+        path.display()
+    ))
+}
+
+fn invalid_input(message: impl Into<String>) -> CliError {
+    CliError::Core(DeadreckonError::InvalidInput(message.into()))
+}
+
+fn path_to_utf8<'a>(name: &str, path: &'a Path) -> Result<&'a str> {
+    path.to_str()
+        .ok_or_else(|| invalid_input(format!("{name} must be valid UTF-8: {}", path.display())))
+}
+
+fn validate_service_value(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(invalid_input(format!("{name} cannot be empty")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(invalid_input(format!(
+            "{name} cannot contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn systemd_quote(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+    use deadreckon_core::{JobView, append_job_event, write_job};
+    use deadreckon_protocol::{
+        Job, JobEvent, JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion,
+        JobShape, SemanticJudgeMode,
+    };
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn context(platform: ServicePlatform) -> ServiceContext {
+        ServiceContext {
+            platform,
+            binary: PathBuf::from("/opt/Dead Reckon/bin/deadreckon"),
+            deadreckon_home: PathBuf::from("/Users/test/Dead Reckon State"),
+            user_home: PathBuf::from("/Users/test"),
+            path_env: "/opt/Agent CLIs/bin:/usr/bin:/bin".to_string(),
+        }
+    }
+
+    #[test]
+    fn macos_launch_agent_is_restart_capable_and_path_safe() {
+        let rendered =
+            render_service(&context(ServicePlatform::Launchd)).expect("render launchd service");
+        assert!(rendered.starts_with("<?xml version=\"1.0\""));
+        assert!(rendered.contains(MANAGED_MARKER));
+        assert!(rendered.contains("<string>/opt/Dead Reckon/bin/deadreckon</string>"));
+        assert!(rendered.contains("<string>/Users/test/Dead Reckon State</string>"));
+        assert!(rendered.contains("<string>supervisor</string>"));
+        assert!(rendered.contains("<string>serve</string>"));
+        assert!(rendered.contains("<key>KeepAlive</key>\n  <true/>"));
+        assert!(is_managed_unit(ServicePlatform::Launchd, &rendered));
+    }
+
+    #[test]
+    fn supervisor_service_lifecycle_is_discoverable_from_cli_help() {
+        let handle = std::thread::Builder::new()
+            .name("supervisor-service-clap-tree".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(assert_supervisor_service_lifecycle_is_discoverable_from_cli_help)
+            .expect("spawn clap command tree test");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn assert_supervisor_service_lifecycle_is_discoverable_from_cli_help() {
+        let mut command = crate::cli::Cli::command();
+        let supervisor = command
+            .find_subcommand_mut("supervisor")
+            .expect("supervisor subcommand");
+        assert!(!supervisor.is_hide_set());
+        let help = supervisor.render_long_help().to_string();
+        for operation in ["install", "start", "status", "stop"] {
+            assert!(
+                help.contains(operation),
+                "missing {operation} from:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_user_unit_is_restart_capable_and_path_safe() {
+        let rendered =
+            render_service(&context(ServicePlatform::Systemd)).expect("render systemd service");
+        assert!(rendered.starts_with(&format!("# {MANAGED_MARKER}\n")));
+        assert!(
+            rendered.contains("ExecStart=\"/opt/Dead Reckon/bin/deadreckon\" supervisor serve")
+        );
+        assert!(rendered.contains("Environment=\"DEADRECKON_HOME=/Users/test/Dead Reckon State\""));
+        assert!(rendered.contains(
+            "StandardOutput=\"append:/Users/test/Dead Reckon State/logs/supervisor-service.out\""
+        ));
+        assert!(rendered.contains("Restart=always"));
+        assert!(rendered.contains("KillMode=control-group"));
+        assert!(is_managed_unit(ServicePlatform::Systemd, &rendered));
+    }
+
+    #[test]
+    fn install_decision_is_idempotent_and_managed_updates_are_explicit() {
+        let expected =
+            render_service(&context(ServicePlatform::Systemd)).expect("render systemd service");
+        assert_eq!(
+            decide_install(ServicePlatform::Systemd, None, &expected),
+            InstallDecision::Create
+        );
+        assert_eq!(
+            decide_install(ServicePlatform::Systemd, Some(&expected), &expected),
+            InstallDecision::Unchanged
+        );
+        let stale = format!("# {MANAGED_MARKER}\nold managed content\n");
+        assert_eq!(
+            decide_install(ServicePlatform::Systemd, Some(&stale), &expected),
+            InstallDecision::ReplaceManaged
+        );
+    }
+
+    #[test]
+    fn unmanaged_units_are_never_selected_for_replacement() {
+        let expected =
+            render_service(&context(ServicePlatform::Launchd)).expect("render launchd service");
+        let foreign = "<?xml version=\"1.0\"?><plist><dict/></plist>";
+        assert_eq!(
+            decide_install(ServicePlatform::Launchd, Some(foreign), &expected),
+            InstallDecision::RefuseUnmanaged
+        );
+    }
+
+    #[test]
+    fn render_escapes_service_syntax_metacharacters() {
+        let mut launchd = context(ServicePlatform::Launchd);
+        launchd.path_env = "/opt/a&b/<cli>:/bin".to_string();
+        let plist = render_service(&launchd).expect("escaped plist");
+        assert!(plist.contains("/opt/a&amp;b/&lt;cli&gt;:/bin"));
+
+        let mut systemd = context(ServicePlatform::Systemd);
+        systemd.path_env = "/opt/100%/a\"b:/bin".to_string();
+        let unit = render_service(&systemd).expect("escaped unit");
+        assert!(unit.contains("PATH=/opt/100%%/a\\\"b:/bin"));
+    }
+
+    #[test]
+    fn render_rejects_control_character_injection() {
+        let mut malicious = context(ServicePlatform::Systemd);
+        malicious.path_env = "/usr/bin\nExecStart=/tmp/foreign".to_string();
+        let error = render_service(&malicious).expect_err("newline must be rejected");
+        assert!(error.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn unsupported_platform_never_claims_machine_restart_durability() {
+        for target_os in ["windows", "freebsd", "unknown"] {
+            let error =
+                service_platform_for_os(target_os).expect_err("unsupported service platform");
+            assert!(
+                error
+                    .to_string()
+                    .contains("supported on macOS launchd and Linux systemd only"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            service_platform_for_os("macos").expect("macOS"),
+            ServicePlatform::Launchd
+        );
+        assert_eq!(
+            service_platform_for_os("linux").expect("Linux"),
+            ServicePlatform::Systemd
+        );
+    }
+
+    #[test]
+    fn unit_posture_never_claims_runtime_service_state() {
+        let configured = machine_restart_posture_label(MachineRestartPosture::InstalledCurrent);
+        assert!(configured.contains("configured by the current service unit"));
+        assert!(configured.contains("runtime state is reported"));
+        assert!(!configured.contains("loaded"));
+        assert!(!configured.contains("active"));
+
+        for posture in [
+            MachineRestartPosture::NotInstalled,
+            MachineRestartPosture::StaleManagedUnit,
+            MachineRestartPosture::UnmanagedUnit,
+            MachineRestartPosture::Unsupported,
+        ] {
+            let label = machine_restart_posture_label(posture);
+            assert!(
+                label.contains("not configured") || label.contains("unsupported"),
+                "{posture:?}: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn lazy_per_job_supervisors_coexist_with_the_installed_service() {
+        assert!(!supervisor_requires_service_singleton(true, Some("job-1")));
+        assert!(supervisor_requires_service_singleton(true, None));
+        assert!(supervisor_requires_service_singleton(false, Some("job-1")));
+        assert!(supervisor_requires_service_singleton(false, None));
+    }
+
+    #[test]
+    fn uninstalled_service_posture_never_claims_machine_restart_durability() {
+        let temp = TempDir::new().expect("tempdir");
+        let context = ServiceContext {
+            platform: ServicePlatform::Systemd,
+            binary: temp.path().join("deadreckon"),
+            deadreckon_home: temp.path().join("state"),
+            user_home: temp.path().join("user"),
+            path_env: "/usr/bin:/bin".to_string(),
+        };
+        assert_eq!(
+            machine_restart_posture(&context).expect("posture"),
+            MachineRestartPosture::NotInstalled
+        );
+    }
+
+    #[test]
+    fn service_posture_distinguishes_unmanaged_stale_and_current_units() {
+        let temp = TempDir::new().expect("tempdir");
+        let context = ServiceContext {
+            platform: ServicePlatform::Systemd,
+            binary: temp.path().join("deadreckon"),
+            deadreckon_home: temp.path().join("state"),
+            user_home: temp.path().join("user"),
+            path_env: "/usr/bin:/bin".to_string(),
+        };
+        let unit_path = context.unit_path();
+        fs::create_dir_all(unit_path.parent().expect("unit parent")).expect("unit dir");
+
+        fs::write(&unit_path, "[Unit]\nDescription=someone else\n").expect("foreign unit");
+        assert_eq!(
+            machine_restart_posture(&context).expect("unmanaged posture"),
+            MachineRestartPosture::UnmanagedUnit
+        );
+
+        fs::write(&unit_path, format!("# {MANAGED_MARKER}\nold settings\n"))
+            .expect("stale managed unit");
+        assert_eq!(
+            machine_restart_posture(&context).expect("stale posture"),
+            MachineRestartPosture::StaleManagedUnit
+        );
+
+        fs::write(&unit_path, render_service(&context).expect("current unit"))
+            .expect("current managed unit");
+        assert_eq!(
+            machine_restart_posture(&context).expect("current posture"),
+            MachineRestartPosture::InstalledCurrent
+        );
+    }
+
+    #[test]
+    fn service_singleton_is_nonblocking_and_replacement_gets_a_new_checkpoint() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("state"));
+        let binary = temp.path().join("bin").join("deadreckon");
+        let first = acquire_supervisor_service_guard(&paths, "service-a", "boot-a", &binary)
+            .expect("first service");
+        assert_eq!(first.checkpoint.generation, 1);
+        assert_eq!(first.checkpoint.instance_id, "service-a");
+
+        let error = acquire_supervisor_service_guard(&paths, "service-b", "boot-a", &binary)
+            .expect_err("live singleton must refuse immediately");
+        assert!(matches!(
+            error,
+            CliError::Core(DeadreckonError::LockHeld { .. })
+        ));
+
+        // Dropping the process-held file lock simulates the old service no
+        // longer running. Its durable checkpoint remains for the successor.
+        drop(first);
+        let replacement = acquire_supervisor_service_guard(&paths, "service-b", "boot-b", &binary)
+            .expect("replacement service");
+        assert_eq!(replacement.checkpoint.generation, 2);
+        assert_eq!(replacement.checkpoint.instance_id, "service-b");
+        assert_eq!(replacement.checkpoint.boot_id, "boot-b");
+        assert_eq!(replacement.checkpoint.deadreckon_home, paths.home());
+        assert_eq!(
+            read_service_instance_checkpoint(&service_instance_checkpoint_path(&paths))
+                .expect("checkpoint read")
+                .expect("checkpoint"),
+            replacement.checkpoint
+        );
+    }
+
+    #[test]
+    fn service_restart_resumes_same_job_workspace_budget_and_attempt() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("state"));
+        let workspace = temp.path().join("isolated-workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(workspace.join("progress.txt"), "durable work\n").expect("workspace progress");
+        let job_id = JobId("service-restart-job".to_string());
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            scope: "service-restart-scope".to_string(),
+            goal: "survive a service replacement".to_string(),
+            shape: JobShape::Single,
+            created_at: Utc::now(),
+            source_cwd: workspace.clone(),
+            launch_plan_sha256: "sha256:launch".to_string(),
+            authority_sha256: "sha256:authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 2.75,
+                max_wall_seconds: 180,
+                max_attempts: 4,
+                deadline: None,
+                semantic_judge: SemanticJudgeMode::Required,
+            },
+        };
+        write_job(&paths, &job).expect("job");
+        for (index, (kind, lease_epoch, detail)) in [
+            (JobEventKind::Created, 0, json!({})),
+            (JobEventKind::Queued, 0, json!({})),
+            (
+                JobEventKind::LeaseAcquired,
+                1,
+                json!({ "owner_id": "service-a" }),
+            ),
+            (
+                JobEventKind::AttemptStarted,
+                1,
+                json!({
+                    "attempt": 1,
+                    "max_spend_usd": 2.75,
+                    "max_wall_seconds": 180,
+                }),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            append_job_event(
+                &paths,
+                &JobEvent {
+                    schema_version: JobSchemaVersion::CURRENT,
+                    job_id: job_id.clone(),
+                    sequence: JobEventSequence::new(index as u64 + 1).expect("sequence"),
+                    event_id: format!("restart-{index}"),
+                    causation_id: format!("restart-{index}"),
+                    timestamp: Utc::now(),
+                    lease_epoch,
+                    kind,
+                    detail,
+                },
+            )
+            .expect("job event");
+        }
+        let history_before = fs::read(paths.job_events(job_id.as_ref())).expect("history bytes");
+        let first = acquire_supervisor_service_guard(
+            &paths,
+            "service-a",
+            "boot-a",
+            Path::new("/opt/deadreckon-a"),
+        )
+        .expect("first service");
+        let view_before = JobView::load(&paths, job_id.as_ref()).expect("job before restart");
+        drop(first);
+
+        let replacement = acquire_supervisor_service_guard(
+            &paths,
+            "service-b",
+            "boot-b",
+            Path::new("/opt/deadreckon-b"),
+        )
+        .expect("replacement service");
+        let view_after = JobView::load(&paths, job_id.as_ref()).expect("job after restart");
+
+        assert_eq!(replacement.checkpoint.generation, 2);
+        assert_eq!(view_after.job, view_before.job);
+        assert_eq!(view_after.job.job_id, job_id);
+        assert_eq!(view_after.job.source_cwd, workspace);
+        assert_eq!(view_after.job.policy.max_spend_usd, 2.75);
+        assert_eq!(view_after.job.policy.max_wall_seconds, 180);
+        assert_eq!(view_after.job.policy.max_attempts, 4);
+        assert_eq!(view_after.projection.attempt_count, 1);
+        assert_eq!(view_after.projection.last_sequence, 4);
+        assert_eq!(
+            fs::read_to_string(view_after.job.source_cwd.join("progress.txt"))
+                .expect("workspace survives"),
+            "durable work\n"
+        );
+        assert_eq!(
+            fs::read(paths.job_events(job_id.as_ref())).expect("history after restart"),
+            history_before,
+            "service replacement must not rewrite lifecycle truth"
+        );
+    }
+}

@@ -9,14 +9,18 @@ pub mod campaign;
 pub mod cancel;
 pub mod chain;
 pub mod codebase;
+pub mod completion;
 pub mod docs;
 pub mod error;
 pub mod events;
+pub mod exec;
 pub mod flight;
 pub mod gate;
 pub mod git;
 pub mod glossary;
 pub mod install_receipt;
+pub mod job;
+pub mod job_lease;
 pub mod learning;
 pub mod ledger_io;
 pub mod lock;
@@ -32,8 +36,8 @@ pub mod update_cache;
 
 pub use artifacts::{
     DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, append_provenance, append_spend,
-    append_trace, copy_tree, diff_snapshots, inventory_files, restore_snapshot, snapshot_diff,
-    snapshot_working,
+    append_trace, copy_tree, diff_snapshots, diff_working_trees, inventory_files, restore_snapshot,
+    snapshot_diff, snapshot_working,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -52,6 +56,9 @@ pub use codebase::{
     prepare_worktree_record, preview_git_state, read_codebase_record, record_for_resolved_mode,
     resolve_mode, user_error, write_codebase_record,
 };
+pub use completion::{
+    SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
+};
 pub use docs::{
     AS_BUILT_DELTA, DOCS_DIR, DocKind, DocsStatus, FileChange, FrontmatterFields,
     IMPLEMENTATION_NOTES_HTML, INCREMENTAL_JSONL, ImplementationNotesStatus, POLISH_JSON,
@@ -68,18 +75,38 @@ pub use docs::{
 };
 pub use error::{DeadreckonError, Result, is_retryable_io_kind};
 pub use events::{RUN_EVENTS_JSONL, RunEventBus, emit_event, event_preview};
+#[cfg(unix)]
+pub use exec::ProcessGroupTerminator;
+pub use exec::{
+    ChildTerminator, HeadTailBuffer, RawPidTerminator, SupervisedProcess, TerminationOutcome,
+    TruncationPolicy, read_supervised_process, spawn_grouped, write_supervised_process,
+};
 pub use gate::{
-    ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceMarker,
-    AcceptanceProgressEntry, AcceptanceSpec, acceptance_progress_path_for_run_root,
-    acceptance_spec_path_for_run_root, evaluate_acceptance, evaluate_acceptance_checks,
-    evaluate_acceptance_checks_with_progress, gate_nonce_path_for_run_root,
-    marker_path_for_run_root, validate_acceptance_marker, write_acceptance_marker,
-    write_acceptance_marker_with_results,
+    ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceContainment,
+    AcceptanceMarker, AcceptanceProgressEntry, AcceptanceProofKind, AcceptanceSignatureStrength,
+    AcceptanceSpec, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
+    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, create_gate_key,
+    decode_gate_key, encode_gate_key, evaluate_acceptance, evaluate_acceptance_checks,
+    evaluate_acceptance_checks_with_progress, gate_key_path, gate_key_path_for_run_root,
+    gate_nonce_path_for_run_root, marker_path_for_run_root, read_gate_key,
+    read_gate_key_for_run_root, validate_acceptance_marker, verify_v2_marker_signature,
+    write_acceptance_marker, write_acceptance_marker_with_results, write_gate_key,
+    write_native_acceptance_marker_with_results_and_key,
 };
 pub use glossary::{
     NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,
     chain_step_status_label, phase_status_label, plan_status_label, plan_task_status_label,
     run_status_label, status_label,
+};
+pub use job::{
+    JOB_CONTROL_LOCK, JOB_EVENTS_JSONL, JOB_JSON, JOB_PROJECTION_JSON, JobHistory, JobProjection,
+    JobView, LegacyJobKind, LegacyJobView, append_job_event, legacy_campaign_job_view,
+    legacy_chain_job_view, legacy_plan_job_view, legacy_run_job_view, load_job,
+    load_job_projection, read_job_history, rebuild_job_projection, reduce_job_history, write_job,
+};
+pub use job_lease::{
+    LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, LeaseToken,
+    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,

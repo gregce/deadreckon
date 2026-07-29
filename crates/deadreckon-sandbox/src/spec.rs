@@ -6,6 +6,25 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::SandboxBackend;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkspaceAccess {
+    /// Ordinary coding-agent posture: the workspace is a writable work area.
+    #[default]
+    ReadWrite,
+    /// Independent verification posture: the workspace may be inspected but
+    /// must not be mutated by the provider or its tools.
+    ReadOnly,
+}
+
+impl WorkspaceAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadWrite => "read-write",
+            Self::ReadOnly => "read-only",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     pub backend: SandboxBackend,
@@ -23,4 +42,5 @@ pub struct SandboxSpec {
     pub read_denylist: Vec<PathBuf>,
     pub write_denylist: Vec<PathBuf>,
     pub network_allowlist: Vec<String>,
+    pub workspace_access: WorkspaceAccess,
 }

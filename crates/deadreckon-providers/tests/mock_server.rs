@@ -11,6 +11,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use deadreckon_providers::{
     ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRequest, ProviderRouter,
+    WorkspaceAccess,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -71,6 +72,7 @@ async fn mock_provider_records_three_turns() {
                 cwd: None,
                 output_path: None,
                 sandbox_backend: None,
+                workspace_access: WorkspaceAccess::ReadWrite,
                 pid_file: None,
                 cancellation_token: None,
                 session_dir: None,
@@ -125,6 +127,7 @@ async fn mock_provider_supports_error_fixture() {
             cwd: None,
             output_path: None,
             sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
             pid_file: None,
             cancellation_token: None,
             session_dir: None,

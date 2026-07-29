@@ -13,6 +13,7 @@ use walkdir::WalkDir;
 use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
 use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::gate::create_gate_key;
 use crate::paths::{DeadreckonPaths, source_root, task_key, workspace_scope};
 use deadreckon_protocol::SpendRecord;
 
@@ -206,8 +207,7 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
     fs::create_dir_all(run_root.join("snapshots")).with_path(run_root.join("snapshots"))?;
     let gate_dir = run_root.join("gate");
     fs::create_dir_all(&gate_dir).with_path(&gate_dir)?;
-    fs::write(gate_dir.join("nonce"), Uuid::new_v4().simple().to_string())
-        .with_path(gate_dir.join("nonce"))?;
+    create_gate_key(paths, &run_id)?;
 
     // AS-BUILT §3: the binary owns deterministic paths while the skill stays a
     // markdown subprocess boundary. User skills (<home>/skills) win over the

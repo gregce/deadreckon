@@ -749,6 +749,11 @@ pub(crate) enum Commands {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
     },
+    #[command(about = "Run and manage the durable local job supervisor")]
+    Supervisor {
+        #[command(subcommand)]
+        command: SupervisorCommand,
+    },
     #[command(
         next_help_heading = "Run Lifecycle",
         about = "Start an unattended coding run",
@@ -757,6 +762,13 @@ pub(crate) enum Commands {
     Run {
         #[arg(help = "Natural-language coding goal, or @path/to/goal.md")]
         goal: Option<String>,
+        #[arg(
+            long,
+            hide = true,
+            value_name = "JOB_ID",
+            help = "Use the durable job id as the root run id (trusted supervisor only)"
+        )]
+        run_id: Option<String>,
         #[arg(
             long,
             hide = true,
@@ -2545,8 +2557,38 @@ pub(crate) enum LibraryCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum SupervisorCommand {
+    #[command(about = "Claim and supervise queued local jobs")]
+    Serve {
+        #[arg(long, help = "Scan once, supervise eligible work, then exit")]
+        once: bool,
+        #[arg(value_name = "JOB_ID", help = "Supervise only this exact job id")]
+        job_id: Option<String>,
+    },
+    #[command(hide = true)]
+    Drive {
+        #[arg(value_name = "JOB_ID")]
+        job_id: String,
+    },
+    #[command(hide = true)]
+    Resume {
+        #[arg(value_name = "JOB_ID")]
+        job_id: String,
+    },
+    #[command(about = "Install or update the per-user supervisor service")]
+    Install,
+    #[command(about = "Enable and start the installed per-user supervisor service")]
+    Start,
+    #[command(about = "Show the installed per-user supervisor service state")]
+    Status,
+    #[command(about = "Disable and stop the per-user supervisor service")]
+    Stop,
+}
+
 pub(crate) struct RunCommandArgs {
     pub(crate) goal: String,
+    pub(crate) run_id: Option<String>,
     /// A retry judges tamper against its node's FIRST attempt's snapshot, so
     /// files edited in an earlier attempt to game the gate stay visible.
     pub(crate) tamper_baseline: Option<PathBuf>,

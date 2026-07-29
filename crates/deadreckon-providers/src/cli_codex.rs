@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use deadreckon_sandbox::SandboxBackend;
+use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 use serde_json::json;
 use which::which;
 
@@ -69,10 +69,14 @@ impl CliCodexProvider {
         if resume_id.is_none() {
             args.extend([
                 "--sandbox".to_string(),
-                codex_sandbox_mode(request.sandbox_backend).to_string(),
+                codex_sandbox_mode(request.sandbox_backend, request.workspace_access).to_string(),
             ]);
         }
-        args.extend(self.extra_args.clone());
+        if request.workspace_access == WorkspaceAccess::ReadOnly {
+            args.extend(read_only_safe_extra_args(&self.extra_args));
+        } else {
+            args.extend(self.extra_args.clone());
+        }
         if caps.json {
             args.push("--json".to_string());
         }
@@ -110,6 +114,8 @@ impl CliCodexProvider {
             request.sandbox_backend,
             request.pid_file.clone(),
             request.cancellation_token.clone(),
+            request.workspace_access,
+            true,
         )
         .await?;
         Ok(CodexAttempt { output, args })
@@ -117,7 +123,9 @@ impl CliCodexProvider {
 
     pub(crate) async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let caps = probe_codex_capabilities(&self.binary);
-        let session_dir = request.session_dir.clone();
+        let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
+            .then(|| request.session_dir.clone())
+            .flatten();
         let session = session_dir
             .as_deref()
             .and_then(|dir| ProviderSession::read(dir, PROVIDER_ID_CODEX));
@@ -222,6 +230,7 @@ impl CliCodexProvider {
             "duration_ms": (wall_time_seconds * 1000.0).round() as u64,
             "exit_code": output.status_code,
             "pid": output.pid,
+            "workspace_access": request.workspace_access.as_str(),
             "sandbox_backend": output.sandbox_backend,
             "sandbox_warning": output.sandbox_warning,
             "contract": {
@@ -333,7 +342,13 @@ impl Provider for CliCodexProvider {
     }
 }
 
-fn codex_sandbox_mode(outer_backend: Option<SandboxBackend>) -> &'static str {
+fn codex_sandbox_mode(
+    outer_backend: Option<SandboxBackend>,
+    workspace_access: WorkspaceAccess,
+) -> &'static str {
+    if workspace_access == WorkspaceAccess::ReadOnly {
+        return "read-only";
+    }
     match outer_backend {
         Some(SandboxBackend::None) | None => "workspace-write",
         Some(
@@ -345,6 +360,31 @@ fn codex_sandbox_mode(outer_backend: Option<SandboxBackend>) -> &'static str {
     }
 }
 
+fn read_only_safe_extra_args(extra_args: &[String]) -> Vec<String> {
+    let mut safe = Vec::with_capacity(extra_args.len());
+    let mut skip_next = false;
+    for arg in extra_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--sandbox" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--sandbox=")
+            || matches!(
+                arg.as_str(),
+                "--dangerously-bypass-approvals-and-sandbox" | "--yolo"
+            )
+        {
+            continue;
+        }
+        safe.push(arg.clone());
+    }
+    safe
+}
+
 trait WithWallTime {
     fn with_wall_time(self, seconds: f64) -> Self;
 }
@@ -352,5 +392,22 @@ impl WithWallTime for SpendEstimate {
     fn with_wall_time(mut self, seconds: f64) -> Self {
         self.wall_time_seconds = Some(seconds);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_only_safe_extra_args;
+
+    #[test]
+    fn read_only_codex_strips_configured_sandbox_bypasses() {
+        let safe = read_only_safe_extra_args(&[
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+            "--sandbox=danger-full-access".to_string(),
+            "--yolo".to_string(),
+            "--json".to_string(),
+        ]);
+        assert_eq!(safe, vec!["--json"]);
     }
 }
