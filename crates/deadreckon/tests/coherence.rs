@@ -732,12 +732,9 @@ fn top_help_uses_canonical_discovery_words() {
     }
     assert!(top.contains("Production flow"), "{top}");
     assert!(top.contains("Start, watch, keep"), "{top}");
-    assert!(
-        top.contains("watch and understand a run, chain, or plan"),
-        "{top}"
-    );
+    assert!(top.contains("watch a durable Job or legacy work"), "{top}");
     assert!(top.contains("stop a run, chain, or plan"), "{top}");
-    assert!(top.contains("find runs and plans"), "{top}");
+    assert!(top.contains("find Jobs and legacy work"), "{top}");
     assert!(
         top.contains("show every command, including advanced commands"),
         "{top}"
@@ -751,9 +748,7 @@ fn top_help_uses_canonical_discovery_words() {
         "plan-facing help should not say jobs:\n{top}"
     );
     assert!(
-        top.contains(
-            "Run, chain, and plan ids accept unique prefixes where that command accepts the kind."
-        ),
+        top.contains("Job, run, chain, plan, and campaign ids accept unique prefixes where that command accepts the kind."),
         "{top}"
     );
 }
@@ -767,7 +762,7 @@ fn help_all_keeps_aliases_inline() {
     assert!(all.contains("run"), "{all}");
     assert!(all.contains("orchestrate"), "{all}");
     assert!(all.contains("chain"), "{all}");
-    assert!(all.contains("find runs and plans"), "{all}");
+    assert!(all.contains("find Jobs and legacy work"), "{all}");
     assert!(
         all.contains("copy a completed fresh/copy run (alias: materialize)"),
         "{all}"
@@ -783,6 +778,83 @@ fn help_all_keeps_aliases_inline() {
 }
 
 #[test]
+fn ordinary_lifecycle_help_names_durable_jobs_and_their_real_commands() {
+    let orchestrate = help(["orchestrate", "--help"]);
+    for phrase in [
+        "durable multi-agent Job",
+        "durable Graph Job",
+        "deadreckon attach <job-id>",
+        "deadreckon status <job-id>",
+        "deadreckon finish <job-id>",
+    ] {
+        assert!(
+            orchestrate.contains(phrase),
+            "missing `{phrase}`:\n{orchestrate}"
+        );
+    }
+    assert!(
+        !orchestrate.contains("deadreckon merge <plan-id>"),
+        "ordinary orchestration owns its internal merge:\n{orchestrate}"
+    );
+
+    let status = help(["status", "--help"]);
+    assert!(
+        status.contains("deadreckon status [OPTIONS] [ID]"),
+        "{status}"
+    );
+    assert!(status.contains("latest durable Job"), "{status}");
+    assert!(
+        status.contains("Optional Job, run, plan, chain, or campaign id"),
+        "{status}"
+    );
+
+    let attach = help(["attach", "--help"]);
+    assert!(
+        attach.contains("deadreckon attach [OPTIONS] <ID>"),
+        "{attach}"
+    );
+    assert!(attach.contains("Watch a durable Job"), "{attach}");
+    assert!(
+        attach.contains("Job id, run id, chain id, plan id, campaign id"),
+        "{attach}"
+    );
+
+    let list = help(["list", "--help"]);
+    assert!(list.contains("Show durable Jobs and legacy work"), "{list}");
+    assert!(
+        list.contains("durable Jobs alongside legacy runs, plans, and chains"),
+        "{list}"
+    );
+
+    let finish = help(["finish", "--help"]);
+    assert!(
+        finish.contains("deadreckon finish [OPTIONS] [ID]"),
+        "{finish}"
+    );
+    assert!(finish.contains("Deliver a verified Job"), "{finish}");
+    assert!(
+        finish.contains("Job id, run id, plan id, chain id"),
+        "{finish}"
+    );
+    assert!(
+        finish.contains("verified Job -> validate its two-key receipt"),
+        "{finish}"
+    );
+
+    let report = help(["report", "--help"]);
+    assert!(
+        report.contains("deadreckon report [OPTIONS] <ID>"),
+        "{report}"
+    );
+    assert!(report.contains("durable Job or legacy run"), "{report}");
+    assert!(report.contains("Job id, run id, plan-child id"), "{report}");
+    assert!(
+        report.contains("machine-readable Job report or legacy RunView"),
+        "{report}"
+    );
+}
+
+#[test]
 fn command_help_prefers_status_finish_export_and_cleanup() {
     let run = help(["run", "--help"]);
     assert!(run.contains("deadreckon status latest"), "{run}");
@@ -793,6 +865,7 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
 
     let attach = help(["attach", "--help"]);
     assert!(attach.contains("deadreckon status latest"), "{attach}");
+    assert!(attach.contains("deadreckon attach <job-id>"), "{attach}");
     assert!(attach.contains("deadreckon attach <chain-id>"), "{attach}");
     assert!(attach.contains("deadreckon attach <plan-id>"), "{attach}");
     assert!(
@@ -800,7 +873,7 @@ fn command_help_prefers_status_finish_export_and_cleanup() {
         "{attach}"
     );
     assert!(
-        attach.contains("Attach opens the live TUI for a run, chain, or plan."),
+        attach.contains("Attach watches a durable Job or a legacy run, chain, plan, or campaign."),
         "{attach}"
     );
     assert!(
@@ -1045,10 +1118,10 @@ fn orchestration_help_uses_plan_child_provider_language() {
         (["merge", "--help"], "merge"),
     ] {
         let out = help(args);
-        if label == "fork" {
+        if matches!(label, "orchestrate" | "fork") {
             assert!(
                 out.contains("durable Graph Job") && out.contains("<job-id>"),
-                "fork help should explain the plan-to-job execution boundary:\n{out}"
+                "{label} help should explain the plan-to-job execution boundary:\n{out}"
             );
         } else {
             assert!(

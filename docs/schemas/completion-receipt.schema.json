@@ -135,6 +135,7 @@
       "type": "string",
       "enum": [
         "verified",
+        "semantic_revise",
         "semantic_uncertain",
         "semantic_unavailable",
         "operator_input_required",

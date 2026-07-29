@@ -26,9 +26,11 @@ pub use seam::{
     parse_seams_config, read_seams_config, resolve_catalog_override, write_seams_audit,
 };
 pub use semantic_judge::{
-    EvidenceItem, SEMANTIC_JUDGMENT_PATH, SemanticEvidencePack, SemanticJudgeResult,
-    build_semantic_evidence, build_semantic_evidence_against_source, run_semantic_judge,
-    run_semantic_judge_against_source, semantic_judgment_path,
+    EvidenceItem, SEMANTIC_JUDGMENT_PATH, SemanticBudgetExhaustion, SemanticEvidencePack,
+    SemanticJudgeBudget, SemanticJudgeResult, build_semantic_evidence,
+    build_semantic_evidence_against_source, persist_semantic_judgment, run_semantic_judge,
+    run_semantic_judge_against_source, run_semantic_judge_against_source_with_budget,
+    run_semantic_judge_with_budget, semantic_judgment_path,
 };
 pub use turn_loop::{
     NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,

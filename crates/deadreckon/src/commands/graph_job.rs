@@ -18,6 +18,7 @@ use super::super::*;
 
 const DRIVER_SIGNAL: &str = "watchkeeper_driver";
 const DRIVER_STATE_FILE: &str = "driver.json";
+const PLAN_PLANNER_ACCOUNTING_FILE: &str = "root-planner-accounting.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +68,41 @@ pub(crate) enum ParentCompletion {
         decision: Option<SemanticDecision>,
         stop_reason: StopReason,
     },
+    BudgetExhausted {
+        reason: String,
+        stop_reason: StopReason,
+    },
     GateFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ParentExecutionUsage {
+    spend_usd: f64,
+    wall_seconds: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PlanPlannerAccounting {
+    schema_version: u32,
+    planner_invoked: bool,
+    provider: Option<String>,
+    model: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    subscription: bool,
+    wall_seconds: f64,
+    recorded_at: chrono::DateTime<Utc>,
+}
+
+pub(crate) const fn semantic_decision_stop_reason(
+    decision: Option<SemanticDecision>,
+) -> Option<StopReason> {
+    match decision {
+        Some(SemanticDecision::Revise) => Some(StopReason::SemanticRevise),
+        Some(SemanticDecision::Uncertain) => Some(StopReason::SemanticUncertain),
+        Some(SemanticDecision::Achieved) | None => None,
+    }
 }
 
 pub(crate) fn embed_driver_spec(
@@ -101,6 +136,29 @@ pub(crate) fn driver_spec(plan: &commands::course::LaunchPlan) -> Result<DriverS
 
 pub(crate) fn driver_state_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
     paths.job_dir(job_id).join(DRIVER_STATE_FILE)
+}
+
+pub(crate) fn record_plan_planner_accounting(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    accounting: Option<&commands::plan::PlannerAccounting>,
+) -> Result<()> {
+    let record = PlanPlannerAccounting {
+        schema_version: 1,
+        planner_invoked: accounting.is_some(),
+        provider: accounting.map(|value| value.spend.provider.clone()),
+        model: accounting.map(|value| value.spend.model.clone()),
+        input_tokens: accounting.map_or(0, |value| value.spend.input_tokens),
+        output_tokens: accounting.map_or(0, |value| value.spend.output_tokens),
+        cost_usd: accounting.map_or(0.0, |value| value.spend.cost_usd),
+        subscription: accounting.is_some_and(|value| value.spend.subscription),
+        wall_seconds: accounting.map_or(0.0, |value| value.wall_seconds),
+        recorded_at: Utc::now(),
+    };
+    super::job::write_json_synced(
+        &paths.plan_dir(plan_id).join(PLAN_PLANNER_ACCOUNTING_FILE),
+        &record,
+    )
 }
 
 pub(crate) fn load_driver_state(paths: &DeadreckonPaths, job_id: &str) -> Result<DriverState> {
@@ -415,13 +473,13 @@ pub(crate) async fn complete_merged_plan_parent(
                 .ok()
                 .flatten()
                 .map(|judgment| judgment.decision);
-            let stop_reason = if decision == Some(SemanticDecision::Uncertain) {
-                StopReason::SemanticUncertain
-            } else if reason.contains("not contained") {
-                StopReason::LostContainment
-            } else {
-                StopReason::SemanticUnavailable
-            };
+            let stop_reason = semantic_decision_stop_reason(decision).unwrap_or_else(|| {
+                if reason.contains("not contained") {
+                    StopReason::LostContainment
+                } else {
+                    StopReason::SemanticUnavailable
+                }
+            });
             return Ok(ParentCompletion::NeedsReview {
                 reason: reason.to_string(),
                 decision,
@@ -489,10 +547,28 @@ pub(crate) async fn complete_merged_plan_parent(
             StopReason::LostContainment,
         );
     }
-    if let Some(judgment) = persisted_semantic_judgment(&parent)?
-        && judgment.decision == SemanticDecision::Achieved
-    {
+    let persisted_achieved = persisted_semantic_judgment(&parent)?
+        .filter(|judgment| judgment.decision == SemanticDecision::Achieved);
+    let execution_usage = match plan_execution_usage(paths, plan) {
+        Ok(usage) => usage,
+        Err(error) => {
+            return parent_needs_review(
+                &mut parent,
+                &format!("graph budget accounting is incomplete or corrupt: {error}"),
+                None,
+                StopReason::CorruptHistory,
+            );
+        }
+    };
+    let current_usage = combined_parent_usage(execution_usage, &parent)?;
+    if let Some(judgment) = persisted_achieved {
+        if let Some((stop_reason, reason)) = semantic_budget_overrun(job, current_usage) {
+            return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+        }
         return seal_achieved_parent(paths, &mut parent, authority, &marker, &judgment);
+    }
+    if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
     }
 
     let router = match semantic_router(paths, plan) {
@@ -506,12 +582,13 @@ pub(crate) async fn complete_merged_plan_parent(
             );
         }
     };
-    let semantic = match deadreckon_runtime::run_semantic_judge_against_source(
+    let semantic = match deadreckon_runtime::run_semantic_judge_against_source_with_budget(
         &parent,
         &marker,
         &router,
         backend,
         &job.source_cwd,
+        remaining_semantic_budget(job, current_usage),
     )
     .await
     {
@@ -526,6 +603,25 @@ pub(crate) async fn complete_merged_plan_parent(
         }
     };
     record_parent_semantic_accounting(&mut parent, job, &semantic)?;
+    let final_usage = combined_parent_usage(execution_usage, &parent)?;
+    if let Some(dimension) = semantic.budget_exhaustion {
+        let (stop_reason, reason) = semantic_judge_budget_exhaustion(job, final_usage, dimension);
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+    }
+    if let Some((stop_reason, reason)) = semantic_budget_overrun(job, final_usage) {
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+    }
+    if let Some(judgment) = semantic.result.judgment()
+        && let Err(error) =
+            deadreckon_runtime::persist_semantic_judgment(&parent.run_root, judgment)
+    {
+        return parent_needs_review(
+            &mut parent,
+            &format!("strict semantic judgment could not be persisted after accounting: {error}"),
+            None,
+            StopReason::SemanticUnavailable,
+        );
+    }
     match semantic.result {
         deadreckon_runtime::SemanticJudgeResult::Achieved(judgment) => {
             seal_achieved_parent(paths, &mut parent, authority, &marker, &judgment)
@@ -537,7 +633,7 @@ pub(crate) async fn complete_merged_plan_parent(
                 judgment.summary
             ),
             Some(SemanticDecision::Revise),
-            StopReason::SemanticUnavailable,
+            StopReason::SemanticRevise,
         ),
         deadreckon_runtime::SemanticJudgeResult::NeedsReview(judgment) => parent_needs_review(
             &mut parent,
@@ -616,13 +712,13 @@ pub(crate) async fn complete_merged_campaign_parent(
                 .ok()
                 .flatten()
                 .map(|judgment| judgment.decision);
-            let stop_reason = if decision == Some(SemanticDecision::Uncertain) {
-                StopReason::SemanticUncertain
-            } else if reason.contains("not contained") {
-                StopReason::LostContainment
-            } else {
-                StopReason::SemanticUnavailable
-            };
+            let stop_reason = semantic_decision_stop_reason(decision).unwrap_or_else(|| {
+                if reason.contains("not contained") {
+                    StopReason::LostContainment
+                } else {
+                    StopReason::SemanticUnavailable
+                }
+            });
             return Ok(ParentCompletion::NeedsReview {
                 reason: reason.to_string(),
                 decision,
@@ -708,10 +804,28 @@ pub(crate) async fn complete_merged_campaign_parent(
             StopReason::LostContainment,
         );
     }
-    if let Some(judgment) = persisted_semantic_judgment(&parent)?
-        && judgment.decision == SemanticDecision::Achieved
-    {
+    let persisted_achieved = persisted_semantic_judgment(&parent)?
+        .filter(|judgment| judgment.decision == SemanticDecision::Achieved);
+    let execution_usage = match campaign_execution_usage(paths, campaign) {
+        Ok(usage) => usage,
+        Err(error) => {
+            return parent_needs_review(
+                &mut parent,
+                &format!("campaign budget accounting is incomplete or corrupt: {error}"),
+                None,
+                StopReason::CorruptHistory,
+            );
+        }
+    };
+    let current_usage = combined_parent_usage(execution_usage, &parent)?;
+    if let Some(judgment) = persisted_achieved {
+        if let Some((stop_reason, reason)) = semantic_budget_overrun(job, current_usage) {
+            return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+        }
         return seal_achieved_parent(paths, &mut parent, authority, &marker, &judgment);
+    }
+    if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
     }
 
     let router = match campaign_semantic_router(paths, &campaign.providers) {
@@ -725,12 +839,13 @@ pub(crate) async fn complete_merged_campaign_parent(
             );
         }
     };
-    let semantic = match deadreckon_runtime::run_semantic_judge_against_source(
+    let semantic = match deadreckon_runtime::run_semantic_judge_against_source_with_budget(
         &parent,
         &marker,
         &router,
         backend,
         &job.source_cwd,
+        remaining_semantic_budget(job, current_usage),
     )
     .await
     {
@@ -745,6 +860,25 @@ pub(crate) async fn complete_merged_campaign_parent(
         }
     };
     record_parent_semantic_accounting(&mut parent, job, &semantic)?;
+    let final_usage = combined_parent_usage(execution_usage, &parent)?;
+    if let Some(dimension) = semantic.budget_exhaustion {
+        let (stop_reason, reason) = semantic_judge_budget_exhaustion(job, final_usage, dimension);
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+    }
+    if let Some((stop_reason, reason)) = semantic_budget_overrun(job, final_usage) {
+        return parent_budget_exhausted(&mut parent, stop_reason, &reason);
+    }
+    if let Some(judgment) = semantic.result.judgment()
+        && let Err(error) =
+            deadreckon_runtime::persist_semantic_judgment(&parent.run_root, judgment)
+    {
+        return parent_needs_review(
+            &mut parent,
+            &format!("strict semantic judgment could not be persisted after accounting: {error}"),
+            None,
+            StopReason::SemanticUnavailable,
+        );
+    }
     match semantic.result {
         deadreckon_runtime::SemanticJudgeResult::Achieved(judgment) => {
             seal_achieved_parent(paths, &mut parent, authority, &marker, &judgment)
@@ -756,7 +890,7 @@ pub(crate) async fn complete_merged_campaign_parent(
                 judgment.summary
             ),
             Some(SemanticDecision::Revise),
-            StopReason::SemanticUnavailable,
+            StopReason::SemanticRevise,
         ),
         deadreckon_runtime::SemanticJudgeResult::NeedsReview(judgment) => parent_needs_review(
             &mut parent,
@@ -1008,6 +1142,327 @@ fn persisted_semantic_judgment(
     Ok(Some(judgment))
 }
 
+fn plan_execution_usage(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<ParentExecutionUsage> {
+    let mut seen_runs = std::collections::BTreeSet::new();
+    let mut seen_plans = std::collections::BTreeSet::new();
+    let mut usage = ParentExecutionUsage::default();
+    add_plan_execution_usage(paths, plan, &mut seen_runs, &mut seen_plans, &mut usage)?;
+    Ok(usage)
+}
+
+fn add_plan_execution_usage(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    seen_runs: &mut std::collections::BTreeSet<String>,
+    seen_plans: &mut std::collections::BTreeSet<String>,
+    usage: &mut ParentExecutionUsage,
+) -> Result<()> {
+    if !seen_plans.insert(plan.plan_id.clone()) {
+        return Ok(());
+    }
+    let planner = load_plan_planner_accounting(paths, &plan.plan_id)?;
+    add_usage(
+        "plan root planner",
+        ParentExecutionUsage {
+            spend_usd: planner.cost_usd,
+            wall_seconds: planner.wall_seconds,
+        },
+        usage,
+    )?;
+    for task in &plan.tasks {
+        if let Some(subplan_id) = task.subplan.as_deref() {
+            let subplan = deadreckon_core::load_plan(paths, subplan_id).map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "cannot verify parent budget because nested sub-plan {subplan_id} is unreadable: {error}"
+                )))
+            })?;
+            add_plan_execution_usage(paths, &subplan, seen_runs, seen_plans, usage)?;
+        }
+        for run_id in task
+            .attempts
+            .iter()
+            .filter_map(|attempt| attempt.run_id.as_deref())
+            .chain(task.child_run_id.as_deref())
+        {
+            if !seen_runs.insert(run_id.to_string()) {
+                continue;
+            }
+            let state = deadreckon_core::load_run(paths, run_id).map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "cannot verify parent budget because task run {run_id} is unreadable: {error}"
+                )))
+            })?;
+            add_usage(
+                &format!("task run {run_id}"),
+                ParentExecutionUsage {
+                    spend_usd: state.total_spend_usd,
+                    wall_seconds: state.total_wall_seconds,
+                },
+                usage,
+            )?;
+        }
+        if task.attempts.iter().any(|attempt| attempt.run_id.is_none()) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify parent budget because graph task {} has an attempt without a run ID",
+                task.task_id
+            ))));
+        }
+        if task.child_run_id.is_none() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify parent budget because graph task {} has no result run",
+                task.task_id
+            ))));
+        }
+    }
+    for event in deadreckon_core::read_plan_events(paths, &plan.plan_id)? {
+        let run_id = match event.event {
+            deadreckon_core::PlanEventKind::MergeRepairRunDiscovered { run_id, .. } => Some(run_id),
+            deadreckon_core::PlanEventKind::MergeRepaired {
+                repair_run_id: Some(run_id),
+                ..
+            } => Some(run_id),
+            _ => None,
+        };
+        let Some(run_id) = run_id else {
+            continue;
+        };
+        if !seen_runs.insert(run_id.clone()) {
+            continue;
+        }
+        let state = deadreckon_core::load_run(paths, &run_id).map_err(|error| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify parent budget because merge-repair run {run_id} is unreadable: {error}"
+            )))
+        })?;
+        add_usage(
+            &format!("merge-repair run {run_id}"),
+            ParentExecutionUsage {
+                spend_usd: state.total_spend_usd,
+                wall_seconds: state.total_wall_seconds,
+            },
+            usage,
+        )?;
+    }
+    Ok(())
+}
+
+fn campaign_execution_usage(
+    paths: &DeadreckonPaths,
+    campaign: &deadreckon_core::campaign::Campaign,
+) -> Result<ParentExecutionUsage> {
+    let mut usage = ParentExecutionUsage::default();
+    if let Some(accounting) =
+        deadreckon_core::campaign::read_campaign_events(&paths.plan_dir(&campaign.campaign_id))?
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "root_planner_accounting")
+    {
+        usage.spend_usd += accounting
+            .detail
+            .get("cost_usd")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "campaign root planner accounting has no valid cost_usd".to_string(),
+                ))
+            })?;
+        usage.wall_seconds += accounting
+            .detail
+            .get("wall_seconds")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "campaign root planner accounting has no valid wall_seconds".to_string(),
+                ))
+            })?;
+    }
+    let mut seen_runs = std::collections::BTreeSet::new();
+    let mut seen_plans = std::collections::BTreeSet::new();
+    for sub in &campaign.sub_goals {
+        let plan_id = sub.sub_plan_id.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify campaign budget because sub-goal {} has no plan ID",
+                sub.sub_id
+            )))
+        })?;
+        let plan = deadreckon_core::load_plan(paths, plan_id).map_err(|error| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify campaign budget because sub-plan {plan_id} is unreadable: {error}"
+            )))
+        })?;
+        add_plan_execution_usage(paths, &plan, &mut seen_runs, &mut seen_plans, &mut usage)?;
+    }
+    validate_parent_usage(usage)?;
+    Ok(usage)
+}
+
+fn load_plan_planner_accounting(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+) -> Result<PlanPlannerAccounting> {
+    let path = paths.plan_dir(plan_id).join(PLAN_PLANNER_ACCOUNTING_FILE);
+    let raw = fs::read(&path).map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.clone(),
+            source,
+        })
+    })?;
+    let accounting: PlanPlannerAccounting = serde_json::from_slice(&raw).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })
+    })?;
+    if accounting.schema_version != 1 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "plan {plan_id} has unsupported root planner accounting schema {}",
+            accounting.schema_version
+        ))));
+    }
+    Ok(accounting)
+}
+
+fn add_usage(
+    source: &str,
+    increment: ParentExecutionUsage,
+    usage: &mut ParentExecutionUsage,
+) -> Result<()> {
+    validate_parent_usage(increment).map_err(|error| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "cannot verify parent budget because {source} has invalid accounting: {error}"
+        )))
+    })?;
+    usage.spend_usd += increment.spend_usd;
+    usage.wall_seconds += increment.wall_seconds;
+    validate_parent_usage(*usage)
+}
+
+fn validate_parent_usage(usage: ParentExecutionUsage) -> Result<()> {
+    if !usage.spend_usd.is_finite()
+        || usage.spend_usd < 0.0
+        || !usage.wall_seconds.is_finite()
+        || usage.wall_seconds < 0.0
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "parent execution accounting must be finite and non-negative".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn combined_parent_usage(
+    execution: ParentExecutionUsage,
+    parent: &deadreckon_core::PipelineState,
+) -> Result<ParentExecutionUsage> {
+    let combined = ParentExecutionUsage {
+        spend_usd: execution.spend_usd + parent.total_spend_usd,
+        wall_seconds: execution.wall_seconds + parent.total_wall_seconds,
+    };
+    validate_parent_usage(combined)?;
+    Ok(combined)
+}
+
+fn remaining_semantic_budget(
+    job: &deadreckon_protocol::Job,
+    usage: ParentExecutionUsage,
+) -> deadreckon_runtime::SemanticJudgeBudget {
+    deadreckon_runtime::SemanticJudgeBudget {
+        remaining_spend_usd: Some(job.policy.max_spend_usd - usage.spend_usd),
+        remaining_wall_seconds: Some(job.policy.max_wall_seconds as f64 - usage.wall_seconds),
+    }
+}
+
+fn semantic_budget_exhaustion(
+    job: &deadreckon_protocol::Job,
+    usage: ParentExecutionUsage,
+) -> Option<(StopReason, String)> {
+    if usage.spend_usd >= job.policy.max_spend_usd {
+        return Some((
+            StopReason::SpendCap,
+            format!(
+                "approved spend cap was exhausted before semantic judging (${:.6} used of ${:.6})",
+                usage.spend_usd, job.policy.max_spend_usd
+            ),
+        ));
+    }
+    if usage.wall_seconds >= job.policy.max_wall_seconds as f64 {
+        return Some((
+            StopReason::WallCap,
+            format!(
+                "approved wall-time cap was exhausted before semantic judging ({:.3}s used of {}s)",
+                usage.wall_seconds, job.policy.max_wall_seconds
+            ),
+        ));
+    }
+    None
+}
+
+fn semantic_budget_overrun(
+    job: &deadreckon_protocol::Job,
+    usage: ParentExecutionUsage,
+) -> Option<(StopReason, String)> {
+    if usage.spend_usd > job.policy.max_spend_usd {
+        return Some((
+            StopReason::SpendCap,
+            format!(
+                "semantic judging exceeded the approved spend cap (${:.6} used of ${:.6})",
+                usage.spend_usd, job.policy.max_spend_usd
+            ),
+        ));
+    }
+    if usage.wall_seconds > job.policy.max_wall_seconds as f64 {
+        return Some((
+            StopReason::WallCap,
+            format!(
+                "semantic judging exceeded the approved wall-time cap ({:.3}s used of {}s)",
+                usage.wall_seconds, job.policy.max_wall_seconds
+            ),
+        ));
+    }
+    None
+}
+
+fn semantic_judge_budget_exhaustion(
+    job: &deadreckon_protocol::Job,
+    usage: ParentExecutionUsage,
+    dimension: deadreckon_runtime::SemanticBudgetExhaustion,
+) -> (StopReason, String) {
+    match dimension {
+        deadreckon_runtime::SemanticBudgetExhaustion::Spend => (
+            StopReason::SpendCap,
+            format!(
+                "semantic judging exhausted the approved spend cap (${:.6} used of ${:.6})",
+                usage.spend_usd, job.policy.max_spend_usd
+            ),
+        ),
+        deadreckon_runtime::SemanticBudgetExhaustion::Wall => (
+            StopReason::WallCap,
+            format!(
+                "semantic judging exhausted the approved wall-time cap ({:.3}s used of {}s)",
+                usage.wall_seconds, job.policy.max_wall_seconds
+            ),
+        ),
+    }
+}
+
+fn parent_budget_exhausted(
+    parent: &mut deadreckon_core::PipelineState,
+    stop_reason: StopReason,
+    reason: &str,
+) -> Result<ParentCompletion> {
+    parent.pause_reason = Some(reason.to_string());
+    parent.failure_reason = Some(reason.to_string());
+    parent.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    deadreckon_core::save_state(parent)?;
+    Ok(ParentCompletion::BudgetExhausted {
+        reason: reason.to_string(),
+        stop_reason,
+    })
+}
+
 fn seal_achieved_parent(
     paths: &DeadreckonPaths,
     parent: &mut deadreckon_core::PipelineState,
@@ -1191,6 +1646,277 @@ fn driver_shape_error(job_id: &str) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_revise_has_its_own_typed_stop_reason() {
+        assert_eq!(
+            semantic_decision_stop_reason(Some(SemanticDecision::Revise)),
+            Some(StopReason::SemanticRevise)
+        );
+        assert_eq!(
+            semantic_decision_stop_reason(Some(SemanticDecision::Uncertain)),
+            Some(StopReason::SemanticUncertain)
+        );
+        assert_eq!(
+            semantic_decision_stop_reason(Some(SemanticDecision::Achieved)),
+            None
+        );
+    }
+
+    #[test]
+    fn parent_semantic_budget_boundary_returns_typed_cap_reasons() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let source_cwd = temp.path().join("source");
+        std::fs::create_dir_all(&source_cwd).expect("source");
+        let job = deadreckon_protocol::Job {
+            schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+            job_id: JobId("budget-parent".to_string()),
+            scope: "scope".to_string(),
+            goal: "bounded parent".to_string(),
+            shape: JobShape::Graph,
+            created_at: Utc::now(),
+            source_cwd,
+            launch_plan_sha256: "sha256:launch".to_string(),
+            authority_sha256: "sha256:authority".to_string(),
+            policy: deadreckon_protocol::JobPolicy {
+                max_spend_usd: 2.0,
+                max_wall_seconds: 30,
+                max_attempts: 1,
+                deadline: None,
+                semantic_judge: deadreckon_protocol::SemanticJudgeMode::Required,
+            },
+        };
+
+        let spend = semantic_budget_exhaustion(
+            &job,
+            ParentExecutionUsage {
+                spend_usd: 2.0,
+                wall_seconds: 1.0,
+            },
+        )
+        .expect("spend cap");
+        assert_eq!(spend.0, StopReason::SpendCap);
+
+        let wall = semantic_budget_exhaustion(
+            &job,
+            ParentExecutionUsage {
+                spend_usd: 1.0,
+                wall_seconds: 30.0,
+            },
+        )
+        .expect("wall cap");
+        assert_eq!(wall.0, StopReason::WallCap);
+
+        assert!(
+            semantic_budget_exhaustion(
+                &job,
+                ParentExecutionUsage {
+                    spend_usd: 1.99,
+                    wall_seconds: 29.99,
+                },
+            )
+            .is_none()
+        );
+        assert!(
+            semantic_budget_overrun(
+                &job,
+                ParentExecutionUsage {
+                    spend_usd: 2.0,
+                    wall_seconds: 30.0,
+                },
+            )
+            .is_none(),
+            "exactly using a cap remains within the approved policy"
+        );
+        assert_eq!(
+            semantic_budget_overrun(
+                &job,
+                ParentExecutionUsage {
+                    spend_usd: 2.01,
+                    wall_seconds: 1.0,
+                },
+            )
+            .expect("spend overrun")
+            .0,
+            StopReason::SpendCap
+        );
+        assert_eq!(
+            semantic_budget_overrun(
+                &job,
+                ParentExecutionUsage {
+                    spend_usd: 1.0,
+                    wall_seconds: 30.01,
+                },
+            )
+            .expect("wall overrun")
+            .0,
+            StopReason::WallCap
+        );
+    }
+
+    #[test]
+    fn graph_usage_loads_run_totals_and_deduplicates_attempt_and_result_ids() {
+        use deadreckon_core::plan::{
+            Plan, PlanMode, PlanProviders, PlanRole, PlanTask, TaskAttempt,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("source");
+        std::fs::create_dir_all(&cwd).expect("source");
+        let mut run = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "child".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "test".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        run.total_spend_usd = 1.25;
+        run.total_wall_seconds = 4.5;
+        deadreckon_core::save_state(&run).expect("state");
+
+        let mut task = PlanTask::new(0, "child", "do work", PlanRole::Child, None);
+        task.child_run_id = Some(run.run_id.clone());
+        task.attempts.push(TaskAttempt::failed(
+            1,
+            Some(run.run_id.clone()),
+            Some("retry reused the same durable run".to_string()),
+            1.25,
+        ));
+        let mut second_task =
+            PlanTask::new(1, "same child", "reuse durable work", PlanRole::Child, None);
+        second_task.child_run_id = Some(run.run_id.clone());
+        let plan = Plan::new(
+            "bounded graph",
+            PlanMode::FullPlan,
+            vec![task, second_task],
+            PlanProviders::default(),
+            None,
+            "test",
+        )
+        .expect("plan");
+        let missing = plan_execution_usage(&paths, &plan)
+            .expect_err("missing planner accounting must fail closed");
+        assert!(
+            missing.to_string().contains(PLAN_PLANNER_ACCOUNTING_FILE),
+            "{missing}"
+        );
+        record_plan_planner_accounting(
+            &paths,
+            &plan.plan_id,
+            Some(&commands::plan::PlannerAccounting {
+                spend: deadreckon_providers::SpendEstimate {
+                    provider: "planner".to_string(),
+                    model: "planner-model".to_string(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cost_usd: 0.25,
+                    subscription: false,
+                    wall_time_seconds: Some(1.0),
+                },
+                wall_seconds: 1.0,
+            }),
+        )
+        .expect("planner accounting");
+
+        let usage = plan_execution_usage(&paths, &plan).expect("usage");
+        assert_eq!(
+            usage,
+            ParentExecutionUsage {
+                spend_usd: 1.5,
+                wall_seconds: 5.5,
+            }
+        );
+    }
+
+    #[test]
+    fn campaign_usage_reads_subplan_runs_instead_of_zero_cost_merge_runs() {
+        use deadreckon_core::campaign::{
+            Campaign, SubGoalStatus, append_campaign_event, build_sub_goals,
+        };
+        use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, save_plan};
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("source");
+        std::fs::create_dir_all(&cwd).expect("source");
+        let mut plan_ids = Vec::new();
+        for (index, (spend_usd, wall_seconds)) in [(0.6, 2.0), (0.7, 3.0)].into_iter().enumerate() {
+            let mut run = deadreckon_core::create_run(
+                &paths,
+                deadreckon_core::RunOptions {
+                    goal: format!("child {index}"),
+                    cwd: cwd.clone(),
+                    sandbox: "none".to_string(),
+                    provider: Some("smoke".to_string()),
+                    skill_name: "test".to_string(),
+                    max_spend_usd: None,
+                    max_wall_seconds: None,
+                    run_id: None,
+                    codebase: None,
+                },
+            )
+            .expect("run");
+            run.total_spend_usd = spend_usd;
+            run.total_wall_seconds = wall_seconds;
+            deadreckon_core::save_state(&run).expect("state");
+
+            let mut first = PlanTask::new(0, "first", "work", PlanRole::Child, None);
+            first.child_run_id = Some(run.run_id.clone());
+            let mut second = PlanTask::new(1, "second", "reuse", PlanRole::Child, None);
+            second.child_run_id = Some(run.run_id.clone());
+            let mut plan = Plan::new(
+                format!("subplan {index}"),
+                PlanMode::FullPlan,
+                vec![first, second],
+                PlanProviders::default(),
+                None,
+                "test",
+            )
+            .expect("plan");
+            plan.plan_id = format!("subplan-{index}");
+            save_plan(&paths, &plan).expect("plan state");
+            record_plan_planner_accounting(&paths, &plan.plan_id, None)
+                .expect("planner accounting");
+            plan_ids.push(plan.plan_id);
+        }
+
+        let mut campaign = Campaign::new(
+            "bounded campaign",
+            build_sub_goals(vec!["one".to_string(), "two".to_string()], 2).expect("sub-goals"),
+            PlanProviders::default(),
+            0,
+            Some(2.0),
+            Some(30.0),
+            "test",
+        )
+        .expect("campaign");
+        for (sub, plan_id) in campaign.sub_goals.iter_mut().zip(plan_ids) {
+            sub.sub_plan_id = Some(plan_id);
+            sub.status = SubGoalStatus::Merged;
+        }
+        append_campaign_event(
+            &paths.plan_dir(&campaign.campaign_id),
+            "root_planner_accounting",
+            json!({
+                "cost_usd": 0.2,
+                "wall_seconds": 1.0,
+            }),
+        )
+        .expect("planner accounting");
+
+        let usage = campaign_execution_usage(&paths, &campaign).expect("usage");
+        assert!((usage.spend_usd - 1.5).abs() < f64::EPSILON);
+        assert!((usage.wall_seconds - 6.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn driver_spec_round_trips_through_the_immutable_launch_plan() {

@@ -31,6 +31,7 @@ export DEADRECKON_DOGFOOD_PROVIDER_A=cli:codex
 export DEADRECKON_DOGFOOD_PROVIDER_B=cli:claude-code
 export DEADRECKON_HOME=/path/to/dogfood-state
 export DEADRECKON_BIN=/path/to/deadreckon
+export DEADRECKON_DOGFOOD_ARTIFACTS=/path/to/dogfood-observations
 ```
 
 Inspect a task, then explicitly enable execution:
@@ -42,16 +43,17 @@ DEADRECKON_DOGFOOD_EXECUTE=1 \
 ```
 
 The harness writes the public command outputs and a final `job-view.json` under
-`artifacts/`. It stops without calling `finish` when the combined receipt is
-missing, uncontained, for a different job, or not a verified two-key result.
+`$DEADRECKON_DOGFOOD_ARTIFACTS`. Keep that directory outside either disposable
+source checkout. It stops without calling `finish` when the public report
+cannot validate a contained two-key receipt for the Job.
 
 Generate metrics from the persisted observations:
 
 ```sh
 python3 examples/watchkeeper-dogfood/collect-metrics.py \
   --home "$DEADRECKON_HOME" \
-  --observations examples/watchkeeper-dogfood/artifacts \
-  --output examples/watchkeeper-dogfood/artifacts/metrics.json
+  --observations "$DEADRECKON_DOGFOOD_ARTIFACTS" \
+  --output "$DEADRECKON_DOGFOOD_ARTIFACTS/metrics.json"
 ```
 
 The collector reads the public `status --json` JobView, append-only job events,

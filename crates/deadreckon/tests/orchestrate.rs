@@ -7478,6 +7478,56 @@ fn start_json_emits_launch_envelope_no_card() {
     assert!(!out.contains("+---"), "no card borders in json mode: {out}");
 }
 
+#[test]
+fn concurrent_same_goal_start_json_returns_each_exact_job_id() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let goal = "concurrent exact job identity";
+
+    let launch = || {
+        let mut command = deadreckon(&paths);
+        command
+            .current_dir(&repo)
+            .env("DEADRECKON_TEST_START_ENVELOPE_DELAY_MS", "500")
+            .args(["start", goal, "--mode", "run", "--fresh", "--yes", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("spawn concurrent start")
+    };
+    let first = launch();
+    let second = launch();
+    let outputs = [
+        first.wait_with_output().expect("first start"),
+        second.wait_with_output().expect("second start"),
+    ];
+
+    let mut returned = BTreeSet::new();
+    for output in outputs {
+        assert_success(&output);
+        let envelope: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("start output must be JSON: {error}"));
+        let ids = envelope["dispatched"]["ids"]
+            .as_array()
+            .expect("dispatched ids");
+        assert_eq!(ids.len(), 1, "{envelope}");
+        returned.insert(ids[0].as_str().expect("job id").to_string());
+    }
+
+    assert_eq!(returned.len(), 2, "each launch must return its own Job ID");
+    assert_eq!(
+        returned,
+        job_ids(&paths),
+        "returned identities must be the exact persisted Jobs"
+    );
+    for job_id in returned {
+        let job = deadreckon_core::load_job(&paths, &job_id).expect("returned Job");
+        assert_eq!(job.job_id.as_ref(), job_id.as_str());
+        assert_eq!(job.goal, goal);
+    }
+}
+
 fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
     fs::create_dir_all(paths.home()).expect("home");
     fs::write(paths.config_path(), "default_provider = \"smoke\"\n").expect("config");

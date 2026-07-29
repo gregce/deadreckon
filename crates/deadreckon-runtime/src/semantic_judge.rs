@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_core::{
@@ -13,7 +13,8 @@ use deadreckon_core::{
     diff_working_trees, implementation_notes_path, snapshot_diff,
 };
 use deadreckon_protocol::{
-    GoalCoverage, JobId, JobSchemaVersion, RunId, SemanticDecision, SemanticJudgment,
+    GoalCoverage, GoalCoverageStatus, JobId, JobSchemaVersion, RunId, SemanticDecision,
+    SemanticJudgment,
 };
 use deadreckon_providers::{
     ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter, WorkspaceAccess,
@@ -22,6 +23,7 @@ use deadreckon_sandbox::SandboxBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::{NamedTempFile, TempDir};
+use tokio_util::sync::CancellationToken;
 
 pub const SEMANTIC_JUDGMENT_PATH: &str = "proofs/semantic-judgment.json";
 const MAX_CONTRACT_BYTES: usize = 64 * 1024;
@@ -83,6 +85,19 @@ pub struct SemanticJudgeAccounting {
 pub struct SemanticJudgeRun {
     pub result: SemanticJudgeResult,
     pub accounting: SemanticJudgeAccounting,
+    pub budget_exhaustion: Option<SemanticBudgetExhaustion>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticBudgetExhaustion {
+    Spend,
+    Wall,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SemanticJudgeBudget {
+    pub remaining_spend_usd: Option<f64>,
+    pub remaining_wall_seconds: Option<f64>,
 }
 
 impl SemanticJudgeResult {
@@ -243,7 +258,25 @@ pub async fn run_semantic_judge(
     router: &ProviderRouter,
     sandbox_backend: SandboxBackend,
 ) -> Result<SemanticJudgeRun> {
-    run_semantic_judge_with_baseline(state, marker, router, sandbox_backend, None).await
+    run_semantic_judge_with_baseline(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        None,
+        SemanticJudgeBudget::default(),
+    )
+    .await
+}
+
+pub async fn run_semantic_judge_with_budget(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    router: &ProviderRouter,
+    sandbox_backend: SandboxBackend,
+    budget: SemanticJudgeBudget,
+) -> Result<SemanticJudgeRun> {
+    run_semantic_judge_with_baseline(state, marker, router, sandbox_backend, None, budget).await
 }
 
 /// Run the fresh, read-only semantic judge for a composed result against the
@@ -261,6 +294,26 @@ pub async fn run_semantic_judge_against_source(
         router,
         sandbox_backend,
         Some(approved_source),
+        SemanticJudgeBudget::default(),
+    )
+    .await
+}
+
+pub async fn run_semantic_judge_against_source_with_budget(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    router: &ProviderRouter,
+    sandbox_backend: SandboxBackend,
+    approved_source: &Path,
+    budget: SemanticJudgeBudget,
+) -> Result<SemanticJudgeRun> {
+    run_semantic_judge_with_baseline(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        Some(approved_source),
+        budget,
     )
     .await
 }
@@ -271,6 +324,7 @@ async fn run_semantic_judge_with_baseline(
     router: &ProviderRouter,
     sandbox_backend: SandboxBackend,
     approved_source: Option<&Path>,
+    budget: SemanticJudgeBudget,
 ) -> Result<SemanticJudgeRun> {
     let started = Instant::now();
     let selected = router.selected_route_info();
@@ -315,12 +369,46 @@ async fn run_semantic_judge_with_baseline(
                 path: state.run_root.join("semantic-judge-workspace"),
                 source,
             })?;
-    let request = semantic_provider_request(
+    let mut request = semantic_provider_request(
         &input,
         judge_workspace.as_ref().map(TempDir::path),
         sandbox_backend,
     );
-    let response = match router.complete(&request).await {
+    let cancellation_token = CancellationToken::new();
+    request.cancellation_token = Some(cancellation_token.clone());
+    let completion = router.complete(&request);
+    let provider_wall_seconds = budget
+        .remaining_wall_seconds
+        .map(|remaining| remaining - started.elapsed().as_secs_f64());
+    let provider_wall_budget = match provider_wall_seconds {
+        Some(seconds) if !seconds.is_finite() || seconds <= 0.0 => {
+            return Ok(unavailable_run(
+                "strict semantic judge unavailable: no wall-time budget remains".to_string(),
+                accounting_without_response(
+                    selected.as_ref(),
+                    sandbox_backend,
+                    started.elapsed().as_secs_f64(),
+                ),
+            ));
+        }
+        Some(seconds) => Some(Duration::from_secs_f64(seconds)),
+        None => None,
+    };
+    let Some(response) =
+        complete_with_semantic_wall_budget(completion, provider_wall_budget, &cancellation_token)
+            .await
+    else {
+        return Ok(budget_exhausted_run(
+            "strict semantic judge exceeded the remaining wall-time budget".to_string(),
+            SemanticBudgetExhaustion::Wall,
+            accounting_without_response(
+                selected.as_ref(),
+                sandbox_backend,
+                started.elapsed().as_secs_f64(),
+            ),
+        ));
+    };
+    let response = match response {
         Ok(response) => response,
         Err(error) => {
             return Ok(unavailable_run(
@@ -342,24 +430,56 @@ async fn run_semantic_judge_with_baseline(
             accounting,
         ));
     }
+    if let Some((dimension, reason)) = semantic_budget_overrun(&accounting, budget) {
+        return Ok(budget_exhausted_run(reason, dimension, accounting));
+    }
 
     let result = classify_semantic_response(&state.run_id, &state.run_id, &input_sha256, response);
-    let Some(judgment) = result.judgment() else {
-        return Ok(SemanticJudgeRun { result, accounting });
+    Ok(SemanticJudgeRun {
+        result,
+        accounting,
+        budget_exhaustion: None,
+    })
+}
+
+async fn complete_with_semantic_wall_budget<F>(
+    completion: F,
+    remaining: Option<Duration>,
+    cancellation_token: &CancellationToken,
+) -> Option<deadreckon_providers::Result<ProviderResponse>>
+where
+    F: std::future::Future<Output = deadreckon_providers::Result<ProviderResponse>>,
+{
+    tokio::pin!(completion);
+    let Some(remaining) = remaining else {
+        return Some(completion.await);
     };
-    if let Err(error) = write_semantic_judgment(&state.run_root, judgment) {
-        return Ok(unavailable_run(
-            format!("strict semantic judge unavailable: judgment could not be persisted: {error}"),
-            accounting,
-        ));
+    if let Ok(result) = tokio::time::timeout(remaining, &mut completion).await {
+        Some(result)
+    } else {
+        cancellation_token.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+        None
     }
-    Ok(SemanticJudgeRun { result, accounting })
 }
 
 fn unavailable_run(reason: String, accounting: SemanticJudgeAccounting) -> SemanticJudgeRun {
     SemanticJudgeRun {
         result: SemanticJudgeResult::Unavailable(reason),
         accounting,
+        budget_exhaustion: None,
+    }
+}
+
+fn budget_exhausted_run(
+    reason: String,
+    dimension: SemanticBudgetExhaustion,
+    accounting: SemanticJudgeAccounting,
+) -> SemanticJudgeRun {
+    SemanticJudgeRun {
+        result: SemanticJudgeResult::Unavailable(reason),
+        accounting,
+        budget_exhaustion: Some(dimension),
     }
 }
 
@@ -399,7 +519,8 @@ fn accounting_from_response(
         wall_time_seconds: response
             .spend
             .wall_time_seconds
-            .unwrap_or(measured_wall_seconds),
+            .unwrap_or(0.0)
+            .max(measured_wall_seconds),
         sandbox_backend: response
             .trace
             .get("sandbox_backend")
@@ -407,6 +528,37 @@ fn accounting_from_response(
             .map(str::to_string)
             .or_else(|| Some(requested_backend.to_string())),
     }
+}
+
+fn semantic_budget_overrun(
+    accounting: &SemanticJudgeAccounting,
+    budget: SemanticJudgeBudget,
+) -> Option<(SemanticBudgetExhaustion, String)> {
+    if budget
+        .remaining_spend_usd
+        .is_some_and(|remaining| accounting.cost_usd > remaining)
+    {
+        return Some((
+            SemanticBudgetExhaustion::Spend,
+            format!(
+                "strict semantic judge exceeded the remaining spend budget (${:.6} used)",
+                accounting.cost_usd
+            ),
+        ));
+    }
+    if budget
+        .remaining_wall_seconds
+        .is_some_and(|remaining| accounting.wall_time_seconds > remaining)
+    {
+        return Some((
+            SemanticBudgetExhaustion::Wall,
+            format!(
+                "strict semantic judge exceeded the remaining wall-time budget ({:.3}s used)",
+                accounting.wall_time_seconds
+            ),
+        ));
+    }
+    None
 }
 
 fn provider_kind_is_cli(kind: &ProviderKind) -> bool {
@@ -479,6 +631,7 @@ fn parse_semantic_response(
     })?;
     bound_model_response(&mut model)?;
     validate_evidence_references(&model.goal_coverage)?;
+    validate_achieved_response(&model)?;
     Ok(SemanticJudgment {
         schema_version: JobSchemaVersion::CURRENT,
         job_id: JobId(job_id.to_string()),
@@ -495,7 +648,7 @@ fn parse_semantic_response(
     })
 }
 
-fn write_semantic_judgment(run_root: &Path, judgment: &SemanticJudgment) -> Result<()> {
+pub fn persist_semantic_judgment(run_root: &Path, judgment: &SemanticJudgment) -> Result<()> {
     let path = semantic_judgment_path(run_root);
     let parent = path.parent().ok_or_else(|| {
         DeadreckonError::InvalidInput(format!(
@@ -598,6 +751,37 @@ fn validate_evidence_references(coverage: &[GoalCoverage]) -> Result<()> {
     Ok(())
 }
 
+fn validate_achieved_response(model: &SemanticModelResponse) -> Result<()> {
+    if model.decision != SemanticDecision::Achieved {
+        return Ok(());
+    }
+    if model.goal_coverage.is_empty() {
+        return Err(DeadreckonError::InvalidInput(
+            "semantic judge claimed achieved without goal coverage".to_string(),
+        ));
+    }
+    if !model.missing.is_empty() {
+        return Err(DeadreckonError::InvalidInput(
+            "semantic judge claimed achieved while reporting missing claims".to_string(),
+        ));
+    }
+    for item in &model.goal_coverage {
+        if item.status != GoalCoverageStatus::Met {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "semantic judge claimed achieved with non-met goal coverage: {}",
+                item.claim
+            )));
+        }
+        if item.evidence.is_empty() {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "semantic judge claimed achieved without evidence for goal coverage: {}",
+                item.claim
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn strip_json_fence(content: &str) -> &str {
     content
         .strip_prefix("```json")
@@ -643,12 +827,16 @@ fn json_error(label: &'static str) -> impl FnOnce(serde_json::Error) -> Deadreck
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use deadreckon_providers::{ProviderResponse, ProviderUsage, SpendEstimate};
     use deadreckon_sandbox::SandboxBackend;
 
     use super::{
-        EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SemanticDecision, SemanticJudgeResult,
-        classify_semantic_response, provider_kind_is_cli, semantic_output_schema,
+        EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SemanticBudgetExhaustion,
+        SemanticDecision, SemanticJudgeAccounting, SemanticJudgeBudget, SemanticJudgeResult,
+        accounting_from_response, classify_semantic_response, complete_with_semantic_wall_budget,
+        provider_kind_is_cli, semantic_budget_overrun, semantic_output_schema,
         semantic_provider_request, strip_json_fence, validate_evidence_references,
     };
     use deadreckon_protocol::{GoalCoverage, GoalCoverageStatus};
@@ -688,6 +876,116 @@ mod tests {
             semantic_output_schema()["properties"]["decision"]["enum"],
             serde_json::json!(["achieved", "revise", "uncertain"])
         );
+    }
+
+    #[test]
+    fn semantic_budget_refuses_only_actual_overruns() {
+        let accounting = SemanticJudgeAccounting {
+            provider: "judge".to_string(),
+            model: "model".to_string(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_usd: 0.25,
+            subscription: false,
+            wall_time_seconds: 2.0,
+            sandbox_backend: Some("docker".to_string()),
+        };
+        assert!(
+            semantic_budget_overrun(
+                &accounting,
+                SemanticJudgeBudget {
+                    remaining_spend_usd: Some(0.25),
+                    remaining_wall_seconds: Some(2.0),
+                },
+            )
+            .is_none(),
+            "using exactly the remaining cap stays within policy"
+        );
+        assert!(
+            semantic_budget_overrun(
+                &accounting,
+                SemanticJudgeBudget {
+                    remaining_spend_usd: Some(0.24),
+                    remaining_wall_seconds: Some(3.0),
+                },
+            )
+            .is_some_and(|(dimension, reason)| {
+                dimension == SemanticBudgetExhaustion::Spend && reason.contains("spend")
+            })
+        );
+        assert!(
+            semantic_budget_overrun(
+                &accounting,
+                SemanticJudgeBudget {
+                    remaining_spend_usd: Some(0.30),
+                    remaining_wall_seconds: Some(1.9),
+                },
+            )
+            .is_some_and(|(dimension, reason)| {
+                dimension == SemanticBudgetExhaustion::Wall && reason.contains("wall-time")
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_accounting_uses_measured_wall_when_provider_undercounts() {
+        let response = ProviderResponse {
+            provider: "judge".to_string(),
+            model: "model".to_string(),
+            content: "{}".to_string(),
+            usage: ProviderUsage {
+                input_tokens: 1,
+                output_tokens: 1,
+            },
+            spend: SpendEstimate {
+                provider: "judge".to_string(),
+                model: "model".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_usd: 0.1,
+                subscription: false,
+                wall_time_seconds: Some(0.1),
+            },
+            trace: serde_json::Value::Null,
+        };
+
+        let accounting = accounting_from_response(&response, SandboxBackend::Docker, 2.5);
+        assert_eq!(accounting.wall_time_seconds, 2.5);
+    }
+
+    #[tokio::test]
+    async fn semantic_wall_budget_cancels_a_call_that_outlives_the_remainder() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let child = token.clone();
+        let completion = async move {
+            child.cancelled().await;
+            Ok(ProviderResponse {
+                provider: "judge".to_string(),
+                model: "model".to_string(),
+                content: "{}".to_string(),
+                usage: ProviderUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
+                spend: SpendEstimate {
+                    provider: "judge".to_string(),
+                    model: "model".to_string(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: 0.0,
+                    subscription: false,
+                    wall_time_seconds: None,
+                },
+                trace: serde_json::Value::Null,
+            })
+        };
+
+        let response =
+            complete_with_semantic_wall_budget(completion, Some(Duration::from_millis(20)), &token)
+                .await;
+
+        assert!(response.is_none());
+        assert!(token.is_cancelled());
     }
 
     #[test]
@@ -769,11 +1067,16 @@ mod tests {
     #[test]
     fn semantic_response_maps_achieved_revise_and_uncertain() {
         fn response(decision: &str) -> ProviderResponse {
+            let goal_coverage = if decision == "achieved" {
+                r#"[{"claim":"approved goal","status":"met","evidence":["approved-goal"]}]"#
+            } else {
+                "[]"
+            };
             ProviderResponse {
                 provider: "judge".to_string(),
                 model: "judge-model".to_string(),
                 content: format!(
-                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":[],"missing":[]}}"#
+                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":{goal_coverage},"missing":[]}}"#
                 ),
                 usage: ProviderUsage {
                     input_tokens: 2,
@@ -796,6 +1099,100 @@ mod tests {
             classify_semantic_response("job", "run", "sha256:input", response("achieved")),
             SemanticJudgeResult::Achieved(_)
         ));
+        assert!(matches!(
+            classify_semantic_response("job", "run", "sha256:input", response("revise")),
+            SemanticJudgeResult::Revise(_)
+        ));
+        assert!(matches!(
+            classify_semantic_response("job", "run", "sha256:input", response("uncertain")),
+            SemanticJudgeResult::NeedsReview(_)
+        ));
+    }
+
+    #[test]
+    fn achieved_semantic_response_requires_evidence_backed_complete_coverage() {
+        fn response(goal_coverage: &str, missing: &str) -> ProviderResponse {
+            ProviderResponse {
+                provider: "judge".to_string(),
+                model: "judge-model".to_string(),
+                content: format!(
+                    r#"{{"decision":"achieved","summary":"bounded","goal_coverage":{goal_coverage},"missing":{missing}}}"#
+                ),
+                usage: ProviderUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+                spend: SpendEstimate {
+                    provider: "judge".to_string(),
+                    model: "judge-model".to_string(),
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cost_usd: 0.01,
+                    subscription: false,
+                    wall_time_seconds: Some(0.1),
+                },
+                trace: serde_json::Value::Null,
+            }
+        }
+
+        for (coverage, missing) in [
+            ("[]", "[]"),
+            (
+                r#"[{"claim":"goal","status":"missing","evidence":["approved-goal"]}]"#,
+                "[]",
+            ),
+            (
+                r#"[{"claim":"goal","status":"unclear","evidence":["approved-goal"]}]"#,
+                "[]",
+            ),
+            (r#"[{"claim":"goal","status":"met","evidence":[]}]"#, "[]"),
+            (
+                r#"[{"claim":"goal","status":"met","evidence":["worker-says-done"]}]"#,
+                "[]",
+            ),
+            (
+                r#"[{"claim":"goal","status":"met","evidence":["approved-goal"]}]"#,
+                r#"["still missing"]"#,
+            ),
+        ] {
+            assert!(matches!(
+                classify_semantic_response(
+                    "job",
+                    "run",
+                    "sha256:input",
+                    response(coverage, missing)
+                ),
+                SemanticJudgeResult::Unavailable(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn revise_and_uncertain_keep_permitting_incomplete_semantic_evidence() {
+        fn response(decision: &str) -> ProviderResponse {
+            ProviderResponse {
+                provider: "judge".to_string(),
+                model: "judge-model".to_string(),
+                content: format!(
+                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":[{{"claim":"goal","status":"unclear","evidence":[]}}],"missing":["goal"]}}"#
+                ),
+                usage: ProviderUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+                spend: SpendEstimate {
+                    provider: "judge".to_string(),
+                    model: "judge-model".to_string(),
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cost_usd: 0.01,
+                    subscription: false,
+                    wall_time_seconds: Some(0.1),
+                },
+                trace: serde_json::Value::Null,
+            }
+        }
+
         assert!(matches!(
             classify_semantic_response("job", "run", "sha256:input", response("revise")),
             SemanticJudgeResult::Revise(_)

@@ -140,6 +140,8 @@ record = {
     "terminal_outcome": projection.get("outcome"),
     "terminal_stop_reason": projection.get("stop_reason"),
     "public_commands": ["start", "status"],
+    "report_attempted": False,
+    "report_succeeded": False,
     "receipt_validation_attempted": False,
     "receipt_validated": False,
     "finish_attempted": False,
@@ -149,64 +151,95 @@ with open(output, "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
 
-receipt_path="$DEADRECKON_HOME/jobs/$job_id/receipt.json"
+report_path="$observation_dir/job-report.json"
 set +e
-python3 - "$receipt_path" "$job_id" <<'PY'
+(
+  cd "$repository"
+  "$deadreckon_bin" report "$job_id" --plain --json
+) >"$report_path" 2>"$observation_dir/job-report.err"
+report_status=$?
+set -e
+
+report_validation_status=$report_status
+if (( report_status == 0 )); then
+  set +e
+  python3 - "$report_path" "$job_id" <<'PY'
 import json
-import os
 import sys
 
-receipt_path, job_id = sys.argv[1:]
-if not os.path.isfile(receipt_path):
-    raise SystemExit(f"verified completion receipt is missing: {receipt_path}")
-with open(receipt_path, encoding="utf-8") as handle:
-    receipt = json.load(handle)
-required = {
-    "job_id": job_id,
-    "run_id": job_id,
+report_path, job_id = sys.argv[1:]
+with open(report_path, encoding="utf-8") as handle:
+    report = json.load(handle)
+required_report = {
+    "id": job_id,
+    "phase": "terminal",
     "outcome": "verified",
     "stop_reason": "verified",
-    "issuer": "deadreckon-supervisor",
+}
+for field, expected in required_report.items():
+    if report.get(field) != expected:
+        raise SystemExit(
+            f"report field {field} was {report.get(field)!r}, expected {expected!r}"
+        )
+
+receipt_report = report.get("receipt")
+if not isinstance(receipt_report, dict):
+    raise SystemExit("public report omitted receipt validation")
+if receipt_report.get("status") != "valid":
+    raise SystemExit(
+        f"public report classified the completion receipt as {receipt_report.get('status')!r}"
+    )
+if receipt_report.get("signature_validation_error") is not None:
+    raise SystemExit(
+        f"public report included a receipt validation error: "
+        f"{receipt_report.get('signature_validation_error')}"
+    )
+if receipt_report.get("sandbox_backend") in (None, "none"):
+    raise SystemExit("validated receipt does not prove a sandbox backend")
+
+validated_receipt = receipt_report.get("receipt")
+if not isinstance(validated_receipt, dict):
+    raise SystemExit("public report omitted the validated receipt")
+required_receipt = {
+    "job_id": job_id,
     "proof_kind": "two_key_completion",
     "contained": True,
 }
-for field, expected in required.items():
-    if receipt.get(field) != expected:
+for field, expected in required_receipt.items():
+    if validated_receipt.get(field) != expected:
         raise SystemExit(
-            f"receipt field {field} was {receipt.get(field)!r}, expected {expected!r}"
+            f"validated receipt field {field} was "
+            f"{validated_receipt.get(field)!r}, expected {expected!r}"
         )
-for digest in (
-    "authority_sha256",
-    "contract_sha256",
-    "deterministic_marker_sha256",
-    "semantic_judgment_sha256",
-    "result_tree_sha256",
-    "signature",
-):
-    if not receipt.get(digest):
-        raise SystemExit(f"receipt omitted {digest}")
 PY
-receipt_validation_status=$?
-set -e
+  report_validation_status=$?
+  set -e
+fi
 
-python3 - "$observation_dir/operator-run.json" "$receipt_validation_status" <<'PY'
+python3 - "$observation_dir/operator-run.json" "$report_status" "$report_validation_status" <<'PY'
 import json
 import sys
 
-path, status = sys.argv[1:]
+path, report_status, validation_status = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     record = json.load(handle)
+record["public_commands"] = ["start", "status", "report"]
+record["report_attempted"] = True
+record["report_exit_status"] = int(report_status)
+record["report_succeeded"] = int(report_status) == 0
 record["receipt_validation_attempted"] = True
-record["receipt_validation_exit_status"] = int(status)
-record["receipt_validated"] = int(status) == 0
+record["receipt_validation_source"] = "deadreckon report --json"
+record["receipt_validation_exit_status"] = int(validation_status)
+record["receipt_validated"] = int(validation_status) == 0
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(record, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
-if (( receipt_validation_status != 0 )); then
-  exit "$receipt_validation_status"
+if (( report_validation_status != 0 )); then
+  exit "$report_validation_status"
 fi
 
+receipt_path="$DEADRECKON_HOME/jobs/$job_id/receipt.json"
 cp "$receipt_path" "$observation_dir/receipt.json"
 
 set +e
@@ -226,7 +259,7 @@ output, status = sys.argv[1:]
 with open(output, encoding="utf-8") as handle:
     record = json.load(handle)
 record["completed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-record["public_commands"] = ["start", "status", "finish"]
+record["public_commands"] = ["start", "status", "report", "finish"]
 record["finish_attempted"] = True
 record["finish_exit_status"] = int(status)
 record["finish_succeeded"] = int(status) == 0

@@ -60,7 +60,15 @@ and revision under one Job ID. It then detaches a lease-fenced supervisor.
 `attach`, `status`, `list`, `kill`, `finish` and `report` resolve that Job
 without duplicating its backing run, plan or campaign.
 
-### Guided Jobs have 2 completion keys
+### Ordinary execution shares the Job scheduler
+
+Ordinary direct `run` and `orchestrate`, new supported chains, stored-plan
+`fork`, and direct campaigns now create durable Jobs and detach through the
+same supervisor. Preview, explicit in-place/uncontained execution, historical
+`chain run|resume`, unsupported conductor-only chain policies, and `extend`
+remain labelled compatibility paths and cannot produce a trusted Job receipt.
+
+### Durable Jobs have 2 completion keys
 
 A contained native gate must pass the frozen deterministic checks. A fresh
 read-only semantic judge must then return `achieved`. The supervisor seals an
@@ -69,26 +77,34 @@ result revisions, tree digests, gate marker, judgment and confinement.
 
 A deterministic failure cannot be overruled. A Single Job can use semantic
 `revise` for another bounded worker turn. A Graph or Campaign parent records
-`revise` as `NEEDS_REVIEW`; safe parent repair is deferred. Uncertainty, judge
-failure, missing containment or an invalid receipt also stop
+`revise` as `NEEDS_REVIEW` / `semantic_revise`; safe parent repair is deferred.
+Uncertainty, judge failure, missing containment or an invalid receipt also stop
 `NEEDS_REVIEW`.
+
+The supervisor now renews its fenced lease during source hashing and parent
+verification, not only while polling a child. Fresh Jobs bind authority to an
+empty Job-local source while preserving the launch workspace's lifecycle
+scope; Copy sources are normalized before the immutable plan is written.
+Concurrent `start --json` calls return the exact Job ID created by that call.
+
+Semantic `achieved` now requires non-empty, all-met, evidence-backed goal
+coverage both when model output is parsed and again when the signed receipt is
+sealed. Semantic judging is bounded by the Job's remaining wall time, and
+Single, Graph and Campaign completion fails closed with typed spend/wall
+reasons when no judging budget remains or a provider response exceeds policy.
 
 ### Graph and Campaign verify the parent result
 
-Guided review and full-plan work always uses at-end delivery. The supervisor
+Durable review and full-plan work always uses at-end delivery. The supervisor
 copies the merged result into a same-ID parent run, runs its native gate, asks
 the semantic judge, validates the receipt and then promotes the parent.
 `finish` exports that receipt-bound parent, not a mutable child artifact.
 
-A guided Campaign can recover an exactly linked persisted sub-plan. Before
+A durable Campaign can recover an exactly linked persisted sub-plan. Before
 parent verification, it rebuilds the worst-of roll-up from current leaf
 evidence and compares it with the stored and merged copies. A refused or
 changed roll-up fails before the semantic judge. A clean campaign parent then
 uses the same gate, judgment, receipt and promotion sequence as a Graph.
-
-Direct `run`, `orchestrate`, `chain` and `campaign` remain process-owned
-compatibility paths. Guided automatic continuation refuses before starting
-work and prints the exact legacy `extend` command.
 
 ### The worker cannot mint its proof
 
@@ -108,9 +124,17 @@ definitions and state classification. They do not prove an active service or a
 live reboot.
 
 The operator dogfood kit contains 24 tasks across 2 repository and provider
-slots. It also includes a metrics collector and human-review schema. Every task
-is `not_run`. This release does not claim live task rates, cross-provider
-results, machine-restart results, or false-accept and false-reject rates.
+slots. It also includes a metrics collector, human-review schema and
+credential-free adversarial runner. The committed credential-free result is 7
+passed, 0 failed, and 5 explicitly unproven live/host claims. The sanitized
+live result records 2 attempts, 22 not run, and 0 verified. This release does
+not claim live task rates, cross-provider results, machine-restart results, or
+false-accept and false-reject rates.
+
+The collector no longer treats raw receipt fields as verified evidence. Its
+verified count requires a valid public `report --json` receipt assessment and a
+successful public `finish`; forged raw receipts and validation-without-finish
+are regression-tested to remain unverified.
 
 ## 0.7.0 — Sea trials — 2026-07-25
 

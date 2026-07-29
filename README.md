@@ -54,12 +54,14 @@ For a higher-level read while it runs, `deadreckon attach latest --view narrativ
 Everything else (budgets, undo, multi-step chains, provider routing) is optional power you reach for later. No API keys? `deadreckon run "hello" --smoke --sandbox none` exercises the whole harness against a faked provider.
 
 > [!TIP]
-> Guided `start` now puts single, review, full-plan, and campaign shapes behind
-> one durable Job ID and lease supervisor. Each shape verifies its same-ID
-> parent result with a native gate and a fresh read-only semantic judge before
-> it validates a receipt and promotes the result. Direct `run`, `orchestrate`,
-> `chain`, and `campaign` remain process-owned compatibility paths. A guided
-> follow-up refuses before work and prints the exact legacy `extend` command.
+> `start`, ordinary direct `run` and `orchestrate`, new chains, stored-plan
+> `fork`, and direct campaigns now enter the same durable Job scheduler. Each
+> shape verifies its same-ID parent result with a native gate and a fresh
+> read-only semantic judge before it validates a receipt and promotes the
+> result. Explicit uncontained/in-place execution, historical `chain
+> run|resume`, previews, and `extend` remain labelled compatibility paths. A
+> guided follow-up refuses before work and prints the exact legacy `extend`
+> command.
 
 ## Why it's different
 
@@ -95,8 +97,8 @@ operator work, not completed claims.
 | **[Resume Semantics](docs/RESUME-SEMANTICS.md)** · **[Multi-Run](docs/MULTI-RUN.md)** | Crash/resume behavior and concurrency rules |
 | **[V1 Candidates](docs/V1-CANDIDATES.md)** | Deferred features and roadmap |
 
-DeadReckon is maintained as production-release software. Guided `start` Jobs
-and older direct execution surfaces coexist during the migration. Every
-supported guided shape has one parent Job lifecycle and a parent two-key
-receipt before promotion. Direct advanced verbs retain their established
-run/plan/chain/campaign state and process ownership.
+DeadReckon is maintained as production-release software. New execution through
+the ordinary direct verbs and guided `start` shares one parent Job lifecycle
+and a parent two-key receipt before promotion. Narrow compatibility paths
+retain their established run/plan/chain/campaign state and are explicitly
+labelled process-owned or untrusted.

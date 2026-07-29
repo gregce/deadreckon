@@ -18,6 +18,7 @@ use deadreckon_protocol::{
 const JOB_ACCEPTANCE_FILE: &str = "acceptance.yaml";
 const SUPERVISOR_LAUNCH_STDOUT: &str = "supervisor.out";
 const SUPERVISOR_LAUNCH_STDERR: &str = "supervisor.err";
+pub(crate) const DURABLE_SCOPE_ROOT_SIGNAL: &str = "watchkeeper_scope_root";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +80,11 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     let job_id = JobId(Uuid::new_v4().simple().to_string());
     let job_dir = request.paths.job_dir(job_id.as_ref());
     fs::create_dir_all(&job_dir)?;
+    let authority_source_cwd = authority_source_cwd(&request.source, request.source_cwd, &job_dir)?;
+    let scope_root = effective_scope_root(request.source_cwd)?;
+    if matches!(request.source.mode, DurableSourceMode::Copy) {
+        request.source.from = Some(authority_source_cwd.clone());
+    }
 
     let mut signals = request
         .launch_plan
@@ -90,6 +96,10 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         "watchkeeper_source".to_string(),
         serde_json::to_value(&request.source)?,
     );
+    signals.insert(
+        DURABLE_SCOPE_ROOT_SIGNAL.to_string(),
+        serde_json::to_value(&scope_root)?,
+    );
     request.launch_plan.signals = serde_json::Value::Object(signals);
 
     let launch_path = request.paths.job_launch_plan(job_id.as_ref());
@@ -98,7 +108,11 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     let launch_plan_sha256 = deadreckon_core::flight::sha256_file(&launch_path)?;
 
     let contract_path = job_dir.join(JOB_ACCEPTANCE_FILE);
-    freeze_contract(request.contract_source, request.source_cwd, &contract_path)?;
+    freeze_contract(
+        request.contract_source,
+        &authority_source_cwd,
+        &contract_path,
+    )?;
     let contract_sha256 = deadreckon_core::flight::sha256_file(&contract_path)?;
 
     let policy = JobPolicy {
@@ -115,7 +129,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         })?,
     );
     let source_tree_sha256 =
-        deadreckon_core::flight::build_working_file_index(request.source_cwd)?.tree_hash();
+        deadreckon_core::flight::build_working_file_index(&authority_source_cwd)?.tree_hash();
     let authority = JobAuthority {
         schema_version: JobSchemaVersion::CURRENT,
         job_id: job_id.clone(),
@@ -127,7 +141,11 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         effective_policy_sha256,
         launch_plan_sha256: launch_plan_sha256.clone(),
         source_tree_sha256,
-        source_revision: git_revision(request.source_cwd),
+        source_revision: if matches!(request.source.mode, DurableSourceMode::Fresh) {
+            None
+        } else {
+            git_revision(&authority_source_cwd)
+        },
         sandbox_requested: request.sandbox_requested,
         semantic_judge_mode: SemanticJudgeMode::Required,
     };
@@ -142,7 +160,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         goal: request.launch_plan.goal,
         shape: request.shape,
         created_at: Utc::now(),
-        source_cwd: request.source_cwd.to_path_buf(),
+        source_cwd: authority_source_cwd,
         launch_plan_sha256,
         authority_sha256,
         policy,
@@ -369,6 +387,7 @@ fn print_job_status_with_open_action(
         .map(|delivery| delivery.destination.display().to_string())
         .unwrap_or_else(|| "-".to_string());
     if json_output {
+        let paths = DeadreckonPaths::discover();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -377,9 +396,7 @@ fn print_job_status_with_open_action(
                 "status": status,
                 "next_actions": [&next_action],
                 "try_lines": Vec::<String>::new(),
-                "paths": {
-                    "job": view.job.source_cwd,
-                },
+                "paths": job_status_paths(&paths, view),
                 "durability": {
                     "process": process_durability,
                     "machine_restart": machine_restart_durability,
@@ -412,6 +429,13 @@ fn print_job_status_with_open_action(
     println!();
     println!("  {} {}", ui_muted("next:"), ui_command(next_action));
     Ok(())
+}
+
+fn job_status_paths(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> Value {
+    json!({
+        "job": paths.job_dir(view.job.job_id.as_ref()),
+        "source": &view.job.source_cwd,
+    })
 }
 
 pub(crate) fn job_primary_action<'a>(
@@ -497,6 +521,39 @@ pub(crate) fn cancel_job(
     }
     let updated = deadreckon_core::JobView::load(paths, view.job.job_id.as_ref())?;
     print_job_status(&updated, false)
+}
+
+fn authority_source_cwd(
+    source: &DurableSource,
+    requested_cwd: &Path,
+    job_dir: &Path,
+) -> Result<PathBuf> {
+    match source.mode {
+        DurableSourceMode::Fresh => {
+            let approved_source = job_dir.join("approved-source");
+            fs::create_dir_all(&approved_source)?;
+            Ok(approved_source)
+        }
+        DurableSourceMode::Copy => {
+            let source = source.from.as_deref().unwrap_or(requested_cwd);
+            Ok(if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                requested_cwd.join(source)
+            })
+        }
+        DurableSourceMode::Worktree | DurableSourceMode::InitGit => Ok(requested_cwd.to_path_buf()),
+    }
+}
+
+fn effective_scope_root(requested_cwd: &Path) -> Result<PathBuf> {
+    let root = if let Some(root) = std::env::var_os("DEADRECKON_SCOPE_ROOT") {
+        PathBuf::from(root)
+    } else {
+        deadreckon_core::find_git_root(requested_cwd)?
+            .unwrap_or_else(|| requested_cwd.to_path_buf())
+    };
+    root.canonicalize().map_err(CliError::from)
 }
 
 fn freeze_contract(source: Option<&Path>, source_cwd: &Path, target: &Path) -> Result<()> {
@@ -602,7 +659,7 @@ mod tests {
         CreateJob {
             paths,
             source_cwd: source,
-            scope: "fixture-scope".to_string(),
+            scope: deadreckon_core::paths::workspace_scope(source).expect("fixture scope"),
             launch_plan: plan,
             shape: JobShape::Single,
             driver: None,
@@ -683,6 +740,220 @@ mod tests {
             fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref())).expect("frozen");
         assert!(frozen.contains("{working_dir}"));
         assert!(!frozen.contains(&source.display().to_string()));
+    }
+
+    #[test]
+    fn fresh_job_authority_is_bound_to_its_empty_job_local_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch_source = temp.path().join("launch-source");
+        fs::create_dir_all(&launch_source).expect("launch source");
+        fs::write(launch_source.join("unrelated.txt"), "before").expect("launch file");
+        let contract = launch_source.join("acceptance.yaml");
+        let contract_body = "name: fresh\nchecks: []\n";
+        fs::write(&contract, contract_body).expect("contract");
+        let mut request = request(&paths, &launch_source, Some(&contract));
+        request.source = DurableSource {
+            mode: DurableSourceMode::Fresh,
+            from: None,
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create fresh job");
+        let expected_source = paths.job_dir(job.job_id.as_ref()).join("approved-source");
+        assert_eq!(job.source_cwd, expected_source);
+        assert!(job.source_cwd.is_dir());
+        assert!(
+            fs::read_dir(&job.source_cwd)
+                .expect("approved source entries")
+                .next()
+                .is_none(),
+            "fresh authority source must start empty"
+        );
+
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority bytes"),
+        )
+        .expect("authority");
+        let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+            .expect("launch plan");
+        assert_eq!(
+            serde_json::from_value::<PathBuf>(
+                plan.signals
+                    .get(DURABLE_SCOPE_ROOT_SIGNAL)
+                    .cloned()
+                    .expect("scope root signal")
+            )
+            .expect("scope root"),
+            launch_source
+                .canonicalize()
+                .expect("canonical launch source")
+        );
+        assert_eq!(
+            authority.source_tree_sha256,
+            deadreckon_core::flight::build_working_file_index(&job.source_cwd)
+                .expect("approved source index")
+                .tree_hash()
+        );
+        assert_eq!(authority.source_revision, None);
+        assert_eq!(
+            fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref()))
+                .expect("frozen contract"),
+            contract_body
+        );
+        let run = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: job.goal.clone(),
+                cwd: launch_source.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "test".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some(job.job_id.as_ref().to_string()),
+                codebase: Some(deadreckon_core::CodebaseRecord::fresh()),
+            },
+        )
+        .expect("same-scope worker run");
+        assert_eq!(run.scope, job.scope);
+        deadreckon_core::append_job_event(
+            &paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: job.job_id.clone(),
+                sequence: JobEventSequence::new(4).expect("sequence"),
+                event_id: "fresh-worker-linked".to_string(),
+                causation_id: "fresh-worker".to_string(),
+                timestamp: Utc::now(),
+                lease_epoch: 0,
+                kind: JobEventKind::ChildLinked,
+                detail: json!({ "run_id": job.job_id.as_ref() }),
+            },
+        )
+        .expect("link worker");
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(view.attempts.len(), 1);
+        assert!(view.missing_attempts.is_empty());
+
+        fs::write(launch_source.join("unrelated.txt"), "after").expect("mutate launch source");
+        super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect("unused launch mutation must not invalidate fresh authority");
+        assert_eq!(
+            authority.source_tree_sha256,
+            deadreckon_core::flight::build_working_file_index(&job.source_cwd)
+                .expect("approved source index after launch mutation")
+                .tree_hash(),
+            "mutating the unused launch checkout must not invalidate a fresh job"
+        );
+        fs::write(job.source_cwd.join("unexpected.txt"), "mutation")
+            .expect("mutate approved source");
+        let error = super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect_err("approved source mutation must invalidate authority");
+        assert!(error.to_string().contains("source tree changed"), "{error}");
+    }
+
+    #[test]
+    fn fresh_default_contract_is_detected_from_empty_approved_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch_source = temp.path().join("node-project");
+        fs::create_dir_all(&launch_source).expect("launch source");
+        fs::write(
+            launch_source.join("package.json"),
+            r#"{"scripts":{"test":"npm run real-tests"}}"#,
+        )
+        .expect("package");
+        let mut request = request(&paths, &launch_source, None);
+        request.source = DurableSource {
+            mode: DurableSourceMode::Fresh,
+            from: None,
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create fresh job");
+        let frozen =
+            fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref())).expect("frozen");
+        assert!(frozen.contains("deadreckon detected unknown"), "{frozen}");
+        assert!(!frozen.contains("npm run real-tests"), "{frozen}");
+    }
+
+    #[test]
+    fn copy_source_is_normalized_once_before_the_launch_plan_is_frozen() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch_source = temp.path().join("launch");
+        let copy_source = launch_source.join("fixtures/source");
+        fs::create_dir_all(&copy_source).expect("copy source");
+        fs::write(copy_source.join("README.md"), "copy").expect("copy file");
+        let mut request = request(&paths, &launch_source, None);
+        request.source = DurableSource {
+            mode: DurableSourceMode::Copy,
+            from: Some(PathBuf::from("fixtures/source")),
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create copy job");
+        assert_eq!(job.source_cwd, copy_source);
+        let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+            .expect("launch plan");
+        let frozen_source: DurableSource = serde_json::from_value(
+            plan.signals
+                .get("watchkeeper_source")
+                .cloned()
+                .expect("source signal"),
+        )
+        .expect("source");
+        assert_eq!(
+            frozen_source.from.as_deref(),
+            Some(job.source_cwd.as_path())
+        );
+    }
+
+    #[test]
+    fn fresh_source_revision_stays_empty_inside_an_enclosing_git_repository() {
+        let temp = TempDir::new().expect("tempdir");
+        let repository = temp.path().join("repository");
+        fs::create_dir_all(&repository).expect("repository");
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "watchkeeper@example.invalid"],
+            vec!["config", "user.name", "Watchkeeper Test"],
+        ] {
+            let output = deadreckon_core::git::run_git(&repository, &args).expect("git setup");
+            assert!(output.status.success(), "{args:?}");
+        }
+        fs::write(repository.join("README.md"), "repository").expect("readme");
+        for args in [vec!["add", "README.md"], vec!["commit", "-m", "fixture"]] {
+            let output = deadreckon_core::git::run_git(&repository, &args).expect("git commit");
+            assert!(output.status.success(), "{args:?}");
+        }
+
+        let paths = DeadreckonPaths::from_home(repository.join("state"));
+        let launch_source = repository.join("launch");
+        fs::create_dir_all(&launch_source).expect("launch source");
+        let contract = launch_source.join("acceptance.yaml");
+        fs::write(&contract, "name: fresh\nchecks: []\n").expect("contract");
+        let mut request = request(&paths, &launch_source, Some(&contract));
+        request.source = DurableSource {
+            mode: DurableSourceMode::Fresh,
+            from: None,
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create fresh job");
+        assert!(
+            git_revision(&job.source_cwd).is_some(),
+            "the fixture must prove the approved source is nested under git"
+        );
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority bytes"),
+        )
+        .expect("authority");
+        assert_eq!(
+            authority.source_revision, None,
+            "Fresh authority never inherits an enclosing repository revision"
+        );
     }
 
     #[test]
@@ -814,6 +1085,25 @@ mod tests {
             serialized_label(view.projection.stop_reason.expect("stop reason")),
             "lost_containment"
         );
+    }
+
+    #[test]
+    fn status_json_distinguishes_job_state_from_source_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job = create_job(request(&paths, &source, None)).expect("job");
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+
+        let status_paths = job_status_paths(&paths, &view);
+
+        assert_eq!(
+            status_paths["job"],
+            json!(paths.job_dir(job.job_id.as_ref()))
+        );
+        assert_eq!(status_paths["source"], json!(source));
+        assert_ne!(status_paths["job"], status_paths["source"]);
     }
 
     #[test]
