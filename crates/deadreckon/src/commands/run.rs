@@ -2,6 +2,36 @@ use super::super::*;
 
 pub(crate) const TRUSTED_SUPERVISOR_JOB_ID_ENV: &str = "DEADRECKON_SUPERVISOR_JOB_ID";
 pub(crate) const TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_PLAN";
+pub(crate) const LEGACY_CHAIN_FOREGROUND_ENV: &str = "DEADRECKON_LEGACY_CHAIN_STEP_FOREGROUND";
+const DURABLE_LEAF_SIGNAL: &str = "watchkeeper_leaf";
+
+/// Direct-run options that affect the worker's result, frozen before the
+/// detached supervisor starts. Source, budget, provider and model already live
+/// in first-class launch-plan/authority fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DurableLeafSpec {
+    pub(crate) base: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) no_seams: bool,
+    pub(crate) doc_provider: Option<String>,
+    pub(crate) skill: String,
+    pub(crate) no_docs: bool,
+    pub(crate) doc_skill: Option<String>,
+    pub(crate) narrate: bool,
+    pub(crate) no_narrate: bool,
+    pub(crate) narrator_model: Option<String>,
+}
+
+pub(crate) fn durable_leaf_spec(
+    plan: &commands::course::LaunchPlan,
+) -> Result<Option<DurableLeafSpec>> {
+    plan.signals
+        .get(DURABLE_LEAF_SIGNAL)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(CliError::from)
+}
 
 fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>> {
     let Some(run_id) = requested else {
@@ -28,7 +58,7 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
 /// Direct `deadreckon run`: a trivial operator plan records the decision so
 /// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
-    let plan = if args.run_id.is_some() {
+    let mut plan = if args.run_id.is_some() {
         let path = std::env::var_os(TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -46,7 +76,293 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             "run",
         )
     };
+    // The trusted child is already owned by a Job. Preview is read-only.
+    // Explicit in-place execution and an explicit uncontained sandbox cannot
+    // honestly promise isolation, restart recovery, or a trusted Job receipt,
+    // so those named compatibility modes keep the existing foreground path.
+    // A persisted legacy Chain also needs its child to complete synchronously;
+    // this private signal selects that untrusted compatibility path without
+    // weakening the sandbox requested by the historical Chain artifact.
+    let explicitly_uncontained = args.sandbox.as_deref() == Some("none");
+    let legacy_chain_foreground = std::env::var_os(LEGACY_CHAIN_FOREGROUND_ENV).is_some();
+    if args.run_id.is_none()
+        && !args.preview
+        && !args.in_place
+        && !explicitly_uncontained
+        && !legacy_chain_foreground
+    {
+        return schedule_direct_run(args, &mut plan).await;
+    }
     run_command_with_launch_plan(args, plan).await
+}
+
+async fn schedule_direct_run(
+    mut args: RunCommandArgs,
+    launch_plan: &mut commands::course::LaunchPlan,
+) -> Result<()> {
+    if args.infer_contract {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--infer-contract requires an interactive foreground review before work starts",
+            "deadreckon def-done \"what should count as done\", then rerun `deadreckon run`",
+        )));
+    }
+    if args.smoke && args.provider.is_some() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--smoke selects the local scripted provider; omit --provider".to_string(),
+        )));
+    }
+    if args.smoke && args.model.is_some() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--smoke selects the local scripted provider; omit --model".to_string(),
+        )));
+    }
+    if let Err(message) = crate::narrator::validate_narration_flags(args.narrate, args.no_narrate) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
+    }
+    if args
+        .prevent_sleep
+        .as_deref()
+        .is_some_and(|value| value != "off")
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "the durable supervisor owns process lifetime; direct jobs cannot freeze a child --prevent-sleep mode",
+            "use `--prevent-sleep off`; install the supervisor user service when the job must outlive login sessions",
+        )));
+    }
+    let explicitly_approved = direct_run_approval_policy(
+        args.yes,
+        args.no_confirm,
+        args.quiet,
+        prompt::is_tty(),
+        &args.goal,
+        args.no_hints,
+    )?;
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    if let Some(model) = args.narrator_model.as_deref()
+        && let Ok(registry) =
+            deadreckon_providers::registry::ProviderRegistry::with_overrides(paths.home())
+        && !crate::narrator::narrator_model_known(&registry, model)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            crate::narrator::narrator_model_refusal(model),
+        )));
+    }
+    let cwd = std::env::current_dir()?;
+    if args.init_git {
+        init_git_repo(&cwd)?;
+    }
+    let explicit_mode =
+        args.fresh || args.worktree || args.from.is_some() || args.in_place || args.init_git;
+    if !explicit_mode && deadreckon_core::find_git_root(&cwd)?.is_none() {
+        if !io::stdin().is_terminal() {
+            return Err(run_codebase_refusal_error(
+                deadreckon_core::user_error(
+                    "non-interactive without a mode flag",
+                    "--fresh or --from . or git init",
+                ),
+                &args.goal,
+                args.no_hints,
+            ));
+        }
+        match prompt_non_git_mode()? {
+            NonGitChoice::Init => {
+                init_git_repo(&cwd)?;
+                args.worktree = true;
+            }
+            NonGitChoice::Copy => {
+                args.from = Some(cwd.clone());
+            }
+            NonGitChoice::Cancel => {
+                print!(
+                    "{}",
+                    cancelled_run_surface().render_plain(!completion_hints_enabled(args.no_hints))
+                );
+                return Ok(());
+            }
+        }
+    }
+    let source = direct_run_source(&cwd, &args)?;
+    let authority_source_cwd = source.from.clone().unwrap_or_else(|| cwd.clone());
+    if matches!(source.mode, commands::job::DurableSourceMode::Worktree) {
+        prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id: Uuid::new_v4().simple().to_string(),
+                task_key: deadreckon_core::paths::task_key(&args.goal),
+                source_path: authority_source_cwd.clone(),
+                base_ref: args.base.clone(),
+                branch_name: args.branch.clone(),
+                allow_dirty: args.allow_dirty,
+            },
+        )
+        .map_err(|error| run_codebase_refusal_error(error, &args.goal, args.no_hints))?;
+    }
+    let contract = commands::acceptance::ensure_acceptance_before_start(
+        &authority_source_cwd,
+        args.acceptance.as_deref(),
+        &args.goal,
+        args.provider.clone(),
+        args.model.clone(),
+        explicitly_approved,
+        "run",
+    )
+    .await?;
+    let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+    let max_wall_seconds = args
+        .max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .unwrap_or(36_000.0)
+        .max(1.0) as u64;
+    let sandbox_requested = args
+        .sandbox
+        .clone()
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
+    if sandbox_requested == "none" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable direct runs require a containment backend; sandbox `none` cannot produce a trusted receipt",
+            "omit `--sandbox none` or choose auto, sandbox-exec, bwrap, or docker",
+        )));
+    }
+    let provider = if args.smoke {
+        Some("smoke".to_string())
+    } else {
+        args.provider.clone()
+    };
+    launch_plan.providers.coder.clone_from(&provider);
+    launch_plan.pieces = vec![commands::course::CoursePiece {
+        id: "run".to_string(),
+        goal: args.goal.clone(),
+        done_hint: None,
+        role: Some("coder".to_string()),
+        provider,
+        model: args.model.clone(),
+        budget_usd: Some(max_spend_usd),
+        depends_on: Vec::new(),
+        subplan: None,
+    }];
+    launch_plan.budget.ceiling_usd = Some(max_spend_usd);
+    launch_plan.budget.wall_seconds = Some(max_wall_seconds);
+    let leaf = DurableLeafSpec {
+        base: args.base.clone(),
+        branch: args.branch.clone(),
+        no_seams: args.no_seams,
+        doc_provider: args.doc_provider.clone(),
+        skill: args.skill.clone(),
+        no_docs: args.no_docs,
+        doc_skill: args.doc_skill.clone(),
+        narrate: args.narrate,
+        no_narrate: args.no_narrate,
+        narrator_model: args.narrator_model.clone(),
+    };
+    let mut signals = launch_plan.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(DURABLE_LEAF_SIGNAL.to_string(), serde_json::to_value(leaf)?);
+    launch_plan.signals = serde_json::Value::Object(signals);
+
+    let accepted_by = if explicitly_approved {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+    } else {
+        if !prompt::confirm("queue this durable job?", true)? {
+            eprintln!("cancelled before job creation");
+            return Ok(());
+        }
+        deadreckon_protocol::AuthorityAcceptedBy::Operator
+    };
+    let job = persist_direct_run_job(
+        &paths,
+        &authority_source_cwd,
+        launch_plan.clone(),
+        contract.as_ref().map(|source| source.path.as_path()),
+        source,
+        max_spend_usd,
+        max_wall_seconds,
+        sandbox_requested,
+        accepted_by,
+    )?;
+    commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
+    if !args.quiet {
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref())?;
+        commands::job::print_job_status(&view, false)?;
+    }
+    Ok(())
+}
+
+fn direct_run_approval_policy(
+    yes: bool,
+    no_confirm: bool,
+    _quiet: bool,
+    is_tty: bool,
+    goal: &str,
+    no_hints: bool,
+) -> Result<bool> {
+    if yes || no_confirm {
+        return Ok(true);
+    }
+    if !is_tty {
+        return Err(durable_run_confirmation_refusal_error(goal, no_hints));
+    }
+    Ok(false)
+}
+
+fn direct_run_source(cwd: &Path, args: &RunCommandArgs) -> Result<commands::job::DurableSource> {
+    let (mode, from) = if args.fresh {
+        (commands::job::DurableSourceMode::Fresh, None)
+    } else if let Some(from) = args.from.as_ref() {
+        (
+            commands::job::DurableSourceMode::Copy,
+            Some(resolve_direct_source_path(cwd, from)),
+        )
+    } else if args.init_git || args.worktree || deadreckon_core::find_git_root(cwd)?.is_some() {
+        (commands::job::DurableSourceMode::Worktree, None)
+    } else {
+        (
+            commands::job::DurableSourceMode::Copy,
+            Some(cwd.to_path_buf()),
+        )
+    };
+    Ok(commands::job::DurableSource {
+        mode,
+        from,
+        allow_dirty: args.allow_dirty,
+    })
+}
+
+fn resolve_direct_source_path(cwd: &Path, requested: &Path) -> PathBuf {
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        cwd.join(requested)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_direct_run_job(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    launch_plan: commands::course::LaunchPlan,
+    contract_source: Option<&Path>,
+    source: commands::job::DurableSource,
+    max_spend_usd: f64,
+    max_wall_seconds: u64,
+    sandbox_requested: String,
+    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
+) -> Result<deadreckon_protocol::Job> {
+    commands::job::create_job(commands::job::CreateJob {
+        paths,
+        source_cwd: cwd,
+        scope: workspace_scope(cwd)?,
+        launch_plan,
+        shape: deadreckon_protocol::JobShape::Single,
+        driver: None,
+        contract_source,
+        source,
+        max_spend_usd,
+        max_wall_seconds,
+        max_attempts: 3,
+        sandbox_requested,
+        accepted_by,
+    })
 }
 
 /// Launch a run carrying an accepted launch plan (C-P9): the plan is saved
@@ -98,7 +414,8 @@ pub(crate) async fn run_command_with_launch_plan(
     if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
     }
-    let auto_confirm = yes || no_confirm || quiet;
+    let auto_confirm =
+        foreground_run_auto_confirm(yes, no_confirm, quiet, requested_run_id.is_some());
     let effective_no_hints = no_hints || quiet;
     if smoke && provider.is_some() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -581,6 +898,15 @@ pub(crate) async fn run_command_with_launch_plan(
     Ok(())
 }
 
+fn foreground_run_auto_confirm(
+    yes: bool,
+    no_confirm: bool,
+    _quiet: bool,
+    trusted_supervisor_child: bool,
+) -> bool {
+    yes || no_confirm || trusted_supervisor_child
+}
+
 fn run_confirmation_refusal_error(goal: &str, run_id: &str, no_hints: bool) -> CliError {
     let primary = format!("deadreckon run {} --yes", run_goal_argument(goal));
     CliError::Surface {
@@ -596,6 +922,30 @@ fn run_confirmation_refusal_error(goal: &str, run_id: &str, no_hints: bool) -> C
                     ("command".to_string(), "run".to_string()),
                     ("goal".to_string(), goal.to_string()),
                     ("preview run".to_string(), run_id.to_string()),
+                ],
+            ),
+            [("Recommended", primary)],
+            std::iter::empty::<(&str, String)>(),
+        )
+        .render_plain(!completion_hints_enabled(no_hints)),
+    }
+}
+
+fn durable_run_confirmation_refusal_error(goal: &str, no_hints: bool) -> CliError {
+    let primary = format!("deadreckon run {} --yes", run_goal_argument(goal));
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::must_new(
+            VerdictKind::Blocked,
+            "run",
+            None,
+            ExplanationPanel::new(
+                "non-interactive without --yes",
+                "A durable direct run needs explicit approval before its immutable Job is queued. DeadReckon refused before creating Job or run state because this shell cannot answer the confirmation prompt.",
+                [
+                    ("command".to_string(), "run".to_string()),
+                    ("goal".to_string(), goal.to_string()),
+                    ("Job".to_string(), "not created".to_string()),
                 ],
             ),
             [("Recommended", primary)],
@@ -850,5 +1200,120 @@ mod cancel_tests {
         assert!(rendered.contains("deadreckon run"), "{rendered}");
         // It is a full surface, not a bare "cancelled" line.
         assert!(rendered.contains("Explanation"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod durable_direct_tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn direct_run_persists_one_bounded_job_with_the_same_run_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), "durable direct run").expect("source file");
+        let mut plan = commands::course::trivial_operator_plan(
+            "finish the direct task",
+            commands::course::CourseShape::Single,
+            "run",
+        );
+        let leaf = DurableLeafSpec {
+            base: Some("main".to_string()),
+            branch: Some("deadreckon/direct".to_string()),
+            no_seams: true,
+            doc_provider: Some("doc-provider".to_string()),
+            skill: "coder".to_string(),
+            no_docs: true,
+            doc_skill: Some("documenter".to_string()),
+            narrate: false,
+            no_narrate: true,
+            narrator_model: None,
+        };
+        plan.signals = json!({ DURABLE_LEAF_SIGNAL: leaf });
+
+        let job = persist_direct_run_job(
+            &paths,
+            &source,
+            plan,
+            None,
+            commands::job::DurableSource {
+                mode: commands::job::DurableSourceMode::Copy,
+                from: Some(source.clone()),
+                allow_dirty: false,
+            },
+            7.5,
+            240,
+            "auto".to_string(),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
+        )
+        .expect("persist direct job");
+        let authority: deadreckon_protocol::JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let frozen =
+            commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+                .expect("launch plan");
+
+        assert_eq!(job.shape, deadreckon_protocol::JobShape::Single);
+        assert_eq!(job.job_id.as_ref(), authority.run_id.as_ref());
+        assert_eq!(job.policy.max_attempts, 3);
+        assert_eq!(job.policy.max_spend_usd, 7.5);
+        assert_eq!(job.policy.max_wall_seconds, 240);
+        assert_eq!(
+            authority.accepted_by,
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+        );
+        assert_eq!(
+            durable_leaf_spec(&frozen)
+                .expect("leaf spec")
+                .expect("leaf"),
+            DurableLeafSpec {
+                base: Some("main".to_string()),
+                branch: Some("deadreckon/direct".to_string()),
+                no_seams: true,
+                doc_provider: Some("doc-provider".to_string()),
+                skill: "coder".to_string(),
+                no_docs: true,
+                doc_skill: Some("documenter".to_string()),
+                narrate: false,
+                no_narrate: true,
+                narrator_model: None,
+            }
+        );
+    }
+
+    #[test]
+    fn relative_copy_source_is_resolved_against_the_operator_checkout() {
+        let cwd = Path::new("/operator/project");
+        assert_eq!(
+            resolve_direct_source_path(cwd, Path::new("../source")),
+            PathBuf::from("/operator/project/../source")
+        );
+        assert_eq!(
+            resolve_direct_source_path(cwd, Path::new("/absolute/source")),
+            PathBuf::from("/absolute/source")
+        );
+    }
+
+    #[test]
+    fn quiet_non_tty_run_is_not_operator_approval() {
+        let error = direct_run_approval_policy(false, false, true, false, "quiet job", false)
+            .expect_err("quiet cannot approve a job");
+        assert!(error.to_string().contains("needs explicit approval"));
+        assert!(
+            direct_run_approval_policy(true, false, true, false, "quiet job", false)
+                .expect("yes approves")
+        );
+    }
+
+    #[test]
+    fn quiet_does_not_approve_foreground_execution_but_trusted_child_does() {
+        assert!(!foreground_run_auto_confirm(false, false, true, false));
+        assert!(foreground_run_auto_confirm(false, false, true, true));
     }
 }

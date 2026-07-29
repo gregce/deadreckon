@@ -99,10 +99,11 @@ pub use glossary::{
     run_status_label, status_label,
 };
 pub use job::{
-    JOB_CONTROL_LOCK, JOB_EVENTS_JSONL, JOB_JSON, JOB_PROJECTION_JSON, JobHistory, JobProjection,
-    JobView, LegacyJobKind, LegacyJobView, append_job_event, legacy_campaign_job_view,
-    legacy_chain_job_view, legacy_plan_job_view, legacy_run_job_view, load_job,
-    load_job_projection, read_job_history, rebuild_job_projection, reduce_job_history, write_job,
+    JOB_CONTROL_LOCK, JOB_EVENTS_JSONL, JOB_JSON, JOB_PROJECTION_JSON, JobDelivery,
+    JobDeliveryKind, JobHistory, JobProjection, JobView, LegacyJobKind, LegacyJobView,
+    append_job_event, legacy_campaign_job_view, legacy_chain_job_view, legacy_plan_job_view,
+    legacy_run_job_view, load_job, load_job_projection, read_job_history, rebuild_job_projection,
+    reduce_job_history, write_job,
 };
 pub use job_lease::{
     LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, LeaseToken,
@@ -134,6 +135,6 @@ pub use run_view::{
     WhyBand,
 };
 pub use state::{
-    CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, RunListEntry, RunOptions,
-    RunStatus, create_run, list_runs, load_run, save_state,
+    CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, ProviderFailureDisposition,
+    RunListEntry, RunOptions, RunStatus, create_run, list_runs, load_run, save_state,
 };

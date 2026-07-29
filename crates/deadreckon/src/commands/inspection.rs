@@ -186,14 +186,7 @@ pub(crate) fn list_command(
         match entry {
             ListEntry::Job(view) => {
                 let status = super::job::job_status_label(&view);
-                let action = if view.projection.is_terminal() {
-                    match view.projection.outcome {
-                        Some(deadreckon_protocol::JobOutcome::Verified) => "finish",
-                        _ => "attach",
-                    }
-                } else {
-                    "attach"
-                };
+                let action = super::job::job_primary_action(&view, "attach");
                 append_list_row(
                     &mut output,
                     &ListRow {

@@ -182,6 +182,8 @@ crate: deadreckon-core
   glossary::StatusLabel
   glossary::status_label
   job::append_job_event
+  job::JobDelivery
+  job::JobDeliveryKind
   job::JobHistory
   job::JOB_CONTROL_LOCK
   job::JOB_EVENTS_JSONL
@@ -292,6 +294,7 @@ crate: deadreckon-core
   state::PhaseState
   state::PhaseStatus
   state::PipelineState
+  state::ProviderFailureDisposition
   state::RunListEntry
   state::RunOptions
   state::RunStatus

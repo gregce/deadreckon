@@ -71,6 +71,7 @@ start_tmp="$artifact_root/$task_id/start.tmp.json"
     --provider "$provider" \
     --max-spend "$max_spend_usd" \
     --yes \
+    --quiet \
     --plain \
     --json
 ) >"$start_tmp"
@@ -120,7 +121,36 @@ PY
   sleep "$poll_seconds"
 done
 
+python3 - "$observation_dir/operator-run.json" "$observation_dir/job-view.json" "$task_id" "$job_id" "$repository" "$provider" <<'PY'
+import datetime
+import json
+import sys
+
+output, job_view_path, task_id, job_id, repository, provider = sys.argv[1:]
+with open(job_view_path, encoding="utf-8") as handle:
+    job_view = json.load(handle)
+projection = job_view["job"]["projection"]
+record = {
+    "schema_version": 1,
+    "task_id": task_id,
+    "job_id": job_id,
+    "repository": repository,
+    "provider_slot_value": provider,
+    "terminal_observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "terminal_outcome": projection.get("outcome"),
+    "terminal_stop_reason": projection.get("stop_reason"),
+    "public_commands": ["start", "status"],
+    "receipt_validation_attempted": False,
+    "receipt_validated": False,
+    "finish_attempted": False,
+}
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
 receipt_path="$DEADRECKON_HOME/jobs/$job_id/receipt.json"
+set +e
 python3 - "$receipt_path" "$job_id" <<'PY'
 import json
 import os
@@ -156,32 +186,56 @@ for digest in (
     if not receipt.get(digest):
         raise SystemExit(f"receipt omitted {digest}")
 PY
+receipt_validation_status=$?
+set -e
+
+python3 - "$observation_dir/operator-run.json" "$receipt_validation_status" <<'PY'
+import json
+import sys
+
+path, status = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    record = json.load(handle)
+record["receipt_validation_attempted"] = True
+record["receipt_validation_exit_status"] = int(status)
+record["receipt_validated"] = int(status) == 0
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+if (( receipt_validation_status != 0 )); then
+  exit "$receipt_validation_status"
+fi
+
 cp "$receipt_path" "$observation_dir/receipt.json"
 
+set +e
 (
   cd "$repository"
   "$deadreckon_bin" finish "$job_id" --no-confirm
 ) >"$observation_dir/finish.out" 2>"$observation_dir/finish.err"
+finish_status=$?
+set -e
 
-python3 - "$observation_dir/operator-run.json" "$task_id" "$job_id" "$repository" "$provider" <<'PY'
+python3 - "$observation_dir/operator-run.json" "$finish_status" <<'PY'
 import datetime
 import json
 import sys
 
-output, task_id, job_id, repository, provider = sys.argv[1:]
-record = {
-    "schema_version": 1,
-    "task_id": task_id,
-    "job_id": job_id,
-    "repository": repository,
-    "provider_slot_value": provider,
-    "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "public_commands": ["start", "status", "finish"],
-    "receipt_validated": True,
-}
+output, status = sys.argv[1:]
+with open(output, encoding="utf-8") as handle:
+    record = json.load(handle)
+record["completed_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+record["public_commands"] = ["start", "status", "finish"]
+record["finish_attempted"] = True
+record["finish_exit_status"] = int(status)
+record["finish_succeeded"] = int(status) == 0
 with open(output, "w", encoding="utf-8") as handle:
     json.dump(record, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY
+if (( finish_status != 0 )); then
+  exit "$finish_status"
+fi
 
 echo "$observation_dir"

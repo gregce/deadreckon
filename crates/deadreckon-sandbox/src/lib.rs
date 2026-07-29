@@ -24,7 +24,13 @@ pub(crate) use commands::sandbox_exec_profile;
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
+    #[cfg(target_os = "macos")]
+    use std::io::{Read, Write};
+    #[cfg(target_os = "macos")]
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    #[cfg(target_os = "macos")]
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[cfg(target_os = "macos")]
@@ -60,6 +66,41 @@ mod tests {
             network_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadWrite,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn local_http_probe() -> (String, thread::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local HTTP probe");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking local HTTP probe");
+        let address = listener.local_addr().expect("local HTTP address");
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("HTTP read timeout");
+                        let mut request = [0_u8; 1024];
+                        let _ = stream.read(&mut request);
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            )
+                            .expect("HTTP response");
+                        return true;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("local HTTP accept failed: {error}"),
+                }
+            }
+            false
+        });
+        (format!("http://{address}/probe"), handle)
     }
 
     #[tokio::test]
@@ -208,6 +249,16 @@ mod tests {
         if which::which("sandbox-exec").is_err() || which::which("curl").is_err() {
             return;
         }
+        let (baseline_url, baseline_server) = local_http_probe();
+        let baseline = std::process::Command::new("curl")
+            .args(["--fail", "--silent", "--max-time", "2", &baseline_url])
+            .output()
+            .expect("unsandboxed local curl");
+        assert!(baseline.status.success(), "{baseline:?}");
+        assert_eq!(baseline.stdout, b"ok");
+        assert!(baseline_server.join().expect("baseline server"));
+
+        let (blocked_url, blocked_server) = local_http_probe();
         let temp = TempDir::new().expect("tempdir");
         let work = temp.path().join("work");
         std::fs::create_dir_all(&work).expect("work");
@@ -216,9 +267,11 @@ mod tests {
             cwd: work,
             program: OsString::from("curl"),
             args: vec![
+                OsString::from("--fail"),
+                OsString::from("--silent"),
                 OsString::from("--max-time"),
                 OsString::from("2"),
-                OsString::from("https://example.com"),
+                OsString::from(blocked_url),
             ],
             stdin: None,
             env: BTreeMap::new(),
@@ -235,7 +288,16 @@ mod tests {
         })
         .await
         .expect("sandbox run");
+        assert!(
+            !output.stderr.contains("sandbox_apply"),
+            "Seatbelt profile did not apply: {}",
+            output.stderr
+        );
         assert_ne!(output.status_code, Some(0));
+        assert!(
+            !blocked_server.join().expect("blocked server"),
+            "contained curl reached the local HTTP server"
+        );
     }
 
     #[cfg(target_os = "macos")]

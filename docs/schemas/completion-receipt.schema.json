@@ -143,6 +143,7 @@
         "deadline",
         "attempt_limit",
         "cancel_requested",
+        "transient_provider",
         "fatal_provider",
         "fatal_gate",
         "lost_containment",

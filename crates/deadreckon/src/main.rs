@@ -884,6 +884,7 @@ async fn main_inner() -> Result<()> {
             max_spend,
             max_wall_seconds,
             sandbox,
+            acceptance,
             preview,
             yes,
             no_hints,
@@ -921,7 +922,7 @@ async fn main_inner() -> Result<()> {
                 goal_file,
                 "deadreckon campaign --goal-file docs/goal.md --yes",
             )?;
-            commands::campaign::campaign_command(commands::campaign::CampaignArgs {
+            let args = commands::campaign::CampaignArgs {
                 goal,
                 n,
                 planner_provider,
@@ -931,6 +932,7 @@ async fn main_inner() -> Result<()> {
                 max_spend,
                 max_wall_seconds,
                 sandbox,
+                acceptance,
                 preview,
                 yes,
                 no_hints,
@@ -939,8 +941,12 @@ async fn main_inner() -> Result<()> {
                 narrate,
                 no_narrate,
                 narrator_model,
-            })
-            .await
+            };
+            if args.preview {
+                commands::campaign::campaign_command(args).await
+            } else {
+                commands::campaign::schedule_campaign_job(args)
+            }
         }
         Commands::Plan {
             goal,
@@ -998,12 +1004,13 @@ async fn main_inner() -> Result<()> {
             reviewer_provider,
             no_repair,
             repair_provider,
+            yes,
             no_hints,
             quiet,
             plain,
         } => {
             ui::set_plain_output(plain);
-            commands::plan::fork_command(ForkCommandArgs {
+            commands::plan::fork_command_from_cli(ForkCommandArgs {
                 plan_id,
                 max_spend,
                 max_wall_seconds,
@@ -1014,6 +1021,7 @@ async fn main_inner() -> Result<()> {
                 reviewer_provider,
                 no_repair,
                 repair_provider,
+                yes,
                 no_hints,
                 quiet,
                 plain,
@@ -1073,6 +1081,7 @@ async fn main_inner() -> Result<()> {
             provider,
             model,
             sandbox,
+            acceptance,
             base,
             n,
             no_hints,
@@ -1111,6 +1120,7 @@ async fn main_inner() -> Result<()> {
                 provider,
                 model,
                 sandbox,
+                acceptance,
                 base,
                 n,
                 no_hints,

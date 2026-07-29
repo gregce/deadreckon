@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
@@ -24,6 +24,22 @@ pub const JOB_EVENTS_JSONL: &str = "job-events.jsonl";
 pub const JOB_PROJECTION_JSON: &str = "projection.json";
 pub const JOB_CONTROL_LOCK: &str = "control.lock";
 
+/// The latest successful operator delivery folded from the Job event history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobDelivery {
+    pub kind: JobDeliveryKind,
+    pub destination: PathBuf,
+    pub resulting_revision: Option<String>,
+    pub delivered_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobDeliveryKind {
+    Applied,
+    Exported,
+}
+
 /// A rebuildable checkpoint over the append-only job lifecycle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobProjection {
@@ -36,6 +52,8 @@ pub struct JobProjection {
     pub current_lease_epoch: u64,
     pub attempt_count: u32,
     pub child_run_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<JobDelivery>,
     pub updated_at: Option<DateTime<Utc>>,
     pub caveats: Vec<String>,
 }
@@ -52,6 +70,7 @@ impl JobProjection {
             current_lease_epoch: 0,
             attempt_count: 0,
             child_run_ids: Vec::new(),
+            delivery: None,
             updated_at: None,
             caveats: Vec::new(),
         }
@@ -554,9 +573,13 @@ fn reduce_event(
             terminal(projection, outcome, reason);
         }
         Verified => terminal(projection, JobOutcome::Verified, StopReason::Verified),
-        JobEventKind::ContractApproved
-        | JobEventKind::ResultApplied
-        | JobEventKind::ResultExported => {}
+        JobEventKind::ResultApplied => {
+            projection.delivery = Some(job_delivery(event, JobDeliveryKind::Applied)?);
+        }
+        JobEventKind::ResultExported => {
+            projection.delivery = Some(job_delivery(event, JobDeliveryKind::Exported)?);
+        }
+        JobEventKind::ContractApproved => {}
     }
     Ok(())
 }
@@ -574,6 +597,31 @@ fn detail_string<'a>(detail: &'a Value, name: &str) -> Option<&'a str> {
 fn detail_stop_reason(detail: &Value) -> Option<StopReason> {
     let value = detail.get("stop_reason")?.clone();
     serde_json::from_value(value).ok()
+}
+
+fn job_delivery(event: &JobEvent, kind: JobDeliveryKind) -> Result<JobDelivery> {
+    let destination = detail_string(&event.detail, "destination").ok_or_else(|| {
+        history_corrupt(
+            event.job_id.as_ref(),
+            "delivery event omitted string destination",
+        )
+    })?;
+    let resulting_revision = match event.detail.get("resulting_revision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(history_corrupt(
+                event.job_id.as_ref(),
+                "delivery event has non-string resulting revision",
+            ));
+        }
+    };
+    Ok(JobDelivery {
+        kind,
+        destination: PathBuf::from(destination),
+        resulting_revision,
+        delivered_at: event.timestamp,
+    })
 }
 
 fn history_corrupt(job_id: &str, detail: &str) -> DeadreckonError {
@@ -684,6 +732,63 @@ mod tests {
         let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
         assert_eq!(projection.outcome, Some(JobOutcome::RetryExhausted));
         assert_eq!(projection.stop_reason, Some(StopReason::AttemptLimit));
+    }
+
+    #[test]
+    fn delivery_event_projects_factual_after_state_without_changing_verdict() {
+        let created = event(1, "created", JobEventKind::Created);
+        let verified = event(2, "verified", JobEventKind::Verified);
+        let mut delivered = event(3, "delivered", JobEventKind::ResultApplied);
+        delivered.detail = json!({
+            "destination": "/tmp/delivered",
+            "resulting_revision": "abc123",
+        });
+        let events = vec![created, verified, delivered.clone()];
+        let raw_lines = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).expect("serialize event"))
+            .collect();
+        let history = JobHistory {
+            events,
+            raw_lines,
+            caveats: Vec::new(),
+        };
+
+        let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
+
+        assert_eq!(projection.outcome, Some(JobOutcome::Verified));
+        assert_eq!(projection.stop_reason, Some(StopReason::Verified));
+        let delivery = projection.delivery.expect("delivery");
+        assert_eq!(delivery.kind, super::JobDeliveryKind::Applied);
+        assert_eq!(
+            delivery.destination,
+            std::path::PathBuf::from("/tmp/delivered")
+        );
+        assert_eq!(delivery.resulting_revision.as_deref(), Some("abc123"));
+        assert_eq!(delivery.delivered_at, delivered.timestamp);
+    }
+
+    #[test]
+    fn malformed_delivery_event_fails_projection_closed() {
+        let created = event(1, "created", JobEventKind::Created);
+        let verified = event(2, "verified", JobEventKind::Verified);
+        let delivered = event(3, "delivered", JobEventKind::ResultExported);
+        let events = vec![created, verified, delivered];
+        let raw_lines = events
+            .iter()
+            .map(|event| serde_json::to_vec(event).expect("serialize event"))
+            .collect();
+        let history = JobHistory {
+            events,
+            raw_lines,
+            caveats: Vec::new(),
+        };
+
+        let error = reduce_job_history(&JobId("job-1".into()), &history)
+            .expect_err("delivery without destination must fail closed")
+            .to_string();
+
+        assert!(error.contains("delivery event omitted string destination"));
     }
 
     #[test]

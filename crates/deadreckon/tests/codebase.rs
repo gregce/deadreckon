@@ -2457,7 +2457,7 @@ fn deadreckon_pty(
     // contend on the package-cache lock), so the ceiling must be generous —
     // 30s flaked whenever two of these landed together.
     let script = format!(
-        "log_user 0\nlog_file -a {}\nset timeout 90\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\nspawn {}\nexpect \"choose \\[1\\]:\"\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
+        "log_user 0\nlog_file -a {}\nset timeout 90\ncd {}\nset env(DEADRECKON_HOME) {}\nset env(DEADRECKON_PROMPT_LINE_MODE) 1\nspawn {}\nexpect -exact {{choose [1]:}}\nsend -- \"{}\"\nexpect {{\n  \"completed run\" {{ exit 0 }}\n  \"cancelled\" {{ exit 0 }}\n  eof {{ exit 125 }}\n  timeout {{ exit 124 }}\n}}\n",
         tcl_brace_quote(&log_path.display().to_string()),
         tcl_brace_quote(&cwd.display().to_string()),
         tcl_brace_quote(&paths.home().display().to_string()),

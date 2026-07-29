@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeadReckon Watchkeeper adversarial results",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "credential_free",
+    "repository",
+    "host",
+    "runner_sha256",
+    "summary",
+    "trials",
+    "live_claims",
+    "matrix_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "credential_free": {
+      "const": true
+    },
+    "repository": {
+      "type": "object",
+      "required": ["revision", "dirty"],
+      "properties": {
+        "revision": {
+          "type": ["string", "null"]
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "host": {
+      "type": "object"
+    },
+    "runner_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "summary": {
+      "type": "object",
+      "required": ["passed", "failed", "unproven"],
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unproven": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "trials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "claim",
+          "proof_type",
+          "status",
+          "limitation",
+          "commands"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "claim": {
+            "type": "string"
+          },
+          "proof_type": {
+            "type": "string"
+          },
+          "status": {
+            "enum": ["passed", "failed", "unproven"]
+          },
+          "reason": {
+            "type": ["string", "null"]
+          },
+          "limitation": {
+            "type": "string"
+          },
+          "commands": {
+            "type": "array"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "live_claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "reason"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "const": "unproven"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "matrix_status": {
+      "type": "object",
+      "required": ["total_tasks", "by_execution_status"],
+      "properties": {
+        "total_tasks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_execution_status": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

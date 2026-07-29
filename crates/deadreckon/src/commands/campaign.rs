@@ -1,6 +1,8 @@
 use super::super::*;
 use crate::commands::orchestrate::recommend_child_count_for_goal;
-use crate::commands::plan::{build_full_plan_tasks, resolve_plan_providers};
+use crate::commands::plan::{
+    PlannerAccounting, build_full_plan_tasks_accounted, resolve_plan_providers,
+};
 use crate::commands::start::{
     classify_goal_shape_for_start, goal_shape_provider_route, write_goal_shape_preview_record,
 };
@@ -292,6 +294,7 @@ pub(crate) struct CampaignArgs {
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,
+    pub(crate) acceptance: Option<PathBuf>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) no_hints: bool,
@@ -309,6 +312,99 @@ pub(crate) struct CampaignRepairArgs {
     pub(crate) repair_attempts: u32,
     pub(crate) no_hints: bool,
     pub(crate) quiet: bool,
+}
+
+struct CampaignRemainingBudget {
+    spend_usd: Option<f64>,
+    wall_seconds: Option<f64>,
+    exhausted_reason: Option<String>,
+}
+
+fn campaign_remaining_after_planning(
+    approved_spend_usd: Option<f64>,
+    approved_wall_seconds: Option<f64>,
+    accounting: Option<&PlannerAccounting>,
+) -> Result<CampaignRemainingBudget> {
+    let planner_spend = accounting.map_or(0.0, |value| value.spend.cost_usd);
+    let planner_wall = accounting.map_or(0.0, |value| value.wall_seconds);
+    if !planner_spend.is_finite()
+        || planner_spend < 0.0
+        || !planner_wall.is_finite()
+        || planner_wall < 0.0
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "campaign planner reported invalid spend or wall accounting".to_string(),
+        )));
+    }
+    let spend_usd = approved_spend_usd.map(|cap| (cap - planner_spend).max(0.0));
+    let wall_seconds = approved_wall_seconds.map(|cap| (cap - planner_wall).max(0.0));
+    let spend_exhausted = approved_spend_usd.is_some_and(|cap| planner_spend >= cap);
+    let wall_exhausted = approved_wall_seconds.is_some_and(|cap| planner_wall >= cap);
+    let exhausted_reason = (spend_exhausted || wall_exhausted).then(|| {
+        format!(
+            "one token-bounded campaign planner completion used ${planner_spend:.6} and {planner_wall:.3}s, exhausting the approved campaign cap before child launch"
+        )
+    });
+    Ok(CampaignRemainingBudget {
+        spend_usd,
+        wall_seconds,
+        exhausted_reason,
+    })
+}
+
+fn merge_campaign_planner_accounting(
+    current: &mut Option<PlannerAccounting>,
+    next: Option<PlannerAccounting>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let Some(current) = current.as_mut() else {
+        *current = Some(next);
+        return;
+    };
+    if current.spend.provider != next.spend.provider {
+        current.spend.provider = "multiple".to_string();
+    }
+    if current.spend.model != next.spend.model {
+        current.spend.model = "multiple".to_string();
+    }
+    current.spend.input_tokens = current
+        .spend
+        .input_tokens
+        .saturating_add(next.spend.input_tokens);
+    current.spend.output_tokens = current
+        .spend
+        .output_tokens
+        .saturating_add(next.spend.output_tokens);
+    current.spend.cost_usd += next.spend.cost_usd;
+    current.spend.subscription &= next.spend.subscription;
+    current.wall_seconds += next.wall_seconds;
+}
+
+fn append_campaign_planner_accounting(
+    campaign_dir: &Path,
+    accounting: Option<&PlannerAccounting>,
+) -> Result<()> {
+    let Some(accounting) = accounting else {
+        return Ok(());
+    };
+    deadreckon_core::campaign::append_campaign_event(
+        campaign_dir,
+        "root_planner_accounting",
+        json!({
+            "provider": accounting.spend.provider,
+            "model": accounting.spend.model,
+            "input_tokens": accounting.spend.input_tokens,
+            "output_tokens": accounting.spend.output_tokens,
+            "cost_usd": accounting.spend.cost_usd,
+            "subscription": accounting.spend.subscription,
+            "wall_seconds": accounting.wall_seconds,
+            "cumulative": true,
+            "overrun_policy": "one token-bounded planner completion may cross a very small cap; child launch is refused when planning exhausts the total",
+        }),
+    )
+    .map_err(CliError::Core)
 }
 
 fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sandbox: Option<&str>) {
@@ -681,6 +777,7 @@ fn promote_campaign_result(
     remove_if_exists(&state.working_dir)?;
     copy_tree(merge_dir, &state.working_dir)?;
     deadreckon_core::campaign::write_campaign_rollup_at_run_root(&state.run_root, rollup)?;
+    record_campaign_result_accounting(paths, campaign_id, &mut state)?;
     write_acceptance_marker(
         &state.run_root,
         state.run_id.clone(),
@@ -693,6 +790,96 @@ fn promote_campaign_result(
         promote_completed_run(paths, &mut state)?;
     }
     Ok(state)
+}
+
+#[derive(Deserialize)]
+struct PersistedPlannerAccounting {
+    provider: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    subscription: bool,
+    wall_seconds: f64,
+}
+
+fn read_campaign_planner_accounting(
+    campaign_dir: &Path,
+) -> Result<Option<PersistedPlannerAccounting>> {
+    let event = deadreckon_core::campaign::read_campaign_events(campaign_dir)?
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "root_planner_accounting");
+    event
+        .map(|event| serde_json::from_value(event.detail).map_err(CliError::from))
+        .transpose()
+}
+
+fn record_campaign_result_accounting(
+    paths: &DeadreckonPaths,
+    campaign_id: &str,
+    state: &mut deadreckon_core::PipelineState,
+) -> Result<()> {
+    let campaign_dir = paths.plan_dir(campaign_id);
+    let campaign = deadreckon_core::campaign::read_campaign(&campaign_dir)?;
+    let planner = read_campaign_planner_accounting(&campaign_dir)?;
+    let total_cap = campaign
+        .tree_budget_usd
+        .map(|remaining| remaining + planner.as_ref().map_or(0.0, |value| value.cost_usd));
+    let total_wall_cap = campaign
+        .tree_wall_seconds
+        .map(|remaining| remaining + planner.as_ref().map_or(0.0, |value| value.wall_seconds));
+    if let Some(planner) = planner {
+        state.total_spend_usd += planner.cost_usd;
+        state.total_wall_seconds += planner.wall_seconds;
+        deadreckon_core::append_spend(
+            state,
+            &SpendRecord {
+                timestamp: Utc::now(),
+                turn: state.turn,
+                provider: planner.provider,
+                model: planner.model,
+                input_tokens: planner.input_tokens,
+                output_tokens: planner.output_tokens,
+                cost_usd: planner.cost_usd,
+                total_cost_usd: state.total_spend_usd,
+                cap_usd: total_cap,
+                subscription: planner.subscription,
+                estimated: false,
+                wall_time_seconds: Some(planner.wall_seconds),
+                wall_time_cap_seconds: total_wall_cap,
+                kind: "campaign_root_planner".to_string(),
+            },
+        )?;
+    }
+    for sub in &campaign.sub_goals {
+        let Some(run_id) = sub.result_run_id.as_deref() else {
+            continue;
+        };
+        let child = load_run(paths, run_id)?;
+        state.total_spend_usd += child.total_spend_usd;
+        state.total_wall_seconds += child.total_wall_seconds;
+        deadreckon_core::append_spend(
+            state,
+            &SpendRecord {
+                timestamp: Utc::now(),
+                turn: state.turn,
+                provider: "deadreckon:campaign-subtree".to_string(),
+                model: sub.sub_id.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cost_usd: child.total_spend_usd,
+                total_cost_usd: state.total_spend_usd,
+                cap_usd: total_cap,
+                subscription: false,
+                estimated: false,
+                wall_time_seconds: Some(child.total_wall_seconds),
+                wall_time_cap_seconds: total_wall_cap,
+                kind: "campaign_subtree".to_string(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn write_campaign_manifest(
@@ -1373,7 +1560,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         },
     )?;
     let overrides = BTreeMap::new();
-    let tasks = build_full_plan_tasks(
+    let planned_tasks = build_full_plan_tasks_accounted(
         &paths,
         &goal,
         n,
@@ -1385,6 +1572,8 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         false,
     )
     .await?;
+    let tasks = planned_tasks.tasks;
+    let mut planner_accounting = planned_tasks.planner_accounting;
     let sub_goal_strings: Vec<String> = tasks.iter().map(|task| task.goal.clone()).collect();
     let sub_goals =
         campaign::build_sub_goals(sub_goal_strings, usize::from(n)).map_err(CliError::Core)?;
@@ -1397,13 +1586,18 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         &[],
     )?;
 
+    let remaining = campaign_remaining_after_planning(
+        args.max_spend,
+        args.max_wall_seconds,
+        planner_accounting.as_ref(),
+    )?;
     let mut campaign_obj = campaign::Campaign::new(
         goal.clone(),
         sub_goals,
         providers.clone(),
         lineage.depth,
-        args.max_spend,
-        args.max_wall_seconds,
+        remaining.spend_usd,
+        remaining.wall_seconds,
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(CliError::Core)?;
@@ -1414,12 +1608,30 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     let campaign_dir = paths.plan_dir(&campaign_id);
     fs::create_dir_all(&campaign_dir)?;
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+    append_campaign_planner_accounting(&campaign_dir, planner_accounting.as_ref())?;
     commands::graph_job::record_current_artifact(
         &paths,
         commands::graph_job::DriverKind::Campaign,
         "campaign",
         &campaign_id,
     )?;
+    if let Some(reason) = remaining.exhausted_reason {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "budget_exhausted",
+            json!({
+                "reason": reason,
+                "phase": "root_planner",
+                "child_launches": 0,
+            }),
+        )?;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &reason,
+            "raise --max-spend/--max-wall-seconds or use a deterministic pre-approved decomposition",
+        )));
+    }
     let mut lineage_scopes = lineage.ancestor_scopes.clone();
     lineage_scopes.push(scope.clone());
     campaign::write_lineage(
@@ -1441,6 +1653,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     if args.preview {
         if !args.quiet {
             print_campaign_preflight(&campaign_obj, args.sandbox.as_deref());
+            print_campaign_contract_preview(&campaign_contract_preview(&args, &cwd)?);
         }
         campaign::write_campaign(&campaign_dir, &campaign_obj)?;
         return Ok(());
@@ -1462,7 +1675,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             }
             CampaignPreflightAction::ChangeCount(new_n) => {
                 n = new_n;
-                let tasks = build_full_plan_tasks(
+                let planned = build_full_plan_tasks_accounted(
                     &paths,
                     &goal,
                     n,
@@ -1474,6 +1687,36 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                     false,
                 )
                 .await?;
+                merge_campaign_planner_accounting(
+                    &mut planner_accounting,
+                    planned.planner_accounting,
+                );
+                let remaining = campaign_remaining_after_planning(
+                    args.max_spend,
+                    args.max_wall_seconds,
+                    planner_accounting.as_ref(),
+                )?;
+                campaign_obj.tree_budget_usd = remaining.spend_usd;
+                campaign_obj.tree_wall_seconds = remaining.wall_seconds;
+                append_campaign_planner_accounting(&campaign_dir, planner_accounting.as_ref())?;
+                if let Some(reason) = remaining.exhausted_reason {
+                    campaign_obj.status = campaign::CampaignStatus::Failed;
+                    campaign::append_campaign_event(
+                        &campaign_dir,
+                        "budget_exhausted",
+                        json!({
+                            "reason": reason,
+                            "phase": "root_planner_replan",
+                            "child_launches": 0,
+                        }),
+                    )?;
+                    campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        &reason,
+                        "raise --max-spend/--max-wall-seconds or keep the current decomposition",
+                    )));
+                }
+                let tasks = planned.tasks;
                 let sub_goal_strings: Vec<String> =
                     tasks.iter().map(|task| task.goal.clone()).collect();
                 let sub_goals = campaign::build_sub_goals(sub_goal_strings, usize::from(n))
@@ -1503,6 +1746,224 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
 
     execute_campaign_state(&paths, &cwd, &scope, &lineage, &args, campaign_obj).await
+}
+
+struct CampaignContractPreview {
+    source: String,
+    name: String,
+    checks: Vec<String>,
+}
+
+fn campaign_contract_preview(args: &CampaignArgs, cwd: &Path) -> Result<CampaignContractPreview> {
+    if let Some(path) = args.acceptance.as_deref() {
+        let spec: deadreckon_core::AcceptanceSpec = serde_yaml::from_slice(&fs::read(path)?)
+            .map_err(|source| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "could not read campaign acceptance contract {}: {source}",
+                    path.display()
+                )))
+            })?;
+        return Ok(CampaignContractPreview {
+            source: format!("selected {}", path.display()),
+            name: spec
+                .name
+                .unwrap_or_else(|| "unnamed acceptance contract".to_string()),
+            checks: spec
+                .checks
+                .iter()
+                .map(campaign_acceptance_check_label)
+                .collect(),
+        });
+    }
+    let kind = deadreckon_core::acceptance_defaults::detect_project_kind(cwd);
+    let checks = deadreckon_core::acceptance_defaults::default_checks_for(&kind, cwd);
+    Ok(CampaignContractPreview {
+        source: format!(
+            "detected {}",
+            deadreckon_core::acceptance_defaults::kind_label(&kind)
+        ),
+        name: format!(
+            "deadreckon detected {}",
+            deadreckon_core::acceptance_defaults::kind_label(&kind)
+        ),
+        checks: checks.iter().map(campaign_acceptance_check_label).collect(),
+    })
+}
+
+fn campaign_acceptance_check_label(check: &deadreckon_core::AcceptanceCheck) -> String {
+    serde_json::to_value(check)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "acceptance_check".to_string())
+}
+
+fn print_campaign_contract_preview(preview: &CampaignContractPreview) {
+    println!("  done contract: {} — {}", preview.source, preview.name);
+    if preview.checks.is_empty() {
+        println!("    checks: none (semantic judge remains required)");
+    } else {
+        println!("    checks: {}", preview.checks.join(", "));
+    }
+}
+
+fn campaign_accepted_by(yes: bool) -> deadreckon_protocol::AuthorityAcceptedBy {
+    if yes {
+        deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+    } else {
+        deadreckon_protocol::AuthorityAcceptedBy::Operator
+    }
+}
+
+pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
+    let goal = args.goal.trim().to_string();
+    if goal.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign goal must be non-empty",
+            "deadreckon campaign \"your goal\" --yes",
+        )));
+    }
+    if let Some(n) = args.n {
+        deadreckon_core::plan::validate_task_count(usize::from(n)).map_err(CliError::Core)?;
+    }
+    if args.planner_model.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable campaign Jobs do not yet preserve a separate planner model; no Job was created",
+            "omit --planner-model or use --model for the shared campaign model",
+        )));
+    }
+    if args.narrate || args.narrator_model.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable campaign Jobs do not yet run the optional legacy narrator; no Job was created",
+            "omit --narrate and inspect the authenticated Job receipt with `deadreckon report latest`",
+        )));
+    }
+    let paths = DeadreckonPaths::discover();
+    let defaults = config_defaults(&paths)?;
+    let cwd = std::env::current_dir()?;
+    let scope = workspace_scope(&cwd)?;
+    let contract_preview = campaign_contract_preview(&args, &cwd)?;
+    let sandbox = args
+        .sandbox
+        .clone()
+        .or(defaults.sandbox)
+        .unwrap_or_else(|| "auto".to_string());
+    if sandbox == "none" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable campaign Jobs require an isolated sandbox; no Job was created",
+            "use --sandbox auto or an available isolated sandbox backend",
+        )));
+    }
+    let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+    let max_wall_seconds = args
+        .max_wall_seconds
+        .or(defaults.cli_max_wall_seconds)
+        .unwrap_or(36_000.0);
+    if !max_spend_usd.is_finite() || max_spend_usd <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable campaign max spend must be a positive finite value".to_string(),
+        )));
+    }
+    if !max_wall_seconds.is_finite() || max_wall_seconds <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable campaign wall cap must be a positive finite value".to_string(),
+        )));
+    }
+    let max_wall_seconds = max_wall_seconds as u64;
+    if !args.yes {
+        if !io::stdin().is_terminal() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "non-interactive durable campaign start requires --yes; no Job was created",
+                "deadreckon campaign \"your goal\" --yes",
+            )));
+        }
+        println!(
+            "durable campaign\n  goal: {}\n  children: {}\n  spend cap: ${max_spend_usd:.2}\n  wall cap: {max_wall_seconds}s",
+            goal,
+            args.n
+                .map_or_else(|| "planner-selected".to_string(), |n| n.to_string())
+        );
+        print_campaign_contract_preview(&contract_preview);
+        if !prompt::confirm("create and start this durable campaign Job?", true)? {
+            println!("{}", ui_status("cancelled"));
+            return Ok(());
+        }
+    }
+    let mut launch = commands::course::trivial_operator_plan(
+        &goal,
+        commands::course::CourseShape::Campaign,
+        "direct_campaign_job",
+    );
+    launch.n = args.n;
+    launch.budget.ceiling_usd = Some(max_spend_usd);
+    launch.budget.wall_seconds = Some(max_wall_seconds);
+    let mut signals = launch.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(
+        "watchkeeper_campaign_budget".to_string(),
+        json!({
+            "approved_total_spend_usd": max_spend_usd,
+            "approved_total_wall_seconds": max_wall_seconds,
+            "root_planner_policy": "measure the token-bounded root planner completion, persist it before child launch, and subtract its exact spend/wall from the campaign tree budget; refuse child launch if either cap is exhausted",
+        }),
+    );
+    signals.insert(
+        "watchkeeper_contract_approval".to_string(),
+        json!({
+            "source": contract_preview.source,
+            "name": contract_preview.name,
+            "checks": contract_preview.checks,
+            "approval": if args.yes { "yes_flag_guardrail" } else { "interactive_operator" },
+        }),
+    );
+    launch.signals = serde_json::Value::Object(signals);
+    launch.accepted_by = Some(if args.yes {
+        "yes-flag-guardrail".to_string()
+    } else {
+        "operator".to_string()
+    });
+    let accepted_by = campaign_accepted_by(args.yes);
+    let job = commands::job::create_job(commands::job::CreateJob {
+        paths: &paths,
+        source_cwd: &cwd,
+        scope,
+        launch_plan: launch,
+        shape: deadreckon_protocol::JobShape::LegacyCampaign,
+        driver: Some(commands::graph_job::DriverSpec {
+            kind: commands::graph_job::DriverKind::Campaign,
+            child_count: args.n,
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            planner_provider: args.planner_provider,
+            child_provider: args.provider,
+            child_provider_overrides: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            model: args.model,
+            source_init_git: false,
+        }),
+        contract_source: args.acceptance.as_deref(),
+        source: commands::job::DurableSource {
+            mode: commands::job::DurableSourceMode::Worktree,
+            from: Some(cwd.clone()),
+            allow_dirty: false,
+        },
+        max_spend_usd,
+        max_wall_seconds,
+        max_attempts: 3,
+        sandbox_requested: sandbox,
+        accepted_by,
+    })?;
+    commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
+    if args.quiet {
+        println!("{}", job.job_id);
+        Ok(())
+    } else {
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref())?;
+        commands::job::print_job_status(&view, false)
+    }
 }
 
 pub(crate) async fn resume_campaign_job(
@@ -1719,6 +2180,31 @@ async fn execute_campaign_state(
                 .unwrap_or(0.0)
         },
     )?;
+
+    let final_tree_spend_usd = campaign_obj
+        .sub_goals
+        .iter()
+        .filter_map(|sub| sub.result_run_id.as_deref())
+        .filter_map(|run_id| load_run(paths, run_id).ok())
+        .map(|state| state.total_spend_usd)
+        .sum::<f64>();
+    if campaign::tree_budget_exhausted(campaign_obj.tree_budget_usd, final_tree_spend_usd) {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "budget_exhausted",
+            json!({
+                "spent_usd": final_tree_spend_usd,
+                "tree_budget_usd": campaign_obj.tree_budget_usd,
+                "phase": "post_children_pre_merge",
+            }),
+        )?;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign children exhausted the remaining approved spend before parent verification",
+            "inspect `deadreckon status` and restart with a larger approved cap",
+        )));
+    }
 
     let rollup = campaign::build_rollup(&campaign_obj, |run_id| match load_run(paths, run_id) {
         Ok(state) => {
@@ -2770,5 +3256,154 @@ mod model_argv_tests {
             narrate_parsed,
             "orchestrate full-plan must parse --narrate/--narrator-model from the campaign argv"
         );
+    }
+}
+
+#[cfg(test)]
+mod durable_campaign_launch_tests {
+    use std::fs;
+
+    use super::{
+        CampaignArgs, PlannerAccounting, campaign_accepted_by, campaign_contract_preview,
+        campaign_remaining_after_planning, schedule_campaign_job,
+    };
+
+    fn args() -> CampaignArgs {
+        CampaignArgs {
+            goal: "complete the campaign".to_string(),
+            n: Some(2),
+            planner_provider: None,
+            provider: None,
+            planner_model: None,
+            model: None,
+            max_spend: Some(2.0),
+            max_wall_seconds: Some(120.0),
+            sandbox: Some("auto".to_string()),
+            acceptance: None,
+            preview: false,
+            yes: true,
+            no_hints: true,
+            quiet: true,
+            plain: true,
+            narrate: false,
+            no_narrate: true,
+            narrator_model: None,
+        }
+    }
+
+    #[test]
+    fn durable_campaign_refuses_unpreserved_planner_model() {
+        let mut request = args();
+        request.planner_model = Some("planner-only".to_string());
+
+        let error = schedule_campaign_job(request).expect_err("planner model must be explicit");
+
+        assert!(error.to_string().contains("separate planner model"));
+        assert!(error.to_string().contains("no Job was created"));
+    }
+
+    #[test]
+    fn durable_campaign_refuses_legacy_narration_instead_of_ignoring_it() {
+        let mut request = args();
+        request.narrate = true;
+
+        let error = schedule_campaign_job(request).expect_err("narration must not be ignored");
+
+        assert!(error.to_string().contains("optional legacy narrator"));
+        assert!(error.to_string().contains("authenticated Job receipt"));
+    }
+
+    #[test]
+    fn durable_campaign_refuses_unsandboxed_trusted_execution() {
+        let mut request = args();
+        request.sandbox = Some("none".to_string());
+
+        let error = schedule_campaign_job(request).expect_err("sandbox none must fail closed");
+
+        assert!(error.to_string().contains("require an isolated sandbox"));
+        assert!(error.to_string().contains("no Job was created"));
+    }
+
+    #[test]
+    fn root_planner_accounting_is_subtracted_before_child_launch() {
+        let accounting = PlannerAccounting {
+            spend: deadreckon_providers::SpendEstimate {
+                provider: "test".to_string(),
+                model: "planner".to_string(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 1.25,
+                subscription: false,
+                wall_time_seconds: Some(5.0),
+            },
+            wall_seconds: 5.0,
+        };
+
+        let remaining =
+            campaign_remaining_after_planning(Some(10.0), Some(100.0), Some(&accounting))
+                .expect("remaining budget");
+
+        assert_eq!(remaining.spend_usd, Some(8.75));
+        assert_eq!(remaining.wall_seconds, Some(95.0));
+        assert!(remaining.exhausted_reason.is_none());
+    }
+
+    #[test]
+    fn root_planner_exhaustion_is_a_typed_pre_child_refusal() {
+        let accounting = PlannerAccounting {
+            spend: deadreckon_providers::SpendEstimate {
+                provider: "test".to_string(),
+                model: "planner".to_string(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 2.0,
+                subscription: false,
+                wall_time_seconds: Some(5.0),
+            },
+            wall_seconds: 5.0,
+        };
+
+        let remaining =
+            campaign_remaining_after_planning(Some(1.0), Some(100.0), Some(&accounting))
+                .expect("bounded accounting");
+
+        assert_eq!(remaining.spend_usd, Some(0.0));
+        assert!(
+            remaining
+                .exhausted_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("before child launch"))
+        );
+    }
+
+    #[test]
+    fn campaign_yes_and_interactive_approval_have_distinct_authority() {
+        assert_eq!(
+            campaign_accepted_by(true),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+        );
+        assert_eq!(
+            campaign_accepted_by(false),
+            deadreckon_protocol::AuthorityAcceptedBy::Operator
+        );
+    }
+
+    #[test]
+    fn selected_campaign_contract_is_parsed_for_pre_approval_display() {
+        let temp = tempfile::tempdir().expect("temp");
+        let acceptance = temp.path().join("acceptance.yaml");
+        fs::write(
+            &acceptance,
+            "name: explicit campaign done\nchecks:\n  - kind: file_exists\n    path: README.md\n",
+        )
+        .expect("acceptance");
+        let mut request = args();
+        request.acceptance = Some(acceptance.clone());
+
+        let preview = campaign_contract_preview(&request, temp.path()).expect("preview");
+
+        assert_eq!(preview.source, format!("selected {}", acceptance.display()));
+        assert_eq!(preview.name, "explicit campaign done");
+        assert_eq!(preview.checks, vec!["file_exists"]);
     }
 }

@@ -215,8 +215,9 @@ async fn drive_plan(
 ) -> Result<()> {
     let authority: deadreckon_protocol::JobAuthority =
         serde_json::from_slice(&fs::read(paths.job_authority(job.job_id.as_ref()))?)?;
+    let execution = commands::orchestrate::durable_orchestration_spec(&plan)?.unwrap_or_default();
     if driver_state_path(paths, job.job_id.as_ref()).is_file() {
-        return resume_plan(paths, job, &authority, driver).await;
+        return resume_plan(paths, job, &authority, driver, execution).await;
     }
     let mode = match driver.kind {
         DriverKind::Review => CliPlanMode::Review,
@@ -229,6 +230,7 @@ async fn drive_plan(
     };
     commands::orchestrate::orchestrate_command(commands::orchestrate::OrchestrateRunArgs {
         seed_pieces: plan.pieces,
+        accepted_launch_plan: None,
         plan: PlanCommandArgs {
             goal: job.goal.clone(),
             n,
@@ -242,11 +244,11 @@ async fn drive_plan(
             child_provider: driver.child_provider_overrides,
             coder_provider: driver.coder_provider,
             reviewer_provider: driver.reviewer_provider,
-            planner_model: None,
+            planner_model: execution.planner_model,
             model: driver.model,
-            child_model: Vec::new(),
-            coder_model: None,
-            reviewer_model: None,
+            child_model: execution.child_models,
+            coder_model: execution.coder_model,
+            reviewer_model: execution.reviewer_model,
             init_git: driver.source_init_git,
             acceptance: Some(commands::job::job_acceptance_path(
                 paths,
@@ -260,10 +262,10 @@ async fn drive_plan(
         },
         preview: false,
         yes: true,
-        no_repair: false,
+        no_repair: execution.no_repair,
         completion_surface: false,
-        narrate: false,
-        narrator_model: None,
+        narrate: execution.narrate,
+        narrator_model: execution.narrator_model,
     })
     .await
 }
@@ -273,6 +275,7 @@ async fn resume_plan(
     job: &deadreckon_protocol::Job,
     authority: &deadreckon_protocol::JobAuthority,
     driver: DriverSpec,
+    execution: commands::orchestrate::DurableOrchestrationSpec,
 ) -> Result<()> {
     use deadreckon_core::plan::{PlanStatus, PlanTaskStatus};
 
@@ -301,14 +304,15 @@ async fn resume_plan(
             child_provider: driver.child_provider_overrides,
             coder_provider: driver.coder_provider,
             reviewer_provider: driver.reviewer_provider,
-            no_repair: false,
+            no_repair: execution.no_repair,
             repair_provider: None,
+            yes: true,
             no_hints: true,
             quiet: true,
             plain: true,
             completion_surface: false,
-            narrate: false,
-            narrator_model: None,
+            narrate: execution.narrate,
+            narrator_model: execution.narrator_model.clone(),
         })
         .await?;
     }
@@ -316,7 +320,7 @@ async fn resume_plan(
         plan_id: job.job_id.as_ref().to_string(),
         strategy: "dag-aware".to_string(),
         prefer_child: None,
-        no_repair: false,
+        no_repair: execution.no_repair,
         repair_provider: None,
         repair_mode: "auto".to_string(),
         repair_attempts: 1,
@@ -347,6 +351,10 @@ async fn drive_campaign(
         max_spend: Some(job.policy.max_spend_usd),
         max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
         sandbox: Some(authority.sandbox_requested),
+        acceptance: Some(commands::job::job_acceptance_path(
+            paths,
+            job.job_id.as_ref(),
+        )),
         preview: false,
         yes: true,
         no_hints: true,

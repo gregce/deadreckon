@@ -1722,11 +1722,16 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
             .into_iter()
             .map(|entry| entry.plan_id)
             .collect();
+    let before_jobs = super::job::list_jobs(&paths, None)?
+        .into_iter()
+        .map(|view| view.job.job_id.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
     let goal = plan.goal.clone();
     super::orchestrate::orchestrate_command(super::orchestrate::OrchestrateRunArgs {
         // A reshape already carries the accepted decomposition; hand it to
         // plan creation instead of re-planning the same goal.
         seed_pieces: plan.pieces.clone(),
+        accepted_launch_plan: Some(plan.clone()),
         plan: crate::cli::PlanCommandArgs {
             goal: goal.clone(),
             n,
@@ -1767,8 +1772,16 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
         .filter(|entry| entry.goal == goal && !before.contains(&entry.plan_id))
         .map(|entry| entry.plan_id)
         .next_back();
+    let dispatched_job = super::job::list_jobs(&paths, None)?
+        .into_iter()
+        .filter(|view| view.job.goal == goal && !before_jobs.contains(view.job.job_id.as_ref()))
+        .map(|view| view.job.job_id.to_string())
+        .next_back();
     if let Some(plan_id) = dispatched.as_ref() {
         save_launch_plan_best_effort(&paths.plan_dir(plan_id), &plan);
+    }
+    if let Some(job_id) = dispatched_job.as_ref() {
+        save_launch_plan_best_effort(&paths.job_dir(job_id), &plan);
     }
     if args.json {
         println!(
@@ -1776,7 +1789,10 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
             serde_json::to_string_pretty(&json!({
                 "kind": "reshape",
                 "run_id": state.run_id,
-                "dispatched": { "plan_id": dispatched },
+                "dispatched": {
+                    "job_id": dispatched_job,
+                    "plan_id": dispatched,
+                },
                 "plan": &plan,
             }))?
         );
