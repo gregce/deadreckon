@@ -7,11 +7,18 @@
 //! I/O, async runtimes, or another DeadReckon crate.
 
 pub mod ids;
+pub mod job;
 pub mod ledger;
 pub mod policy;
 pub mod schema;
 
-pub use ids::{PlanId, RunId, TurnId};
+pub use ids::{JobId, PlanId, RunId, TurnId};
+pub use job::{
+    AuthorityAcceptedBy, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
+    GoalCoverage, GoalCoverageStatus, JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent,
+    JobEventKind, JobEventSequence, JobLease, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion,
+    JobShape, SemanticDecision, SemanticJudgeMode, SemanticJudgment, StopReason,
+};
 pub use ledger::{
     EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,
     NarrativeSnapshotRef, NarrativeSnapshotRefLine, RunEvent, RunEventKind, SpendLine, SpendRecord,

@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SemanticJudgment",
+  "description": "Independent read-only assessment persisted in `proofs/semantic-judgment.json`.",
+  "type": "object",
+  "required": [
+    "decision",
+    "goal_coverage",
+    "input_sha256",
+    "job_id",
+    "judged_at",
+    "missing",
+    "model",
+    "provider",
+    "run_id",
+    "schema_version",
+    "spend_usd",
+    "summary"
+  ],
+  "properties": {
+    "decision": {
+      "$ref": "#/definitions/SemanticDecision"
+    },
+    "goal_coverage": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GoalCoverage"
+      }
+    },
+    "input_sha256": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "judged_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "model": {
+      "type": "string"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "spend_usd": {
+      "type": "number",
+      "format": "double"
+    },
+    "summary": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "GoalCoverage": {
+      "type": "object",
+      "required": [
+        "claim",
+        "evidence",
+        "status"
+      ],
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "$ref": "#/definitions/GoalCoverageStatus"
+        }
+      }
+    },
+    "GoalCoverageStatus": {
+      "type": "string",
+      "enum": [
+        "met",
+        "missing",
+        "unclear"
+      ]
+    },
+    "SemanticDecision": {
+      "type": "string",
+      "enum": [
+        "achieved",
+        "revise",
+        "uncertain"
+      ]
+    }
+  }
+}
