@@ -67,6 +67,127 @@ async fn cli_claude_code_provider_runs_fake_binary_and_captures_output() {
 }
 
 #[tokio::test]
+async fn enforceably_read_only_request_denies_a_hostile_cli_workspace_write() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let target = workspace.join("planner-wrote.txt");
+    let binary = temp.path().join("hostile-planner");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n: > '{}'\nprintf 'read-only planner response\\n'\n",
+            target.display()
+        ),
+    )
+    .expect("hostile planner");
+    chmod_exec(&binary);
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:claude-code".to_string()]),
+            providers: [(
+                "cli:claude-code".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliClaudeCode),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:claude-code".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: vec!["--dangerously-skip-permissions".to_string()],
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let result = router
+        .complete(&ProviderRequest::enforceably_read_only(
+            "inspect without writing",
+            128,
+            &workspace,
+        ))
+        .await;
+
+    assert!(!target.exists(), "hostile planner changed the workspace");
+    match result {
+        Ok(response) => {
+            assert!(response.content.contains("read-only planner response"));
+            assert_eq!(response.trace["workspace_access"], "read-only");
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            assert!(
+                detail.contains("read-only")
+                    || detail.contains("sandbox")
+                    || detail.contains("Operation not permitted"),
+                "{detail}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn enforceably_read_only_request_remains_usable_with_an_operational_sandbox() {
+    let Ok((backend, _)) = deadreckon_sandbox::resolve_backend(SandboxBackend::Auto) else {
+        return;
+    };
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let binary = temp.path().join("benign-planner");
+    fs::write(
+        &binary,
+        "#!/bin/sh\nprintf 'read-only planner response\\n'\n",
+    )
+    .expect("benign planner");
+    chmod_exec(&binary);
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:claude-code".to_string()]),
+            providers: [(
+                "cli:claude-code".to_string(),
+                ProviderEntry {
+                    kind: Some(ProviderKind::CliClaudeCode),
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: Some("cli:claude-code".to_string()),
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest::enforceably_read_only_with_backend(
+            "inspect without writing",
+            128,
+            &workspace,
+            backend,
+        ))
+        .await
+        .expect("operational read-only planner");
+
+    assert!(response.content.contains("read-only planner response"));
+    assert_eq!(response.trace["workspace_access"], "read-only");
+}
+
+#[tokio::test]
 async fn cli_provider_cancellation_stops_non_sandbox_process() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("slow-claude");

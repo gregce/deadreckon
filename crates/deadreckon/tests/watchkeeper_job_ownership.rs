@@ -11,8 +11,13 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_core::campaign::{Campaign, CampaignStatus, build_sub_goals, write_campaign};
-use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, save_plan};
-use deadreckon_core::{DeadreckonPaths, write_job};
+use deadreckon_core::plan::{
+    Plan, PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, TaskAttempt,
+    save_plan,
+};
+use deadreckon_core::{
+    DeadreckonPaths, RunOptions, RunOwnership, RunStatus, create_owned_run, save_state, write_job,
+};
 #[cfg(target_os = "macos")]
 use deadreckon_core::{JobView, read_job_history, read_plan_events};
 #[cfg(target_os = "macos")]
@@ -76,6 +81,26 @@ fn public_fork_and_merge_cannot_mutate_a_job_owned_plan() {
     child.parent_plan_id = Some(job_id.to_string());
     child.parent_cwd = Some(workspace.clone());
     plan.tasks[0].subplan = Some(child.plan_id.clone());
+    let mut nested_result = create_owned_run(
+        &paths,
+        RunOptions {
+            goal: child.root_goal.clone(),
+            cwd: workspace.clone(),
+            sandbox: "auto".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+        RunOwnership::plan_result(job_id, &child.plan_id),
+    )
+    .expect("owned nested result");
+    nested_result.status = RunStatus::Completed;
+    save_state(&nested_result).expect("save nested result");
+    child.merged_run_id = Some(nested_result.run_id.clone());
+    child.status = PlanStatus::Merged;
     save_plan(&paths, &child).expect("save nested plan");
     save_plan(&paths, &plan).expect("save plan");
     let root_before = fs::read(paths.plan_json(job_id)).expect("root Plan before");
@@ -105,6 +130,21 @@ fn public_fork_and_merge_cannot_mutate_a_job_owned_plan() {
             );
         }
     }
+    let export = temp.path().join("forbidden-plan-export");
+    let output = deadreckon(&paths, &workspace)
+        .args([
+            "finish",
+            &child.plan_id,
+            "--dest",
+            export.to_str().expect("export path"),
+        ])
+        .output()
+        .expect("public nested Plan finish");
+    assert_job_owned_refusal(&output);
+    assert!(
+        !export.exists(),
+        "public nested Plan finish exported a result"
+    );
     assert_eq!(
         fs::read_dir(paths.jobs_dir())
             .expect("jobs")
@@ -112,6 +152,182 @@ fn public_fork_and_merge_cannot_mutate_a_job_owned_plan() {
             .count(),
         1,
         "public fork compiled a second durable Job"
+    );
+}
+
+#[test]
+fn public_resume_and_extend_cannot_mutate_a_job_owned_child() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(&workspace).expect("workspace");
+    let job_id = "12121212121212121212121212121212";
+    write_job_fixture(&paths, &workspace, job_id, JobShape::Graph);
+
+    let mut plan = Plan::new(
+        "complete one owned task",
+        PlanMode::FullPlan,
+        vec![
+            PlanTask::new(
+                0,
+                "owned task",
+                "complete owned task",
+                PlanRole::Child,
+                None,
+            ),
+            PlanTask::new(
+                1,
+                "later task",
+                "complete later task",
+                PlanRole::Child,
+                None,
+            ),
+        ],
+        PlanProviders::default(),
+        Some("watchkeeper-test".to_string()),
+        "test",
+    )
+    .expect("plan");
+    plan.plan_id = job_id.to_string();
+    plan.owner_job_id = Some(job_id.to_string());
+    plan.parent_cwd = Some(workspace.clone());
+    plan.tasks[0].status = PlanTaskStatus::Running;
+    save_plan(&paths, &plan).expect("save awaiting Plan");
+
+    let mut first = create_owned_run(
+        &paths,
+        RunOptions {
+            goal: "first owned attempt".to_string(),
+            cwd: workspace.clone(),
+            sandbox: "auto".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+        RunOwnership::plan_task(job_id, job_id, "task-0", 0, 1),
+    )
+    .expect("owned first Run");
+    first.status = RunStatus::Completed;
+    save_state(&first).expect("save first Run");
+
+    let first_before = fs::read(first.state_path()).expect("first state before");
+    let output = deadreckon(&paths, &workspace)
+        .args(["resume", &first.run_id])
+        .output()
+        .expect("public resume in ownership creation window");
+    assert_job_owned_refusal(&output);
+    assert_eq!(
+        fs::read(first.state_path()).expect("first state after"),
+        first_before
+    );
+
+    plan.tasks[0].attempts.push(TaskAttempt::failed(
+        1,
+        Some(first.run_id.clone()),
+        Some("retry fixture".to_string()),
+        0.0,
+    ));
+    let mut current = create_owned_run(
+        &paths,
+        RunOptions {
+            goal: "current owned attempt".to_string(),
+            cwd: workspace.clone(),
+            sandbox: "auto".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+        RunOwnership::plan_task(job_id, job_id, "task-0", 0, 2),
+    )
+    .expect("owned current Run");
+    current.status = RunStatus::Completed;
+    save_state(&current).expect("save current Run");
+    plan.tasks[0].child_run_id = Some(current.run_id.clone());
+    save_plan(&paths, &plan).expect("save linked Plan");
+
+    let plan_before = fs::read(paths.plan_json(job_id)).expect("Plan before");
+    let current_before = fs::read(current.state_path()).expect("current state before");
+    for arguments in [
+        vec!["resume".to_string(), format!("{job_id}:task-0")],
+        vec![
+            "extend".to_string(),
+            current.run_id.clone(),
+            "unauthorized follow-up".to_string(),
+        ],
+        vec!["resume".to_string(), first.run_id.clone()],
+        vec!["finish".to_string(), current.run_id.clone()],
+        vec!["apply".to_string(), current.run_id.clone()],
+        vec!["abandon".to_string(), current.run_id.clone()],
+        vec!["cleanup".to_string(), current.run_id.clone()],
+        vec!["undo".to_string(), current.run_id.clone()],
+        vec![
+            "rewind".to_string(),
+            current.run_id.clone(),
+            "--preview".to_string(),
+        ],
+        vec![
+            "steer".to_string(),
+            current.run_id.clone(),
+            "change the approved task".to_string(),
+        ],
+        vec![
+            "doc".to_string(),
+            current.run_id.clone(),
+            "--polish".to_string(),
+            "--no-confirm".to_string(),
+            "--force".to_string(),
+        ],
+    ] {
+        let output = deadreckon(&paths, &workspace)
+            .args(arguments)
+            .output()
+            .expect("public child mutation");
+        assert_job_owned_refusal(&output);
+        assert_eq!(
+            fs::read(paths.plan_json(job_id)).expect("Plan after"),
+            plan_before
+        );
+        assert_eq!(
+            fs::read(first.state_path()).expect("first state after"),
+            first_before
+        );
+        assert_eq!(
+            fs::read(current.state_path()).expect("current state after"),
+            current_before
+        );
+    }
+
+    let output = deadreckon(&paths, &workspace)
+        .args(["kill", &current.run_id])
+        .output()
+        .expect("kill owned child");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        deadreckon_core::read_job_history(&paths.job_events(job_id))
+            .expect("Job history")
+            .events()
+            .iter()
+            .any(|event| matches!(
+                event.kind,
+                deadreckon_protocol::JobEventKind::CancelRequested
+            )),
+        "killing a child did not cancel its durable Job"
+    );
+    assert_eq!(
+        fs::read(current.state_path()).expect("current state after Job cancellation"),
+        current_before,
+        "Job cancellation mutated the child Run directly"
     );
 }
 
@@ -160,6 +376,79 @@ fn public_campaign_repair_cannot_mutate_a_job_owned_campaign() {
         directory_names(&campaign_dir),
         files_before,
         "public campaign repair wrote evidence before refusing"
+    );
+}
+
+#[test]
+fn public_campaign_result_cannot_bypass_its_job_lifecycle() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(&workspace).expect("workspace");
+    let job_id = "23232323232323232323232323232323";
+    write_job_fixture(&paths, &workspace, job_id, JobShape::LegacyCampaign);
+
+    let mut campaign = Campaign::new(
+        "complete both campaign branches",
+        build_sub_goals(
+            vec!["complete first".to_string(), "complete second".to_string()],
+            2,
+        )
+        .expect("sub-goals"),
+        PlanProviders::default(),
+        0,
+        None,
+        None,
+        "test",
+    )
+    .expect("campaign");
+    campaign.campaign_id = job_id.to_string();
+    campaign.status = CampaignStatus::Forked;
+    let campaign_dir = paths.plan_dir(job_id);
+    fs::create_dir_all(&campaign_dir).expect("campaign dir");
+    write_campaign(&campaign_dir, &campaign).expect("write campaign creation window");
+
+    let mut result = create_owned_run(
+        &paths,
+        RunOptions {
+            goal: campaign.root_goal.clone(),
+            cwd: workspace.clone(),
+            sandbox: "auto".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+        RunOwnership::campaign_result(job_id, job_id),
+    )
+    .expect("owned Campaign result");
+    result.status = RunStatus::Completed;
+    save_state(&result).expect("save Campaign result");
+
+    let state_before = fs::read(result.state_path()).expect("Campaign result before");
+    let output = deadreckon(&paths, &workspace)
+        .args(["resume", &result.run_id])
+        .output()
+        .expect("public Campaign result resume during creation window");
+    assert_job_owned_refusal(&output);
+    assert_eq!(
+        fs::read(result.state_path()).expect("Campaign result after"),
+        state_before
+    );
+
+    campaign.merged_run_id = Some(result.run_id.clone());
+    campaign.status = CampaignStatus::Merged;
+    write_campaign(&campaign_dir, &campaign).expect("write linked Campaign");
+    let output = deadreckon(&paths, &workspace)
+        .args(["doc", &result.run_id, "--polish", "--no-confirm", "--force"])
+        .output()
+        .expect("public Campaign result doc polish");
+    assert_job_owned_refusal(&output);
+    assert_eq!(
+        fs::read(result.state_path()).expect("Campaign result after doc polish"),
+        state_before
     );
 }
 

@@ -4433,7 +4433,7 @@ and promotion enforcement.
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
 human-review template, and a credential-free adversarial runner. The committed
-credential-free result records 7 passes, 0 failures, and 5 explicitly
+credential-free result records 11 passes, 0 failures, and 9 explicitly
 unproven live/host claims. The sanitized live result records 2 attempted tasks,
 22 not run, and 0 verified.
 

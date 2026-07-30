@@ -523,19 +523,11 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     let planner_started = std::time::Instant::now();
     let response = with_cli_wait_status(
         "drafting chain plan",
-        router.complete(&ProviderRequest {
+        router.complete(&ProviderRequest::enforceably_read_only(
             prompt,
-            max_output_tokens: u32::from(n) * 96,
-            cwd: Some(std::env::current_dir()?),
-            output_path: None,
-            sandbox_backend: None,
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token: None,
-                    session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-}),
+            u32::from(n) * 96,
+            std::env::current_dir()?,
+        )),
     )
     .await
     .map_err(|err| {
@@ -3720,7 +3712,8 @@ fn json_value_kind(value: &Value) -> &'static str {
 
 fn chain_planner_prompt(goal: &str, n: u8) -> String {
     format!(
-        "You are decomposing a coding goal into an ordered serial chain.\n\
+        "You are a read-only planning agent decomposing a coding goal into an ordered serial chain. \
+Do not write files, create temporary files, install packages, commit, delete, move, or mutate state.\n\
 Output a JSON array of <= {n} strings, each <= 160 chars, each a concrete next step. \
 Each step builds on the previous step's result. No prose, no commentary. Goal: {goal:?}."
     )

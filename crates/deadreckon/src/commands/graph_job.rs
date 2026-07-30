@@ -73,7 +73,7 @@ struct DriverContext {
 }
 
 static DRIVER_CONTEXT: OnceLock<DriverContext> = OnceLock::new();
-static DELEGATED_PLAN_CHILD: OnceLock<DelegatedAction> = OnceLock::new();
+static DELEGATED_PLAN_CHILD: OnceLock<deadreckon_core::RunOwnership> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -539,6 +539,29 @@ pub(crate) fn current_parent_job_id() -> Option<&'static str> {
     DRIVER_CONTEXT.get().map(|context| context.job_id.as_str())
 }
 
+pub(crate) fn current_driver_sandbox_backend(
+    paths: &DeadreckonPaths,
+) -> Result<Option<deadreckon_sandbox::SandboxBackend>> {
+    let Some(context) = DRIVER_CONTEXT.get() else {
+        return Ok(None);
+    };
+    let authority_path = paths.job_authority(&context.job_id);
+    let authority: deadreckon_protocol::JobAuthority =
+        serde_json::from_slice(&fs::read(&authority_path)?).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: authority_path,
+                source,
+            })
+        })?;
+    if authority.job_id.as_ref() != context.job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "trusted driver authority changed Job identity from {} to {}",
+            context.job_id, authority.job_id
+        ))));
+    }
+    Ok(Some(authority.sandbox_requested.parse()?))
+}
+
 pub(crate) fn current_acceptance_path() -> Option<&'static Path> {
     DRIVER_CONTEXT
         .get()
@@ -552,10 +575,11 @@ pub(crate) fn current_driver_owns_root_artifact() -> bool {
 }
 
 pub(crate) fn delegated_plan_child_authorized() -> bool {
-    matches!(
-        DELEGATED_PLAN_CHILD.get(),
-        Some(DelegatedAction::PlanChild { .. })
-    )
+    DELEGATED_PLAN_CHILD.get().is_some()
+}
+
+pub(crate) fn delegated_plan_child_ownership() -> Option<deadreckon_core::RunOwnership> {
+    DELEGATED_PLAN_CHILD.get().cloned()
 }
 
 fn install_driver_context(
@@ -1425,12 +1449,25 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
     let consumed = delegation_consumed_path(&paths, job_id, &capability_id);
     claim_delegation_record(&pending, &consumed, &raw)?;
     match &record.action {
-        action @ DelegatedAction::PlanChild { .. } => {
-            DELEGATED_PLAN_CHILD.set(action.clone()).map_err(|_| {
-                CliError::Core(DeadreckonError::InvalidInput(
-                    "this process already consumed another Plan child capability".to_string(),
+        DelegatedAction::PlanChild {
+            plan_id,
+            task_id,
+            task_index,
+            task_attempt,
+        } => {
+            DELEGATED_PLAN_CHILD
+                .set(deadreckon_core::RunOwnership::plan_task(
+                    record.job_id.clone(),
+                    plan_id.clone(),
+                    task_id.clone(),
+                    *task_index,
+                    *task_attempt,
                 ))
-            })?;
+                .map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "this process already consumed another Plan child capability".to_string(),
+                    ))
+                })?;
         }
         DelegatedAction::PlanFork { .. }
         | DelegatedAction::PlanMerge { .. }
@@ -1493,6 +1530,319 @@ pub(crate) fn require_current_driver_for_job_artifact(
         &format!(
             "{operation} cannot mutate {} because it belongs to durable Job {}",
             run_prefix(artifact_id),
+            run_prefix(owner.job.job_id.as_ref())
+        ),
+        &format!(
+            "deadreckon attach {}",
+            run_prefix(owner.job.job_id.as_ref())
+        ),
+    )))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedRunOwner {
+    pub(crate) job: deadreckon_protocol::Job,
+    owners: Vec<ResolvedPlanOwner>,
+}
+
+fn plan_task_references_run(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    run_id: &str,
+) -> Result<BTreeSet<String>> {
+    let mut tasks = BTreeSet::new();
+    for task in &plan.tasks {
+        let recorded = task.child_run_id.as_deref() == Some(run_id)
+            || task
+                .attempts
+                .iter()
+                .any(|attempt| attempt.run_id.as_deref() == Some(run_id));
+        let launched = fs::read_to_string(
+            paths
+                .plan_dir(&plan.plan_id)
+                .join("launch")
+                .join(&task.task_id)
+                .join("run-id"),
+        )
+        .ok()
+        .is_some_and(|recorded| recorded.trim() == run_id);
+        if recorded || launched {
+            tasks.insert(task.task_id.clone());
+        }
+    }
+    for event in deadreckon_core::read_plan_events(paths, &plan.plan_id)? {
+        let (task_id, event_run_id) = match event.event {
+            deadreckon_core::PlanEventKind::TaskRunDiscovered {
+                task_id, run_id, ..
+            }
+            | deadreckon_core::PlanEventKind::TaskCompleted {
+                task_id, run_id, ..
+            }
+            | deadreckon_core::PlanEventKind::TaskKilled {
+                task_id, run_id, ..
+            } => (Some(task_id), run_id),
+            deadreckon_core::PlanEventKind::TaskApplied {
+                task_id, run_id, ..
+            } => (Some(task_id), Some(run_id)),
+            deadreckon_core::PlanEventKind::TaskRetrying {
+                task_id,
+                parent_run_id,
+                ..
+            } => (Some(task_id), parent_run_id),
+            deadreckon_core::PlanEventKind::MergeRepairRunDiscovered { run_id, .. }
+            | deadreckon_core::PlanEventKind::MergeCompleted {
+                merged_run_id: run_id,
+            } => (None, Some(run_id)),
+            deadreckon_core::PlanEventKind::MergeRepaired { repair_run_id, .. } => {
+                (None, repair_run_id)
+            }
+            _ => (None, None),
+        };
+        if event_run_id.as_deref() == Some(run_id) {
+            tasks.insert(task_id.unwrap_or_default());
+        }
+    }
+    if plan.merged_run_id.as_deref() == Some(run_id) {
+        tasks.insert(String::new());
+    }
+    Ok(tasks)
+}
+
+fn stamped_run_owner(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    stamped: &deadreckon_core::RunOwnership,
+) -> Result<ResolvedRunOwner> {
+    if stamped.schema_version != 1 || stamped.job_id.trim().is_empty() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Run {} has incomplete durable ownership",
+            state.run_id
+        ))));
+    }
+    let job = deadreckon_core::load_job(paths, &stamped.job_id)?;
+    if job.job_id.as_ref() != stamped.job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Run {} changed durable Job owner from {} to {}",
+            state.run_id, stamped.job_id, job.job_id
+        ))));
+    }
+
+    let mut owners = Vec::new();
+    match &stamped.artifact {
+        deadreckon_core::RunOwnershipArtifact::PlanTask {
+            plan_id,
+            task_id,
+            task_index,
+            task_attempt,
+        } => {
+            if plan_id.trim().is_empty() || task_id.trim().is_empty() || *task_attempt == 0 {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} has incomplete durable Plan task ownership",
+                    state.run_id
+                ))));
+            }
+            let plan = deadreckon_core::load_plan(paths, plan_id)?;
+            let owner = resolve_plan_owner(paths, &plan)?.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} names Plan {} without a durable Job owner",
+                    state.run_id, plan_id
+                )))
+            })?;
+            let task = plan
+                .tasks
+                .get(*task_index as usize)
+                .filter(|task| task.task_id == *task_id)
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "Run {} no longer names an existing owned Plan task",
+                        state.run_id
+                    )))
+                })?;
+            let recorded = task.child_run_id.as_deref() == Some(state.run_id.as_str())
+                || task
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.run_id.as_deref() == Some(state.run_id.as_str()));
+            let awaiting_parent_record = task.status == deadreckon_core::PlanTaskStatus::Running
+                && *task_attempt == task.attempts.len() as u32 + 1;
+            if !recorded && !awaiting_parent_record {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} ownership is not retained by Plan task {}",
+                    state.run_id, task_id
+                ))));
+            }
+            if owner.job.job_id != job.job_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} Plan owner does not match durable Job {}",
+                    state.run_id, job.job_id
+                ))));
+            }
+            owners.push(owner);
+        }
+        deadreckon_core::RunOwnershipArtifact::PlanResult { plan_id } => {
+            let plan = deadreckon_core::load_plan(paths, plan_id)?;
+            let owner = resolve_plan_owner(paths, &plan)?.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} names Plan {} without a durable Job owner",
+                    state.run_id, plan_id
+                )))
+            })?;
+            if owner.job.job_id != job.job_id
+                || plan
+                    .merged_run_id
+                    .as_deref()
+                    .is_some_and(|run_id| run_id != state.run_id)
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} does not match its durable Plan result authority",
+                    state.run_id
+                ))));
+            }
+            owners.push(owner);
+        }
+        deadreckon_core::RunOwnershipArtifact::CampaignResult { campaign_id } => {
+            let campaign = deadreckon_core::campaign::read_campaign(&paths.plan_dir(campaign_id))?;
+            if job.shape != JobShape::LegacyCampaign
+                || campaign.campaign_id != *campaign_id
+                || campaign.campaign_id != job.job_id.as_ref()
+                || campaign
+                    .merged_run_id
+                    .as_deref()
+                    .is_some_and(|run_id| run_id != state.run_id)
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} does not match its durable Campaign result authority",
+                    state.run_id
+                ))));
+            }
+        }
+        deadreckon_core::RunOwnershipArtifact::ParentResult => {
+            if state.run_id != job.job_id.as_ref()
+                || !matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign)
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} does not match its durable parent result authority",
+                    state.run_id
+                ))));
+            }
+        }
+    }
+    Ok(ResolvedRunOwner { job, owners })
+}
+
+pub(crate) fn resolve_run_owner(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<Option<ResolvedRunOwner>> {
+    if let Some(stamped) = state.ownership.as_ref() {
+        return stamped_run_owner(paths, state, stamped).map(Some);
+    }
+
+    let mut matches = Vec::new();
+    for plan_id in commands::reference::plan_ids_matching(paths, "")? {
+        let Ok(plan) = deadreckon_core::load_plan(paths, &plan_id) else {
+            continue;
+        };
+        let Some(owner) = resolve_plan_owner(paths, &plan)? else {
+            continue;
+        };
+        let task_ids = plan_task_references_run(paths, &plan, &state.run_id)?;
+        if task_ids.is_empty() {
+            continue;
+        }
+        matches.push(owner);
+    }
+
+    let mut campaign_owner = None;
+    if paths.plans_dir().is_dir() {
+        for entry in fs::read_dir(paths.plans_dir())?.filter_map(std::result::Result::ok) {
+            let campaign_dir = entry.path();
+            if !deadreckon_core::campaign::campaign_path_for_plan_dir(&campaign_dir).is_file() {
+                continue;
+            }
+            let Ok(campaign) = deadreckon_core::campaign::read_campaign(&campaign_dir) else {
+                continue;
+            };
+            if campaign.merged_run_id.as_deref() != Some(state.run_id.as_str())
+                || !paths.job_json(&campaign.campaign_id).is_file()
+            {
+                continue;
+            }
+            let job = deadreckon_core::load_job(paths, &campaign.campaign_id)?;
+            if job.shape != JobShape::LegacyCampaign || job.job_id.as_ref() != campaign.campaign_id
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} is claimed by an incompatible durable Campaign",
+                    state.run_id
+                ))));
+            }
+            if campaign_owner
+                .as_ref()
+                .is_some_and(|owner: &deadreckon_protocol::Job| owner.job_id != job.job_id)
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} is claimed by more than one durable Campaign",
+                    state.run_id
+                ))));
+            }
+            campaign_owner = Some(job);
+        }
+    }
+
+    let Some(first_job) = matches
+        .first()
+        .map(|owner| owner.job.clone())
+        .or(campaign_owner.clone())
+    else {
+        return Ok(None);
+    };
+    if matches
+        .iter()
+        .any(|owner| owner.job.job_id != first_job.job_id)
+        || campaign_owner
+            .as_ref()
+            .is_some_and(|owner| owner.job_id != first_job.job_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Run {} is claimed by more than one durable Job",
+            state.run_id
+        ))));
+    }
+    Ok(Some(ResolvedRunOwner {
+        job: first_job,
+        owners: matches,
+    }))
+}
+
+pub(crate) fn require_current_driver_for_job_owned_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    operation: &str,
+) -> Result<()> {
+    let Some(owner) = resolve_run_owner(paths, state)? else {
+        return Ok(());
+    };
+    if let Some(context) = DRIVER_CONTEXT
+        .get()
+        .filter(|context| context.job_id == owner.job.job_id.as_ref())
+    {
+        if context.authority.job_id != owner.job.job_id.as_ref()
+            || !commands::supervisor::guarded_driver_authority_is_live(paths, &context.authority)?
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{operation} refused stale authority for durable Job {}",
+                owner.job.job_id
+            ))));
+        }
+        for plan_owner in &owner.owners {
+            validate_owned_plan_lineage(paths, plan_owner)?;
+        }
+        return Ok(());
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "{operation} cannot mutate {} because it belongs to durable Job {}",
+            run_prefix(&state.run_id),
             run_prefix(owner.job.job_id.as_ref())
         ),
         &format!(
@@ -3497,7 +3847,7 @@ pub(crate) fn prepare_parent_result_run(
         return Ok(existing);
     }
 
-    let mut state = deadreckon_core::create_run(
+    let mut state = deadreckon_core::create_owned_run(
         paths,
         deadreckon_core::RunOptions {
             goal: job.goal.clone(),
@@ -3510,6 +3860,7 @@ pub(crate) fn prepare_parent_result_run(
             run_id: Some(job.job_id.as_ref().to_string()),
             codebase: None,
         },
+        deadreckon_core::RunOwnership::parent_result(job.job_id.as_ref()),
     )?;
     if state.scope != job.scope || state.run_id != job.job_id.as_ref() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(

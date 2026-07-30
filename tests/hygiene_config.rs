@@ -173,6 +173,10 @@ fn release_profile_keeps_panic_unwind() {
 
 #[test]
 fn release_binary_size_within_baseline_slack() {
+    if std::env::var_os("DEADRECKON_RELEASE_SIZE_CHECK").is_none() {
+        eprintln!("skipping binary size check outside `make size-check`");
+        return;
+    }
     let root = workspace_root();
     // Binary size is format- and platform-specific (Mach-O vs ELF), so each
     // OS pins its own baseline; an OS without one skips.
@@ -186,25 +190,44 @@ fn release_binary_size_within_baseline_slack() {
     };
     let baseline = raw.trim().parse::<u64>().expect("parse size baseline");
     let binary = root.join("target/release/deadreckon");
-    if !binary.exists() {
-        let output = Command::new("cargo")
-            .args(["build", "--release"])
-            .current_dir(&root)
-            .output()
-            .expect("build release binary");
-        assert!(
-            output.status.success(),
-            "cargo build --release failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let actual = fs::metadata(&binary).expect("release binary metadata").len();
+    let actual = fs::metadata(&binary)
+        .expect("`make size-check` must build the current release binary first")
+        .len();
     let allowed = baseline + (baseline / 20);
     assert!(
         actual <= allowed,
         "release binary grew too much: actual={actual}, baseline={baseline}, allowed={allowed}"
     );
+}
+
+#[test]
+fn verify_checks_size_only_after_building_the_release_binary() {
+    let makefile = fs::read_to_string(workspace_root().join("Makefile")).expect("read Makefile");
+    assert!(makefile.contains("size-check: build"));
+    assert!(makefile.contains("DEADRECKON_RELEASE_SIZE_CHECK=1 cargo test"));
+    let verify = makefile
+        .split_once("verify:\n")
+        .and_then(|(_, tail)| tail.split_once("\nverify-timed:"))
+        .map(|(body, _)| body)
+        .expect("verify recipe");
+    assert!(verify.contains("$(MAKE) test"));
+    assert!(verify.contains("$(MAKE) size-check"));
+    assert!(
+        verify.find("$(MAKE) test") < verify.find("$(MAKE) size-check"),
+        "size check must inspect the final release artifact after ordinary tests"
+    );
+}
+
+#[test]
+fn ci_and_release_verification_run_the_fresh_size_gate() {
+    let root = workspace_root();
+    for relative in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let workflow = fs::read_to_string(root.join(relative)).expect("read workflow");
+        assert!(
+            workflow.contains("make size-check"),
+            "{relative} must measure a freshly built release binary"
+        );
+    }
 }
 
 #[test]

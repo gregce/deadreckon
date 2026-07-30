@@ -685,20 +685,22 @@ pub(crate) async fn run_command_with_launch_plan(
     if codebase.mode == CodebaseMode::Worktree {
         create_worktree(&codebase)?;
     }
-    let mut state = create_run(
-        &paths,
-        RunOptions {
-            goal,
-            cwd,
-            sandbox: backend.to_string(),
-            provider: effective_provider.clone(),
-            skill_name: skill,
-            max_spend_usd: effective_max_spend,
-            max_wall_seconds: effective_max_wall_seconds,
-            run_id: Some(run_id),
-            codebase: Some(codebase.clone()),
-        },
-    )?;
+    let run_options = RunOptions {
+        goal,
+        cwd,
+        sandbox: backend.to_string(),
+        provider: effective_provider.clone(),
+        skill_name: skill,
+        max_spend_usd: effective_max_spend,
+        max_wall_seconds: effective_max_wall_seconds,
+        run_id: Some(run_id),
+        codebase: Some(codebase.clone()),
+    };
+    let mut state = if let Some(ownership) = commands::graph_job::delegated_plan_child_ownership() {
+        deadreckon_core::create_owned_run(&paths, run_options, ownership)?
+    } else {
+        create_run(&paths, run_options)?
+    };
     commands::course::save_launch_plan_best_effort(&state.run_root, &launch_plan);
     if let Some(baseline) = tamper_baseline.as_deref() {
         deadreckon_core::tamper::write_tamper_baseline(&state.run_root, baseline)

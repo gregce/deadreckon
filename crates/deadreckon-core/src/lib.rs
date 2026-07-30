@@ -152,5 +152,6 @@ pub use run_view::{
 };
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, ProviderFailureDisposition,
-    RunListEntry, RunOptions, RunStatus, create_run, list_runs, load_run, save_state,
+    RunListEntry, RunOptions, RunOwnership, RunOwnershipArtifact, RunStatus, create_owned_run,
+    create_run, list_runs, load_run, save_state,
 };

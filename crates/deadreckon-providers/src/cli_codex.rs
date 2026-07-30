@@ -10,7 +10,9 @@ use crate::cli_contract::{
     PROVIDER_ID_CODEX, ParsedStream, ProviderContract, ProviderSession, add_caveat,
     flight_rows_from, session_not_found, write_schema_file,
 };
-use crate::codex_events::{parse_codex_line, probe_codex_capabilities};
+use crate::codex_events::{
+    CodexCapabilities, parse_codex_capabilities, parse_codex_line, probe_codex_capabilities,
+};
 use crate::{
     Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
     ProviderUsage, Result, SpendEstimate,
@@ -121,8 +123,30 @@ impl CliCodexProvider {
         Ok(CodexAttempt { output, args })
     }
 
+    async fn capabilities_for_request(&self, request: &ProviderRequest) -> CodexCapabilities {
+        if request.workspace_access == WorkspaceAccess::ReadWrite {
+            return probe_codex_capabilities(&self.binary);
+        }
+        run_cli(
+            &self.name,
+            &self.binary,
+            &["exec".to_string(), "--help".to_string()],
+            request.cwd.clone(),
+            request.sandbox_backend,
+            None,
+            request.cancellation_token.clone(),
+            WorkspaceAccess::ReadOnly,
+            true,
+        )
+        .await
+        .ok()
+        .filter(|output| output.status_code == Some(0))
+        .map(|output| parse_codex_capabilities(&output.stdout))
+        .unwrap_or_else(CodexCapabilities::none)
+    }
+
     pub(crate) async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let caps = probe_codex_capabilities(&self.binary);
+        let caps = self.capabilities_for_request(request).await;
         let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
             .then(|| request.session_dir.clone())
             .flatten();

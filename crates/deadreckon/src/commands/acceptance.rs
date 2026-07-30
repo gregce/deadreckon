@@ -661,19 +661,7 @@ pub(crate) async fn acceptance_agent_command_in_dir(
             AcceptanceAgentMode::Draft => "compiling done criteria",
             AcceptanceAgentMode::Refine => "refining done criteria",
         },
-        router.complete(&ProviderRequest {
-            prompt,
-            max_output_tokens: 6_000,
-            cwd: Some(cwd.to_path_buf()),
-            output_path: None,
-            sandbox_backend: None,
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token: None,
-            session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-        }),
+        router.complete(&ProviderRequest::enforceably_read_only(prompt, 6_000, cwd)),
     )
     .await
     .map_err(|err| {
@@ -709,19 +697,11 @@ pub(crate) async fn acceptance_agent_command_in_dir(
         )?;
         let redraft_response = with_cli_wait_status(
             "redrafting done criteria once",
-            router.complete(&ProviderRequest {
-                prompt: redraft_prompt,
-                max_output_tokens: 6_000,
-                cwd: Some(cwd.to_path_buf()),
-                output_path: None,
-                sandbox_backend: None,
-                workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-                pid_file: None,
-                cancellation_token: None,
-                session_dir: None,
-                output_schema: None,
-                capability_posture: None,
-            }),
+            router.complete(&ProviderRequest::enforceably_read_only(
+                redraft_prompt,
+                6_000,
+                cwd,
+            )),
         )
         .await
         .map_err(|err| {
@@ -1675,19 +1655,7 @@ async fn run_contract_critic(
     let floor = || critic_floor_verdict(goal, contract, lint_findings);
     match with_cli_wait_status(
         "critiquing done criteria",
-        router.complete(&ProviderRequest {
-            prompt,
-            max_output_tokens: 1_000,
-            cwd: Some(cwd.to_path_buf()),
-            output_path: None,
-            sandbox_backend: None,
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token: None,
-            session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-        }),
+        router.complete(&ProviderRequest::enforceably_read_only(prompt, 1_000, cwd)),
     )
     .await
     {

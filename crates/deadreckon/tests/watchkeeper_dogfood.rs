@@ -58,6 +58,10 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "gate_key_search_and_forgery",
         "receipt_mutation",
         "result_delivery",
+        "unified_job_journey",
+        "job_child_and_planner_boundaries",
+        "semantic_parent_repair",
+        "repair_lineage_tamper",
     ] {
         assert!(source.contains(trial), "missing adversarial trial {trial}");
     }
@@ -67,6 +71,10 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "live_provider_network_loss",
         "machine_reboot",
         "cross_provider_gate_attack",
+        "live_provider_parent_repair",
+        "live_campaign_interruption_recovery",
+        "linux_bubblewrap_gate_boundary",
+        "docker_gate_boundary",
     ] {
         assert!(
             source.contains(unproven),
@@ -115,8 +123,35 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         deadreckon_core::flight::sha256_file(&dogfood_dir().join("adversarial.py"))
             .expect("runner digest")
     );
+    let trials = payload["trials"]
+        .as_array()
+        .expect("credential-free trials");
+    let expected_trials = [
+        "terminal_detach",
+        "worker_kill",
+        "supervisor_restart",
+        "network_denial",
+        "gate_key_search_and_forgery",
+        "receipt_mutation",
+        "result_delivery",
+        "unified_job_journey",
+        "job_child_and_planner_boundaries",
+        "semantic_parent_repair",
+        "repair_lineage_tamper",
+    ];
+    assert_eq!(trials.len(), expected_trials.len());
+    for id in expected_trials {
+        let trial = trials
+            .iter()
+            .find(|trial| trial["id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("missing checked adversarial result {id}"));
+        assert_eq!(
+            trial["status"], "passed",
+            "checked adversarial result {id} must pass"
+        );
+    }
     let live = payload["live_claims"].as_array().expect("live claims");
-    assert!(!live.is_empty());
+    assert_eq!(live.len(), 9);
     assert!(
         live.iter()
             .all(|claim| claim["status"].as_str() == Some("unproven"))

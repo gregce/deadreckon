@@ -319,6 +319,7 @@ crate: deadreckon-core
   run_view::TurnView
   run_view::VerdictBand
   run_view::WhyBand
+  state::create_owned_run
   state::create_run
   state::CurrentRunPointer
   state::list_runs
@@ -330,6 +331,8 @@ crate: deadreckon-core
   state::ProviderFailureDisposition
   state::RunListEntry
   state::RunOptions
+  state::RunOwnership
+  state::RunOwnershipArtifact
   state::RunStatus
   state::save_state
 crate: deadreckon-providers

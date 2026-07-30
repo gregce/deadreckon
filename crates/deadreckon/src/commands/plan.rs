@@ -51,7 +51,7 @@ pub(crate) async fn create_orchestration_plan(
         apply,
         max_spend: _,
         max_wall_seconds: _,
-        sandbox: _,
+        sandbox,
         planner_provider,
         provider,
         child_provider,
@@ -89,6 +89,11 @@ pub(crate) async fn create_orchestration_plan(
     validate_plan_task_count(&goal, n, no_hints, json_output)?;
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    let planner_sandbox = sandbox
+        .as_deref()
+        .or(defaults.sandbox.as_deref())
+        .unwrap_or("auto")
+        .parse::<deadreckon_sandbox::SandboxBackend>()?;
     let cwd = std::env::current_dir()?;
     let scope = workspace_scope(&cwd)?;
     let plan_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
@@ -148,6 +153,7 @@ pub(crate) async fn create_orchestration_plan(
                     &providers,
                     &overrides,
                     &cwd,
+                    planner_sandbox,
                     plain,
                     no_hints,
                     json_output,
@@ -588,6 +594,7 @@ pub(crate) async fn build_full_plan_tasks_accounted(
     providers: &PlanProviders,
     overrides: &BTreeMap<u32, String>,
     cwd: &Path,
+    sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
     no_hints: bool,
     json_output: bool,
@@ -602,7 +609,16 @@ pub(crate) async fn build_full_plan_tasks_accounted(
             accounting: None,
         }
     } else {
-        provider_plan_drafts(paths, goal, n, providers.planner.as_deref(), cwd, plain).await?
+        provider_plan_drafts(
+            paths,
+            goal,
+            n,
+            providers.planner.as_deref(),
+            cwd,
+            sandbox_backend,
+            plain,
+        )
+        .await?
     };
     let PlannerDraftBatch { drafts, accounting } = batch;
     if drafts.len() != usize::from(n) {
@@ -784,23 +800,13 @@ async fn provider_plan_drafts(
     n: u8,
     planner_provider: Option<&str>,
     cwd: &Path,
+    sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
 ) -> Result<PlannerDraftBatch> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), planner_provider)?;
     let prompt = planner_prompt(goal, n);
-    let request = ProviderRequest {
-        prompt,
-        max_output_tokens: 4096,
-        cwd: Some(cwd.to_path_buf()),
-        output_path: None,
-        sandbox_backend: None,
-        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-        pid_file: None,
-        cancellation_token: None,
-        session_dir: None,
-        output_schema: None,
-        capability_posture: None,
-    };
+    let request =
+        ProviderRequest::enforceably_read_only_with_backend(prompt, 4096, cwd, sandbox_backend);
     let started = std::time::Instant::now();
     let response =
         maybe_with_cli_wait_status(!plain, "planning child graph", router.complete(&request))

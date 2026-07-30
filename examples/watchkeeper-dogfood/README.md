@@ -87,6 +87,16 @@ python3 examples/watchkeeper-dogfood/adversarial.py \
   --output examples/watchkeeper-dogfood/credential-free-results.json
 ```
 
+The checked-in result currently records 11 passing credential-free proof
+groups and no failures. The added proof groups directly cover supported
+creation routes entering one Job journey, one- and two-round Graph semantic
+parent repair, one-round Campaign semantic parent repair, candidate-ready
+recovery, and all seven repair-receipt lineage attacks. They also prove that
+Job-owned child Runs cannot bypass their parent lifecycle and that hostile
+read-only planning cannot write to the operator workspace while a benign
+planner remains usable under an operational sandbox. Nine live or
+host-specific claims remain explicitly unproven.
+
 The JSON output records each command, duration, exit status, matched test line,
 and stdout/stderr digest. It labels proof by scope. The runner first proves
 that `sandbox-exec` can apply a profile; nested environments that deny that
@@ -101,4 +111,10 @@ The following remain `unproven` in that file until an operator performs them:
 - supervisor death during an approved live provider run;
 - host network loss during a live provider call;
 - a real machine reboot with the user service active;
-- a cross-provider hostile gate trial from the 24-task matrix.
+- a cross-provider hostile gate trial from the 24-task matrix;
+- a naturally occurring live semantic `revise` followed by Graph or Campaign
+  parent repair;
+- live Campaign interruption and recovery without duplicate sub-plan or repair
+  work;
+- the equivalent protected gate boundary on Linux/bubblewrap;
+- the equivalent protected gate boundary through Docker.

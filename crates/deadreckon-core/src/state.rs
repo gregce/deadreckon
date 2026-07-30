@@ -94,6 +94,13 @@ pub struct PipelineState {
     pub skill_path: PathBuf,
     pub sandbox: String,
     pub provider: Option<String>,
+    /// Durable Job authority that owns this Run as one Plan task attempt.
+    ///
+    /// Ordinary and historical Runs omit this field. Trusted Plan children
+    /// receive it in the first state write so public Run lifecycle commands
+    /// cannot mistake them for independently mutable compatibility Runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership: Option<RunOwnership>,
     pub max_spend_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wall_seconds: Option<f64>,
@@ -111,6 +118,98 @@ pub struct PipelineState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub promoted_library_dir: Option<PathBuf>,
     pub phases: Vec<PhaseState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunOwnership {
+    pub schema_version: u32,
+    pub job_id: String,
+    #[serde(flatten)]
+    pub artifact: RunOwnershipArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RunOwnershipArtifact {
+    PlanTask {
+        plan_id: String,
+        task_id: String,
+        task_index: u32,
+        task_attempt: u32,
+    },
+    PlanResult {
+        plan_id: String,
+    },
+    CampaignResult {
+        campaign_id: String,
+    },
+    ParentResult,
+}
+
+impl RunOwnership {
+    pub fn plan_task(
+        job_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        task_id: impl Into<String>,
+        task_index: u32,
+        task_attempt: u32,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            job_id: job_id.into(),
+            artifact: RunOwnershipArtifact::PlanTask {
+                plan_id: plan_id.into(),
+                task_id: task_id.into(),
+                task_index,
+                task_attempt,
+            },
+        }
+    }
+
+    pub fn plan_result(job_id: impl Into<String>, plan_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: 1,
+            job_id: job_id.into(),
+            artifact: RunOwnershipArtifact::PlanResult {
+                plan_id: plan_id.into(),
+            },
+        }
+    }
+
+    pub fn campaign_result(job_id: impl Into<String>, campaign_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: 1,
+            job_id: job_id.into(),
+            artifact: RunOwnershipArtifact::CampaignResult {
+                campaign_id: campaign_id.into(),
+            },
+        }
+    }
+
+    pub fn parent_result(job_id: impl Into<String>) -> Self {
+        Self {
+            schema_version: 1,
+            job_id: job_id.into(),
+            artifact: RunOwnershipArtifact::ParentResult,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        if self.schema_version != 1 || self.job_id.trim().is_empty() {
+            return false;
+        }
+        match &self.artifact {
+            RunOwnershipArtifact::PlanTask {
+                plan_id,
+                task_id,
+                task_attempt,
+                ..
+            } => !plan_id.trim().is_empty() && !task_id.trim().is_empty() && *task_attempt > 0,
+            RunOwnershipArtifact::PlanResult { plan_id } => !plan_id.trim().is_empty(),
+            RunOwnershipArtifact::CampaignResult { campaign_id } => !campaign_id.trim().is_empty(),
+            RunOwnershipArtifact::ParentResult => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +308,27 @@ fn resolve_skill_path(paths: &DeadreckonPaths, skill_name: &str) -> PathBuf {
 }
 
 pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<PipelineState> {
+    create_run_with_optional_ownership(paths, options, None)
+}
+
+pub fn create_owned_run(
+    paths: &DeadreckonPaths,
+    options: RunOptions,
+    ownership: RunOwnership,
+) -> Result<PipelineState> {
+    if !ownership.is_complete() {
+        return Err(DeadreckonError::InvalidInput(
+            "owned Run requires complete durable Job artifact authority".to_string(),
+        ));
+    }
+    create_run_with_optional_ownership(paths, options, Some(ownership))
+}
+
+fn create_run_with_optional_ownership(
+    paths: &DeadreckonPaths,
+    options: RunOptions,
+    ownership: Option<RunOwnership>,
+) -> Result<PipelineState> {
     let scope = workspace_scope(&options.cwd)?;
     let task_key = task_key(&options.goal);
     let run_id = options
@@ -246,6 +366,7 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
         skill_path,
         sandbox: options.sandbox,
         provider: options.provider,
+        ownership,
         max_spend_usd: options.max_spend_usd,
         max_wall_seconds: options.max_wall_seconds,
         total_spend_usd: 0.0,

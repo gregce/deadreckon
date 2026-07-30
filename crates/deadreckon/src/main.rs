@@ -6967,19 +6967,11 @@ async fn invoke_merge_repair_planner(
         .parent_cwd
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| paths.home().to_path_buf()));
-    let request = ProviderRequest {
-        prompt,
-        max_output_tokens: 8192,
-        cwd: Some(cwd),
-        output_path: None,
-        sandbox_backend: None,
-        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-        pid_file: None,
-        cancellation_token: None,
-        session_dir: None,
-        output_schema: None,
-        capability_posture: None,
-    };
+    let sandbox_backend = commands::graph_job::current_driver_sandbox_backend(paths)?
+        .filter(|backend| *backend != deadreckon_sandbox::SandboxBackend::None)
+        .unwrap_or(deadreckon_sandbox::SandboxBackend::Auto);
+    let request =
+        ProviderRequest::enforceably_read_only_with_backend(prompt, 8192, cwd, sandbox_backend);
     let response =
         maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
             .await?;
@@ -7391,24 +7383,30 @@ fn create_merged_plan_run(
     no_gate: bool,
 ) -> Result<deadreckon_core::PipelineState> {
     let cwd = std::env::current_dir()?;
-    let mut state = create_run(
-        paths,
-        RunOptions {
-            // The merged run IS the delivered result of the operator's goal, so it
-            // carries that goal verbatim. Prefixing an internal label ("merge
-            // orchestration plan …") leaked into the status goal line and, via
-            // task_key, into the suggested export dir (./merge-orchestration-plan).
-            goal: plan.root_goal.clone(),
-            cwd,
-            sandbox: "none".to_string(),
-            provider: None,
-            skill_name: "default-coding".to_string(),
-            max_spend_usd: None,
-            max_wall_seconds: None,
-            run_id: None,
-            codebase: None,
-        },
-    )?;
+    let run_options = RunOptions {
+        // The merged run IS the delivered result of the operator's goal, so it
+        // carries that goal verbatim. Prefixing an internal label ("merge
+        // orchestration plan …") leaked into the status goal line and, via
+        // task_key, into the suggested export dir (./merge-orchestration-plan).
+        goal: plan.root_goal.clone(),
+        cwd,
+        sandbox: "none".to_string(),
+        provider: None,
+        skill_name: "default-coding".to_string(),
+        max_spend_usd: None,
+        max_wall_seconds: None,
+        run_id: None,
+        codebase: None,
+    };
+    let mut state = if let Some(owner) = commands::graph_job::resolve_plan_owner(paths, plan)? {
+        deadreckon_core::create_owned_run(
+            paths,
+            run_options,
+            deadreckon_core::RunOwnership::plan_result(owner.job.job_id.as_ref(), &plan.plan_id),
+        )?
+    } else {
+        create_run(paths, run_options)?
+    };
     remove_if_exists(&state.working_dir)?;
     copy_deliverable_tree(&paths.merge_working(&plan.plan_id), &state.working_dir)?;
     if no_gate {
@@ -9723,8 +9721,20 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         commands::reference::ResolvedRef::Chain(chain) => {
             return commands::chain::chain_kill_command(&paths, &chain.chain_id, force);
         }
-        commands::reference::ResolvedRef::Run(state) => *state,
-        commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
+        commands::reference::ResolvedRef::Run(state) => {
+            if let Some(owner) = commands::graph_job::resolve_run_owner(&paths, &state)? {
+                let view = deadreckon_core::JobView::load(&paths, owner.job.job_id.as_ref())?;
+                return commands::job::cancel_job(&paths, &view, force);
+            }
+            *state
+        }
+        commands::reference::ResolvedRef::PlanChild { state, .. } => {
+            if let Some(owner) = commands::graph_job::resolve_run_owner(&paths, &state)? {
+                let view = deadreckon_core::JobView::load(&paths, owner.job.job_id.as_ref())?;
+                return commands::job::cancel_job(&paths, &view, force);
+            }
+            *state
+        }
     };
     kill_loaded_run(&paths, &mut state, force)?;
     print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain, true);
@@ -10017,6 +10027,7 @@ async fn resume_command(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = commands::reference::resolve_run_like(&paths, Some(&run_id), "resume")?;
+    commands::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "resume")?;
     resume_loaded_command(&paths, state, from_turn, max_wall_seconds, no_docs, plain).await
 }
 
@@ -10230,6 +10241,7 @@ fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
             ));
         }
     };
+    commands::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "undo")?;
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
     let restore_state = undo_restore_state(&paths, &state)?;
     restore_snapshot(&restore_state, target_turn)?;
@@ -10322,6 +10334,7 @@ struct ResolvedRewindTarget {
 fn rewind_command(run_id: &str, options: &RewindCliOptions) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = commands::reference::resolve_run_like(&paths, Some(run_id), "rewind")?;
+    commands::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "rewind")?;
     let mode = rewind_mode(options)?;
     let resolved = resolve_rewind_target(&state, options)?;
     let checkpoint = read_checkpoint_by_id(&state, &resolved.checkpoint_id)?;

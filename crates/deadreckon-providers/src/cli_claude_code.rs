@@ -5,7 +5,9 @@ use deadreckon_sandbox::WorkspaceAccess;
 use serde_json::json;
 use which::which;
 
-use crate::claude_events::{parse_claude_line, probe_claude_capabilities};
+use crate::claude_events::{
+    ClaudeCapabilities, parse_claude_capabilities, parse_claude_line, probe_claude_capabilities,
+};
 use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
 use crate::cli_contract::{
     PROVIDER_ID_CLAUDE, ParsedStream, ProviderContract, ProviderSession, add_caveat,
@@ -100,8 +102,30 @@ impl CliClaudeCodeProvider {
         Ok(ClaudeAttempt { output, args })
     }
 
+    async fn capabilities_for_request(&self, request: &ProviderRequest) -> ClaudeCapabilities {
+        if request.workspace_access == WorkspaceAccess::ReadWrite {
+            return probe_claude_capabilities(&self.binary);
+        }
+        run_cli(
+            &self.name,
+            &self.binary,
+            &["--help".to_string()],
+            request.cwd.clone(),
+            request.sandbox_backend,
+            None,
+            request.cancellation_token.clone(),
+            WorkspaceAccess::ReadOnly,
+            false,
+        )
+        .await
+        .ok()
+        .filter(|output| output.status_code == Some(0))
+        .map(|output| parse_claude_capabilities(&output.stdout))
+        .unwrap_or_else(ClaudeCapabilities::none)
+    }
+
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let caps = probe_claude_capabilities(&self.binary);
+        let caps = self.capabilities_for_request(request).await;
         let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
             .then(|| request.session_dir.clone())
             .flatten();

@@ -176,19 +176,8 @@ pub(crate) async fn propose_contract(
     working_dir: &Path,
 ) -> Option<ProposedContract> {
     let router = ProviderRouter::from_config_path(config_path, Some(provider)).ok()?;
-    let request = ProviderRequest {
-        prompt: infer_prompt(working_dir),
-        max_output_tokens: 512,
-        cwd: Some(working_dir.to_path_buf()),
-        output_path: None,
-        sandbox_backend: None,
-        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-        pid_file: None,
-        cancellation_token: None,
-        session_dir: None,
-        output_schema: None,
-        capability_posture: None,
-    };
+    let request =
+        ProviderRequest::enforceably_read_only(infer_prompt(working_dir), 512, working_dir);
     let response = tokio::time::timeout(Duration::from_secs(8), router.complete(&request))
         .await
         .ok()?
