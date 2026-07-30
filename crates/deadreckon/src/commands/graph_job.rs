@@ -1891,7 +1891,14 @@ pub(crate) async fn complete_merged_plan_parent(
             }
         }
     } else {
-        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(&parent, backend)
+        let launch_owner = parent_gate_launch_owner(paths, job)?;
+        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(
+            &parent,
+            backend,
+            Some(&launch_owner),
+            None,
+        )
+        .await
         {
             parent.failure_reason = Some(format!("deterministic graph gate failed: {error}"));
             parent.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
@@ -2148,7 +2155,14 @@ pub(crate) async fn complete_merged_campaign_parent(
             }
         }
     } else {
-        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(&parent, backend)
+        let launch_owner = parent_gate_launch_owner(paths, job)?;
+        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(
+            &parent,
+            backend,
+            Some(&launch_owner),
+            None,
+        )
+        .await
         {
             parent.failure_reason = Some(format!("deterministic campaign gate failed: {error}"));
             parent.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
@@ -2437,7 +2451,7 @@ pub(crate) fn prepare_parent_result_run(
     if state.working_dir.exists() {
         fs::remove_dir_all(&state.working_dir)?;
     }
-    deadreckon_core::copy_tree(&merged.working_dir, &state.working_dir)?;
+    deadreckon_core::copy_deliverable_tree(&merged.working_dir, &state.working_dir)?;
     // A promoted child run's manifest is lifecycle metadata for that child.
     // The parent receipt binds only the merged result tree; parent promotion
     // writes its own manifest later.
@@ -2475,10 +2489,12 @@ fn verify_parent_result_identity(
             job.job_id
         ))));
     }
-    let mut parent_index = deadreckon_core::flight::build_working_file_index(&parent.working_dir)?;
+    let mut parent_index =
+        deadreckon_core::flight::build_deliverable_file_index(&parent.working_dir)?;
     parent_index.files.remove(Path::new("manifest.json"));
     let parent_hash = parent_index.tree_hash();
-    let mut merged_index = deadreckon_core::flight::build_working_file_index(&merged.working_dir)?;
+    let mut merged_index =
+        deadreckon_core::flight::build_deliverable_file_index(&merged.working_dir)?;
     merged_index.files.remove(Path::new("manifest.json"));
     let merged_hash = merged_index.tree_hash();
     if parent_hash != merged_hash {
@@ -2997,6 +3013,42 @@ fn record_parent_semantic_accounting(
     Ok(())
 }
 
+fn parent_gate_launch_owner(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+) -> Result<deadreckon_runtime::GateLaunchOwner> {
+    let view = deadreckon_core::JobView::load(paths, job.job_id.as_ref())?;
+    let attempt = view.projection.attempt_count;
+    let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))?;
+    let linked = history
+        .events()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == deadreckon_protocol::JobEventKind::ChildLinked
+                && event
+                    .detail
+                    .get("attempt")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(attempt))
+        })
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "strict parent gate has no durable outer launch for Job attempt {attempt}"
+            )))
+        })?;
+    let outer_launch_id = linked
+        .detail
+        .get("launch_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "strict parent gate has no launch identity for Job attempt {attempt}"
+            )))
+        })?;
+    deadreckon_runtime::GateLaunchOwner::new(attempt, outer_launch_id).map_err(CliError::Core)
+}
+
 fn parent_needs_review(
     state: &mut deadreckon_core::PipelineState,
     reason: &str,
@@ -3054,6 +3106,7 @@ mod tests {
                     max_attempts: 1,
                     deadline: None,
                     semantic_judge: deadreckon_protocol::SemanticJudgeMode::Required,
+                    execution: None,
                 },
             },
         )
@@ -3347,6 +3400,7 @@ mod tests {
                 max_attempts: 1,
                 deadline: None,
                 semantic_judge: deadreckon_protocol::SemanticJudgeMode::Required,
+                execution: None,
             },
         };
 

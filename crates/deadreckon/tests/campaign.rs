@@ -408,8 +408,8 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
         "notify"
     );
     assert!(
-        !library.join(".deadreckon/codebase.json").exists(),
-        "campaign result library should reproduce the missing-codebase apply case"
+        library.join(".deadreckon/codebase.json").is_file(),
+        "campaign promotion must retain lifecycle metadata for verified apply and cleanup"
     );
 
     let output = deadreckon(&paths)

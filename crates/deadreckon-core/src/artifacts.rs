@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -12,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
+use crate::artifact_policy::{is_deliverable_workspace_path, is_promotable_workspace_path};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
@@ -201,13 +201,7 @@ fn snapshot_file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 fn diff_excluded_path(path: &Path) -> bool {
-    path.components().any(|component| {
-        matches!(
-            component,
-            Component::Normal(name)
-                if name == ".git" || name == "target" || name == ".deadreckon"
-        )
-    })
+    !is_deliverable_workspace_path(path)
 }
 
 fn file_delta(
@@ -290,11 +284,96 @@ pub fn inventory_files(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    fs::create_dir_all(to).with_path(to)?;
-    if !from.exists() {
-        return Ok(());
+    copy_tree_with_filter(from, to, |_| true)
+}
+
+pub fn copy_deliverable_tree(from: &Path, to: &Path) -> Result<()> {
+    copy_classified_tree(from, to, is_deliverable_workspace_path)
+}
+
+pub fn copy_promotable_tree(from: &Path, to: &Path) -> Result<()> {
+    copy_classified_tree(from, to, is_promotable_workspace_path)
+}
+
+/// Copy one filesystem artifact without changing or following its identity.
+///
+/// Graph composition and result seeding already have an allowlisted relative
+/// path. This leaf-level primitive preserves regular/executable permissions
+/// and symbolic-link targets while refusing directories and special files.
+pub fn copy_artifact_path(source: &Path, target: &Path) -> Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(target)
+        && metadata.file_type().is_dir()
+        && fs::read_dir(target)
+            .with_path(target)?
+            .next()
+            .transpose()
+            .with_path(target)?
+            .is_some()
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "artifact destination hierarchy is not empty: {}",
+            target.display()
+        )));
     }
-    for entry in WalkDir::new(from).into_iter() {
+    let metadata = fs::symlink_metadata(source).with_path(source)?;
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        copy_regular_file(source, target, &metadata)
+    } else if file_type.is_symlink() {
+        copy_symbolic_link(source, target)
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "unsupported filesystem artifact while copying {}",
+            source.display()
+        )))
+    }
+}
+
+/// Remove an artifact leaf without following symbolic links.
+///
+/// Directories are accepted for callers replacing a prior hierarchy, but a
+/// symbolic link to a directory is removed as the link itself.
+pub fn remove_artifact_path(path: &Path) -> Result<()> {
+    remove_copy_target_if_present(path)
+}
+
+fn copy_classified_tree(from: &Path, to: &Path, include: fn(&Path) -> bool) -> Result<()> {
+    copy_tree_with_filter(from, to, include)
+}
+
+fn copy_tree_with_filter(from: &Path, to: &Path, include: fn(&Path) -> bool) -> Result<()> {
+    ensure_copy_destination_root(to)?;
+    let source_metadata = match fs::symlink_metadata(from) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: from.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !source_metadata.file_type().is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "copy source is not a directory: {}",
+            from.display()
+        )));
+    }
+
+    // WalkDir does not follow links by default; make the security boundary
+    // explicit because snapshots and provider-evidence archives must preserve
+    // links themselves rather than importing whatever they point at.
+    for entry in WalkDir::new(from)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(from)
+                .ok()
+                .is_none_or(|relative| relative.as_os_str().is_empty() || include(relative))
+        })
+    {
         let entry = entry.map_err(|source| DeadreckonError::Io {
             path: from.to_path_buf(),
             source: source.into(),
@@ -302,17 +381,164 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
         let relative = entry.path().strip_prefix(from).map_err(|err| {
             DeadreckonError::InvalidInput(format!("copy source prefix error: {err}"))
         })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
         let target = to.join(relative);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target).with_path(&target)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).with_path(parent)?;
-            }
-            fs::copy(entry.path(), &target).with_path(&target)?;
+        let metadata = fs::symlink_metadata(entry.path()).with_path(entry.path())?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            // A checked-out Git submodule also appears as a directory here.
+            // Filesystem copying treats it as a directory tree and never
+            // misrepresents it as a symbolic link or a Git `160000` entry.
+            ensure_directory_target(&target)?;
+        } else if file_type.is_file() {
+            copy_regular_file(entry.path(), &target, &metadata)?;
+        } else if file_type.is_symlink() {
+            copy_symbolic_link(entry.path(), &target)?;
+        } else {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "unsupported filesystem entry while copying {}",
+                entry.path().display()
+            )));
         }
     }
     Ok(())
+}
+
+fn ensure_copy_destination_root(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(DeadreckonError::InvalidInput(format!(
+            "copy destination is not a directory: {}",
+            path.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).with_path(path)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn ensure_directory_target(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => {
+            remove_copy_target(path)?;
+            fs::create_dir(path).with_path(path)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).with_path(path)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn copy_regular_file(source: &Path, target: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        ensure_directory_target(parent)?;
+    }
+    remove_copy_target_if_present(target)?;
+    fs::copy(source, target).with_path(target)?;
+    // `fs::copy` is platform-specific about metadata. Setting the source
+    // permissions explicitly keeps the executable bit on Unix and the
+    // supported permission representation elsewhere.
+    fs::set_permissions(target, metadata.permissions()).with_path(target)
+}
+
+fn copy_symbolic_link(source: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        ensure_directory_target(parent)?;
+    }
+    remove_copy_target_if_present(target)?;
+    let link_target = fs::read_link(source).with_path(source)?;
+    create_symbolic_link(source, &link_target, target)
+}
+
+#[cfg(unix)]
+fn create_symbolic_link(_source: &Path, link_target: &Path, target: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(link_target, target).with_path(target)
+}
+
+#[cfg(windows)]
+fn create_symbolic_link(source: &Path, link_target: &Path, target: &Path) -> Result<()> {
+    use std::os::windows::fs::FileTypeExt as _;
+
+    // Windows requires the link kind at creation time. The reparse-point kind
+    // is available from symlink metadata, so dangling links never need to be
+    // followed merely to preserve them.
+    let source_type = fs::symlink_metadata(source).with_path(source)?.file_type();
+    if source_type.is_symlink_dir() {
+        std::os::windows::fs::symlink_dir(link_target, target).with_path(target)
+    } else if source_type.is_symlink_file() {
+        std::os::windows::fs::symlink_file(link_target, target).with_path(target)
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "unsupported symbolic-link target while copying {}",
+            source.display()
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symbolic_link(source: &Path, _link_target: &Path, _target: &Path) -> Result<()> {
+    Err(DeadreckonError::InvalidInput(format!(
+        "symbolic-link copies are unsupported on this platform: {}",
+        source.display()
+    )))
+}
+
+fn remove_copy_target_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => remove_copy_target(path),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn remove_copy_target(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).with_path(path)?;
+    let file_type = metadata.file_type();
+    if file_type.is_dir() {
+        fs::remove_dir_all(path).with_path(path)
+    } else if file_type.is_symlink() {
+        remove_symbolic_link(path)
+    } else {
+        fs::remove_file(path).with_path(path)
+    }
+}
+
+#[cfg(unix)]
+fn remove_symbolic_link(path: &Path) -> Result<()> {
+    fs::remove_file(path).with_path(path)
+}
+
+#[cfg(windows)]
+fn remove_symbolic_link(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::IsADirectory => {
+            fs::remove_dir(path).with_path(path)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_symbolic_link(path: &Path) -> Result<()> {
+    fs::remove_file(path).with_path(path)
 }
 
 #[cfg(test)]
@@ -326,8 +552,8 @@ mod tests {
     use crate::state::{RunOptions, create_run};
 
     use super::{
-        diff_snapshots, diff_working_trees, inventory_files, restore_snapshot, snapshot_diff,
-        snapshot_working,
+        copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree, diff_snapshots,
+        diff_working_trees, inventory_files, restore_snapshot, snapshot_diff, snapshot_working,
     };
 
     #[test]
@@ -466,6 +692,180 @@ mod tests {
     }
 
     #[test]
+    fn provider_private_paths_are_evidence_only_not_semantic_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let before = temp.path().join("before");
+        let after = temp.path().join("after");
+        fs::create_dir_all(before.join(".specstory/history")).expect("before private");
+        fs::create_dir_all(after.join(".specstory/history")).expect("after private");
+        fs::create_dir_all(after.join("src")).expect("source");
+        fs::write(before.join(".specstory/history/session.md"), "before").expect("before");
+        fs::write(after.join(".specstory/history/session.md"), "after").expect("after");
+        fs::write(after.join("src/lib.rs"), "pub fn value() -> u8 { 42 }\n").expect("source");
+
+        let diff = diff_working_trees(&before, &after).expect("diff");
+
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].path, Path::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn deliverable_copy_keeps_source_and_run_docs_but_omits_provider_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("src")).expect("source");
+        fs::create_dir_all(source.join("docs")).expect("docs");
+        fs::create_dir_all(source.join(".specstory/history")).expect("private");
+        fs::write(source.join("src/lib.rs"), "source\n").expect("source");
+        fs::write(source.join("docs/RUN-AS-BUILT.md"), "run docs\n").expect("docs");
+        fs::write(source.join("implementation-notes.html"), "notes\n").expect("notes");
+        fs::write(source.join(".specstory/history/session.md"), "private\n").expect("private");
+
+        copy_deliverable_tree(&source, &destination).expect("copy");
+
+        assert!(destination.join("src/lib.rs").exists());
+        assert!(destination.join("docs/RUN-AS-BUILT.md").exists());
+        assert!(destination.join("implementation-notes.html").exists());
+        assert!(!destination.join(".specstory").exists());
+    }
+
+    #[test]
+    fn promotable_copy_keeps_lifecycle_metadata_but_omits_provider_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join(".deadreckon")).expect("lifecycle");
+        fs::create_dir_all(source.join(".specstory/history")).expect("private");
+        fs::write(source.join(".deadreckon/codebase.json"), "{}\n").expect("lifecycle");
+        fs::write(source.join(".specstory/history/session.md"), "private\n").expect("private");
+
+        copy_promotable_tree(&source, &destination).expect("copy");
+
+        assert!(destination.join(".deadreckon/codebase.json").exists());
+        assert!(!destination.join(".specstory").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliverable_copy_preserves_executable_files_and_symlinks_without_following() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("bin")).expect("bin");
+        fs::create_dir_all(source.join(".specstory/history")).expect("evidence");
+        let executable = source.join("bin/run");
+        fs::write(&executable, "#!/bin/sh\n").expect("executable");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("mode");
+        fs::write(source.join(".specstory/history/session.md"), "private\n").expect("evidence");
+        symlink(
+            "../.specstory/history/session.md",
+            source.join("bin/session"),
+        )
+        .expect("symlink");
+
+        copy_deliverable_tree(&source, &destination).expect("copy");
+
+        assert_ne!(
+            fs::metadata(destination.join("bin/run"))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert!(
+            fs::symlink_metadata(destination.join("bin/session"))
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(destination.join("bin/session")).expect("link target"),
+            Path::new("../.specstory/history/session.md")
+        );
+        assert!(!destination.join(".specstory").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_snapshot_preserves_nested_symlink_without_importing_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(source.join(".specstory/history")).expect("evidence");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret.txt"), "outside\n").expect("outside file");
+        symlink(
+            "../../../outside",
+            source.join(".specstory/history/external"),
+        )
+        .expect("symlink");
+
+        copy_tree(&source, &destination).expect("copy");
+
+        let copied_link = destination.join(".specstory/history/external");
+        assert!(
+            fs::symlink_metadata(&copied_link)
+                .expect("metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&copied_link).expect("link target"),
+            Path::new("../../../outside")
+        );
+        assert!(!destination.join("outside").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tree_copy_fails_closed_on_special_files() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&source).expect("source");
+        let _listener = UnixListener::bind(source.join("provider.sock")).expect("socket");
+
+        let error = copy_tree(&source, &destination).expect_err("special file refused");
+
+        assert!(
+            error.to_string().contains("unsupported filesystem entry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn artifact_copy_refuses_to_replace_a_nonempty_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let target = temp.path().join("target");
+        fs::write(&source, "replacement\n").expect("source");
+        fs::create_dir(&target).expect("target directory");
+        fs::write(target.join("preserved.txt"), "preserved\n").expect("preserved");
+
+        let error = copy_artifact_path(&source, &target).expect_err("hierarchy refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("artifact destination hierarchy is not empty"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("preserved.txt")).expect("preserved remains"),
+            "preserved\n"
+        );
+    }
+
+    #[test]
     fn snapshot_diff_handles_binary_and_missing_without_error() {
         let temp = TempDir::new().expect("tempdir");
         let a = temp.path().join("a");
@@ -482,8 +882,7 @@ mod tests {
         assert!(
             diff.files
                 .iter()
-                .any(|file| file.path == std::path::PathBuf::from("image.bin")
-                    && file.unified_diff.is_none())
+                .any(|file| file.path == Path::new("image.bin") && file.unified_diff.is_none())
         );
     }
 }

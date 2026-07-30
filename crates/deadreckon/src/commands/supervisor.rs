@@ -813,6 +813,16 @@ async fn supervise_one_job(
             let launch_id = child.launch_id.clone();
             let exit =
                 monitor_child(paths, &token, MonitoredChild::Adopted(child.process.pid)).await?;
+            if let Err(error) = reconcile_attempt_processes(
+                paths,
+                job_id,
+                Some(&child),
+                Duration::from_secs(2),
+                false,
+            ) {
+                block_for_lost_containment(paths, &token, &error.to_string())?;
+                return Ok(());
+            }
             let attempt = initial.projection.attempt_count.max(1);
             remove_child_control_files(paths, job_id, launch_id.as_deref())?;
             match reconcile_child_exit(paths, &initial.job, &token, exit, attempt, max_attempts)
@@ -823,6 +833,16 @@ async fn supervise_one_job(
             }
         }
         if !resuming_advanced {
+            if let Err(error) = reconcile_attempt_processes(
+                paths,
+                job_id,
+                (!reboot_reclaim).then_some(&child),
+                Duration::from_secs(2),
+                reboot_reclaim,
+            ) {
+                block_for_lost_containment(paths, &token, &error.to_string())?;
+                return Ok(());
+            }
             remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
             match reconcile_child_exit(
                 paths,
@@ -841,6 +861,12 @@ async fn supervise_one_job(
                 ChildReconciliation::Finished => return Ok(()),
             }
         }
+    }
+    if let Err(error) =
+        reconcile_attempt_processes(paths, job_id, None, Duration::from_secs(2), reboot_reclaim)
+    {
+        block_for_lost_containment(paths, &token, &error.to_string())?;
+        return Ok(());
     }
 
     // Advanced terminal evidence is durable before the conductor exits. If
@@ -987,6 +1013,16 @@ async fn supervise_one_job(
                 let launch_id = guarded.metadata.launch_id.clone();
                 let exit =
                     monitor_child(paths, &token, MonitoredChild::Owned(guarded.child)).await?;
+                if let Err(error) = reconcile_attempt_processes(
+                    paths,
+                    job_id,
+                    Some(&guarded.metadata),
+                    Duration::from_secs(2),
+                    false,
+                ) {
+                    block_for_lost_containment(paths, &token, &error.to_string())?;
+                    return Ok(());
+                }
                 remove_child_control_files(paths, job_id, launch_id.as_deref())?;
                 if finish_cancel_requested(paths, &token, Some(&exit))? {
                     return Ok(());
@@ -1241,11 +1277,27 @@ fn load_launch_inputs(paths: &DeadreckonPaths, job: &Job) -> Result<LaunchInputs
         job,
         "source tree",
         &authority.source_tree_sha256,
-        &deadreckon_core::flight::build_working_file_index(&job.source_cwd)?.tree_hash(),
+        &deadreckon_core::flight::build_deliverable_file_index(&job.source_cwd)?.tree_hash(),
     )?;
     if authority.semantic_judge_mode != job.policy.semantic_judge {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "semantic judge policy mismatch for job {}",
+            job.job_id
+        ))));
+    }
+    let execution = job.policy.execution.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "job {} predates immutable execution policy; refusing unattended execution",
+            job.job_id
+        )))
+    })?;
+    if !execution.require_containment
+        || execution.sandbox_requested != authority.sandbox_requested
+        || !execution.tools.contains_key("bash")
+        || !execution.tools.contains_key("write_file")
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "effective execution policy does not match authority for job {}",
             job.job_id
         ))));
     }
@@ -1765,6 +1817,113 @@ fn child_process_may_still_be_live(metadata: &SupervisorChildMetadata) -> bool {
             .is_none_or(|observed| observed == expected),
         None => true,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorChildIdentity {
+    Current,
+    Exited,
+    DifferentBoot,
+    Reused,
+    Unverifiable,
+}
+
+fn supervisor_child_identity(metadata: &SupervisorChildMetadata) -> SupervisorChildIdentity {
+    if !pid_is_alive(metadata.process.pid) {
+        return SupervisorChildIdentity::Exited;
+    }
+    let Some(stored_boot) = metadata.boot_id.as_deref() else {
+        return SupervisorChildIdentity::Unverifiable;
+    };
+    if stored_boot != boot_identity() {
+        return SupervisorChildIdentity::DifferentBoot;
+    }
+    let Some(expected) = metadata.process_start_identity.as_deref() else {
+        return SupervisorChildIdentity::Unverifiable;
+    };
+    match process_start_identity(metadata.process.pid) {
+        Some(observed) if observed == expected => SupervisorChildIdentity::Current,
+        Some(_) => SupervisorChildIdentity::Reused,
+        None => SupervisorChildIdentity::Unverifiable,
+    }
+}
+
+fn reconcile_supervisor_child(metadata: &SupervisorChildMetadata, grace: Duration) -> Result<()> {
+    match supervisor_child_identity(metadata) {
+        SupervisorChildIdentity::DifferentBoot => Ok(()),
+        SupervisorChildIdentity::Current => {
+            let outcome = super::job::terminate_supervised_process(metadata.process, grace);
+            if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
+                Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "could not stop supervised Job process {}: {reason}",
+                    metadata.process.pid
+                ))))
+            } else {
+                Ok(())
+            }
+        }
+        SupervisorChildIdentity::Exited => {
+            #[cfg(unix)]
+            if let Some(pgid) = metadata.process.pgid {
+                use deadreckon_core::ChildTerminator as _;
+
+                let pgid = i32::try_from(pgid).map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "invalid supervised Job process group {pgid}"
+                    )))
+                })?;
+                if let deadreckon_core::TerminationOutcome::Failed(reason) =
+                    deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace)
+                {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "could not reconcile residual Job process group {pgid}: {reason}"
+                    ))));
+                }
+            }
+            Ok(())
+        }
+        SupervisorChildIdentity::Reused => {
+            Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "refused to signal reused supervised Job pid {}",
+                metadata.process.pid
+            ))))
+        }
+        SupervisorChildIdentity::Unverifiable => {
+            Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify supervised Job process identity {}",
+                metadata.process.pid
+            ))))
+        }
+    }
+}
+
+fn reconcile_attempt_processes(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    outer: Option<&SupervisorChildMetadata>,
+    grace: Duration,
+    boot_changed: bool,
+) -> Result<()> {
+    if let Some(outer) = outer {
+        reconcile_supervisor_child(outer, grace)?;
+    }
+    if let Ok(state) = load_run(paths, job_id) {
+        super::job::reconcile_run_supervised_processes(&state, grace, boot_changed)?;
+    }
+    Ok(())
+}
+
+fn reconcile_attempt_processes_from_disk(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    grace: Duration,
+) -> Result<()> {
+    let outer = child_metadata(paths, job_id)?;
+    reconcile_attempt_processes(paths, job_id, outer.as_ref(), grace, false)?;
+    if let Some(outer) = outer {
+        remove_child_control_files(paths, job_id, outer.launch_id.as_deref())?;
+    }
+    Ok(())
 }
 
 fn recoverable_unlinked_guarded_launch(
@@ -3241,7 +3400,12 @@ fn append_terminal_event(
     if view.projection.is_terminal() {
         return Ok(view.projection);
     }
-    let cancelled = view.projection.stop_reason == Some(StopReason::CancelRequested);
+    // Cancellation may only become terminal after every supervised process is
+    // reconciled. If cleanup identity is lost, the honest terminal is blocked
+    // containment—not a reassuring but unproved `Cancelled`.
+    let containment_block = kind == JobEventKind::Blocked && reason == StopReason::LostContainment;
+    let cancelled =
+        view.projection.stop_reason == Some(StopReason::CancelRequested) && !containment_block;
     let suppressed_kind = serde_json::to_value(kind)?;
     let effective_kind = if cancelled {
         JobEventKind::Cancelled
@@ -3298,6 +3462,18 @@ fn finish_cancel_requested(
     if view.projection.stop_reason != Some(StopReason::CancelRequested) {
         return Ok(false);
     }
+    if let Err(error) =
+        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
+    {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "operator cancellation could not prove every supervised process stopped: {error}"
+            ),
+        )?;
+        return Ok(true);
+    }
     let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
     if attempt_active {
         append_attempt_stopped(
@@ -3324,6 +3500,29 @@ fn finish_cancel_requested(
         }),
     )?;
     Ok(true)
+}
+
+fn block_for_lost_containment(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    reason: &str,
+) -> Result<()> {
+    if attempt_is_active(paths, token.job_id.as_ref())? {
+        append_attempt_stopped(
+            paths,
+            token,
+            StopReason::LostContainment,
+            json!({ "reason": reason }),
+        )?;
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::Blocked,
+        StopReason::LostContainment,
+        json!({ "reason": reason }),
+    )?;
+    Ok(())
 }
 
 fn attempt_is_active(paths: &DeadreckonPaths, job_id: &str) -> Result<bool> {
@@ -3593,6 +3792,9 @@ mod tests {
             max_attempts,
             deadline: None,
             semantic_judge: SemanticJudgeMode::Required,
+            execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+                "none",
+            )),
         };
 
         let authority = JobAuthority {
@@ -3608,7 +3810,7 @@ mod tests {
                 &serde_json::to_string(&policy).expect("policy json"),
             ),
             launch_plan_sha256: launch_plan_sha256.clone(),
-            source_tree_sha256: deadreckon_core::flight::build_working_file_index(&source)
+            source_tree_sha256: deadreckon_core::flight::build_deliverable_file_index(&source)
                 .expect("source index")
                 .tree_hash(),
             source_revision: None,

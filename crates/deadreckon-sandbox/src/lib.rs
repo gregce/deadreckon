@@ -15,7 +15,7 @@ pub use commands::{SandboxCommand, build_command};
 pub use doctor::{BackendAvailability, doctor};
 pub use policy::{ProtectedPathPolicy, ToolSandboxPolicy};
 pub use process::{SandboxRunOutput, run};
-pub use spec::{SandboxSpec, WorkspaceAccess};
+pub use spec::{GuardedLaunchSpec, SandboxSpec, WorkspaceAccess};
 
 #[cfg(test)]
 pub(crate) use commands::sandbox_exec_profile;
@@ -33,7 +33,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -65,6 +65,8 @@ mod tests {
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadWrite,
+            cleanup_process_group: false,
+            guarded_launch: None,
         }
     }
 
@@ -133,6 +135,82 @@ mod tests {
             started.elapsed() < Duration::from_secs(4),
             "cancel did not escalate promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_boundary_scrubs_inherited_gate_signing_inputs() {
+        let mut spec = shell_spec();
+        spec.env.insert(
+            deadreckon_core::GATE_KEY_ENV.to_string(),
+            "must-not-cross".to_string(),
+        );
+        spec.env.insert(
+            deadreckon_core::GATE_CONTAINED_ENV.to_string(),
+            "true".to_string(),
+        );
+        spec.env.insert(
+            deadreckon_core::GATE_SANDBOX_BACKEND_ENV.to_string(),
+            "sandbox-exec".to_string(),
+        );
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(
+                "test -z \"$DEADRECKON_GATE_KEY\" && \
+                 test -z \"$DEADRECKON_GATE_CONTAINED\" && \
+                 test -z \"$DEADRECKON_GATE_SANDBOX_BACKEND\"",
+            ),
+        ];
+
+        let output = run(spec).await.expect("run");
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_command_cleans_background_process_group_before_returning() {
+        let temp = TempDir::new().expect("tempdir");
+        let delayed = temp.path().join("delayed");
+        let mut spec = shell_spec();
+        spec.cleanup_process_group = true;
+        spec.env.insert(
+            "DEADRECKON_DELAYED_SENTINEL".to_string(),
+            delayed.to_string_lossy().into_owned(),
+        );
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from("(sleep 0.5; : > \"$DEADRECKON_DELAYED_SENTINEL\") & printf done"),
+        ];
+
+        let output = run(spec).await.expect("run");
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+        assert_eq!(output.stdout, "done");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !delayed.exists(),
+            "background sandbox descendant survived the direct child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_group_is_persisted_for_cross_process_cancellation() {
+        let temp = TempDir::new().expect("tempdir");
+        let pid_file = temp.path().join("child-pids/gate.pid");
+        let mut spec = shell_spec();
+        spec.cleanup_process_group = true;
+        spec.pid_file = Some(pid_file.clone());
+        spec.args = vec![OsString::from("-c"), OsString::from("sleep 0.5")];
+
+        let handle = tokio::spawn(async move { run(spec).await });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let process =
+            deadreckon_core::read_supervised_process(&pid_file).expect("supervised process");
+        assert_eq!(process.pgid, Some(process.pid));
+        handle.await.expect("join").expect("run");
+        assert!(!pid_file.exists());
     }
 
     #[test]
@@ -237,6 +315,8 @@ mod tests {
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadWrite,
+            cleanup_process_group: false,
+            guarded_launch: None,
         })
         .await
         .expect("sandbox run");
@@ -285,6 +365,8 @@ mod tests {
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadWrite,
+            cleanup_process_group: false,
+            guarded_launch: None,
         })
         .await
         .expect("sandbox run");

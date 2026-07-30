@@ -11,13 +11,15 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::IoContext;
-use deadreckon_core::codebase::{read_codebase_record, write_codebase_record};
+use deadreckon_core::codebase::{
+    read_run_codebase_record, write_codebase_record, write_trusted_codebase_record,
+};
 use deadreckon_core::docs::{
     AS_BUILT_DELTA, RUN_AS_BUILT, RUN_DECISIONS, RUN_NARRATIVE, append_docs_warning, as_built_path,
     changed_doc_files, decisions_path, delta_path, diff_samples_markdown, docs_dir,
     implementation_notes_path, is_documentable_path, missing_files_in_narrative, narrative_path,
-    polish_path, publish_docs_for_promotion, read_turn_records, rewrite_templated_docs,
-    source_layout, tool_stdio_markdown,
+    polish_path, publish_docs_for_promotion, publish_docs_for_promotion_uncommitted,
+    read_turn_records, rewrite_templated_docs, source_layout, tool_stdio_markdown,
 };
 use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::paths::source_root;
@@ -35,6 +37,11 @@ pub struct PolishConfig {
     pub doc_subskills: Vec<String>,
     pub token_budget: u32,
     pub budget_cap_usd: Option<f64>,
+    pub sandbox_backend: SandboxBackend,
+    /// Standalone `doc --polish` keeps the historical immediate commit. A
+    /// durable run sets this false and commits through the trusted turn
+    /// sanitizer after all provider-backed documentation work has finished.
+    pub commit_docs: bool,
     pub no_llm: bool,
     pub force: bool,
 }
@@ -117,7 +124,7 @@ pub async fn polish_run_docs(
                 diff_coverage: None,
             },
         )?;
-        publish_docs_for_promotion(state)?;
+        publish_docs(state, config)?;
         return Ok(());
     }
 
@@ -127,7 +134,7 @@ pub async fn polish_run_docs(
         && existing.status == "polished"
         && existing.inputs_hash == hash
     {
-        publish_docs_for_promotion(state)?;
+        publish_docs(state, config)?;
         return Ok(());
     }
 
@@ -158,7 +165,7 @@ pub async fn polish_run_docs(
                         diff_coverage: None,
                     },
                 )?;
-                publish_docs_for_promotion(state)?;
+                publish_docs(state, config)?;
                 return Ok(());
             }
             Err(_) => {
@@ -168,6 +175,14 @@ pub async fn polish_run_docs(
     }
 
     polish_run_docs_legacy(state, router, config, &hash).await
+}
+
+fn publish_docs(state: &PipelineState, config: &PolishConfig) -> Result<()> {
+    if config.commit_docs {
+        publish_docs_for_promotion(state)
+    } else {
+        publish_docs_for_promotion_uncommitted(state)
+    }
 }
 
 async fn polish_run_docs_legacy(
@@ -199,36 +214,32 @@ async fn polish_run_docs_legacy(
                     diff_coverage: None,
                 },
             )?;
-            publish_docs_for_promotion(state)?;
+            publish_docs(state, config)?;
             return Ok(());
         }
     };
 
+    let provider_workspace = tempfile::tempdir().map_err(|source| DeadreckonError::Io {
+        path: state.run_root.join("docs-polish-workspace"),
+        source,
+    })?;
     let mut retries = 0;
     let mut prompt_suffix = String::new();
     let mut total_cost = 0.0;
     loop {
         let prompt = polish_prompt(state, &resolved.path, &prompt_suffix)?;
         let response = match router
-            .complete(&ProviderRequest {
+            .complete(&polish_provider_request(
                 prompt,
-                max_output_tokens: 20_000,
-                cwd: Some(state.working_dir.clone()),
-                output_path: Some(
-                    state
-                        .run_root
-                        .join("turns")
-                        .join("docs-polish")
-                        .join("provider.out"),
-                ),
-                sandbox_backend: Some(SandboxBackend::None),
-                workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
-                pid_file: None,
-                cancellation_token: None,
-                session_dir: None,
-                output_schema: None,
-                capability_posture: None,
-            })
+                20_000,
+                provider_workspace.path(),
+                state
+                    .run_root
+                    .join("turns")
+                    .join("docs-polish")
+                    .join("provider.out"),
+                config.sandbox_backend,
+            ))
             .await
         {
             Ok(response) => response,
@@ -253,7 +264,7 @@ async fn polish_run_docs_legacy(
                         diff_coverage: None,
                     },
                 )?;
-                publish_docs_for_promotion(state)?;
+                publish_docs(state, config)?;
                 return Ok(());
             }
         };
@@ -304,7 +315,7 @@ async fn polish_run_docs_legacy(
                     },
                 )?;
                 write_hash_to_codebase(state, hash)?;
-                publish_docs_for_promotion(state)?;
+                publish_docs(state, config)?;
                 return Ok(());
             }
             Err(err) => {
@@ -336,7 +347,7 @@ async fn polish_run_docs_legacy(
                         diff_coverage: None,
                     },
                 )?;
-                publish_docs_for_promotion(state)?;
+                publish_docs(state, config)?;
                 return Ok(());
             }
         }
@@ -469,7 +480,7 @@ async fn polish_run_docs_split(
     if status == "polished" {
         write_hash_to_codebase(state, hash)?;
     }
-    publish_docs_for_promotion(state)?;
+    publish_docs(state, config)?;
     Ok(())
 }
 
@@ -481,6 +492,12 @@ async fn run_polish_subcall(
     skill: &ResolvedSkill,
     suffix: &str,
 ) -> SubcallResult {
+    let provider_workspace = match tempfile::tempdir() {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return failed_subcall(name, skill, "workspace_error", 0, None, error.to_string());
+        }
+    };
     let mut retries = 0;
     let mut prompt_suffix = suffix.to_string();
     loop {
@@ -499,26 +516,18 @@ async fn run_polish_subcall(
             }
         };
         let response = router
-            .complete(&ProviderRequest {
+            .complete(&polish_provider_request(
                 prompt,
-                max_output_tokens: polish_token_budget(config),
-                cwd: Some(state.working_dir.clone()),
-                output_path: Some(
-                    state
-                        .run_root
-                        .join("turns")
-                        .join("docs-polish")
-                        .join(name)
-                        .join("provider.out"),
-                ),
-                sandbox_backend: Some(SandboxBackend::None),
-                workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
-                pid_file: None,
-                cancellation_token: None,
-                session_dir: None,
-                output_schema: None,
-                capability_posture: None,
-            })
+                polish_token_budget(config),
+                provider_workspace.path(),
+                state
+                    .run_root
+                    .join("turns")
+                    .join("docs-polish")
+                    .join(name)
+                    .join("provider.out"),
+                config.sandbox_backend,
+            ))
             .await;
         let duration_ms = Some(started.elapsed().as_millis());
         let response = match response {
@@ -608,6 +617,28 @@ fn failed_subcall(
             duration_ms,
             error: Some(error),
         },
+    }
+}
+
+fn polish_provider_request(
+    prompt: String,
+    max_output_tokens: u32,
+    isolated_workspace: &Path,
+    output_path: PathBuf,
+    sandbox_backend: SandboxBackend,
+) -> ProviderRequest {
+    ProviderRequest {
+        prompt,
+        max_output_tokens,
+        cwd: Some(isolated_workspace.to_path_buf()),
+        output_path: Some(output_path),
+        sandbox_backend: Some(sandbox_backend),
+        workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadOnly,
+        pid_file: None,
+        cancellation_token: None,
+        session_dir: None,
+        output_schema: None,
+        capability_posture: None,
     }
 }
 
@@ -1054,7 +1085,7 @@ fn inline_hunk(hunk: &str) -> String {
 
 pub fn resolve_skill(name: &str, state: &PipelineState, home: &Path) -> Result<ResolvedSkill> {
     let mut candidates = Vec::new();
-    if let Ok(record) = read_codebase_record(&state.working_dir)
+    if let Ok(record) = read_run_codebase_record(&state.run_root, &state.working_dir)
         && let Some(source) = record.source_path.as_ref()
     {
         candidates.push((
@@ -1109,7 +1140,7 @@ pub fn inputs_hash(state: &PipelineState) -> Result<String> {
     for file in changed_doc_files(state)? {
         hasher.update(file.as_bytes());
     }
-    if let Ok(record) = read_codebase_record(&state.working_dir)
+    if let Ok(record) = read_run_codebase_record(&state.run_root, &state.working_dir)
         && let Some(source) = record.source_path.as_ref()
     {
         for name in ["AS-BUILT-ARCHITECTURE.md", "AS-BUILT.md"] {
@@ -1351,11 +1382,12 @@ pub fn read_polish_record(state: &PipelineState) -> Result<Option<PolishRecord>>
 }
 
 fn write_hash_to_codebase(state: &PipelineState, hash: &str) -> Result<()> {
-    let Ok(mut record) = read_codebase_record(&state.working_dir) else {
+    let Ok(mut record) = read_run_codebase_record(&state.run_root, &state.working_dir) else {
         return Ok(());
     };
     record.doc_polish_hash = Some(hash.to_string());
-    write_codebase_record(&state.working_dir, &record)
+    write_codebase_record(&state.working_dir, &record)?;
+    write_trusted_codebase_record(&state.run_root, &record)
 }
 
 fn skill_source_label(source: &SkillSource) -> &'static str {
@@ -1405,8 +1437,30 @@ fn required_doc_names() -> [&'static str; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::live_narrative_digest;
+    use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
+
+    use super::{live_narrative_digest, polish_provider_request};
     use tempfile::TempDir;
+
+    #[test]
+    fn documentation_provider_is_read_only_in_an_isolated_workspace() {
+        let source = TempDir::new().expect("source");
+        let isolated = TempDir::new().expect("isolated");
+        let request = polish_provider_request(
+            "{}".to_string(),
+            1_000,
+            isolated.path(),
+            source.path().join("provider.out"),
+            SandboxBackend::SandboxExec,
+        );
+
+        assert_eq!(request.workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(request.sandbox_backend, Some(SandboxBackend::SandboxExec));
+        assert_eq!(request.cwd.as_deref(), Some(isolated.path()));
+        assert_ne!(request.cwd.as_deref(), Some(source.path()));
+        assert!(request.session_dir.is_none());
+        assert!(request.pid_file.is_none());
+    }
 
     #[test]
     fn posthoc_run_narrative_seeds_from_full_live_beat_history() {

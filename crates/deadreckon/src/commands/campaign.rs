@@ -913,7 +913,7 @@ fn promote_campaign_result(
         },
     )?;
     remove_if_exists(&state.working_dir)?;
-    copy_tree(merge_dir, &state.working_dir)?;
+    copy_deliverable_tree(merge_dir, &state.working_dir)?;
     deadreckon_core::campaign::write_campaign_rollup_at_run_root(&state.run_root, rollup)?;
     record_campaign_result_accounting(paths, campaign_id, &mut state)?;
     write_acceptance_marker(

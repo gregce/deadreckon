@@ -10,7 +10,9 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::codebase::{CodebaseMode, CodebaseRecord, write_codebase_record};
+use crate::codebase::{
+    CodebaseMode, CodebaseRecord, write_codebase_record, write_trusted_codebase_record,
+};
 use crate::docs::ensure_docs_started;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::gate::create_gate_key;
@@ -259,6 +261,7 @@ pub fn create_run(paths: &DeadreckonPaths, options: RunOptions) -> Result<Pipeli
     };
     state.set_phase_status(PhaseId(0), PhaseStatus::Planned)?;
     save_state(&state)?;
+    write_trusted_codebase_record(&state.run_root, &codebase)?;
     write_codebase_record(&state.working_dir, &codebase)?;
     ensure_docs_started(&state)?;
     write_current_pointer(paths, &state)?;
@@ -548,6 +551,12 @@ mod tests {
         .expect("create run");
 
         assert!(state.state_path().exists());
+        assert!(state.run_root.join(crate::TRUSTED_CODEBASE_RECORD).exists());
+        assert_eq!(
+            crate::read_run_codebase_record(&state.run_root, &state.working_dir)
+                .expect("trusted codebase record"),
+            crate::read_codebase_record(&state.working_dir).expect("workspace codebase record")
+        );
         assert_eq!(state.status, RunStatus::Planned);
         assert_eq!(state.phases[0].id, PhaseId(0));
         assert_eq!(state.phases[1].id, PhaseId(10));

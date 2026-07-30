@@ -3,6 +3,7 @@
 //! This module contains wire types only. Event I/O, lease fencing, history
 //! reduction, and receipt verification belong to higher-level crates.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -90,6 +91,49 @@ pub struct JobPolicy {
     pub max_attempts: u32,
     pub deadline: Option<DateTime<Utc>>,
     pub semantic_judge: SemanticJudgeMode,
+    /// Resolved provider capability policy approved before the first turn.
+    ///
+    /// `None` is retained only for reading pre-Watchkeeper-policy jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<JobExecutionPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobExecutionPolicy {
+    pub sandbox_requested: String,
+    pub require_containment: bool,
+    pub tools: BTreeMap<String, JobToolPolicy>,
+}
+
+impl JobExecutionPolicy {
+    /// The default unattended coding capability set: workspace-local reads and
+    /// writes, with no network authority.
+    pub fn workspace_only(sandbox_requested: impl Into<String>) -> Self {
+        let mut tools = BTreeMap::new();
+        for name in ["bash", "write_file"] {
+            tools.insert(
+                name.to_string(),
+                JobToolPolicy {
+                    workspace_read: true,
+                    workspace_write: true,
+                    network_allowlist: Vec::new(),
+                },
+            );
+        }
+        Self {
+            sandbox_requested: sandbox_requested.into(),
+            require_containment: true,
+            tools,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobToolPolicy {
+    pub workspace_read: bool,
+    pub workspace_write: bool,
+    #[serde(default)]
+    pub network_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

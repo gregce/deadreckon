@@ -43,10 +43,10 @@ use deadreckon::ui_card::{
 };
 use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::flight::{
-    CheckpointManifest, FLIGHT_EVENTS_JSONL, FLIGHT_MANIFEST_JSON, FlightSessionStatus,
-    RewindEvent, RewindMode, RewindStatus, RewindTarget, RewindTargetKind, append_rewind_event,
-    build_working_file_index, list_checkpoint_manifests, materialize_checkpoint,
-    read_flight_events, read_flight_manifest,
+    ArtifactFileFingerprint, ArtifactFileKind, CheckpointManifest, FLIGHT_EVENTS_JSONL,
+    FLIGHT_MANIFEST_JSON, FlightSessionStatus, RewindEvent, RewindMode, RewindStatus, RewindTarget,
+    RewindTargetKind, append_rewind_event, build_deliverable_file_index, build_working_file_index,
+    list_checkpoint_manifests, materialize_checkpoint, read_flight_events, read_flight_manifest,
 };
 use deadreckon_core::glossary::{NOUN_DONE_CONTRACT, NOUN_VERIFIED_RUN};
 use deadreckon_core::install_receipt::{Channel, detect_receipt, read_receipt, write_receipt};
@@ -76,12 +76,13 @@ use deadreckon_core::{
     append_plan_message, append_provenance, append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
-    copy_source_to_working, copy_tree, create_run, create_worktree, doc_path_for_kind,
-    docs_status_for_state, emit_event, evaluate_acceptance_checks, inventory_files, list_runs,
-    load_chain, load_plan, load_run, marker_path_for_run_root, pid_is_alive, plan_status_label,
-    plan_task_status_label, prepare_worktree_record, preview_git_state, promote_completed_run,
-    read_chain_step_marker, read_codebase_record, read_plan_messages, record_for_resolved_mode,
-    release_lock_file, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
+    copy_artifact_path, copy_deliverable_tree, copy_source_to_working, copy_tree, create_run,
+    create_worktree, doc_path_for_kind, docs_status_for_state, emit_event,
+    evaluate_acceptance_checks, inventory_files, list_runs, load_chain, load_plan, load_run,
+    marker_path_for_run_root, pid_is_alive, plan_status_label, plan_task_status_label,
+    prepare_worktree_record, preview_git_state, promote_completed_run, read_chain_step_marker,
+    read_codebase_record, read_plan_messages, record_for_resolved_mode, release_lock_file,
+    remove_artifact_path, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
     save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
     write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
     write_coordinator_state, write_plan_child_marker, write_worker_spec,
@@ -1223,7 +1224,11 @@ async fn main_inner() -> Result<()> {
             dest,
             force,
             include_manifest,
-        } => commands::lifecycle::materialize_command(run_id, dest, force, include_manifest),
+        } => {
+            let paths = DeadreckonPaths::discover();
+            let dest = resolve_external_dest(&paths, dest, "export")?;
+            commands::lifecycle::materialize_command(run_id, dest, force, include_manifest)
+        }
         Commands::Apply {
             run_id,
             strategy,
@@ -1277,6 +1282,8 @@ async fn main_inner() -> Result<()> {
             no_narrate,
             narrator_model,
         } => {
+            let paths = DeadreckonPaths::discover();
+            let dest = resolve_external_dest(&paths, dest, "extend")?;
             commands::lifecycle::extend_command(ExtendCommandArgs {
                 parent_run_id,
                 new_goal,
@@ -6164,8 +6171,7 @@ fn commit_plan_apply_docs_update(
     plan: &Plan,
     merged_state: &deadreckon_core::PipelineState,
 ) -> Result<()> {
-    git_status(worktree_path, &["add", "docs"])?;
-    git_status(worktree_path, &["add", "-f", ".deadreckon/docs"])?;
+    stage_plan_result_changes(worktree_path)?;
     let staged = git_stdout(worktree_path, &["diff", "--cached", "--stat"])?;
     if staged.trim().is_empty() {
         return Ok(());
@@ -6288,7 +6294,7 @@ struct PlanMergeSeenFile {
     run_id: String,
     artifact_root: PathBuf,
     artifact_path: PathBuf,
-    hash: u64,
+    hash: ArtifactFileFingerprint,
 }
 
 #[derive(Debug, Clone)]
@@ -6297,6 +6303,13 @@ struct PlanMergeSource {
     task_index: u32,
     run_id: String,
     artifact_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct MergeableRunArtifact {
+    relative: PathBuf,
+    artifact_path: PathBuf,
+    fingerprint: ArtifactFileFingerprint,
 }
 
 #[derive(Debug, Clone)]
@@ -6318,24 +6331,43 @@ impl PlanMergeOutcome {
 fn mergeable_run_files_with_prefix_error(
     root: &Path,
     prefix_error: &str,
-) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
+) -> Result<Vec<MergeableRunArtifact>> {
     let mut files = Vec::new();
-    for file in inventory_files(root)? {
-        let relative = file
-            .strip_prefix(root)
-            .map_err(|err| DeadreckonError::InvalidInput(format!("{prefix_error}: {err}")))?;
-        if skip_plan_merge_file(relative) {
+    for (relative, fingerprint) in build_deliverable_file_index(root)?.files {
+        if skip_plan_merge_file(&relative) {
             continue;
         }
-        let hash = file_hash(&file)?;
-        files.push((relative.to_path_buf(), file.clone(), hash));
+        let artifact_path = root.join(&relative);
+        if artifact_path.strip_prefix(root).is_err() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{prefix_error}: {} is outside {}",
+                artifact_path.display(),
+                root.display()
+            ))));
+        }
+        files.push(MergeableRunArtifact {
+            relative,
+            artifact_path,
+            fingerprint,
+        });
     }
     Ok(files)
 }
 
 #[cfg(test)]
-fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, u64)>> {
-    mergeable_run_files_with_prefix_error(root, "merge source prefix error")
+fn mergeable_run_files(root: &Path) -> Result<Vec<(PathBuf, PathBuf, ArtifactFileFingerprint)>> {
+    Ok(
+        mergeable_run_files_with_prefix_error(root, "merge source prefix error")?
+            .into_iter()
+            .map(|artifact| {
+                (
+                    artifact.relative,
+                    artifact.artifact_path,
+                    artifact.fingerprint,
+                )
+            })
+            .collect(),
+    )
 }
 
 /// A same-path collision between two independent campaign sub-results.
@@ -6368,32 +6400,41 @@ enum ComposeMergeDecision<C> {
 fn compose_merge_sources<T, S, C>(
     merge_dir: &Path,
     sources: &[ComposeFileSource<T>],
-    mut make_seen: impl FnMut(&T, &Path, &Path, u64) -> S,
+    mut make_seen: impl FnMut(&T, &Path, &Path, ArtifactFileFingerprint) -> S,
     mut decide_conflict: impl FnMut(&Path, &S, &S) -> ComposeMergeDecision<C>,
 ) -> Result<Vec<C>> {
+    let inventories = sources
+        .iter()
+        .map(|source| mergeable_run_files_with_prefix_error(&source.root, source.prefix_error))
+        .collect::<Result<Vec<_>>>()?;
+    reject_artifact_hierarchy_collisions(&inventories)?;
+
     remove_if_exists(merge_dir)?;
     fs::create_dir_all(merge_dir)?;
-    let mut seen: BTreeMap<PathBuf, (S, u64)> = BTreeMap::new();
+    let mut seen: BTreeMap<PathBuf, (S, ArtifactFileFingerprint)> = BTreeMap::new();
     let mut conflicts = Vec::new();
-    for source in sources {
-        for (relative, file, hash) in
-            mergeable_run_files_with_prefix_error(&source.root, source.prefix_error)?
-        {
-            let current = make_seen(&source.data, &relative, &file, hash);
-            let decision = match seen.get(&relative) {
-                Some((_, previous_hash)) if *previous_hash == hash => continue,
-                Some((previous, _)) => decide_conflict(&relative, previous, &current),
+    for (source, inventory) in sources.iter().zip(inventories) {
+        for artifact in inventory {
+            let current = make_seen(
+                &source.data,
+                &artifact.relative,
+                &artifact.artifact_path,
+                artifact.fingerprint.clone(),
+            );
+            let decision = match seen.get(&artifact.relative) {
+                Some((_, previous)) if previous == &artifact.fingerprint => continue,
+                Some((previous, _)) => decide_conflict(&artifact.relative, previous, &current),
                 None => {
-                    copy_merge_file(&file, &merge_dir.join(&relative))?;
-                    seen.insert(relative, (current, hash));
+                    copy_merge_file(&artifact.artifact_path, &merge_dir.join(&artifact.relative))?;
+                    seen.insert(artifact.relative, (current, artifact.fingerprint));
                     continue;
                 }
             };
             match decision {
                 ComposeMergeDecision::KeepExisting => {}
                 ComposeMergeDecision::UseCurrent => {
-                    copy_merge_file(&file, &merge_dir.join(&relative))?;
-                    seen.insert(relative, (current, hash));
+                    copy_merge_file(&artifact.artifact_path, &merge_dir.join(&artifact.relative))?;
+                    seen.insert(artifact.relative, (current, artifact.fingerprint));
                 }
                 ComposeMergeDecision::RecordConflict {
                     conflict,
@@ -6401,14 +6442,41 @@ fn compose_merge_sources<T, S, C>(
                 } => {
                     conflicts.push(conflict);
                     if use_current {
-                        copy_merge_file(&file, &merge_dir.join(&relative))?;
-                        seen.insert(relative, (current, hash));
+                        copy_merge_file(
+                            &artifact.artifact_path,
+                            &merge_dir.join(&artifact.relative),
+                        )?;
+                        seen.insert(artifact.relative, (current, artifact.fingerprint));
                     }
                 }
             }
         }
     }
     Ok(conflicts)
+}
+
+fn reject_artifact_hierarchy_collisions(inventories: &[Vec<MergeableRunArtifact>]) -> Result<()> {
+    let paths = inventories
+        .iter()
+        .flat_map(|inventory| inventory.iter().map(|artifact| artifact.relative.clone()))
+        .collect::<BTreeSet<_>>();
+    for path in &paths {
+        let mut ancestor = path.parent();
+        while let Some(candidate) = ancestor {
+            if candidate.as_os_str().is_empty() {
+                break;
+            }
+            if paths.contains(candidate) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "plan artifact hierarchy collision: {} is an ancestor of {}",
+                    candidate.display(),
+                    path.display()
+                ))));
+            }
+            ancestor = candidate.parent();
+        }
+    }
+    Ok(())
 }
 
 /// Compose several already-promoted result trees into one merge dir. Sub-results
@@ -6428,7 +6496,7 @@ fn compose_roots(roots: &[(String, PathBuf)], merge_dir: &Path) -> Result<Compos
     let conflicts = compose_merge_sources(
         merge_dir,
         &sources,
-        |label, _relative, _file, _hash| label.clone(),
+        |label, _relative, _file, _fingerprint| label.clone(),
         |relative, previous, current| ComposeMergeDecision::RecordConflict {
             conflict: ComposeConflict {
                 path: relative.to_path_buf(),
@@ -6563,9 +6631,18 @@ fn plan_merge_conflict_child(plan: &Plan, file: &PlanMergeSeenFile) -> PlanMerge
         run_id: file.run_id.clone(),
         artifact_root: file.artifact_root.clone(),
         artifact_path: file.artifact_path.clone(),
-        hash: format!("{:016x}", file.hash),
+        hash: artifact_fingerprint_label(&file.hash),
         depends_on,
     }
+}
+
+fn artifact_fingerprint_label(fingerprint: &ArtifactFileFingerprint) -> String {
+    let kind = match fingerprint.kind {
+        ArtifactFileKind::RegularFile => "regular",
+        ArtifactFileKind::ExecutableFile => "executable",
+        ArtifactFileKind::SymbolicLink => "symlink",
+    };
+    format!("{kind}:{}:{}", fingerprint.size, fingerprint.hash)
 }
 
 fn write_plan_merge_conflicts(
@@ -7117,6 +7194,7 @@ fn apply_synthesized_repair(
 ) -> Result<()> {
     for action in &repair_plan.actions {
         let dest = merge.working_dir.join(&action.path);
+        remove_artifact_path(&dest)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -7259,16 +7337,14 @@ fn write_merge_repair_run_record(
 }
 
 fn copy_repair_library_to_working(working_dir: &Path, library: &Path) -> Result<()> {
+    let library_files = build_deliverable_file_index(library)?.files;
     remove_if_exists(working_dir)?;
     fs::create_dir_all(working_dir)?;
-    for file in inventory_files(library)? {
-        let relative = file.strip_prefix(library).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("repair source prefix error: {err}"))
-        })?;
-        if skip_plan_merge_file(relative) {
+    for (relative, _) in library_files {
+        if skip_plan_merge_file(&relative) {
             continue;
         }
-        copy_merge_file(&file, &working_dir.join(relative))?;
+        copy_merge_file(&library.join(&relative), &working_dir.join(relative))?;
     }
     Ok(())
 }
@@ -7283,7 +7359,8 @@ fn child_artifact_root(paths: &DeadreckonPaths, state: &deadreckon_core::Pipelin
 }
 
 fn skip_plan_merge_file(relative: &Path) -> bool {
-    relative == Path::new("manifest.json")
+    !deadreckon_core::is_deliverable_workspace_path(relative)
+        || relative == Path::new("manifest.json")
         || relative == Path::new(deadreckon_core::IMPLEMENTATION_NOTES_HTML)
         || relative.starts_with(".deadreckon")
         || path_has_component(relative, ".git")
@@ -7300,18 +7377,8 @@ fn skip_plan_merge_file(relative: &Path) -> bool {
             .is_some_and(|name| name.starts_with("RUN-"))
 }
 
-fn file_hash(path: &Path) -> Result<u64> {
-    let mut hasher = DefaultHasher::new();
-    fs::read(path)?.hash(&mut hasher);
-    Ok(hasher.finish())
-}
-
 fn copy_merge_file(source: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(source, dest)?;
-    Ok(())
+    copy_artifact_path(source, dest).map_err(CliError::from)
 }
 
 fn skip_plan_apply_file(relative: &Path) -> bool {
@@ -7343,7 +7410,7 @@ fn create_merged_plan_run(
         },
     )?;
     remove_if_exists(&state.working_dir)?;
-    copy_tree(&paths.merge_working(&plan.plan_id), &state.working_dir)?;
+    copy_deliverable_tree(&paths.merge_working(&plan.plan_id), &state.working_dir)?;
     if no_gate {
         eprintln!(
             "{}",
@@ -7552,27 +7619,20 @@ fn seed_plan_result_worktree(
     merged_source: &Path,
     worktree_path: &Path,
 ) -> Result<()> {
-    for file in inventory_files(worktree_path)? {
-        let relative = file.strip_prefix(worktree_path).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("plan apply worktree prefix error: {err}"))
-        })?;
-        if path_has_component(relative, ".git") {
+    let merged_files = build_deliverable_file_index(merged_source)?.files;
+    clear_plan_result_deliverables(worktree_path)?;
+    for (relative, _) in merged_files {
+        if skip_plan_apply_file(&relative) {
             continue;
         }
-        remove_if_exists(&file)?;
-    }
-    for file in inventory_files(merged_source)? {
-        let relative = file.strip_prefix(merged_source).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("plan apply source prefix error: {err}"))
-        })?;
-        if skip_plan_apply_file(relative) {
-            continue;
-        }
-        copy_merge_file(&file, &worktree_path.join(relative))?;
+        copy_merge_file(
+            &merged_source.join(&relative),
+            &worktree_path.join(relative),
+        )?;
     }
     materialize_plan_docs_to_working(paths, plan, worktree_path, None)?;
 
-    git_status(worktree_path, &["add", "-A"])?;
+    stage_plan_result_changes(worktree_path)?;
     let staged = git_stdout(worktree_path, &["diff", "--cached", "--stat"])?;
     if staged.trim().is_empty() {
         return Ok(());
@@ -7587,6 +7647,389 @@ fn seed_plan_result_worktree(
             &plan_apply_commit_body(plan, merged_state),
         ],
     )
+}
+
+fn clear_plan_result_deliverables(worktree_path: &Path) -> Result<()> {
+    for relative in build_deliverable_file_index(worktree_path)?.files.keys() {
+        remove_artifact_path(&worktree_path.join(relative))?;
+    }
+    Ok(())
+}
+
+fn stage_plan_result_changes(worktree_path: &Path) -> Result<()> {
+    let mut paths = BTreeSet::new();
+    paths.extend(git_nul_paths(
+        worktree_path,
+        &["diff", "--name-only", "--no-renames", "-z"],
+    )?);
+    paths.extend(git_nul_paths(
+        worktree_path,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?);
+
+    for relative in paths
+        .iter()
+        .filter(|relative| is_plan_committable_path(relative))
+    {
+        let pathspec = format!(":(literal){}", path_to_str(relative)?);
+        git_status(worktree_path, &["add", "-A", "--", &pathspec])?;
+    }
+
+    let inadmissible = git_nul_paths(
+        worktree_path,
+        &["diff", "--cached", "--name-only", "--no-renames", "-z"],
+    )?
+    .into_iter()
+    .filter(|relative| !is_plan_committable_path(relative))
+    .collect::<Vec<_>>();
+    if !inadmissible.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "plan result staging contains non-deliverable paths: {}",
+                inadmissible
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "remove the staged provider/runtime artifacts and retry",
+        )));
+    }
+    Ok(())
+}
+
+fn git_nul_paths(cwd: &Path, args: &[&str]) -> Result<Vec<PathBuf>> {
+    let output = deadreckon_core::git::run_git(cwd, args)?;
+    if !output.status.success() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path).map(PathBuf::from).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "git reported a path that is not valid UTF-8".to_string(),
+                ))
+            })
+        })
+        .collect()
+}
+
+fn is_plan_committable_path(relative: &Path) -> bool {
+    deadreckon_core::is_deliverable_workspace_path(relative)
+}
+
+#[cfg(test)]
+mod plan_artifact_boundary_tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::TempDir;
+
+    use super::{
+        clear_plan_result_deliverables, compose_roots, copy_repair_library_to_working,
+        git_nul_paths, git_status, stage_plan_result_changes,
+    };
+
+    fn write_file(root: &Path, relative: &str, body: &str) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+
+    #[test]
+    fn plan_composition_ignores_provider_and_runtime_artifacts() {
+        let temp = TempDir::new().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_file(&first, "src/first.rs", "first\n");
+        write_file(&second, "src/second.rs", "second\n");
+        write_file(&first, ".specstory/history/session.md", "private first\n");
+        write_file(&second, ".specstory/history/session.md", "private second\n");
+        write_file(&first, "target/debug/output", "runtime first\n");
+        write_file(&second, "target/debug/output", "runtime second\n");
+        write_file(&first, ".deadreckon/codebase.json", "{}\n");
+        write_file(&second, ".deadreckon/codebase.json", "{}\n");
+
+        let merge = temp.path().join("merge");
+        let result = compose_roots(
+            &[("first".to_string(), first), ("second".to_string(), second)],
+            &merge,
+        )
+        .expect("compose");
+
+        assert!(result.conflicts.is_empty());
+        assert!(merge.join("src/first.rs").is_file());
+        assert!(merge.join("src/second.rs").is_file());
+        assert!(!merge.join(".specstory").exists());
+        assert!(!merge.join("target").exists());
+        assert!(!merge.join(".deadreckon").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_composition_preserves_executable_and_symlink_identity() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        write_file(&first, "bin/run", "#!/bin/sh\n");
+        fs::set_permissions(first.join("bin/run"), fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        symlink("run", first.join("bin/current")).expect("source symlink");
+        write_file(&second, "config/settings.toml", "enabled = true\n");
+
+        let merge = temp.path().join("merge");
+        let result = compose_roots(
+            &[("first".to_string(), first), ("second".to_string(), second)],
+            &merge,
+        )
+        .expect("compose");
+
+        assert!(result.conflicts.is_empty());
+        assert_ne!(
+            fs::metadata(merge.join("bin/run"))
+                .expect("merged executable")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert!(
+            fs::symlink_metadata(merge.join("bin/current"))
+                .expect("merged symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(merge.join("bin/current")).expect("raw symlink target"),
+            Path::new("run")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_composition_treats_mode_and_kind_changes_as_conflicts() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let regular = temp.path().join("regular");
+        let executable = temp.path().join("executable");
+        write_file(&regular, "bin/run", "same bytes\n");
+        write_file(&executable, "bin/run", "same bytes\n");
+        fs::set_permissions(regular.join("bin/run"), fs::Permissions::from_mode(0o644))
+            .expect("regular mode");
+        fs::set_permissions(
+            executable.join("bin/run"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("executable mode");
+
+        let mode_result = compose_roots(
+            &[
+                ("regular".to_string(), regular),
+                ("executable".to_string(), executable),
+            ],
+            &temp.path().join("mode-merge"),
+        )
+        .expect("mode compose");
+        assert_eq!(mode_result.conflicts.len(), 1);
+        assert_eq!(mode_result.conflicts[0].path, Path::new("bin/run"));
+
+        let file_root = temp.path().join("file-root");
+        let link_root = temp.path().join("link-root");
+        write_file(&file_root, "current", "release\n");
+        fs::create_dir_all(&link_root).expect("link root");
+        symlink("release", link_root.join("current")).expect("kind symlink");
+
+        let kind_result = compose_roots(
+            &[
+                ("file".to_string(), file_root),
+                ("link".to_string(), link_root),
+            ],
+            &temp.path().join("kind-merge"),
+        )
+        .expect("kind compose");
+        assert_eq!(kind_result.conflicts.len(), 1);
+        assert_eq!(kind_result.conflicts[0].path, Path::new("current"));
+    }
+
+    #[test]
+    fn plan_composition_rejects_hierarchy_collisions_before_copying() {
+        let temp = TempDir::new().expect("tempdir");
+        let ancestor = temp.path().join("ancestor");
+        let descendant = temp.path().join("descendant");
+        write_file(&ancestor, "config", "single file\n");
+        write_file(&descendant, "config/settings.toml", "nested file\n");
+        let merge = temp.path().join("merge");
+        write_file(&merge, "sentinel.txt", "must remain\n");
+
+        let error = compose_roots(
+            &[
+                ("ancestor".to_string(), ancestor),
+                ("descendant".to_string(), descendant),
+            ],
+            &merge,
+        )
+        .expect_err("hierarchy collision must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("plan artifact hierarchy collision"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(merge.join("sentinel.txt")).expect("sentinel"),
+            "must remain\n"
+        );
+        assert!(!merge.join("config").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_library_copy_preserves_identity_and_omits_private_artifacts() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let library = temp.path().join("library");
+        let working = temp.path().join("working");
+        write_file(&library, "bin/run", "#!/bin/sh\n");
+        fs::set_permissions(library.join("bin/run"), fs::Permissions::from_mode(0o755))
+            .expect("executable mode");
+        symlink("run", library.join("bin/current")).expect("library symlink");
+        write_file(
+            &library,
+            ".specstory/history/session.md",
+            "provider private\n",
+        );
+
+        copy_repair_library_to_working(&working, &library).expect("repair copy");
+
+        assert_ne!(
+            fs::metadata(working.join("bin/run"))
+                .expect("copied executable")
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert!(
+            fs::symlink_metadata(working.join("bin/current"))
+                .expect("copied symlink")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(working.join("bin/current")).expect("raw symlink target"),
+            Path::new("run")
+        );
+        assert!(!working.join(".specstory").exists());
+    }
+
+    #[test]
+    fn plan_apply_preserves_private_base_files_and_stages_only_result_artifacts() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        git_status(&repo, &["init", "-b", "main"]).expect("git init");
+        git_status(
+            &repo,
+            &["config", "user.email", "deadreckon@example.invalid"],
+        )
+        .expect("git email");
+        git_status(&repo, &["config", "user.name", "deadreckon"]).expect("git name");
+        write_file(&repo, "old.txt", "old result\n");
+        write_file(&repo, ".specstory/history/session.md", "private base\n");
+        write_file(&repo, "target/debug/output", "runtime base\n");
+        write_file(&repo, ".deadreckon/codebase.json", "{}\n");
+        git_status(&repo, &["add", "-A"]).expect("baseline add");
+        git_status(&repo, &["commit", "-m", "baseline"]).expect("baseline commit");
+
+        clear_plan_result_deliverables(&repo).expect("clear deliverables");
+        assert!(!repo.join("old.txt").exists());
+        assert!(repo.join(".specstory/history/session.md").is_file());
+        assert!(repo.join("target/debug/output").is_file());
+        assert!(repo.join(".deadreckon/codebase.json").is_file());
+
+        write_file(&repo, "result.txt", "new result\n");
+        write_file(&repo, ".specstory/history/session.md", "private mutation\n");
+        write_file(
+            &repo,
+            ".deadreckon/docs/PLAN-NARRATIVE.md",
+            "approved lifecycle doc\n",
+        );
+        write_file(
+            &repo,
+            ".deadreckon/docs/.specstory/secret.md",
+            "not an approved lifecycle doc\n",
+        );
+
+        stage_plan_result_changes(&repo).expect("stage result");
+
+        let staged = git_nul_paths(
+            &repo,
+            &["diff", "--cached", "--name-only", "--no-renames", "-z"],
+        )
+        .expect("staged")
+        .into_iter()
+        .collect::<BTreeSet<PathBuf>>();
+        assert_eq!(
+            staged,
+            BTreeSet::from([PathBuf::from("old.txt"), PathBuf::from("result.txt"),])
+        );
+        let unstaged =
+            git_nul_paths(&repo, &["diff", "--name-only", "--no-renames", "-z"]).expect("unstaged");
+        assert!(
+            unstaged
+                .iter()
+                .any(|path| path == Path::new(".specstory/history/session.md"))
+        );
+        assert!(!staged.iter().any(|path| {
+            path.starts_with(".specstory")
+                || path.starts_with(".deadreckon")
+                || path.starts_with("target")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_result_cleanup_removes_symlink_deliverables_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let worktree = temp.path().join("worktree");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::write(&outside, "operator-owned\n").expect("outside");
+        symlink(&outside, worktree.join("result-link")).expect("deliverable symlink");
+        write_file(
+            &worktree,
+            ".specstory/history/session.md",
+            "private evidence\n",
+        );
+
+        clear_plan_result_deliverables(&worktree).expect("clear result");
+
+        assert!(
+            fs::symlink_metadata(worktree.join("result-link")).is_err(),
+            "deliverable symlink should be removed"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).expect("outside survives"),
+            "operator-owned\n"
+        );
+        assert!(worktree.join(".specstory/history/session.md").is_file());
+    }
 }
 
 fn plan_apply_commit_subject(plan: &Plan) -> String {
@@ -8919,16 +9362,86 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 }
 
 fn absolute_dest(path: PathBuf) -> Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
+    let absolute = if path.is_absolute() {
+        path
     } else {
-        Ok(std::env::current_dir()?.join(path))
+        std::env::current_dir()?.join(path)
+    };
+    let normalized = lexical_normalize_path(&absolute);
+    resolve_nearest_existing_ancestor(&normalized)
+}
+
+fn lexical_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::RootDir
+            | std::path::Component::Prefix(_)
+            | std::path::Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
     }
+    normalized
+}
+
+fn resolve_nearest_existing_ancestor(path: &Path) -> Result<PathBuf> {
+    let mut existing = path;
+    loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                existing = existing.parent().ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "destination {} has no resolvable ancestor",
+                        path.display()
+                    )))
+                })?;
+            }
+            Err(source) => return Err(CliError::Io(source)),
+        }
+    }
+
+    let unresolved = path.strip_prefix(existing).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "destination {} could not be resolved safely",
+            path.display()
+        )))
+    })?;
+    let resolved = fs::canonicalize(existing).map_err(|source| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "destination alias {} could not be resolved safely: {source}",
+            existing.display()
+        )))
+    })?;
+    Ok(resolved.join(unresolved))
+}
+
+fn resolve_external_dest(
+    paths: &DeadreckonPaths,
+    dest: Option<PathBuf>,
+    verb: &str,
+) -> Result<Option<PathBuf>> {
+    dest.map(|dest| {
+        let dest = absolute_dest(dest)?;
+        refuse_dest_inside_home(paths, &dest, verb)?;
+        Ok(dest)
+    })
+    .transpose()
 }
 
 fn refuse_dest_inside_home(paths: &DeadreckonPaths, dest: &Path, verb: &str) -> Result<()> {
-    let home = paths.home();
-    if dest.starts_with(home) {
+    let home = fs::canonicalize(paths.home()).map_err(|source| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "DeadReckon home {} could not be resolved safely: {source}",
+            paths.home().display()
+        )))
+    })?;
+    if dest.starts_with(&home) || home.starts_with(dest) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "refusing to {verb} back into runstate (pick a path outside ~/.deadreckon/)"
         ))));
@@ -9098,6 +9611,10 @@ fn read_run_codebase_record(
     paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
 ) -> Result<CodebaseRecord> {
+    if paths.job_json(&state.run_id).is_file() {
+        return deadreckon_core::read_trusted_codebase_record(&state.run_root)
+            .map_err(CliError::from);
+    }
     let mut bases = vec![state.working_dir.clone()];
     if let Some(library_dir) = state.promoted_library_dir.as_ref() {
         bases.push(library_dir.clone());
@@ -9679,7 +10196,7 @@ fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
         }
     };
     let target_turn = turn.unwrap_or_else(|| state.turn.saturating_sub(1));
-    let restore_state = undo_restore_state(&state)?;
+    let restore_state = undo_restore_state(&paths, &state)?;
     restore_snapshot(&restore_state, target_turn)?;
     append_trace(
         &state,
@@ -9730,10 +10247,13 @@ fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
 }
 
 fn undo_restore_state(
+    paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
 ) -> Result<deadreckon_core::PipelineState> {
-    let Ok(record) = read_codebase_record(&state.working_dir) else {
-        return Ok(state.clone());
+    let record = match read_run_codebase_record(paths, state) {
+        Ok(record) => record,
+        Err(error) if paths.job_json(&state.run_id).is_file() => return Err(error),
+        Err(_) => return Ok(state.clone()),
     };
     if record.mode != CodebaseMode::InPlace {
         return Ok(state.clone());
@@ -12199,6 +12719,7 @@ fn prompt_materialize_action(
         PathBuf::from(answer.trim())
     };
     let dest = absolute_dest(dest)?;
+    refuse_dest_inside_home(paths, &dest, "export")?;
     let force = if dest.exists() && !commands::lifecycle::path_is_empty_dir(&dest)? {
         prompt::confirm("destination is not empty; overwrite?", false)?
     } else {
@@ -12222,6 +12743,8 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
     } else {
         Some(PathBuf::from(dest.trim()))
     };
+    let paths = DeadreckonPaths::discover();
+    let dest = resolve_external_dest(&paths, dest, "extend")?;
     commands::lifecycle::extend_command(ExtendCommandArgs {
         parent_run_id: state.run_id.clone(),
         new_goal: goal,

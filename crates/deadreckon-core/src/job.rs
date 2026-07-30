@@ -671,6 +671,9 @@ mod tests {
                 max_attempts: 3,
                 deadline: None,
                 semantic_judge: SemanticJudgeMode::Required,
+                execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+                    "sandbox-exec",
+                )),
             },
         }
     }

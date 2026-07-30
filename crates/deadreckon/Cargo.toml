@@ -52,6 +52,7 @@ deadreckon-providers = { workspace = true }
 deadreckon-runtime = { workspace = true }
 deadreckon-sandbox = { workspace = true }
 futures-util.workspace = true
+nix.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 regex.workspace = true

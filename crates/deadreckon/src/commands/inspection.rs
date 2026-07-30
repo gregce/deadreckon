@@ -1227,10 +1227,13 @@ fn library_docs_contain(path: &Path, needle: &str) -> bool {
         .unwrap_or_default()
         .into_iter()
         .filter(|file| {
-            matches!(
-                file.extension().and_then(|ext| ext.to_str()),
-                Some("md" | "txt" | "json" | "jsonl" | "toml")
-            )
+            file.strip_prefix(path)
+                .ok()
+                .is_some_and(deadreckon_core::is_promotable_workspace_path)
+                && matches!(
+                    file.extension().and_then(|ext| ext.to_str()),
+                    Some("md" | "txt" | "json" | "jsonl" | "toml")
+                )
         })
         .any(|file| {
             fs::read_to_string(file)

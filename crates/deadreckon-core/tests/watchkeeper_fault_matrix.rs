@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use deadreckon_core::flight::{build_working_file_index, sha256_file, sha256_text};
+use deadreckon_core::flight::{build_deliverable_file_index, sha256_file, sha256_text};
 use deadreckon_core::{
     AcceptanceCheckResult, AcceptanceContainment, DeadreckonPaths, JobHistory, LeaseOwner,
     PipelineState, RunOptions, append_fenced_job_event, append_job_event, claim_job_lease,
@@ -112,6 +112,9 @@ fn completion_fixture() -> CompletionFixture {
         max_attempts: 3,
         deadline: None,
         semantic_judge: SemanticJudgeMode::Required,
+        execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+            "sandbox-exec",
+        )),
     };
     let authority = JobAuthority {
         schema_version: JobSchemaVersion::CURRENT,
@@ -123,7 +126,7 @@ fn completion_fixture() -> CompletionFixture {
         contract_sha256: sha256_file(&contract_path).expect("contract digest"),
         effective_policy_sha256: sha256_text(&serde_json::to_string(&policy).expect("policy json")),
         launch_plan_sha256: sha256_file(&launch_path).expect("launch digest"),
-        source_tree_sha256: build_working_file_index(&state.working_dir)
+        source_tree_sha256: build_deliverable_file_index(&state.working_dir)
             .expect("source index")
             .tree_hash(),
         source_revision: None,

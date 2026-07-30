@@ -399,6 +399,19 @@ pub fn rewrite_templated_docs(state: &PipelineState, doc_writer: &str) -> Result
 }
 
 pub fn publish_docs_for_promotion(state: &PipelineState) -> Result<()> {
+    publish_docs_for_promotion_with_commit(state, true)
+}
+
+/// Publish the operator-facing run documents without invoking Git.
+///
+/// Durable runs use this form because provider-backed polishing happens after
+/// a coding turn. The runtime then routes the final document write through the
+/// same trusted Git-control sanitizer as every other result change.
+pub fn publish_docs_for_promotion_uncommitted(state: &PipelineState) -> Result<()> {
+    publish_docs_for_promotion_with_commit(state, false)
+}
+
+fn publish_docs_for_promotion_with_commit(state: &PipelineState, commit_docs: bool) -> Result<()> {
     let internal = docs_dir(&state.working_dir);
     if !internal.is_dir() {
         return Ok(());
@@ -429,7 +442,9 @@ pub fn publish_docs_for_promotion(state: &PipelineState) -> Result<()> {
             .with_path(delta_path(&state.working_dir))?;
     }
     mirror_trace_file(state)?;
-    commit_docs_if_worktree(state)?;
+    if commit_docs {
+        commit_docs_if_worktree(state)?;
+    }
     Ok(())
 }
 

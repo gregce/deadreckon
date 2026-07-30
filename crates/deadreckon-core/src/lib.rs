@@ -4,6 +4,7 @@
 //! Core state, locking, and run artifacts for the deadreckon harness.
 
 pub mod acceptance_defaults;
+pub mod artifact_policy;
 pub mod artifacts;
 pub mod campaign;
 pub mod cancel;
@@ -34,9 +35,15 @@ pub mod steer_inbox;
 pub mod tamper;
 pub mod update_cache;
 
+pub use artifact_policy::{
+    WorkspacePathClass, classify_workspace_path, delivery_git_exclude_pathspecs,
+    evidence_only_roots, is_deliverable_workspace_path, is_promotable_workspace_path,
+    runtime_output_root,
+};
 pub use artifacts::{
     DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, append_provenance, append_spend,
-    append_trace, copy_tree, diff_snapshots, diff_working_trees, inventory_files, restore_snapshot,
+    append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree,
+    diff_snapshots, diff_working_trees, inventory_files, remove_artifact_path, restore_snapshot,
     snapshot_diff, snapshot_working,
 };
 pub use cancel::{
@@ -52,9 +59,11 @@ pub use chain::{
 };
 pub use codebase::{
     CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, PreviewGitState, ResolvedMode,
-    WorktreeOptions, codebase_record_path, copy_source_to_working, create_worktree, find_git_root,
-    prepare_worktree_record, preview_git_state, read_codebase_record, record_for_resolved_mode,
-    resolve_mode, user_error, write_codebase_record,
+    TRUSTED_CODEBASE_RECORD, WorktreeOptions, codebase_record_path, copy_source_to_working,
+    create_worktree, find_git_root, prepare_worktree_record, preview_git_state,
+    read_codebase_record, read_run_codebase_record, read_trusted_codebase_record,
+    record_for_resolved_mode, resolve_mode, user_error, write_codebase_record,
+    write_trusted_codebase_record,
 };
 pub use completion::{
     SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
@@ -78,20 +87,25 @@ pub use events::{RUN_EVENTS_JSONL, RunEventBus, emit_event, event_preview};
 #[cfg(unix)]
 pub use exec::ProcessGroupTerminator;
 pub use exec::{
-    ChildTerminator, HeadTailBuffer, RawPidTerminator, SupervisedProcess, TerminationOutcome,
-    TruncationPolicy, read_supervised_process, spawn_grouped, write_supervised_process,
+    ChildTerminator, HeadTailBuffer, RawPidTerminator, SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION,
+    SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase, SupervisedProcessRecord,
+    TerminationOutcome, TruncationPolicy, boot_identity, process_start_identity,
+    read_supervised_process, read_supervised_process_record,
+    remove_supervised_process_record_if_matches, spawn_grouped, write_supervised_process,
+    write_supervised_process_record,
 };
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceContainment,
     AcceptanceMarker, AcceptanceProgressEntry, AcceptanceProofKind, AcceptanceSignatureStrength,
-    AcceptanceSpec, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
-    acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root, create_gate_key,
-    decode_gate_key, encode_gate_key, evaluate_acceptance, evaluate_acceptance_checks,
-    evaluate_acceptance_checks_with_progress, gate_key_path, gate_key_path_for_run_root,
-    gate_nonce_path_for_run_root, marker_path_for_run_root, read_gate_key,
-    read_gate_key_for_run_root, validate_acceptance_marker, verify_v2_marker_signature,
-    write_acceptance_marker, write_acceptance_marker_with_results, write_gate_key,
-    write_native_acceptance_marker_with_results_and_key,
+    AcceptanceSpec, GATE_CONTAINED_ENV, GATE_EVALUATION_SCHEMA_VERSION, GATE_KEY_ENV,
+    GATE_SANDBOX_BACKEND_ENV, GateEvaluation, acceptance_progress_path_for_run_root,
+    acceptance_spec_path_for_run_root, create_gate_key, decode_gate_key, encode_gate_key,
+    evaluate_acceptance, evaluate_acceptance_checks, evaluate_acceptance_checks_with_progress,
+    evaluate_gate, gate_key_path, gate_key_path_for_run_root, gate_nonce_path_for_run_root,
+    marker_path_for_run_root, read_gate_key, read_gate_key_for_run_root,
+    sign_gate_evaluation_with_key, validate_acceptance_marker, validate_gate_evaluation,
+    verify_v2_marker_signature, write_acceptance_marker, write_acceptance_marker_with_results,
+    write_gate_key, write_native_acceptance_marker_with_results_and_key,
 };
 pub use glossary::{
     NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,

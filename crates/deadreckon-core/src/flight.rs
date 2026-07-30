@@ -13,6 +13,9 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
+use crate::artifact_policy::{
+    WorkspacePathClass, classify_workspace_path, is_deliverable_workspace_path,
+};
 use crate::artifacts::copy_tree;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::ledger_io::append_ledger_item;
@@ -209,6 +212,39 @@ pub struct WorkingFileIndex {
     pub files: BTreeMap<PathBuf, FileFingerprint>,
 }
 
+/// The filesystem kind bound into a verified deliverable tree.
+///
+/// This is deliberately a filesystem model, not a Git tree model. In
+/// particular, a checked-out submodule is a directory whose children are
+/// indexed normally; only the Git-facing completion boundary can identify and
+/// validate a `160000` gitlink entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactFileKind {
+    RegularFile,
+    ExecutableFile,
+    SymbolicLink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFileFingerprint {
+    pub kind: ArtifactFileKind,
+    pub hash: String,
+    pub size: u64,
+}
+
+/// Receipt-grade projection of the operator-visible result.
+///
+/// This is separate from [`WorkingFileIndex`] so flight/checkpoint deltas keep
+/// their established regular-file-only behavior while receipts bind file
+/// kinds, executable permission and symbolic-link targets.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArtifactFileIndex {
+    pub files: BTreeMap<PathBuf, ArtifactFileFingerprint>,
+}
+
+/// Compatibility name for callers whose projection is deliverable-only.
+pub type DeliverableFileIndex = ArtifactFileIndex;
+
 #[derive(Debug, Clone)]
 pub struct CheckpointCaptureRequest {
     pub checkpoint_id: String,
@@ -359,6 +395,98 @@ pub fn build_working_file_index(root: &Path) -> Result<WorkingFileIndex> {
     Ok(WorkingFileIndex { files })
 }
 
+/// Hash only paths eligible to cross the verified result boundary.
+///
+/// The broad working index remains the flight/checkpoint primitive so private
+/// provider evidence is recoverable. Authority, semantic, receipt and
+/// promotion code must use this narrower projection.
+pub fn build_deliverable_file_index(root: &Path) -> Result<ArtifactFileIndex> {
+    build_artifact_file_index(root, is_deliverable_workspace_path)
+}
+
+/// Hash every agent-visible workspace path while excluding only runtime
+/// implementation state.
+///
+/// The semantic judge uses this broader projection as a read-only mutation
+/// guard: provider evidence and lifecycle metadata are not deliverables, but a
+/// judge must not be allowed to change them.
+pub fn build_workspace_guard_file_index(root: &Path) -> Result<ArtifactFileIndex> {
+    build_artifact_file_index(root, |path| {
+        classify_workspace_path(path) != WorkspacePathClass::RuntimeOnly
+    })
+}
+
+fn build_artifact_file_index(root: &Path, include: fn(&Path) -> bool) -> Result<ArtifactFileIndex> {
+    let mut files = BTreeMap::new();
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArtifactFileIndex { files });
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !root_metadata.file_type().is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "deliverable index root is not a directory: {}",
+            root.display()
+        )));
+    }
+
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .is_none_or(|relative| relative.as_os_str().is_empty() || include(relative))
+        })
+    {
+        let entry = entry.map_err(|source| DeadreckonError::Io {
+            path: root.to_path_buf(),
+            source: source.into(),
+        })?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(|err| {
+            DeadreckonError::InvalidInput(format!("deliverable path prefix error: {err}"))
+        })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(path).with_path(path)?;
+        let file_type = metadata.file_type();
+        let fingerprint = if file_type.is_file() {
+            ArtifactFileFingerprint {
+                kind: regular_file_kind(&metadata),
+                hash: sha256_file(path)?,
+                size: metadata.len(),
+            }
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(path).with_path(path)?;
+            ArtifactFileFingerprint {
+                kind: ArtifactFileKind::SymbolicLink,
+                hash: sha256_path_identity(&target),
+                size: path_identity_len(&target),
+            }
+        } else if file_type.is_dir() {
+            continue;
+        } else {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "unsupported deliverable filesystem entry at {}",
+                path.display()
+            )));
+        };
+        files.insert(relative.to_path_buf(), fingerprint);
+    }
+    Ok(ArtifactFileIndex { files })
+}
+
 pub fn capture_delta_checkpoint(
     state: &PipelineState,
     before: &WorkingFileIndex,
@@ -494,6 +622,98 @@ impl WorkingFileIndex {
         }
         let digest = hasher.finalize();
         format_sha256(&digest)
+    }
+}
+
+impl ArtifactFileIndex {
+    pub fn tree_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"deadreckon-deliverable-tree-v2\0");
+        for (path, fingerprint) in &self.files {
+            update_path_identity(&mut hasher, path);
+            hasher.update(b"\0");
+            hasher.update(match fingerprint.kind {
+                ArtifactFileKind::RegularFile => b"regular".as_slice(),
+                ArtifactFileKind::ExecutableFile => b"executable".as_slice(),
+                ArtifactFileKind::SymbolicLink => b"symlink".as_slice(),
+            });
+            hasher.update(b"\0");
+            hasher.update(fingerprint.size.to_le_bytes());
+            hasher.update(b"\0");
+            hasher.update(fingerprint.hash.as_bytes());
+            hasher.update(b"\0");
+        }
+        let digest = hasher.finalize();
+        format_sha256(&digest)
+    }
+}
+
+#[cfg(unix)]
+fn regular_file_kind(metadata: &fs::Metadata) -> ArtifactFileKind {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if metadata.permissions().mode() & 0o111 == 0 {
+        ArtifactFileKind::RegularFile
+    } else {
+        ArtifactFileKind::ExecutableFile
+    }
+}
+
+#[cfg(not(unix))]
+fn regular_file_kind(_metadata: &fs::Metadata) -> ArtifactFileKind {
+    ArtifactFileKind::RegularFile
+}
+
+fn sha256_path_identity(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    update_path_identity(&mut hasher, path);
+    let digest = hasher.finalize();
+    format_sha256(&digest)
+}
+
+fn update_path_identity(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let bytes = path.as_os_str().as_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        hasher.update((units.len() as u64).to_le_bytes());
+        for unit in units {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+}
+
+fn path_identity_len(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        path.as_os_str().as_bytes().len() as u64
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        (path.as_os_str().encode_wide().count() * std::mem::size_of::<u16>()) as u64
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.as_os_str().as_encoded_bytes().len() as u64
     }
 }
 
@@ -791,6 +1011,159 @@ mod tests {
                 .join("files/created.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn deliverable_index_excludes_provider_evidence_but_raw_flight_index_keeps_it() {
+        let (_temp, state) = fixture();
+        fs::create_dir_all(state.working_dir.join(".specstory/history")).expect("private");
+        fs::create_dir_all(state.working_dir.join("src")).expect("source");
+        fs::write(
+            state.working_dir.join(".specstory/history/session.md"),
+            "private\n",
+        )
+        .expect("private");
+        fs::write(state.working_dir.join("src/lib.rs"), "source\n").expect("source");
+
+        let raw = build_working_file_index(&state.working_dir).expect("raw");
+        let deliverable = build_deliverable_file_index(&state.working_dir).expect("deliverable");
+
+        assert!(
+            raw.files
+                .contains_key(Path::new(".specstory/history/session.md"))
+        );
+        assert!(
+            !deliverable
+                .files
+                .contains_key(Path::new(".specstory/history/session.md"))
+        );
+        assert!(deliverable.files.contains_key(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn workspace_guard_binds_evidence_and_lifecycle_but_excludes_runtime_state() {
+        let temp = TempDir::new().expect("temp");
+        for directory in [
+            ".specstory/history",
+            ".deadreckon",
+            ".git/objects",
+            "target/debug",
+            "web/node_modules/pkg",
+        ] {
+            fs::create_dir_all(temp.path().join(directory)).expect("directory");
+        }
+        for file in [
+            "answer.txt",
+            ".specstory/history/session.md",
+            ".deadreckon/codebase.json",
+            ".git/objects/private",
+            "target/debug/output",
+            "web/node_modules/pkg/index.js",
+        ] {
+            fs::write(temp.path().join(file), "before\n").expect("file");
+        }
+
+        let before = build_workspace_guard_file_index(temp.path()).expect("before");
+        fs::write(temp.path().join(".specstory/history/session.md"), "after\n")
+            .expect("mutate evidence");
+        let after = build_workspace_guard_file_index(temp.path()).expect("after");
+
+        assert!(before.files.contains_key(Path::new("answer.txt")));
+        assert!(
+            before
+                .files
+                .contains_key(Path::new(".specstory/history/session.md"))
+        );
+        assert!(
+            before
+                .files
+                .contains_key(Path::new(".deadreckon/codebase.json"))
+        );
+        assert!(!before.files.contains_key(Path::new(".git/objects/private")));
+        assert!(!before.files.contains_key(Path::new("target/debug/output")));
+        assert!(
+            !before
+                .files
+                .contains_key(Path::new("web/node_modules/pkg/index.js"))
+        );
+        assert_ne!(before.tree_hash(), after.tree_hash());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliverable_index_keeps_distinct_non_utf8_path_identities() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let first_name = OsString::from_vec(vec![b'n', b'a', b'm', b'e', 0x80]);
+        let second_name = OsString::from_vec(vec![b'n', b'a', b'm', b'e', 0x81]);
+        let fingerprint = ArtifactFileFingerprint {
+            kind: ArtifactFileKind::RegularFile,
+            hash: sha256_text("same bytes"),
+            size: 10,
+        };
+        let first = ArtifactFileIndex {
+            files: BTreeMap::from([(PathBuf::from(&first_name), fingerprint.clone())]),
+        };
+        let second = ArtifactFileIndex {
+            files: BTreeMap::from([(PathBuf::from(&second_name), fingerprint)]),
+        };
+
+        assert!(first.files.contains_key(Path::new(&first_name)));
+        assert!(second.files.contains_key(Path::new(&second_name)));
+        assert_ne!(first.tree_hash(), second.tree_hash());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliverable_index_binds_executable_permission() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().expect("temp");
+        let script = temp.path().join("run");
+        fs::write(&script, "#!/bin/sh\n").expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).expect("non executable");
+        let regular = build_deliverable_file_index(temp.path()).expect("regular index");
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("executable");
+        let executable = build_deliverable_file_index(temp.path()).expect("executable index");
+
+        assert_eq!(
+            regular.files[Path::new("run")].kind,
+            ArtifactFileKind::RegularFile
+        );
+        assert_eq!(
+            executable.files[Path::new("run")].kind,
+            ArtifactFileKind::ExecutableFile
+        );
+        assert_ne!(regular.tree_hash(), executable.tree_hash());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deliverable_index_binds_symlink_kind_and_raw_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("first"), "same bytes").expect("first");
+        fs::write(temp.path().join("second"), "same bytes").expect("second");
+        let link = temp.path().join("current");
+        symlink("first", &link).expect("first link");
+        let first = build_deliverable_file_index(temp.path()).expect("first index");
+
+        fs::remove_file(&link).expect("remove link");
+        symlink("second", &link).expect("second link");
+        let second = build_deliverable_file_index(temp.path()).expect("second index");
+
+        assert_eq!(
+            first.files[Path::new("current")].kind,
+            ArtifactFileKind::SymbolicLink
+        );
+        assert_ne!(
+            first.files[Path::new("current")].hash,
+            second.files[Path::new("current")].hash
+        );
+        assert_ne!(first.tree_hash(), second.tree_hash());
     }
 
     #[test]

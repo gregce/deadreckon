@@ -25,6 +25,7 @@ pub const ACCEPTANCE_SPEC: &str = "acceptance.yaml";
 pub const GATE_KEY_ENV: &str = "DEADRECKON_GATE_KEY";
 pub const GATE_CONTAINED_ENV: &str = "DEADRECKON_GATE_CONTAINED";
 pub const GATE_SANDBOX_BACKEND_ENV: &str = "DEADRECKON_GATE_SANDBOX_BACKEND";
+pub const GATE_EVALUATION_SCHEMA_VERSION: u32 = 1;
 const GATE_NONCE: &str = "gate/nonce";
 const GATE_KEY_BYTES: usize = 32;
 const V2_CANONICAL_MAGIC: &[u8] = b"deadreckon.acceptance-marker.v2\0";
@@ -192,6 +193,23 @@ pub struct AcceptanceProgressEntry {
     pub total: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<AcceptanceCheckResult>,
+}
+
+/// Keyless output from the deterministic evaluator.
+///
+/// This document crosses the sandbox boundary as captured stdout. It carries
+/// no authority by itself: the trusted signing phase re-reads the approved
+/// contract, validates every result against it, and recomputes tamper evidence
+/// before it can write a marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateEvaluation {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub working_dir: PathBuf,
+    pub contract_sha256: String,
+    pub results: Vec<AcceptanceCheckResult>,
+    pub tamper: crate::tamper::AcceptanceTamper,
 }
 
 pub fn marker_path(state: &PipelineState) -> PathBuf {
@@ -521,34 +539,102 @@ pub fn run_acceptance_gate_and_write_marker(
     run_id: &str,
     working_dir: &Path,
 ) -> Result<AcceptanceMarker> {
-    let results = evaluate_acceptance_checks_with_progress(run_root, working_dir)?;
-    let checks = compiled_acceptance_checks(run_root, working_dir)?;
-    let tamper = crate::tamper::evaluate(run_id, run_root, working_dir, &checks)?;
-    crate::tamper::write_acceptance_tamper(run_root, &tamper)?;
-    if tamper.verdict == AcceptanceTamperVerdict::Refuse {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "acceptance refused: {}",
-            tamper.refusal_reasons.join("; ")
-        )));
-    }
-    if let Some(failed) = results
-        .iter()
-        .find(|result| result.must_pass && !result.passed)
-    {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "acceptance check failed: {}",
-            failed.detail
-        )));
-    }
+    // Compatibility callers still use the in-process gate. Materializing a
+    // generated default is a trusted-controller action; the keyless evaluator
+    // itself only ever reads an already-approved contract.
+    compiled_acceptance_checks(run_root, working_dir)?;
+    let evaluation = evaluate_gate(run_id, run_root, working_dir)?;
     let key = read_gate_key_for_run_root(run_root, run_id)?;
-    write_native_acceptance_marker_with_results_and_key(
+    sign_gate_evaluation_with_key(
         run_root,
-        run_id.to_string(),
-        working_dir.to_path_buf(),
-        results,
+        run_id,
+        working_dir,
+        evaluation,
         &key,
         AcceptanceContainment::uncontained("none"),
     )
+}
+
+/// Evaluate an already-approved acceptance contract without reading signing
+/// material or writing outside the working directory.
+///
+/// The caller is responsible for running this function inside the resolved
+/// sandbox and transporting the returned value directly to a trusted signer.
+pub fn evaluate_gate(run_id: &str, run_root: &Path, working_dir: &Path) -> Result<GateEvaluation> {
+    let canonical_working_dir = canonical_working_dir(working_dir)?;
+    let (checks, contract_sha256) = approved_acceptance_contract(run_root)?;
+    let mut results = Vec::with_capacity(checks.len());
+    for check in checks.iter().cloned() {
+        results.push(evaluate_check(working_dir, check)?);
+    }
+    let tamper = crate::tamper::evaluate(run_id, run_root, working_dir, &checks)?;
+    Ok(GateEvaluation {
+        schema_version: GATE_EVALUATION_SCHEMA_VERSION,
+        run_id: run_id.to_string(),
+        working_dir: canonical_working_dir,
+        contract_sha256,
+        results,
+        tamper,
+    })
+}
+
+/// Validate a keyless evaluation against current trusted inputs.
+///
+/// This is deliberately side-effect free. Signing performs this validation
+/// first, then persists reconstructed evidence and the marker.
+pub fn validate_gate_evaluation(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    evaluation: &GateEvaluation,
+) -> Result<()> {
+    let checks = validate_gate_evaluation_integrity(run_id, run_root, working_dir, evaluation)?;
+    ensure_gate_evaluation_accepted(evaluation, &checks)
+}
+
+/// Validate, persist trusted evidence, and sign a keyless gate evaluation.
+///
+/// No acceptance checks are executed in this phase. The signing key therefore
+/// never shares a process with repository-controlled check subprocesses.
+pub fn sign_gate_evaluation_with_key(
+    run_root: &Path,
+    run_id: &str,
+    working_dir: &Path,
+    evaluation: GateEvaluation,
+    gate_key: &[u8],
+    containment: AcceptanceContainment,
+) -> Result<AcceptanceMarker> {
+    require_gate_key_length(gate_key)?;
+    validate_signing_containment(&containment)?;
+    let checks = validate_gate_evaluation_integrity(run_id, run_root, working_dir, &evaluation)?;
+    crate::tamper::write_acceptance_tamper(run_root, &evaluation.tamper)?;
+    write_reconstructed_acceptance_progress(run_root, &evaluation.results)?;
+    ensure_gate_evaluation_accepted(&evaluation, &checks)?;
+    write_native_acceptance_marker_with_results_and_key(
+        run_root,
+        run_id.to_string(),
+        evaluation.working_dir,
+        evaluation.results,
+        gate_key,
+        containment,
+    )
+}
+
+fn validate_signing_containment(containment: &AcceptanceContainment) -> Result<()> {
+    let backend = containment.sandbox_backend.as_str();
+    let coherent = if containment.contained {
+        matches!(backend, "sandbox-exec" | "bwrap" | "docker")
+    } else {
+        backend == "none"
+    };
+    if coherent {
+        Ok(())
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "acceptance containment is incoherent: contained={} backend={backend}",
+            containment.contained
+        )))
+    }
 }
 
 pub fn evaluate_acceptance(
@@ -609,6 +695,321 @@ pub fn compiled_acceptance_checks(
     let checks = crate::acceptance_defaults::default_checks_for(&kind, working_dir);
     write_generated_spec(&spec_path, &kind, &checks)?;
     Ok(checks)
+}
+
+fn approved_acceptance_contract(run_root: &Path) -> Result<(Vec<AcceptanceCheck>, String)> {
+    let spec_path = acceptance_spec_path_for_run_root(run_root);
+    let metadata = std::fs::symlink_metadata(&spec_path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            DeadreckonError::InvalidInput(format!(
+                "approved acceptance contract is missing at {}; the trusted controller must materialize it before evaluation",
+                spec_path.display()
+            ))
+        } else {
+            DeadreckonError::Io {
+                path: spec_path.clone(),
+                source,
+            }
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved acceptance contract at {} must be a regular, non-symlink file",
+            spec_path.display()
+        )));
+    }
+    let raw = std::fs::read_to_string(&spec_path).with_path(&spec_path)?;
+    let contract_sha256 = crate::flight::sha256_text(&raw);
+    Ok((parse_acceptance_checks(&raw)?, contract_sha256))
+}
+
+fn canonical_working_dir(working_dir: &Path) -> Result<PathBuf> {
+    working_dir
+        .canonicalize()
+        .map_err(|source| DeadreckonError::Io {
+            path: working_dir.to_path_buf(),
+            source,
+        })
+}
+
+fn validate_gate_evaluation_integrity(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    evaluation: &GateEvaluation,
+) -> Result<Vec<AcceptanceCheck>> {
+    if evaluation.schema_version != GATE_EVALUATION_SCHEMA_VERSION {
+        return Err(invalid_gate_evaluation(format!(
+            "unsupported schema {}; expected {}",
+            evaluation.schema_version, GATE_EVALUATION_SCHEMA_VERSION
+        )));
+    }
+    if evaluation.run_id != run_id {
+        return Err(invalid_gate_evaluation(format!(
+            "run id {} does not match {run_id}",
+            evaluation.run_id
+        )));
+    }
+    let canonical_working_dir = canonical_working_dir(working_dir)?;
+    if evaluation.working_dir != canonical_working_dir {
+        return Err(invalid_gate_evaluation(format!(
+            "working directory {} does not match {}",
+            evaluation.working_dir.display(),
+            canonical_working_dir.display()
+        )));
+    }
+    let (checks, contract_sha256) = approved_acceptance_contract(run_root)?;
+    if evaluation.contract_sha256 != contract_sha256 {
+        return Err(invalid_gate_evaluation(format!(
+            "contract digest {} does not match {contract_sha256}",
+            evaluation.contract_sha256
+        )));
+    }
+    if evaluation.results.len() != checks.len() {
+        return Err(invalid_gate_evaluation(format!(
+            "result count {} does not match approved check count {}",
+            evaluation.results.len(),
+            checks.len()
+        )));
+    }
+    for (index, (check, result)) in checks.iter().zip(&evaluation.results).enumerate() {
+        validate_result_binding(working_dir, check, result).map_err(|err| {
+            invalid_gate_evaluation(format!("result {} is not approved: {err}", index + 1))
+        })?;
+    }
+    if evaluation.tamper.schema_version != 1 {
+        return Err(invalid_gate_evaluation(format!(
+            "unsupported tamper schema {}",
+            evaluation.tamper.schema_version
+        )));
+    }
+    if evaluation.tamper.run_id != run_id {
+        return Err(invalid_gate_evaluation(format!(
+            "tamper run id {} does not match {run_id}",
+            evaluation.tamper.run_id
+        )));
+    }
+    let recomputed = crate::tamper::evaluate(run_id, run_root, working_dir, &checks)?;
+    if !same_tamper_facts(&evaluation.tamper, &recomputed) {
+        return Err(invalid_gate_evaluation(
+            "tamper evidence does not match trusted recomputation",
+        ));
+    }
+    Ok(checks)
+}
+
+fn ensure_gate_evaluation_accepted(
+    evaluation: &GateEvaluation,
+    checks: &[AcceptanceCheck],
+) -> Result<()> {
+    debug_assert_eq!(evaluation.results.len(), checks.len());
+    if evaluation.tamper.verdict == AcceptanceTamperVerdict::Refuse {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "acceptance refused: {}",
+            evaluation.tamper.refusal_reasons.join("; ")
+        )));
+    }
+    if let Some(failed) = evaluation
+        .results
+        .iter()
+        .find(|result| result.must_pass && !result.passed)
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "acceptance check failed: {}",
+            failed.detail
+        )));
+    }
+    Ok(())
+}
+
+fn validate_result_binding(
+    working_dir: &Path,
+    check: &AcceptanceCheck,
+    result: &AcceptanceCheckResult,
+) -> std::result::Result<(), String> {
+    let (kind, must_pass, command, cwd, process_check) = match check {
+        AcceptanceCheck::CargoTest { args, must_pass } => (
+            "cargo_test",
+            *must_pass,
+            Some(format_command("cargo test", args)),
+            Some(working_dir.to_path_buf()),
+            true,
+        ),
+        AcceptanceCheck::FileExists { must_pass, .. } => {
+            ("file_exists", *must_pass, None, None, false)
+        }
+        AcceptanceCheck::ContentMatch { must_pass, .. } => {
+            ("content_match", *must_pass, None, None, false)
+        }
+        AcceptanceCheck::BuildSuccess { cwd, must_pass } => (
+            "build_success",
+            *must_pass,
+            Some("cargo build".to_string()),
+            Some(render_template(working_dir, cwd)),
+            true,
+        ),
+        AcceptanceCheck::Shell {
+            command,
+            cwd,
+            must_pass,
+        } => (
+            "shell",
+            *must_pass,
+            Some(command.clone()),
+            Some(
+                cwd.as_deref()
+                    .map(|cwd| render_template(working_dir, cwd))
+                    .unwrap_or_else(|| working_dir.to_path_buf()),
+            ),
+            true,
+        ),
+    };
+    if result.kind != kind {
+        return Err(format!("kind {} does not match {kind}", result.kind));
+    }
+    if result.must_pass != must_pass {
+        return Err(format!(
+            "must_pass {} does not match {must_pass}",
+            result.must_pass
+        ));
+    }
+    if result.command != command {
+        return Err(format!(
+            "command {:?} does not match {:?}",
+            result.command, command
+        ));
+    }
+    if result.cwd != cwd {
+        return Err(format!("cwd {:?} does not match {:?}", result.cwd, cwd));
+    }
+    if result.detail.trim().is_empty() {
+        return Err("detail is empty".to_string());
+    }
+    if process_check {
+        if result.duration_ms.is_none() {
+            return Err("process result is missing duration".to_string());
+        }
+        let success_suffix = format!("; success={}", result.passed);
+        if !result.detail.ends_with(&success_suffix) {
+            return Err(format!(
+                "process detail does not end with {success_suffix:?}"
+            ));
+        }
+    } else if result.duration_ms.is_some() || result.stdout.is_some() || result.stderr.is_some() {
+        return Err("non-process result contains process output".to_string());
+    }
+    match check {
+        AcceptanceCheck::FileExists { path, .. } => {
+            let exists = render_template(working_dir, path).exists();
+            if result.passed != exists {
+                return Err(format!(
+                    "file existence result {} does not match recomputed {exists}",
+                    result.passed
+                ));
+            }
+        }
+        AcceptanceCheck::ContentMatch { path, pattern, .. } => {
+            let path = render_template(working_dir, path);
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            let matched = regex::Regex::new(pattern)
+                .map(|regex| regex.is_match(&body))
+                .unwrap_or_else(|_| body.contains(pattern));
+            if result.passed != matched {
+                return Err(format!(
+                    "content result {} does not match recomputed {matched}",
+                    result.passed
+                ));
+            }
+        }
+        AcceptanceCheck::CargoTest { .. }
+        | AcceptanceCheck::BuildSuccess { .. }
+        | AcceptanceCheck::Shell { .. } => {}
+    }
+    Ok(())
+}
+
+fn same_tamper_facts(
+    left: &crate::tamper::AcceptanceTamper,
+    right: &crate::tamper::AcceptanceTamper,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.run_id == right.run_id
+        && left.verdict == right.verdict
+        && left.spec_modified == right.spec_modified
+        && left.lint_findings == right.lint_findings
+        && left.covered_files_touched == right.covered_files_touched
+        && left.caveats == right.caveats
+        && left.refusal_reasons == right.refusal_reasons
+}
+
+fn invalid_gate_evaluation(message: impl Into<String>) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!(
+        "gate evaluation validation failed: {}",
+        message.into()
+    ))
+}
+
+fn write_reconstructed_acceptance_progress(
+    run_root: &Path,
+    results: &[AcceptanceCheckResult],
+) -> Result<()> {
+    let path = acceptance_progress_path_for_run_root(run_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_path(parent)?;
+    }
+    let total = results.len();
+    let mut entries = Vec::with_capacity(total.saturating_mul(2).saturating_add(2));
+    entries.push(AcceptanceProgressEntry {
+        checked_at: Utc::now(),
+        status: "started".to_string(),
+        index: 0,
+        total,
+        result: None,
+    });
+    for (index, result) in results.iter().cloned().enumerate() {
+        let index = index + 1;
+        entries.push(AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: "running".to_string(),
+            index,
+            total,
+            result: None,
+        });
+        entries.push(AcceptanceProgressEntry {
+            checked_at: Utc::now(),
+            status: if result.passed {
+                "passed".to_string()
+            } else {
+                "failed".to_string()
+            },
+            index,
+            total,
+            result: Some(result),
+        });
+    }
+    entries.push(AcceptanceProgressEntry {
+        checked_at: Utc::now(),
+        status: if results
+            .iter()
+            .any(|result| result.must_pass && !result.passed)
+        {
+            "failed".to_string()
+        } else {
+            "passed".to_string()
+        },
+        index: total,
+        total,
+        result: None,
+    });
+    let mut bytes = Vec::new();
+    for entry in entries {
+        serde_json::to_writer(&mut bytes, &entry).map_err(|source| DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })?;
+        bytes.push(b'\n');
+    }
+    std::fs::write(&path, bytes).with_path(&path)
 }
 
 /// Serialize a detected/inferred default contract to the run's acceptance spec
@@ -752,7 +1153,11 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 kind: "cargo_test".to_string(),
                 passed: output.status.success(),
                 must_pass,
-                detail: format!("cargo test exited with {}", output.status),
+                detail: format!(
+                    "cargo test exited with {}; success={}",
+                    output.status,
+                    output.status.success()
+                ),
                 command: Some(format_command("cargo test", &args)),
                 cwd: Some(working_dir.to_path_buf()),
                 duration_ms: Some(duration_ms(started)),
@@ -821,9 +1226,10 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 passed: output.status.success(),
                 must_pass,
                 detail: format!(
-                    "cargo build in {} exited with {}",
+                    "cargo build in {} exited with {}; success={}",
                     cwd.display(),
-                    output.status
+                    output.status,
+                    output.status.success()
                 ),
                 command: Some("cargo build".to_string()),
                 cwd: Some(cwd),
@@ -855,10 +1261,11 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 passed: output.status.success(),
                 must_pass,
                 detail: format!(
-                    "shell {:?} in {} exited with {}",
+                    "shell {:?} in {} exited with {}; success={}",
                     command,
                     cwd.display(),
-                    output.status
+                    output.status,
+                    output.status.success()
                 ),
                 command: Some(command),
                 cwd: Some(cwd),
@@ -1386,15 +1793,216 @@ mod tests {
 
     use crate::artifacts::{ProvenanceRecord, append_provenance, snapshot_working};
     use crate::paths::DeadreckonPaths;
-    use crate::state::{RunOptions, create_run};
+    use crate::state::{PipelineState, RunOptions, create_run};
     use crate::tamper::{AcceptanceTamperVerdict, read_acceptance_tamper_for_run_root};
 
     use super::{
-        ACCEPTANCE_MARKER, AcceptanceCheckResult, AcceptanceMarker, AcceptanceProofKind,
-        validate_acceptance_marker,
+        ACCEPTANCE_MARKER, AcceptanceCheckResult, AcceptanceContainment, AcceptanceMarker,
+        AcceptanceProofKind, GateEvaluation, validate_acceptance_marker,
     };
 
     // ---- Binnacle P1-P4: protected key, cryptographic marker, containment ----
+
+    fn keyless_evaluation_fixture() -> (TempDir, PipelineState, GateEvaluation) {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "two phase gate".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("two-phase-gate".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        std::fs::write(state.working_dir.join("README.md"), "approved\n").expect("readme");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("acceptance contract");
+        let evaluation = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect("keyless evaluation");
+        (temp, state, evaluation)
+    }
+
+    #[test]
+    fn keyless_evaluation_is_versioned_and_writes_no_proof_artifacts() {
+        let (_temp, state, evaluation) = keyless_evaluation_fixture();
+
+        assert_eq!(
+            evaluation.schema_version,
+            super::GATE_EVALUATION_SCHEMA_VERSION
+        );
+        assert_eq!(evaluation.run_id, state.run_id);
+        assert_eq!(
+            evaluation.working_dir,
+            state.working_dir.canonicalize().expect("canonical working")
+        );
+        assert_eq!(evaluation.results.len(), 1);
+        assert!(evaluation.results[0].passed);
+        assert_eq!(
+            evaluation.contract_sha256,
+            crate::flight::sha256_file(&state.run_root.join("acceptance.yaml"))
+                .expect("contract digest")
+        );
+        assert!(!super::marker_path(&state).exists());
+        assert!(!super::acceptance_progress_path_for_run_root(&state.run_root).exists());
+        assert!(!crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root).exists());
+    }
+
+    #[test]
+    fn keyless_evaluation_requires_a_materialized_regular_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "missing approved contract".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("missing-contract".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+
+        let err = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect_err("missing contract refused");
+
+        assert!(err.to_string().contains("trusted controller"), "{err}");
+        assert!(!state.run_root.join("acceptance.yaml").exists());
+    }
+
+    #[test]
+    fn signer_rejects_wrong_identity_contract_result_and_tamper() {
+        let (_temp, state, evaluation) = keyless_evaluation_fixture();
+
+        let mut wrong_run = evaluation.clone();
+        wrong_run.run_id = "other-run".to_string();
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &wrong_run,
+        )
+        .expect_err("wrong run refused");
+        assert!(err.to_string().contains("run id"), "{err}");
+
+        let mut wrong_path = evaluation.clone();
+        wrong_path.working_dir = state.run_root.clone();
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &wrong_path,
+        )
+        .expect_err("wrong path refused");
+        assert!(err.to_string().contains("working directory"), "{err}");
+
+        let contract_path = state.run_root.join("acceptance.yaml");
+        let contract = std::fs::read_to_string(&contract_path).expect("contract");
+        std::fs::write(&contract_path, format!("{contract}\n# changed\n"))
+            .expect("change contract");
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &evaluation,
+        )
+        .expect_err("wrong contract refused");
+        assert!(err.to_string().contains("contract digest"), "{err}");
+        std::fs::write(&contract_path, contract).expect("restore contract");
+
+        let mut wrong_count = evaluation.clone();
+        wrong_count.results.clear();
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &wrong_count,
+        )
+        .expect_err("wrong count refused");
+        assert!(err.to_string().contains("result count"), "{err}");
+
+        let mut wrong_result = evaluation.clone();
+        wrong_result.results[0].passed = false;
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &wrong_result,
+        )
+        .expect_err("wrong result refused");
+        assert!(err.to_string().contains("recomputed"), "{err}");
+
+        let mut wrong_tamper = evaluation;
+        wrong_tamper.tamper.spec_modified = !wrong_tamper.tamper.spec_modified;
+        let err = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &wrong_tamper,
+        )
+        .expect_err("wrong tamper refused");
+        assert!(err.to_string().contains("tamper evidence"), "{err}");
+    }
+
+    #[test]
+    fn trusted_signer_reconstructs_evidence_then_writes_native_marker() {
+        let (temp, state, evaluation) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+
+        let marker = super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            evaluation,
+            &key,
+            AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("sign");
+
+        assert!(marker.contained);
+        assert_eq!(marker.sandbox_backend, "sandbox-exec");
+        assert!(super::acceptance_progress_path_for_run_root(&state.run_root).is_file());
+        assert!(crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root).is_file());
+        validate_acceptance_marker(&state).expect("marker validates");
+    }
+
+    #[test]
+    fn trusted_signer_writes_nothing_for_an_invalid_evaluation() {
+        let (temp, state, mut evaluation) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+        evaluation.results[0].passed = false;
+
+        let err = super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            evaluation,
+            &key,
+            AcceptanceContainment::uncontained("none"),
+        )
+        .expect_err("invalid evaluation refused");
+
+        assert!(err.to_string().contains("recomputed"), "{err}");
+        assert!(!super::marker_path(&state).exists());
+        assert!(!super::acceptance_progress_path_for_run_root(&state.run_root).exists());
+        assert!(!crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root).exists());
+    }
 
     #[test]
     fn gate_key_is_written_outside_the_run_root() {

@@ -1,181 +1,530 @@
-use std::path::{Path, PathBuf};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::process::Command;
+use std::str::FromStr as _;
 
 use deadreckon_core::gate::{
     AcceptanceContainment, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
-    compiled_acceptance_checks, decode_gate_key, evaluate_acceptance_checks_with_progress,
-    write_native_acceptance_marker_with_results_and_key,
+    GateEvaluation, decode_gate_key, evaluate_gate, sign_gate_evaluation_with_key,
 };
-use deadreckon_core::tamper::{self, AcceptanceTamperVerdict};
+use deadreckon_core::{
+    SupervisedProcessIdentity, SupervisedProcessPhase, read_supervised_process_record,
+    write_supervised_process_record,
+};
+use deadreckon_sandbox::SandboxBackend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut run_id = None;
-    let mut run_root = None;
-    let mut working_dir = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--run" => run_id = args.next(),
-            "--run-root" => run_root = args.next().map(PathBuf::from),
-            "--working-dir" => working_dir = args.next().map(PathBuf::from),
-            other => return Err(format!("unknown argument {other}").into()),
-        }
+    let mut raw = std::env::args_os().skip(1);
+    let mode = raw
+        .next()
+        .ok_or("usage: dr-gate <evaluate|sign> [arguments]")?;
+    if mode == OsStr::new("guarded-exec") {
+        let args = parse_guarded_exec(raw)?;
+        return guarded_exec(&args);
     }
-    let run_id = run_id.ok_or("--run is required")?;
-    let working_dir = working_dir.ok_or("--working-dir is required")?;
-    let run_root = match run_root {
-        Some(run_root) => run_root,
-        None => infer_run_root(&working_dir)?,
-    };
-    let gate_environment =
-        GateEnvironment::from_lookup(|name| std::env::var(name).ok()).map_err(|message| {
-            format!("dr-gate cannot sign without trusted supervisor inputs: {message}")
-        })?;
-    let results = evaluate_acceptance_checks_with_progress(&run_root, &working_dir)?;
-    let checks = compiled_acceptance_checks(&run_root, &working_dir)?;
-    let tamper = tamper::evaluate(&run_id, &run_root, &working_dir, &checks)?;
-    tamper::write_acceptance_tamper(&run_root, &tamper)?;
-    if tamper.verdict == AcceptanceTamperVerdict::Refuse {
-        eprintln!("acceptance refused");
-        for reason in &tamper.refusal_reasons {
-            eprintln!("refuse: {reason}");
-        }
-        return Err(format!("acceptance refused: {}", tamper.refusal_reasons.join("; ")).into());
+    let mode = mode
+        .into_string()
+        .map_err(|_| "dr-gate command must be valid UTF-8")?;
+    let rest = raw
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| "dr-gate arguments must be valid UTF-8")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let command = parse_command(std::iter::once(mode).chain(rest))?;
+    match command {
+        GateCommand::Evaluate(args) => evaluate(&args),
+        GateCommand::Sign(args) => sign(args),
     }
-    if let Some(failed) = results
-        .iter()
-        .find(|result| result.must_pass && !result.passed)
-    {
-        eprintln!("acceptance failed");
-        for result in &results {
-            let mark = if result.passed { "PASS" } else { "FAIL" };
-            let required = if result.must_pass {
-                "required"
-            } else {
-                "optional"
-            };
-            eprintln!("{mark} {required} {}: {}", result.kind, result.detail);
-            if !result.passed {
-                if let Some(stderr) = result.stderr.as_deref() {
-                    eprintln!("stderr: {}", one_line(stderr, 500));
-                }
-                if let Some(stdout) = result.stdout.as_deref() {
-                    eprintln!("stdout: {}", one_line(stdout, 500));
-                }
-            }
-        }
-        return Err(format!("required check failed: {}", failed.detail).into());
-    }
-    write_native_acceptance_marker_with_results_and_key(
-        &run_root,
-        run_id,
-        working_dir,
-        results,
-        &gate_environment.key,
-        gate_environment.containment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommonArgs {
+    run_id: String,
+    run_root: PathBuf,
+    working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignArgs {
+    common: CommonArgs,
+    evaluation: String,
+    containment: AcceptanceContainment,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateCommand {
+    Evaluate(CommonArgs),
+    Sign(SignArgs),
+}
+
+#[derive(Debug)]
+struct GuardedExecArgs {
+    metadata: PathBuf,
+    launch_id: String,
+    attempt: u32,
+    release_token_sha256: String,
+    program: OsString,
+    args: Vec<OsString>,
+}
+
+fn evaluate(args: &CommonArgs) -> Result<(), Box<dyn std::error::Error>> {
+    reject_evaluator_gate_environment(|name| std::env::var_os(name).is_some())
+        .map_err(|message| format!("dr-gate evaluate refused unsafe environment: {message}"))?;
+    let evaluation = evaluate_gate(&args.run_id, &args.run_root, &args.working_dir)?;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(&mut stdout, &evaluation)?;
+    stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+fn sign(args: SignArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let environment = SigningEnvironment::from_lookup(
+        |name| std::env::var(name).ok(),
+        |name| std::env::var_os(name).is_some(),
+    )
+    .map_err(|message| format!("dr-gate sign refused unsafe supervisor inputs: {message}"))?;
+    let raw = read_evaluation(&args.evaluation)?;
+    let evaluation: GateEvaluation = serde_json::from_str(&raw)
+        .map_err(|error| format!("invalid gate evaluation JSON: {error}"))?;
+    sign_gate_evaluation_with_key(
+        &args.common.run_root,
+        &args.common.run_id,
+        &args.common.working_dir,
+        evaluation,
+        &environment.key,
+        args.containment,
     )?;
     Ok(())
 }
 
-struct GateEnvironment {
-    key: Vec<u8>,
-    containment: AcceptanceContainment,
+fn read_evaluation(source: &str) -> Result<String, Box<dyn std::error::Error>> {
+    if source == "-" {
+        let mut raw = String::new();
+        io::stdin().read_to_string(&mut raw)?;
+        Ok(raw)
+    } else {
+        Ok(fs::read_to_string(source)?)
+    }
 }
 
-impl GateEnvironment {
-    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Result<Self, String> {
+fn parse_guarded_exec(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<GuardedExecArgs, Box<dyn std::error::Error>> {
+    let mut metadata = None;
+    let mut launch_id = None;
+    let mut attempt = None;
+    let mut release_token_sha256 = None;
+    loop {
+        let argument = args
+            .next()
+            .ok_or("guarded-exec requires -- followed by a command")?;
+        if argument == OsStr::new("--") {
+            break;
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{} requires a value", argument.to_string_lossy()))?;
+        match argument.to_str() {
+            Some("--metadata") => set_once(&mut metadata, PathBuf::from(value), "--metadata")?,
+            Some("--launch-id") => set_once(
+                &mut launch_id,
+                value
+                    .into_string()
+                    .map_err(|_| "--launch-id must be valid UTF-8")?,
+                "--launch-id",
+            )?,
+            Some("--attempt") => {
+                let value = value
+                    .into_string()
+                    .map_err(|_| "--attempt must be valid UTF-8")?;
+                set_once(
+                    &mut attempt,
+                    value.parse::<u32>().map_err(|_| {
+                        format!("--attempt must be a positive integer, got {value}")
+                    })?,
+                    "--attempt",
+                )?;
+            }
+            Some("--release-token-sha256") => set_once(
+                &mut release_token_sha256,
+                value
+                    .into_string()
+                    .map_err(|_| "--release-token-sha256 must be valid UTF-8")?,
+                "--release-token-sha256",
+            )?,
+            _ => {
+                return Err(format!(
+                    "unknown guarded-exec argument {}",
+                    argument.to_string_lossy()
+                )
+                .into());
+            }
+        }
+    }
+    let program = args.next().ok_or("guarded-exec command is required")?;
+    let command_args = args.collect();
+    let attempt = attempt
+        .filter(|attempt| *attempt > 0)
+        .ok_or("--attempt is required and must be positive")?;
+    Ok(GuardedExecArgs {
+        metadata: metadata.ok_or("--metadata is required")?,
+        launch_id: launch_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("--launch-id is required")?,
+        attempt,
+        release_token_sha256: release_token_sha256
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("--release-token-sha256 is required")?,
+        program,
+        args: command_args,
+    })
+}
+
+fn guarded_exec(args: &GuardedExecArgs) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_RELEASE_TOKEN_BYTES: u64 = 512;
+    let mut release_bytes = Vec::new();
+    io::stdin()
+        .take(MAX_RELEASE_TOKEN_BYTES + 1)
+        .read_to_end(&mut release_bytes)?;
+    if release_bytes.len() as u64 > MAX_RELEASE_TOKEN_BYTES {
+        return Err("guarded-exec release token exceeded its bounded size".into());
+    }
+    let release_token = std::str::from_utf8(&release_bytes)
+        .map_err(|_| "guarded-exec release token was not UTF-8")?
+        .trim();
+    if release_token.is_empty()
+        || deadreckon_core::flight::sha256_text(release_token) != args.release_token_sha256
+    {
+        return Err("guarded-exec release token did not match its durable launch".into());
+    }
+
+    let mut record = read_supervised_process_record(&args.metadata)?;
+    if record.process.pid != std::process::id()
+        || record.launch_id != args.launch_id
+        || record.attempt != args.attempt
+        || record.release_token_sha256 != args.release_token_sha256
+        || record.phase != SupervisedProcessPhase::Prepared
+        || record.identity() != SupervisedProcessIdentity::Current
+    {
+        return Err("guarded-exec identity did not match its durable prepared record".into());
+    }
+
+    #[cfg(unix)]
+    {
+        nix::unistd::setpgid(nix::unistd::Pid::from_raw(0), nix::unistd::Pid::from_raw(0))
+            .map_err(|error| format!("guarded-exec could not create its process group: {error}"))?;
+        record.process.pgid = Some(record.process.pid);
+    }
+    record.phase = SupervisedProcessPhase::Running;
+    write_supervised_process_record(&args.metadata, &record)?;
+
+    let mut command = Command::new(&args.program);
+    command.args(&args.args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let error = command.exec();
+        Err(Box::new(error))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("guarded command exited with status {status}").into())
+        }
+    }
+}
+
+fn parse_command(
+    mut args: impl Iterator<Item = String>,
+) -> Result<GateCommand, Box<dyn std::error::Error>> {
+    let mode = args
+        .next()
+        .ok_or("usage: dr-gate <evaluate|sign> [arguments]")?;
+    let mut run_id = None;
+    let mut run_root = None;
+    let mut working_dir = None;
+    let mut evaluation = None;
+    let mut contained = None;
+    let mut sandbox_backend = None;
+    while let Some(arg) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--run" => set_once(&mut run_id, value, "--run")?,
+            "--run-root" => set_once(&mut run_root, PathBuf::from(value), "--run-root")?,
+            "--working-dir" => {
+                set_once(&mut working_dir, PathBuf::from(value), "--working-dir")?;
+            }
+            "--evaluation" => set_once(&mut evaluation, value, "--evaluation")?,
+            "--contained" => set_once(&mut contained, parse_bool(&value)?, "--contained")?,
+            "--sandbox-backend" => {
+                set_once(&mut sandbox_backend, value, "--sandbox-backend")?;
+            }
+            other => return Err(format!("unknown argument {other}").into()),
+        }
+    }
+    let common = CommonArgs {
+        run_id: run_id.ok_or("--run is required")?,
+        run_root: run_root.ok_or("--run-root is required")?,
+        working_dir: working_dir.ok_or("--working-dir is required")?,
+    };
+    match mode.as_str() {
+        "evaluate" => {
+            reject_sign_only_args(&evaluation, &contained, &sandbox_backend)?;
+            Ok(GateCommand::Evaluate(common))
+        }
+        "sign" => Ok(GateCommand::Sign(SignArgs {
+            common,
+            evaluation: evaluation.ok_or("--evaluation is required")?,
+            containment: explicit_containment(
+                contained.ok_or("--contained is required")?,
+                &sandbox_backend.ok_or("--sandbox-backend is required")?,
+            )?,
+        })),
+        other => Err(format!("unknown dr-gate command {other}; expected evaluate or sign").into()),
+    }
+}
+
+fn set_once<T>(
+    slot: &mut Option<T>,
+    value: T,
+    argument: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if slot.replace(value).is_some() {
+        return Err(format!("{argument} may only be supplied once").into());
+    }
+    Ok(())
+}
+
+fn parse_bool(value: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("--contained must be true or false, got {value}").into()),
+    }
+}
+
+fn reject_sign_only_args(
+    evaluation: &Option<String>,
+    contained: &Option<bool>,
+    sandbox_backend: &Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if evaluation.is_some() || contained.is_some() || sandbox_backend.is_some() {
+        return Err(
+            "--evaluation, --contained and --sandbox-backend are only valid for sign".into(),
+        );
+    }
+    Ok(())
+}
+
+fn explicit_containment(
+    contained: bool,
+    backend: &str,
+) -> Result<AcceptanceContainment, Box<dyn std::error::Error>> {
+    let backend = SandboxBackend::from_str(backend)?;
+    if backend == SandboxBackend::Auto {
+        return Err("signing requires the observed backend; auto is not an observation".into());
+    }
+    if contained != (backend != SandboxBackend::None) {
+        return Err(format!(
+            "--contained {contained} is inconsistent with observed backend {backend}"
+        )
+        .into());
+    }
+    if contained {
+        Ok(AcceptanceContainment::contained(backend.to_string()))
+    } else {
+        Ok(AcceptanceContainment::uncontained(backend.to_string()))
+    }
+}
+
+fn reject_evaluator_gate_environment(
+    mut is_present: impl FnMut(&str) -> bool,
+) -> Result<(), String> {
+    let present = [GATE_KEY_ENV, GATE_CONTAINED_ENV, GATE_SANDBOX_BACKEND_ENV]
+        .into_iter()
+        .filter(|name| is_present(name))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "keyless evaluation must not receive {}",
+            present.join(", ")
+        ))
+    }
+}
+
+struct SigningEnvironment {
+    key: Vec<u8>,
+}
+
+impl SigningEnvironment {
+    fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Option<String>,
+        mut is_present: impl FnMut(&str) -> bool,
+    ) -> Result<Self, String> {
+        let legacy = [GATE_CONTAINED_ENV, GATE_SANDBOX_BACKEND_ENV]
+            .into_iter()
+            .filter(|name| is_present(name))
+            .collect::<Vec<_>>();
+        if !legacy.is_empty() {
+            return Err(format!(
+                "legacy containment environment is forbidden: {}",
+                legacy.join(", ")
+            ));
+        }
         let encoded_key = lookup(GATE_KEY_ENV)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| format!("{GATE_KEY_ENV} is required"))?;
         let key = decode_gate_key(&encoded_key).map_err(|err| err.to_string())?;
-        let backend = lookup(GATE_SANDBOX_BACKEND_ENV)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{GATE_SANDBOX_BACKEND_ENV} is required"))?;
-        let contained = match lookup(GATE_CONTAINED_ENV).as_deref() {
-            Some("true") => true,
-            Some("false") => false,
-            Some(value) => {
-                return Err(format!(
-                    "{GATE_CONTAINED_ENV} must be true or false, got {value}"
-                ));
-            }
-            None => return Err(format!("{GATE_CONTAINED_ENV} is required")),
-        };
-        let containment = if contained {
-            AcceptanceContainment::contained(backend)
-        } else {
-            AcceptanceContainment::uncontained(backend)
-        };
-        Ok(Self { key, containment })
+        Ok(Self { key })
     }
-}
-
-fn one_line(value: &str, limit: usize) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.len() <= limit {
-        compact
-    } else {
-        let clipped = compact.chars().take(limit).collect::<String>();
-        format!("{clipped}...")
-    }
-}
-
-fn infer_run_root(working_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if working_dir.file_name().and_then(|name| name.to_str()) != Some("working") {
-        return Err("working directory must be <run-root>/working".into());
-    }
-    working_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "working directory has no parent".into())
 }
 
 #[cfg(test)]
 mod tests {
-    use deadreckon_core::gate::{
-        AcceptanceProofKind, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
-        write_native_acceptance_marker_with_results_and_key,
-    };
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use deadreckon_core::gate::{GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV};
     use tempfile::TempDir;
 
-    use super::GateEnvironment;
+    use super::{
+        GateCommand, SigningEnvironment, explicit_containment, parse_command, parse_guarded_exec,
+        read_evaluation, reject_evaluator_gate_environment,
+    };
 
-    #[test]
-    fn dr_gate_signs_from_the_env_key_without_reading_the_key_path() {
-        let temp = TempDir::new().expect("tempdir");
-        let environment = GateEnvironment::from_lookup(|name| match name {
-            GATE_KEY_ENV => Some("07".repeat(32)),
-            GATE_CONTAINED_ENV => Some("true".to_string()),
-            GATE_SANDBOX_BACKEND_ENV => Some("seatbelt".to_string()),
-            _ => None,
-        })
-        .expect("environment");
-        let marker = write_native_acceptance_marker_with_results_and_key(
-            temp.path(),
-            "env-signed".to_string(),
-            temp.path().join("working"),
-            Vec::new(),
-            &environment.key,
-            environment.containment,
-        )
-        .expect("marker");
-
-        assert_eq!(marker.proof_kind, AcceptanceProofKind::NativeGate);
-        assert!(marker.contained);
-        assert_eq!(marker.sandbox_backend, "seatbelt");
-        assert!(!temp.path().join("gate-keys").exists());
+    fn common_args(command: &str) -> Vec<String> {
+        vec![
+            command.to_string(),
+            "--run".to_string(),
+            "run-1".to_string(),
+            "--run-root".to_string(),
+            "/tmp/run-1".to_string(),
+            "--working-dir".to_string(),
+            "/tmp/run-1/working".to_string(),
+        ]
     }
 
     #[test]
-    fn dr_gate_without_the_env_key_fails_loudly() {
-        let err = GateEnvironment::from_lookup(|name| match name {
-            GATE_CONTAINED_ENV => Some("false".to_string()),
-            GATE_SANDBOX_BACKEND_ENV => Some("none".to_string()),
-            _ => None,
-        })
+    fn evaluate_cli_has_no_signing_inputs() {
+        let parsed = parse_command(common_args("evaluate").into_iter()).expect("evaluate args");
+        let GateCommand::Evaluate(args) = parsed else {
+            panic!("expected evaluate");
+        };
+        assert_eq!(args.run_id, "run-1");
+        assert_eq!(args.run_root, PathBuf::from("/tmp/run-1"));
+    }
+
+    #[test]
+    fn sign_cli_requires_explicit_coherent_containment() {
+        let mut args = common_args("sign");
+        args.extend([
+            "--evaluation".to_string(),
+            "-".to_string(),
+            "--contained".to_string(),
+            "true".to_string(),
+            "--sandbox-backend".to_string(),
+            "sandbox-exec".to_string(),
+        ]);
+        let parsed = parse_command(args.into_iter()).expect("sign args");
+        let GateCommand::Sign(args) = parsed else {
+            panic!("expected sign");
+        };
+        assert!(args.containment.contained);
+        assert_eq!(args.containment.sandbox_backend, "sandbox-exec");
+
+        let err = explicit_containment(true, "none").expect_err("incoherent containment");
+        assert!(err.to_string().contains("inconsistent"), "{err}");
+        let err = explicit_containment(true, "auto").expect_err("unobserved backend");
+        assert!(err.to_string().contains("observed backend"), "{err}");
+    }
+
+    #[test]
+    fn evaluator_refuses_every_gate_environment_variable() {
+        for forbidden in [GATE_KEY_ENV, GATE_CONTAINED_ENV, GATE_SANDBOX_BACKEND_ENV] {
+            let err = reject_evaluator_gate_environment(|name| name == forbidden)
+                .expect_err("gate environment refused");
+            assert!(err.contains(forbidden), "{err}");
+        }
+    }
+
+    #[test]
+    fn signer_reads_only_the_key_and_rejects_legacy_containment_env() {
+        let environment = SigningEnvironment::from_lookup(
+            |name| (name == GATE_KEY_ENV).then(|| "07".repeat(32)),
+            |_| false,
+        )
+        .expect("key");
+        assert_eq!(environment.key, vec![7; 32]);
+
+        let err = SigningEnvironment::from_lookup(
+            |name| (name == GATE_KEY_ENV).then(|| "07".repeat(32)),
+            |name| name == GATE_CONTAINED_ENV,
+        )
         .err()
-        .expect("missing key refused");
+        .expect("legacy env refused");
+        assert!(err.contains(GATE_CONTAINED_ENV), "{err}");
+    }
+
+    #[test]
+    fn signer_without_key_fails_loudly() {
+        let err = SigningEnvironment::from_lookup(|_| None, |_| false)
+            .err()
+            .expect("missing key refused");
 
         assert!(err.contains(GATE_KEY_ENV), "{err}");
         assert!(err.contains("required"), "{err}");
+    }
+
+    #[test]
+    fn signer_can_read_an_explicit_evaluation_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("evaluation.json");
+        std::fs::write(&path, "{\"schema_version\":1}\n").expect("evaluation fixture");
+
+        let raw = read_evaluation(path.to_str().expect("utf-8 path")).expect("read evaluation");
+
+        assert_eq!(raw, "{\"schema_version\":1}\n");
+    }
+
+    #[test]
+    fn guarded_exec_preserves_non_utf8_command_arguments_and_requires_identity() {
+        let parsed = parse_guarded_exec(
+            [
+                "--metadata",
+                "/tmp/gate.json",
+                "--launch-id",
+                "launch-1",
+                "--attempt",
+                "2",
+                "--release-token-sha256",
+                "digest",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf ok",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("guarded args");
+
+        assert_eq!(parsed.metadata, PathBuf::from("/tmp/gate.json"));
+        assert_eq!(parsed.launch_id, "launch-1");
+        assert_eq!(parsed.attempt, 2);
+        assert_eq!(parsed.program, OsString::from("/bin/sh"));
+        assert_eq!(parsed.args.len(), 2);
     }
 }

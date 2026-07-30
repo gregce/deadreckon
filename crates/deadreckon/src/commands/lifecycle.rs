@@ -132,9 +132,7 @@ pub(crate) fn finish_command(
 
     print_finish_consistency_summary(&state);
 
-    let mode = read_codebase_record(&state.working_dir)
-        .map(|record| record.mode)
-        .unwrap_or(CodebaseMode::Fresh);
+    let mode = lifecycle_codebase_record(&paths, &state)?.mode;
     match mode {
         CodebaseMode::Worktree => {
             apply_command_inner(
@@ -215,6 +213,16 @@ fn delivered_git_revision(destination: &Path) -> Option<String> {
         .filter(|revision| !revision.is_empty())
 }
 
+fn lifecycle_codebase_record(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> deadreckon_core::Result<CodebaseRecord> {
+    if paths.job_json(&state.run_id).is_file() {
+        return deadreckon_core::read_trusted_codebase_record(&state.run_root);
+    }
+    deadreckon_core::read_run_codebase_record(&state.run_root, &state.working_dir)
+}
+
 pub(crate) fn finish_job_state(
     paths: &DeadreckonPaths,
     job: &deadreckon_core::JobView,
@@ -280,30 +288,29 @@ pub(crate) fn materialize_completed_run(
     include_manifest: bool,
 ) -> Result<MaterializedRun> {
     ensure_completed_run(state, "materialize")?;
-    if let Ok(record) = read_codebase_record(&state.working_dir) {
-        match record.mode {
-            CodebaseMode::Worktree => {
-                return Err(codebase_mode_refusal_error(
-                    "materialize",
-                    state,
-                    record.mode,
-                    "export is for copy/fresh runs; run was worktree",
-                    format!("deadreckon apply {}", run_prefix(&state.run_id)),
-                    "Materialize exports copy/fresh artifacts, while this run already has a worktree branch that should be applied instead.",
-                ));
-            }
-            CodebaseMode::InPlace => {
-                return Err(codebase_mode_refusal_error(
-                    "materialize",
-                    state,
-                    record.mode,
-                    "export is not needed; run edited the source in-place",
-                    format!("deadreckon undo --run {}", run_prefix(&state.run_id)),
-                    "Materialize would duplicate work already written in place; use undo only if those edits need to be reverted.",
-                ));
-            }
-            CodebaseMode::Copy | CodebaseMode::Fresh => {}
+    let record = lifecycle_codebase_record(paths, state)?;
+    match record.mode {
+        CodebaseMode::Worktree => {
+            return Err(codebase_mode_refusal_error(
+                "materialize",
+                state,
+                record.mode,
+                "export is for copy/fresh runs; run was worktree",
+                format!("deadreckon apply {}", run_prefix(&state.run_id)),
+                "Materialize exports copy/fresh artifacts, while this run already has a worktree branch that should be applied instead.",
+            ));
         }
+        CodebaseMode::InPlace => {
+            return Err(codebase_mode_refusal_error(
+                "materialize",
+                state,
+                record.mode,
+                "export is not needed; run edited the source in-place",
+                format!("deadreckon undo --run {}", run_prefix(&state.run_id)),
+                "Materialize would duplicate work already written in place; use undo only if those edits need to be reverted.",
+            ));
+        }
+        CodebaseMode::Copy | CodebaseMode::Fresh => {}
     }
     let library_dir = paths.library_dir(&state.scope, &state.run_id);
     if !library_dir.is_dir() {
@@ -328,7 +335,7 @@ pub(crate) fn materialize_completed_run(
     refuse_dest_inside_home(paths, &dest, "export")?;
     prepare_empty_dest(&dest, force)?;
 
-    copy_tree(&library_dir, &dest)?;
+    copy_deliverable_tree(&library_dir, &dest)?;
     if !include_manifest {
         remove_if_exists(&dest.join("manifest.json"))?;
     }
@@ -448,12 +455,19 @@ fn apply_command_inner(
     let paths = DeadreckonPaths::discover();
     let mut state = resolve_apply_state(&paths, &run_id, quiet, verified_job_state)?;
     ensure_completed_run(&state, "apply")?;
-    let record = match read_codebase_record(&state.working_dir) {
-        Ok(record) => record,
+    let record = match lifecycle_codebase_record(&paths, &state) {
+        Ok(record) if record.mode == CodebaseMode::Worktree => record,
+        Ok(record) => match prepare_result_run_apply_state(&paths, &state, quiet)? {
+            Some(prepared) => {
+                state = prepared;
+                lifecycle_codebase_record(&paths, &state)?
+            }
+            None => record,
+        },
         Err(source) => match prepare_result_run_apply_state(&paths, &state, quiet)? {
             Some(prepared) => {
                 state = prepared;
-                read_codebase_record(&state.working_dir)?
+                lifecycle_codebase_record(&paths, &state)?
             }
             None => return Err(apply_missing_codebase_error(&paths, &state, &source)),
         },
@@ -471,8 +485,14 @@ fn apply_command_inner(
             "missing branch_name".to_string(),
         ))
     })?;
+    refuse_non_deliverable_result_history(&state, &record, git_root, branch)?;
     let target =
         target_branch.unwrap_or(git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])?);
+    let delivery_before = delivered_git_revision(git_root).ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "target checkout has no Git revision before apply".to_string(),
+        ))
+    })?;
     let diff_stat = git_stdout(
         git_root,
         &["diff", "--stat", &format!("{target}..{branch}")],
@@ -482,7 +502,14 @@ fn apply_command_inner(
         if !quiet {
             print_already_applied(&state, branch, &target);
         }
-        record_applied_job_delivery(&paths, verified_job_id, git_root)?;
+        record_applied_job_delivery(
+            &paths,
+            verified_job_id,
+            &state,
+            &record,
+            git_root,
+            &delivery_before,
+        )?;
         let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
         if !quiet {
             print!(
@@ -547,7 +574,14 @@ fn apply_command_inner(
                 if !quiet {
                     print_already_applied(&state, branch, &target);
                 }
-                record_applied_job_delivery(&paths, verified_job_id, git_root)?;
+                record_applied_job_delivery(
+                    &paths,
+                    verified_job_id,
+                    &state,
+                    &record,
+                    git_root,
+                    &delivery_before,
+                )?;
                 let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
                 if !quiet {
                     print!(
@@ -575,8 +609,36 @@ fn apply_command_inner(
             ))));
         }
     }
+    let verified_revision = match verify_applied_job_delivery(
+        &paths,
+        verified_job_id,
+        &state,
+        &record,
+        git_root,
+        &delivery_before,
+    ) {
+        Ok(revision) => revision,
+        Err(error) => {
+            return Err(rollback_refused_job_delivery(
+                git_root,
+                &state.run_id,
+                &delivery_before,
+                autostash.as_ref(),
+                error,
+            ));
+        }
+    };
     if let Some(stash) = autostash.as_ref() {
         restore_apply_autostash(git_root, &state.run_id, stash)?;
+    }
+    if let (Some(job_id), Some(revision)) = (verified_job_id, verified_revision.as_deref()) {
+        super::job::record_job_delivery(
+            &paths,
+            job_id,
+            super::job::JobDeliveryKind::Applied,
+            git_root,
+            Some(revision),
+        )?;
     }
     if !quiet {
         println!(
@@ -587,7 +649,6 @@ fn apply_command_inner(
         );
         println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     }
-    record_applied_job_delivery(&paths, verified_job_id, git_root)?;
     let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
     if !quiet {
         print!(
@@ -602,19 +663,242 @@ fn apply_command_inner(
 fn record_applied_job_delivery(
     paths: &DeadreckonPaths,
     verified_job_id: Option<&str>,
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
     destination: &Path,
+    delivery_before: &str,
 ) -> Result<()> {
     let Some(job_id) = verified_job_id else {
         return Ok(());
     };
-    let revision = delivered_git_revision(destination);
+    let Some(revision) = verify_applied_job_delivery(
+        paths,
+        Some(job_id),
+        state,
+        record,
+        destination,
+        delivery_before,
+    )?
+    else {
+        return Ok(());
+    };
     super::job::record_job_delivery(
         paths,
         job_id,
         super::job::JobDeliveryKind::Applied,
         destination,
-        revision.as_deref(),
+        Some(&revision),
     )
+}
+
+fn verify_applied_job_delivery(
+    paths: &DeadreckonPaths,
+    verified_job_id: Option<&str>,
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    destination: &Path,
+    delivery_before: &str,
+) -> Result<Option<String>> {
+    let Some(job_id) = verified_job_id else {
+        return Ok(None);
+    };
+    let receipt = deadreckon_core::validate_completion_receipt(paths, state)?;
+    verify_applied_receipt_identity(job_id, &receipt, record, destination, delivery_before)?;
+    let revision = delivered_git_revision(destination).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("applied job {job_id}, but the delivered Git revision is unavailable"),
+            &format!("deadreckon show {}", run_prefix(job_id)),
+        ))
+    })?;
+    Ok(Some(revision))
+}
+
+fn rollback_refused_job_delivery(
+    git_root: &Path,
+    run_id: &str,
+    delivery_before: &str,
+    autostash: Option<&ApplyAutoStash>,
+    validation_error: CliError,
+) -> CliError {
+    if let Err(rollback_error) = git_status(git_root, &["reset", "--hard", delivery_before]) {
+        return CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "verified delivery was refused ({validation_error}), and restoring the target revision also failed: {rollback_error}"
+            ),
+            "inspect `git status`, preserve any autostash, and restore the target branch manually before retrying finish",
+        ));
+    }
+    if let Some(stash) = autostash
+        && let Err(stash_error) = restore_apply_autostash(git_root, run_id, stash)
+    {
+        return CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "verified delivery was refused and the target revision was restored, but restoring {} failed: {stash_error}",
+                stash.refname
+            ),
+            &format!(
+                "inspect `git status`, then recover the operator changes with `git stash pop {}`",
+                stash.refname
+            ),
+        ));
+    }
+    validation_error
+}
+
+fn refuse_non_deliverable_result_history(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    git_root: &Path,
+    branch: &str,
+) -> Result<()> {
+    let base = record.base_sha.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing base_sha for result artifact boundary".to_string(),
+        ))
+    })?;
+    let paths =
+        deadreckon_core::completion::non_deliverable_git_history_paths(git_root, base, branch)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let listed = paths
+        .iter()
+        .take(8)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "run {} result history contains non-deliverable paths: {listed}",
+            run_prefix(&state.run_id)
+        ),
+        &format!(
+            "rebuild {branch} without provider-private, lifecycle, or runtime artifacts and re-verify the result"
+        ),
+    )))
+}
+
+fn verify_applied_receipt_identity(
+    job_id: &str,
+    receipt: &deadreckon_protocol::CompletionReceipt,
+    record: &CodebaseRecord,
+    destination: &Path,
+    delivery_before: &str,
+) -> Result<()> {
+    let base = receipt.source_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed source revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        ))
+    })?;
+    if record.base_sha.as_deref() != Some(base) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} apply base does not match its signed receipt"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    let result = receipt.result_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed result revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        ))
+    })?;
+    let delivered = delivered_git_revision(destination).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("applied job {job_id}, but the delivered Git revision is unavailable"),
+            &format!("deadreckon show {}", run_prefix(job_id)),
+        ))
+    })?;
+    let changed =
+        deadreckon_core::completion::deliverable_git_delta_paths(destination, base, result)?;
+    let signed_paths = changed
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in changed {
+        let signed = git_tree_entry(destination, result, &path)?;
+        let applied = git_tree_entry(destination, &delivered, &path)?;
+        if signed != applied {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "applied job {job_id}, but delivered path {} does not match the signed result",
+                    path.display()
+                ),
+                &format!("deadreckon verdict {}", run_prefix(job_id)),
+            )));
+        }
+    }
+    let delivered_paths = deadreckon_core::completion::git_delivery_history_paths(
+        destination,
+        delivery_before,
+        &delivered,
+    )?;
+    let unexpected = delivered_paths
+        .into_iter()
+        .filter(|path| !signed_paths.contains(path))
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        let listed = unexpected
+            .iter()
+            .take(8)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "applied job {job_id}, but delivery committed paths outside the signed result: {listed}"
+            ),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    Ok(())
+}
+
+fn git_tree_entry(git_root: &Path, revision: &str, path: &Path) -> Result<Vec<u8>> {
+    let output = deadreckon_core::git::run_git(
+        git_root,
+        &["ls-tree", "-r", "-z", "--full-tree", revision, "--"],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            if stderr.is_empty() {
+                format!(
+                    "could not inspect {} at Git revision {revision}",
+                    path.display()
+                )
+            } else {
+                stderr
+            },
+        )));
+    }
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        if git_path_matches(path, &entry[tab + 1..])? {
+            return Ok(entry[..tab].to_vec());
+        }
+    }
+    Ok(Vec::new())
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // The non-Unix implementation can reject unrepresentable paths.
+fn git_path_matches(path: &Path, raw: &[u8]) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+
+    Ok(path.as_os_str().as_bytes() == raw)
+}
+
+#[cfg(not(unix))]
+fn git_path_matches(path: &Path, raw: &[u8]) -> Result<bool> {
+    let raw = std::str::from_utf8(raw).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "Git returned a result path that cannot be represented on this platform".to_string(),
+        ))
+    })?;
+    Ok(path == Path::new(raw))
 }
 
 fn resolve_apply_state(
@@ -1000,8 +1284,13 @@ fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
 pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = super::reference::resolve_run_like(&paths, Some(&run_id), "abandon")?;
-    let Ok(record) = read_codebase_record(&state.working_dir) else {
-        print!(
+    let record = match lifecycle_codebase_record(&paths, &state) {
+        Ok(record) => record,
+        Err(error) if paths.job_json(&state.run_id).is_file() => {
+            return Err(CliError::Core(error));
+        }
+        Err(_) => {
+            print!(
             "{}",
             cleanup_noop_surface(
                 "abandon",
@@ -1021,7 +1310,8 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
             )
             .render_plain(!completion_hints_enabled(false))
         );
-        return Ok(());
+            return Ok(());
+        }
     };
     if record.mode == CodebaseMode::InPlace {
         return Err(codebase_mode_refusal_error(
@@ -1087,7 +1377,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
             }
             let _ = kill_loaded_run(&paths, &mut state, escalate);
         }
-        let record = read_codebase_record(&state.working_dir)?;
+        let record = lifecycle_codebase_record(&paths, &state)?;
         let result = cleanup_worktree_run(
             &state,
             &record,
@@ -1201,8 +1491,12 @@ fn cleanup_candidates(
         let Ok(state) = load_run(paths, &run.run_id) else {
             continue;
         };
-        let Ok(record) = read_codebase_record(&state.working_dir) else {
-            continue;
+        let record = match lifecycle_codebase_record(paths, &state) {
+            Ok(record) => record,
+            Err(error) if paths.job_json(&state.run_id).is_file() => {
+                return Err(CliError::Core(error));
+            }
+            Err(_) => continue,
         };
         if record.mode != CodebaseMode::Worktree {
             continue;
@@ -1279,6 +1573,22 @@ fn cleanup_worktree_run(
     {
         let was_registered = git_worktree_registered(git_root, worktree)?;
         if worktree.exists() || was_registered {
+            if !force
+                && worktree.exists()
+                && let Some(branch) = record.branch_name.as_deref()
+                && local_branch_exists(git_root, branch)?
+                && let Err(error) =
+                    remove_untracked_runtime_roots(git_root, worktree, branch, &mut removed)
+            {
+                return Err(cleanup_incomplete_error(
+                    state,
+                    record,
+                    reason,
+                    force,
+                    &removed,
+                    &error.to_string(),
+                ));
+            }
             let result = if worktree.exists() {
                 let mut args = vec!["worktree", "remove"];
                 if force {
@@ -1348,6 +1658,123 @@ fn cleanup_worktree_run(
         force,
         reason,
     })
+}
+
+fn remove_untracked_runtime_roots(
+    git_root: &Path,
+    worktree: &Path,
+    revision: &str,
+    removed: &mut Vec<String>,
+) -> Result<()> {
+    let tracked = git_tree_paths(git_root, revision)?;
+    let runtime_roots = workspace_runtime_roots(worktree)?;
+    for relative in runtime_roots {
+        if tracked
+            .iter()
+            .any(|path| path == &relative || path.starts_with(&relative))
+        {
+            continue;
+        }
+        let absolute = worktree.join(&relative);
+        match fs::symlink_metadata(&absolute) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(&absolute)?;
+            }
+            Ok(_) => fs::remove_file(&absolute)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(CliError::Io(error)),
+        }
+        removed.push(absolute.display().to_string());
+    }
+    Ok(())
+}
+
+fn workspace_runtime_roots(worktree: &Path) -> Result<Vec<PathBuf>> {
+    fn visit(worktree: &Path, directory: &Path, roots: &mut BTreeSet<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let relative = path.strip_prefix(worktree).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "runtime cleanup path {} escaped owned worktree {}",
+                    path.display(),
+                    worktree.display()
+                )))
+            })?;
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if let Some(root) = deadreckon_core::runtime_output_root(relative) {
+                roots.insert(root);
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                visit(worktree, &path, roots)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut roots = BTreeSet::new();
+    visit(worktree, worktree, &mut roots)?;
+    Ok(roots.into_iter().collect())
+}
+
+fn git_tree_paths(git_root: &Path, revision: &str) -> Result<Vec<PathBuf>> {
+    let output = deadreckon_core::git::run_git(
+        git_root,
+        &["ls-tree", "-r", "-z", "--full-tree", revision, "--"],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            if stderr.is_empty() {
+                format!(
+                    "could not inspect tracked paths at Git revision {revision} in {}",
+                    git_root.display()
+                )
+            } else {
+                stderr
+            },
+        )));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let tab = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "Git returned a malformed tree entry during runtime cleanup".to_string(),
+                    ))
+                })?;
+            git_path_from_bytes(&entry[tab + 1..])
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // The non-Unix implementation can reject unrepresentable paths.
+fn git_path_from_bytes(raw: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(raw: &[u8]) -> Result<PathBuf> {
+    String::from_utf8(raw.to_vec())
+        .map(PathBuf::from)
+        .map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "Git returned a tracked path that cannot be represented on this platform"
+                    .to_string(),
+            ))
+        })
 }
 
 fn git_worktree_registered(git_root: &Path, worktree: &Path) -> Result<bool> {
@@ -2350,7 +2777,7 @@ fn cleanup_new_run(state: &deadreckon_core::PipelineState) {
 }
 
 fn seed_working_from_library(library_dir: &Path, working_dir: &Path) -> Result<()> {
-    copy_tree(library_dir, working_dir)?;
+    copy_deliverable_tree(library_dir, working_dir)?;
     remove_if_exists(&working_dir.join("manifest.json"))?;
     remove_if_exists(&working_dir.join(".materialized-to"))?;
     Ok(())
@@ -2625,6 +3052,7 @@ mod tests {
                     max_attempts: 1,
                     deadline: None,
                     semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
                 },
             },
             projection: JobProjection {
@@ -2675,6 +3103,74 @@ mod tests {
             sandbox_backend: "none".to_string(),
             signature: "not-trusted".to_string(),
         }
+    }
+
+    fn git_repo(root: &Path) -> (String, String) {
+        fs::create_dir_all(root).expect("repo");
+        git_status(root, &["init"]).expect("git init");
+        git_status(
+            root,
+            &["config", "user.email", "deadreckon@example.invalid"],
+        )
+        .expect("git email");
+        git_status(root, &["config", "user.name", "DeadReckon Test"]).expect("git name");
+        fs::write(root.join("signed.txt"), "base\n").expect("base file");
+        git_status(root, &["add", "signed.txt"]).expect("add base");
+        git_status(root, &["commit", "-m", "approved base"]).expect("commit base");
+        let base = git_stdout(root, &["rev-parse", "HEAD"]).expect("base revision");
+        let base_branch =
+            git_stdout(root, &["symbolic-ref", "--short", "HEAD"]).expect("base branch");
+        (base, base_branch)
+    }
+
+    fn worktree_record(root: &Path, base: &str, branch: &str) -> CodebaseRecord {
+        CodebaseRecord {
+            schema_version: deadreckon_core::codebase::CODEBASE_RECORD_VERSION,
+            mode: CodebaseMode::Worktree,
+            source_path: Some(root.to_path_buf()),
+            source_git_root: Some(root.to_path_buf()),
+            branch_name: Some(branch.to_string()),
+            base_ref: Some(base.to_string()),
+            base_sha: Some(base.to_string()),
+            parent_branch: None,
+            worktree_path: Some(root.to_path_buf()),
+            dirty_files_seeded: false,
+            head_was_detached: false,
+            created_at: Utc::now(),
+            deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
+            doc_polish_hash: None,
+        }
+    }
+
+    #[test]
+    fn runtime_cleanup_removes_only_untracked_disposable_roots() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        git_repo(&repo);
+        fs::create_dir_all(repo.join("target")).expect("tracked runtime root");
+        fs::write(repo.join("target/tracked.txt"), "operator source\n").expect("tracked file");
+        git_status(&repo, &["add", "-f", "target/tracked.txt"]).expect("add tracked file");
+        git_status(&repo, &["commit", "-m", "track target source"]).expect("commit tracked file");
+
+        fs::create_dir_all(repo.join("target/debug")).expect("target build output");
+        fs::write(repo.join("target/debug/generated"), "build output\n").expect("target output");
+        fs::create_dir_all(repo.join("web/node_modules/pkg")).expect("dependency output");
+        fs::write(repo.join("web/node_modules/pkg/index.js"), "generated\n")
+            .expect("dependency file");
+        fs::write(repo.join("operator-note.txt"), "preserve me\n").expect("unknown file");
+
+        let mut removed = Vec::new();
+        remove_untracked_runtime_roots(&repo, &repo, "HEAD", &mut removed)
+            .expect("remove disposable residue");
+
+        assert!(repo.join("target/tracked.txt").exists());
+        assert!(repo.join("target/debug/generated").exists());
+        assert!(!repo.join("web/node_modules").exists());
+        assert!(repo.join("operator-note.txt").exists());
+        assert_eq!(
+            removed,
+            vec![repo.join("web/node_modules").display().to_string()]
+        );
     }
 
     #[test]
@@ -2755,6 +3251,7 @@ mod tests {
                     max_attempts: 1,
                     deadline: None,
                     semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
                 },
             },
         )
@@ -2767,5 +3264,284 @@ mod tests {
         let resolved = resolve_apply_state(&paths, job_id, true, Some(state))
             .expect("finish already validated the Job and may retain its backing Run");
         assert_eq!(resolved.run_id, job_id);
+    }
+
+    #[test]
+    fn legacy_apply_refuses_private_artifact_even_when_later_deleted() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, _) = git_repo(&repo);
+        let private = repo.join(".specstory/history/session.md");
+        fs::create_dir_all(private.parent().expect("private parent")).expect("private dir");
+        fs::write(&private, "provider evidence\n").expect("private evidence");
+        git_status(&repo, &["add", "-f", ".specstory/history/session.md"]).expect("add private");
+        git_status(&repo, &["commit", "-m", "add private artifact"]).expect("commit private");
+        fs::remove_file(&private).expect("remove private");
+        git_status(&repo, &["add", "-u", ".specstory/history/session.md"])
+            .expect("stage private removal");
+        git_status(&repo, &["commit", "-m", "remove private artifact"]).expect("commit removal");
+        let branch = git_stdout(&repo, &["symbolic-ref", "--short", "HEAD"]).expect("branch");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "deliver clean history".to_string(),
+                cwd: repo.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("legacy-private-history".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("state");
+        let record = worktree_record(&repo, &base, &branch);
+
+        let error = refuse_non_deliverable_result_history(&state, &record, &repo, &branch)
+            .expect_err("legacy result history must be refused");
+
+        assert!(
+            error.to_string().contains("non-deliverable paths"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn applied_identity_uses_committed_revision_not_restored_operator_changes() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("signed.txt"), "signed result\n").expect("signed result");
+        git_status(&repo, &["add", "signed.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "signed result"]).expect("commit result");
+        let result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+        git_status(
+            &repo,
+            &["merge", "--no-ff", "result", "-m", "deliver result"],
+        )
+        .expect("merge result");
+
+        let job_id = JobId("efefefefefefefefefefefefefefefef".to_string());
+        let mut receipt = uncontained_receipt(&job_id);
+        receipt.source_revision = Some(base.clone());
+        receipt.result_revision = Some(result);
+        let record = worktree_record(&repo, &base, "result");
+
+        // This models an operator edit restored from autostash. It changes the
+        // working file, but not the delivered Git revision being recorded.
+        fs::write(repo.join("signed.txt"), "operator local edit\n").expect("operator edit");
+        verify_applied_receipt_identity(job_id.as_ref(), &receipt, &record, &repo, &base)
+            .expect("restored operator edit must not obscure committed delivery identity");
+
+        git_status(&repo, &["add", "signed.txt"]).expect("stage tamper");
+        git_status(&repo, &["commit", "-m", "tamper delivered result"]).expect("commit tamper");
+        let error =
+            verify_applied_receipt_identity(job_id.as_ref(), &receipt, &record, &repo, &base)
+                .expect_err("committed delivery mismatch must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the signed result"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn applied_identity_refuses_extra_committed_delivery_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("signed.txt"), "signed result\n").expect("signed result");
+        git_status(&repo, &["add", "signed.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "signed result"]).expect("commit result");
+        let result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+        git_status(
+            &repo,
+            &["merge", "--no-ff", "result", "-m", "deliver result"],
+        )
+        .expect("merge result");
+        fs::write(repo.join("hook-output.txt"), "not in signed result\n").expect("hook output");
+        git_status(&repo, &["add", "hook-output.txt"]).expect("add hook output");
+        git_status(&repo, &["commit", "-m", "unexpected apply side effect"])
+            .expect("commit hook output");
+
+        let job_id = JobId("abababababababababababababababab".to_string());
+        let mut receipt = uncontained_receipt(&job_id);
+        receipt.source_revision = Some(base.clone());
+        receipt.result_revision = Some(result);
+        let record = worktree_record(&repo, &base, "result");
+
+        let error =
+            verify_applied_receipt_identity(job_id.as_ref(), &receipt, &record, &repo, &base)
+                .expect_err("extra committed delivery path must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the signed result: hook-output.txt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn applied_identity_refuses_extra_path_added_then_deleted_during_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("signed.txt"), "signed result\n").expect("signed result");
+        git_status(&repo, &["add", "signed.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "signed result"]).expect("commit result");
+        let result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+        git_status(
+            &repo,
+            &["merge", "--no-ff", "result", "-m", "deliver result"],
+        )
+        .expect("merge result");
+        fs::write(repo.join("transient-hook-output.txt"), "transient\n").expect("hook output");
+        git_status(&repo, &["add", "transient-hook-output.txt"]).expect("add hook output");
+        git_status(&repo, &["commit", "-m", "unexpected apply side effect"])
+            .expect("commit hook output");
+        fs::remove_file(repo.join("transient-hook-output.txt")).expect("remove hook output");
+        git_status(&repo, &["add", "-u", "transient-hook-output.txt"]).expect("stage hook removal");
+        git_status(&repo, &["commit", "-m", "hide apply side effect"])
+            .expect("commit hook removal");
+
+        let job_id = JobId("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".to_string());
+        let mut receipt = uncontained_receipt(&job_id);
+        receipt.source_revision = Some(base.clone());
+        receipt.result_revision = Some(result);
+        let record = worktree_record(&repo, &base, "result");
+
+        let error =
+            verify_applied_receipt_identity(job_id.as_ref(), &receipt, &record, &repo, &base)
+                .expect_err("transient extra delivery path must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("outside the signed result: transient-hook-output.txt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn delivery_history_does_not_reclassify_existing_target_changes_as_side_effects() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("signed.txt"), "signed result\n").expect("signed result");
+        git_status(&repo, &["add", "signed.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "signed result"]).expect("commit result");
+        let result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+        fs::write(repo.join("operator.txt"), "existing target change\n").expect("operator change");
+        git_status(&repo, &["add", "operator.txt"]).expect("add operator change");
+        git_status(&repo, &["commit", "-m", "operator target change"])
+            .expect("commit operator change");
+        let delivery_before = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("delivery base");
+        git_status(
+            &repo,
+            &["merge", "--no-ff", "result", "-m", "deliver result"],
+        )
+        .expect("merge result");
+
+        let job_id = JobId("dededededededededededededededede".to_string());
+        let mut receipt = uncontained_receipt(&job_id);
+        receipt.source_revision = Some(base.clone());
+        receipt.result_revision = Some(result);
+        let record = worktree_record(&repo, &base, "result");
+
+        verify_applied_receipt_identity(
+            job_id.as_ref(),
+            &receipt,
+            &record,
+            &repo,
+            &delivery_before,
+        )
+        .expect("pre-existing target commits are not delivery side effects");
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn applied_identity_preserves_non_utf8_git_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        let raw_path = PathBuf::from(OsString::from_vec(b"signed-\xff.txt".to_vec()));
+        fs::write(repo.join(&raw_path), "raw path result\n").expect("raw result");
+        git_status(&repo, &["add", "-A"]).expect("add raw result");
+        git_status(&repo, &["commit", "-m", "signed raw path"]).expect("commit raw result");
+        let result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+        git_status(
+            &repo,
+            &["merge", "--no-ff", "result", "-m", "deliver raw result"],
+        )
+        .expect("merge raw result");
+
+        let job_id = JobId("efefefefefefefefefefefefefefefef".to_string());
+        let mut receipt = uncontained_receipt(&job_id);
+        receipt.source_revision = Some(base.clone());
+        receipt.result_revision = Some(result);
+        let record = worktree_record(&repo, &base, "result");
+
+        verify_applied_receipt_identity(job_id.as_ref(), &receipt, &record, &repo, &base)
+            .expect("raw Git path must compare without UTF-8 conversion");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_tree_path_matching_does_not_require_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"signed-\xff.txt".to_vec()));
+        assert!(git_path_matches(&path, b"signed-\xff.txt").expect("raw path comparison"));
+        assert!(!git_path_matches(&path, b"signed-other.txt").expect("different raw path"));
+    }
+
+    #[test]
+    fn refused_verified_delivery_restores_the_target_revision() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let (base, _) = git_repo(&repo);
+        fs::write(repo.join("signed.txt"), "applied but refused\n").expect("applied change");
+        git_status(&repo, &["add", "signed.txt"]).expect("add applied change");
+        git_status(&repo, &["commit", "-m", "applied result"]).expect("commit applied change");
+        assert_ne!(
+            git_stdout(&repo, &["rev-parse", "HEAD"]).expect("applied revision"),
+            base
+        );
+
+        let error = rollback_refused_job_delivery(
+            &repo,
+            "abababababababababababababababab",
+            &base,
+            None,
+            CliError::Core(DeadreckonError::InvalidInput(
+                "post-apply identity mismatch".to_string(),
+            )),
+        );
+
+        assert!(error.to_string().contains("post-apply identity mismatch"));
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "HEAD"]).expect("restored revision"),
+            base
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("signed.txt")).expect("restored file"),
+            "base\n"
+        );
     }
 }
