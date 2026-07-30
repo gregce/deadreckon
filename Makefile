@@ -7,14 +7,15 @@ DEADRECKON_HOME ?= $(ROOT)/.deadreckon-smoke
 STRESS_SECONDS ?= 600
 VERIFY_LOG_DIR ?= $(ROOT)/target/verify-timings
 
-.PHONY: help build release test test-agentic test-chain test-codebase test-lifecycle test-smoke-invariant clippy fmt fmt-check public-surface hygiene-recursive verify verify-timed smoke doctor alias-zsh completion-install stress clean-runtime clean-target
+.PHONY: help build release size-check test test-agentic test-chain test-codebase test-lifecycle test-smoke-invariant clippy fmt fmt-check public-surface hygiene-recursive verify verify-timed smoke doctor alias-zsh completion-install stress clean-runtime clean-target
 
 help:
 	@printf '%s\n' \
 		'deadreckon make targets:' \
 		'  make build          Build release binary' \
-		'  make verify         fmt --check, clippy -D warnings, public surface, test, build' \
+		'  make verify         fmt, clippy, public surface, tests, release build and size check' \
 		'  make verify-timed   Run verify phases with per-phase timing logs' \
+		'  make size-check     Build and check the current release binary size' \
 		'  make public-surface Check exported library surface against baseline' \
 		'  make test-agentic   Run agentic_loop integration tests' \
 		'  make test-chain     Run chain integration tests' \
@@ -28,7 +29,10 @@ help:
 		'  make clean-runtime  Remove repo-local smoke runtime state'
 
 build release:
-	cd $(ROOT) && cargo build --release
+	cd $(ROOT) && cargo build --release --workspace --locked
+
+size-check: build
+	cd $(ROOT) && DEADRECKON_RELEASE_SIZE_CHECK=1 cargo test -p deadreckon --test hygiene_config release_binary_size_within_baseline_slack -- --exact
 
 test:
 	cd $(ROOT) && cargo test --workspace
@@ -69,7 +73,7 @@ verify:
 	$(MAKE) clippy
 	$(MAKE) public-surface
 	$(MAKE) test
-	$(MAKE) build
+	$(MAKE) size-check
 
 verify-timed:
 	mkdir -p $(VERIFY_LOG_DIR)
@@ -77,7 +81,7 @@ verify-timed:
 	set -o pipefail; mkdir -p $(VERIFY_LOG_DIR); /usr/bin/time -p $(MAKE) clippy 2>&1 | tee $(VERIFY_LOG_DIR)/02-clippy.log
 	set -o pipefail; mkdir -p $(VERIFY_LOG_DIR); /usr/bin/time -p $(MAKE) public-surface 2>&1 | tee $(VERIFY_LOG_DIR)/03-public-surface.log
 	set -o pipefail; mkdir -p $(VERIFY_LOG_DIR); /usr/bin/time -p $(MAKE) test 2>&1 | tee $(VERIFY_LOG_DIR)/04-test.log
-	set -o pipefail; mkdir -p $(VERIFY_LOG_DIR); /usr/bin/time -p $(MAKE) build 2>&1 | tee $(VERIFY_LOG_DIR)/05-build.log
+	set -o pipefail; mkdir -p $(VERIFY_LOG_DIR); /usr/bin/time -p $(MAKE) size-check 2>&1 | tee $(VERIFY_LOG_DIR)/05-size-check.log
 
 smoke: build
 	rm -rf $(DEADRECKON_HOME)

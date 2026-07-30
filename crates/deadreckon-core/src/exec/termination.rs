@@ -169,6 +169,7 @@ mod tests {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::{Pid, getpgid};
+    use std::path::Path;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -198,12 +199,15 @@ mod tests {
             .env("CHILD_PID_FILE", &child_pid_path);
         let (mut group_leader, terminator) =
             spawn_grouped(command).expect("spawn grouped child tree");
-        wait_for(|| child_pid_path.exists(), Duration::from_secs(3));
-        let child_pid = std::fs::read_to_string(&child_pid_path)
-            .expect("read child pid")
-            .trim()
-            .parse::<i32>()
-            .expect("parse child pid");
+        wait_for(
+            || read_pid_when_complete(&child_pid_path).is_some(),
+            Duration::from_secs(3),
+        );
+        let Some(child_pid) = read_pid_when_complete(&child_pid_path) else {
+            let _ = terminator.terminate(Duration::ZERO);
+            let _ = group_leader.wait();
+            panic!("child pid file was not complete before the timeout");
+        };
 
         let outcome = terminator.terminate(Duration::from_millis(250));
         assert!(
@@ -269,5 +273,13 @@ mod tests {
             Err(Errno::ESRCH) => false,
             Err(_) => false,
         }
+    }
+
+    fn read_pid_when_complete(path: &Path) -> Option<i32> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<i32>()
+            .ok()
     }
 }

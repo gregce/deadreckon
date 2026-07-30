@@ -309,7 +309,7 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   for protocol corruption, lease races and reclaim, protected paths, receipt
   tampering, promotion refusal and service rendering. The real macOS
   public-command end-to-end test proves the contained two-phase Seatbelt gate.
-  The credential-free adversarial runner records 7 passes and 0 failures. The
+  The credential-free adversarial runner records 11 passes and 0 failures. The
   24-row live operator kit records 2 attempted tasks, 22 not run, and 0
   verified. It has no live Linux/bubblewrap or Docker gate trial, reboot trial,
   or measured false-accept and false-reject rates.

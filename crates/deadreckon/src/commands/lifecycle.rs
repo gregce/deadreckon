@@ -81,8 +81,14 @@ pub(crate) fn finish_command(
             let job_id = job.job.job_id.as_ref().to_string();
             (finish_job_state(&paths, &job)?, None, dest, Some(job_id))
         }
-        super::reference::ResolvedRef::Run(state) => (*state, None, dest, None),
-        super::reference::ResolvedRef::PlanChild { state, .. } => (*state, None, dest, None),
+        super::reference::ResolvedRef::Run(state) => {
+            super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "finish")?;
+            (*state, None, dest, None)
+        }
+        super::reference::ResolvedRef::PlanChild { state, .. } => {
+            super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "finish")?;
+            (*state, None, dest, None)
+        }
         super::reference::ResolvedRef::Plan(plan) => {
             let plan_id = plan.plan_id.clone();
             let Some(result) = resolve_plan_result_run(&paths, &plan_id, "finish")? else {
@@ -92,6 +98,11 @@ pub(crate) fn finish_command(
                     &plan_id,
                 ));
             };
+            super::graph_job::require_current_driver_for_job_owned_run(
+                &paths,
+                &result.state,
+                "finish",
+            )?;
             if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
                 return apply_command_inner(
                     plan_id, strategy, branch, no_confirm, autostash, cleanup, message, false,
@@ -907,6 +918,7 @@ fn resolve_apply_state(
     quiet: bool,
     verified_job_state: Option<deadreckon_core::PipelineState>,
 ) -> Result<deadreckon_core::PipelineState> {
+    let public_mutation = verified_job_state.is_none();
     let state = match verified_job_state {
         Some(state) => state,
         None => match super::reference::try_resolve_run(paths, run_id, "apply")? {
@@ -926,6 +938,9 @@ fn resolve_apply_state(
             },
         },
     };
+    if public_mutation {
+        super::graph_job::require_current_driver_for_job_owned_run(paths, &state, "apply")?;
+    }
     Ok(state)
 }
 
@@ -1284,6 +1299,7 @@ fn should_prompt_cleanup(no_confirm: bool) -> Result<bool> {
 pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = super::reference::resolve_run_like(&paths, Some(&run_id), "abandon")?;
+    super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "abandon")?;
     let record = match lifecycle_codebase_record(&paths, &state) {
         Ok(record) => record,
         Err(error) if paths.job_json(&state.run_id).is_file() => {
@@ -1368,6 +1384,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     if let Some(run_id) = run_id {
         let mut state = resolve_cleanup_state(&paths, &run_id)?;
+        super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "cleanup")?;
         if state.status == RunStatus::Executing {
             if !escalate {
                 return Err(CliError::Core(deadreckon_core::user_error(
@@ -1491,6 +1508,9 @@ fn cleanup_candidates(
         let Ok(state) = load_run(paths, &run.run_id) else {
             continue;
         };
+        if super::graph_job::resolve_run_owner(paths, &state)?.is_some() {
+            continue;
+        }
         let record = match lifecycle_codebase_record(paths, &state) {
             Ok(record) => record,
             Err(error) if paths.job_json(&state.run_id).is_file() => {
@@ -2099,6 +2119,7 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
 
     let paths = DeadreckonPaths::discover();
     let parent = super::reference::resolve_run_like(&paths, Some(&parent_run_id), "extend")?;
+    super::graph_job::require_current_driver_for_job_owned_run(&paths, &parent, "extend")?;
     if parent.status != RunStatus::Completed {
         return Err(CliError::Surface {
             code: 1,

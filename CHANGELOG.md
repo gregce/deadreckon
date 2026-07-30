@@ -183,8 +183,8 @@ live reboot.
 
 The operator dogfood kit contains 24 tasks across 2 repository and provider
 slots. It also includes a metrics collector, human-review schema and
-credential-free adversarial runner. The committed credential-free result is 7
-passed, 0 failed, and 5 explicitly unproven live/host claims. The sanitized
+credential-free adversarial runner. The committed credential-free result is 11
+passed, 0 failed, and 9 explicitly unproven live/host claims. The sanitized
 live result records 2 attempted tasks, 22 not run, and 0 verified. This release
 does not claim live task rates, cross-provider results, machine-restart
 results, or false-accept and false-reject rates.

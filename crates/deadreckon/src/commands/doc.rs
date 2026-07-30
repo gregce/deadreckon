@@ -61,6 +61,7 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
     let kind_arg = cli_doc_kind_arg(kind);
     let kind = run_doc_kind(kind)?;
     if polish {
+        super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "doc polish")?;
         if state.status != RunStatus::Completed {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!(
@@ -231,6 +232,12 @@ async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> 
         )));
     };
     if polish {
+        super::graph_job::require_current_driver_for_job_artifact(
+            paths,
+            &target.plan.plan_id,
+            deadreckon_protocol::JobShape::Graph,
+            "doc polish",
+        )?;
         let selection = select_plan_doc_provider(paths, &target.plan, doc_provider.as_deref())?;
         let defaults = config_defaults(paths)?;
         refresh_plan_docs(

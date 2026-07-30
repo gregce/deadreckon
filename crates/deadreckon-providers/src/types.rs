@@ -122,6 +122,55 @@ pub struct CapabilityPosture {
 }
 
 impl ProviderRequest {
+    /// Build a provider request that may inspect a workspace but cannot write
+    /// it. Local CLI routes run under the host's automatically selected
+    /// sandbox; when no backend can enforce read-only access, the common CLI
+    /// runner refuses before spawning the provider.
+    pub fn enforceably_read_only(
+        prompt: impl Into<String>,
+        max_output_tokens: u32,
+        cwd: impl Into<PathBuf>,
+    ) -> Self {
+        Self::enforceably_read_only_with_backend(
+            prompt,
+            max_output_tokens,
+            cwd,
+            SandboxBackend::Auto,
+        )
+    }
+
+    /// Build an enforceably read-only request using an already approved
+    /// sandbox backend. This keeps preflight planners and trusted Job helpers
+    /// inside the same operator-selected containment boundary.
+    pub fn enforceably_read_only_with_backend(
+        prompt: impl Into<String>,
+        max_output_tokens: u32,
+        cwd: impl Into<PathBuf>,
+        sandbox_backend: SandboxBackend,
+    ) -> Self {
+        // An uncontained worker policy never weakens a planner or judge.
+        // Elevate `none` to automatic host containment and let the common CLI
+        // runner fail closed when no enforceable backend exists.
+        let sandbox_backend = if sandbox_backend == SandboxBackend::None {
+            SandboxBackend::Auto
+        } else {
+            sandbox_backend
+        };
+        Self {
+            prompt: prompt.into(),
+            max_output_tokens,
+            cwd: Some(cwd.into()),
+            output_path: None,
+            sandbox_backend: Some(sandbox_backend),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            pid_file: None,
+            cancellation_token: None,
+            session_dir: None,
+            output_schema: None,
+            capability_posture: None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_capability_posture(
         &mut self,
@@ -192,4 +241,31 @@ pub struct ProviderRouteInfo {
     pub kind: ProviderKind,
     pub model: String,
     pub has_credential: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enforceably_read_only_request_carries_a_real_boundary() {
+        let cwd = PathBuf::from("/tmp/deadreckon-planner");
+        let request = ProviderRequest::enforceably_read_only("plan", 512, cwd.clone());
+        assert_eq!(request.cwd.as_deref(), Some(cwd.as_path()));
+        assert_eq!(request.workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(request.sandbox_backend, Some(SandboxBackend::Auto));
+        assert!(request.session_dir.is_none());
+        assert!(request.capability_posture.is_none());
+    }
+
+    #[test]
+    fn uncontained_worker_policy_cannot_weaken_a_read_only_request() {
+        let request = ProviderRequest::enforceably_read_only_with_backend(
+            "plan",
+            512,
+            "/tmp/deadreckon-planner",
+            SandboxBackend::None,
+        );
+        assert_eq!(request.sandbox_backend, Some(SandboxBackend::Auto));
+    }
 }

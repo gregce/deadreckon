@@ -31,3 +31,6 @@ jobs:
         run: |
           cargo test --workspace --locked --no-fail-fast
           cargo test -p deadreckon --features internal-characterization --test chain --test orchestrate --locked
+      - name: Fresh release binary size
+        shell: bash
+        run: make size-check

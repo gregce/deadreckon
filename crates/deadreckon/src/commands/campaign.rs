@@ -898,20 +898,31 @@ fn promote_campaign_result(
     rollup: &deadreckon_core::campaign::CampaignRollup,
 ) -> Result<deadreckon_core::PipelineState> {
     let cwd = std::env::current_dir()?;
-    let mut state = create_run(
-        paths,
-        RunOptions {
-            goal: format!("campaign {}", run_prefix(campaign_id)),
-            cwd,
-            sandbox: "none".to_string(),
-            provider: Some("deadreckon:campaign".to_string()),
-            skill_name: "default-coding".to_string(),
-            max_spend_usd: None,
-            max_wall_seconds: None,
-            run_id: None,
-            codebase: None,
-        },
-    )?;
+    let run_options = RunOptions {
+        goal: format!("campaign {}", run_prefix(campaign_id)),
+        cwd,
+        sandbox: "none".to_string(),
+        provider: Some("deadreckon:campaign".to_string()),
+        skill_name: "default-coding".to_string(),
+        max_spend_usd: None,
+        max_wall_seconds: None,
+        run_id: None,
+        codebase: None,
+    };
+    let mut state = if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+        if job_id != campaign_id {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Campaign {campaign_id} is being driven by unrelated durable Job {job_id}"
+            ))));
+        }
+        deadreckon_core::create_owned_run(
+            paths,
+            run_options,
+            deadreckon_core::RunOwnership::campaign_result(job_id, campaign_id),
+        )?
+    } else {
+        create_run(paths, run_options)?
+    };
     remove_if_exists(&state.working_dir)?;
     copy_deliverable_tree(merge_dir, &state.working_dir)?;
     deadreckon_core::campaign::write_campaign_rollup_at_run_root(&state.run_root, rollup)?;
@@ -1645,6 +1656,12 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    let planner_sandbox = args
+        .sandbox
+        .as_deref()
+        .or(defaults.sandbox.as_deref())
+        .unwrap_or("auto")
+        .parse::<deadreckon_sandbox::SandboxBackend>()?;
     let cwd = std::env::current_dir()?;
     let scope = workspace_scope(&cwd)?;
     let mut n = if let Some(n) = args.n {
@@ -1656,9 +1673,15 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             .or(args.provider.as_deref())
             .map(ToString::to_string)
             .or_else(|| goal_shape_provider_route(&paths, &defaults, None));
-        let recommendation =
-            classify_goal_shape_for_start(&paths, &cwd, &goal, provider.as_deref(), args.plain)
-                .await;
+        let recommendation = classify_goal_shape_for_start(
+            &paths,
+            &cwd,
+            &goal,
+            provider.as_deref(),
+            planner_sandbox,
+            args.plain,
+        )
+        .await;
         write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
         recommendation
             .n
@@ -1705,6 +1728,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         &providers,
         &overrides,
         &cwd,
+        planner_sandbox,
         args.plain,
         args.no_hints,
         false,
@@ -1831,6 +1855,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                     &providers,
                     &overrides,
                     &cwd,
+                    planner_sandbox,
                     args.plain,
                     args.no_hints,
                     false,

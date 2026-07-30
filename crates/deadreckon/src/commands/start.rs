@@ -455,6 +455,7 @@ pub(crate) async fn classify_goal_shape_for_start(
     cwd: &Path,
     goal: &str,
     provider: Option<&str>,
+    sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
 ) -> GoalShapeRecommendation {
     let defaults_ceiling = config_defaults(paths).ok().and_then(|d| d.max_spend);
@@ -463,8 +464,17 @@ pub(crate) async fn classify_goal_shape_for_start(
     if let Some(provider) = provider
         && provider != "smoke"
         && !provider.starts_with("smoke:")
-        && let Some(resolved) =
-            provider_course_plan(paths, cwd, goal, provider, plain, &signals, &ladder).await
+        && let Some(resolved) = provider_course_plan(
+            paths,
+            cwd,
+            goal,
+            provider,
+            sandbox_backend,
+            plain,
+            &signals,
+            &ladder,
+        )
+        .await
     {
         let (shape, n, pieces, apply, resolution) = resolved;
         return GoalShapeRecommendation {
@@ -482,29 +492,24 @@ pub(crate) async fn classify_goal_shape_for_start(
     ladder_goal_shape_recommendation(goal, &ladder)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn provider_course_plan(
     paths: &DeadreckonPaths,
     cwd: &Path,
     goal: &str,
     provider: &str,
+    sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
     signals: &commands::course::SignalBundle,
     ladder: &commands::course::LadderDecision,
 ) -> Option<commands::course::ResolvedCoursePlan> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(provider)).ok()?;
-    let request = ProviderRequest {
-        prompt: commands::course::course_planner_prompt(goal, signals),
-        max_output_tokens: 512,
-        cwd: Some(cwd.to_path_buf()),
-        output_path: None,
-        sandbox_backend: None,
-        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-        pid_file: None,
-        cancellation_token: None,
-        session_dir: None,
-        output_schema: None,
-        capability_posture: None,
-    };
+    let request = ProviderRequest::enforceably_read_only_with_backend(
+        commands::course::course_planner_prompt(goal, signals),
+        512,
+        cwd,
+        sandbox_backend,
+    );
     let response = tokio::time::timeout(
         course_planner_timeout(provider),
         maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request)),
@@ -2639,11 +2644,17 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         let provider = start_should_ask_provider_for_shape(&args, eligibility)
             .then(|| start_goal_shape_provider_route(&paths, &defaults, &args))
             .flatten();
+        let planner_sandbox = defaults
+            .sandbox
+            .as_deref()
+            .unwrap_or("auto")
+            .parse::<deadreckon_sandbox::SandboxBackend>()?;
         let recommendation = classify_goal_shape_for_start(
             &paths,
             &cwd,
             &args.goal,
             provider.as_deref(),
+            planner_sandbox,
             args.plain,
         )
         .await;

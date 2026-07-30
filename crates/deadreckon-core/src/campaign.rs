@@ -4,8 +4,8 @@
 //!
 //! This module owns the file-backed campaign state, the depth/cycle guard, and the
 //! lineage record that rides the spawn boundary. Child work stays normal
-//! `deadreckon` subprocesses (AS-BUILT §30.1): campaigns add no fields to `Plan`,
-//! `PlanTask`, or `PipelineState`.
+//! `deadreckon` subprocesses (AS-BUILT §30.1). Durable Campaign result Runs
+//! carry the same Job ownership stamp as other trusted artifacts.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -154,8 +154,9 @@ pub struct SubGoal {
 }
 
 /// File-backed campaign state at `~/.deadreckon/plans/<campaign-id>/campaign.json`.
-/// Adds no fields to `Plan`/`PlanTask`/`PipelineState`; sub-orchestrators produce
-/// ordinary plans and ordinary merged runs.
+/// Sub-orchestrators produce normal Plans and Runs. A durable Campaign stamps
+/// its final result Run with the owning Job before the Campaign records the Run
+/// id, closing the public-mutation window during result creation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Campaign {
     pub schema_version: u32,
