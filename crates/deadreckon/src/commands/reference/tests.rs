@@ -690,6 +690,11 @@ fn report_accepts_durable_jobs() {
 }
 
 #[test]
+fn cleanup_accepts_durable_jobs_with_same_id_backing_runs() {
+    assert!(accepts_for("cleanup").contains(RefKind::Job));
+}
+
+#[test]
 fn campaigns_are_not_candidates_for_a_scope_bound_latest() {
     let fx = fixture();
     // A campaign carries no scope of its own, so it cannot be attributed to
