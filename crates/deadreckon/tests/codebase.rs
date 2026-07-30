@@ -11,11 +11,16 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, ModeFlags, ResolvedMode, RunOptions, RunStatus,
-    WorktreeOptions, create_run, create_worktree, list_runs, load_run, prepare_worktree_record,
-    read_codebase_record, record_for_resolved_mode, resolve_mode, save_state,
-    write_codebase_record,
+    WorktreeOptions, append_job_event, create_run, create_worktree, list_runs, load_run,
+    prepare_worktree_record, read_codebase_record, record_for_resolved_mode, resolve_mode,
+    save_state, write_codebase_record, write_job,
+};
+use deadreckon_protocol::{
+    Job, JobEvent, JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape,
+    SemanticJudgeMode,
 };
 use tempfile::TempDir;
 
@@ -1579,6 +1584,66 @@ fn apply_cleanup_after_already_applied_removes_worktree_and_branch() {
 }
 
 #[test]
+fn dirty_apply_cleanup_reports_incomplete_and_same_id_job_cleanup_recovers() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+    let state = load_run(&paths, &run_id).expect("state");
+    let record = read_codebase_record(&state.working_dir).expect("codebase");
+    let worktree = record.worktree_path.clone().expect("worktree");
+    let branch = record.branch_name.clone().expect("branch");
+    let private_history = worktree.join(".specstory/history/narrator.md");
+    fs::create_dir_all(private_history.parent().expect("history parent")).expect("history dir");
+    fs::write(&private_history, "untracked provider evidence\n").expect("private history");
+
+    let apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .arg("--cleanup")
+        .output()
+        .expect("apply");
+
+    assert!(
+        !apply.status.success(),
+        "dirty cleanup must not report success:\n{}",
+        stdout(&apply)
+    );
+    let stderr = stderr(&apply);
+    assert!(stderr.contains("applied"), "{stderr}");
+    assert!(stderr.contains("cleanup did not complete"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("deadreckon cleanup {} --overwrite", &run_id[..8])),
+        "{stderr}"
+    );
+    assert!(worktree.exists());
+    assert!(git_ref_exists(&repo, &branch));
+    assert!(!state.run_root.join("abandoned.json").exists());
+    assert!(
+        git_stdout(&repo, &["diff", "--stat", &format!("HEAD..{branch}")])
+            .trim()
+            .is_empty(),
+        "apply must remain successful even though cleanup failed"
+    );
+
+    write_same_id_job(&paths, &state, &repo);
+    let cleanup = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("cleanup")
+        .arg(&run_id)
+        .arg("--overwrite")
+        .output()
+        .expect("same-id Job cleanup");
+
+    assert_success(&cleanup);
+    assert!(!worktree.exists());
+    assert!(!git_ref_exists(&repo, &branch));
+    assert!(state.run_root.join("abandoned.json").exists());
+}
+
+#[test]
 fn apply_merge_no_ff_creates_merge_commit() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -2381,6 +2446,48 @@ fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String
         .next()
         .expect("run")
         .run_id
+}
+
+fn write_same_id_job(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    repo: &std::path::Path,
+) {
+    let job_id = JobId(state.run_id.clone());
+    let job = Job {
+        schema_version: JobSchemaVersion::CURRENT,
+        job_id: job_id.clone(),
+        scope: state.scope.clone(),
+        goal: state.goal.clone(),
+        shape: JobShape::Single,
+        created_at: Utc::now(),
+        source_cwd: repo.to_path_buf(),
+        launch_plan_sha256: "sha256:test-launch".to_string(),
+        authority_sha256: "sha256:test-authority".to_string(),
+        policy: JobPolicy {
+            max_spend_usd: 1.0,
+            max_wall_seconds: 60,
+            max_attempts: 1,
+            deadline: None,
+            semantic_judge: SemanticJudgeMode::Required,
+        },
+    };
+    write_job(paths, &job).expect("job");
+    append_job_event(
+        paths,
+        &JobEvent {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id,
+            sequence: JobEventSequence::new(1).expect("nonzero"),
+            event_id: "created".to_string(),
+            causation_id: "created".to_string(),
+            timestamp: Utc::now(),
+            lease_epoch: 0,
+            kind: JobEventKind::Created,
+            detail: serde_json::json!({}),
+        },
+    )
+    .expect("created event");
 }
 
 fn clean_git_repo(temp: &TempDir) -> PathBuf {

@@ -179,7 +179,7 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     },
     VerbRefSpec {
         verb: "cleanup",
-        accepts: RUN_LIKE,
+        accepts: RefKinds::JOB.union(RUN_LIKE),
     },
     // A verdict describes one gated run, so plans and chains redirect.
     VerbRefSpec {

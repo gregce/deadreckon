@@ -95,7 +95,7 @@ pub(crate) fn finish_command(
             if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
                 return apply_command_inner(
                     plan_id, strategy, branch, no_confirm, autostash, cleanup, message, false,
-                    false, None,
+                    false, None, None,
                 );
             }
             let dest = Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
@@ -137,12 +137,6 @@ pub(crate) fn finish_command(
         .unwrap_or(CodebaseMode::Fresh);
     match mode {
         CodebaseMode::Worktree => {
-            let record = read_codebase_record(&state.working_dir)?;
-            let destination = record.source_git_root.ok_or_else(|| {
-                CliError::Core(DeadreckonError::InvalidInput(
-                    "verified worktree result is missing its source git root".to_string(),
-                ))
-            })?;
             apply_command_inner(
                 state.run_id.clone(),
                 strategy,
@@ -154,17 +148,8 @@ pub(crate) fn finish_command(
                 false,
                 false,
                 Some(state),
+                finished_job_id.as_deref(),
             )?;
-            if let Some(job_id) = finished_job_id.as_deref() {
-                let revision = delivered_git_revision(&destination);
-                super::job::record_job_delivery(
-                    &paths,
-                    job_id,
-                    super::job::JobDeliveryKind::Applied,
-                    &destination,
-                    revision.as_deref(),
-                )?;
-            }
             Ok(())
         }
         CodebaseMode::Copy | CodebaseMode::Fresh => {
@@ -416,6 +401,7 @@ pub(crate) fn apply_command(
         false,
         plain,
         None,
+        None,
     )
 }
 
@@ -439,6 +425,7 @@ pub(crate) fn apply_command_quiet(
         true,
         false,
         None,
+        None,
     )
 }
 
@@ -456,6 +443,7 @@ fn apply_command_inner(
     quiet: bool,
     _plain: bool,
     verified_job_state: Option<deadreckon_core::PipelineState>,
+    verified_job_id: Option<&str>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let mut state = resolve_apply_state(&paths, &run_id, quiet, verified_job_state)?;
@@ -494,6 +482,7 @@ fn apply_command_inner(
         if !quiet {
             print_already_applied(&state, branch, &target);
         }
+        record_applied_job_delivery(&paths, verified_job_id, git_root)?;
         let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
         if !quiet {
             print!(
@@ -558,6 +547,7 @@ fn apply_command_inner(
                 if !quiet {
                     print_already_applied(&state, branch, &target);
                 }
+                record_applied_job_delivery(&paths, verified_job_id, git_root)?;
                 let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
                 if !quiet {
                     print!(
@@ -597,6 +587,7 @@ fn apply_command_inner(
         );
         println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     }
+    record_applied_job_delivery(&paths, verified_job_id, git_root)?;
     let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
     if !quiet {
         print!(
@@ -606,6 +597,24 @@ fn apply_command_inner(
         );
     }
     Ok(())
+}
+
+fn record_applied_job_delivery(
+    paths: &DeadreckonPaths,
+    verified_job_id: Option<&str>,
+    destination: &Path,
+) -> Result<()> {
+    let Some(job_id) = verified_job_id else {
+        return Ok(());
+    };
+    let revision = delivered_git_revision(destination);
+    super::job::record_job_delivery(
+        paths,
+        job_id,
+        super::job::JobDeliveryKind::Applied,
+        destination,
+        revision.as_deref(),
+    )
 }
 
 fn resolve_apply_state(
@@ -1068,7 +1077,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     } = args;
     let paths = DeadreckonPaths::discover();
     if let Some(run_id) = run_id {
-        let mut state = super::reference::resolve_run_like(&paths, Some(&run_id), "cleanup")?;
+        let mut state = resolve_cleanup_state(&paths, &run_id)?;
         if state.status == RunStatus::Executing {
             if !escalate {
                 return Err(CliError::Core(deadreckon_core::user_error(
@@ -1139,6 +1148,38 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
     }
     print_cleanup_results(&results);
     Ok(())
+}
+
+fn resolve_cleanup_state(
+    paths: &DeadreckonPaths,
+    reference: &str,
+) -> Result<deadreckon_core::PipelineState> {
+    match super::reference::resolve_ref(
+        paths,
+        super::reference::RefQuery {
+            reference: Some(reference),
+            all_scopes: false,
+            verb: "cleanup",
+        },
+    )? {
+        super::reference::ResolvedRef::Job(job) => load_run(paths, job.job.job_id.as_ref())
+            .map_err(|source| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!(
+                        "job {} has no recoverable same-ID run workspace: {source}",
+                        job.job.job_id
+                    ),
+                    &format!("deadreckon show {}", run_prefix(job.job.job_id.as_ref())),
+                ))
+            }),
+        super::reference::ResolvedRef::Run(state)
+        | super::reference::ResolvedRef::PlanChild { state, .. } => Ok(*state),
+        other => Err(super::reference::refusal_for(
+            other.kind(),
+            "cleanup",
+            &super::reference::resolved_id(&other),
+        )),
+    }
 }
 
 #[derive(Debug)]
@@ -1236,20 +1277,64 @@ fn cleanup_worktree_run(
             record.worktree_path.as_ref(),
         )
     {
-        if worktree.exists() {
-            let mut args = vec!["worktree", "remove"];
-            if force {
-                args.push("--force");
+        let was_registered = git_worktree_registered(git_root, worktree)?;
+        if worktree.exists() || was_registered {
+            let result = if worktree.exists() {
+                let mut args = vec!["worktree", "remove"];
+                if force {
+                    args.push("--force");
+                }
+                args.push(path_to_str(worktree)?);
+                git_status(git_root, &args)
+            } else {
+                git_status(git_root, &["worktree", "prune", "--expire", "now"])
+            };
+            if let Err(error) = result {
+                return Err(cleanup_incomplete_error(
+                    state,
+                    record,
+                    reason,
+                    force,
+                    &removed,
+                    &error.to_string(),
+                ));
             }
-            args.push(path_to_str(worktree)?);
-            let _ = git_status(git_root, &args);
+            if worktree.exists() || git_worktree_registered(git_root, worktree)? {
+                return Err(cleanup_incomplete_error(
+                    state,
+                    record,
+                    reason,
+                    force,
+                    &removed,
+                    "Git returned success but the worktree remains registered or present",
+                ));
+            }
             removed.push(worktree.display().to_string());
         }
         if !keep_branch
             && let Some(branch) = record.branch_name.as_deref()
-            && git_stdout(git_root, &["rev-parse", "--verify", branch]).is_ok()
+            && local_branch_exists(git_root, branch)?
         {
-            let _ = git_status(git_root, &["branch", "-D", branch]);
+            if let Err(error) = git_status(git_root, &["branch", "-D", branch]) {
+                return Err(cleanup_incomplete_error(
+                    state,
+                    record,
+                    reason,
+                    force,
+                    &removed,
+                    &error.to_string(),
+                ));
+            }
+            if local_branch_exists(git_root, branch)? {
+                return Err(cleanup_incomplete_error(
+                    state,
+                    record,
+                    reason,
+                    force,
+                    &removed,
+                    "Git returned success but the temporary branch remains",
+                ));
+            }
             removed.push(format!("branch {branch}"));
         }
     }
@@ -1263,6 +1348,83 @@ fn cleanup_worktree_run(
         force,
         reason,
     })
+}
+
+fn git_worktree_registered(git_root: &Path, worktree: &Path) -> Result<bool> {
+    let listing = git_stdout(git_root, &["worktree", "list", "--porcelain"])?;
+    Ok(listing.lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .is_some_and(|path| Path::new(path) == worktree)
+    }))
+}
+
+fn local_branch_exists(git_root: &Path, branch: &str) -> Result<bool> {
+    let reference = format!("refs/heads/{branch}");
+    let output =
+        deadreckon_core::git::run_git(git_root, &["show-ref", "--verify", "--quiet", &reference])?;
+    Ok(output.status.success())
+}
+
+fn cleanup_incomplete_error(
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    reason: CleanupReason,
+    force: bool,
+    removed: &[String],
+    detail: &str,
+) -> CliError {
+    let id = run_prefix(&state.run_id);
+    let mut evidence = vec![
+        ("run".to_string(), id.clone()),
+        ("cleanup".to_string(), "incomplete".to_string()),
+        ("failure".to_string(), one_line(detail, 240)),
+        ("removed entries".to_string(), removed.len().to_string()),
+    ];
+    for (index, item) in removed.iter().enumerate() {
+        evidence.push((format!("removed {}", index + 1), item.clone()));
+    }
+    if let Some(worktree) = record.worktree_path.as_ref()
+        && worktree.exists()
+    {
+        evidence.push((
+            "retained worktree".to_string(),
+            worktree.display().to_string(),
+        ));
+    }
+    if let Some(branch) = record.branch_name.as_ref() {
+        evidence.push(("retained branch".to_string(), branch.clone()));
+    }
+    let what = match reason {
+        CleanupReason::Applied => "DeadReckon applied the run, but cleanup did not complete.",
+        CleanupReason::Abandoned => {
+            "DeadReckon could not finish removing the abandoned run resources."
+        }
+        CleanupReason::Cleaned => {
+            "DeadReckon could not finish removing the selected run resources."
+        }
+    };
+    let why = if force {
+        "Git refused or failed a cleanup operation even with explicit overwrite authority. DeadReckon retained the remaining resources and did not write a completed-cleanup marker."
+    } else {
+        "Git refused or failed a cleanup operation. DeadReckon retained the remaining resources, did not write a completed-cleanup marker, and requires explicit overwrite authority before discarding untracked evidence."
+    };
+    let recommended = if force {
+        format!("deadreckon show {id}")
+    } else {
+        format!("deadreckon cleanup {id} --overwrite")
+    };
+    CliError::Surface {
+        code: 1,
+        surface: VerdictSurface::must_new(
+            VerdictKind::Blocked,
+            reason.subject(),
+            Some(&id),
+            ExplanationPanel::new(what, why, evidence),
+            vec![("Recommended", recommended)],
+            vec![("Secondary", format!("deadreckon show {id}"))],
+        )
+        .render_plain(!completion_hints_enabled(false)),
+    }
 }
 
 fn print_cleanup_results(results: &[CleanupRunResult]) {
