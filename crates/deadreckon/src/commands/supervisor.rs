@@ -4,22 +4,24 @@
 //! to inspect persisted run evidence; it is never accepted as completion.
 
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, JobProjection, JobView, LeaseClaimDisposition, LeaseOwner,
     LeaseReclaimReason, LeaseToken, ProviderFailureDisposition, SupervisedProcess,
-    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_run, pid_is_alive,
-    read_supervised_process, spawn_grouped, validate_acceptance_marker,
-    validate_completion_receipt, write_supervised_process,
+    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease, load_run,
+    pid_is_alive, read_job_history, read_supervised_process, spawn_grouped,
+    validate_acceptance_marker, validate_completion_receipt,
 };
 use deadreckon_protocol::{
-    Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobSchemaVersion, JobShape, RunId,
-    SemanticDecision, SemanticJudgment, StopReason,
+    Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobId, JobSchemaVersion, JobShape,
+    RunId, SemanticDecision, SemanticJudgment, StopReason,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -32,8 +34,14 @@ use super::run::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const LEASE_TTL: Duration = Duration::from_secs(15);
 const CHILD_METADATA_FILE: &str = "supervised-child.json";
+const CHILD_RELEASE_ACK_PREFIX: &str = "supervised-release-";
 const SUPERVISOR_STDOUT_FILE: &str = "supervisor.out";
 const SUPERVISOR_STDERR_FILE: &str = "supervisor.err";
+const GUARDED_LAUNCH_PROTOCOL: &str = "stdin_release_v1";
+const MAX_RELEASE_TOKEN_BYTES: u64 = 512;
+const GUARDED_CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const SUPERVISOR_FAILPOINT_ENABLE_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINTS";
+const SUPERVISOR_FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
 
 /// Keeps fenced ownership alive for the entire claimed operation, including
 /// synchronous source hashing and asynchronous parent verification. Child
@@ -117,6 +125,92 @@ struct LaunchInputs {
     authority: JobAuthority,
 }
 
+#[derive(Debug, Clone)]
+struct PreparedChildLaunch {
+    attempt: u32,
+    launch_id: String,
+    release_token: String,
+    release_token_sha256: String,
+}
+
+impl PreparedChildLaunch {
+    fn new(attempt: u32) -> Self {
+        let launch_id = Uuid::new_v4().to_string();
+        let release_token = format!("{}:{}", launch_id, Uuid::new_v4());
+        let release_token_sha256 = deadreckon_core::flight::sha256_text(&release_token);
+        Self {
+            attempt,
+            launch_id,
+            release_token,
+            release_token_sha256,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SupervisorChildMetadata {
+    #[serde(flatten)]
+    process: SupervisedProcess,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_token_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SupervisorReleaseAck {
+    launch_protocol: String,
+    job_id: String,
+    attempt: u32,
+    launch_id: String,
+    release_token: String,
+    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_identity: Option<String>,
+    acknowledged_at: chrono::DateTime<Utc>,
+}
+
+impl SupervisorChildMetadata {
+    fn legacy(process: SupervisedProcess) -> Self {
+        Self {
+            process,
+            launch_id: None,
+            attempt: None,
+            release_token_sha256: None,
+            boot_id: None,
+            process_start_identity: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GuardedChild {
+    child: Child,
+    release: Option<ChildStdin>,
+    metadata: SupervisorChildMetadata,
+    release_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardedLaunchRecovery {
+    attempt: u32,
+    launch_id: String,
+    release_token_sha256: String,
+    attempt_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlinkedLaunchDisposition {
+    Relaunch,
+    RecheckAcknowledgement,
+}
+
 #[derive(Debug)]
 enum MonitoredChild {
     Owned(Child),
@@ -178,6 +272,151 @@ pub(crate) async fn supervisor_serve_command(
         }
         tokio::time::sleep(HEARTBEAT_INTERVAL).await;
     }
+}
+
+pub(crate) fn supervisor_launch_command(
+    job_id: &str,
+    attempt: u32,
+    launch_id: String,
+    release_token_sha256: &str,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let job = deadreckon_core::load_job(&paths, job_id)?;
+    if job.job_id.as_ref() != job_id
+        || attempt == 0
+        || attempt > job.policy.max_attempts.max(1)
+        || Uuid::parse_str(&launch_id).is_err()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guarded launch does not match an approved job attempt".to_string(),
+        )));
+    }
+
+    let mut release_bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_RELEASE_TOKEN_BYTES + 1)
+        .read_to_end(&mut release_bytes)?;
+    if release_bytes.len() as u64 > MAX_RELEASE_TOKEN_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guarded launch release token exceeded its bounded size".to_string(),
+        )));
+    }
+    let release_token = std::str::from_utf8(&release_bytes)
+        .map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "guarded launch release token was not UTF-8".to_string(),
+            ))
+        })?
+        .trim();
+    if release_token.is_empty()
+        || deadreckon_core::flight::sha256_text(release_token) != release_token_sha256
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guarded launch release token did not match the prepared launch".to_string(),
+        )));
+    }
+
+    let process_start = process_start_identity(std::process::id());
+    if !launcher_link_is_durable(
+        &paths,
+        job_id,
+        attempt,
+        &launch_id,
+        release_token_sha256,
+        std::process::id(),
+        process_start.as_deref(),
+    )? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guarded launch refused because its fenced ChildLinked event is not durable"
+                .to_string(),
+        )));
+    }
+
+    write_release_ack(
+        &paths,
+        &SupervisorReleaseAck {
+            launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+            job_id: job_id.to_string(),
+            attempt,
+            launch_id,
+            release_token: release_token.to_string(),
+            pid: std::process::id(),
+            process_start_identity: process_start,
+            acknowledged_at: Utc::now(),
+        },
+    )?;
+    supervisor_test_failpoint("after_release_ack");
+
+    let launch = load_launch_inputs(&paths, &job)?;
+    let executable = std::env::current_exe()?;
+    let mut command = build_job_driver_command(&paths, &job, &launch, &executable, attempt)?;
+    apply_durable_scope_root(&mut command, &launch.plan);
+    command
+        .current_dir(&job.source_cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "guarded job driver exited with status {status}"
+        ))))
+    }
+}
+
+fn launcher_link_is_durable(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    attempt: u32,
+    launch_id: &str,
+    release_token_sha256: &str,
+    pid: u32,
+    process_start_identity: Option<&str>,
+) -> Result<bool> {
+    let history = read_job_history(&paths.job_events(job_id))?;
+    let current_lease_epoch = load_job_lease(paths, &JobId(job_id.to_string()))?.epoch;
+    let mut prepared = false;
+    for event in history.events() {
+        if event.kind == JobEventKind::ChildLaunchPrepared
+            && launch_detail_matches(&event.detail, attempt, launch_id, release_token_sha256)
+        {
+            prepared = true;
+            continue;
+        }
+        if prepared
+            && event.kind == JobEventKind::ChildLinked
+            && event.lease_epoch == current_lease_epoch
+            && launch_detail_matches(&event.detail, attempt, launch_id, release_token_sha256)
+            && event.detail.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
+            && match process_start_identity {
+                Some(identity) => {
+                    event
+                        .detail
+                        .get("process_start_identity")
+                        .and_then(Value::as_str)
+                        == Some(identity)
+                }
+                None => event.detail.get("process_start_identity").is_none(),
+            }
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn launch_detail_matches(
+    detail: &Value,
+    attempt: u32,
+    launch_id: &str,
+    release_token_sha256: &str,
+) -> bool {
+    detail.get("launch_protocol").and_then(Value::as_str) == Some(GUARDED_LAUNCH_PROTOCOL)
+        && detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
+        && detail.get("launch_id").and_then(Value::as_str) == Some(launch_id)
+        && detail.get("release_token_sha256").and_then(Value::as_str) == Some(release_token_sha256)
 }
 
 fn eligible_job_ids(paths: &DeadreckonPaths) -> Result<Vec<String>> {
@@ -273,20 +512,91 @@ async fn supervise_one_job(
 
     let max_attempts = initial.job.policy.max_attempts.max(1);
     let mut resuming_advanced = false;
-    if let Some(child) = child_metadata(paths, job_id)? {
+    let mut guarded_recovery =
+        match recoverable_unlinked_guarded_launch(paths, job_id, &initial.projection) {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                append_terminal_event(
+                    paths,
+                    &token,
+                    JobEventKind::Blocked,
+                    StopReason::CorruptHistory,
+                    json!({ "reason": error.to_string() }),
+                )?;
+                return Ok(());
+            }
+        };
+    let mut stored_child = match child_metadata(paths, job_id) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            append_terminal_event(
+                paths,
+                &token,
+                JobEventKind::Blocked,
+                StopReason::CorruptHistory,
+                json!({ "reason": error.to_string() }),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Some(recovery) = guarded_recovery.as_ref() {
+        match prepare_unlinked_launch_recovery(paths, job_id, &mut stored_child, recovery) {
+            Ok(UnlinkedLaunchDisposition::Relaunch) => {}
+            Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement) => {
+                match recoverable_unlinked_guarded_launch(paths, job_id, &initial.projection) {
+                    Ok(None) => guarded_recovery = None,
+                    Ok(Some(_)) => {
+                        append_terminal_event(
+                            paths,
+                            &token,
+                            JobEventKind::Blocked,
+                            StopReason::LostContainment,
+                            json!({
+                                "reason": "guarded child acknowledgement disappeared while recovery was reconciling it"
+                            }),
+                        )?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        append_terminal_event(
+                            paths,
+                            &token,
+                            JobEventKind::Blocked,
+                            StopReason::CorruptHistory,
+                            json!({ "reason": error.to_string() }),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) => {
+                append_terminal_event(
+                    paths,
+                    &token,
+                    JobEventKind::Blocked,
+                    StopReason::LostContainment,
+                    json!({ "reason": error.to_string() }),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+    if let Some(child) = stored_child {
         // A PID observed after a reboot may belong to an unrelated process.
         // Boot identity is stronger evidence than PID reuse, so never adopt it.
-        if !reboot_reclaim && pid_is_alive(child.pid) {
+        if !reboot_reclaim && child_identity_is_current(&child) {
             append_control_event(
                 paths,
                 &token,
                 JobEventKind::ChildLinked,
-                format!("adopt-child:{}:{}", token.epoch, child.pid),
-                child_link_detail(&initial.job, child, true, None),
+                format!("adopt-child:{}:{}", token.epoch, child.process.pid),
+                child_link_detail(&initial.job, &child, true, None),
             )?;
-            let exit = monitor_child(paths, &token, MonitoredChild::Adopted(child.pid)).await?;
+            let launch_id = child.launch_id.clone();
+            let exit =
+                monitor_child(paths, &token, MonitoredChild::Adopted(child.process.pid)).await?;
             let attempt = initial.projection.attempt_count.max(1);
-            let _ = fs::remove_file(child_metadata_path(paths, job_id));
+            remove_child_control_files(paths, job_id, launch_id.as_deref())?;
             if initial.job.shape == JobShape::Single
                 && maybe_schedule_leaf_retry(
                     paths,
@@ -314,7 +624,7 @@ async fn supervise_one_job(
             && initial.projection.attempt_count < max_attempts
         {
             schedule_advanced_recovery(paths, &token, initial.projection.attempt_count)?;
-            let _ = fs::remove_file(child_metadata_path(paths, job_id));
+            remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
             resuming_advanced = true;
         } else if !resuming_advanced
             && initial.job.shape == JobShape::Single
@@ -330,9 +640,10 @@ async fn supervise_one_job(
                 max_attempts,
             )?
         {
-            let _ = fs::remove_file(child_metadata_path(paths, job_id));
+            remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
             resuming_advanced = true;
         } else if !resuming_advanced {
+            remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
             return classify_job_attempt(
                 paths,
                 &initial.job,
@@ -371,6 +682,7 @@ async fn supervise_one_job(
     // prove the old process group is dead, so fail closed instead of duplicating
     // mutating work. P7 closes the smaller spawn-before-sidecar window.
     if initial.projection.attempt_count > 0
+        && guarded_recovery.is_none()
         && !resuming_advanced
         && reboot_reclaim
         && initial.job.shape == JobShape::Single
@@ -389,6 +701,7 @@ async fn supervise_one_job(
         resuming_advanced = true;
     }
     if initial.projection.attempt_count > 0
+        && guarded_recovery.is_none()
         && !resuming_advanced
         && advanced_artifact_recoverable(paths, &initial.job)
         && initial.projection.attempt_count < max_attempts
@@ -396,7 +709,7 @@ async fn supervise_one_job(
         schedule_advanced_recovery(paths, &token, initial.projection.attempt_count)?;
         resuming_advanced = true;
     }
-    if initial.projection.attempt_count > 0 && !resuming_advanced {
+    if initial.projection.attempt_count > 0 && guarded_recovery.is_none() && !resuming_advanced {
         append_attempt_stopped(
             paths,
             &token,
@@ -413,7 +726,7 @@ async fn supervise_one_job(
         return Ok(());
     }
 
-    let launch = match load_launch_inputs(paths, &initial.job) {
+    let _launch = match load_launch_inputs(paths, &initial.job) {
         Ok(launch) => launch,
         Err(error) => {
             append_terminal_event(
@@ -426,27 +739,79 @@ async fn supervise_one_job(
             return Ok(());
         }
     };
-    let first_attempt = initial.projection.attempt_count.saturating_add(1);
+    let first_attempt = guarded_recovery.as_ref().map_or_else(
+        || initial.projection.attempt_count.saturating_add(1),
+        |recovery| recovery.attempt,
+    );
     for attempt in first_attempt..=max_attempts {
+        let attempt_already_started = guarded_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.attempt == attempt && recovery.attempt_started);
+        let prepared = PreparedChildLaunch::new(attempt);
         append_control_event(
             paths,
             &token,
-            JobEventKind::AttemptStarted,
-            format!("attempt-started:{}:{attempt}", token.epoch),
-            attempt_detail(&initial.job, attempt),
+            JobEventKind::ChildLaunchPrepared,
+            format!(
+                "child-launch-prepared:{}:{}",
+                token.epoch, prepared.launch_id
+            ),
+            child_launch_prepared_detail(&initial.job, &prepared),
         )?;
+        supervisor_test_failpoint("after_launch_prepared");
+        if !attempt_already_started {
+            append_control_event(
+                paths,
+                &token,
+                JobEventKind::AttemptStarted,
+                format!("attempt-started:{}:{attempt}", token.epoch),
+                attempt_detail(&initial.job, attempt),
+            )?;
+            supervisor_test_failpoint("after_attempt_started");
+        }
+        guarded_recovery = None;
 
-        match spawn_job_driver(paths, &initial.job, &launch, &instance.executable, attempt) {
-            Ok((child, metadata)) => {
+        match spawn_job_driver(paths, &initial.job, &instance.executable, &prepared) {
+            Ok(mut guarded) => {
                 append_control_event(
                     paths,
                     &token,
                     JobEventKind::ChildLinked,
                     format!("child-linked:{}:{attempt}", token.epoch),
-                    child_link_detail(&initial.job, metadata, false, Some(attempt)),
+                    child_link_detail(&initial.job, &guarded.metadata, false, Some(attempt)),
                 )?;
-                let exit = monitor_child(paths, &token, MonitoredChild::Owned(child)).await?;
-                let _ = fs::remove_file(child_metadata_path(paths, job_id));
+                supervisor_test_failpoint("after_child_linked");
+                let release_error = release_guarded_child(&mut guarded).err();
+                if release_error.is_none() {
+                    supervisor_test_failpoint("after_child_released");
+                }
+                let launch_id = guarded.metadata.launch_id.clone();
+                let exit =
+                    monitor_child(paths, &token, MonitoredChild::Owned(guarded.child)).await?;
+                remove_child_control_files(paths, job_id, launch_id.as_deref())?;
+                if let Some(error) = release_error {
+                    append_attempt_stopped(
+                        paths,
+                        &token,
+                        StopReason::LostContainment,
+                        json!({
+                            "attempt": attempt,
+                            "reason": "guarded child release failed",
+                            "error": error.to_string(),
+                            "exit": exit_detail(&exit),
+                        }),
+                    )?;
+                    append_terminal_event(
+                        paths,
+                        &token,
+                        JobEventKind::Blocked,
+                        StopReason::LostContainment,
+                        json!({
+                            "reason": "cannot prove whether the guarded child received its release token"
+                        }),
+                    )?;
+                    return Ok(());
+                }
                 if initial.job.shape == JobShape::Single
                     && maybe_schedule_leaf_retry(
                         paths,
@@ -731,10 +1096,9 @@ fn current_source_revision(cwd: &Path) -> Option<String> {
 fn spawn_job_driver(
     paths: &DeadreckonPaths,
     job: &Job,
-    launch: &LaunchInputs,
     executable: &Path,
-    attempt: u32,
-) -> Result<(Child, SupervisedProcess)> {
+    prepared: &PreparedChildLaunch,
+) -> Result<GuardedChild> {
     let job_dir = paths.job_dir(job.job_id.as_ref());
     fs::create_dir_all(&job_dir)?;
     let stdout = OpenOptions::new()
@@ -745,7 +1109,65 @@ fn spawn_job_driver(
         .create(true)
         .append(true)
         .open(job_dir.join(SUPERVISOR_STDERR_FILE))?;
-    let mut command = match job.shape {
+    let mut command = Command::new(executable);
+    command
+        .arg("supervisor")
+        .arg("launch")
+        .arg(job.job_id.as_ref())
+        .arg(prepared.attempt.to_string())
+        .arg(&prepared.launch_id)
+        .arg(&prepared.release_token_sha256)
+        .env("DEADRECKON_HOME", paths.home())
+        .current_dir(&job.source_cwd)
+        .stdin(Stdio::piped())
+        .stdout(stdout)
+        .stderr(stderr);
+    let (mut child, terminator) = spawn_grouped(command)?;
+    supervisor_test_failpoint("after_guarded_spawn");
+    let Some(release) = child.stdin.take() else {
+        let _ = terminator.terminate(Duration::from_secs(2));
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guarded launcher did not expose its release pipe".to_string(),
+        )));
+    };
+    let process = SupervisedProcess {
+        pid: child.id(),
+        #[cfg(unix)]
+        pgid: Some(child.id()),
+        #[cfg(not(unix))]
+        pgid: None,
+    };
+    let metadata = SupervisorChildMetadata {
+        process,
+        launch_id: Some(prepared.launch_id.clone()),
+        attempt: Some(prepared.attempt),
+        release_token_sha256: Some(prepared.release_token_sha256.clone()),
+        boot_id: Some(boot_identity()),
+        process_start_identity: process_start_identity(child.id()),
+    };
+    let metadata_path = child_metadata_path(paths, job.job_id.as_ref());
+    if let Err(error) = write_child_metadata(&metadata_path, &metadata) {
+        drop(release);
+        let _ = terminator.terminate(Duration::from_secs(2));
+        return Err(error);
+    }
+    supervisor_test_failpoint("after_child_metadata");
+    Ok(GuardedChild {
+        child,
+        release: Some(release),
+        metadata,
+        release_token: prepared.release_token.clone(),
+    })
+}
+
+fn build_job_driver_command(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    launch: &LaunchInputs,
+    executable: &Path,
+    attempt: u32,
+) -> Result<Command> {
+    let command = match job.shape {
         JobShape::Single if attempt == 1 => build_leaf_command(paths, job, launch, executable),
         JobShape::Single => build_leaf_resume_command(paths, job, executable),
         JobShape::Graph | JobShape::LegacyCampaign => {
@@ -757,26 +1179,19 @@ fn spawn_job_driver(
             )));
         }
     };
-    apply_durable_scope_root(&mut command, &launch.plan);
-    command
-        .current_dir(&job.source_cwd)
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
-    let (child, terminator) = spawn_grouped(command)?;
-    let metadata = SupervisedProcess {
-        pid: child.id(),
-        #[cfg(unix)]
-        pgid: Some(child.id()),
-        #[cfg(not(unix))]
-        pgid: None,
+    Ok(command)
+}
+
+fn release_guarded_child(child: &mut GuardedChild) -> std::io::Result<()> {
+    let Some(mut release) = child.release.take() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "guarded child was already released",
+        ));
     };
-    let metadata_path = child_metadata_path(paths, job.job_id.as_ref());
-    if let Err(error) = write_supervised_process(&metadata_path, metadata) {
-        let _ = terminator.terminate(Duration::from_secs(2));
-        return Err(error.into());
-    }
-    Ok((child, metadata))
+    release.write_all(child.release_token.as_bytes())?;
+    release.write_all(b"\n")?;
+    release.flush()
 }
 
 fn apply_durable_scope_root(command: &mut Command, plan: &LaunchPlan) {
@@ -828,18 +1243,51 @@ fn attempt_detail(job: &Job, attempt: u32) -> Value {
     }
 }
 
+fn child_launch_prepared_detail(job: &Job, prepared: &PreparedChildLaunch) -> Value {
+    let mut detail = attempt_detail(job, prepared.attempt)
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    detail.insert(
+        "launch_protocol".to_string(),
+        json!(GUARDED_LAUNCH_PROTOCOL),
+    );
+    detail.insert("launch_id".to_string(), json!(prepared.launch_id));
+    detail.insert(
+        "release_token_sha256".to_string(),
+        json!(prepared.release_token_sha256),
+    );
+    Value::Object(detail)
+}
+
 fn child_link_detail(
     job: &Job,
-    metadata: SupervisedProcess,
+    metadata: &SupervisorChildMetadata,
     adopted: bool,
     attempt: Option<u32>,
 ) -> Value {
     let mut detail = serde_json::Map::new();
     detail.insert("adopted".to_string(), Value::Bool(adopted));
-    detail.insert("pid".to_string(), json!(metadata.pid));
-    detail.insert("process_group".to_string(), json!(metadata.pgid));
-    if let Some(attempt) = attempt {
+    detail.insert("pid".to_string(), json!(metadata.process.pid));
+    detail.insert("process_group".to_string(), json!(metadata.process.pgid));
+    if let Some(attempt) = attempt.or(metadata.attempt) {
         detail.insert("attempt".to_string(), json!(attempt));
+    }
+    if let Some(launch_id) = metadata.launch_id.as_deref() {
+        detail.insert(
+            "launch_protocol".to_string(),
+            json!(GUARDED_LAUNCH_PROTOCOL),
+        );
+        detail.insert("launch_id".to_string(), json!(launch_id));
+    }
+    if let Some(digest) = metadata.release_token_sha256.as_deref() {
+        detail.insert("release_token_sha256".to_string(), json!(digest));
+    }
+    if let Some(boot_id) = metadata.boot_id.as_deref() {
+        detail.insert("boot_id".to_string(), json!(boot_id));
+    }
+    if let Some(identity) = metadata.process_start_identity.as_deref() {
+        detail.insert("process_start_identity".to_string(), json!(identity));
     }
     if job.shape == JobShape::Single {
         detail.insert("run_id".to_string(), json!(job.job_id.as_ref()));
@@ -978,14 +1426,321 @@ fn child_metadata_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
     paths.job_dir(job_id).join(CHILD_METADATA_FILE)
 }
 
-fn child_metadata(paths: &DeadreckonPaths, job_id: &str) -> Result<Option<SupervisedProcess>> {
-    let path = child_metadata_path(paths, job_id);
-    let metadata = match read_supervised_process(&path) {
-        Ok(metadata) => metadata,
+fn write_child_metadata(path: &Path, metadata: &SupervisorChildMetadata) -> Result<()> {
+    write_synced_json(path, metadata)
+}
+
+fn child_release_ack_path(paths: &DeadreckonPaths, job_id: &str, launch_id: &str) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(format!("{CHILD_RELEASE_ACK_PREFIX}{launch_id}.json"))
+}
+
+fn remove_child_control_files(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    launch_id: Option<&str>,
+) -> Result<()> {
+    remove_control_file_if_present(&child_metadata_path(paths, job_id))?;
+    if let Some(launch_id) = launch_id {
+        remove_control_file_if_present(&child_release_ack_path(paths, job_id, launch_id))?;
+    }
+    Ok(())
+}
+
+fn remove_control_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(source.into()),
+    }
+}
+
+fn write_release_ack(paths: &DeadreckonPaths, ack: &SupervisorReleaseAck) -> Result<()> {
+    write_synced_json(
+        &child_release_ack_path(paths, &ack.job_id, &ack.launch_id),
+        ack,
+    )
+}
+
+fn release_ack(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    launch_id: &str,
+) -> Result<Option<SupervisorReleaseAck>> {
+    let path = child_release_ack_path(paths, job_id, launch_id);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(source.into()),
     };
-    Ok(Some(metadata))
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|source| CliError::Core(DeadreckonError::Json { path, source }))
+}
+
+fn write_synced_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "supervisor control path has no parent: {}",
+            path.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("supervisor-control");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let write_result = (|| -> Result<()> {
+        let mut encoded = serde_json::to_vec(value).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
+        encoded.push(b'\n');
+        let mut temp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        temp.write_all(&encoded)?;
+        temp.sync_all()?;
+        fs::rename(&temp_path, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+fn child_metadata(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Option<SupervisorChildMetadata>> {
+    let path = child_metadata_path(paths, job_id);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(source.into()),
+    };
+    let trimmed = raw.strip_suffix(b"\n").unwrap_or(raw.as_slice());
+    if trimmed.starts_with(b"{") {
+        let metadata = serde_json::from_slice(trimmed).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        return Ok(Some(metadata));
+    }
+    let process = read_supervised_process(&path)?;
+    Ok(Some(SupervisorChildMetadata::legacy(process)))
+}
+
+fn child_identity_is_current(metadata: &SupervisorChildMetadata) -> bool {
+    if !pid_is_alive(metadata.process.pid)
+        || metadata.boot_id.as_deref() != Some(boot_identity().as_str())
+    {
+        return false;
+    }
+    let Some(expected) = metadata.process_start_identity.as_deref() else {
+        return false;
+    };
+    process_start_identity(metadata.process.pid).as_deref() == Some(expected)
+}
+
+fn child_process_may_still_be_live(metadata: &SupervisorChildMetadata) -> bool {
+    if !pid_is_alive(metadata.process.pid)
+        || metadata.boot_id.as_deref() != Some(boot_identity().as_str())
+    {
+        return false;
+    }
+    match metadata.process_start_identity.as_deref() {
+        Some(expected) => process_start_identity(metadata.process.pid)
+            .as_deref()
+            .is_none_or(|observed| observed == expected),
+        None => true,
+    }
+}
+
+fn recoverable_unlinked_guarded_launch(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    projection: &JobProjection,
+) -> Result<Option<GuardedLaunchRecovery>> {
+    let history = read_job_history(&paths.job_events(job_id))?;
+    for (index, prepared_event) in history.events().iter().enumerate().rev() {
+        if prepared_event.kind != JobEventKind::ChildLaunchPrepared {
+            continue;
+        }
+        let attempt = prepared_event
+            .detail
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "ChildLaunchPrepared event is missing a valid attempt".to_string(),
+                ))
+            })?;
+        let launch_id = prepared_event
+            .detail
+            .get("launch_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "ChildLaunchPrepared event is missing its launch id".to_string(),
+                ))
+            })?;
+        let release_token_sha256 = prepared_event
+            .detail
+            .get("release_token_sha256")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "ChildLaunchPrepared event is missing its release-token digest".to_string(),
+                ))
+            })?;
+        if prepared_event
+            .detail
+            .get("launch_protocol")
+            .and_then(Value::as_str)
+            != Some(GUARDED_LAUNCH_PROTOCOL)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "ChildLaunchPrepared event names an unsupported launch protocol".to_string(),
+            )));
+        }
+
+        let attempt_started = history.events().iter().any(|event| {
+            event.kind == JobEventKind::AttemptStarted
+                && event.detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
+        });
+        let expected_attempt = if attempt_started {
+            projection.attempt_count
+        } else {
+            projection.attempt_count.saturating_add(1)
+        };
+        if attempt != expected_attempt {
+            continue;
+        }
+
+        if let Some(ack) = release_ack(paths, job_id, launch_id)? {
+            let linked = history.events()[index + 1..].iter().any(|event| {
+                event.kind == JobEventKind::ChildLinked
+                    && launch_detail_matches(
+                        &event.detail,
+                        attempt,
+                        launch_id,
+                        release_token_sha256,
+                    )
+                    && event.detail.get("pid").and_then(Value::as_u64) == Some(u64::from(ack.pid))
+                    && match ack.process_start_identity.as_deref() {
+                        Some(identity) => {
+                            event
+                                .detail
+                                .get("process_start_identity")
+                                .and_then(Value::as_str)
+                                == Some(identity)
+                        }
+                        None => event.detail.get("process_start_identity").is_none(),
+                    }
+            });
+            let valid_ack = ack.launch_protocol == GUARDED_LAUNCH_PROTOCOL
+                && ack.job_id == job_id
+                && ack.attempt == attempt
+                && ack.launch_id == launch_id
+                && deadreckon_core::flight::sha256_text(&ack.release_token) == release_token_sha256
+                && linked;
+            if !valid_ack {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "guarded launch release acknowledgement failed validation".to_string(),
+                )));
+            }
+            return Ok(None);
+        }
+
+        let invalidated = history.events()[index + 1..].iter().any(|event| {
+            matches!(
+                event.kind,
+                JobEventKind::AttemptStopped
+                    | JobEventKind::RetryScheduled
+                    | JobEventKind::NeedsReview
+                    | JobEventKind::Blocked
+                    | JobEventKind::BudgetExhausted
+                    | JobEventKind::DeadlineReached
+                    | JobEventKind::Cancelled
+                    | JobEventKind::Failed
+                    | JobEventKind::Verified
+            )
+        });
+        if invalidated {
+            return Ok(None);
+        }
+        return Ok(Some(GuardedLaunchRecovery {
+            attempt,
+            launch_id: launch_id.to_string(),
+            release_token_sha256: release_token_sha256.to_string(),
+            attempt_started,
+        }));
+    }
+    Ok(None)
+}
+
+fn prepare_unlinked_launch_recovery(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    metadata: &mut Option<SupervisorChildMetadata>,
+    recovery: &GuardedLaunchRecovery,
+) -> Result<UnlinkedLaunchDisposition> {
+    let Some(child) = metadata.as_ref() else {
+        return Ok(UnlinkedLaunchDisposition::Relaunch);
+    };
+    let matches_prepared = child.launch_id.as_deref() == Some(recovery.launch_id.as_str())
+        && child.attempt == Some(recovery.attempt)
+        && child.release_token_sha256.as_deref() == Some(recovery.release_token_sha256.as_str());
+    if !matches_prepared && child_process_may_still_be_live(child) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "unlinked guarded launch conflicts with a different live supervised process"
+                .to_string(),
+        )));
+    }
+    if matches_prepared {
+        let acknowledgement = child_release_ack_path(paths, job_id, recovery.launch_id.as_str());
+        let deadline = Instant::now() + GUARDED_CHILD_SETTLE_TIMEOUT;
+        loop {
+            if acknowledgement.is_file() {
+                return Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement);
+            }
+            if !child_process_may_still_be_live(child) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "linked guarded child remained alive without a durable release acknowledgement"
+                        .to_string(),
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if acknowledgement.is_file() {
+            return Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement);
+        }
+    }
+    let path = child_metadata_path(paths, job_id);
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(source.into()),
+    }
+    *metadata = None;
+    Ok(UnlinkedLaunchDisposition::Relaunch)
 }
 
 async fn monitor_child(
@@ -2090,6 +2845,14 @@ fn live_lease_refusal(error: &CliError) -> bool {
     error.to_string().contains("live lease held by owner")
 }
 
+fn supervisor_test_failpoint(name: &str) {
+    if std::env::var(SUPERVISOR_FAILPOINT_ENABLE_ENV).as_deref() == Ok("1")
+        && std::env::var(SUPERVISOR_FAILPOINT_ENV).as_deref() == Ok(name)
+    {
+        std::process::exit(86);
+    }
+}
+
 fn boot_identity() -> String {
     if let Some(value) = std::env::var_os("DEADRECKON_BOOT_ID")
         && !value.is_empty()
@@ -2119,6 +2882,50 @@ fn boot_identity() -> String {
     // like a reboot and could reclaim a live lease; stable unknown instead
     // waits for normal expiry and fails safely.
     "unknown-boot".to_string()
+}
+
+fn process_start_identity(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let command_end = raw.rfind(')')?;
+        let fields = raw[command_end + 1..]
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        // `/proc/<pid>/stat` field 22 is process start ticks. The slice starts
+        // at field 3 (`state`), so index 19 is the stable same-boot identity.
+        return fields.get(19).map(|start| format!("linux:{start}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let start = String::from_utf8_lossy(&output.stdout);
+        let start = start.trim();
+        return (!start.is_empty()).then(|| format!("macos:{start}"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script =
+            format!("(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks");
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let start = String::from_utf8_lossy(&output.stdout);
+        let start = start.trim();
+        return (!start.is_empty()).then(|| format!("windows:{start}"));
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 #[cfg(test)]
@@ -3809,6 +4616,396 @@ mod tests {
         assert_eq!(
             view.projection.outcome,
             Some(deadreckon_protocol::JobOutcome::RetryExhausted)
+        );
+    }
+
+    #[test]
+    fn guarded_launcher_requires_its_current_fenced_child_link() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 2);
+        let owner = LeaseOwner {
+            owner_id: "launch-owner".to_string(),
+            boot_id: "launch-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        let claim =
+            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL).expect("claim");
+        let token = claim.token();
+        let prepared = PreparedChildLaunch::new(1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLaunchPrepared,
+            "prepared-launch".to_string(),
+            child_launch_prepared_detail(&job, &prepared),
+        )
+        .expect("prepared");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "started-attempt".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("started");
+        let process_start = process_start_identity(std::process::id());
+
+        assert!(
+            !launcher_link_is_durable(
+                &paths,
+                job.job_id.as_ref(),
+                1,
+                &prepared.launch_id,
+                &prepared.release_token_sha256,
+                std::process::id(),
+                process_start.as_deref(),
+            )
+            .expect("unlinked refusal")
+        );
+
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: std::process::id(),
+                #[cfg(unix)]
+                pgid: Some(std::process::id()),
+                #[cfg(not(unix))]
+                pgid: None,
+            },
+            launch_id: Some(prepared.launch_id.clone()),
+            attempt: Some(1),
+            release_token_sha256: Some(prepared.release_token_sha256.clone()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start.clone(),
+        };
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "linked-launch".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("linked");
+        assert!(
+            launcher_link_is_durable(
+                &paths,
+                job.job_id.as_ref(),
+                1,
+                &prepared.launch_id,
+                &prepared.release_token_sha256,
+                std::process::id(),
+                process_start.as_deref(),
+            )
+            .expect("linked authorization")
+        );
+
+        let replacement = LeaseOwner {
+            owner_id: "replacement".to_string(),
+            boot_id: "replacement-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        claim_job_lease(&paths, &job.job_id, &replacement, Utc::now(), LEASE_TTL)
+            .expect("reclaim by new boot");
+        assert!(
+            !launcher_link_is_durable(
+                &paths,
+                job.job_id.as_ref(),
+                1,
+                &prepared.launch_id,
+                &prepared.release_token_sha256,
+                std::process::id(),
+                process_start.as_deref(),
+            )
+            .expect("stale link refusal")
+        );
+    }
+
+    #[test]
+    fn private_release_ack_is_required_and_bound_to_its_token_preimage() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 2);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let prepared = PreparedChildLaunch::new(1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLaunchPrepared,
+            "prepared-after-test-attempt".to_string(),
+            child_launch_prepared_detail(&job, &prepared),
+        )
+        .expect("prepared");
+        let projection = JobView::load(&paths, job.job_id.as_ref())
+            .expect("view")
+            .projection;
+        let recovery =
+            recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+                .expect("unreleased launch")
+                .expect("recoverable");
+        assert_eq!(recovery.attempt, 1);
+        assert!(recovery.attempt_started);
+
+        let process_start = process_start_identity(std::process::id());
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: std::process::id(),
+                #[cfg(unix)]
+                pgid: Some(std::process::id()),
+                #[cfg(not(unix))]
+                pgid: None,
+            },
+            launch_id: Some(prepared.launch_id.clone()),
+            attempt: Some(1),
+            release_token_sha256: Some(prepared.release_token_sha256.clone()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start.clone(),
+        };
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "linked-for-ack".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("linked");
+
+        write_release_ack(
+            &paths,
+            &SupervisorReleaseAck {
+                launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+                job_id: job.job_id.as_ref().to_string(),
+                attempt: 1,
+                launch_id: prepared.launch_id.clone(),
+                release_token: "forged-visible-digest-preimage".to_string(),
+                pid: std::process::id(),
+                process_start_identity: process_start.clone(),
+                acknowledged_at: Utc::now(),
+            },
+        )
+        .expect("forged ack fixture");
+        let error = recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+            .expect_err("a forged acknowledgement must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledgement failed validation"),
+            "{error}"
+        );
+
+        write_release_ack(
+            &paths,
+            &SupervisorReleaseAck {
+                launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+                job_id: job.job_id.as_ref().to_string(),
+                attempt: 1,
+                launch_id: prepared.launch_id.clone(),
+                release_token: prepared.release_token.clone(),
+                pid: std::process::id(),
+                process_start_identity: process_start,
+                acknowledged_at: Utc::now(),
+            },
+        )
+        .expect("real ack fixture");
+        assert!(
+            recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+                .expect("acknowledged launch")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_waits_for_a_linked_launcher_to_settle_before_relaunching() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 2);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let prepared = PreparedChildLaunch::new(1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLaunchPrepared,
+            "prepared-before-release-race".to_string(),
+            child_launch_prepared_detail(&job, &prepared),
+        )
+        .expect("prepared");
+        let process_start = process_start_identity(std::process::id());
+        let child = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: std::process::id(),
+                #[cfg(unix)]
+                pgid: Some(std::process::id()),
+                #[cfg(not(unix))]
+                pgid: None,
+            },
+            launch_id: Some(prepared.launch_id.clone()),
+            attempt: Some(1),
+            release_token_sha256: Some(prepared.release_token_sha256.clone()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start.clone(),
+        };
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "linked-before-release-race".to_string(),
+            child_link_detail(&job, &child, false, Some(1)),
+        )
+        .expect("linked");
+        let projection = JobView::load(&paths, job.job_id.as_ref())
+            .expect("projection")
+            .projection;
+        let recovery =
+            recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+                .expect("unacknowledged launch")
+                .expect("recoverable launch");
+
+        let ack_paths = paths.clone();
+        let ack_job_id = job.job_id.as_ref().to_string();
+        let ack_launch_id = prepared.launch_id.clone();
+        let ack_token = prepared.release_token.clone();
+        let acknowledgement = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            write_release_ack(
+                &ack_paths,
+                &SupervisorReleaseAck {
+                    launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+                    job_id: ack_job_id,
+                    attempt: 1,
+                    launch_id: ack_launch_id,
+                    release_token: ack_token,
+                    pid: std::process::id(),
+                    process_start_identity: process_start,
+                    acknowledged_at: Utc::now(),
+                },
+            )
+            .expect("release acknowledgement");
+        });
+        let mut stored_child = Some(child);
+        assert_eq!(
+            prepare_unlinked_launch_recovery(
+                &paths,
+                job.job_id.as_ref(),
+                &mut stored_child,
+                &recovery,
+            )
+            .expect("settled launch"),
+            UnlinkedLaunchDisposition::RecheckAcknowledgement
+        );
+        acknowledgement.join().expect("acknowledgement writer");
+        assert!(
+            stored_child.is_some(),
+            "released child must remain adoptable"
+        );
+        assert!(
+            recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+                .expect("validated acknowledgement")
+                .is_none(),
+            "a valid acknowledgement forbids relaunching the logical attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_release_ack_stops_with_an_explicit_corrupt_history_reason() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 2);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let prepared = PreparedChildLaunch::new(1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLaunchPrepared,
+            "prepared-for-forged-ack".to_string(),
+            child_launch_prepared_detail(&job, &prepared),
+        )
+        .expect("prepared");
+        let process_start = process_start_identity(std::process::id());
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: std::process::id(),
+                #[cfg(unix)]
+                pgid: Some(std::process::id()),
+                #[cfg(not(unix))]
+                pgid: None,
+            },
+            launch_id: Some(prepared.launch_id.clone()),
+            attempt: Some(1),
+            release_token_sha256: Some(prepared.release_token_sha256.clone()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start.clone(),
+        };
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "linked-for-forged-ack".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("linked");
+        write_release_ack(
+            &paths,
+            &SupervisorReleaseAck {
+                launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+                job_id: job.job_id.as_ref().to_string(),
+                attempt: 1,
+                launch_id: prepared.launch_id,
+                release_token: "not-the-private-release-token".to_string(),
+                pid: std::process::id(),
+                process_start_identity: process_start,
+                acknowledged_at: Utc::now(),
+            },
+        )
+        .expect("forged acknowledgement fixture");
+
+        let recovering_instance = SupervisorInstance {
+            owner: LeaseOwner {
+                owner_id: "forged-ack-recovery".to_string(),
+                boot_id: "replacement-boot".to_string(),
+                pid: std::process::id(),
+                process_group: std::process::id(),
+            },
+            executable: temp.path().join("must-not-launch"),
+        };
+        supervise_one_job(&paths, &recovering_instance, job.job_id.as_ref())
+            .await
+            .expect("forged acknowledgement is classified");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("blocked view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Blocked)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::CorruptHistory)
+        );
+    }
+
+    #[test]
+    fn child_adoption_requires_boot_and_process_start_identity() {
+        let process_start = process_start_identity(std::process::id());
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: std::process::id(),
+                #[cfg(unix)]
+                pgid: Some(std::process::id()),
+                #[cfg(not(unix))]
+                pgid: None,
+            },
+            launch_id: Some(Uuid::new_v4().to_string()),
+            attempt: Some(1),
+            release_token_sha256: Some("sha256:test".to_string()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start.clone(),
+        };
+        assert_eq!(
+            child_identity_is_current(&metadata),
+            process_start.is_some(),
+            "supported platforms must match the exact current process identity"
+        );
+        let mut reused = metadata;
+        reused.process_start_identity = Some("different-process-start".to_string());
+        assert!(
+            !child_identity_is_current(&reused),
+            "a live reused PID must not be adopted"
         );
     }
 

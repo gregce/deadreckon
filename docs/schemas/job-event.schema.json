@@ -59,6 +59,7 @@
         "queued",
         "lease_acquired",
         "lease_reclaimed",
+        "child_launch_prepared",
         "attempt_started",
         "child_linked",
         "attempt_stopped",
