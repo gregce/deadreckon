@@ -232,6 +232,7 @@ pub enum JobEventKind {
     Queued,
     LeaseAcquired,
     LeaseReclaimed,
+    ChildLaunchPrepared,
     AttemptStarted,
     ChildLinked,
     AttemptStopped,

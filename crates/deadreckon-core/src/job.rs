@@ -493,10 +493,10 @@ fn reduce_event(
     child_ids: &mut BTreeSet<String>,
 ) -> Result<()> {
     use JobEventKind::{
-        AttemptStarted, AttemptStopped, Blocked, CancelRequested, Cancelled, ChildLinked, Created,
-        DeadlineReached, DeterministicGateFailed, DeterministicGatePassed, Failed, LeaseAcquired,
-        LeaseReclaimed, NeedsReview, Queued, RetryScheduled, SemanticJudgeAchieved,
-        SemanticJudgeRevise, SemanticJudgeUncertain, Verified,
+        AttemptStarted, AttemptStopped, Blocked, CancelRequested, Cancelled, ChildLaunchPrepared,
+        ChildLinked, Created, DeadlineReached, DeterministicGateFailed, DeterministicGatePassed,
+        Failed, LeaseAcquired, LeaseReclaimed, NeedsReview, Queued, RetryScheduled,
+        SemanticJudgeAchieved, SemanticJudgeRevise, SemanticJudgeUncertain, Verified,
     };
 
     match event.kind {
@@ -511,6 +511,7 @@ fn reduce_event(
             projection.current_lease_epoch = event.lease_epoch;
             projection.phase = JobPhase::Running;
         }
+        ChildLaunchPrepared => projection.phase = JobPhase::Running,
         AttemptStarted => {
             projection.phase = JobPhase::Running;
             projection.attempt_count = projection.attempt_count.saturating_add(1);
@@ -709,6 +710,27 @@ mod tests {
         let right = reduce_job_history(&first.job_id, &history).expect("projection");
         assert_eq!(left, right);
         assert_eq!(left.last_sequence, 2);
+    }
+
+    #[test]
+    fn child_launch_preparation_does_not_consume_a_logical_attempt() {
+        let events = vec![
+            event(1, "created", JobEventKind::Created),
+            event(2, "prepared", JobEventKind::ChildLaunchPrepared),
+            event(3, "started", JobEventKind::AttemptStarted),
+        ];
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+
+        let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
+        assert_eq!(projection.attempt_count, 1);
+        assert_eq!(projection.phase, deadreckon_protocol::JobPhase::Running);
     }
 
     #[test]

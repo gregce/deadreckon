@@ -726,6 +726,17 @@ async fn main_inner() -> Result<()> {
                 commands::graph_job::drive_job_command(job_id).await
             }
             SupervisorCommand::Resume { job_id } => trusted_supervisor_resume_command(job_id).await,
+            SupervisorCommand::Launch {
+                job_id,
+                attempt,
+                launch_id,
+                release_token_sha256,
+            } => commands::supervisor::supervisor_launch_command(
+                &job_id,
+                attempt,
+                launch_id,
+                &release_token_sha256,
+            ),
             SupervisorCommand::Install => {
                 commands::supervisor_service::supervisor_service_install_command()
             }

@@ -2623,6 +2623,17 @@ pub(crate) enum SupervisorCommand {
         #[arg(value_name = "JOB_ID")]
         job_id: String,
     },
+    #[command(hide = true)]
+    Launch {
+        #[arg(value_name = "JOB_ID")]
+        job_id: String,
+        #[arg(value_name = "ATTEMPT")]
+        attempt: u32,
+        #[arg(value_name = "LAUNCH_ID")]
+        launch_id: String,
+        #[arg(value_name = "RELEASE_TOKEN_SHA256")]
+        release_token_sha256: String,
+    },
     #[command(about = "Install or update the per-user supervisor service")]
     Install,
     #[command(about = "Enable and start the installed per-user supervisor service")]
