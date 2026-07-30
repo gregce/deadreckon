@@ -32,12 +32,13 @@ build release:
 
 test:
 	cd $(ROOT) && cargo test --workspace
+	cd $(ROOT) && cargo test -p deadreckon --features internal-characterization --test chain --test orchestrate
 
 test-agentic:
 	cd $(ROOT) && cargo test -p deadreckon --test agentic_loop
 
 test-chain:
-	cd $(ROOT) && cargo test -p deadreckon --test chain
+	cd $(ROOT) && cargo test -p deadreckon --features internal-characterization --test chain
 
 test-codebase:
 	cd $(ROOT) && cargo test -p deadreckon --test codebase

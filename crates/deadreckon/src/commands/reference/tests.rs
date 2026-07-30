@@ -117,6 +117,7 @@ impl Fixture {
             sub_goals: Vec::new(),
             tree_budget_usd: None,
             tree_wall_seconds: None,
+            root_planner_accounting: None,
             status: CampaignStatus::Pending,
             merged_run_id: None,
             created_at: Utc::now(),

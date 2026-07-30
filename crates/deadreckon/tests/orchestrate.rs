@@ -26,11 +26,11 @@ use common::{assert_success, deadreckon as deadreckon_binary, repo_tempdir, stde
 
 /// This suite characterizes the inner Plan conductor and merge machinery.
 /// Public `fork` and `orchestrate` now queue durable Jobs; debug test binaries
-/// retain this explicit route so the inner executor can still be exercised
+/// retain this separate route so the inner executor can still be exercised
 /// without turning every conductor assertion into a supervisor integration.
 fn deadreckon(paths: &DeadreckonPaths) -> Command {
-    let mut command = deadreckon_binary(paths);
-    command.env("DEADRECKON_TEST_FOREGROUND_ADVANCED", "1");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"));
+    command.env("DEADRECKON_HOME", paths.home());
     command
 }
 

@@ -139,6 +139,7 @@ jobs:
           # script): no release ships on a suite that never ran.
           cargo fmt --check
           cargo test --workspace --locked --no-fail-fast
+          cargo test --release -p deadreckon --features internal-characterization --test chain --test orchestrate --locked
           cargo build --release --workspace --locked
 
   build-local-artifacts:

@@ -677,6 +677,25 @@ pub(crate) fn plan_event_summary(event: &PlanEventKind) -> String {
         } => {
             format!("{task_id} failed: {reason}")
         }
+        PlanEventKind::TaskBudgetExhausted {
+            task_id,
+            dimension,
+            reason,
+            ..
+        } => {
+            let dimension = match dimension {
+                deadreckon_core::plan::BudgetDimension::Spend => "spend",
+                deadreckon_core::plan::BudgetDimension::Wall => "wall time",
+            };
+            format!("{task_id} {dimension} budget exhausted: {reason}")
+        }
+        PlanEventKind::RootBudgetExhausted { dimension, reason } => {
+            let dimension = match dimension {
+                deadreckon_core::plan::BudgetDimension::Spend => "spend",
+                deadreckon_core::plan::BudgetDimension::Wall => "wall time",
+            };
+            format!("root planner {dimension} budget exhausted: {reason}")
+        }
         PlanEventKind::TaskKilled {
             task_id, run_id, ..
         } => {

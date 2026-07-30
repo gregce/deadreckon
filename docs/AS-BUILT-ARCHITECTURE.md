@@ -4056,20 +4056,36 @@ deterministic marker, semantic judgment, and final receipt.
 The recovery policy is intentionally fail-closed:
 
 - a same-boot replacement can retain a child only when the persisted process
-  metadata still identifies a live process;
+  metadata still identifies a live process with the same boot and process-start
+  identity;
 - expired or changed-boot leases get a higher epoch;
 - a Single Job can resume its exact persisted run under the frozen attempt,
   spend and wall-time policy;
-- a Graph resume keeps the same pending or forked plan ID;
+- a Graph resume keeps the same pending or forked plan ID, and can reconstruct
+  a missing root `driver.json` from the exact same-ID Plan without replanning;
 - a Campaign resume keeps the same parent campaign ID and reconciles an exactly
-  linked persisted sub-plan before it launches the next sub-plan;
+  linked persisted sub-plan before it launches the next sub-plan; Campaign
+  child Plan IDs are reserved before spawn and retained across every covered
+  launch crash window;
+- guarded launch persists the intended attempt before spawn and releases the
+  child only after exact linkage, so a pre-release crash can relaunch the same
+  logical attempt while a post-release crash must adopt the bound identity or
+  fail closed;
+- root planner spend and wall time are embedded before child work, restored
+  after mapping-creation crashes, subtracted from the Job policy, and divided
+  across Plan tasks or Campaign sub-plans rather than granting every child the
+  whole parent cap;
+- persisted Graph or Campaign budget evidence remains terminal across crashes
+  after child metadata removal and between `attempt_stopped` and the final Job
+  event; cancellation still wins if it races budget finalization;
 - spawn failures consume the bounded attempt policy;
 - missing identity or containment evidence stops with a typed reason instead
   of guessing.
 
-This slice does not prove crash-before-link exactly-once execution, safe
-process identity across a real machine reboot, or exact graph-node process
-adoption. Those remain acceptance and implementation gaps.
+Hermetic tests cover the guarded launch boundaries, same-ID root repair,
+Campaign sub-plan reservation, boot/PID reuse refusal, and typed restart
+classification. They do not prove recovery through a real machine reboot or
+an active launchd/systemd restart; those remain operator acceptance gaps.
 
 ### 58.5 Deterministic gate and protected boundary
 
@@ -4185,9 +4201,11 @@ lease fencing/reclaim, process-group survival, frozen approval inputs, HMAC
 markers, boundary denials, hostile marker search/forgery, semantic read-only
 posture and decisions, receipt tamper refusal, detached-parent survival, typed
 spawn failure, the shared Job resolver, guided Graph and Campaign identity,
-persisted Campaign sub-plan recovery, worst-of roll-up refusal, parent receipt
-crash recovery, service rendering, fault boundaries, and promotion
-enforcement.
+same-ID root mapping repair, guarded launch recovery, persisted Campaign
+sub-plan recovery and reserved identities, aggregate root-planner spend/wall
+enforcement, terminal budget recovery after sidecar loss, cancellation races,
+worst-of roll-up refusal, parent receipt crash recovery, service rendering,
+fault boundaries, and promotion enforcement.
 
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
@@ -4207,4 +4225,4 @@ open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper recovery hardening (§58: crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

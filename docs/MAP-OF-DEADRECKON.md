@@ -1,7 +1,7 @@
 # Map of DeadReckon
 
-Status: repository analysis updated 2026-07-29 through the Watchkeeper
-convergence and credential-free adversarial trials.
+Status: repository analysis updated 2026-07-30 through the Watchkeeper
+recovery/budget hardening and credential-free adversarial trials.
 
 ## Executive map
 
@@ -245,9 +245,15 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   modes, explicit in-place/uncontained execution, previews, and chain
   extension remain process-owned and need preservation or intentional
   retirement.
-- **Crash-window closure**: child adoption is implemented when exact child
-  metadata is durable, but a crash between launch and linkage is classified as
-  lost containment instead of guessed at or silently retried.
+- **Crash-window closure**: guarded launch records the intended attempt before
+  spawn and releases it only after exact linkage. Pre-release crashes relaunch
+  the same attempt; post-release recovery requires matching boot and
+  process-start identity or fails closed. Same-ID root mappings and reserved
+  Campaign sub-plan IDs are recoverable without replanning.
+- **Aggregate advanced budgets**: root planner spend/wall usage is embedded
+  before child work, restored after mapping crashes, subtracted from the Job
+  policy and divided across children. Typed Graph/Campaign budget exhaustion
+  remains terminal after sidecar loss or a supervisor restart.
 - **Provider parity**: structured events, context accounting, steering and approvals differ across adapters.
 - **Fault injection and measurement**: the repository has deterministic tests
   for protocol corruption, lease races and reclaim, protected paths, receipt

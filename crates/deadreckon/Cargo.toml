@@ -15,6 +15,29 @@ workspace = true
 [features]
 default = ["selfupdate"]
 selfupdate = ["dep:axoupdater"]
+internal-characterization = []
+
+[[bin]]
+name = "deadreckon"
+path = "src/main.rs"
+
+[[bin]]
+name = "deadreckon-characterization"
+path = "src/main.rs"
+required-features = ["internal-characterization"]
+test = false
+bench = false
+doc = false
+
+[[test]]
+name = "chain"
+path = "tests/chain.rs"
+required-features = ["internal-characterization"]
+
+[[test]]
+name = "orchestrate"
+path = "tests/orchestrate.rs"
+required-features = ["internal-characterization"]
 
 [dependencies]
 axoupdater = { workspace = true, optional = true }

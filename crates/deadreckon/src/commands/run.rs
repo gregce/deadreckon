@@ -58,6 +58,10 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
 /// Direct `deadreckon run`: a trivial operator plan records the decision so
 /// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
+    if let Some(run_id) = args.run_id.as_deref() {
+        let paths = DeadreckonPaths::discover();
+        let _authority = commands::supervisor::require_guarded_driver_launch(&paths, run_id)?;
+    }
     let mut plan = if args.run_id.is_some() {
         let path = std::env::var_os(TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV)
             .filter(|value| !value.is_empty())
@@ -85,11 +89,13 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
     // weakening the sandbox requested by the historical Chain artifact.
     let explicitly_uncontained = args.sandbox.as_deref() == Some("none");
     let legacy_chain_foreground = std::env::var_os(LEGACY_CHAIN_FOREGROUND_ENV).is_some();
+    let durable_job_child = commands::graph_job::delegated_plan_child_authorized();
     if args.run_id.is_none()
         && !args.preview
         && !args.in_place
         && !explicitly_uncontained
         && !legacy_chain_foreground
+        && !durable_job_child
     {
         return schedule_direct_run(args, &mut plan).await;
     }

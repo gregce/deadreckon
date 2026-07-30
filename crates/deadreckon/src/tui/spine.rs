@@ -952,6 +952,8 @@ fn newest_plan_failure(events: &[PlanEvent]) -> Option<String> {
         deadreckon_core::PlanEventKind::PlanFailed { reason }
         | deadreckon_core::PlanEventKind::TaskFailed { reason, .. }
         | deadreckon_core::PlanEventKind::TaskBlocked { reason, .. }
+        | deadreckon_core::PlanEventKind::TaskBudgetExhausted { reason, .. }
+        | deadreckon_core::PlanEventKind::RootBudgetExhausted { reason, .. }
         | deadreckon_core::PlanEventKind::MergeRepairFailed { reason } => Some(reason.clone()),
         deadreckon_core::PlanEventKind::CircuitBreakerTripped {
             consecutive_failures,

@@ -15,10 +15,12 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
         source_dir: &source,
         launch_dir: &launch_dir,
         campaign_id: "camp-1",
+        sub_plan_id: "00000000000000000000000000000001",
         sub_goal: "rebuild billing",
         sub_n: 2,
         sandbox: "none",
         max_spend: Some(5.0),
+        max_wall_seconds: Some(30.0),
         plain: true,
         planner_provider: Some("smoke"),
         child_provider: Some("smoke"),
@@ -57,6 +59,11 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
             .and_then(|v| v.clone()),
         Some(launch_dir.to_string_lossy().into_owned())
     );
+    assert_eq!(
+        envs.get("DEADRECKON_CAMPAIGN_SUB_PLAN_ID")
+            .and_then(|v| v.clone()),
+        Some("00000000000000000000000000000001".to_string())
+    );
 
     let args: Vec<String> = command
         .get_args()
@@ -69,6 +76,14 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "--n" && pair[1] == "2")
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--max-spend" && pair[1] == "5.000000")
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--max-wall-seconds" && pair[1] == "30.000000")
     );
 }
 
@@ -129,7 +144,7 @@ fn campaign_fork_launches_all_subs_and_records_events() {
             Ok(SubResult {
                 schema_version: 1,
                 sub_id: sub.sub_id.clone(),
-                plan_id: Some(format!("plan-{}", sub.sub_id)),
+                plan_id: sub.sub_plan_id.clone(),
                 result_run_id: Some(format!("run-{}", sub.sub_id)),
                 ok: true,
             })
@@ -194,7 +209,7 @@ fn interrupted_campaign_resume_reconciles_linked_plan_without_duplicate_launch()
             Ok(SubResult {
                 schema_version: 1,
                 sub_id: sub.sub_id.clone(),
-                plan_id: Some(format!("plan-{}", sub.sub_id)),
+                plan_id: sub.sub_plan_id.clone(),
                 result_run_id: Some(format!("run-{}", sub.sub_id)),
                 ok: true,
             })
@@ -239,7 +254,7 @@ fn campaign_fork_marks_failed_sub_without_aborting_siblings() {
                 Ok(SubResult {
                     schema_version: 1,
                     sub_id: sub.sub_id.clone(),
-                    plan_id: Some("plan-sub-1".to_string()),
+                    plan_id: sub.sub_plan_id.clone(),
                     result_run_id: Some("run-sub-1".to_string()),
                     ok: true,
                 })
@@ -275,7 +290,7 @@ fn aggregate_spend_exhaustion_refuses_next_sub_launch() {
             Ok(SubResult {
                 schema_version: 1,
                 sub_id: sub.sub_id.clone(),
-                plan_id: Some(format!("plan-{}", sub.sub_id)),
+                plan_id: sub.sub_plan_id.clone(),
                 result_run_id: Some(format!("run-{}", sub.sub_id)),
                 ok: true,
             })

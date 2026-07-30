@@ -7,6 +7,7 @@ use crate::commands::start::{
     classify_goal_shape_for_start, goal_shape_provider_route, write_goal_shape_preview_record,
 };
 use crate::plan_event_bus::JsonlTail;
+use deadreckon_protocol::StopReason;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
@@ -22,10 +23,12 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) source_dir: &'a Path,
     pub(crate) launch_dir: &'a Path,
     pub(crate) campaign_id: &'a str,
+    pub(crate) sub_plan_id: &'a str,
     pub(crate) sub_goal: &'a str,
     pub(crate) sub_n: u8,
     pub(crate) sandbox: &'a str,
     pub(crate) max_spend: Option<f64>,
+    pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) plain: bool,
     pub(crate) planner_provider: Option<&'a str>,
     pub(crate) child_provider: Option<&'a str>,
@@ -50,7 +53,8 @@ pub(crate) fn build_sub_orchestrator_command(
         .env("DEADRECKON_SCOPE_ROOT", launch.launch_dir)
         .env(campaign::ENV_DEPTH, "1")
         .env(campaign::ENV_ROOT, launch.campaign_id)
-        .env(campaign::ENV_SUB_RESULT, launch.launch_dir);
+        .env(campaign::ENV_SUB_RESULT, launch.launch_dir)
+        .env(campaign::ENV_SUB_PLAN_ID, launch.sub_plan_id);
     if !launch.ancestor_task_keys.is_empty() {
         command.env(
             campaign::ENV_ANCESTOR_TASK_KEYS,
@@ -81,6 +85,11 @@ pub(crate) fn build_sub_orchestrator_command(
     }
     if let Some(max_spend) = launch.max_spend {
         command.arg("--max-spend").arg(format!("{max_spend:.6}"));
+    }
+    if let Some(max_wall_seconds) = launch.max_wall_seconds {
+        command
+            .arg("--max-wall-seconds")
+            .arg(format!("{max_wall_seconds:.6}"));
     }
     if let Some(planner) = launch.planner_provider {
         command.arg("--planner-provider").arg(planner);
@@ -141,18 +150,17 @@ fn recover_persisted_campaign_sub(
         }
         return Ok(Some(result));
     }
-    let Some(plan_id) = read_sub_plan_id(launch_dir) else {
+    let Some(plan_id) = sub.sub_plan_id.clone() else {
         return Ok(None);
     };
-    if sub
-        .sub_plan_id
-        .as_ref()
-        .is_some_and(|expected| expected != &plan_id)
-    {
+    if read_sub_plan_id(launch_dir).is_some_and(|published| published != plan_id) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "linked campaign sub-plan {plan_id} does not match persisted sub {} plan",
+            "published campaign sub-plan identity does not match persisted sub {} plan {plan_id}",
             sub.sub_id
         ))));
+    }
+    if !paths.plan_json(&plan_id).is_file() {
+        return Ok(None);
     }
     let plan = deadreckon_core::plan::load_plan(paths, &plan_id)?;
     if plan.plan_id != plan_id {
@@ -165,6 +173,14 @@ fn recover_persisted_campaign_sub(
             "linked campaign sub-plan {plan_id} does not match sub {} goal",
             sub.sub_id
         ))));
+    }
+    if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+        if plan.owner_job_id.as_deref() != Some(job_id) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "linked campaign sub-plan {plan_id} does not retain Campaign Job {job_id}"
+            ))));
+        }
+        commands::graph_job::record_owned_plan_tree(paths, &plan)?;
     }
     match plan.status {
         PlanStatus::Failed => {
@@ -193,13 +209,35 @@ fn recover_persisted_campaign_sub(
                 fork.arg("--max-wall-seconds")
                     .arg(format!("{max_wall_seconds:.3}"));
             }
-            let status = fork.status()?;
+            let status = if commands::graph_job::current_parent_job_id().is_some() {
+                let argv = fork.get_args().map(ToOwned::to_owned).collect::<Vec<_>>();
+                let delegation = commands::graph_job::prepare_delegated_invocation(
+                    paths,
+                    commands::graph_job::DelegatedAction::PlanFork {
+                        plan_id: plan_id.clone(),
+                    },
+                    &argv,
+                    source_dir,
+                    launch_dir,
+                    Some(&plan),
+                )?;
+                let mut child =
+                    commands::graph_job::spawn_delegated(paths, &mut fork, &delegation)?;
+                let status = child.wait();
+                let revoke = commands::graph_job::revoke_pending_delegation(paths, &delegation);
+                let status = status?;
+                revoke?;
+                status
+            } else {
+                fork.status()?
+            };
             if !status.success() {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                     "linked campaign sub-plan {plan_id} fork resume exited with {status}"
                 ))));
             }
-            let status = std::process::Command::new(executable)
+            let mut merge = std::process::Command::new(executable);
+            merge
                 .current_dir(source_dir)
                 .env("DEADRECKON_HOME", paths.home())
                 .env("DEADRECKON_SCOPE_ROOT", launch_dir)
@@ -210,8 +248,30 @@ fn recover_persisted_campaign_sub(
                 .arg("--yes")
                 .arg("--no-hints")
                 .arg("--quiet")
-                .arg("--plain")
-                .status()?;
+                .arg("--plain");
+            let status = if commands::graph_job::current_parent_job_id().is_some() {
+                let resumed_plan = deadreckon_core::plan::load_plan(paths, &plan_id)?;
+                let argv = merge.get_args().map(ToOwned::to_owned).collect::<Vec<_>>();
+                let delegation = commands::graph_job::prepare_delegated_invocation(
+                    paths,
+                    commands::graph_job::DelegatedAction::PlanMerge {
+                        plan_id: plan_id.clone(),
+                    },
+                    &argv,
+                    source_dir,
+                    launch_dir,
+                    Some(&resumed_plan),
+                )?;
+                let mut child =
+                    commands::graph_job::spawn_delegated(paths, &mut merge, &delegation)?;
+                let status = child.wait();
+                let revoke = commands::graph_job::revoke_pending_delegation(paths, &delegation);
+                let status = status?;
+                revoke?;
+                status
+            } else {
+                merge.status()?
+            };
             if !status.success() {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                     "linked campaign sub-plan {plan_id} merge resume exited with {status}"
@@ -249,8 +309,28 @@ const SUB_PLAN_ID_FILE: &str = "plan-id";
 /// Publish a sub-orchestrator's plan id to its launch dir as soon as the plan
 /// exists, so the campaign parent's live aggregate can discover the grandchild
 /// run roots before the sub finishes.
-pub(crate) fn publish_sub_plan_id(launch_dir: &Path, plan_id: &str) {
-    let _ = fs::write(launch_dir.join(SUB_PLAN_ID_FILE), plan_id);
+pub(crate) fn publish_sub_plan_id(launch_dir: &Path, plan_id: &str) -> Result<()> {
+    fs::create_dir_all(launch_dir)?;
+    if let Some(existing) = read_sub_plan_id(launch_dir) {
+        if existing == plan_id {
+            return Ok(());
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "campaign launch already reserves Plan {existing}, not {plan_id}"
+        ))));
+    }
+    let path = launch_dir.join(SUB_PLAN_ID_FILE);
+    let temporary = launch_dir.join(format!(".{SUB_PLAN_ID_FILE}.{}.tmp", Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(plan_id.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path)?;
+    #[cfg(unix)]
+    fs::File::open(launch_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Read a sub-orchestrator's published plan id, if it has reached plan creation.
@@ -261,10 +341,22 @@ pub(crate) fn read_sub_plan_id(launch_dir: &Path) -> Option<String> {
         .filter(|plan_id| !plan_id.is_empty())
 }
 
+pub(crate) fn campaign_test_failpoint(name: &str) {
+    if std::env::var("DEADRECKON_TEST_CAMPAIGN_FAILPOINTS").as_deref() == Ok("1")
+        && std::env::var("DEADRECKON_TEST_CAMPAIGN_FAILPOINT").as_deref() == Ok(name)
+    {
+        std::process::exit(86);
+    }
+}
+
 /// Write a sub-orchestrator's result sidecar. Called at the end of
 /// `orchestrate full-plan` when launched by a campaign (DEADRECKON_CAMPAIGN_SUB_RESULT
 /// is set): records the plan id and its merged result run for the meta-coordinator.
-pub(crate) fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, ok: bool) {
+pub(crate) fn record_sub_orchestrator_result(
+    plan_id: &str,
+    launch_dir: &Path,
+    ok: bool,
+) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let result_run_id = deadreckon_core::plan::load_plan(&paths, plan_id)
         .ok()
@@ -281,7 +373,7 @@ pub(crate) fn record_sub_orchestrator_result(plan_id: &str, launch_dir: &Path, o
         result_run_id,
         ok,
     };
-    let _ = deadreckon_core::campaign::write_sub_result(launch_dir, &result);
+    deadreckon_core::campaign::write_sub_result(launch_dir, &result).map_err(CliError::Core)
 }
 
 pub(crate) struct CampaignArgs {
@@ -318,6 +410,7 @@ struct CampaignRemainingBudget {
     spend_usd: Option<f64>,
     wall_seconds: Option<f64>,
     exhausted_reason: Option<String>,
+    exhausted_stop_reason: Option<StopReason>,
 }
 
 fn campaign_remaining_after_planning(
@@ -340,6 +433,13 @@ fn campaign_remaining_after_planning(
     let wall_seconds = approved_wall_seconds.map(|cap| (cap - planner_wall).max(0.0));
     let spend_exhausted = approved_spend_usd.is_some_and(|cap| planner_spend >= cap);
     let wall_exhausted = approved_wall_seconds.is_some_and(|cap| planner_wall >= cap);
+    let exhausted_stop_reason = if spend_exhausted {
+        Some(StopReason::SpendCap)
+    } else if wall_exhausted {
+        Some(StopReason::WallCap)
+    } else {
+        None
+    };
     let exhausted_reason = (spend_exhausted || wall_exhausted).then(|| {
         format!(
             "one token-bounded campaign planner completion used ${planner_spend:.6} and {planner_wall:.3}s, exhausting the approved campaign cap before child launch"
@@ -349,6 +449,7 @@ fn campaign_remaining_after_planning(
         spend_usd,
         wall_seconds,
         exhausted_reason,
+        exhausted_stop_reason,
     })
 }
 
@@ -382,29 +483,66 @@ fn merge_campaign_planner_accounting(
     current.wall_seconds += next.wall_seconds;
 }
 
-fn append_campaign_planner_accounting(
+fn append_campaign_planner_accounting_snapshot(
     campaign_dir: &Path,
-    accounting: Option<&PlannerAccounting>,
+    accounting: &deadreckon_core::plan::RootPlannerAccounting,
 ) -> Result<()> {
-    let Some(accounting) = accounting else {
+    if !accounting.planner_invoked {
         return Ok(());
-    };
+    }
+    let detail = campaign_planner_accounting_detail(accounting);
     deadreckon_core::campaign::append_campaign_event(
         campaign_dir,
         "root_planner_accounting",
-        json!({
-            "provider": accounting.spend.provider,
-            "model": accounting.spend.model,
-            "input_tokens": accounting.spend.input_tokens,
-            "output_tokens": accounting.spend.output_tokens,
-            "cost_usd": accounting.spend.cost_usd,
-            "subscription": accounting.spend.subscription,
-            "wall_seconds": accounting.wall_seconds,
-            "cumulative": true,
-            "overrun_policy": "one token-bounded planner completion may cross a very small cap; child launch is refused when planning exhausts the total",
-        }),
+        detail,
     )
     .map_err(CliError::Core)
+}
+
+fn campaign_planner_accounting_detail(
+    accounting: &deadreckon_core::plan::RootPlannerAccounting,
+) -> Value {
+    json!({
+        "schema_version": accounting.schema_version,
+        "planner_invoked": accounting.planner_invoked,
+        "provider": accounting.provider,
+        "model": accounting.model,
+        "input_tokens": accounting.input_tokens,
+        "output_tokens": accounting.output_tokens,
+        "cost_usd": accounting.cost_usd,
+        "subscription": accounting.subscription,
+        "wall_seconds": accounting.wall_seconds,
+        "recorded_at": accounting.recorded_at,
+        "cumulative": true,
+        "overrun_policy": "one token-bounded planner completion may cross a very small cap; child launch is refused when planning exhausts the total",
+    })
+}
+
+pub(crate) fn restore_campaign_planner_accounting_snapshot(
+    campaign_dir: &Path,
+    accounting: &deadreckon_core::plan::RootPlannerAccounting,
+) -> Result<()> {
+    if !accounting.planner_invoked {
+        return Ok(());
+    }
+    let expected = campaign_planner_accounting_detail(accounting);
+    let existing = deadreckon_core::campaign::read_campaign_events(campaign_dir)?
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "root_planner_accounting");
+    match existing {
+        Some(event) if event.detail == expected => Ok(()),
+        Some(_) => Err(CliError::Core(DeadreckonError::InvalidInput(
+            "campaign root planner accounting disagrees with its crash-safe root snapshot"
+                .to_string(),
+        ))),
+        None => deadreckon_core::campaign::append_campaign_event(
+            campaign_dir,
+            "root_planner_accounting",
+            expected,
+        )
+        .map_err(CliError::Core),
+    }
 }
 
 fn print_campaign_preflight(campaign: &deadreckon_core::campaign::Campaign, sandbox: Option<&str>) {
@@ -1604,11 +1742,18 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
     if let Some(job_id) = commands::graph_job::current_parent_job_id() {
         campaign_obj.campaign_id = job_id.to_string();
     }
+    let mut root_planner_accounting =
+        commands::graph_job::root_planner_accounting(planner_accounting.as_ref());
+    campaign_obj.root_planner_accounting = Some(root_planner_accounting.clone());
     let campaign_id = campaign_obj.campaign_id.clone();
     let campaign_dir = paths.plan_dir(&campaign_id);
     fs::create_dir_all(&campaign_dir)?;
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-    append_campaign_planner_accounting(&campaign_dir, planner_accounting.as_ref())?;
+    if commands::graph_job::current_driver_owns_root_artifact() {
+        campaign_test_failpoint("after_root_campaign_saved_before_driver_state");
+    }
+    commands::graph_job::record_owned_campaign(&paths, &campaign_obj)?;
+    append_campaign_planner_accounting_snapshot(&campaign_dir, &root_planner_accounting)?;
     commands::graph_job::record_current_artifact(
         &paths,
         commands::graph_job::DriverKind::Campaign,
@@ -1616,6 +1761,9 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         &campaign_id,
     )?;
     if let Some(reason) = remaining.exhausted_reason {
+        let stop_reason = remaining
+            .exhausted_stop_reason
+            .unwrap_or(StopReason::SpendCap);
         campaign_obj.status = campaign::CampaignStatus::Failed;
         campaign::append_campaign_event(
             &campaign_dir,
@@ -1624,6 +1772,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 "reason": reason,
                 "phase": "root_planner",
                 "child_launches": 0,
+                "stop_reason": stop_reason,
             }),
         )?;
         campaign::write_campaign(&campaign_dir, &campaign_obj)?;
@@ -1698,8 +1847,18 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                 )?;
                 campaign_obj.tree_budget_usd = remaining.spend_usd;
                 campaign_obj.tree_wall_seconds = remaining.wall_seconds;
-                append_campaign_planner_accounting(&campaign_dir, planner_accounting.as_ref())?;
+                root_planner_accounting =
+                    commands::graph_job::root_planner_accounting(planner_accounting.as_ref());
+                campaign_obj.root_planner_accounting = Some(root_planner_accounting.clone());
+                campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+                append_campaign_planner_accounting_snapshot(
+                    &campaign_dir,
+                    &root_planner_accounting,
+                )?;
                 if let Some(reason) = remaining.exhausted_reason {
+                    let stop_reason = remaining
+                        .exhausted_stop_reason
+                        .unwrap_or(StopReason::SpendCap);
                     campaign_obj.status = campaign::CampaignStatus::Failed;
                     campaign::append_campaign_event(
                         &campaign_dir,
@@ -1708,6 +1867,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
                             "reason": reason,
                             "phase": "root_planner_replan",
                             "child_launches": 0,
+                            "stop_reason": stop_reason,
                         }),
                     )?;
                     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
@@ -1744,6 +1904,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         }
     }
     campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+    commands::graph_job::record_owned_campaign(&paths, &campaign_obj)?;
 
     execute_campaign_state(&paths, &cwd, &scope, &lineage, &args, campaign_obj).await
 }
@@ -1974,17 +2135,64 @@ pub(crate) async fn resume_campaign_job(
     use deadreckon_core::campaign::{self, CampaignStatus};
 
     let campaign_dir = paths.plan_dir(job.job_id.as_ref());
-    let campaign_obj = campaign::read_campaign(&campaign_dir)?;
+    let mut campaign_obj = campaign::read_campaign(&campaign_dir)?;
     if campaign_obj.campaign_id != job.job_id.as_ref()
         || campaign_obj.root_goal != job.goal
         || campaign_obj.status == CampaignStatus::Killed
-        || campaign_obj.status == CampaignStatus::Failed
     {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "campaign job {} does not have resumable persisted campaign state",
             job.job_id
         ))));
     }
+    if campaign_obj.status == CampaignStatus::Pending {
+        let accounting = campaign_obj
+            .root_planner_accounting
+            .as_ref()
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "campaign job {} has no root planner accounting",
+                    job.job_id
+                )))
+            })?;
+        if let Some(exhaustion) = commands::graph_job::root_planner_budget_exhaustion(
+            accounting,
+            job.policy.max_spend_usd,
+            job.policy.max_wall_seconds as f64,
+        )? {
+            if !campaign::read_campaign_events(&campaign_dir)?
+                .iter()
+                .any(|event| {
+                    event.kind == "budget_exhausted"
+                        && event.detail.get("phase").and_then(Value::as_str) == Some("root_planner")
+                })
+            {
+                campaign::append_campaign_event(
+                    &campaign_dir,
+                    "budget_exhausted",
+                    json!({
+                        "reason": exhaustion.reason,
+                        "phase": "root_planner",
+                        "child_launches": 0,
+                        "stop_reason": exhaustion.stop_reason,
+                    }),
+                )?;
+            }
+            campaign_obj.status = CampaignStatus::Failed;
+            campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &exhaustion.reason,
+                "raise the approved Job budget or use a deterministic pre-approved decomposition",
+            )));
+        }
+    }
+    if campaign_obj.status == CampaignStatus::Failed {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "campaign job {} has a failed campaign and cannot be resumed automatically",
+            job.job_id
+        ))));
+    }
+    commands::graph_job::validate_owned_campaign(paths, &campaign_obj, job.job_id.as_ref())?;
     if campaign_obj.status == CampaignStatus::Merged {
         return Ok(());
     }
@@ -2011,12 +2219,59 @@ async fn execute_campaign_state(
 
     let campaign_id = campaign_obj.campaign_id.clone();
     let campaign_dir = paths.plan_dir(&campaign_id);
+    let pre_child_exhaustion = if campaign_obj
+        .tree_budget_usd
+        .is_some_and(|remaining| remaining <= 0.0)
+    {
+        Some((
+            StopReason::SpendCap,
+            "campaign root planner left no approved spend for child work".to_string(),
+        ))
+    } else if campaign_obj
+        .tree_wall_seconds
+        .is_some_and(|remaining| remaining <= 0.0)
+    {
+        Some((
+            StopReason::WallCap,
+            "campaign root planner left no approved wall time for child work".to_string(),
+        ))
+    } else {
+        None
+    };
+    if let Some((stop_reason, reason)) = pre_child_exhaustion {
+        if !campaign::read_campaign_events(&campaign_dir)?
+            .iter()
+            .any(|event| {
+                event.kind == "budget_exhausted"
+                    && event.detail.get("phase").and_then(Value::as_str) == Some("root_planner")
+            })
+        {
+            campaign::append_campaign_event(
+                &campaign_dir,
+                "budget_exhausted",
+                json!({
+                    "reason": reason,
+                    "phase": "root_planner",
+                    "child_launches": 0,
+                    "stop_reason": stop_reason,
+                }),
+            )?;
+        }
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &reason,
+            "raise --max-spend/--max-wall-seconds or use a deterministic pre-approved decomposition",
+        )));
+    }
     let providers = campaign_obj.providers.clone();
     let sandbox = args.sandbox.clone().unwrap_or_else(|| "auto".to_string());
     let per_sub = campaign_obj
         .tree_budget_usd
         .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
-    let tree_wall_seconds = campaign_obj.tree_wall_seconds;
+    let per_sub_wall = campaign_obj
+        .tree_wall_seconds
+        .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
     let home = paths.home().to_path_buf();
     let planner = providers.planner.clone();
     let child_provider = providers.default_child.clone();
@@ -2061,7 +2316,9 @@ async fn execute_campaign_state(
                 per_sub
                     .as_ref()
                     .and_then(|shares| shares.get(position).copied()),
-                tree_wall_seconds,
+                per_sub_wall
+                    .as_ref()
+                    .and_then(|shares| shares.get(position).copied()),
             )
         },
         |sub, launch_dir| {
@@ -2074,6 +2331,15 @@ async fn execute_campaign_state(
             let share = per_sub
                 .as_ref()
                 .and_then(|shares| shares.get(sub_index).copied());
+            let wall_share = per_sub_wall
+                .as_ref()
+                .and_then(|shares| shares.get(sub_index).copied());
+            let sub_plan_id = sub.sub_plan_id.as_deref().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "campaign sub {} has no reserved Plan identity",
+                    sub.sub_id
+                )))
+            })?;
             let position = sub_index + 1;
             let aggregate_on = campaign_narrate && !campaign_quiet;
             let mut command = build_sub_orchestrator_command(&CampaignSubLaunch {
@@ -2081,10 +2347,12 @@ async fn execute_campaign_state(
                 source_dir: cwd,
                 launch_dir,
                 campaign_id: &campaign_id,
+                sub_plan_id,
                 sub_goal: &sub.goal,
                 sub_n: 2,
                 sandbox: &sandbox,
                 max_spend: share,
+                max_wall_seconds: wall_share,
                 plain,
                 planner_provider: planner.as_deref(),
                 child_provider: child_provider.as_deref(),
@@ -2102,7 +2370,32 @@ async fn execute_campaign_state(
                     sub.sub_id
                 );
             }
-            let mut child = command.spawn()?;
+            let delegation = if commands::graph_job::current_parent_job_id().is_some() {
+                let argv = command
+                    .get_args()
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                let prepared = commands::graph_job::prepare_delegated_invocation(
+                    paths,
+                    commands::graph_job::DelegatedAction::CampaignSub {
+                        campaign_id: campaign_id.clone(),
+                        sub_id: sub.sub_id.clone(),
+                        plan_id: sub_plan_id.to_string(),
+                    },
+                    &argv,
+                    cwd,
+                    launch_dir,
+                    None,
+                )?;
+                Some(prepared)
+            } else {
+                None
+            };
+            let mut child = if let Some(prepared) = delegation.as_ref() {
+                commands::graph_job::spawn_delegated(paths, &mut command, prepared)?
+            } else {
+                command.spawn()?
+            };
             let mut last_tick = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(2))
                 .unwrap_or_else(std::time::Instant::now);
@@ -2140,12 +2433,36 @@ async fn execute_campaign_state(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             };
+            if let Some(prepared) = delegation.as_ref() {
+                commands::graph_job::revoke_pending_delegation(paths, prepared)?;
+            }
             if !status.success() {
                 if aggregate_on {
                     eprintln!(
                         "campaign {campaign_prefix} · {} ({position}/{n_subs}) failed",
                         sub.sub_id
                     );
+                }
+                if let Some(result) = recover_persisted_campaign_sub(
+                    paths,
+                    cwd,
+                    launch_dir,
+                    sub,
+                    &sandbox,
+                    share,
+                    per_sub_wall
+                        .as_ref()
+                        .and_then(|shares| shares.get(sub_index).copied()),
+                )? {
+                    return Ok(result);
+                }
+                if !paths.plan_json(sub_plan_id).is_file() {
+                    return Err(CliError::RetryableInterruption {
+                        message: format!(
+                            "campaign sub-orchestrator {} was interrupted before reserved Plan {sub_plan_id} was created",
+                            sub.sub_id
+                        ),
+                    });
                 }
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                     "sub-orchestrator {} exited with {status}",
@@ -2197,11 +2514,40 @@ async fn execute_campaign_state(
                 "spent_usd": final_tree_spend_usd,
                 "tree_budget_usd": campaign_obj.tree_budget_usd,
                 "phase": "post_children_pre_merge",
+                "stop_reason": StopReason::SpendCap,
             }),
         )?;
         campaign::write_campaign(&campaign_dir, &campaign_obj)?;
         return Err(CliError::Core(deadreckon_core::user_error(
             "campaign children exhausted the remaining approved spend before parent verification",
+            "inspect `deadreckon status` and restart with a larger approved cap",
+        )));
+    }
+    let final_tree_wall_seconds = campaign_obj
+        .sub_goals
+        .iter()
+        .filter_map(|sub| sub.result_run_id.as_deref())
+        .filter_map(|run_id| load_run(paths, run_id).ok())
+        .map(|state| state.total_wall_seconds)
+        .sum::<f64>();
+    if campaign_obj
+        .tree_wall_seconds
+        .is_some_and(|cap| final_tree_wall_seconds >= cap)
+    {
+        campaign_obj.status = campaign::CampaignStatus::Failed;
+        campaign::append_campaign_event(
+            &campaign_dir,
+            "budget_exhausted",
+            json!({
+                "wall_seconds": final_tree_wall_seconds,
+                "tree_wall_seconds": campaign_obj.tree_wall_seconds,
+                "phase": "post_children_pre_merge",
+                "stop_reason": StopReason::WallCap,
+            }),
+        )?;
+        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "campaign children exhausted the remaining approved wall time before parent verification",
             "inspect `deadreckon status` and restart with a larger approved cap",
         )));
     }
@@ -2357,6 +2703,12 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
             "deadreckon list --all",
         )));
     };
+    commands::graph_job::require_current_driver_for_job_artifact(
+        &paths,
+        &campaign_obj.campaign_id,
+        deadreckon_protocol::JobShape::LegacyCampaign,
+        "campaign repair",
+    )?;
     match campaign_obj.status {
         campaign::CampaignStatus::Failed => {}
         campaign::CampaignStatus::Merged => {
@@ -3056,14 +3408,50 @@ where
             append_campaign_event(
                 campaign_dir,
                 "budget_exhausted",
-                serde_json::json!({ "spent_usd": spent_usd, "tree_budget_usd": tree_budget }),
+                serde_json::json!({
+                    "spent_usd": spent_usd,
+                    "tree_budget_usd": tree_budget,
+                    "stop_reason": StopReason::SpendCap,
+                }),
             )?;
             break;
         }
-        let sub = campaign.sub_goals[index].clone();
-        let launch_dir = campaign_dir.join("launch").join(&sub.sub_id);
+        let launch_dir = campaign_dir
+            .join("launch")
+            .join(&campaign.sub_goals[index].sub_id);
         fs::create_dir_all(&launch_dir)?;
+        if campaign.sub_goals[index].sub_plan_id.is_none() {
+            let plan_id = read_sub_plan_id(&launch_dir)
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+            campaign.sub_goals[index].sub_plan_id = Some(plan_id.clone());
+            campaign.sub_goals[index].status = SubGoalStatus::Running;
+            campaign::write_campaign(campaign_dir, campaign)?;
+            publish_sub_plan_id(&launch_dir, &plan_id)?;
+            append_campaign_event(
+                campaign_dir,
+                "sub_launch_prepared",
+                serde_json::json!({
+                    "sub_id": campaign.sub_goals[index].sub_id,
+                    "plan_id": plan_id,
+                }),
+            )?;
+            campaign_test_failpoint("after_sub_launch_intent_before_spawn");
+        } else {
+            let plan_id = campaign.sub_goals[index]
+                .sub_plan_id
+                .clone()
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "Campaign lost its reserved sub Plan identity".to_string(),
+                    ))
+                })?;
+            publish_sub_plan_id(&launch_dir, &plan_id)?;
+            campaign.sub_goals[index].status = SubGoalStatus::Running;
+            campaign::write_campaign(campaign_dir, campaign)?;
+        }
+        let sub = campaign.sub_goals[index].clone();
         if let Some(result) = recover(&sub, &launch_dir)? {
+            validate_campaign_sub_result(&sub, &result)?;
             spent_usd += spend_of(&result);
             let target = &mut campaign.sub_goals[index];
             target.sub_plan_id = result.plan_id.clone();
@@ -3089,9 +3477,15 @@ where
         append_campaign_event(
             campaign_dir,
             "sub_launched",
-            serde_json::json!({ "sub_id": sub.sub_id }),
+            serde_json::json!({
+                "sub_id": sub.sub_id,
+                "plan_id": sub.sub_plan_id,
+            }),
         )?;
-        match launch(&sub, &launch_dir) {
+        match launch(&sub, &launch_dir).and_then(|result| {
+            validate_campaign_sub_result(&sub, &result)?;
+            Ok(result)
+        }) {
             Ok(result) => {
                 spent_usd += spend_of(&result);
                 let target = &mut campaign.sub_goals[index];
@@ -3116,6 +3510,7 @@ where
                     }),
                 )?;
             }
+            Err(err @ CliError::RetryableInterruption { .. }) => return Err(err),
             Err(err) => {
                 campaign.sub_goals[index].status = SubGoalStatus::Failed;
                 append_campaign_event(
@@ -3126,6 +3521,19 @@ where
             }
         }
         campaign::write_campaign(campaign_dir, campaign)?;
+    }
+    Ok(())
+}
+
+fn validate_campaign_sub_result(
+    sub: &deadreckon_core::campaign::SubGoal,
+    result: &deadreckon_core::campaign::SubResult,
+) -> Result<()> {
+    if result.sub_id != sub.sub_id || result.plan_id != sub.sub_plan_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Campaign sub {} returned a result for a different reserved Plan",
+            sub.sub_id
+        ))));
     }
     Ok(())
 }
@@ -3142,7 +3550,7 @@ mod sub_plan_marker_tests {
             read_sub_plan_id(temp.path()).is_none(),
             "no marker before the sub-orchestrator creates its plan"
         );
-        publish_sub_plan_id(temp.path(), "plan-abc123");
+        publish_sub_plan_id(temp.path(), "plan-abc123").expect("publish");
         assert_eq!(
             read_sub_plan_id(temp.path()).as_deref(),
             Some("plan-abc123"),
@@ -3163,10 +3571,12 @@ mod model_argv_tests {
             source_dir: Path::new("/tmp/src"),
             launch_dir: Path::new("/tmp/launch"),
             campaign_id: "cmp-1",
+            sub_plan_id: "00000000000000000000000000000001",
             sub_goal: "sub goal",
             sub_n: 2,
             sandbox: "none",
             max_spend: None,
+            max_wall_seconds: None,
             plain: false,
             planner_provider: Some("smoke"),
             child_provider: Some("smoke"),
@@ -3198,10 +3608,12 @@ mod model_argv_tests {
             source_dir: Path::new("/tmp/src"),
             launch_dir: Path::new("/tmp/launch"),
             campaign_id: "cmp-1",
+            sub_plan_id: "00000000000000000000000000000001",
             sub_goal: "sub goal",
             sub_n: 2,
             sandbox: "none",
             max_spend: None,
+            max_wall_seconds: None,
             plain: false,
             planner_provider: Some("smoke"),
             child_provider: Some("smoke"),
@@ -3267,6 +3679,7 @@ mod durable_campaign_launch_tests {
         CampaignArgs, PlannerAccounting, campaign_accepted_by, campaign_contract_preview,
         campaign_remaining_after_planning, schedule_campaign_job,
     };
+    use deadreckon_protocol::StopReason;
 
     fn args() -> CampaignArgs {
         CampaignArgs {
@@ -3368,12 +3781,35 @@ mod durable_campaign_launch_tests {
                 .expect("bounded accounting");
 
         assert_eq!(remaining.spend_usd, Some(0.0));
+        assert_eq!(remaining.exhausted_stop_reason, Some(StopReason::SpendCap));
         assert!(
             remaining
                 .exhausted_reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("before child launch"))
         );
+    }
+
+    #[test]
+    fn root_planner_wall_exhaustion_keeps_the_wall_dimension() {
+        let accounting = PlannerAccounting {
+            spend: deadreckon_providers::SpendEstimate {
+                provider: "test".to_string(),
+                model: "planner".to_string(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cost_usd: 0.25,
+                subscription: false,
+                wall_time_seconds: Some(10.0),
+            },
+            wall_seconds: 10.0,
+        };
+
+        let remaining = campaign_remaining_after_planning(Some(1.0), Some(5.0), Some(&accounting))
+            .expect("bounded accounting");
+
+        assert_eq!(remaining.wall_seconds, Some(0.0));
+        assert_eq!(remaining.exhausted_stop_reason, Some(StopReason::WallCap));
     }
 
     #[test]

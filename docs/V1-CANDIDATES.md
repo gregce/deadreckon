@@ -7,14 +7,18 @@ supervisor, two-key completion for guided Single, Graph and Campaign Jobs,
 fault harness, and explicit per-user service operations are implemented in
 this tree. These are the remaining boundaries:
 
-- Move direct `orchestrate`, `chain`, and `campaign` plus chain extension under
-  the Job lifecycle. They remain process-coordinated compatibility surfaces.
+- Resolve the remaining compatibility boundary. Direct `orchestrate`,
+  supported new chains, stored-plan `fork`, and direct `campaign` are
+  Job-scheduled; historical `chain run|resume`, policy-rich chain modes, chain
+  extension, previews, and explicitly in-place/uncontained execution remain
+  process-owned.
 - Add safe parent repair for guided Graph and Campaign Jobs. A semantic
   `revise` currently stops `NEEDS_REVIEW`, while a deterministic parent gate
   failure stops `FAILED`.
-- Close the launch-before-link crash window and strengthen process identity
-  beyond a persisted PID before promising automatic recovery from every
-  interruption.
+- Prove guarded-launch and process-identity recovery through an active service
+  and real machine restart before promising recovery from every interruption.
+  Hermetic tests cover pre/post-release crashes, boot identity, PID reuse and
+  process-start identity; they do not establish host reboot behavior.
 - Add live launchd/systemd acceptance and machine-restart drills, service
   preflight/repair UX, and a designed Windows service posture. Current tests
   cover rendered definitions and state classification, not an active service

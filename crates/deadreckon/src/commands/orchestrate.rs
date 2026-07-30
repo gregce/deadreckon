@@ -498,11 +498,8 @@ fn orchestrate_provider_choice_lines(
 }
 
 pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> {
-    let internal_sub_orchestration =
-        std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_some();
     if commands::graph_job::current_parent_job_id().is_none()
-        && !internal_sub_orchestration
-        && !commands::plan::test_foreground_advanced_requested()
+        && !commands::plan::internal_characterization_requested()
         && !args.preview
     {
         return schedule_direct_orchestration(args).await;
@@ -519,7 +516,8 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     let plan = commands::plan::create_orchestration_plan(args.plan, &args.seed_pieces).await?;
     let plan_id = plan.plan_id.clone();
     if let Ok(launch_dir) = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT) {
-        commands::campaign::publish_sub_plan_id(std::path::Path::new(&launch_dir), &plan_id);
+        commands::campaign::publish_sub_plan_id(std::path::Path::new(&launch_dir), &plan_id)?;
+        commands::campaign::campaign_test_failpoint("after_sub_plan_created_before_execution");
     }
     if !quiet {
         commands::plan::print_orchestrate_preflight(
@@ -581,11 +579,15 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     })
     .await;
     if let Some(launch_dir) = sub_result_launch_dir {
-        commands::campaign::record_sub_orchestrator_result(
+        commands::campaign::campaign_test_failpoint("after_sub_merge_before_result");
+        let record_result = commands::campaign::record_sub_orchestrator_result(
             &plan_id,
             std::path::Path::new(&launch_dir),
             merge_result.is_ok(),
         );
+        if merge_result.is_ok() {
+            record_result?;
+        }
     }
     merge_result
 }
