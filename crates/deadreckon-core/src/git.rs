@@ -22,6 +22,7 @@ pub fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
 pub fn run_git_with_input(cwd: &Path, args: &[&str], input: &[u8]) -> Result<Output> {
     let mut child = git_command(cwd, args)
         .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(git_io)?;
@@ -81,5 +82,25 @@ fn git_io(source: std::io::Error) -> DeadreckonError {
     DeadreckonError::Io {
         path: PathBuf::from("git"),
         source,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::run_git_with_input;
+
+    #[test]
+    fn git_with_input_captures_stdout_for_callers_that_parse_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let output = run_git_with_input(temp.path(), &["hash-object", "--stdin"], b"fixture\n")
+            .expect("hash stdin");
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "ee8c1ee49b4799bbd170233915a897c19e3b55e1"
+        );
     }
 }

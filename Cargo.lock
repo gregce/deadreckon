@@ -657,6 +657,7 @@ dependencies = [
  "deadreckon-sandbox",
  "futures-util",
  "inquire",
+ "nix",
  "pulldown-cmark",
  "ratatui",
  "regex",
@@ -752,6 +753,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "uuid",
+ "which",
 ]
 
 [[package]]
@@ -765,6 +768,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
  "which",
 ]
 

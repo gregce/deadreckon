@@ -265,6 +265,7 @@ pub async fn run_semantic_judge(
         sandbox_backend,
         None,
         SemanticJudgeBudget::default(),
+        None,
     )
     .await
 }
@@ -275,8 +276,18 @@ pub async fn run_semantic_judge_with_budget(
     router: &ProviderRouter,
     sandbox_backend: SandboxBackend,
     budget: SemanticJudgeBudget,
+    cancellation_token: Option<&CancellationToken>,
 ) -> Result<SemanticJudgeRun> {
-    run_semantic_judge_with_baseline(state, marker, router, sandbox_backend, None, budget).await
+    run_semantic_judge_with_baseline(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        None,
+        budget,
+        cancellation_token,
+    )
+    .await
 }
 
 /// Run the fresh, read-only semantic judge for a composed result against the
@@ -295,6 +306,7 @@ pub async fn run_semantic_judge_against_source(
         sandbox_backend,
         Some(approved_source),
         SemanticJudgeBudget::default(),
+        None,
     )
     .await
 }
@@ -314,6 +326,7 @@ pub async fn run_semantic_judge_against_source_with_budget(
         sandbox_backend,
         Some(approved_source),
         budget,
+        None,
     )
     .await
 }
@@ -325,6 +338,7 @@ async fn run_semantic_judge_with_baseline(
     sandbox_backend: SandboxBackend,
     approved_source: Option<&Path>,
     budget: SemanticJudgeBudget,
+    external_cancellation: Option<&CancellationToken>,
 ) -> Result<SemanticJudgeRun> {
     let started = Instant::now();
     let selected = router.selected_route_info();
@@ -374,7 +388,7 @@ async fn run_semantic_judge_with_baseline(
         ));
     }
 
-    let before = deadreckon_core::flight::build_working_file_index(&state.working_dir)?.tree_hash();
+    let before = semantic_guard_identity(&state.working_dir)?;
     let judge_workspace =
         is_cli
             .then(TempDir::new)
@@ -408,42 +422,75 @@ async fn run_semantic_judge_with_baseline(
         Some(seconds) => Some(Duration::from_secs_f64(seconds)),
         None => None,
     };
-    let Some(response) =
-        complete_with_semantic_wall_budget(completion, provider_wall_budget, &cancellation_token)
-            .await
-    else {
-        return Ok(budget_exhausted_run(
-            "strict semantic judge exceeded the remaining wall-time budget".to_string(),
-            SemanticBudgetExhaustion::Wall,
-            accounting_without_response(
+    let completion = complete_with_semantic_wall_budget(
+        completion,
+        provider_wall_budget,
+        &cancellation_token,
+        external_cancellation,
+    )
+    .await;
+    let accounting = match &completion {
+        SemanticProviderCompletion::Finished(result) => match result.as_ref() {
+            Ok(response) => {
+                accounting_from_response(response, sandbox_backend, started.elapsed().as_secs_f64())
+            }
+            Err(_) => accounting_without_response(
                 selected.as_ref(),
                 sandbox_backend,
                 started.elapsed().as_secs_f64(),
             ),
-        ));
+        },
+        SemanticProviderCompletion::WallExpired | SemanticProviderCompletion::Cancelled => {
+            accounting_without_response(
+                selected.as_ref(),
+                sandbox_backend,
+                started.elapsed().as_secs_f64(),
+            )
+        }
     };
-    let response = match response {
-        Ok(response) => response,
+    let after = match semantic_guard_identity(&state.working_dir) {
+        Ok(after) => after,
         Err(error) => {
             return Ok(unavailable_run(
-                format!("strict semantic judge unavailable: {error}"),
-                accounting_without_response(
-                    selected.as_ref(),
-                    sandbox_backend,
-                    started.elapsed().as_secs_f64(),
+                format!(
+                    "semantic judge changed or obscured the result workspace; judgment refused: {error}"
                 ),
+                accounting,
             ));
         }
     };
-    let accounting =
-        accounting_from_response(&response, sandbox_backend, started.elapsed().as_secs_f64());
-    let after = deadreckon_core::flight::build_working_file_index(&state.working_dir)?.tree_hash();
     if before != after {
         return Ok(unavailable_run(
-            "semantic judge changed the result tree; judgment refused".to_string(),
+            "semantic judge changed the result or trusted workspace state; judgment refused"
+                .to_string(),
             accounting,
         ));
     }
+
+    let response = match completion {
+        SemanticProviderCompletion::Finished(result) => match *result {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(unavailable_run(
+                    format!("strict semantic judge unavailable: {error}"),
+                    accounting,
+                ));
+            }
+        },
+        SemanticProviderCompletion::WallExpired => {
+            return Ok(budget_exhausted_run(
+                "strict semantic judge exceeded the remaining wall-time budget".to_string(),
+                SemanticBudgetExhaustion::Wall,
+                accounting,
+            ));
+        }
+        SemanticProviderCompletion::Cancelled => {
+            return Ok(unavailable_run(
+                "strict semantic judge cancelled by the durable run controller".to_string(),
+                accounting,
+            ));
+        }
+    };
     if let Some((dimension, reason)) = semantic_budget_overrun(&accounting, budget) {
         return Ok(budget_exhausted_run(reason, dimension, accounting));
     }
@@ -456,24 +503,89 @@ async fn run_semantic_judge_with_baseline(
     })
 }
 
+fn semantic_guard_identity(working_dir: &Path) -> Result<(String, String)> {
+    Ok((
+        deadreckon_core::flight::build_workspace_guard_file_index(working_dir)?.tree_hash(),
+        workspace_git_control_identity(working_dir)?,
+    ))
+}
+
+fn workspace_git_control_identity(working_dir: &Path) -> Result<String> {
+    let git = working_dir.join(".git");
+    let metadata = match fs::symlink_metadata(&git) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok("missing".to_string());
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io { path: git, source });
+        }
+    };
+    if metadata.file_type().is_file() {
+        return deadreckon_core::flight::sha256_file(&git).map(|hash| format!("file:{hash}"));
+    }
+    if metadata.file_type().is_dir() {
+        let hash = deadreckon_core::flight::build_workspace_guard_file_index(&git)?.tree_hash();
+        return Ok(format!("directory:{hash}"));
+    }
+    Err(DeadreckonError::InvalidInput(format!(
+        "semantic judge refuses unsupported Git control entry {}",
+        git.display()
+    )))
+}
+
+enum SemanticProviderCompletion {
+    Finished(Box<deadreckon_providers::Result<ProviderResponse>>),
+    WallExpired,
+    Cancelled,
+}
+
 async fn complete_with_semantic_wall_budget<F>(
     completion: F,
     remaining: Option<Duration>,
     cancellation_token: &CancellationToken,
-) -> Option<deadreckon_providers::Result<ProviderResponse>>
+    external_cancellation: Option<&CancellationToken>,
+) -> SemanticProviderCompletion
 where
     F: std::future::Future<Output = deadreckon_providers::Result<ProviderResponse>>,
 {
     tokio::pin!(completion);
-    let Some(remaining) = remaining else {
-        return Some(completion.await);
-    };
-    if let Ok(result) = tokio::time::timeout(remaining, &mut completion).await {
-        Some(result)
-    } else {
-        cancellation_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-        None
+    match (remaining, external_cancellation) {
+        (None, None) => SemanticProviderCompletion::Finished(Box::new(completion.await)),
+        (Some(remaining), None) => {
+            if let Ok(result) = tokio::time::timeout(remaining, &mut completion).await {
+                SemanticProviderCompletion::Finished(Box::new(result))
+            } else {
+                cancellation_token.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+                SemanticProviderCompletion::WallExpired
+            }
+        }
+        (None, Some(external)) => {
+            tokio::select! {
+                result = &mut completion => SemanticProviderCompletion::Finished(Box::new(result)),
+                _ = external.cancelled() => {
+                    cancellation_token.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+                    SemanticProviderCompletion::Cancelled
+                }
+            }
+        }
+        (Some(remaining), Some(external)) => {
+            tokio::select! {
+                result = &mut completion => SemanticProviderCompletion::Finished(Box::new(result)),
+                _ = tokio::time::sleep(remaining) => {
+                    cancellation_token.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+                    SemanticProviderCompletion::WallExpired
+                }
+                _ = external.cancelled() => {
+                    cancellation_token.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
+                    SemanticProviderCompletion::Cancelled
+                }
+            }
+        }
     }
 }
 
@@ -841,6 +953,7 @@ fn json_error(label: &'static str) -> impl FnOnce(serde_json::Error) -> Deadreck
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::Duration;
 
     use deadreckon_providers::{ProviderResponse, ProviderUsage, SpendEstimate};
@@ -849,9 +962,10 @@ mod tests {
     use super::{
         EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SemanticBudgetExhaustion,
         SemanticDecision, SemanticJudgeAccounting, SemanticJudgeBudget, SemanticJudgeResult,
-        accounting_from_response, classify_semantic_response, complete_with_semantic_wall_budget,
-        provider_kind_is_cli, semantic_budget_overrun, semantic_output_schema,
-        semantic_provider_request, strip_json_fence, validate_evidence_references,
+        SemanticProviderCompletion, accounting_from_response, classify_semantic_response,
+        complete_with_semantic_wall_budget, provider_kind_is_cli, semantic_budget_overrun,
+        semantic_guard_identity, semantic_output_schema, semantic_provider_request,
+        strip_json_fence, validate_evidence_references,
     };
     use deadreckon_protocol::{GoalCoverage, GoalCoverageStatus};
     use deadreckon_providers::ProviderKind;
@@ -873,6 +987,39 @@ mod tests {
             request.cwd.as_deref(),
             Some(std::path::Path::new("/tmp/empty-judge-workspace"))
         );
+    }
+
+    #[test]
+    fn semantic_guard_covers_lifecycle_evidence_and_git_control() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let working = temp.path();
+        fs::create_dir_all(working.join(".deadreckon")).expect("lifecycle");
+        fs::create_dir_all(working.join(".specstory")).expect("evidence");
+        fs::write(working.join("result.txt"), "result\n").expect("result");
+        fs::write(working.join(".deadreckon/codebase.json"), "{}\n").expect("codebase");
+        fs::write(working.join(".specstory/trace.jsonl"), "{}\n").expect("trace");
+        fs::write(working.join(".git"), "gitdir: /trusted/one\n").expect("git control");
+
+        let before = semantic_guard_identity(working).expect("before");
+        fs::write(
+            working.join(".deadreckon/codebase.json"),
+            "{\"tampered\":true}\n",
+        )
+        .expect("tamper lifecycle");
+        let lifecycle = semantic_guard_identity(working).expect("lifecycle identity");
+        assert_ne!(before, lifecycle);
+
+        fs::write(
+            working.join(".specstory/trace.jsonl"),
+            "{\"tampered\":true}\n",
+        )
+        .expect("tamper evidence");
+        let evidence = semantic_guard_identity(working).expect("evidence identity");
+        assert_ne!(lifecycle, evidence);
+
+        fs::write(working.join(".git"), "gitdir: /operator/decoy\n").expect("tamper Git control");
+        let git = semantic_guard_identity(working).expect("Git identity");
+        assert_ne!(evidence, git);
     }
 
     #[test]
@@ -994,12 +1141,80 @@ mod tests {
             })
         };
 
-        let response =
-            complete_with_semantic_wall_budget(completion, Some(Duration::from_millis(20)), &token)
-                .await;
+        let response = complete_with_semantic_wall_budget(
+            completion,
+            Some(Duration::from_millis(20)),
+            &token,
+            None,
+        )
+        .await;
 
-        assert!(response.is_none());
+        assert!(matches!(response, SemanticProviderCompletion::WallExpired));
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn external_cancellation_drains_and_discards_a_late_achieved_response() {
+        fn achieved_response() -> ProviderResponse {
+            ProviderResponse {
+                provider: "judge".to_string(),
+                model: "judge-model".to_string(),
+                content: r#"{"decision":"achieved","summary":"bounded","goal_coverage":[{"claim":"approved goal","status":"met","evidence":["approved-goal"]}],"missing":[]}"#
+                    .to_string(),
+                usage: ProviderUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+                spend: SpendEstimate {
+                    provider: "judge".to_string(),
+                    model: "judge-model".to_string(),
+                    input_tokens: 2,
+                    output_tokens: 1,
+                    cost_usd: 0.01,
+                    subscription: false,
+                    wall_time_seconds: Some(0.1),
+                },
+                trace: serde_json::Value::Null,
+            }
+        }
+
+        assert!(matches!(
+            classify_semantic_response("job", "run", "sha256:input", achieved_response()),
+            SemanticJudgeResult::Achieved(_)
+        ));
+
+        let request_cancellation = tokio_util::sync::CancellationToken::new();
+        let provider_cancellation = request_cancellation.clone();
+        let helper_cancellation = request_cancellation.clone();
+        let external_cancellation = tokio_util::sync::CancellationToken::new();
+        let helper_external_cancellation = external_cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let provider = async move {
+            started_tx.send(()).expect("test observes provider start");
+            provider_cancellation.cancelled().await;
+            drained_tx
+                .send(())
+                .expect("test observes provider cancellation");
+            Ok(achieved_response())
+        };
+        let completion = tokio::spawn(async move {
+            complete_with_semantic_wall_budget(
+                provider,
+                None,
+                &helper_cancellation,
+                Some(&helper_external_cancellation),
+            )
+            .await
+        });
+
+        started_rx.await.expect("provider request started");
+        external_cancellation.cancel();
+
+        let result = completion.await.expect("semantic completion task");
+        drained_rx.await.expect("provider request drained");
+        assert!(request_cancellation.is_cancelled());
+        assert!(matches!(result, SemanticProviderCompletion::Cancelled));
     }
 
     #[test]

@@ -321,6 +321,8 @@ fn seam_sandbox_spec(
         write_denylist: denied,
         network_allowlist: Vec::new(),
         workspace_access: WorkspaceAccess::ReadWrite,
+        cleanup_process_group: false,
+        guarded_launch: None,
     }
 }
 

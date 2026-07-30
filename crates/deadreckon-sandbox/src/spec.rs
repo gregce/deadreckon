@@ -6,6 +6,20 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::SandboxBackend;
 
+/// Trusted release helper used when the sandboxed command must move into a
+/// separately recoverable process group.
+#[derive(Debug, Clone)]
+pub struct GuardedLaunchSpec {
+    /// Executable providing the hidden `guarded-exec` release protocol.
+    pub program: OsString,
+    /// Unique identity for this evaluator launch, not merely the Job attempt.
+    pub launch_id: String,
+    /// Durable supervisor attempt that owns this launch.
+    pub attempt: u32,
+    /// Unique outer Job launch, when available, for audit correlation.
+    pub owner_launch_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WorkspaceAccess {
     /// Ordinary coding-agent posture: the workspace is a writable work area.
@@ -43,4 +57,15 @@ pub struct SandboxSpec {
     pub write_denylist: Vec<PathBuf>,
     pub network_allowlist: Vec<String>,
     pub workspace_access: WorkspaceAccess,
+    /// Put the wrapper and all ordinary descendants in a fresh process group,
+    /// then terminate residual members before returning.
+    ///
+    /// This is opt-in because a long-lived worker may already belong to a
+    /// supervisor-owned process group. Moving every nested tool into a new
+    /// group would let it escape that outer cancellation boundary.
+    pub cleanup_process_group: bool,
+    /// Block the command behind a private release pipe until its per-launch,
+    /// boot-aware identity is atomically persisted. Required for strict gate
+    /// evaluation, which intentionally leaves the outer worker process group.
+    pub guarded_launch: Option<GuardedLaunchSpec>,
 }

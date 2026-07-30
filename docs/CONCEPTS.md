@@ -7,7 +7,10 @@ it*. For step-by-step usage, see [HOWTO](../HOWTO.md).
 ## How it works
 
 1. **You write "done" in plain English.** deadreckon compiles it into executable checks: tests that must pass, files that must exist, scripts that must succeed.
-2. **The agent runs in an isolated worktree**, inside a sandbox. Your real checkout is never touched.
+2. **The agent runs in an isolated workspace.** Git sources default to a
+   separate worktree. Non-Git sources default to a copy. DeadReckon requests a
+   process sandbox, and a strict receipt requires a real backend to resolve.
+   Explicit in-place compatibility mode is the workspace-isolation exception.
 3. **Every turn is saved** (state, spend, traces, file provenance, snapshots) so you can attach, kill, resume, undo, or audit any moment.
 4. **A separate watchdog process (`dr-gate`) runs the approved checks.** For a
    strict Job, the signing key is outside the agent workspace and protected
@@ -18,7 +21,7 @@ it*. For step-by-step usage, see [HOWTO](../HOWTO.md).
    `uncertain`.
 6. **The trusted supervisor seals the final parent receipt.** Only a contained
    deterministic pass plus semantic `achieved` produces the HMAC-SHA-256
-   two-key receipt required to promote a guided Job. A Single Job can use
+   two-key receipt required to promote a durable Job. A Single Job can use
    `revise` for another bounded turn. A Graph or Campaign parent stops
    `NEEDS_REVIEW` because safe parent repair is not implemented yet.
 
@@ -104,7 +107,10 @@ Agentic CLIs usually leave you with a patch and a transcript. deadreckon turns t
 
 Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 
-- **Your checkout is never touched.** Runs default to an isolated `git worktree` on a `dr/...` branch; your real checkout changes only when you `deadreckon apply`. Copy, fresh, and explicit in-place modes are available too.
+- **Source work is isolated by default.** Git sources use a separate
+  `git worktree` on a `dr/...` branch. Non-Git sources use a copy. Your Git
+  checkout changes only when you apply a result, unless you explicitly choose
+  in-place compatibility mode. Fresh mode is also available.
 - **Durable at two levels.** All runs persist state. Jobs created by `start`,
   ordinary `run`/`orchestrate`, new `chain`/`campaign`, and stored-plan `fork`
   also have an append-only lifecycle, a fenced renewable lease, process-group
@@ -115,7 +121,12 @@ Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
 - **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo <id> --turn 3`), recorded in the run trace, not just a `git reset`. The same verb unwinds a chain's last applied step.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
-- **Ordered multi-step work.** A goal that names its steps in order ("migrate the schema, then update the callers, then delete the shim") runs them one at a time, each behind its own signed gate, landing on your branch as it passes. `deadreckon start` reaches this directly; `deadreckon chain` is the explicit form when you already know the steps.
+- **Ordered multi-step work.** A new `deadreckon chain` compiles the steps into
+  a linear Graph Job. Each child depends on the previous child. DeadReckon
+  composes the result at the end, then verifies the same-ID parent once with
+  both completion keys. Historical `chain run|resume` compatibility uses the
+  older stepwise gate and apply model and does not produce this trusted parent
+  receipt.
 - **Retries instead of a pause.** A step that misses its done criteria is told exactly what failed and tried again — twice by default — before the plan decides whether the rest of the work continues. An unattended run should not stop and wait for someone who walked away.
 
 ## The mental model
@@ -167,7 +178,7 @@ deadreckon doesn't replace Claude Code, Codex, or the rest; it supervises them. 
 
 | Operational concern | Agentic CLI alone | deadreckon supervising the CLI |
 |---|---|---|
-| Workspace safety | Often runs where you start it | Isolated worktree by default; your checkout untouched |
+| Workspace safety | Often runs where you start it | Separate worktree for Git sources and a copy for non-Git sources by default |
 | Long-running attach | Tied to the current terminal | Durable state; guided `start` Jobs also detach their supervisor |
 | Spend control | Varies by provider | Tracks totals; enforces spend and wall-clock caps |
 | Undo | git-level or manual | Snapshots every turn; restores a specific turn |

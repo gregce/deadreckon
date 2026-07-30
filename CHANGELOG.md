@@ -55,8 +55,9 @@ migration step runs.
 ## Watchkeeper one durable Job and two-key completion 2026-07-28
 
 Watchkeeper makes guided `start` durable before the first agent turn. It
-freezes the approved goal, definition of done, policy, launch plan, source tree
-and revision under one Job ID. It then detaches a lease-fenced supervisor.
+freezes the approved goal, definition of done, requested sandbox and tool
+policy, launch plan, deliverable source tree and revision under one Job ID. It
+then detaches a lease-fenced supervisor.
 `attach`, `status`, `list`, `kill`, `finish` and `report` resolve that Job
 without duplicating its backing run, plan or campaign.
 
@@ -70,10 +71,32 @@ remain labelled compatibility paths and cannot produce a trusted Job receipt.
 
 ### Durable Jobs have 2 completion keys
 
-A contained native gate must pass the frozen deterministic checks. A fresh
-read-only semantic judge must then return `achieved`. The supervisor seals an
-HMAC-SHA-256 receipt that binds the authority, policy, launch plan, source and
-result revisions, tree digests, gate marker, judgment and confinement.
+A contained native gate must pass the frozen deterministic checks. The trusted
+controller materializes the approved `acceptance.yaml`, then runs keyless
+`dr-gate evaluate` under the backend that the sandbox resolver actually chose.
+The evaluator receives no `GATE_*` inputs and cannot write proof or Job control
+files. The sandbox runner scrubs inherited gate inputs and reaps the evaluator's
+whole process group, including delayed descendants.
+
+Strict evaluation is now crash-guarded as well as sandboxed. A private release
+pipe prevents the helper from creating its evaluator process group or executing
+repository-controlled checks until a unique per-attempt record has been
+atomically written and synced with the Job attempt, outer launch, boot ID and
+process-start identity. Losing the worker before that point closes the pipe and
+the command never starts. After release, cancellation and supervisor recovery
+reconcile the identity-checked evaluator group before recording `Cancelled` or
+starting a retry; corrupt, reused or unverifiable identities stop
+`LostContainment` instead.
+
+A strict Job refuses a resolved backend of `none` before reading signing
+material. Only after the evaluator has stopped does childless `dr-gate sign`
+receive the HMAC key. It strictly revalidates the evaluation, approved contract
+and tamper facts, reconstructs progress and tamper evidence, and signs the
+observed backend. A fresh read-only semantic judge must then return `achieved`.
+The supervisor seals an HMAC-SHA-256 receipt that binds the authority, approved
+policy digest, launch plan, optional source and result revisions, deliverable
+source and result tree digests, gate marker, judgment, confinement, and the
+sandbox backend that actually ran.
 
 A deterministic failure cannot be overruled. A Single Job can use semantic
 `revise` for another bounded worker turn. A Graph or Campaign parent records
@@ -108,12 +131,37 @@ uses the same gate, judgment, receipt and promotion sequence as a Graph.
 
 ### The worker cannot mint its proof
 
-Gate keys live outside the agent-visible workspace. Authority, lifecycle,
-gate, proof, snapshot, provenance and receipt paths are denied or read-only
-across the supported sandbox and provider routes. Version-2 markers and
-receipts fail closed on missing key material, synthetic proof,
-`sandbox_backend = none` or `contained = false`. Legacy runs retain their
-historical marker validator.
+Gate keys live outside the agent-visible workspace and are not read until the
+sandboxed evaluator and its residual process group are gone. Public macOS fault
+tests cancel a held-open gate and SIGKILL its outer launcher; both prove the old
+evaluator is gone before terminal cancellation or the next attempt. Authority,
+lifecycle, gate, proof, snapshot, provenance and receipt paths are denied or
+read-only across the supported sandbox and provider routes. Version-2 markers
+and receipts fail closed on missing key material, synthetic proof,
+`sandbox_backend = none` or `contained = false`. Legacy-v1 runs retain their
+historical nonce marker validator.
+
+### Result and delivery identity are fail-closed
+
+DeadReckon now separates deliverable files from provider evidence, lifecycle
+metadata and disposable build output. Trusted result copying preserves
+executable files and symlinks without following them, rejects special files,
+and keeps raw Unix path identity. Provider-created Git commits and index state
+are discarded before DeadReckon creates its own hook-free result commit through
+trusted Git control paths. Documentation providers run read-only and their
+parsed output crosses the same trusted commit boundary.
+
+Strict receipt fields bind the approved policy digest, optional source and
+result revisions, deliverable source and result tree digests, and the resolved
+backend and containment result. Worktree sealing and validation separately
+enforce the approved base, merge-aware path history, filesystem and Git
+identity, dirty and masked index checks, active filters, and gitlinks. Sealing
+also creates a deterministic result-retention ref; the ref is not a receipt
+field. For a verified worktree apply, `finish` validates every introduced
+delivery-history path and restores the pre-delivery revision when final
+identity checks fail. Promotion publishes only validated candidates, records
+durable state before removing owned working data, and can recover each covered
+crash window idempotently.
 
 ### Service support is conditional
 
@@ -127,9 +175,15 @@ The operator dogfood kit contains 24 tasks across 2 repository and provider
 slots. It also includes a metrics collector, human-review schema and
 credential-free adversarial runner. The committed credential-free result is 7
 passed, 0 failed, and 5 explicitly unproven live/host claims. The sanitized
-live result records 2 attempts, 22 not run, and 0 verified. This release does
-not claim live task rates, cross-provider results, machine-restart results, or
-false-accept and false-reject rates.
+live result records 2 attempted tasks, 22 not run, and 0 verified. This release
+does not claim live task rates, cross-provider results, machine-restart
+results, or false-accept and false-reject rates.
+
+A real macOS public-command end-to-end test proves the contained two-phase
+Seatbelt gate. It checks protected-path denial, inherited gate-input scrubbing,
+residual process-group cleanup and the signed observed backend. Equivalent live
+Linux/bubblewrap and Docker evidence, and a real service-backed reboot, remain
+outstanding.
 
 The collector no longer treats raw receipt fields as verified evidence. Its
 verified count requires a valid public `report --json` receipt assessment and a
@@ -1442,8 +1496,9 @@ candidates; the sections below carry the full per-change record.
   sources, and full `history.json` retention.
 - P7: Added `--no-seams` run/start controls, seam resolution in preview and
   doctor output, and policy-seam refusal footers with recovery commands.
-- P8: Added adversarial trust-boundary tests proving seam workers cannot write
-  markers/proofs, cannot read `gate/nonce`, and cannot affect gate signatures.
+- P8: Added adversarial trust-boundary tests for the then-current legacy-v1
+  gate, proving seam workers could not write markers/proofs, read `gate/nonce`,
+  or affect gate signatures.
 - P9: Added explicit seam config validation tests for unknown kinds, empty
   commands, and bad timeouts, plus an all-seams smoke run that writes
   `seams.json` and validates a gate marker.
@@ -1455,9 +1510,10 @@ candidates; the sections below carry the full per-change record.
   subprocess, fixed per-kind fail policy) makes policy, model-catalog,
   hook-fanout, and event-sink swappable via `[seams]`; unconfigured seams keep
   built-in behavior and `--no-seams` forces all built-ins.
-- Release summary: the acceptance gate stays deliberately non-swappable: no seam
-  can write or redirect the marker, read `gate/nonce`, or alter the signature;
-  seam workers run sandboxed.
+- Release summary: the acceptance gate stayed deliberately non-swappable. In
+  that legacy-v1 path, no seam could write or redirect the marker, read
+  `gate/nonce`, or alter the signature; seam workers ran sandboxed. Strict
+  durable Jobs now use the keyless-evaluate/HMAC-sign boundary described above.
 - Release summary: deterministic, resume-safe context-window compaction closes
   the direct-API history gap in `compaction.jsonl`; CLI-provider paths are
   untouched.
@@ -2019,7 +2075,10 @@ Implementation commit: `cec49f3`.
 
 - Hardened the run loop with broadcast/file-backed events, per-turn timers, cancellation tokens, wall-clock CLI spend accounting, partial-trace resume, and `resume --from-turn`.
 - Hardened sandbox execution with generated Seatbelt/bwrap policy inputs, tmp `$HOME`, network denial, persisted profiles, and adversarial path/network tests.
-- Hardened acceptance by moving `dr-gate` to `acceptance.yaml`, signing markers with a run-local nonce, and refusing forged self-attestation.
+- Hardened the original legacy-v1 acceptance path by moving `dr-gate` to
+  `acceptance.yaml`, signing markers with a run-local nonce, and refusing forged
+  self-attestation. Strict durable Jobs now use HMAC-SHA-256 and the contained
+  two-phase gate described above.
 - Hardened import normalization for Claude Code, Codex, and Cursor histories into deadreckon traces/provenance.
 - Hardened multi-run coordination with scope-qualified lock files and same-scope refusal tests.
 - Hardened library promotion with post-gate atomic move, manifest writing, and crash recovery.

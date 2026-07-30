@@ -698,7 +698,14 @@ checks:
         .arg(&acceptance)
         .status()?;
     let run_id = newest_created_run_id(paths, &before_runs)?;
-    run_git(&worktree, &["add", "-A"])?;
+    // Providers may create their own commits. Rebuild the candidate from the
+    // approved base so an evidence-only blob cannot survive in intermediate
+    // history and later enter a merge or rebase delivery.
+    run_git(&worktree, &["reset", "--mixed", &base_commit])?;
+    restore_evidence_only_candidate_paths(&worktree, &base_commit)?;
+    let mut stage_args = vec!["add", "-A", "--", "."];
+    stage_args.extend_from_slice(deadreckon_core::delivery_git_exclude_pathspecs());
+    run_git(&worktree, &stage_args)?;
     let staged = git_stdout(&worktree, &["diff", "--cached", "--name-only"])?;
     if !staged.trim().is_empty() {
         let message = format!("self-improve: {}", one_line(&proposal.title, 64));
@@ -716,13 +723,17 @@ checks:
         )?;
     }
     let head_commit = git_stdout(&worktree, &["rev-parse", "HEAD"])?;
-    let changed_files = git_stdout(&worktree, &["diff", "--name-only", "HEAD~1..HEAD"])
+    let candidate_range = format!("{base_commit}..HEAD");
+    let changed_files = git_stdout(&worktree, &["diff", "--name-only", &candidate_range])
         .unwrap_or_default()
         .lines()
+        .filter(|path| deadreckon_core::is_deliverable_workspace_path(Path::new(path)))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let diff = diff_summary(&worktree, "HEAD~1..HEAD").unwrap_or_default();
-    let diff_text = git_stdout(&worktree, &["diff", "HEAD~1..HEAD"]).unwrap_or_default();
+    let diff = diff_summary(&worktree, &candidate_range).unwrap_or_default();
+    let mut diff_args = vec!["diff", candidate_range.as_str(), "--", "."];
+    diff_args.extend_from_slice(deadreckon_core::delivery_git_exclude_pathspecs());
+    let diff_text = git_stdout(&worktree, &diff_args).unwrap_or_default();
     let risk = classify_candidate_risk(&changed_files);
     let mut candidate = LearningCandidate {
         version: 1,
@@ -807,6 +818,37 @@ checks:
         );
     } else {
         println!("{}", surface.render_plain(!completion_hints_enabled(false)));
+    }
+    Ok(())
+}
+
+fn restore_evidence_only_candidate_paths(worktree: &Path, base_commit: &str) -> Result<()> {
+    for root in deadreckon_core::evidence_only_roots() {
+        let path = worktree.join(root);
+        remove_if_exists(&path)?;
+        let base_files = git_stdout(
+            worktree,
+            &["ls-tree", "-r", "--name-only", base_commit, "--", root],
+        )?;
+        if base_files.trim().is_empty() {
+            // The provider may have committed this private path itself. Stage
+            // its deletion so the candidate branch converges back to the
+            // approved base even though the broad delivery add excludes it.
+            run_git(worktree, &["add", "-A", "--", root])?;
+        } else {
+            run_git(
+                worktree,
+                &[
+                    "restore",
+                    "--source",
+                    base_commit,
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    root,
+                ],
+            )?;
+        }
     }
     Ok(())
 }

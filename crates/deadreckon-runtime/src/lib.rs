@@ -33,6 +33,6 @@ pub use semantic_judge::{
     run_semantic_judge_with_budget, semantic_judgment_path,
 };
 pub use turn_loop::{
-    NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
+    GateLaunchOwner, NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
     run_deterministic_completion_gate, run_turn_loop,
 };

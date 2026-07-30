@@ -1183,6 +1183,7 @@ mod tests {
                 max_attempts: 4,
                 deadline: None,
                 semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
             },
         };
         write_job(&paths, &job).expect("job");

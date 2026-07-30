@@ -16,8 +16,9 @@ pub use ids::{JobId, PlanId, RunId, TurnId};
 pub use job::{
     AuthorityAcceptedBy, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
     GoalCoverage, GoalCoverageStatus, JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent,
-    JobEventKind, JobEventSequence, JobLease, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion,
-    JobShape, SemanticDecision, SemanticJudgeMode, SemanticJudgment, StopReason,
+    JobEventKind, JobEventSequence, JobExecutionPolicy, JobLease, JobOutcome, JobPhase, JobPolicy,
+    JobSchemaVersion, JobShape, JobToolPolicy, SemanticDecision, SemanticJudgeMode,
+    SemanticJudgment, StopReason,
 };
 pub use ledger::{
     EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,

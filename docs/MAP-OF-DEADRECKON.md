@@ -108,7 +108,7 @@ semantics can be represented truthfully by Jobs.
 | Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close repair and live recovery proof** |
 | Lifecycle control | Start, observe, cancel and finish Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason | Ordinary operations read persisted control truth | **Stable / bounded**: the cross-kind journey and Job resolver are tested | **Preserve one resolver and one Job event truth** |
 | Codebase isolation | Contain changes and make promotion deliberate | Worktree, copy, fresh-repo and in-place modes separate the agent's workspace from the user's target | Isolation is part of the run contract, not a provider feature | **Hardened** | **Essential; preserve** |
-| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap commands; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: `none` remains callable but cannot yield a contained verified Job | **Preserve fail-closed receipt rule; continue backend parity tests** |
+| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; live Linux and Docker gate proof remains outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
 | Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event and steering parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
 | Structured provider contracts | Replace output scraping with declared event semantics | Pi/Copilot and app-server paths emit/consume typed events; other adapters retain parsing gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
 | Budgets and context | Bound delegated work and reveal consumption | Wall-time, turn and API-spend caps plus spend/context records drive status and stopping | Budget is enforced by the outer harness | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
@@ -131,11 +131,28 @@ semantics can be represented truthfully by Jobs.
 | Supervisor service operations | Restore local work after the worker shell or supervisor disappears | Explicit managed launchd/systemd definitions pin binary, home and PATH; install/start/status/stop refuse unmanaged conflicts | Machine-level posture is opt-in and inspectable | **Implemented definitions and commands; live cross-platform reboot acceptance outstanding** | **Dogfood before making restart-at-login a default claim** |
 | Doctor, setup, update and release trust | Make the binary installable and diagnosable | Environment checks, provider setup, update flow, signing/attestation and packaging support operations | Necessary for trusting a local supervisor binary | **Stable / maturing** | **Add service/containment preflight; otherwise maintain as infrastructure** |
 
-## Guided Job gates are closed; direct paths remain
+## Durable Job gates are closed; compatibility paths remain
 
 Watchkeeper closes the concrete trust gaps identified by the previous map for
-guided Single, Graph and Campaign Jobs:
+durable Single, Graph and Campaign Jobs created through guided or supported
+ordinary direct launches:
 
+- the trusted controller materializes the approved `acceptance.yaml` before
+  evaluation;
+- keyless `dr-gate evaluate` runs under the backend that actually resolves,
+  receives no `GATE_*` inputs, and cannot write proof or Job control files;
+- the sandbox runner scrubs inherited gate inputs and reaps the evaluator's
+  whole process group, including delayed descendants;
+- a private release pipe prevents repository checks from starting until a
+  unique per-attempt evaluator record is atomically synced with its outer
+  launch, boot and process-start identity;
+- cancellation and retry reconcile the outer worker and every nested evaluator
+  identity before becoming terminal or launching another attempt; corrupt,
+  reused or unverifiable identity stops `LostContainment`;
+- a strict resolved backend of `none` refuses before signing material is read;
+- only then does childless `dr-gate sign` read the external HMAC key, strictly
+  revalidate the evaluation, contract and tamper facts, reconstruct progress
+  and tamper evidence, and sign the observed backend;
 - version-2 native markers and final receipts use HMAC-SHA-256 with
   constant-time verification;
 - key material lives outside the run workspace under an owner-only key store;
@@ -143,9 +160,23 @@ guided Single, Graph and Campaign Jobs:
   control paths are denied or read-only across Seatbelt, bubblewrap, Docker,
   CLI providers and the Codex app-server boundary;
 - canonical/symlinked path variants are covered;
-- issuer, proof kind, resolved sandbox backend and containment are signed;
+- issuer, proof kind, resolved sandbox backend and containment are signed in
+  the marker and final receipt;
 - a synthetic controller marker is not a native `dr-gate` proof;
-- final validation recomputes the result-tree digest rather than trusting mtime;
+- Job policy stores the requested sandbox selector and tool capabilities;
+  authority binds that policy by digest but does not claim which backend will
+  resolve at runtime;
+- trusted Git routing captures and validates the `.git` redirect, run
+  worktree, linked-worktree Git directory and common Git directory; provider
+  commits and index state are discarded before trusted result commits;
+- receipt fields bind optional source and result revisions and deliverable
+  source and result tree digests; validation separately enforces merge-aware
+  path history, filesystem kind, executable mode and symlink target rather
+  than trusting mtime;
+- active Git filters and gitlinks fail closed instead of escaping the artifact
+  model;
+- a verified worktree apply validates every introduced history path and resets
+  the target to its pre-delivery revision if final identity checks reject it;
 - an uncontained or `none` result cannot become a verified strict receipt.
 
 The second key is semantic. Deterministic success triggers a fresh read-only
@@ -156,12 +187,20 @@ another bounded worker turn. A Graph or Campaign parent records `revise` as
 malformed results also stop `NEEDS_REVIEW`. Deterministic failure never calls
 the judge.
 
-This boundary covers guided Jobs, not every execution path. Direct `run`,
-`orchestrate`, `chain`, and `campaign` retain their older marker and process
-semantics. Host configuration also matters: strict verification needs a real
-resolved sandbox. The repository contains hostile-path, forgery and fault
-tests. Live adversarial trials across providers and host versions remain
-operator work.
+This boundary covers durable Jobs, not every compatibility path. Supported
+ordinary `run` and `orchestrate`, new chains, stored-plan `fork`, and direct
+campaigns enter the same Job scheduler. Preview, explicit in-place or
+uncontained work, historical `chain run|resume`, unsupported conductor-only
+policies, and `extend` retain process-owned compatibility semantics. Host
+configuration also matters: strict verification needs a real resolved
+sandbox. The repository contains hostile-path, forgery and fault tests. Live
+adversarial trials across providers and host versions remain operator work. The
+real macOS public-command suite proves the two-phase Seatbelt gate, protected
+path denial, gate-input scrubbing, residual cleanup and signed observed backend;
+it also cancels a held-open evaluator and SIGKILLs the outer launcher, proving
+the old group is reaped before cancellation or one bounded retry. Equivalent
+live Linux/bubblewrap and Docker proof, and a real service-backed reboot, remain
+outstanding.
 
 ## Original unmet needs: current outcome
 
@@ -187,7 +226,7 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 | 16 | Provider routing | Registry, capabilities, descriptors and routing cover several providers | **Mostly met; provider parity remains** |
 | 17 | Handoff and continuity | Attach, status, extend and docs help a human resume; no first-class handoff artifact or memory carryover | **Partly met** |
 | 18 | Port and environment isolation | Worktrees and process sandboxes isolate files/processes; there is no port/env lease broker | **Partly met** |
-| 19 | Governance receipts | Durable Jobs bind approved authority, checks, semantic judgment, revisions, result digest and confinement in an HMAC receipt; rules/skill receipts remain absent | **Mostly met; live cross-provider proof remains** |
+| 19 | Governance receipts | Durable Jobs bind approved authority, checks, semantic judgment, optional revisions, result digest and confinement in an HMAC receipt; rules/skill receipts remain absent | **Mostly met; live cross-provider proof remains** |
 | 20 | Paid-review continuity | Review runs exist, but no specific paid-review workflow or continuity layer | **Mostly absent / not prioritized** |
 | 21 | Local-first operation | Durable file-backed state and static artifacts are foundational | **Strongly met** |
 | 22 | Meeting-to-code traceability | No dedicated workflow | **Absent / intentionally out of scope so far** |
@@ -245,11 +284,14 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   modes, explicit in-place/uncontained execution, previews, and chain
   extension remain process-owned and need preservation or intentional
   retirement.
-- **Crash-window closure**: guarded launch records the intended attempt before
-  spawn and releases it only after exact linkage. Pre-release crashes relaunch
-  the same attempt; post-release recovery requires matching boot and
-  process-start identity or fails closed. Same-ID root mappings and reserved
-  Campaign sub-plan IDs are recoverable without replanning.
+- **Outer-worker crash-window closure**: the supervisor records the prepared
+  launch and attempt before spawn. The worker blocks on a private pipe until
+  its metadata and `ChildLinked` event are durable. A pre-release crash can
+  relaunch the same logical attempt. Post-release recovery also requires a
+  valid release acknowledgement tied to that linked launch, plus matching boot
+  and process-start identity. Missing or conflicting evidence fails closed.
+  Same-ID root mappings and reserved Campaign sub-plan IDs are recoverable
+  without replanning.
 - **Aggregate advanced budgets**: root planner spend/wall usage is embedded
   before child work, restored after mapping crashes, subtracted from the Job
   policy and divided across children. Typed Graph/Campaign budget exhaustion
@@ -257,10 +299,12 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 - **Provider parity**: structured events, context accounting, steering and approvals differ across adapters.
 - **Fault injection and measurement**: the repository has deterministic tests
   for protocol corruption, lease races and reclaim, protected paths, receipt
-  tampering, promotion refusal and service rendering. The credential-free
-  adversarial runner records 7 passes and 0 failures. The 24-row live operator
-  kit records 2 attempts, 22 not run, and 0 verified. It has no reboot trial or
-  measured false-accept and false-reject rates.
+  tampering, promotion refusal and service rendering. The real macOS
+  public-command end-to-end test proves the contained two-phase Seatbelt gate.
+  The credential-free adversarial runner records 7 passes and 0 failures. The
+  24-row live operator kit records 2 attempted tasks, 22 not run, and 0
+  verified. It has no live Linux/bubblewrap or Docker gate trial, reboot trial,
+  or measured false-accept and false-reject rates.
 
 ### Product bets needing validation
 
@@ -337,9 +381,11 @@ paths, tests, changelog, goal and rider history, [`PRODUCT.md`](../PRODUCT.md),
 
 The map is intentionally stricter than milestone labels such as “closed” or
 “stable”: those labels demonstrate implementation progress, while this
-document asks whether the operator outcome is actually met. Unit and
-integration tests and the all-`not_run` 24-row dogfood kit do not establish
-successful reboot recovery, live cross-provider behavior, or
-false-accept/false-reject rates. Market maturity, frequency of use and
+document asks whether the operator outcome is actually met. The real macOS
+public-command gate trial proves the contained two-phase Seatbelt path. Unit and
+integration tests and the 24-row dogfood result, with 2 attempted tasks, 22 not
+run and 0 verified, do not establish live Linux/bubblewrap or Docker gate
+containment, successful reboot recovery, live cross-provider behavior, or
+false-accept and false-reject rates. Market maturity, frequency of use and
 willingness to pay cannot be inferred from this repository and remain
 validation questions.

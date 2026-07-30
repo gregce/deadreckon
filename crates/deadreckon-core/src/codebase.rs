@@ -9,6 +9,7 @@ use crate::paths::{DeadreckonPaths, sanitize_slug, workspace_scope};
 
 pub const CODEBASE_RECORD_VERSION: u32 = 1;
 pub const CODEBASE_RECORD_PATH: &str = ".deadreckon/codebase.json";
+pub const TRUSTED_CODEBASE_RECORD: &str = "codebase.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -287,6 +288,7 @@ pub fn copy_source_to_working(source: &Path, working_dir: &Path) -> Result<()> {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .follow_links(false)
         .build()
         .filter_map(std::result::Result::ok)
     {
@@ -296,16 +298,128 @@ pub fn copy_source_to_working(source: &Path, working_dir: &Path) -> Result<()> {
         }
         let relative = path.strip_prefix(source).unwrap_or(path);
         let dest = working_dir.join(relative);
-        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
-            std::fs::create_dir_all(&dest).with_path(&dest)?;
-        } else if entry.file_type().is_some_and(|kind| kind.is_file()) {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).with_path(parent)?;
-            }
-            std::fs::copy(path, &dest).with_path(path)?;
+        let metadata = std::fs::symlink_metadata(path).with_path(path)?;
+        let file_type = metadata.file_type();
+        if file_type.is_dir() {
+            ensure_copy_directory(&dest)?;
+        } else if file_type.is_file() {
+            copy_source_file(path, &dest, &metadata)?;
+        } else if file_type.is_symlink() {
+            copy_source_symlink(path, &dest, &file_type)?;
+        } else {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "unsupported filesystem entry while copying source {}",
+                path.display()
+            )));
         }
     }
     Ok(())
+}
+
+fn ensure_copy_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => {
+            remove_copy_destination(path)?;
+            std::fs::create_dir(path).with_path(path)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path).with_path(path)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn copy_source_file(source: &Path, destination: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        ensure_copy_directory(parent)?;
+    }
+    remove_copy_destination_if_present(destination)?;
+    std::fs::copy(source, destination).with_path(source)?;
+    // `fs::copy` does not promise identical metadata behavior on every
+    // platform. Reapplying the supported permission representation preserves
+    // executable mode on Unix.
+    std::fs::set_permissions(destination, metadata.permissions()).with_path(destination)
+}
+
+fn copy_source_symlink(
+    source: &Path,
+    destination: &Path,
+    file_type: &std::fs::FileType,
+) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        ensure_copy_directory(parent)?;
+    }
+    remove_copy_destination_if_present(destination)?;
+    let target = std::fs::read_link(source).with_path(source)?;
+    create_source_symlink(source, &target, destination, file_type)
+}
+
+#[cfg(unix)]
+fn create_source_symlink(
+    _source: &Path,
+    target: &Path,
+    destination: &Path,
+    _file_type: &std::fs::FileType,
+) -> Result<()> {
+    std::os::unix::fs::symlink(target, destination).with_path(destination)
+}
+
+#[cfg(windows)]
+fn create_source_symlink(
+    source: &Path,
+    target: &Path,
+    destination: &Path,
+    file_type: &std::fs::FileType,
+) -> Result<()> {
+    use std::os::windows::fs::FileTypeExt;
+
+    if file_type.is_symlink_dir() {
+        std::os::windows::fs::symlink_dir(target, destination).with_path(destination)
+    } else if file_type.is_symlink_file() {
+        std::os::windows::fs::symlink_file(target, destination).with_path(destination)
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "unsupported symbolic link while copying source {}",
+            source.display()
+        )))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_source_symlink(
+    source: &Path,
+    _target: &Path,
+    _destination: &Path,
+    _file_type: &std::fs::FileType,
+) -> Result<()> {
+    Err(DeadreckonError::InvalidInput(format!(
+        "symbolic links are unsupported while copying source {}",
+        source.display()
+    )))
+}
+
+fn remove_copy_destination_if_present(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => remove_copy_destination(path),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn remove_copy_destination(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).with_path(path)?;
+    if metadata.file_type().is_dir() {
+        std::fs::remove_dir_all(path).with_path(path)
+    } else {
+        std::fs::remove_file(path).with_path(path)
+    }
 }
 
 pub fn preview_git_state(path: &Path) -> Result<Option<PreviewGitState>> {
@@ -394,6 +508,43 @@ pub fn read_codebase_record(working_dir: &Path) -> Result<CodebaseRecord> {
     let path = codebase_record_path(working_dir);
     let data = std::fs::read(&path).with_path(&path)?;
     serde_json::from_slice(&data).with_json_path(path)
+}
+
+/// Persist the lifecycle routing record outside the agent-visible workspace.
+///
+/// The workspace copy remains useful to docs and legacy commands, but delivery
+/// and receipt code should prefer this control-plane copy so a provider cannot
+/// redirect `finish` by editing `.deadreckon/codebase.json`.
+pub fn write_trusted_codebase_record(run_root: &Path, record: &CodebaseRecord) -> Result<()> {
+    let path = run_root.join(TRUSTED_CODEBASE_RECORD);
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(record).map_err(|source| DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })?,
+    )
+    .with_path(path)
+}
+
+pub fn read_trusted_codebase_record(run_root: &Path) -> Result<CodebaseRecord> {
+    let path = run_root.join(TRUSTED_CODEBASE_RECORD);
+    let data = std::fs::read(&path).with_path(&path)?;
+    serde_json::from_slice(&data).with_json_path(path)
+}
+
+pub fn read_run_codebase_record(run_root: &Path, working_dir: &Path) -> Result<CodebaseRecord> {
+    read_trusted_codebase_record(run_root).or_else(|error| {
+        if matches!(
+            &error,
+            DeadreckonError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound
+        ) {
+            read_codebase_record(working_dir)
+        } else {
+            Err(error)
+        }
+    })
 }
 
 pub fn find_git_root(path: &Path) -> Result<Option<PathBuf>> {
@@ -582,5 +733,103 @@ fn canonical_or_self(path: &Path) -> Result<PathBuf> {
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+#[cfg(test)]
+mod trusted_record_tests {
+    use tempfile::TempDir;
+
+    use super::{
+        CodebaseMode, CodebaseRecord, copy_source_to_working, read_run_codebase_record,
+        write_codebase_record, write_trusted_codebase_record,
+    };
+
+    #[test]
+    fn run_record_prefers_control_plane_copy_over_workspace_tampering() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().join("run");
+        let working = temp.path().join("working");
+        std::fs::create_dir_all(&run_root).expect("run root");
+        std::fs::create_dir_all(&working).expect("working");
+        let trusted = CodebaseRecord::fresh();
+        write_codebase_record(&working, &trusted).expect("workspace record");
+        write_trusted_codebase_record(&run_root, &trusted).expect("trusted record");
+
+        let mut tampered = trusted.clone();
+        tampered.mode = CodebaseMode::InPlace;
+        tampered.source_path = Some(temp.path().join("redirected-source"));
+        write_codebase_record(&working, &tampered).expect("tampered workspace record");
+
+        assert_eq!(
+            read_run_codebase_record(&run_root, &working).expect("run record"),
+            trusted
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_source_preserves_symlinks_and_executable_mode_without_following() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let working = temp.path().join("working");
+        std::fs::create_dir_all(source.join("bin")).expect("source bin");
+        std::fs::create_dir_all(source.join("target")).expect("ignored target");
+        std::fs::write(source.join("bin/tool"), "#!/bin/sh\nexit 0\n").expect("tool");
+        std::fs::set_permissions(
+            source.join("bin/tool"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .expect("tool mode");
+        symlink("../missing-outside-secret", source.join("outside-link")).expect("source link");
+        std::fs::write(source.join("target/ignored"), "ignored\n").expect("ignored file");
+
+        copy_source_to_working(&source, &working).expect("copy source");
+
+        let copied_link = working.join("outside-link");
+        assert!(
+            std::fs::symlink_metadata(&copied_link)
+                .expect("copied link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&copied_link).expect("raw copied target"),
+            std::path::Path::new("../missing-outside-secret")
+        );
+        assert_eq!(
+            std::fs::metadata(working.join("bin/tool"))
+                .expect("copied tool")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert!(!working.join("target").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_source_rejects_unsupported_special_files() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let working = temp.path().join("working");
+        std::fs::create_dir_all(&source).expect("source");
+        let _listener = UnixListener::bind(source.join("provider.sock")).expect("socket");
+
+        let error =
+            copy_source_to_working(&source, &working).expect_err("special file must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported filesystem entry while copying source"),
+            "{error}"
+        );
+        assert!(!working.join("provider.sock").exists());
     }
 }

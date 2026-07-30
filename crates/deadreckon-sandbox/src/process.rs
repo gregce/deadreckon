@@ -1,13 +1,16 @@
+#[cfg(unix)]
+use std::io;
 use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 use crate::backend::{Result, SandboxBackend, SandboxError};
 use crate::commands::build_command;
-use crate::spec::SandboxSpec;
+use crate::spec::{GuardedLaunchSpec, SandboxSpec};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRunOutput {
@@ -21,51 +24,172 @@ pub struct SandboxRunOutput {
 
 pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let command = build_command(&spec)?;
-    let mut child = Command::new(&command.program)
-        .args(&command.args)
+    let guarded = validate_guarded_launch(&spec)?;
+    let guarded_release = guarded.as_ref().map(|guard| {
+        let token = format!("{}:{}", guard.launch_id, Uuid::new_v4());
+        let digest = deadreckon_core::flight::sha256_text(&token);
+        (token, digest)
+    });
+    let mut process =
+        if let (Some(guard), Some((_, digest))) = (guarded.as_ref(), guarded_release.as_ref()) {
+            let pid_file = spec.pid_file.as_ref().ok_or_else(|| {
+                SandboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "guarded sandbox launch requires a pid file",
+                ))
+            })?;
+            let mut process = Command::new(&guard.program);
+            process
+                .arg("guarded-exec")
+                .arg("--metadata")
+                .arg(pid_file)
+                .arg("--launch-id")
+                .arg(&guard.launch_id)
+                .arg("--attempt")
+                .arg(guard.attempt.to_string())
+                .arg("--release-token-sha256")
+                .arg(digest)
+                .arg("--")
+                .arg(&command.program)
+                .args(&command.args);
+            process
+        } else {
+            let mut process = Command::new(&command.program);
+            process.args(&command.args);
+            process
+        };
+    process
         .current_dir(&command.cwd)
         .envs(&command.env)
-        .stdin(if spec.stdin.is_some() {
+        // Signing inputs belong only to the trusted gate-signing phase. The
+        // common sandbox boundary must scrub inherited copies even when the
+        // caller did not put them in `SandboxSpec::env`.
+        .env_remove(deadreckon_core::GATE_KEY_ENV)
+        .env_remove(deadreckon_core::GATE_CONTAINED_ENV)
+        .env_remove(deadreckon_core::GATE_SANDBOX_BACKEND_ENV)
+        .stdin(if spec.stdin.is_some() || guarded.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    // A guarded helper must remain in the worker's existing group until its
+    // identity is durable. It creates the fresh group itself only after the
+    // private release capability is validated.
+    configure_process_tree(
+        &mut process,
+        spec.cleanup_process_group && guarded.is_none(),
+    );
+    let mut child = process.spawn()?;
     let pid = child.id();
-    let stdin_task = spec.stdin.take().and_then(|bytes| {
-        child.stdin.take().map(|mut stdin| {
-            tokio::spawn(async move {
-                stdin.write_all(&bytes).await?;
-                stdin.shutdown().await
-            })
-        })
-    });
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(read_pipe(stdout));
     let stderr_task = tokio::spawn(read_pipe(stderr));
-    if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
-        if let Some(parent) = pid_file.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+    let mut guarded_identity = None;
+    if let (Some(pid), Some(pid_file), Some(guard), Some((token, digest))) = (
+        pid,
+        spec.pid_file.as_ref(),
+        guarded.as_ref(),
+        guarded_release.as_ref(),
+    ) {
+        let record = match deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess { pid, pgid: None },
+            guard.launch_id.clone(),
+            guard.attempt,
+            guard.owner_launch_id.clone(),
+            digest.clone(),
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                signal_process(pid, true, false);
+                let _ = child.wait().await;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = deadreckon_core::write_supervised_process_record(pid_file, &record) {
+            signal_process(pid, true, false);
+            let _ = child.wait().await;
+            return Err(error.into());
         }
-        tokio::fs::write(pid_file, format!("{pid}\n")).await?;
+        guarded_identity = Some((guard.launch_id.clone(), pid));
+        let Some(mut release) = child.stdin.take() else {
+            signal_process(pid, true, false);
+            let _ = child.wait().await;
+            remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+            return Err(SandboxError::Io(std::io::Error::other(
+                "guarded sandbox helper did not expose its release pipe",
+            )));
+        };
+        if let Err(error) = async {
+            release.write_all(token.as_bytes()).await?;
+            release.write_all(b"\n").await?;
+            release.shutdown().await
+        }
+        .await
+        {
+            signal_process(pid, true, false);
+            let _ = child.wait().await;
+            remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+            return Err(error.into());
+        }
+    } else if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
+        if spec.cleanup_process_group {
+            deadreckon_core::write_supervised_process(
+                pid_file,
+                deadreckon_core::SupervisedProcess {
+                    pid,
+                    pgid: Some(pid),
+                },
+            )?;
+        } else {
+            if let Some(parent) = pid_file.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(pid_file, format!("{pid}\n")).await?;
+        }
     }
+    let stdin_task = if guarded.is_none() {
+        spec.stdin.take().and_then(|bytes| {
+            child.stdin.take().map(|mut stdin| {
+                tokio::spawn(async move {
+                    stdin.write_all(&bytes).await?;
+                    stdin.shutdown().await
+                })
+            })
+        })
+    } else {
+        None
+    };
     let status = if let Some(token) = spec.cancellation_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
                 if let Some(pid) = pid {
-                    signal_pid(pid, false);
+                    if guarded.is_some() {
+                        // Before release the guard is a raw child in the outer
+                        // group; after release it is the leader of its own
+                        // group. Target both identities to close that race.
+                        signal_process(pid, false, true);
+                        signal_process(pid, false, false);
+                    } else {
+                        signal_process(pid, false, spec.cleanup_process_group);
+                    }
                     sleep(Duration::from_secs(2)).await;
                     if child.try_wait()?.is_none() {
-                        signal_pid(pid, true);
+                        if guarded.is_some() {
+                            signal_process(pid, true, true);
+                            signal_process(pid, true, false);
+                        } else {
+                            signal_process(pid, true, spec.cleanup_process_group);
+                        }
                     }
                 }
                 let _ = child.wait().await;
-                if let Some(pid_file) = spec.pid_file.as_ref() {
-                    let _ = tokio::fs::remove_file(pid_file).await;
+                if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
+                    cleanup_residual_process_tree(pid).await?;
                 }
+                remove_pid_file(&spec, guarded_identity.as_ref()).await?;
                 return Err(SandboxError::Cancelled);
             }
             status = child.wait() => status
@@ -73,6 +197,12 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     } else {
         child.wait().await
     }?;
+    // A check can exit its direct shell while leaving background descendants
+    // alive. Clean the process group before consuming output or returning
+    // control to a caller that may subsequently read a signing key.
+    if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
+        cleanup_residual_process_tree(pid).await?;
+    }
     let stdout = stdout_task
         .await
         .unwrap_or_else(|err| Ok(format!("stdout join error: {err}")))?;
@@ -84,9 +214,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             .await
             .unwrap_or_else(|err| Err(std::io::Error::other(format!("stdin join error: {err}"))))?;
     }
-    if let Some(pid_file) = spec.pid_file.as_ref() {
-        let _ = tokio::fs::remove_file(pid_file).await;
-    }
+    remove_pid_file(&spec, guarded_identity.as_ref()).await?;
     Ok(SandboxRunOutput {
         backend: command.backend,
         pid,
@@ -95,6 +223,106 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         stderr,
         warning: command.warning,
     })
+}
+
+fn validate_guarded_launch(spec: &SandboxSpec) -> Result<Option<GuardedLaunchSpec>> {
+    let Some(guard) = spec.guarded_launch.clone() else {
+        return Ok(None);
+    };
+    if !spec.cleanup_process_group
+        || spec.pid_file.is_none()
+        || spec.stdin.is_some()
+        || guard.program.is_empty()
+        || guard.launch_id.trim().is_empty()
+        || guard.attempt == 0
+    {
+        return Err(SandboxError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "guarded sandbox launch requires cleanup, a pid file, no command stdin, and complete launch identity",
+        )));
+    }
+    Ok(Some(guard))
+}
+
+async fn remove_pid_file(
+    spec: &SandboxSpec,
+    guarded_identity: Option<&(String, u32)>,
+) -> Result<()> {
+    let Some(path) = spec.pid_file.as_ref() else {
+        return Ok(());
+    };
+    if let Some((launch_id, pid)) = guarded_identity {
+        deadreckon_core::remove_supervised_process_record_if_matches(path, launch_id, *pid)?;
+    } else {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_process_tree(command: &mut Command, cleanup_process_group: bool) {
+    use std::os::unix::process::CommandExt as _;
+
+    if cleanup_process_group {
+        command.as_std_mut().process_group(0);
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_tree(_command: &mut Command, _cleanup_process_group: bool) {}
+
+#[cfg(unix)]
+async fn cleanup_residual_process_tree(pid: u32) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| SandboxError::Io(io::Error::other("sandbox process id exceeds i32")))?;
+    if pid <= 0 {
+        return Err(SandboxError::Io(io::Error::other(
+            "sandbox process id must be positive",
+        )));
+    }
+    let group = Pid::from_raw(-pid);
+    match kill(group, None) {
+        Err(Errno::ESRCH) => return Ok(()),
+        Ok(()) => {}
+        Err(error) => return Err(process_tree_error("inspect", pid, error)),
+    }
+    match kill(group, Some(Signal::SIGTERM)) {
+        Err(Errno::ESRCH) => return Ok(()),
+        Ok(()) => {}
+        Err(error) => return Err(process_tree_error("terminate", pid, error)),
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < deadline {
+        match kill(group, None) {
+            Err(Errno::ESRCH) | Err(Errno::EPERM) => return Ok(()),
+            Ok(()) => sleep(Duration::from_millis(10)).await,
+            Err(error) => return Err(process_tree_error("inspect", pid, error)),
+        }
+    }
+    match kill(group, Some(Signal::SIGKILL)) {
+        Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => Ok(()),
+        Err(error) => Err(process_tree_error("kill", pid, error)),
+    }
+}
+
+#[cfg(not(unix))]
+async fn cleanup_residual_process_tree(_pid: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_tree_error(operation: &str, pid: i32, error: nix::errno::Errno) -> SandboxError {
+    SandboxError::Io(io::Error::other(format!(
+        "failed to {operation} sandbox process group {pid}: {error}"
+    )))
 }
 
 async fn read_pipe<R>(pipe: Option<R>) -> std::io::Result<String>
@@ -110,7 +338,7 @@ where
 }
 
 #[cfg(unix)]
-fn signal_pid(pid: u32, force: bool) {
+fn signal_process(pid: u32, force: bool, process_group: bool) {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
@@ -119,8 +347,11 @@ fn signal_pid(pid: u32, force: bool) {
     } else {
         Signal::SIGTERM
     };
-    let _ = kill(Pid::from_raw(pid as i32), Some(signal));
+    if let Ok(pid) = i32::try_from(pid) {
+        let target = if process_group { -pid } else { pid };
+        let _ = kill(Pid::from_raw(target), Some(signal));
+    }
 }
 
 #[cfg(not(unix))]
-fn signal_pid(_pid: u32, _force: bool) {}
+fn signal_process(_pid: u32, _force: bool, _process_group: bool) {}

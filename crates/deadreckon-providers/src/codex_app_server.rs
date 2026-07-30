@@ -1222,6 +1222,8 @@ fn app_server_launch_command(spec: &CodexAppServerSpec) -> Result<AppServerLaunc
         write_denylist: Vec::new(),
         network_allowlist: policy.network_allowlist,
         workspace_access: spec.workspace_access,
+        cleanup_process_group: false,
+        guarded_launch: None,
     })
     .map_err(|source| ProviderError::Cli {
         provider: spec.provider.clone(),

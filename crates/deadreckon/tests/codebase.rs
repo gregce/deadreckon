@@ -2470,6 +2470,7 @@ fn write_same_id_job(
             max_attempts: 1,
             deadline: None,
             semantic_judge: SemanticJudgeMode::Required,
+            execution: None,
         },
     };
     write_job(paths, &job).expect("job");

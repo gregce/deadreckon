@@ -147,6 +147,7 @@ impl Fixture {
                 max_attempts: 2,
                 deadline: None,
                 semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
             },
         };
         write_job(&self.paths, &job).expect("write job");

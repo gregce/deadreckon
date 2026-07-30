@@ -764,9 +764,7 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 }
 
 fn ignored_relative(path: &Path) -> bool {
-    path.components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == ".deadreckon")
+    !crate::artifact_policy::is_deliverable_workspace_path(path)
 }
 
 fn change_verb(change: TouchedChange) -> &'static str {
@@ -938,13 +936,27 @@ mod tests {
     }
 
     #[test]
-    fn touched_files_excludes_deadreckon_subtree() {
-        let (_temp, state) = fixture_run("deadreckon excluded");
+    fn touched_files_excludes_lifecycle_and_provider_evidence_subtrees() {
+        let (_temp, state) = fixture_run("private paths excluded");
         std::fs::create_dir_all(state.working_dir.join(".deadreckon")).expect("dir");
+        std::fs::create_dir_all(state.working_dir.join(".specstory/history")).expect("private dir");
         std::fs::write(state.working_dir.join(".deadreckon/RUN.md"), "generated\n").expect("doc");
+        std::fs::write(
+            state.working_dir.join(".specstory/history/session.md"),
+            "private\n",
+        )
+        .expect("private");
         snapshot_working(&state, 0).expect("snapshot");
         std::fs::remove_file(state.working_dir.join(".deadreckon/RUN.md")).expect("delete");
-        record_files(&state, vec![state.working_dir.join(".deadreckon/RUN.md")]);
+        std::fs::remove_file(state.working_dir.join(".specstory/history/session.md"))
+            .expect("delete private");
+        record_files(
+            &state,
+            vec![
+                state.working_dir.join(".deadreckon/RUN.md"),
+                state.working_dir.join(".specstory/history/session.md"),
+            ],
+        );
 
         let touched = super::touched_files(&state.run_root, &state.working_dir).expect("touched");
 
@@ -1026,7 +1038,7 @@ mod tests {
         }];
         let coverage = super::check_coverage(&checks, working_dir).expect("coverage");
         coverage.iter().any(|item| {
-            item.path == PathBuf::from(test_rel)
+            item.path == std::path::Path::new(test_rel)
                 && item.classification == CoverageClassification::Test
         })
     }

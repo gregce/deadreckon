@@ -1359,6 +1359,7 @@ mod tests {
                     max_attempts: 2,
                     deadline: None,
                     semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
                 },
             },
             projection: deadreckon_core::JobProjection {

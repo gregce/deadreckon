@@ -21,8 +21,8 @@ use deadreckon_core::flight::{
 use deadreckon_core::{
     CodebaseMode, CodebaseRecord, DeadreckonPaths, PhaseId, PhaseStatus, PipelineState, RunOptions,
     RunStatus, acquire_lock, append_spend, append_trace, create_run, emit_event, list_runs,
-    load_run, promote_completed_run, read_codebase_record, save_state, snapshot_working,
-    write_acceptance_marker, write_codebase_record,
+    load_run, promote_completed_run, read_codebase_record, read_trusted_codebase_record,
+    save_state, snapshot_working, write_acceptance_marker,
 };
 use deadreckon_protocol::{RunEventKind, SpendRecord, TraceRecord};
 use serde::Deserialize;
@@ -61,7 +61,11 @@ fn materialize_copies_library_to_dest() {
         )),
         "{stdout}"
     );
-    assert!(stdout.contains(&dest.display().to_string()), "{stdout}");
+    let resolved_dest = fs::canonicalize(&dest).expect("resolved dest");
+    assert!(
+        stdout.contains(&resolved_dest.display().to_string()),
+        "{stdout}"
+    );
     assert!(!stdout.contains("try:"), "{stdout}");
     assert_eq!(
         fs::read_to_string(dest.join("app.txt")).expect("app"),
@@ -292,7 +296,8 @@ fn materialize_records_reverse_marker_in_library() {
             .join(".materialized-to"),
     )
     .expect("reverse marker");
-    assert!(marker.contains(&dest.display().to_string()));
+    let resolved_dest = fs::canonicalize(&dest).expect("resolved dest");
+    assert!(marker.contains(&resolved_dest.display().to_string()));
 }
 
 #[test]
@@ -311,6 +316,196 @@ fn materialize_refuses_dest_inside_runstate() {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains("refusing to export back into runstate"));
+}
+
+#[cfg(unix)]
+#[test]
+fn export_overwrite_refuses_symlink_alias_to_runstate_without_touching_state() {
+    use std::os::unix::fs::symlink;
+
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "export runstate alias");
+    let state_path = parent.run_root.join("state.json");
+    let state_before = fs::read(&state_path).expect("state before");
+    let alias = temp.path().join("runstate-alias");
+    symlink(paths.runstate_dir(), &alias).expect("runstate alias");
+
+    let output = deadreckon(&paths)
+        .arg("export")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&alias)
+        .arg("--overwrite")
+        .output()
+        .expect("export");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("refusing to export back into runstate"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&state_path).expect("state after"), state_before);
+    assert!(
+        fs::symlink_metadata(&alias)
+            .expect("alias metadata")
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn export_uses_resolved_destination_without_replacing_safe_symlink_alias() {
+    use std::os::unix::fs::symlink;
+
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "export safe alias");
+    let target = temp.path().join("safe-target");
+    let alias = temp.path().join("safe-alias");
+    fs::create_dir(&target).expect("target");
+    fs::write(target.join("stale.txt"), "stale").expect("stale");
+    symlink(&target, &alias).expect("safe alias");
+
+    let output = deadreckon(&paths)
+        .arg("export")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&alias)
+        .arg("--overwrite")
+        .output()
+        .expect("export");
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(target.join("app.txt")).expect("exported app"),
+        "parent app"
+    );
+    assert!(
+        fs::symlink_metadata(&alias)
+            .expect("alias metadata")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!target.join("stale.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn extend_refuses_symlink_alias_to_runstate_before_creating_child_state() {
+    use std::os::unix::fs::symlink;
+
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "extend runstate alias");
+    let state_path = parent.run_root.join("state.json");
+    let state_before = fs::read(&state_path).expect("state before");
+    let runs_before = list_runs(&paths, None).expect("runs before").len();
+    let alias = temp.path().join("extend-runstate-alias");
+    symlink(paths.runstate_dir(), &alias).expect("runstate alias");
+
+    let output = extend_command(&paths, &parent, "unsafe extension")
+        .arg("--dest")
+        .arg(&alias)
+        .output()
+        .expect("extend");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("refusing to extend back into runstate"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&state_path).expect("state after"), state_before);
+    assert_eq!(
+        list_runs(&paths, None).expect("runs after").len(),
+        runs_before
+    );
+}
+
+#[test]
+fn export_refuses_dotdot_alias_into_runstate() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "export dotdot alias");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).expect("outside");
+    let dest = outside
+        .join("..")
+        .join("home")
+        .join("runstate")
+        .join("dotdot-alias");
+
+    let output = deadreckon(&paths)
+        .arg("export")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(&dest)
+        .output()
+        .expect("export");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("refusing to export back into runstate"),
+        "{stderr}"
+    );
+    assert!(!paths.runstate_dir().join("dotdot-alias").exists());
+}
+
+#[test]
+fn export_refuses_destination_ancestor_that_contains_deadreckon_home() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "export home ancestor");
+    let state_path = parent.run_root.join("state.json");
+    let state_before = fs::read(&state_path).expect("state before");
+
+    let output = deadreckon(&paths)
+        .arg("export")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(temp.path())
+        .output()
+        .expect("export");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("refusing to export back into runstate"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&state_path).expect("state after"), state_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn export_fails_closed_on_dangling_destination_alias() {
+    use std::os::unix::fs::symlink;
+
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "export dangling alias");
+    let state_path = parent.run_root.join("state.json");
+    let state_before = fs::read(&state_path).expect("state before");
+    let alias = temp.path().join("dangling-alias");
+    symlink(temp.path().join("missing-target"), &alias).expect("dangling alias");
+
+    let output = deadreckon(&paths)
+        .arg("export")
+        .arg(&parent.run_id)
+        .arg("--dest")
+        .arg(alias.join("child"))
+        .arg("--overwrite")
+        .output()
+        .expect("export");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("could not be resolved safely"), "{stderr}");
+    assert_eq!(fs::read(&state_path).expect("state after"), state_before);
+    assert!(
+        fs::symlink_metadata(&alias)
+            .expect("alias metadata")
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1108,6 +1303,40 @@ fn library_search_greps_promoted_run_docs() {
 
     assert_success(&search);
     assert!(stdout(&search).contains(&parent.run_id[..8]));
+}
+
+#[test]
+fn library_search_ignores_private_provider_evidence() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "private evidence is not searchable");
+    let private_history = parent.working_dir.join(".specstory/history");
+    let nested_private_history = parent.working_dir.join(".deadreckon/.specstory");
+    fs::create_dir_all(&private_history).expect("private history");
+    fs::create_dir_all(&nested_private_history).expect("nested private history");
+    for path in [
+        private_history.join("session.md"),
+        nested_private_history.join("session.md"),
+    ] {
+        fs::write(
+            path,
+            "This provider-private artifact contains never-index-private-evidence.",
+        )
+        .expect("private evidence");
+    }
+
+    let search = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .args(["library", "search", "never-index-private-evidence"])
+        .output()
+        .expect("library search private evidence");
+
+    assert_success(&search);
+    let stdout = stdout(&search);
+    assert!(
+        stdout.contains("no-op library search never-index-private-evidence"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains(&parent.run_id[..8]), "{stdout}");
 }
 
 #[test]
@@ -2112,10 +2341,20 @@ fn finish_exports_completed_fresh_run() {
 #[test]
 fn finish_in_place_run_has_one_primary_action_and_demoted_secondary_actions() {
     let temp = repo_tempdir();
-    let (paths, parent) = completed_parent(&temp, "finish in-place parent");
+    let source = temp.path().join("workspace");
     let mut record = CodebaseRecord::fresh();
     record.mode = CodebaseMode::InPlace;
-    write_codebase_record(&parent.working_dir, &record).expect("codebase record");
+    record.source_path = Some(source);
+    let (paths, parent) = completed_parent_at_with_codebase(
+        &temp,
+        "finish in-place parent",
+        "workspace",
+        Some(record.clone()),
+    );
+    assert_eq!(
+        read_trusted_codebase_record(&parent.run_root).expect("trusted codebase record"),
+        record
+    );
 
     let output = deadreckon(&paths)
         .arg("finish")
@@ -2698,7 +2937,12 @@ fn abandon_surface_recommends_inspection_after_removing_worktree() {
         ],
     )
     .expect("worktree add");
-    let mut state = create_run(
+    let mut record = CodebaseRecord::fresh();
+    record.mode = CodebaseMode::Worktree;
+    record.source_git_root = Some(repo.clone());
+    record.worktree_path = Some(worktree.clone());
+    record.branch_name = Some("dr-abandon-test".to_string());
+    let state = create_run(
         &paths,
         RunOptions {
             goal: "abandon surface".to_string(),
@@ -2709,18 +2953,14 @@ fn abandon_surface_recommends_inspection_after_removing_worktree() {
             max_spend_usd: Some(1.0),
             max_wall_seconds: Some(30.0),
             run_id: None,
-            codebase: None,
+            codebase: Some(record.clone()),
         },
     )
     .expect("run");
-    state.working_dir = worktree.clone();
-    save_state(&state).expect("save");
-    let mut record = CodebaseRecord::fresh();
-    record.mode = CodebaseMode::Worktree;
-    record.source_git_root = Some(repo.clone());
-    record.worktree_path = Some(worktree.clone());
-    record.branch_name = Some("dr-abandon-test".to_string());
-    write_codebase_record(&worktree, &record).expect("codebase record");
+    assert_eq!(
+        read_trusted_codebase_record(&state.run_root).expect("trusted codebase record"),
+        record
+    );
 
     let output = deadreckon(&paths)
         .arg("abandon")
@@ -2799,6 +3039,15 @@ fn completed_parent_at(
     goal: &str,
     workspace_name: &str,
 ) -> (DeadreckonPaths, PipelineState) {
+    completed_parent_at_with_codebase(temp, goal, workspace_name, None)
+}
+
+fn completed_parent_at_with_codebase(
+    temp: &TempDir,
+    goal: &str,
+    workspace_name: &str,
+    codebase: Option<CodebaseRecord>,
+) -> (DeadreckonPaths, PipelineState) {
     let home = temp.path().join("home");
     let paths = DeadreckonPaths::from_home(&home);
     let cwd = temp.path().join(workspace_name);
@@ -2814,7 +3063,7 @@ fn completed_parent_at(
             max_spend_usd: Some(1.0),
             max_wall_seconds: Some(30.0),
             run_id: None,
-            codebase: None,
+            codebase,
         },
     )
     .expect("run");

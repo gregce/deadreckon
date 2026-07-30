@@ -1,27 +1,38 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use deadreckon_protocol::{RunEvent, RunEventKind, SpendRecord, TraceRecord};
+use deadreckon_protocol::{JobAuthority, RunEvent, RunEventKind, SpendRecord, TraceRecord};
 use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
-use deadreckon_sandbox::{SandboxBackend, SandboxSpec, ToolSandboxPolicy, run as run_sandbox};
+use deadreckon_sandbox::{
+    GuardedLaunchSpec, ProtectedPathPolicy, SandboxBackend, SandboxSpec, ToolSandboxPolicy,
+    WorkspaceAccess, run as run_sandbox,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::compaction::{append_compaction_record, compact_history, read_compaction_config};
 use crate::error::IoContext;
 use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
+use deadreckon_core::artifact_policy::{
+    delivery_git_exclude_pathspecs, evidence_only_roots, is_deliverable_workspace_path,
+};
 use deadreckon_core::artifacts::{
-    ProvenanceRecord, append_provenance, append_spend, append_trace, inventory_files,
+    ProvenanceRecord, append_provenance, append_spend, append_trace, copy_tree, inventory_files,
     snapshot_working,
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
-use deadreckon_core::codebase::{CodebaseMode, read_codebase_record};
+use deadreckon_core::codebase::{
+    CodebaseMode, CodebaseRecord, read_run_codebase_record, read_trusted_codebase_record,
+    write_trusted_codebase_record,
+};
 use deadreckon_core::docs::{
     IMPLEMENTATION_NOTES_HTML, ImplementationNotesStatus, TurnDocInput, append_turn_doc,
     check_implementation_notes_current, incremental_path, rewrite_templated_docs,
@@ -30,7 +41,7 @@ use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{emit_event, event_preview, tool_args_json};
 use deadreckon_core::flight::FlightSessionStatus;
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
-use deadreckon_core::git::run_git;
+use deadreckon_core::git::{run_git, run_git_with_input};
 use deadreckon_core::paths::DeadreckonPaths;
 use deadreckon_core::promotion::promote_completed_run;
 use deadreckon_core::state::{
@@ -58,6 +69,33 @@ pub struct RunLoopConfig {
     /// constructor leaves it `None`); the CLI sets `Some(..)` to spawn the
     /// in-process narrator sidecar that subscribes to `event_sender`.
     pub narrate: Option<NarratorConfig>,
+}
+
+/// Durable outer launch that owns one strict deterministic-gate evaluation.
+///
+/// A gate evaluator deliberately leaves the worker's process group so the
+/// supervisor can recover it independently. The attempt and outer launch ID
+/// bind that escaped process back to the append-only Job history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateLaunchOwner {
+    attempt: u32,
+    outer_launch_id: String,
+}
+
+impl GateLaunchOwner {
+    pub fn new(attempt: u32, outer_launch_id: impl Into<String>) -> Result<Self> {
+        let outer_launch_id = outer_launch_id.into();
+        if attempt == 0 || Uuid::parse_str(&outer_launch_id).is_err() {
+            return Err(DeadreckonError::InvalidInput(
+                "strict gate requires a valid durable attempt and outer launch identity"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            attempt,
+            outer_launch_id,
+        })
+    }
 }
 
 /// Settings for the live narrator sidecar. Defaults mirror the
@@ -153,13 +191,13 @@ struct ReshapePieceDraft {
     done_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SandboxToml {
     version: u32,
     tools: BTreeMap<String, SandboxTomlTool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SandboxTomlTool {
     #[serde(default)]
     read: Vec<PathBuf>,
@@ -239,6 +277,7 @@ pub async fn run_turn_loop(
             config.event_sender.as_ref(),
             RunEventKind::TurnStarted { turn },
         )?;
+        capture_trusted_turn_head(state, turn)?;
         snapshot_working(state, turn.saturating_sub(1))?;
         let selected_route = router.selected_route_info();
         let selected_provider = config
@@ -571,15 +610,8 @@ pub async fn run_turn_loop(
                 },
             )
             .await?;
-            let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
-            if changed.is_empty() {
-                state.failure_reason =
-                    Some("cli subagent completed without file changes".to_string());
-                state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
-                save_state(state)?;
-                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
-                return Ok(RunLoopOutcome::Failed);
-            }
+            let raw_changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
+            let changed = deliverable_changed_files(state, &raw_changed)?;
             snapshot_working(state, turn)?;
             append_trace(
                 state,
@@ -600,14 +632,17 @@ pub async fn run_turn_loop(
                     }),
                 },
             )?;
-            append_provenance_for_files(
-                state,
-                turn,
-                &tool_call_id,
-                &response.model,
-                changed.clone(),
-            )?;
+            append_provenance_for_files(state, turn, &tool_call_id, &response.model, raw_changed)?;
             commit_worktree_turn(state, turn, "cli_subagent")?;
+            if changed.is_empty() {
+                state.failure_reason = Some(
+                    "cli subagent completed without file changes in the deliverable".to_string(),
+                );
+                state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
+                save_state(state)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
+                return Ok(RunLoopOutcome::Failed);
+            }
             append_turn_doc_checkpoint(
                 state,
                 config.event_sender.as_ref(),
@@ -662,16 +697,35 @@ pub async fn run_turn_loop(
             save_history(state, &history)?;
             save_state(state)?;
             complete_run_docs(state, router, &config).await?;
+            commit_finalized_turn(state, turn)?;
             let Some(marker) = acceptance_gate_passed_or_record_failure(
                 state,
                 config.event_sender.as_ref(),
                 turn,
                 &mut history,
                 config.sandbox_backend,
-            )?
+                &run_token,
+            )
+            .await?
             else {
+                if finish_cancelled_run_if_requested(
+                    state,
+                    &run_token,
+                    config.event_sender.as_ref(),
+                    "run cancelled during deterministic verification",
+                )? {
+                    return Ok(RunLoopOutcome::Killed);
+                }
                 continue;
             };
+            if finish_cancelled_run_if_requested(
+                state,
+                &run_token,
+                config.event_sender.as_ref(),
+                "run cancelled before semantic verification",
+            )? {
+                return Ok(RunLoopOutcome::Killed);
+            }
             match semantic_completion_disposition(
                 state,
                 router,
@@ -679,6 +733,7 @@ pub async fn run_turn_loop(
                 turn,
                 &marker,
                 &mut history,
+                &run_token,
             )
             .await?
             {
@@ -704,6 +759,23 @@ pub async fn run_turn_loop(
                     )?;
                     return Ok(RunLoopOutcome::PausedAtCap);
                 }
+                SemanticCompletionDisposition::Cancelled => {
+                    finish_cancelled_run_if_requested(
+                        state,
+                        &run_token,
+                        config.event_sender.as_ref(),
+                        "run cancelled during semantic verification",
+                    )?;
+                    return Ok(RunLoopOutcome::Killed);
+                }
+            }
+            if finish_cancelled_run_if_requested(
+                state,
+                &run_token,
+                config.event_sender.as_ref(),
+                "run cancelled before promotion",
+            )? {
+                return Ok(RunLoopOutcome::Killed);
             }
             promote_if_ready(state)?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
@@ -798,6 +870,8 @@ pub async fn run_turn_loop(
                     write_denylist: Vec::new(),
                     network_allowlist: policy.network_allowlist,
                     workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
+                    cleanup_process_group: false,
+                    guarded_launch: None,
                 })
                 .await
                 {
@@ -835,14 +909,15 @@ pub async fn run_turn_loop(
                         }),
                     },
                 )?;
-                let changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
+                let raw_changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
+                let changed = deliverable_changed_files(state, &raw_changed)?;
                 snapshot_working(state, turn)?;
                 append_provenance_for_files(
                     state,
                     turn,
                     &tool_call_id,
                     &response.model,
-                    changed.clone(),
+                    raw_changed,
                 )?;
                 commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"))?;
                 append_turn_doc_checkpoint(
@@ -943,10 +1018,7 @@ pub async fn run_turn_loop(
                     save_state(state)?;
                     continue;
                 }
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent).with_path(parent)?;
-                }
-                std::fs::write(&target, content).with_path(&target)?;
+                write_workspace_file_no_follow(&state.working_dir, &path, content.as_bytes())?;
                 append_trace(
                     state,
                     &TraceRecord {
@@ -1060,16 +1132,35 @@ pub async fn run_turn_loop(
                     continue;
                 }
                 complete_run_docs(state, router, &config).await?;
+                commit_finalized_turn(state, turn)?;
                 let Some(marker) = acceptance_gate_passed_or_record_failure(
                     state,
                     config.event_sender.as_ref(),
                     turn,
                     &mut history,
                     config.sandbox_backend,
-                )?
+                    &run_token,
+                )
+                .await?
                 else {
+                    if finish_cancelled_run_if_requested(
+                        state,
+                        &run_token,
+                        config.event_sender.as_ref(),
+                        "run cancelled during deterministic verification",
+                    )? {
+                        return Ok(RunLoopOutcome::Killed);
+                    }
                     continue;
                 };
+                if finish_cancelled_run_if_requested(
+                    state,
+                    &run_token,
+                    config.event_sender.as_ref(),
+                    "run cancelled before semantic verification",
+                )? {
+                    return Ok(RunLoopOutcome::Killed);
+                }
                 match semantic_completion_disposition(
                     state,
                     router,
@@ -1077,6 +1168,7 @@ pub async fn run_turn_loop(
                     turn,
                     &marker,
                     &mut history,
+                    &run_token,
                 )
                 .await?
                 {
@@ -1102,6 +1194,23 @@ pub async fn run_turn_loop(
                         )?;
                         return Ok(RunLoopOutcome::PausedAtCap);
                     }
+                    SemanticCompletionDisposition::Cancelled => {
+                        finish_cancelled_run_if_requested(
+                            state,
+                            &run_token,
+                            config.event_sender.as_ref(),
+                            "run cancelled during semantic verification",
+                        )?;
+                        return Ok(RunLoopOutcome::Killed);
+                    }
+                }
+                if finish_cancelled_run_if_requested(
+                    state,
+                    &run_token,
+                    config.event_sender.as_ref(),
+                    "run cancelled before promotion",
+                )? {
+                    return Ok(RunLoopOutcome::Killed);
                 }
                 promote_if_ready(state)?;
                 state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
@@ -1128,6 +1237,22 @@ pub async fn run_turn_loop(
 
 fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
     state.status == RunStatus::Killed || token.is_cancelled() || cancel_marker_present(state)
+}
+
+fn finish_cancelled_run_if_requested(
+    state: &mut PipelineState,
+    token: &CancellationToken,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    reason: &str,
+) -> Result<bool> {
+    if !should_cancel_run(state, token) {
+        return Ok(false);
+    }
+    state.status = RunStatus::Killed;
+    state.failure_reason = Some(reason.to_string());
+    save_state(state)?;
+    emit_run_completed(state, sender, RunLoopOutcome::Killed)?;
+    Ok(true)
 }
 
 /// Backoff before the single transient-error retry: long enough for a rate
@@ -1403,6 +1528,12 @@ fn safe_working_path(root: &Path, relative: &Path) -> Result<PathBuf> {
             relative.display()
         )));
     }
+    if !is_deliverable_workspace_path(relative) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "write_file path {} is reserved for evidence, lifecycle metadata, or runtime state and is not part of the deliverable\ntry: write a project source, test, or documentation path instead",
+            relative.display()
+        )));
+    }
     Ok(root.join(relative))
 }
 
@@ -1425,37 +1556,221 @@ fn safe_working_path_with_policy(
     )))
 }
 
+fn write_workspace_file_no_follow(root: &Path, relative: &Path, content: &[u8]) -> Result<PathBuf> {
+    let target = safe_working_path(root, relative)?;
+    ensure_real_directory_no_follow(root)?;
+
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut parent = root.to_path_buf();
+    for component in parent_relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                parent.push(part);
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(metadata) => refuse_non_directory_or_symlink(&parent, &metadata)?,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&parent).with_path(&parent)?;
+                        let metadata = std::fs::symlink_metadata(&parent).with_path(&parent)?;
+                        refuse_non_directory_or_symlink(&parent, &metadata)?;
+                    }
+                    Err(source) => {
+                        return Err(DeadreckonError::Io {
+                            path: parent.clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(DeadreckonError::InvalidInput(format!(
+                    "unsafe write path {}",
+                    relative.display()
+                )));
+            }
+        }
+    }
+
+    let file_name = relative.file_name().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "write_file path {} does not name a file",
+            relative.display()
+        ))
+    })?;
+    let leaf = parent.join(file_name);
+    match std::fs::symlink_metadata(&leaf) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(symlink_write_refusal(&leaf));
+        }
+        Ok(metadata) if metadata.is_file() => {
+            let mut temp = tempfile::NamedTempFile::new_in(&parent).with_path(&parent)?;
+            temp.as_file()
+                .set_permissions(metadata.permissions())
+                .with_path(temp.path())?;
+            temp.write_all(content).with_path(temp.path())?;
+            temp.flush().with_path(temp.path())?;
+            temp.persist(&leaf).map_err(|err| DeadreckonError::Io {
+                path: leaf.clone(),
+                source: err.error,
+            })?;
+        }
+        Ok(_) => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "write_file path {} is not a regular file",
+                leaf.display()
+            )));
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&leaf)
+                .with_path(&leaf)?;
+            file.write_all(content).with_path(&leaf)?;
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io { path: leaf, source });
+        }
+    }
+    Ok(target)
+}
+
+fn ensure_real_directory_no_follow(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).with_path(path)?;
+    refuse_non_directory_or_symlink(path, &metadata)
+}
+
+fn refuse_non_directory_or_symlink(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        return Err(symlink_write_refusal(path));
+    }
+    if !metadata.is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "write_file ancestor {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn symlink_write_refusal(path: &Path) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!(
+        "write_file refuses symlink path {} to prevent writes outside the working directory",
+        path.display()
+    ))
+}
+
 fn sandbox_toml_path(state: &PipelineState) -> PathBuf {
     state.run_root.join("sandbox.toml")
 }
 
 fn ensure_sandbox_toml(state: &PipelineState) -> Result<()> {
     let path = sandbox_toml_path(state);
+    let approved = approved_sandbox_toml(state)?;
     if path.exists() {
+        if let Some(expected) = approved {
+            let raw = std::fs::read_to_string(&path).with_path(&path)?;
+            let actual = toml::from_str::<SandboxToml>(&raw).map_err(|err| {
+                DeadreckonError::InvalidInput(format!(
+                    "invalid sandbox.toml: {err}\ntry: inspect {}",
+                    path.display()
+                ))
+            })?;
+            if actual != expected {
+                return Err(DeadreckonError::InvalidInput(
+                    "sandbox.toml no longer matches the immutable approved Job execution policy"
+                        .to_string(),
+                ));
+            }
+        }
         return Ok(());
     }
-    let mut tools = BTreeMap::new();
-    tools.insert(
-        "bash".to_string(),
-        SandboxTomlTool {
-            read: vec![state.working_dir.clone()],
-            write: vec![state.working_dir.clone()],
-            network: Vec::new(),
-        },
-    );
-    tools.insert(
-        "write_file".to_string(),
-        SandboxTomlTool {
-            read: vec![state.working_dir.clone()],
-            write: vec![state.working_dir.clone()],
-            network: Vec::new(),
-        },
-    );
-    let config = SandboxToml { version: 1, tools };
+    let config = approved.unwrap_or_else(|| default_sandbox_toml(state));
     let raw = toml::to_string_pretty(&config).map_err(|err| {
         DeadreckonError::InvalidInput(format!("sandbox.toml encode error: {err}"))
     })?;
     std::fs::write(&path, raw).with_path(&path)
+}
+
+fn default_sandbox_toml(state: &PipelineState) -> SandboxToml {
+    let mut tools = BTreeMap::new();
+    for name in ["bash", "write_file"] {
+        tools.insert(
+            name.to_string(),
+            SandboxTomlTool {
+                read: vec![state.working_dir.clone()],
+                write: vec![state.working_dir.clone()],
+                network: Vec::new(),
+            },
+        );
+    }
+    SandboxToml { version: 1, tools }
+}
+
+fn approved_sandbox_toml(state: &PipelineState) -> Result<Option<SandboxToml>> {
+    let paths = paths_for_state(state)?;
+    if !paths.job_json(&state.run_id).is_file() {
+        return Ok(None);
+    }
+    let job = deadreckon_core::load_job(&paths, &state.run_id)?;
+    let authority_path = paths.job_authority(&state.run_id);
+    if deadreckon_core::flight::sha256_file(&authority_path)? != job.authority_sha256 {
+        return Err(DeadreckonError::InvalidInput(
+            "Job authority changed before execution policy materialization".to_string(),
+        ));
+    }
+    let authority_raw = std::fs::read(&authority_path).with_path(&authority_path)?;
+    let authority: JobAuthority =
+        serde_json::from_slice(&authority_raw).map_err(|source| DeadreckonError::Json {
+            path: authority_path,
+            source,
+        })?;
+    let policy_raw =
+        serde_json::to_string(&job.policy).map_err(|source| DeadreckonError::Json {
+            path: paths.job_json(&state.run_id),
+            source,
+        })?;
+    if deadreckon_core::flight::sha256_text(&policy_raw) != authority.effective_policy_sha256 {
+        return Err(DeadreckonError::InvalidInput(
+            "Job execution policy no longer matches approved authority".to_string(),
+        ));
+    }
+    let execution = job.policy.execution.as_ref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "Job predates immutable execution policy; refusing unattended execution".to_string(),
+        )
+    })?;
+    if !execution.require_containment || execution.sandbox_requested != authority.sandbox_requested
+    {
+        return Err(DeadreckonError::InvalidInput(
+            "Job containment policy no longer matches approved authority".to_string(),
+        ));
+    }
+    let tools = execution
+        .tools
+        .iter()
+        .map(|(name, tool)| {
+            (
+                name.clone(),
+                SandboxTomlTool {
+                    read: tool
+                        .workspace_read
+                        .then(|| state.working_dir.clone())
+                        .into_iter()
+                        .collect(),
+                    write: tool
+                        .workspace_write
+                        .then(|| state.working_dir.clone())
+                        .into_iter()
+                        .collect(),
+                    network: tool.network_allowlist.clone(),
+                },
+            )
+        })
+        .collect();
+    Ok(Some(SandboxToml { version: 1, tools }))
 }
 
 fn load_tool_policy_from_sandbox_toml(
@@ -1663,6 +1978,26 @@ fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Re
         }
     }
     Ok(changed)
+}
+
+fn deliverable_changed_files(state: &PipelineState, changed: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    changed
+        .iter()
+        .filter_map(|path| {
+            let relative = path.strip_prefix(&state.working_dir).map_err(|err| {
+                DeadreckonError::InvalidInput(format!(
+                    "changed path {} is outside working directory {}: {err}",
+                    path.display(),
+                    state.working_dir.display()
+                ))
+            });
+            match relative {
+                Ok(relative) if is_deliverable_workspace_path(relative) => Some(Ok(path.clone())),
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect()
 }
 
 fn file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
@@ -2039,6 +2374,8 @@ async fn complete_run_docs(
             doc_subskills: config.docs.doc_subskills.clone(),
             token_budget: config.docs.token_budget,
             budget_cap_usd: config.docs.budget_cap_usd,
+            sandbox_backend: config.sandbox_backend,
+            commit_docs: false,
             no_llm: config.docs.no_docs,
             force: false,
         },
@@ -2180,49 +2517,179 @@ fn provider_output_name(provider: &str) -> String {
 /// This is also used by the durable graph supervisor after it has copied the
 /// merged artifact into the parent job's result run. It intentionally does
 /// not expose marker construction: only `dr-gate` receives the signing key.
-pub fn run_deterministic_completion_gate(
+pub async fn run_deterministic_completion_gate(
     state: &PipelineState,
     requested_backend: SandboxBackend,
+    launch_owner: Option<&GateLaunchOwner>,
+    cancellation_token: Option<&CancellationToken>,
 ) -> Result<()> {
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DeadreckonError::InvalidInput(
+            "deterministic completion gate cancelled before evaluation".to_string(),
+        ));
+    }
     let gate = gate_binary_path()?;
     let paths = paths_for_state(state)?;
+    let strict_job = paths.job_json(&state.run_id).is_file();
+    let (pid_file, guarded_launch) = if strict_job {
+        let launch_owner = launch_owner.ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "strict gate is missing its durable outer launch identity".to_string(),
+            )
+        })?;
+        let launch_id = Uuid::new_v4().to_string();
+        (
+            state.run_root.join("child-pids").join(format!(
+                "dr-gate-evaluate-{}-{launch_id}.json",
+                launch_owner.attempt
+            )),
+            Some(GuardedLaunchSpec {
+                program: gate.clone().into_os_string(),
+                launch_id,
+                attempt: launch_owner.attempt,
+                owner_launch_id: Some(launch_owner.outer_launch_id.clone()),
+            }),
+        )
+    } else {
+        (
+            state
+                .run_root
+                .join("child-pids")
+                .join("dr-gate-evaluate.pid"),
+            None,
+        )
+    };
+    // Default detection and contract persistence are trusted-controller work.
+    // The keyless evaluator is deliberately read-only outside `working_dir`
+    // and refuses to create or replace this approved input.
+    deadreckon_core::gate::compiled_acceptance_checks(&state.run_root, &state.working_dir)?;
+
+    let mut boundary = ProtectedPathPolicy::for_paths(&paths);
+    boundary.protect_workspace_git_control(&state.working_dir);
+    let mut read_allowlist = vec![state.run_root.clone()];
+    if let Some(parent) = gate.parent() {
+        read_allowlist.push(parent.to_path_buf());
+    }
+    extend_gate_toolchain_reads(&mut read_allowlist);
+    read_allowlist.sort();
+    read_allowlist.dedup();
+    let evaluation = run_sandbox(SandboxSpec {
+        backend: requested_backend,
+        cwd: state.working_dir.clone(),
+        program: gate.clone().into_os_string(),
+        args: vec![
+            "evaluate".into(),
+            "--run".into(),
+            state.run_id.clone().into(),
+            "--run-root".into(),
+            state.run_root.clone().into_os_string(),
+            "--working-dir".into(),
+            state.working_dir.clone().into_os_string(),
+        ],
+        stdin: None,
+        env: BTreeMap::new(),
+        allow_network: false,
+        pid_file: Some(pid_file),
+        cancellation_token: cancellation_token.cloned(),
+        profile_dir: None,
+        read_allowlist,
+        write_allowlist: vec![state.working_dir.clone()],
+        read_denylist: boundary.read_denylist,
+        write_denylist: boundary.write_denylist,
+        network_allowlist: Vec::new(),
+        workspace_access: WorkspaceAccess::ReadWrite,
+        cleanup_process_group: strict_job,
+        guarded_launch,
+    })
+    .await
+    .map_err(|err| sandbox_error(&err))?;
+    if evaluation.status_code != Some(0) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "sandboxed dr-gate evaluation failed: {}{}",
+            evaluation.stdout, evaluation.stderr
+        )));
+    }
+    let contained = evaluation.backend != SandboxBackend::None;
+    if !contained && strict_job {
+        return Err(DeadreckonError::InvalidInput(
+            "deterministic completion gate was not contained; strict Job proof refused".to_string(),
+        ));
+    }
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DeadreckonError::InvalidInput(
+            "deterministic completion gate cancelled before signing".to_string(),
+        ));
+    }
+
+    // Read the key only after the sandbox runner has reaped the evaluator and
+    // terminated residual descendants. The signing phase executes no
+    // repository-controlled checks.
     let gate_key = deadreckon_core::read_gate_key(&paths, &state.run_id)?;
     let encoded_key = deadreckon_core::encode_gate_key(&gate_key)?;
-    let (resolved_backend, _) = deadreckon_sandbox::resolve_backend(requested_backend)
-        .map_err(|err| sandbox_error(&err))?;
-    let output = std::process::Command::new(&gate)
+    let mut signer = std::process::Command::new(&gate);
+    signer
+        .arg("sign")
         .arg("--run")
         .arg(&state.run_id)
         .arg("--run-root")
         .arg(&state.run_root)
         .arg("--working-dir")
         .arg(&state.working_dir)
+        .arg("--evaluation")
+        .arg("-")
+        .arg("--contained")
+        .arg(if contained { "true" } else { "false" })
+        .arg("--sandbox-backend")
+        .arg(evaluation.backend.to_string())
         .env(deadreckon_core::GATE_KEY_ENV, encoded_key)
-        .env(
-            deadreckon_core::GATE_CONTAINED_ENV,
-            if resolved_backend == SandboxBackend::None {
-                "false"
-            } else {
-                "true"
-            },
-        )
-        .env(
-            deadreckon_core::GATE_SANDBOX_BACKEND_ENV,
-            resolved_backend.to_string(),
-        )
-        .output()
+        .env_remove(deadreckon_core::GATE_CONTAINED_ENV)
+        .env_remove(deadreckon_core::GATE_SANDBOX_BACKEND_ENV)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut signer = signer.spawn().map_err(|source| DeadreckonError::Io {
+        path: gate.clone(),
+        source,
+    })?;
+    signer
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            DeadreckonError::InvalidInput("dr-gate signer stdin is unavailable".to_string())
+        })?
+        .write_all(evaluation.stdout.as_bytes())
+        .with_path(&gate)?;
+    let output = signer
+        .wait_with_output()
         .map_err(|source| DeadreckonError::Io {
             path: gate.clone(),
             source,
         })?;
     if !output.status.success() {
         return Err(DeadreckonError::InvalidInput(format!(
-            "dr-gate failed: {}{}",
+            "dr-gate signing failed: {}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )));
     }
     Ok(())
+}
+
+fn extend_gate_toolchain_reads(read_allowlist: &mut Vec<PathBuf>) {
+    for variable in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = std::env::var_os(variable).map(PathBuf::from) {
+            read_allowlist.push(path);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        read_allowlist.push(home.join(".cargo"));
+        read_allowlist.push(home.join(".rustup"));
+    }
+    for program in ["cargo", "rustc", "sh"] {
+        if let Ok(path) = which::which(program) {
+            read_allowlist.push(path);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2231,6 +2698,7 @@ enum SemanticCompletionDisposition {
     Revise,
     NeedsReview,
     BudgetExhausted,
+    Cancelled,
 }
 
 async fn semantic_completion_disposition(
@@ -2240,7 +2708,11 @@ async fn semantic_completion_disposition(
     turn: u32,
     marker: &deadreckon_core::AcceptanceMarker,
     history: &mut Vec<String>,
+    cancellation_token: &CancellationToken,
 ) -> Result<SemanticCompletionDisposition> {
+    if should_cancel_run(state, cancellation_token) {
+        return Ok(SemanticCompletionDisposition::Cancelled);
+    }
     let paths = paths_for_state(state)?;
     if !paths.job_json(&state.run_id).is_file() {
         // Compatibility runs predate Watchkeeper. They keep their historical
@@ -2283,6 +2755,7 @@ async fn semantic_completion_disposition(
                 job.policy.max_wall_seconds as f64 - state.total_wall_seconds,
             ),
         },
+        Some(cancellation_token),
     )
     .await
     {
@@ -2298,6 +2771,9 @@ async fn semantic_completion_disposition(
         }
     };
     record_semantic_judge_accounting(state, turn, config, &semantic_run)?;
+    if should_cancel_run(state, cancellation_token) {
+        return Ok(SemanticCompletionDisposition::Cancelled);
+    }
     let overrun_reason = match semantic_run.budget_exhaustion {
         Some(crate::semantic_judge::SemanticBudgetExhaustion::Spend) => {
             Some("semantic judge exhausted the approved spend cap")
@@ -2513,18 +2989,29 @@ fn record_needs_review(
     save_state(state)
 }
 
-fn acceptance_gate_passed_or_record_failure(
+async fn acceptance_gate_passed_or_record_failure(
     state: &mut PipelineState,
     sender: Option<&broadcast::Sender<RunEvent>>,
     turn: u32,
     history: &mut Vec<String>,
     sandbox_backend: SandboxBackend,
+    cancellation_token: &CancellationToken,
 ) -> Result<Option<deadreckon_core::AcceptanceMarker>> {
-    match run_deterministic_completion_gate(state, sandbox_backend)
-        .and_then(|()| validate_acceptance_marker(state))
+    let launch_owner = gate_launch_owner_from_environment(state)?;
+    match run_deterministic_completion_gate(
+        state,
+        sandbox_backend,
+        launch_owner.as_ref(),
+        Some(cancellation_token),
+    )
+    .await
+    .and_then(|()| validate_acceptance_marker(state))
     {
         Ok(marker) => Ok(Some(marker)),
         Err(err) => {
+            if should_cancel_run(state, cancellation_token) {
+                return Ok(None);
+            }
             let reason = err.to_string();
             append_trace(
                 state,
@@ -2556,40 +3043,1076 @@ fn acceptance_gate_passed_or_record_failure(
     }
 }
 
-fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {
-    let Ok(record) = read_codebase_record(&state.working_dir) else {
-        return Ok(());
-    };
+fn gate_launch_owner_from_environment(state: &PipelineState) -> Result<Option<GateLaunchOwner>> {
+    let paths = paths_for_state(state)?;
+    if !paths.job_json(&state.run_id).is_file() {
+        return Ok(None);
+    }
+    let attempt = std::env::var("DEADRECKON_SUPERVISOR_ATTEMPT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "strict worker gate is missing its durable supervisor attempt identity".to_string(),
+            )
+        })?;
+    let outer_launch_id = std::env::var("DEADRECKON_SUPERVISOR_LAUNCH_ID").map_err(|_| {
+        DeadreckonError::InvalidInput(
+            "strict worker gate is missing its durable supervisor launch identity".to_string(),
+        )
+    })?;
+    GateLaunchOwner::new(attempt, outer_launch_id).map(Some)
+}
+
+fn trusted_turn_head_path(state: &PipelineState, turn: u32) -> PathBuf {
+    state
+        .run_root
+        .join("provider-evidence")
+        .join(format!("turn-{turn}"))
+        .join("result-head-before-provider.txt")
+}
+
+fn trusted_lifecycle_snapshot_path(state: &PipelineState, turn: u32) -> PathBuf {
+    state
+        .run_root
+        .join("provider-evidence")
+        .join(format!("turn-{turn}"))
+        .join("lifecycle-before-provider")
+}
+
+fn trusted_git_control_snapshot_path(state: &PipelineState, turn: u32) -> PathBuf {
+    state
+        .run_root
+        .join("provider-evidence")
+        .join(format!("turn-{turn}"))
+        .join("git-control-before-provider")
+}
+
+#[derive(Debug)]
+struct TrustedGitControl {
+    workspace: PathBuf,
+    workspace_control: PathBuf,
+    snapshot: PathBuf,
+    expected_control: Vec<u8>,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+}
+
+fn capture_trusted_turn_head(state: &PipelineState, turn: u32) -> Result<()> {
+    capture_trusted_lifecycle_metadata(state, turn)?;
+    let record = read_turn_codebase_record(state)?;
+    write_trusted_codebase_record(&state.run_root, &record)?;
     if record.mode != CodebaseMode::Worktree {
         return Ok(());
     }
-    git_status(
-        &state.working_dir,
-        &["config", "user.email", "deadreckon@example.invalid"],
-    )?;
-    git_status(&state.working_dir, &["config", "user.name", "deadreckon"])?;
-    git_status(&state.working_dir, &["add", "-A"])?;
-    if git_quiet(&state.working_dir, &["diff", "--cached", "--quiet"])? {
+    let control = capture_trusted_git_control(state, turn, &record)?;
+    let head = trusted_git_stdout(&control, &["rev-parse", "HEAD"])?;
+    let path = trusted_turn_head_path(state, turn);
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted turn head path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+    if std::fs::read_to_string(&path).is_ok_and(|existing| !existing.trim().is_empty()) {
+        // A process may die after the provider committed but before the turn
+        // sanitizer ran. Preserve the original pre-provider boundary across
+        // restart instead of blessing the provider's current HEAD.
         return Ok(());
     }
-    git_status(
-        &state.working_dir,
-        &["commit", "-m", &format!("turn {turn}: {label}")],
+    std::fs::write(&path, format!("{head}\n")).with_path(path)
+}
+
+fn capture_trusted_git_control(
+    state: &PipelineState,
+    turn: u32,
+    record: &CodebaseRecord,
+) -> Result<TrustedGitControl> {
+    let snapshot = trusted_git_control_snapshot_path(state, turn);
+    let captured = snapshot.with_extension("captured");
+    let expected_control = match std::fs::symlink_metadata(&snapshot) {
+        Ok(metadata) => {
+            require_regular_git_control(&snapshot, &metadata, "trusted Git control snapshot")?;
+            std::fs::read(&snapshot).with_path(&snapshot)?
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if captured.exists() {
+                return Err(DeadreckonError::InvalidInput(format!(
+                    "trusted Git control marker exists without snapshot {}; refusing recovery",
+                    snapshot.display()
+                )));
+            }
+            let workspace_control = state.working_dir.join(".git");
+            let metadata =
+                std::fs::symlink_metadata(&workspace_control).with_path(&workspace_control)?;
+            require_regular_git_control(
+                &workspace_control,
+                &metadata,
+                "linked-worktree .git control",
+            )?;
+            let bytes = std::fs::read(&workspace_control).with_path(&workspace_control)?;
+            // Validate the live record before persisting it as control-plane
+            // truth. A normal repository `.git` directory or a pointer into an
+            // unrelated repository is never accepted for Worktree mode.
+            validate_git_control_record(state, record, &bytes)?;
+            let parent = snapshot.parent().ok_or_else(|| {
+                DeadreckonError::InvalidInput(format!(
+                    "trusted Git control path has no parent: {}",
+                    snapshot.display()
+                ))
+            })?;
+            std::fs::create_dir_all(parent).with_path(parent)?;
+            write_new_file(&snapshot, &bytes)?;
+            bytes
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: snapshot,
+                source,
+            });
+        }
+    };
+    let (git_dir, common_dir) = validate_git_control_record(state, record, &expected_control)?;
+    archive_changed_git_control(state, turn, &expected_control)?;
+    if !captured.exists() {
+        write_new_file(&captured, b"trusted Git control captured\n")?;
+    } else {
+        let metadata = std::fs::symlink_metadata(&captured).with_path(&captured)?;
+        require_regular_git_control(&captured, &metadata, "trusted Git control marker")?;
+    }
+    let control = TrustedGitControl {
+        workspace: state.working_dir.clone(),
+        workspace_control: state.working_dir.join(".git"),
+        snapshot,
+        expected_control,
+        git_dir,
+        common_dir,
+    };
+    restore_and_verify_git_control(&control)?;
+    Ok(control)
+}
+
+fn load_trusted_git_control(
+    state: &PipelineState,
+    turn: u32,
+    record: &CodebaseRecord,
+) -> Result<TrustedGitControl> {
+    let snapshot = trusted_git_control_snapshot_path(state, turn);
+    let captured = snapshot.with_extension("captured");
+    let marker_metadata = std::fs::symlink_metadata(&captured).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            DeadreckonError::NotFound(format!("trusted Git control marker {}", captured.display()))
+        } else {
+            DeadreckonError::Io {
+                path: captured.clone(),
+                source,
+            }
+        }
+    })?;
+    require_regular_git_control(&captured, &marker_metadata, "trusted Git control marker")?;
+    let snapshot_metadata = std::fs::symlink_metadata(&snapshot).with_path(&snapshot)?;
+    require_regular_git_control(
+        &snapshot,
+        &snapshot_metadata,
+        "trusted Git control snapshot",
+    )?;
+    let expected_control = std::fs::read(&snapshot).with_path(&snapshot)?;
+    let (git_dir, common_dir) = validate_git_control_record(state, record, &expected_control)?;
+    archive_changed_git_control(state, turn, &expected_control)?;
+    let control = TrustedGitControl {
+        workspace: state.working_dir.clone(),
+        workspace_control: state.working_dir.join(".git"),
+        snapshot,
+        expected_control,
+        git_dir,
+        common_dir,
+    };
+    restore_and_verify_git_control(&control)?;
+    Ok(control)
+}
+
+fn validate_git_control_record(
+    state: &PipelineState,
+    record: &CodebaseRecord,
+    control: &[u8],
+) -> Result<(PathBuf, PathBuf)> {
+    let recorded_worktree = record.worktree_path.as_deref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "worktree codebase record is missing worktree_path; refusing Git control recovery"
+                .to_string(),
+        )
+    })?;
+    let actual_worktree = state
+        .working_dir
+        .canonicalize()
+        .with_path(&state.working_dir)?;
+    let recorded_worktree = recorded_worktree
+        .canonicalize()
+        .with_path(recorded_worktree)?;
+    if actual_worktree != recorded_worktree {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted worktree {} does not match run working directory {}; refusing Git routing",
+            recorded_worktree.display(),
+            actual_worktree.display()
+        )));
+    }
+
+    let git_dir = parse_gitdir_control(control, &state.working_dir.join(".git"))?;
+    let git_dir = canonical_git_directory(&git_dir, "linked-worktree Git directory")?;
+    let common_dir = resolve_common_git_directory(&git_dir, true)?;
+    let source_root = record.source_git_root.as_deref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "worktree codebase record is missing source_git_root; refusing Git control recovery"
+                .to_string(),
+        )
+    })?;
+    let source_common_dir = resolve_source_common_git_directory(source_root)?;
+    if common_dir != source_common_dir {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "linked-worktree Git control resolves to common directory {}, expected trusted source metadata {}; refusing repository redirection",
+            common_dir.display(),
+            source_common_dir.display()
+        )));
+    }
+    let expected_worktrees = common_dir.join("worktrees");
+    if !git_dir.starts_with(&expected_worktrees) || git_dir == expected_worktrees {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "linked-worktree Git directory {} is outside trusted worktree metadata {}; refusing unexpected control form",
+            git_dir.display(),
+            expected_worktrees.display()
+        )));
+    }
+    Ok((git_dir, common_dir))
+}
+
+fn parse_gitdir_control(bytes: &[u8], control_path: &Path) -> Result<PathBuf> {
+    let line = single_control_line(bytes, control_path, "linked-worktree .git control")?;
+    let raw = line.strip_prefix(b"gitdir: ").ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "{} is not a linked-worktree gitdir control record",
+            control_path.display()
+        ))
+    })?;
+    if raw.is_empty() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "{} has an empty gitdir target",
+            control_path.display()
+        )));
+    }
+    let raw = std::str::from_utf8(raw).map_err(|_| {
+        DeadreckonError::InvalidInput(format!(
+            "{} has a non-UTF-8 gitdir target; refusing ambiguous Git routing",
+            control_path.display()
+        ))
+    })?;
+    let target = PathBuf::from(raw);
+    Ok(if target.is_absolute() {
+        target
+    } else {
+        control_path
+            .parent()
+            .ok_or_else(|| {
+                DeadreckonError::InvalidInput(format!(
+                    "Git control path has no parent: {}",
+                    control_path.display()
+                ))
+            })?
+            .join(target)
+    })
+}
+
+fn single_control_line<'a>(bytes: &'a [u8], path: &Path, label: &str) -> Result<&'a [u8]> {
+    let without_lf = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let line = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
+    if line.is_empty() || line.contains(&b'\n') || line.contains(&b'\r') || line.contains(&0) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "{label} {} has an unexpected multiline or empty form",
+            path.display()
+        )));
+    }
+    Ok(line)
+}
+
+fn canonical_git_directory(path: &Path, label: &str) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(path).with_path(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "{label} {} must be a real directory, not a symlink or other file type",
+            path.display()
+        )));
+    }
+    path.canonicalize().with_path(path)
+}
+
+fn resolve_common_git_directory(git_dir: &Path, require_record: bool) -> Result<PathBuf> {
+    let record = git_dir.join("commondir");
+    let metadata = match std::fs::symlink_metadata(&record) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && !require_record => {
+            return Ok(git_dir.to_path_buf());
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "linked-worktree Git directory {} has no commondir record",
+                git_dir.display()
+            )));
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: record,
+                source,
+            });
+        }
+    };
+    require_regular_git_control(&record, &metadata, "Git commondir record")?;
+    let bytes = std::fs::read(&record).with_path(&record)?;
+    let raw = single_control_line(&bytes, &record, "Git commondir record")?;
+    let raw = std::str::from_utf8(raw).map_err(|_| {
+        DeadreckonError::InvalidInput(format!(
+            "Git commondir record {} is not UTF-8; refusing ambiguous Git routing",
+            record.display()
+        ))
+    })?;
+    let common = PathBuf::from(raw);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        git_dir.join(common)
+    };
+    canonical_git_directory(&common, "common Git directory")
+}
+
+fn resolve_source_common_git_directory(source_root: &Path) -> Result<PathBuf> {
+    let source_control = source_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&source_control).with_path(&source_control)?;
+    if metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted source Git control {} is a symlink; refusing ambiguous Git routing",
+            source_control.display()
+        )));
+    }
+    if metadata.is_dir() {
+        return source_control.canonicalize().with_path(source_control);
+    }
+    if !metadata.is_file() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted source Git control {} has an unexpected file type",
+            source_control.display()
+        )));
+    }
+    let bytes = std::fs::read(&source_control).with_path(&source_control)?;
+    let source_git_dir = parse_gitdir_control(&bytes, &source_control)?;
+    let source_git_dir = canonical_git_directory(&source_git_dir, "trusted source Git directory")?;
+    resolve_common_git_directory(&source_git_dir, true)
+}
+
+fn require_regular_git_control(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    label: &str,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "{label} {} must be a regular file; refusing symlink, directory, or unexpected control form",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn archive_changed_git_control(state: &PipelineState, turn: u32, expected: &[u8]) -> Result<()> {
+    let control = state.working_dir.join(".git");
+    let destination = state
+        .run_root
+        .join("provider-evidence")
+        .join(format!("turn-{turn}"))
+        .join("git-control-after-provider");
+    if destination.exists() {
+        return Ok(());
+    }
+    let metadata = match std::fs::symlink_metadata(&control) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return write_new_file(
+                &destination,
+                b"provider removed linked-worktree .git control\n",
+            );
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: control,
+                source,
+            });
+        }
+    };
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        let actual = std::fs::read(&control).with_path(&control)?;
+        if actual == expected {
+            return Ok(());
+        }
+        return write_new_file(&destination, &actual);
+    }
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&control).with_path(&control)?;
+        return write_new_file(
+            &destination.with_extension("symlink-target"),
+            target.to_string_lossy().as_bytes(),
+        );
+    }
+    let kind = if metadata.is_dir() {
+        "provider replaced linked-worktree .git control with a directory\n"
+    } else {
+        "provider replaced linked-worktree .git control with an unexpected file type\n"
+    };
+    write_new_file(
+        &destination.with_extension("unexpected-kind"),
+        kind.as_bytes(),
     )
 }
 
-fn git_quiet(cwd: &Path, args: &[&str]) -> Result<bool> {
-    let output = run_git(cwd, args)?;
+fn restore_and_verify_git_control(control: &TrustedGitControl) -> Result<()> {
+    let snapshot_metadata =
+        std::fs::symlink_metadata(&control.snapshot).with_path(&control.snapshot)?;
+    require_regular_git_control(
+        &control.snapshot,
+        &snapshot_metadata,
+        "trusted Git control snapshot",
+    )?;
+    let snapshot = std::fs::read(&control.snapshot).with_path(&control.snapshot)?;
+    if snapshot != control.expected_control {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted Git control snapshot {} changed after capture",
+            control.snapshot.display()
+        )));
+    }
+    match std::fs::symlink_metadata(&control.workspace_control) {
+        Ok(metadata) => {
+            require_regular_git_control(
+                &control.workspace_control,
+                &metadata,
+                "linked-worktree .git control",
+            )?;
+            std::fs::remove_file(&control.workspace_control)
+                .with_path(&control.workspace_control)?;
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: control.workspace_control.clone(),
+                source,
+            });
+        }
+    }
+    write_new_file(&control.workspace_control, &control.expected_control)?;
+    let restored_metadata = std::fs::symlink_metadata(&control.workspace_control)
+        .with_path(&control.workspace_control)?;
+    require_regular_git_control(
+        &control.workspace_control,
+        &restored_metadata,
+        "restored linked-worktree .git control",
+    )?;
+    let restored =
+        std::fs::read(&control.workspace_control).with_path(&control.workspace_control)?;
+    if restored != control.expected_control {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "restored linked-worktree Git control {} does not match trusted snapshot",
+            control.workspace_control.display()
+        )));
+    }
+    let git_dir = parse_gitdir_control(&restored, &control.workspace_control)?;
+    let git_dir = canonical_git_directory(&git_dir, "restored linked-worktree Git directory")?;
+    let common_dir = resolve_common_git_directory(&git_dir, true)?;
+    if git_dir != control.git_dir || common_dir != control.common_dir {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "restored linked-worktree Git routing no longer matches trusted metadata; expected {} via {}, found {} via {}",
+            control.common_dir.display(),
+            control.git_dir.display(),
+            common_dir.display(),
+            git_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted control path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_path(path)?;
+    file.write_all(bytes).with_path(path)?;
+    file.sync_all().with_path(path)
+}
+
+fn capture_trusted_lifecycle_metadata(state: &PipelineState, turn: u32) -> Result<()> {
+    let destination = trusted_lifecycle_snapshot_path(state, turn);
+    let captured = destination.with_extension("captured");
+    if captured.is_file() {
+        return Ok(());
+    }
+    remove_workspace_path(&destination)?;
+    let source = state.working_dir.join(".deadreckon");
+    if source.is_dir() {
+        copy_tree(&source, &destination)?;
+    } else {
+        std::fs::create_dir_all(&destination).with_path(&destination)?;
+    }
+    std::fs::write(&captured, b"trusted lifecycle snapshot\n").with_path(captured)
+}
+
+fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {
+    commit_worktree_turn_inner(state, turn, label, true)
+}
+
+/// Commit DeadReckon's final generated documents through the same trusted Git
+/// boundary as provider edits. The coding sanitizer already restored the
+/// pre-provider lifecycle snapshot; retaining it here preserves trusted turn
+/// records written by DeadReckon after that point.
+fn commit_finalized_turn(state: &PipelineState, turn: u32) -> Result<()> {
+    commit_worktree_turn_inner(state, turn, "finalize_docs", false)
+}
+
+fn commit_worktree_turn_inner(
+    state: &PipelineState,
+    turn: u32,
+    label: &str,
+    restore_lifecycle: bool,
+) -> Result<()> {
+    if restore_lifecycle {
+        restore_lifecycle_metadata(state, turn)?;
+    }
+    let record = read_turn_codebase_record(state)?;
+    if record.mode != CodebaseMode::Worktree {
+        return Ok(());
+    }
+    // Load and restore the pre-provider linked-worktree router before invoking
+    // Git. Every Git command below repeats this restoration and also receives
+    // an explicit trusted --git-dir, so a provider-created `.git` redirect is
+    // evidence, never authority.
+    let control = load_trusted_git_control(state, turn, &record)?;
+    let base_sha = record.base_sha.as_deref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "worktree codebase record is missing base_sha; refusing to commit an unbounded result"
+                .to_string(),
+        )
+    })?;
+    let trusted_head = trusted_head_for_turn(state, turn, base_sha, &control)?;
+    // Provider-created commits and index entries are not accepted
+    // capabilities. Always rebuild the index from the trusted pre-provider
+    // head, while retaining filesystem edits as untrusted input for
+    // DeadReckon's own filtered commit. Resetting the whole index also avoids
+    // addressing provider-chosen paths through a lossy string conversion.
+    trusted_git_status(&control, &["reset", "--mixed", &trusted_head])?;
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "worktree codebase record is missing branch_name; refusing detached delivery"
+                .to_string(),
+        )
+    })?;
+    let branch_ref = format!("refs/heads/{branch}");
+    trusted_git_status(&control, &["update-ref", &branch_ref, &trusted_head])?;
+    trusted_git_status(&control, &["symbolic-ref", "HEAD", &branch_ref])?;
+    sanitize_evidence_only_paths(state, turn, base_sha, &control)?;
+    refuse_filtered_deliverables(state, &control)?;
+    let mut add_args = vec!["add", "-A", "--", "."];
+    add_args.extend_from_slice(delivery_git_exclude_pathspecs());
+    trusted_git_status(&control, &add_args)?;
+    refuse_gitlinks(&control)?;
+    if trusted_git_quiet(&control, &["diff", "--cached", "--quiet"])? {
+        verify_evidence_only_paths_clean(base_sha, &control)?;
+        return Ok(());
+    }
+    let disabled_hooks = state.run_root.join("disabled-git-hooks");
+    std::fs::create_dir_all(&disabled_hooks).with_path(&disabled_hooks)?;
+    let disabled_hooks = disabled_hooks.to_string_lossy();
+    trusted_git_status(
+        &control,
+        &[
+            "-c",
+            &format!("core.hooksPath={disabled_hooks}"),
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.email=deadreckon@example.invalid",
+            "-c",
+            "user.name=deadreckon",
+            "commit",
+            "-m",
+            &format!("turn {turn}: {label}"),
+        ],
+    )?;
+    verify_evidence_only_paths_clean(base_sha, &control)
+}
+
+fn read_turn_codebase_record(state: &PipelineState) -> Result<CodebaseRecord> {
+    let paths = paths_for_state(state)?;
+    if paths.job_json(&state.run_id).is_file() {
+        // A Job is born under the strict durable contract. Missing trusted
+        // routing is corruption, not an invitation to bless an agent-visible
+        // workspace record during restart.
+        read_trusted_codebase_record(&state.run_root)
+    } else {
+        // Compatibility runs may predate the trusted record. They can migrate
+        // once, before provider execution, through the historical workspace
+        // copy.
+        read_run_codebase_record(&state.run_root, &state.working_dir)
+    }
+}
+
+fn restore_lifecycle_metadata(state: &PipelineState, turn: u32) -> Result<()> {
+    let trusted = trusted_lifecycle_snapshot_path(state, turn);
+    let working = state.working_dir.join(".deadreckon");
+    if !trusted.exists() {
+        return Err(DeadreckonError::NotFound(format!(
+            "trusted lifecycle snapshot {}",
+            trusted.display()
+        )));
+    }
+    remove_workspace_path(&working)?;
+    copy_tree(&trusted, &working)
+}
+
+fn trusted_head_for_turn(
+    state: &PipelineState,
+    turn: u32,
+    base_sha: &str,
+    control: &TrustedGitControl,
+) -> Result<String> {
+    let path = trusted_turn_head_path(state, turn);
+    let candidate = std::fs::read_to_string(&path)
+        .ok()
+        .map(|head| head.trim().to_string())
+        .filter(|head| !head.is_empty())
+        .unwrap_or_else(|| base_sha.to_string());
+
+    // If this is a resumed legacy run whose previous commits ever touched a
+    // non-deliverable path, rebuild from the approved base. Aggregate tree
+    // cleanliness alone is insufficient because a private blob can survive
+    // in an add-then-delete commit pair.
+    if !non_deliverable_history_paths(control, base_sha, &candidate)?.is_empty() {
+        return Ok(base_sha.to_string());
+    }
+    Ok(candidate)
+}
+
+fn sanitize_evidence_only_paths(
+    state: &PipelineState,
+    turn: u32,
+    base_sha: &str,
+    control: &TrustedGitControl,
+) -> Result<()> {
+    for root in evidence_only_roots() {
+        let source = state.working_dir.join(root);
+        if source.exists() || std::fs::symlink_metadata(&source).is_ok() {
+            archive_evidence_path(state, turn, root, &source)?;
+            remove_workspace_path(&source)?;
+        }
+
+        let base_entries = trusted_git_stdout(
+            control,
+            &["ls-tree", "-r", "--name-only", base_sha, "--", root],
+        )?;
+        if base_entries.is_empty() {
+            let indexed = trusted_git_stdout(control, &["ls-files", "--", root])?;
+            if !indexed.is_empty() {
+                trusted_git_status(control, &["add", "-A", "--", root])?;
+            }
+        } else {
+            trusted_git_status(
+                control,
+                &[
+                    "restore",
+                    "--source",
+                    base_sha,
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    root,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn archive_evidence_path(
+    state: &PipelineState,
+    turn: u32,
+    root: &str,
+    source: &Path,
+) -> Result<()> {
+    let evidence_destination = state
+        .run_root
+        .join("provider-evidence")
+        .join(format!("turn-{turn}"))
+        .join("workspace")
+        .join(root);
+    copy_evidence_path(source, &evidence_destination, root)?;
+    let raw_snapshot_destination = state
+        .run_root
+        .join("snapshots")
+        .join(format!("turn-{turn}-provider-raw"))
+        .join(root);
+    copy_evidence_path(source, &raw_snapshot_destination, root)
+}
+
+fn copy_evidence_path(source: &Path, destination: &Path, root: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(source).with_path(source)?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(source).with_path(source)?;
+        let parent = destination.parent().ok_or_else(|| {
+            DeadreckonError::InvalidInput(format!(
+                "provider evidence path has no parent: {}",
+                destination.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent).with_path(parent)?;
+        let target_record = parent.join(format!("{root}.symlink-target"));
+        return std::fs::write(&target_record, target.to_string_lossy().as_bytes())
+            .with_path(target_record);
+    }
+    if metadata.is_dir() {
+        return copy_tree(source, destination);
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "provider evidence path has no parent: {}",
+            destination.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+    std::fs::copy(source, destination)
+        .with_path(destination)
+        .map(|_| ())
+}
+
+fn remove_workspace_path(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path).with_path(path)
+    } else {
+        std::fs::remove_file(path).with_path(path)
+    }
+}
+
+fn verify_evidence_only_paths_clean(base_sha: &str, control: &TrustedGitControl) -> Result<()> {
+    let head = trusted_git_stdout(control, &["rev-parse", "HEAD"])?;
+    let prohibited = non_deliverable_history_paths(control, base_sha, &head)?;
+    if !prohibited.is_empty() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "non-deliverable paths remain in result history: {}; refusing to seal provider-private or runtime artifacts",
+            display_git_paths(&prohibited)
+        )));
+    }
+    let range = format!("{base_sha}..{head}");
+    for root in evidence_only_roots() {
+        let history = trusted_git_stdout(control, &["log", "--format=%H", &range, "--", root])?;
+        let status = trusted_git_stdout(
+            control,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                root,
+            ],
+        )?;
+        if !trusted_git_quiet(control, &["diff", "--quiet", &range, "--", root])?
+            || !history.is_empty()
+            || !status.is_empty()
+        {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "evidence-only path {root} remains in the result branch; refusing to seal provider-private artifacts"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_gitlinks(control: &TrustedGitControl) -> Result<()> {
+    let output = trusted_git_output(control, &["ls-files", "--stage", "-z", "--"])?;
+    if !output.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "git index-kind inventory failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let gitlinks = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let tab = entry.iter().position(|byte| *byte == b'\t')?;
+            entry[..tab]
+                .starts_with(b"160000 ")
+                .then_some(&entry[tab + 1..])
+        })
+        .map(path_from_git_bytes)
+        .collect::<Result<Vec<_>>>()?;
+    if gitlinks.is_empty() {
+        return Ok(());
+    }
+    Err(DeadreckonError::InvalidInput(format!(
+        "strict result contains unsupported Git submodule entries: {}; stop for review instead of omitting gitlinks from the receipt",
+        display_git_paths(&gitlinks)
+    )))
+}
+
+fn refuse_filtered_deliverables(state: &PipelineState, control: &TrustedGitControl) -> Result<()> {
+    let index = deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)?;
+    let input = git_path_input(index.files.keys())?;
+    if input.is_empty() {
+        return Ok(());
+    }
+    let output =
+        trusted_git_output_with_input(control, &["check-attr", "-z", "--stdin", "filter"], &input)?;
+    if !output.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "git filter-attribute inventory failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let fields = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() % 3 != 0 {
+        return Err(DeadreckonError::InvalidInput(
+            "git filter-attribute inventory returned a malformed record".to_string(),
+        ));
+    }
+    let filtered = fields
+        .chunks_exact(3)
+        .filter(|record| record[2] != b"unspecified")
+        .map(|record| path_from_git_bytes(record[0]))
+        .collect::<Result<Vec<_>>>()?;
+    if filtered.is_empty() {
+        return Ok(());
+    }
+    Err(DeadreckonError::InvalidInput(format!(
+        "strict result applies external Git filter attributes to deliverables: {}; refusing to execute mutable clean or smudge commands",
+        display_git_paths(&filtered)
+    )))
+}
+
+fn non_deliverable_history_paths(
+    control: &TrustedGitControl,
+    base_sha: &str,
+    head: &str,
+) -> Result<Vec<PathBuf>> {
+    let ancestor = trusted_git_output(control, &["merge-base", "--is-ancestor", base_sha, head])?;
+    if !ancestor.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved base {base_sha} is not an ancestor of result {head}; refusing unbounded result history"
+        )));
+    }
+
+    let range = format!("{base_sha}..{head}");
+    let revisions = trusted_git_stdout(control, &["rev-list", "--reverse", &range])?;
+    let mut paths = BTreeSet::new();
+    for revision in revisions
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        // `-m` expands every merge parent. Aggregate `git log --name-only`
+        // output can omit paths introduced only through a merge.
+        let output = trusted_git_output(
+            control,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                "-m",
+                "-z",
+                revision,
+                "--",
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "git result-history inventory failed for {revision}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        paths.extend(nul_separated_paths(&output.stdout)?);
+    }
+
+    Ok(paths
+        .into_iter()
+        .filter(|path| !is_deliverable_workspace_path(path))
+        .collect())
+}
+
+fn nul_separated_paths(output: &[u8]) -> Result<Vec<PathBuf>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+        .map(path_from_git_bytes)
+        .collect()
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // The non-Unix implementation can reject unrepresentable paths.
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    Ok(PathBuf::from(OsString::from_vec(raw.to_vec())))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {
+    String::from_utf8(raw.to_vec())
+        .map(PathBuf::from)
+        .map_err(|_| {
+            DeadreckonError::InvalidInput(
+                "Git returned a result path that cannot be represented on this platform"
+                    .to_string(),
+            )
+        })
+}
+
+fn display_git_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .take(8)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn git_path_input<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> Result<Vec<u8>> {
+    let mut input = Vec::new();
+    for path in paths {
+        append_git_path_bytes(&mut input, path)?;
+        input.push(0);
+    }
+    Ok(input)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // The non-Unix implementation can reject unrepresentable paths.
+fn append_git_path_bytes(output: &mut Vec<u8>, path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    output.extend_from_slice(path.as_os_str().as_bytes());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn append_git_path_bytes(output: &mut Vec<u8>, path: &Path) -> Result<()> {
+    let path = path.to_str().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "deliverable path cannot be represented for Git on this platform".to_string(),
+        )
+    })?;
+    output.extend_from_slice(path.as_bytes());
+    Ok(())
+}
+
+fn trusted_git_output(control: &TrustedGitControl, args: &[&str]) -> Result<std::process::Output> {
+    restore_and_verify_git_control(control)?;
+    let git_dir = control.git_dir.to_str().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted Git directory {} is not UTF-8; refusing ambiguous command routing",
+            control.git_dir.display()
+        ))
+    })?;
+    let workspace = control.workspace.to_str().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted worktree {} is not UTF-8; refusing ambiguous command routing",
+            control.workspace.display()
+        ))
+    })?;
+    let git_dir_arg = format!("--git-dir={git_dir}");
+    let work_tree_arg = format!("--work-tree={workspace}");
+    let mut routed = Vec::with_capacity(args.len() + 2);
+    routed.push(git_dir_arg.as_str());
+    routed.push(work_tree_arg.as_str());
+    routed.extend_from_slice(args);
+    let output = run_git(&control.workspace, &routed)?;
+    restore_and_verify_git_control(control)?;
+    Ok(output)
+}
+
+fn trusted_git_output_with_input(
+    control: &TrustedGitControl,
+    args: &[&str],
+    input: &[u8],
+) -> Result<std::process::Output> {
+    restore_and_verify_git_control(control)?;
+    let git_dir = control.git_dir.to_str().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted Git directory {} is not UTF-8; refusing ambiguous command routing",
+            control.git_dir.display()
+        ))
+    })?;
+    let workspace = control.workspace.to_str().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "trusted worktree {} is not UTF-8; refusing ambiguous command routing",
+            control.workspace.display()
+        ))
+    })?;
+    let git_dir_arg = format!("--git-dir={git_dir}");
+    let work_tree_arg = format!("--work-tree={workspace}");
+    let mut routed = Vec::with_capacity(args.len() + 2);
+    routed.push(git_dir_arg.as_str());
+    routed.push(work_tree_arg.as_str());
+    routed.extend_from_slice(args);
+    let output = run_git_with_input(&control.workspace, &routed, input)?;
+    restore_and_verify_git_control(control)?;
+    Ok(output)
+}
+
+fn trusted_git_quiet(control: &TrustedGitControl, args: &[&str]) -> Result<bool> {
+    let output = trusted_git_output(control, args)?;
     Ok(output.status.success())
 }
 
-fn git_status(cwd: &Path, args: &[&str]) -> Result<()> {
-    let output = run_git(cwd, args)?;
+fn trusted_git_stdout(control: &TrustedGitControl, args: &[&str]) -> Result<String> {
+    let output = trusted_git_output(control, args)?;
+    if !output.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted git {:?} failed: {}{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn trusted_git_status(control: &TrustedGitControl, args: &[&str]) -> Result<()> {
+    let output = trusted_git_output(control, args)?;
     if output.status.success() {
         Ok(())
     } else {
         Err(DeadreckonError::InvalidInput(format!(
-            "git {:?} failed: {}{}",
+            "trusted git {:?} failed: {}{}",
             args,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -2631,22 +4154,35 @@ mod tests {
     use deadreckon_core::gate::{run_acceptance_gate_and_write_marker, validate_acceptance_marker};
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run, spend_summary};
-    use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
+    use deadreckon_core::{
+        CodebaseMode, CodebaseRecord, TurnDocInput, append_turn_doc, implementation_notes_path,
+        snapshot_working,
+    };
     use deadreckon_protocol::{
         FlightEventKind, RunEventKind, RunId, SemanticDecision, SemanticJudgment,
     };
 
     use super::{
-        NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
+        GateLaunchOwner, NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
         SemanticCompletionDisposition, append_provider_approval_traces, append_tool_refusal,
-        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, complete_within_wall_budget,
-        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
-        is_direct_api_provider_kind, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
-        provider_failure_disposition, provider_output_name, record_semantic_judge_accounting,
-        run_turn_loop, safe_working_path, safe_working_path_with_policy, save_history,
-        seal_achieved_semantic_completion, semantic_completion_disposition,
+        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
+        changed_files_since_snapshot, commit_finalized_turn, commit_worktree_turn,
+        complete_within_wall_budget, deliverable_changed_files, ensure_sandbox_toml,
+        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
+        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, load_trusted_git_control,
+        non_deliverable_history_paths, policy_seam_refusal, policy_seam_refusal_message,
+        provider_failure_disposition, provider_output_name, read_turn_codebase_record,
+        record_semantic_judge_accounting, refuse_gitlinks, run_turn_loop, safe_working_path,
+        safe_working_path_with_policy, save_history, seal_achieved_semantic_completion,
+        semantic_completion_disposition, write_workspace_file_no_follow,
     };
+
+    #[test]
+    fn gate_launch_owner_requires_a_durable_attempt_and_uuid() {
+        assert!(GateLaunchOwner::new(0, uuid::Uuid::new_v4().to_string()).is_err());
+        assert!(GateLaunchOwner::new(1, "not-a-launch-id").is_err());
+        assert!(GateLaunchOwner::new(1, uuid::Uuid::new_v4().to_string()).is_ok());
+    }
 
     fn base_run_loop_config() -> RunLoopConfig {
         RunLoopConfig {
@@ -2806,6 +4342,9 @@ mod tests {
                     max_attempts: 1,
                     deadline: None,
                     semantic_judge: SemanticJudgeMode::Required,
+                    execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+                        "sandbox-exec",
+                    )),
                 },
             },
         )
@@ -2910,6 +4449,9 @@ mod tests {
                     max_attempts: 1,
                     deadline: None,
                     semantic_judge: SemanticJudgeMode::Required,
+                    execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+                        "sandbox-exec",
+                    )),
                 },
             },
         )
@@ -3008,6 +4550,7 @@ mod tests {
             1,
             &marker,
             &mut Vec::new(),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("semantic disposition");
@@ -3060,6 +4603,7 @@ mod tests {
             1,
             &marker,
             &mut Vec::new(),
+            &tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("semantic disposition");
@@ -4571,6 +6115,804 @@ storage = "jsonl"
     }
 
     #[test]
+    fn write_file_refuses_every_non_deliverable_path_class() {
+        let root = PathBuf::from("/tmp/deadreckon-safe-root");
+        for path in [
+            ".specstory/history/session.md",
+            "nested/.specstory/history/session.md",
+            ".deadreckon/codebase.json",
+            "target/debug/output",
+            "web/node_modules/package/index.js",
+        ] {
+            let err = safe_working_path(&root, Path::new(path)).expect_err("reserved path refused");
+            assert!(
+                err.to_string().contains("not part of the deliverable"),
+                "{path}: {err}"
+            );
+        }
+        assert!(
+            safe_working_path(&root, Path::new("docs/RUN-AS-BUILT.md"))
+                .expect("deliverable documentation")
+                .ends_with("docs/RUN-AS-BUILT.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_symlink_root_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let outside = temp.path().join("outside");
+        let workspace_link = temp.path().join("workspace-link");
+        std::fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, &workspace_link).expect("workspace symlink");
+
+        let error = write_workspace_file_no_follow(
+            &workspace_link,
+            Path::new("nested/result.txt"),
+            b"escaped",
+        )
+        .expect_err("symlink root refused");
+
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!outside.join("nested/result.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_symlink_ancestor_without_touching_external_files() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        std::fs::create_dir(&outside).expect("outside directory");
+        std::fs::write(outside.join("sentinel.txt"), "keep").expect("sentinel");
+        symlink(&outside, workspace.join("escape")).expect("ancestor symlink");
+
+        let error =
+            write_workspace_file_no_follow(&workspace, Path::new("escape/result.txt"), b"escaped")
+                .expect_err("symlink ancestor refused");
+
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!outside.join("result.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("sentinel.txt")).expect("sentinel"),
+            "keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_symlink_leaf_without_overwriting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside.txt");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        std::fs::write(&outside, "keep").expect("outside file");
+        let leaf = workspace.join("result.txt");
+        symlink(&outside, &leaf).expect("leaf symlink");
+
+        let error =
+            write_workspace_file_no_follow(&workspace, Path::new("result.txt"), b"overwritten")
+                .expect_err("symlink leaf refused");
+
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside file"),
+            "keep"
+        );
+        assert!(
+            std::fs::symlink_metadata(&leaf)
+                .expect("leaf metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn write_file_creates_nested_directories_and_overwrites_regular_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace directory");
+        let relative = Path::new("src/generated/result.txt");
+
+        let target =
+            write_workspace_file_no_follow(&workspace, relative, b"first").expect("initial write");
+        assert_eq!(target, workspace.join(relative));
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("initial content"),
+            "first"
+        );
+
+        write_workspace_file_no_follow(&workspace, relative, b"second").expect("regular overwrite");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("updated content"),
+            "second"
+        );
+    }
+
+    #[test]
+    fn strict_job_never_migrates_workspace_codebase_routing() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let operator = temp.path().join("operator");
+        std::fs::create_dir_all(&operator).expect("operator directory");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "strict routing".to_string(),
+                cwd: operator,
+                sandbox: "none".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: Some("strict-job".to_string()),
+                codebase: Some(CodebaseRecord::fresh()),
+            },
+        )
+        .expect("run");
+        std::fs::create_dir_all(paths.job_dir(&state.run_id)).expect("job directory");
+        std::fs::write(paths.job_json(&state.run_id), "{}\n").expect("job marker");
+        std::fs::remove_file(
+            state
+                .run_root
+                .join(deadreckon_core::TRUSTED_CODEBASE_RECORD),
+        )
+        .expect("remove trusted record");
+        std::fs::write(
+            state.working_dir.join(".deadreckon/codebase.json"),
+            serde_json::to_vec_pretty(&CodebaseRecord::fresh()).expect("workspace record"),
+        )
+        .expect("tampered workspace record");
+
+        let error = capture_trusted_turn_head(&state, 1)
+            .expect_err("strict Job must fail when trusted routing is absent");
+
+        assert!(error.to_string().contains("codebase.json"), "{error}");
+        assert!(
+            !state
+                .run_root
+                .join(deadreckon_core::TRUSTED_CODEBASE_RECORD)
+                .exists(),
+            "workspace routing must not be promoted to trusted Job authority"
+        );
+    }
+
+    #[test]
+    fn turn_commit_archives_private_artifacts_and_rewrites_provider_commits() {
+        let temp = TempDir::new().expect("tempdir");
+        let source_repository = temp.path().join("source-repository");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(source_repository.join("src")).expect("src");
+        std::fs::create_dir_all(source_repository.join(".specstory/history")).expect("specstory");
+        test_git(&source_repository, &["init", "-q"]);
+        test_git(
+            &source_repository,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        test_git(&source_repository, &["config", "user.name", "fixture"]);
+        std::fs::write(
+            source_repository.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("source");
+        std::fs::write(
+            source_repository.join(".specstory/history/base.md"),
+            "operator-owned base\n",
+        )
+        .expect("base evidence");
+        std::fs::write(
+            source_repository.join(".git/info/exclude"),
+            ".deadreckon/\ntarget/\nnode_modules/\n",
+        )
+        .expect("git exclude");
+        test_git(&source_repository, &["add", "-A"]);
+        test_git(&source_repository, &["commit", "-q", "-m", "base"]);
+        let base_sha = test_git(&source_repository, &["rev-parse", "HEAD"]);
+        test_git(
+            &source_repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "deadreckon-result",
+                repository.to_str().expect("UTF-8 worktree"),
+                &base_sha,
+            ],
+        );
+
+        let mut codebase = CodebaseRecord::fresh();
+        codebase.mode = CodebaseMode::Worktree;
+        codebase.source_path = Some(source_repository.clone());
+        codebase.source_git_root = Some(source_repository);
+        codebase.branch_name = Some("deadreckon-result".to_string());
+        codebase.base_ref = Some("master".to_string());
+        codebase.base_sha = Some(base_sha.clone());
+        codebase.worktree_path = Some(repository.clone());
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "keep provider evidence out of the result".to_string(),
+                cwd: repository.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: Some(codebase),
+            },
+        )
+        .expect("run");
+
+        capture_trusted_turn_head(&state, 1).expect("trusted first-turn head");
+        snapshot_working(&state, 0).expect("raw before snapshot");
+        std::fs::write(
+            repository.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .expect("source change");
+        std::fs::write(
+            repository.join(".specstory/history/base.md"),
+            "provider modified private evidence\n",
+        )
+        .expect("modified private evidence");
+        std::fs::write(
+            repository.join(".specstory/history/untracked.md"),
+            "provider-private untracked evidence\n",
+        )
+        .expect("untracked private evidence");
+
+        let raw_changed = changed_files_since_snapshot(&state, 0).expect("raw changes");
+        let deliverable =
+            deliverable_changed_files(&state, &raw_changed).expect("deliverable changes");
+        assert!(
+            raw_changed
+                .iter()
+                .any(|path| path.ends_with(".specstory/history/untracked.md"))
+        );
+        assert_eq!(
+            deliverable
+                .iter()
+                .filter_map(|path| path.strip_prefix(&repository).ok())
+                .collect::<Vec<_>>(),
+            vec![Path::new("src/lib.rs")]
+        );
+        super::append_provenance_for_files(&state, 1, "cli-turn-1", "codex", raw_changed)
+            .expect("raw provenance");
+        snapshot_working(&state, 1).expect("raw after snapshot");
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .run_root
+                    .join("snapshots/turn-1/.specstory/history/untracked.md")
+            )
+            .expect("private evidence in raw snapshot"),
+            "provider-private untracked evidence\n"
+        );
+        assert!(
+            std::fs::read_to_string(state.run_root.join("provenance.jsonl"))
+                .expect("provenance")
+                .contains(".specstory")
+        );
+
+        commit_worktree_turn(&state, 1, "cli_subagent").expect("sanitized first turn");
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .run_root
+                    .join("provider-evidence/turn-1/workspace/.specstory/history/untracked.md")
+            )
+            .expect("archived untracked evidence"),
+            "provider-private untracked evidence\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .run_root
+                    .join("snapshots/turn-1-provider-raw/.specstory/history/untracked.md")
+            )
+            .expect("durable raw provider snapshot"),
+            "provider-private untracked evidence\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.join(".specstory/history/base.md"))
+                .expect("base restored"),
+            "operator-owned base\n"
+        );
+        assert!(!repository.join(".specstory/history/untracked.md").exists());
+        assert!(
+            test_git(
+                &repository,
+                &["diff", "--name-only", &format!("{base_sha}..HEAD")]
+            )
+            .lines()
+            .all(|path| !path.starts_with(".specstory"))
+        );
+
+        capture_trusted_turn_head(&state, 2).expect("trusted second-turn head");
+        let trusted_codebase =
+            std::fs::read(repository.join(".deadreckon/codebase.json")).expect("trusted codebase");
+        std::fs::write(
+            repository.join("src/second.rs"),
+            "pub const SECOND: u8 = 2;\n",
+        )
+        .expect("second source");
+        std::fs::write(
+            repository.join(".specstory/history/base.md"),
+            "provider committed private modification\n",
+        )
+        .expect("committed private modification");
+        std::fs::write(
+            repository.join(".specstory/history/committed.md"),
+            "provider-private committed evidence\n",
+        )
+        .expect("committed private evidence");
+        std::fs::write(repository.join(".deadreckon/provider-forced.json"), "{}\n")
+            .expect("forced lifecycle metadata");
+        std::fs::write(
+            repository.join(".deadreckon/codebase.json"),
+            "{ \"tampered\": true }\n",
+        )
+        .expect("tampered lifecycle authority");
+        std::fs::create_dir_all(repository.join("target/debug")).expect("target");
+        std::fs::write(repository.join("target/debug/provider.out"), "runtime\n")
+            .expect("forced runtime output");
+        std::fs::create_dir_all(repository.join("web/node_modules/pkg")).expect("node modules");
+        std::fs::write(
+            repository.join("web/node_modules/pkg/provider.js"),
+            "runtime\n",
+        )
+        .expect("forced dependency output");
+        test_git(&repository, &["add", "-A"]);
+        test_git(
+            &repository,
+            &[
+                "add",
+                "-f",
+                "--",
+                ".deadreckon/codebase.json",
+                ".deadreckon/provider-forced.json",
+                "target/debug/provider.out",
+                "web/node_modules/pkg/provider.js",
+            ],
+        );
+        test_git(&repository, &["commit", "-q", "-m", "provider commit"]);
+        test_git(&repository, &["switch", "--detach", "-q"]);
+        assert!(
+            !test_git(
+                &repository,
+                &[
+                    "log",
+                    "--format=%H",
+                    &format!("{base_sha}..HEAD"),
+                    "--",
+                    ".specstory"
+                ]
+            )
+            .is_empty(),
+            "fixture must prove the provider committed private evidence"
+        );
+        snapshot_working(&state, 2).expect("raw provider-committed snapshot");
+        capture_trusted_turn_head(&state, 2)
+            .expect("restart must preserve the original pre-provider head");
+        snapshot_working(&state, 1)
+            .expect("restart overwrites the ordinary pre-turn snapshot with current state");
+
+        commit_worktree_turn(&state, 2, "cli_subagent").expect("rewrite provider commit");
+        assert_eq!(
+            std::fs::read(repository.join(".deadreckon/codebase.json"))
+                .expect("restored lifecycle authority"),
+            trusted_codebase
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                state
+                    .run_root
+                    .join("provider-evidence/turn-2/workspace/.specstory/history/committed.md")
+            )
+            .expect("archived committed evidence"),
+            "provider-private committed evidence\n"
+        );
+        assert!(
+            test_git(
+                &repository,
+                &[
+                    "log",
+                    "--format=%H",
+                    &format!("{base_sha}..HEAD"),
+                    "--",
+                    ".specstory"
+                ]
+            )
+            .is_empty(),
+            "no delivered result commit may retain a private evidence blob"
+        );
+        for path in [
+            ".deadreckon/codebase.json",
+            ".deadreckon/provider-forced.json",
+            "target/debug/provider.out",
+            "web/node_modules/pkg/provider.js",
+        ] {
+            assert!(
+                test_git(
+                    &repository,
+                    &[
+                        "log",
+                        "--format=%H",
+                        &format!("{base_sha}..HEAD"),
+                        "--",
+                        path
+                    ]
+                )
+                .is_empty(),
+                "no delivered result commit may retain {path}"
+            );
+        }
+        let result_paths = test_git(
+            &repository,
+            &["diff", "--name-only", &format!("{base_sha}..HEAD")],
+        );
+        assert!(result_paths.lines().any(|path| path == "src/lib.rs"));
+        assert!(result_paths.lines().any(|path| path == "src/second.rs"));
+        assert!(
+            result_paths
+                .lines()
+                .all(|path| !path.starts_with(".specstory"))
+        );
+        let subjects = test_git(
+            &repository,
+            &["log", "--format=%s", &format!("{base_sha}..HEAD")],
+        );
+        assert_eq!(
+            test_git(&repository, &["symbolic-ref", "--short", "HEAD"]),
+            "deadreckon-result"
+        );
+        assert!(subjects.contains("turn 1: cli_subagent"));
+        assert!(subjects.contains("turn 2: cli_subagent"));
+        assert!(!subjects.contains("provider commit"));
+
+        capture_trusted_turn_head(&state, 3).expect("trusted third-turn head");
+        let sentinel = temp.path().join("clean-filter-ran");
+        test_git(
+            &repository,
+            &[
+                "config",
+                "filter.evil.clean",
+                &format!("sh -c 'touch {}; cat'", sentinel.display()),
+            ],
+        );
+        std::fs::write(repository.join(".gitattributes"), "src/*.rs filter=evil\n")
+            .expect("provider filter attributes");
+        std::fs::write(
+            repository.join("src/third.rs"),
+            "pub const THIRD: u8 = 3;\n",
+        )
+        .expect("third source");
+
+        let error = commit_worktree_turn(&state, 3, "cli_subagent")
+            .expect_err("provider-selected filter must be refused before staging");
+        assert!(error.to_string().contains("external Git filter"), "{error}");
+        assert!(
+            !sentinel.exists(),
+            "sanitisation must not execute the configured clean command"
+        );
+    }
+
+    #[test]
+    fn turn_commit_restores_git_control_before_sanitizing_after_restart() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let worktree = temp.path().join("worktree");
+        let decoy = temp.path().join("operator-decoy");
+        for repository in [&source, &decoy] {
+            std::fs::create_dir_all(repository.join("src")).expect("source directory");
+            test_git(repository, &["init", "-q"]);
+            test_git(
+                repository,
+                &["config", "user.email", "fixture@example.invalid"],
+            );
+            test_git(repository, &["config", "user.name", "fixture"]);
+        }
+        std::fs::write(source.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").expect("source");
+        test_git(&source, &["add", "-A"]);
+        test_git(&source, &["commit", "-q", "-m", "source base"]);
+        let base_sha = test_git(&source, &["rev-parse", "HEAD"]);
+        test_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "deadreckon-result",
+                worktree.to_str().expect("UTF-8 worktree"),
+                &base_sha,
+            ],
+        );
+        std::fs::write(decoy.join("src/operator.txt"), "operator state\n").expect("decoy source");
+        test_git(&decoy, &["add", "-A"]);
+        test_git(&decoy, &["commit", "-q", "-m", "operator base"]);
+        let decoy_head = test_git(&decoy, &["rev-parse", "HEAD"]);
+        let decoy_refs = test_git(&decoy, &["show-ref"]);
+        let decoy_index = std::fs::read(decoy.join(".git/index")).expect("decoy index");
+        let decoy_config = std::fs::read(decoy.join(".git/config")).expect("decoy config");
+
+        let mut codebase = CodebaseRecord::fresh();
+        codebase.mode = CodebaseMode::Worktree;
+        codebase.source_path = Some(source.clone());
+        codebase.source_git_root = Some(source);
+        codebase.branch_name = Some("deadreckon-result".to_string());
+        codebase.base_ref = Some("master".to_string());
+        codebase.base_sha = Some(base_sha.clone());
+        codebase.worktree_path = Some(worktree.clone());
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "never follow provider-controlled Git routing".to_string(),
+                cwd: worktree.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: Some(codebase),
+            },
+        )
+        .expect("run");
+
+        capture_trusted_turn_head(&state, 1).expect("capture trusted Git control");
+        let trusted_control = std::fs::read(worktree.join(".git")).expect("trusted control");
+        std::fs::write(worktree.join("src/lib.rs"), "pub fn value() -> u8 { 2 }\n")
+            .expect("provider source edit");
+        let redirect = format!("gitdir: {}\n", decoy.join(".git").display());
+        std::fs::write(worktree.join(".git"), &redirect).expect("provider redirect");
+
+        // Model a process restart: turn setup is called again after the
+        // provider changed `.git`. It must preserve the original snapshot,
+        // archive the redirect, and restore trusted routing before reading
+        // HEAD.
+        capture_trusted_turn_head(&state, 1).expect("restart recovery");
+        assert_eq!(
+            std::fs::read(
+                state
+                    .run_root
+                    .join("provider-evidence/turn-1/git-control-after-provider")
+            )
+            .expect("redirect evidence"),
+            redirect.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(worktree.join(".git")).expect("restored after restart"),
+            trusted_control
+        );
+
+        // A second redirect immediately before sanitisation proves each Git
+        // command routes explicitly through the trusted snapshot.
+        std::fs::write(worktree.join(".git"), &redirect).expect("second provider redirect");
+        commit_worktree_turn(&state, 1, "cli_subagent").expect("trusted sanitisation");
+
+        assert_eq!(test_git(&decoy, &["rev-parse", "HEAD"]), decoy_head);
+        assert_eq!(test_git(&decoy, &["show-ref"]), decoy_refs);
+        assert_eq!(
+            std::fs::read(decoy.join(".git/index")).expect("unchanged decoy index"),
+            decoy_index
+        );
+        assert_eq!(
+            std::fs::read(decoy.join(".git/config")).expect("unchanged decoy config"),
+            decoy_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(decoy.join("src/operator.txt")).expect("decoy worktree"),
+            "operator state\n"
+        );
+        assert_eq!(
+            std::fs::read(worktree.join(".git")).expect("final trusted control"),
+            trusted_control
+        );
+        assert_eq!(
+            test_git(&worktree, &["symbolic-ref", "--short", "HEAD"]),
+            "deadreckon-result"
+        );
+        let delivered_paths = test_git(
+            &worktree,
+            &["diff", "--name-only", &format!("{base_sha}..HEAD")],
+        );
+        assert!(delivered_paths.lines().any(|path| path == "src/lib.rs"));
+
+        // DeadReckon's generated documentation is a later write boundary than
+        // the coding provider. It must be committed through the same trusted
+        // router, even if `.git` is redirected again between those phases.
+        std::fs::create_dir_all(worktree.join("docs")).expect("docs directory");
+        std::fs::write(
+            worktree.join("docs/RUN-NARRATIVE.md"),
+            "# Trusted final docs\n",
+        )
+        .expect("final docs");
+        std::fs::write(worktree.join(".git"), &redirect).expect("docs-phase redirect");
+        commit_finalized_turn(&state, 1).expect("trusted final docs sanitisation");
+        assert_eq!(test_git(&decoy, &["rev-parse", "HEAD"]), decoy_head);
+        assert_eq!(test_git(&decoy, &["show-ref"]), decoy_refs);
+        assert_eq!(
+            test_git(&worktree, &["show", "HEAD:docs/RUN-NARRATIVE.md",],),
+            "# Trusted final docs"
+        );
+
+        capture_trusted_turn_head(&state, 2).expect("second-turn control snapshot");
+        std::fs::remove_file(worktree.join(".git")).expect("remove regular control");
+        std::fs::create_dir(worktree.join(".git")).expect("replace control with directory");
+        let directory_error = commit_worktree_turn(&state, 2, "cli_subagent")
+            .expect_err("directory Git control must fail closed");
+        assert!(
+            directory_error
+                .to_string()
+                .contains("must be a regular file"),
+            "{directory_error}"
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(worktree.join(".git")).expect("remove directory control");
+            std::os::unix::fs::symlink(decoy.join(".git"), worktree.join(".git"))
+                .expect("replace control with symlink");
+            let symlink_error = commit_worktree_turn(&state, 2, "cli_subagent")
+                .expect_err("symlink Git control must fail closed");
+            assert!(
+                symlink_error.to_string().contains("must be a regular file"),
+                "{symlink_error}"
+            );
+        }
+        assert_eq!(
+            test_git(&decoy, &["show-ref"]),
+            decoy_refs,
+            "refused control forms must never route sanitisation into the decoy"
+        );
+    }
+
+    #[test]
+    fn result_history_inventory_detects_merge_only_private_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(source.join("src")).expect("source directory");
+        test_git(&source, &["init", "-q", "-b", "main"]);
+        test_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        test_git(&source, &["config", "user.name", "fixture"]);
+        std::fs::write(source.join("src/base.txt"), "base\n").expect("base");
+        test_git(&source, &["add", "-A"]);
+        test_git(&source, &["commit", "-q", "-m", "base"]);
+        let base_sha = test_git(&source, &["rev-parse", "HEAD"]);
+
+        test_git(&source, &["switch", "-q", "-c", "provider-side"]);
+        std::fs::write(source.join("src/side.txt"), "side\n").expect("side");
+        test_git(&source, &["add", "src/side.txt"]);
+        test_git(&source, &["commit", "-q", "-m", "side"]);
+        test_git(&source, &["switch", "-q", "main"]);
+        test_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "deadreckon-result",
+                worktree.to_str().expect("UTF-8 worktree"),
+                &base_sha,
+            ],
+        );
+
+        let mut codebase = CodebaseRecord::fresh();
+        codebase.mode = CodebaseMode::Worktree;
+        codebase.source_path = Some(source.clone());
+        codebase.source_git_root = Some(source);
+        codebase.branch_name = Some("deadreckon-result".to_string());
+        codebase.base_ref = Some("main".to_string());
+        codebase.base_sha = Some(base_sha.clone());
+        codebase.worktree_path = Some(worktree.clone());
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "detect private paths created by a merge".to_string(),
+                cwd: worktree.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: Some(codebase),
+            },
+        )
+        .expect("run");
+        capture_trusted_turn_head(&state, 1).expect("trusted Git control");
+
+        std::fs::write(worktree.join("src/main.txt"), "main\n").expect("main");
+        test_git(&worktree, &["add", "src/main.txt"]);
+        test_git(&worktree, &["commit", "-q", "-m", "main"]);
+        test_git(
+            &worktree,
+            &["merge", "-q", "--no-ff", "--no-commit", "provider-side"],
+        );
+        std::fs::create_dir_all(worktree.join(".specstory")).expect("private directory");
+        let private_path = PathBuf::from(".specstory/merge-only.txt");
+        std::fs::write(
+            worktree.join(&private_path),
+            "merge-only private evidence\n",
+        )
+        .expect("merge-only private evidence");
+        test_git(&worktree, &["add", "-f", "--", ".specstory/merge-only.txt"]);
+        test_git(&worktree, &["commit", "-q", "-m", "provider merge"]);
+        let head = test_git(&worktree, &["rev-parse", "HEAD"]);
+
+        let record = read_turn_codebase_record(&state).expect("trusted routing");
+        let control =
+            load_trusted_git_control(&state, 1, &record).expect("trusted Git control snapshot");
+        let prohibited =
+            non_deliverable_history_paths(&control, &base_sha, &head).expect("history inventory");
+
+        assert_eq!(prohibited, vec![private_path]);
+
+        let nested = worktree.join("vendor/nested-repository");
+        std::fs::create_dir_all(&nested).expect("nested repository");
+        test_git(&nested, &["init", "-q", "-b", "main"]);
+        test_git(
+            &nested,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        test_git(&nested, &["config", "user.name", "fixture"]);
+        std::fs::write(nested.join("README.md"), "nested\n").expect("nested file");
+        test_git(&nested, &["add", "README.md"]);
+        test_git(&nested, &["commit", "-q", "-m", "nested"]);
+        test_git(&worktree, &["add", "vendor/nested-repository"]);
+        let error = refuse_gitlinks(&control).expect_err("gitlinks must fail before commit");
+        assert!(error.to_string().contains("unsupported Git submodule"));
+        assert!(error.to_string().contains("vendor/nested-repository"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_path_inventory_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let raw = b".specstory/private-\xff\0src/lib.rs\0";
+        let paths = super::nul_separated_paths(raw).expect("raw Git paths");
+
+        assert_eq!(paths[0].as_os_str().as_bytes(), b".specstory/private-\xff");
+        assert_eq!(
+            paths[0],
+            PathBuf::from(std::ffi::OsString::from_vec(
+                b".specstory/private-\xff".to_vec()
+            ))
+        );
+        assert_eq!(paths[1], PathBuf::from("src/lib.rs"));
+    }
+
+    fn test_git(cwd: &Path, args: &[&str]) -> String {
+        let output = deadreckon_core::git::run_git(cwd, args).expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
     fn sandbox_toml_gates_write_file_policy() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -4615,6 +6957,113 @@ network = []
                 .expect_err("blocked by sandbox.toml");
         assert!(err.to_string().contains("sandbox.toml"));
         assert!(err.to_string().contains("try:"));
+    }
+
+    #[test]
+    fn strict_job_refuses_execution_policy_drift() {
+        use chrono::Utc;
+        use deadreckon_core::write_job;
+        use deadreckon_protocol::{
+            AuthorityAcceptedBy, Job, JobAuthority, JobExecutionPolicy, JobId, JobPolicy,
+            JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
+        };
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "bind effective execution policy".to_string(),
+                cwd: source.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("strict-policy".to_string()),
+                codebase: Some(CodebaseRecord::fresh()),
+            },
+        )
+        .expect("run");
+        let policy = JobPolicy {
+            max_spend_usd: 1.0,
+            max_wall_seconds: 60,
+            max_attempts: 1,
+            deadline: None,
+            semantic_judge: SemanticJudgeMode::Required,
+            execution: Some(JobExecutionPolicy::workspace_only("sandbox-exec")),
+        };
+        let policy_hash = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(&policy).expect("policy JSON"),
+        );
+        let authority = JobAuthority {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(state.run_id.clone()),
+            run_id: RunId(state.run_id.clone()),
+            approved_at: Utc::now(),
+            accepted_by: AuthorityAcceptedBy::Operator,
+            goal_sha256: "sha256:goal".to_string(),
+            contract_sha256: "sha256:contract".to_string(),
+            effective_policy_sha256: policy_hash,
+            launch_plan_sha256: "sha256:launch".to_string(),
+            source_tree_sha256: "sha256:source".to_string(),
+            source_revision: None,
+            sandbox_requested: "sandbox-exec".to_string(),
+            semantic_judge_mode: SemanticJudgeMode::Required,
+        };
+        let authority_path = paths.job_authority(&state.run_id);
+        std::fs::create_dir_all(authority_path.parent().expect("authority parent"))
+            .expect("authority directory");
+        std::fs::write(
+            &authority_path,
+            serde_json::to_vec_pretty(&authority).expect("authority JSON"),
+        )
+        .expect("authority");
+        let authority_sha256 =
+            deadreckon_core::flight::sha256_file(&authority_path).expect("authority digest");
+        write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(state.run_id.clone()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: source,
+                launch_plan_sha256: "sha256:launch".to_string(),
+                authority_sha256,
+                policy,
+            },
+        )
+        .expect("job");
+
+        ensure_sandbox_toml(&state).expect("approved sandbox policy");
+        let sandbox_path = state.run_root.join("sandbox.toml");
+        let mut sandbox: super::SandboxToml =
+            toml::from_str(&std::fs::read_to_string(&sandbox_path).expect("sandbox policy"))
+                .expect("sandbox TOML");
+        sandbox
+            .tools
+            .get_mut("bash")
+            .expect("bash policy")
+            .network
+            .push("*".to_string());
+        std::fs::write(
+            &sandbox_path,
+            toml::to_string_pretty(&sandbox).expect("tampered sandbox TOML"),
+        )
+        .expect("tamper sandbox");
+
+        let error = ensure_sandbox_toml(&state).expect_err("policy drift must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("immutable approved Job execution policy"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub(crate) async fn run_cli_with_options(
             write_denylist: Vec::new(),
             network_allowlist: policy.network_allowlist,
             workspace_access: options.workspace_access,
+            cleanup_process_group: false,
+            guarded_launch: None,
         })
         .await
         .map_err(|source| ProviderError::Cli {

@@ -140,6 +140,8 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
                     doc_subskills: subskills,
                     token_budget,
                     budget_cap_usd: budget_cap,
+                    sandbox_backend: deadreckon_sandbox::SandboxBackend::Auto,
+                    commit_docs: true,
                     no_llm: false,
                     force,
                 },

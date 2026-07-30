@@ -53,8 +53,9 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
 
 fn with_protected_boundary(spec: &SandboxSpec) -> SandboxSpec {
     let mut effective = spec.clone();
-    ProtectedPathPolicy::discover()
-        .merge_into(&mut effective.read_denylist, &mut effective.write_denylist);
+    let mut boundary = ProtectedPathPolicy::discover();
+    boundary.protect_workspace_git_control(&spec.cwd);
+    boundary.merge_into(&mut effective.read_denylist, &mut effective.write_denylist);
     effective
 }
 
@@ -385,6 +386,8 @@ mod tests {
             write_denylist: Vec::new(),
             network_allowlist: Vec::new(),
             workspace_access: WorkspaceAccess::ReadOnly,
+            cleanup_process_group: false,
+            guarded_launch: None,
         }
     }
 
@@ -449,6 +452,37 @@ mod tests {
         let paths = DeadreckonPaths::discover();
         assert!(spec.read_denylist.contains(&paths.home().join("gate-keys")));
         assert!(spec.write_denylist.contains(&paths.jobs_dir()));
+        assert!(
+            spec.write_denylist
+                .contains(&PathBuf::from("/work/project/.git"))
+        );
+    }
+
+    #[test]
+    fn every_writable_outer_sandbox_denies_the_workspace_git_router() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("worktree");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(
+            workspace.join(".git"),
+            "gitdir: /operator/repo.git/worktrees/run\n",
+        )
+        .expect("git control");
+        let mut spec = read_only_spec(SandboxBackend::SandboxExec);
+        spec.cwd = workspace.clone();
+        spec.workspace_access = WorkspaceAccess::ReadWrite;
+
+        let effective = with_protected_boundary(&spec);
+        assert!(effective.write_denylist.contains(&workspace.join(".git")));
+        assert!(
+            effective
+                .write_denylist
+                .contains(&PathBuf::from("/operator/repo.git/worktrees/run"))
+        );
+
+        let profile = sandbox_exec_profile(&effective).expect("seatbelt profile");
+        let control = workspace.join(".git").display().to_string();
+        assert!(profile.contains(&format!("(deny file-write* (literal \"{control}\"))")));
     }
 
     #[test]

@@ -2,7 +2,9 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-05-31 (Composable seams, direct-API compaction, Effortless friendliness contract, tamper-evident gate, production-release posture, consolidated plan-result docs, guided first use, local self-improvement loop, provider flight recorder, checkpoint rewind, implementation decision ledger, orchestration live UX, plan event bus feed, coherence closure)
+**Last updated:** 2026-07-30 (Watchkeeper durable Jobs, contained two-phase
+gate, external HMAC signing, read-only semantic judge, result-bound receipts,
+trusted promotion and explicit live-evidence limits)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -102,7 +104,12 @@ Why this shape works:
 
 - **The CLI is thin.** It parses args, sets up state, hands off to `deadreckon-runtime`, and prints summaries. Durable schemas and atomic file operations live in `deadreckon-core`.
 - **State is on disk before every meaningful change.** `state.json` is atomic-written via temp+rename after every phase transition, snapshot, spend record, and tool call.
-- **The agent cannot mark its own gate.** `dr-gate` is a separate binary that signs an acceptance marker against a nonce only it can read; the deadreckon binary refuses to mark a run `Completed` without that signed marker.
+- **The agent cannot mark its own gate.** For strict durable Jobs, the trusted
+  controller first materializes the approved contract. Keyless `dr-gate
+  evaluate` runs inside the resolved sandbox. Only after that process group is
+  gone does childless `dr-gate sign` receive the external HMAC key, revalidate
+  the evidence and write the marker. Legacy-v1 compatibility runs retain their
+  historical nonce validator.
 - **Sandboxes are platform-native.** macOS uses Seatbelt; Linux uses Bubblewrap; Docker is opt-in. No daemon, no `bollard`, no Lima.
 - **BYOK extends to subscriptions.** Subscription-bearing users drive deadreckon by routing turns through their local `claude` or `codex` CLIs; no API key required.
 
@@ -186,7 +193,16 @@ Why this shape works:
 | `doctor.rs` | backend availability checks |
 | `process.rs` | `run(SandboxSpec) -> SandboxRunOutput`, PID files, cancellation, SIGTERM/SIGKILL escalation |
 
-**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser definitions (`cli.rs`), a root entrypoint/dispatcher and shared helpers (`main.rs`), private command-family modules (`commands/`), private attach render/state modules (`tui/`), and `dr-gate` as a standalone acceptance-marker writer (`bin/dr-gate.rs`). Supporting modules: `narrative.rs` (deterministic + provider-backed narrative projection), `plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs` (`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering vocabulary and cards), `setup.rs` (provider/done-contract resolution), `prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
+**`deadreckon` (binary crate, `crates/deadreckon/src/`).** Clap parser
+definitions (`cli.rs`), a root entrypoint/dispatcher and shared helpers
+(`main.rs`), private command-family modules (`commands/`), private attach
+render/state modules (`tui/`), and `dr-gate` as the two-command keyless
+evaluator and trusted signer (`bin/dr-gate.rs`). Supporting modules:
+`narrative.rs` (deterministic + provider-backed narrative projection),
+`plan_event_bus.rs` (`PlanEventBus`/`PlanEventFeed`), `tui_events.rs`
+(`TuiEventFeed`), `ui.rs` + `ui_card.rs` + `cards/` (CLI/TUI rendering
+vocabulary and cards), `setup.rs` (provider/done-contract resolution),
+`prompt.rs` (confirmation prompts), and `sleep.rs` (sleep-prevention).
 
 ### 2.3 Top-level documentation
 
@@ -317,7 +333,7 @@ pub struct PhaseState {
 | 20 | `provider` | router built from config, fallback chain resolved |
 | 30 | `sandbox` | sandbox backend selected, profile prepared |
 | 40 | `execute` | the turn loop runs here; sets `RunStatus::Executing` |
-| 50 | `verify` | post-loop verification (currently runs `dr-gate`) |
+| 50 | `verify` | post-loop verification; strict Jobs run contained keyless evaluation, then trusted HMAC signing |
 | 60 | `complete` | acceptance marker validated, promotion atomic-swaps, `RunStatus::Completed` |
 
 The gap-numbering (0, 10, 20 …) leaves room for future phases (e.g., 15, 25, 55) without re-writing on-disk state.
@@ -435,9 +451,9 @@ JSONL files (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) 
 │               │   └── turn-<N>/  # provider stdout, prompt.md
 │               ├── proofs/
 │               │   ├── turn-acceptance.json       # AcceptanceMarker
-│               │   └── acceptance-progress.jsonl  # streaming AcceptanceProgressEntry
+│               │   └── acceptance-progress.jsonl  # reconstructed after strict evaluation; legacy may stream
 │               ├── gate/
-│               │   └── nonce      # uuid; only dr-gate can read for signing
+│               │   └── nonce      # legacy-v1 compatibility secret; strict Jobs use an external HMAC key
 │               ├── child-pids/
 │               │   └── *.pid      # per-subprocess PID files
 │               ├── sandbox/       # per-run Seatbelt profile (if mac) or bwrap args
@@ -499,7 +515,8 @@ Task key (`paths.rs:218-229`) is `"<slug-of-goal>-<fnv1a32-hex-of-goal>"` (slug 
 
 ## 6. Run Lifecycle & Phase Machine
 
-Sequence for a typical `deadreckon run` invocation:
+The following sequence describes the historical process-owned `run` path.
+Strict durable Jobs use the Job supervisor and the two-phase gate in §58.5.
 
 ```
 main.rs run_command()
@@ -510,7 +527,7 @@ main.rs run_command()
   │   ├── mint run_id (uuid simple form)
   │   ├── derive scope (paths.rs:67) and task_key (paths.rs:88)
   │   ├── create run_root/working/snapshots/proofs/gate/turns
-  │   ├── write gate/nonce (uuid)
+  │   ├── write gate/nonce (legacy-v1 compatibility)
   │   ├── initialize 7 phases (state.rs:233-254)
   │   ├── write CurrentRunPointer
   │   └── save_state()
@@ -1050,71 +1067,110 @@ Multiple sources contribute PIDs to track:
 
 ### 13.1 The principle
 
-The agent (LLM) **cannot** be trusted to declare a run done. `Completed` is reachable only via an acceptance marker signed by an external binary that the agent does not have keys to.
+The agent cannot be trusted to declare a run done. A strict durable Job can
+only reach verified completion through a contained, deterministic evaluation
+and a separate HMAC signing phase. The signing key never shares a process tree
+with repository-controlled checks.
+
+This section describes the current strict path first. Process-owned
+compatibility runs and old version-1 markers retain the historical nonce path.
+They must not be described as contained, two-key-verified Jobs.
 
 ### 13.2 `AcceptanceMarker`
 
-`crates/deadreckon-core/src/gate.rs:20-33`:
+`crates/deadreckon-core/src/gate.rs`:
 
 ```rust
 pub struct AcceptanceMarker {
     pub schema_version: u32,
     pub run_id: String,
     pub status: String,           // "pass" | "fail"
-    pub produced_by: String,      // must be "dr-gate"
+    pub produced_by: String,
+    pub issuer: String,           // "dr-gate" for a native proof
+    pub proof_kind: AcceptanceProofKind,
     pub checked_at: DateTime<Utc>,
     pub working_dir: PathBuf,
-    pub signature: String,        // hash over fields + nonce + checks + tamper file bytes
+    pub contained: bool,
+    pub sandbox_backend: String,  // observed, never "auto"
+    pub signature: String,        // HMAC-SHA-256 for version 2
     pub check_count: usize,
-    #[serde(default)]
-    pub checks: Vec<AcceptanceCheckResult>,  // per-check evidence, also covered by the signature
+    pub checks: Vec<AcceptanceCheckResult>,
 }
 ```
 
-Marker location: `<run_root>/proofs/turn-acceptance.json`. The marker remains schema 1; tamper evidence is an external proof file, not a marker field.
+The marker lives at `<run_root>/proofs/turn-acceptance.json`. Version 2 binds
+the issuer, native proof kind, check results, containment and observed backend.
+Version 1 remains readable through the legacy validator.
 
 ### 13.3 `dr-gate` binary
 
-`crates/deadreckon/src/bin/dr-gate.rs` (73 lines). Standalone binary that:
+`crates/deadreckon/src/bin/dr-gate.rs` has 2 commands.
 
-1. Reads `--run <id>` and `--working-dir <path>`.
-2. Loads `acceptance.yaml` (if present) from the run root.
-3. Runs each check (cargo test, file-exists, content-match, build-success, shell).
-4. Evaluates `tamper.rs` against the compiled checks, provenance, and the first snapshot diff, then writes `proofs/acceptance-tamper.json` for clean, caveat, and refuse verdicts.
-5. If the tamper verdict is `refuse`, prints the refusal reasons and exits nonzero without writing a marker.
-6. If all required checks pass and the tamper verdict is `clean` or `caveat`, writes a signed `AcceptanceMarker` to `proofs/turn-acceptance.json`.
+The trusted controller first copies or generates the approved
+`acceptance.yaml`. The evaluator refuses a missing, symlinked or non-regular
+contract. Contract detection and persistence are controller work, not
+evaluator side effects.
 
-The marker's `signature` is computed from `gate/nonce` (a UUID written at run-init time by the deadreckon binary at `state.rs:188`), marker fields, check results, and the raw bytes of `proofs/acceptance-tamper.json` (empty bytes if absent for backward tolerance). Only `dr-gate` reads the nonce; the agent never has access. Editing the tamper proof after signing invalidates marker validation.
+`dr-gate evaluate` then:
+
+1. refuses `DEADRECKON_GATE_KEY`, `DEADRECKON_GATE_CONTAINED` and
+   `DEADRECKON_GATE_SANDBOX_BACKEND`;
+2. runs under the backend that the sandbox resolver actually selected;
+3. runs every approved check and computes tamper facts;
+4. writes no proof or Job control files;
+5. returns one `GateEvaluation` as JSON on stdout.
+
+The sandbox runner also scrubs those 3 inputs from inherited process
+environment. For strict Jobs it puts the evaluator and descendants in a fresh
+process group. It terminates residual descendants before it returns. This
+prevents a delayed check process from surviving long enough to observe the
+signing phase.
+
+That fresh group is entered through a guarded release protocol. The helper
+starts blocked on a private pipe in the worker's existing group. The runner
+atomically writes and syncs a unique record containing evaluator launch ID, Job
+attempt, outer launch ID, boot ID and process-start identity. Only after the
+helper revalidates that record may it create the new process group, rewrite the
+record as `running`, and execute the sandbox command. If the worker disappears
+before release, EOF makes the helper exit without running a check. Per-launch
+filenames prevent a later attempt from overwriting or deleting the earlier
+identity.
+
+If the resolved backend is `none`, a strict Job refuses before reading the
+key. Otherwise, and only after evaluator cleanup, the controller starts
+childless `dr-gate sign`. The signer receives the evaluation over stdin, the
+HMAC key through `DEADRECKON_GATE_KEY`, and explicit containment plus the
+observed backend as arguments. It:
+
+1. rejects legacy containment environment;
+2. validates the evaluation schema, run ID and canonical working directory;
+3. reloads the approved contract and matches its digest, check count and every
+   result to the approved checks;
+4. recomputes tamper facts and requires an exact match;
+5. reconstructs `acceptance-progress.jsonl` and
+   `acceptance-tamper.json`;
+6. writes a version-2 HMAC-SHA-256 marker bound to the observed backend.
+
+The signer runs no repository-controlled checks and has no child process.
 
 ### 13.4 Validation
 
-`gate.rs:124-154`:
+Current validation requires a version-2 native `dr-gate` proof, the correct
+issuer and run identity, coherent containment and an HMAC-SHA-256 signature
+from the Job's external key. Strict receipt validation also refuses
+`sandbox_backend = none`, `contained = false`, synthetic controller markers
+and missing key material.
 
-```rust
-pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMarker> {
-    let path = marker_path(state);
-    let raw = std::fs::read(&path).with_path(&path)?;
-    let marker: AcceptanceMarker = serde_json::from_slice(&raw).with_json_path(&path)?;
-    if marker.schema_version != 1 { return Err(...); }
-    if marker.run_id != state.run_id {
-        return Err("acceptance marker run_id ... does not match");
-    }
-    if marker.status != "pass" || marker.produced_by != "dr-gate" {
-        return Err("acceptance marker was not produced by dr-gate with pass status");
-    }
-    let expected = marker_signature(&state.run_root, &marker)?;
-    if marker.signature != expected {
-        return Err("acceptance marker signature is invalid; forged self-attestation refused");
-    }
-    Ok(marker)
-}
-```
-
-A forged marker by the agent fails the signature check (`gate.rs:149`).
+Version-1 markers still validate against the run-local nonce during the
+compatibility window. That compatibility does not upgrade them into native
+strict proof.
 
 ### 13.5 Streaming progress
 
-While checks are running, `evaluate_acceptance_checks_with_progress` (`gate.rs:233-249`) appends one `AcceptanceProgressEntry` per state transition to `proofs/acceptance-progress.jsonl`:
+Strict evaluation does not stream progress into the protected proofs
+directory. After strict revalidation, the signer reconstructs one
+`AcceptanceProgressEntry` for each final result in
+`proofs/acceptance-progress.jsonl`:
 
 ```rust
 pub struct AcceptanceProgressEntry {
@@ -1126,17 +1182,32 @@ pub struct AcceptanceProgressEntry {
 }
 ```
 
-The progress file is truncated at the start of each evaluation so resumed/extended runs do not mix with prior attempts. The attach TUI tails this file (§18) so operators can see acceptance advance from "running 2/5" → "passed 2/5" while `dr-gate` works. The signed `AcceptanceMarker` is still the load-bearing artifact; progress is observational telemetry only.
+The TUI can read this file after signing, but it does not receive trusted
+per-check progress while strict checks are still running. Historical
+process-owned compatibility paths may still use the old live-streaming helper.
+Progress remains observational. The version-2 marker is the load-bearing
+deterministic proof.
 
 ### 13.7 Tamper evidence
 
-The gate is tamper-evident, not tamper-proof. `crates/deadreckon-core/src/tamper.rs` builds a touched-file set from `provenance.jsonl` plus the earliest `snapshots/turn-*` inventory, maps compiled checks to covered paths, lints shell/cargo command strings for suppression patterns, and classifies the run as `clean`, `caveat`, or `refuse`. The durable proof is `proofs/acceptance-tamper.json`; it is signed indirectly because the marker signature hashes the proof bytes. See §35 for the full policy and limits.
+The deterministic policy is tamper-evident, not a causal proof.
+`crates/deadreckon-core/src/tamper.rs` builds a touched-file set from
+`provenance.jsonl` plus the earliest `snapshots/turn-*` inventory. It maps
+compiled checks to covered paths, lints commands for suppression patterns, and
+classifies the run as `clean`, `caveat`, or `refuse`.
+
+For a strict Job, the evaluator returns tamper facts without writing the proof.
+The signer recomputes them from trusted inputs, requires an exact match, writes
+`proofs/acceptance-tamper.json`, and includes its digest in the version-2 HMAC
+marker. See §35 for the full policy and limits.
 
 ### 13.6 Where the gate is invoked
 
-When the turn loop emits `Action::Done` — either through a CLI sub-agent finishing or a JSON-action provider returning `Done` — it routes through `acceptance_gate_passed_or_record_failure` (`crates/deadreckon-runtime/src/turn_loop.rs:1442`). Both call sites (`turn_loop.rs:405` for CLI sub-agent Done, `turn_loop.rs:672` for JSON Done) use this helper.
-
-The helper composes `run_acceptance_gate` (invokes `dr-gate` as a subprocess) and `validate_acceptance_marker` (signature + run_id check):
+When the turn loop emits `Action::Done`, it routes through
+`acceptance_gate_passed_or_record_failure`. The helper calls
+`run_deterministic_completion_gate`, which owns the 2-phase sandboxed
+evaluation and trusted signing sequence described above. It then validates the
+marker.
 
 - **If the gate passes:** the helper returns `true` and the loop continues into `promote_if_ready`.
 - **If the gate fails:** the helper logs `acceptance.failed` to `traces.jsonl`, appends an explicit corrective hint to the run history (`"acceptance failed after turn N: <reason>. Continue by fixing the failing done criteria; do not declare done until dr-gate passes."`), emits a `RunEventKind::Error` event, records the reason in `state.failure_reason`, and **returns `false` — the run does not terminate**.
@@ -1176,6 +1247,10 @@ Script-runner detection is a textual, deterministic scan for a `test` entry-poin
 
 `verdict` is a read-only verb (`crates/deadreckon/src/commands/verdict.rs`) that answers one question about **any** run — native or imported — without touching its state. It composes the pieces above rather than adding a new engine: it re-runs the run's acceptance checks **now** through the gate's write-free `evaluate_acceptance_checks` (no spec, no progress, no state writes), reads (never overwrites) the original signed marker via `validate_acceptance_marker`, and counts changed files since the earliest snapshot through the same `tamper::touched_files` diff the gate uses.
 
+This re-run is a read-side regression signal, not the strict Job completion
+gate. It does not replace contained `dr-gate evaluate`, trusted signing or the
+semantic judge, and it cannot issue a Job receipt.
+
 **Three honest states**, decided by the pure `compute_verdict(had_marker, marker_valid, rerun_all_must_pass)`:
 
 | State | Meaning |
@@ -1192,7 +1267,14 @@ Run resolution defaults to the most-recently-updated run across every scope (so 
 
 ## 14. Telemetry: Spend, Traces, Provenance, Events
 
-Five append-only JSONL files capture every run's history. Four (`spend.jsonl`, `traces.jsonl`, `provenance.jsonl`, `events.jsonl`) live under `<run_root>/` directly; the fifth (`proofs/acceptance-progress.jsonl`, see §13.5) is gate-scoped and truncated per evaluation. The gate also writes `proofs/acceptance-tamper.json`, a single proof object bound into the signed marker (§35.5). JSONL files are written via `append_json_line` (`state.rs:375-388`), which opens in append mode and `sync_all`s after each line.
+Five JSONL files capture run evidence. Four (`spend.jsonl`, `traces.jsonl`,
+`provenance.jsonl`, `events.jsonl`) live under `<run_root>/` directly. The
+fifth, `proofs/acceptance-progress.jsonl`, is reconstructed by the trusted
+signer after strict evaluation. Legacy compatibility evaluation may still
+stream and truncate it. The signer also writes
+`proofs/acceptance-tamper.json`, bound into the signed marker. Normal ledger
+JSONL files use `append_json_line`, which opens in append mode and calls
+`sync_all` after each line.
 
 ### 14.1 `spend.jsonl`
 
@@ -1427,7 +1509,12 @@ The top band is split horizontally into three panels for subscription providers 
 - **Header** (short run id, status, phase, provider, sandbox, turn timer, truncated goal, working/artifact path; degrades to an identity strip when live status is unavailable).
 - **Spend meter** only for metered API providers; CLI subscription providers omit cost and emphasize context/wall time.
 - **Context meter**: compact token/window summary with green/yellow/red thresholds.
-- **Acceptance meter**: derived from `AcceptanceLive` (`collect_acceptance_live` in `main.rs:24615`). When `proofs/acceptance-progress.jsonl` exists, the panel tails it and surfaces `running 2/5`, `passed`, or `failed` with the offending check; once `turn-acceptance.json` is signed, it pivots to a marker view (`acceptance_live_from_marker`). Color thresholds are owned by `acceptance_color`.
+- **Acceptance meter**: derived from `AcceptanceLive`
+  (`collect_acceptance_live`). The panel tails
+  `proofs/acceptance-progress.jsonl` when present and pivots to a marker view
+  once `turn-acceptance.json` is signed. Strict Jobs reconstruct final progress
+  after evaluation; only legacy compatibility paths can show per-check
+  `running` transitions from this file.
 - **Center, left**: wide streaming list of tool calls + provider activity + recent events. Acceptance lines from `acceptance_activity_lines` are interleaved so the operator sees the same progress in the activity stream and the meter.
 - **Narrative view**: `--view narrative` or `n` swaps the center-left activity pane for prose sections under the `Narrated` operator heading: freshness/coverage, headline, current work, architecture notes, risks, next likely action, and citations. Wide terminals split that pane with a right-side visual map where that surface owns one; narrow terminals collapse to prose first. Run narratives cite `proofs/acceptance-progress.jsonl` or `proofs/turn-acceptance.json` when acceptance evidence exists, so failed done criteria point at the durable proof artifact. Plain/off-TTY narrative attach prints the same projection with citations and ASCII map lines when `--visual` is not `none`; `--json --view narrative` emits the structured state, snapshot, and graph objects. Non-TTY narrative attach stays deterministic and does not call a provider unless a future explicit refresh surface opts in. Chain attach now supports the narrative view and keeps chain steps in the voyage pane with spine/timeline participation.
 - **Completed docs view**: pressing `d` toggles the center-left panel from provider activity or narrative view to `RUN-NARRATIVE.md` rendered through `pulldown-cmark` into ratatui `Line`/`Span`s. Headings, bullets, inline code, fenced code blocks, links, task markers, math, and horizontal rules receive terminal styles and remain scrollable. The docs view remains a separate completed-run artifact rather than being merged into the live narrative projection.
@@ -1590,7 +1677,10 @@ cargo fmt --check
 
 2. **Two-layer split is non-negotiable.** Skills (Markdown) own judgment; the binary owns invariants. A skill cannot bypass the gate; a gate cannot read prompts.
 
-3. **Anti-self-attestation via a nonce only `dr-gate` reads.** The agent can produce any output it wants; it cannot produce a valid `AcceptanceMarker.signature` because it never sees `gate/nonce`.
+3. **Anti-self-attestation separates evaluation from signing.** Strict Jobs run
+   keyless checks under the resolved sandbox, reap the whole evaluator process
+   group, then give the external HMAC key only to childless `dr-gate sign`.
+   Legacy-v1 compatibility markers retain their nonce validator.
 
 4. **Atomic promotion before completion.** `Completed` is set only after the library swap succeeds. If promotion fails, the run fails. This means a `Completed` status always implies a durable artifact in `library/`.
 
@@ -1662,14 +1752,21 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Contract (§48): `.deadreckon/acceptance.yaml` remains the durable done-contract schema, but `acceptance` and `start` now compile it into a read model with stable per-check summaries, behavior/falsifiability labels, deterministic lint findings, and goal↔contract divergence. The compiler prompt sees the run goal, demands behavioral/falsifiable checks, bans source-scan-only contracts and `--if-present`-only build/test gates, and the Course plan/card/JSON carry compiled checks plus divergence.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
-- Streaming acceptance progress: `proofs/acceptance-progress.jsonl` reports per-check `started`/`running`/`passed`/`failed` transitions while `dr-gate` is mid-evaluation; the attach TUI tails it alongside the signed marker.
+- Acceptance progress: strict Jobs reconstruct final per-check rows only after
+  the signer revalidates the evaluation. Legacy process-owned paths may still
+  stream `started`/`running`/`passed`/`failed` rows. The attach TUI tails the
+  file alongside the signed marker.
 - Extended runs carry the parent's `acceptance.yaml` into the child run and emit the same `print_run_started` startup details (provider route, doc-provider source) as fresh runs; resume does the same.
 - `--max-spend` cap with pause-at-cap; `--max-wall-seconds` for subscription providers.
 - Event-backed TUI attach: production run attaches (same- and cross-process) tail `events.jsonl` incrementally via `TuiEventFeed::file_tail` — `TuiEventFeed::from_broadcast` is `#[cfg(test)]` only. Plan attach uses `PlanEventBus` for durable replay/tail plus child/repair event multiplexing, chain attach tails `chain-events.jsonl` incrementally with partial-line tolerance, and campaign attach tails `campaign-events.jsonl` plus each discovered sub-plan's `plan-events.jsonl`.
 - Cross-process cancellation: `kill` writes a durable cancel marker before signaling; the run loop observes it while provider calls are in flight and reports killed status through events.
 - Partial-trace resume: resume reconstructs only completed tool boundaries and `resume --from-turn` truncates traces, spend records, and future snapshots together.
 - Durable per-run `sandbox.toml` plus per-tool sandbox policy: bash/write-file paths get specific filesystem and network permissions; refusals include `try:` and are recorded in traces and provenance.
-- YAML done-contract files (`acceptance.yaml`): `dr-gate` evaluates required/optional tests, file existence, content matches, shell commands, and build checks, writes `acceptance-tamper.json`, refuses suppression-pattern/spec edits, caveats check-covered test/target edits, then signs check-level proof results and the tamper proof bytes.
+- YAML done-contract files (`acceptance.yaml`): the trusted controller
+  materializes the approved contract. Keyless `dr-gate evaluate` runs its
+  required or optional tests inside the resolved sandbox and returns results
+  plus tamper facts without proof writes. Childless `dr-gate sign` revalidates
+  them, reconstructs tamper and progress evidence, then signs with HMAC.
 - Exhaustive local doctor: OS, sandbox binaries, provider binaries, config, runstate permissions, disk, and opt-in provider pings all produce actionable `try:` hints.
 - Promoted library query surface: `deadreckon library list|search|show` reads library manifests and reverse materialization markers, filters by goal/date, and searches promoted run docs.
 - Import parity hardening: descriptor-backed CLI imports and Cursor SQLite imports preserve source metadata, deterministic session run IDs, stable row ordering, manifests, content hashes, and provenance paths; committed goldens and fixtures cover normalized `show` output plus provider-specific discovery.
@@ -1736,12 +1833,19 @@ The Effortless pass is presentation and advisory orchestration only. It did not 
 - **Sandbox** — process-isolation backend selected at run start (`Auto` → platform-native by default; `SandboxExec` / `Bwrap` / `Docker` / `None`).
 - **Snapshot** — a full copy of `working/` taken before each turn. Lives at `snapshots/turn-<N>/`. Restored by `undo`.
 - **Promotion** — the atomic swap of `working/` into `library/<scope>/<run_id>/`. Only runs that pass the gate get promoted.
-- **Acceptance marker** — a signed JSON file (`proofs/turn-acceptance.json`) written by `dr-gate`. Its signature is tied to a per-run nonce only `dr-gate` reads.
+- **Acceptance marker** — a signed JSON file
+  (`proofs/turn-acceptance.json`). Strict Jobs get a version-2 native marker
+  from childless `dr-gate sign`, bound by HMAC-SHA-256 to checks, tamper facts,
+  containment and the observed backend. Version-1 compatibility markers use
+  the historical run-local nonce.
 - **Spend** — a record of LLM cost per turn. USD for HTTP providers; wall-clock seconds + `subscription: true` for CLI providers.
 - **Provenance** — per-file attribution: which `tool_call_id` produced which file in which turn under which model.
 - **Trace** — every LLM call and every tool dispatch, with latency + structured detail.
 - **CLI sub-agent** — a `cli:*` provider whose `complete()` invocation is one whole turn (the sub-agent does its own tool calls inside). Detected by `response.trace["kind"] == "cli_subagent"`.
-- **dr-gate** — the standalone binary at `crates/deadreckon/src/bin/dr-gate.rs` that owns acceptance verification. The agent cannot impersonate it.
+- **dr-gate** — the standalone binary at
+  `crates/deadreckon/src/bin/dr-gate.rs`. Its keyless `evaluate` command runs
+  approved checks. Its childless, key-bearing `sign` command revalidates and
+  signs them. The agent cannot impersonate a native version-2 proof.
 - **BYOK** — Bring Your Own Key. In deadreckon this extends to subscriptions: a Claude Max or ChatGPT Pro user can drive deadreckon via `cli:*` providers without an API key.
 
 ---
@@ -2361,11 +2465,22 @@ The proof file lives at `<run-root>/proofs/acceptance-tamper.json`:
 }
 ```
 
-The `AcceptanceMarker` schema stays at version 1 and receives no new fields. `gate.rs::marker_signature` hashes the tamper file bytes alongside the nonce, marker fields, and check results. Missing tamper files hash as empty bytes for backward tolerance. A forged or edited tamper file invalidates marker validation, so an agent cannot erase a caveat after signing.
+For strict Jobs, keyless evaluation returns the tamper object in memory. The
+signer recomputes it from the approved contract and current evidence, requires
+an exact match, then writes this file and the version-2 marker. The
+HMAC-SHA-256 signature binds the tamper digest with the marker fields, check
+results, containment and observed backend.
+
+Version-1 compatibility markers keep the historical nonce-and-proof-bytes
+signature. Missing tamper files retain their old empty-bytes tolerance only on
+that legacy path.
 
 ### 35.6 Surfacing
 
-`status`, exit cards, `show --why-failed`, and attach activity derive a per-check gate line from marker/progress rows, for example `gate: PASSED 4/4` or `gate: FAILED 0/1 - cargo_test x auth::tests::expired_token`. Tamper proof data adds `tests modified this run: yes/no` and caveat text such as `accepted (caveat: agent modified test file tests/auth_test.rs this run)`. Exit cards render caveat gates with `Warn` tone.
+`status`, exit cards, `show --why-failed`, and attach activity derive a
+per-check gate line from marker and progress rows, for example `gate: PASSED
+4/4`. On strict Jobs, progress rows appear after signing rather than live
+during evaluation. Tamper proof data adds whether tests changed and any caveat.
 
 ### 35.7 Honest subscription spend
 
@@ -2373,7 +2488,12 @@ The same result surfaces no longer render subscription-only CLI routes as `~$0.0
 
 ### 35.8 Limits
 
-This is tamper-evidence, not a causal soundness proof. It does not prove that a covered-file edit caused a pass, does not cover *every* language's idioms exhaustively, and does not sandbox the checks' own writes. Those larger designs are tracked in `docs/V1-CANDIDATES.md`.
+This is tamper evidence, not a causal soundness proof. It does not prove that a
+covered-file edit caused a pass, and it does not cover every language's idioms.
+Strict Job checks run inside the resolved sandbox. They can write only through
+the sandbox's working-directory policy and cannot write gate or proof paths.
+Historical process-owned compatibility checks do not gain that strict
+containment guarantee.
 
 ### 35.9 Cross-language tamper coverage
 
@@ -2842,8 +2962,9 @@ that launch. Run previews and `doctor` report which seams are external.
 
 `SeamKind` has no gate variant, config rejects `[seams.gate]`, and seam
 subprocesses deny `<run-root>/gate/` and `<run-root>/proofs/`. Adversarial tests
-cover marker/proof writes, `gate/nonce` reads, and signature validation with
-seam sidecars present. Seam files do not alter `marker_signature` inputs.
+cover marker/proof writes and signature validation with seam sidecars present.
+Strict Jobs also deny the external HMAC key; legacy-v1 tests retain
+`gate/nonce` read coverage. Seam files do not alter signature inputs.
 
 ### 39.6 Context-window compaction on the direct-API path
 
@@ -3473,8 +3594,9 @@ The CLI surfaces are now projections over that same model:
   model-exchange reference, sandbox events, spend delta, and final check
   outcome when present.
 - `deadreckon show <run> --raw <artifact>` dumps stable run artifacts verbatim
-  and refuses gate nonce reads with a `verdict` hint; its help points to the
-  checked ledger schemas under `docs/schemas/*.schema.json`.
+  and refuses protected gate secrets, including the legacy-v1 nonce, with a
+  `verdict` hint; its help points to the checked ledger schemas under
+  `docs/schemas/*.schema.json`.
 - `deadreckon report <run>` writes a static Markdown report by default, or
   self-contained HTML with `--html`, and JSON with `--json`; live/pending runs
   refuse with an attach command. The JSON projection is checked against
@@ -3705,8 +3827,9 @@ normal `show`, verdict, report, and attach surfaces.
 `deadreckon-protocol/src/policy.rs` is the single pure answer to whether a
 `LedgerItem` persists, which `LedgerFile` receives it, and what redaction must
 happen before it reaches disk. Unknown items do not persist. Event tool
-arguments and trace details recursively redact gate-nonce keys; spend, flight,
-and narrative references pass through unchanged.
+arguments and trace details recursively redact gate-secret keys, including the
+legacy-v1 nonce vocabulary; spend, flight, and narrative references pass
+through unchanged.
 
 `deadreckon_core::ledger_io` is the I/O adapter above that policy.
 `prepare_ledger_item` applies redaction and resolves the path;
@@ -4022,11 +4145,18 @@ mutable mapping is navigation evidence, never completion authority.
 
 1. save and sync the resolved `launch-plan.json`;
 2. copy or materialize `acceptance.yaml`;
-3. hash the goal, contract, effective policy, launch plan, source tree, and
-   source revision into `authority.json`;
+3. hash the goal, contract, effective policy, launch plan, deliverable source
+   tree, and source revision into `authority.json`;
 4. save `job.json`;
 5. append `created`, `contract_approved`, and `queued`;
 6. only then spawn the detached supervisor.
+
+The effective-policy digest includes the requested sandbox selector and
+tool-capability policy, not only spend, wall-time, retry, and semantic-judge
+limits. Authority does not claim which backend will resolve at runtime. The
+runtime reconstructs the approved policy before provider execution. The
+native marker and final receipt separately bind the backend that actually
+resolved and whether it contained the gate.
 
 For a Single shape, the Job ID is also the root run ID from launch. For Graph
 and Campaign shapes, the plan or campaign keeps that parent ID while child runs
@@ -4067,10 +4197,16 @@ The recovery policy is intentionally fail-closed:
   linked persisted sub-plan before it launches the next sub-plan; Campaign
   child Plan IDs are reserved before spawn and retained across every covered
   launch crash window;
-- guarded launch persists the intended attempt before spawn and releases the
-  child only after exact linkage, so a pre-release crash can relaunch the same
-  logical attempt while a post-release crash must adopt the bound identity or
-  fail closed;
+- outer-worker guarded launch persists the prepared launch and attempt before
+  spawn, then releases the blocked child only after its metadata and
+  `ChildLinked` event are durable. A pre-release crash can relaunch the same
+  logical attempt. Post-release recovery requires a valid release
+  acknowledgement tied to that linked launch, plus matching boot and
+  process-start identity, or it fails closed;
+- a second guarded release surrounds strict gate evaluation: repository checks
+  cannot start before their unique boot/process/attempt identity is synced, and
+  cancellation or retry must reconcile every nested identity plus the outer
+  worker group first;
 - root planner spend and wall time are embedded before child work, restored
   after mapping-creation crashes, subtracted from the Job policy, and divided
   across Plan tasks or Campaign sub-plans rather than granting every child the
@@ -4082,30 +4218,78 @@ The recovery policy is intentionally fail-closed:
 - missing identity or containment evidence stops with a typed reason instead
   of guessing.
 
-Hermetic tests cover the guarded launch boundaries, same-ID root repair,
-Campaign sub-plan reservation, boot/PID reuse refusal, and typed restart
-classification. They do not prove recovery through a real machine reboot or
-an active launchd/systemd restart; those remain operator acceptance gaps.
+Hermetic tests cover both guarded launch boundaries, same-ID root repair,
+Campaign sub-plan reservation, boot/PID reuse refusal, corrupt nested identity
+refusal, and typed restart classification. Public macOS tests additionally hold
+open a real Seatbelt gate, prove operator cancellation reaps it without signing,
+and SIGKILL the outer launcher to prove the old evaluator is gone before one
+bounded retry. They do not prove recovery through a real machine reboot or an
+active launchd/systemd restart; those remain operator acceptance gaps.
 
 ### 58.5 Deterministic gate and protected boundary
 
+The strict gate has 2 contained phases. The trusted controller materializes the
+approved `acceptance.yaml` before evaluation. It then starts keyless `dr-gate
+evaluate` through the sandbox runner under the backend that actually resolves.
+The evaluator receives no `GATE_*` inputs. It runs the approved checks, computes
+tamper facts, writes no proof or Job control files, and returns JSON on stdout.
+
+The sandbox runner scrubs inherited signing and containment inputs. For strict
+Jobs a private release pipe holds the evaluator until its unique, synced
+attempt/launch/boot/process identity exists; the helper then creates the fresh
+evaluator process group and marks the record running before any check executes.
+Cancellation and retry reconcile that group by identity, while corrupt or
+reused identity blocks as `LostContainment`. The runner terminates residual
+descendants before returning. A resolved backend of `none` refuses before the
+controller reads any signing material.
+
+Only then does the controller start childless `dr-gate sign`. The signer reads
+the Job's HMAC key, strictly validates the evaluation against the run ID,
+canonical working directory and approved contract, and recomputes tamper facts.
+It reconstructs progress and tamper evidence and writes the version-2 marker
+with the containment fact and observed backend. No repository-controlled check
+runs in the signing phase.
+
 Version-2 native markers use HMAC-SHA-256 over canonical bytes with
 constant-time verification. Keys live outside the agent-visible run root under
-`~/.deadreckon/gate-keys/` with owner-only permissions. The marker binds its
-issuer, native/synthetic proof kind, check results, containment fact, and
-resolved sandbox backend. Missing v2 key material fails verification; old v1
-markers remain explicitly legacy rather than being upgraded by description.
+`~/.deadreckon/gate-keys/` with owner-only permissions. Missing version-2 key
+material fails verification. Old version-1 nonce markers remain explicitly
+legacy rather than being upgraded by description.
 
-Worker sandbox policy denies the key store and makes Job authority, contract,
-receipt, lifecycle, proof, snapshot, and provenance control paths inaccessible
-or read-only across Seatbelt, bubblewrap, Docker, CLI providers, and the Codex
-app-server outer boundary. Symlink and canonical-path cases are covered. A
-strict durable Job receipt refuses `sandbox_backend = none` or
+Worker and gate-evaluator sandbox policy denies the key store and makes Job
+authority, contract, receipt, lifecycle, proof, snapshot, and provenance
+control paths inaccessible or read-only across Seatbelt, bubblewrap, Docker,
+CLI providers, and the Codex app-server outer boundary. Symlink and
+canonical-path cases are covered. A strict durable Job refuses
+`sandbox_backend = none` before signing and cannot produce a receipt with
 `contained = false`.
 
-These are code and hermetic-test guarantees. Host sandbox availability still
-matters: an `auto` request that resolves to no real backend cannot produce a
-verified strict Job.
+Provider output crosses a separate artifact boundary before it can become a
+trusted result. Workspace paths are classified as deliverable,
+evidence-only, lifecycle metadata, or disposable runtime output. Trusted
+copies preserve regular files, executable mode, symlinks, and raw symlink
+targets without following links; special filesystem entries fail closed.
+Provider-created commits and index state are discarded, then DeadReckon stages
+only deliverable paths and creates its own hook-free commit through a captured
+Git control context outside the provider's authority.
+
+That Git context captures and validates the original `.git` redirect, run
+worktree path, linked-worktree Git directory, and common Git directory.
+Privileged sanitization and trusted commits do not use a provider-rewritten
+workspace router. Documentation providers receive a read-only isolated
+workspace; only DeadReckon parses, writes, and commits the approved
+documentation result. Merge-aware history scans preserve raw Unix path bytes
+and reject private paths even when they appear only in a merge or are added
+and later deleted. Platforms that cannot represent a path fail closed. Strict
+result paths with active Git filters or `160000` gitlinks are currently
+refused rather than incompletely modeled.
+
+The real macOS public-command end-to-end test runs the approved shell check
+under Seatbelt. It proves protected-path denial, inherited `GATE_*` scrubbing,
+residual process-group cleanup and signing of the observed `sandbox-exec`
+backend. Equivalent live Linux/bubblewrap and Docker trials remain
+outstanding. Host sandbox availability still matters: an `auto` request that
+resolves to no real backend cannot produce a verified strict Job.
 
 ### 58.6 Independent semantic judge
 
@@ -4135,12 +4319,27 @@ recorded judge response exceeds the remaining spend or wall policy.
 
 For a durable Job, `receipt.json` is supervisor-issued
 `two_key_completion` evidence. Its
-HMAC-SHA-256 signature covers identity, outcome, authority, goal, contract,
-effective policy, launch plan, source tree/revision, canonical result
-tree/revision, deterministic marker, semantic judgment, and confinement.
-Validation recomputes file and result-tree digests; it does not trust mtimes.
-Receipt sealing repeats the evidence-backed `achieved` invariant, so a
-persisted file cannot bypass the semantic response parser during recovery.
+HMAC-SHA-256 signature covers identity, outcome, issuer, proof and stop reason;
+authority, goal, contract, effective-policy and launch-plan digests;
+deliverable source and result tree digests; optional source and result
+revisions; deterministic-marker and semantic-judgment digests; containment;
+and the resolved sandbox backend. Validation recomputes deliverable tree
+digests; it does not trust mtimes. Receipt sealing repeats the evidence-backed
+`achieved` invariant, so a persisted file cannot bypass the semantic response
+parser during recovery.
+
+The receipt schema does not contain a branch name, filesystem inventory,
+merge-history inventory, or retention-ref name. For worktree results, sealing
+and validation use the trusted codebase record and Git state to enforce the
+approved base, result branch and revision, exact Git and filesystem identity,
+ignored or uncommitted deliverables, `assume-unchanged` and `skip-worktree`
+masking, and unexpected private history. Sealing separately creates
+`refs/deadreckon/results/<job-hash>` to retain the signed revision; the ref name
+is not a receipt field. During a verified worktree apply, `finish` compares
+each signed deliverable delta path's Git entry and every introduced
+delivery-history path with the sealed result. A failed final identity check
+resets the target to its pre-delivery revision instead of leaving rejected
+commits behind.
 
 New Job promotion calls this validator. Changing the authority, launch plan,
 contract, deterministic marker, semantic judgment, result bytes, containment
@@ -4149,10 +4348,10 @@ validator during the compatibility window and must not be presented as
 two-key-verified Jobs.
 
 Graph Jobs normalize delivery to `AtEnd`. After merge, the supervisor copies
-the substantive result tree into a run with the Job ID. It runs `dr-gate`
-against the frozen contract, asks a fresh read-only semantic judge, seals and
-validates the parent receipt, then promotes. `finish` exports that
-receipt-bound parent.
+the deliverable result tree into a run with the Job ID. It runs the contained
+keyless-evaluate/HMAC-sign gate against the frozen contract, asks a fresh
+read-only semantic judge, seals and validates the parent receipt, then
+promotes. `finish` exports that receipt-bound parent.
 
 Campaign Jobs use the same parent sequence. Before the native gate, the
 supervisor validates the merged result marker, compares the stored and merged
@@ -4198,9 +4397,10 @@ real login or reboot.
 
 The repository has focused tests for schemas, reduction, projection rebuild,
 lease fencing/reclaim, process-group survival, frozen approval inputs, HMAC
-markers, boundary denials, hostile marker search/forgery, semantic read-only
-posture and decisions, receipt tamper refusal, detached-parent survival, typed
-spawn failure, the shared Job resolver, guided Graph and Campaign identity,
+markers, the two-phase gate, boundary denials, hostile marker search/forgery,
+semantic read-only posture and decisions, receipt tamper refusal,
+detached-parent survival, typed spawn failure, the shared Job resolver, guided
+Graph and Campaign identity,
 same-ID root mapping repair, guarded launch recovery, persisted Campaign
 sub-plan recovery and reserved identities, aggregate root-planner spend/wall
 enforcement, terminal budget recovery after sidecar loss, cancellation races,
@@ -4211,18 +4411,20 @@ fault boundaries, and promotion enforcement.
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
 human-review template, and a credential-free adversarial runner. The committed
 credential-free result records 7 passes, 0 failures, and 5 explicitly
-unproven live/host claims. The sanitized live result records 2 attempts, 22
-not run, and 0 verified.
+unproven live/host claims. The sanitized live result records 2 attempted tasks,
+22 not run, and 0 verified.
 
-The repository therefore does not report verified completion rates from the
-planned live tasks, prove false-acceptance or false-rejection rates,
-demonstrate a real machine restart, or demonstrate live Campaign interruption
-recovery. Direct run, orchestration, stored-plan fork, supported new chain, and
-campaign launches now share the Job scheduler; historical and explicitly
-untrusted compatibility paths do not. The operator script in
+The macOS public-command end-to-end gate trial is real host evidence, not a
+hermetic backend simulation. The repository still does not report verified
+completion rates from the planned live tasks, prove false-acceptance or
+false-rejection rates, demonstrate live Linux/bubblewrap or Docker gate
+containment, demonstrate a real machine restart, or demonstrate live Campaign
+interruption recovery. Direct run, orchestration, stored-plan fork, supported
+new chain, and campaign launches now share the Job scheduler; historical and
+explicitly untrusted compatibility paths do not. The operator script in
 `docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available now from
 open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper recovery hardening (§58: crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

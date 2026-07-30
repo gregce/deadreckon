@@ -1882,6 +1882,8 @@ fn polish_config(home: &Path, no_llm: bool, force: bool) -> PolishConfig {
         doc_subskills: Vec::new(),
         token_budget: 0,
         budget_cap_usd: None,
+        sandbox_backend: deadreckon_sandbox::SandboxBackend::Auto,
+        commit_docs: true,
         no_llm,
         force,
     }
@@ -1901,6 +1903,8 @@ fn split_polish_config(home: &Path, force: bool) -> PolishConfig {
         ],
         token_budget: 0,
         budget_cap_usd: None,
+        sandbox_backend: deadreckon_sandbox::SandboxBackend::Auto,
+        commit_docs: true,
         no_llm: false,
         force,
     }

@@ -11,8 +11,9 @@ use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use deadreckon_protocol::{
-    AuthorityAcceptedBy, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobId,
-    JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
+    AuthorityAcceptedBy, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
+    JobExecutionPolicy, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
+    StopReason,
 };
 
 const JOB_ACCEPTANCE_FILE: &str = "acceptance.yaml";
@@ -55,6 +56,12 @@ pub(crate) struct CreateJob<'a> {
 }
 
 pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
+    if request.sandbox_requested.trim() == "none" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable Jobs require containment; sandbox `none` cannot be frozen as trusted execution policy",
+            "use sandbox auto or an available sandbox-exec, bwrap, or docker backend",
+        )));
+    }
     let expected_shape = match request.launch_plan.shape {
         commands::course::CourseShape::Single => JobShape::Single,
         commands::course::CourseShape::Plan => JobShape::Graph,
@@ -121,6 +128,9 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         max_attempts: request.max_attempts.max(1),
         deadline: None,
         semantic_judge: SemanticJudgeMode::Required,
+        execution: Some(JobExecutionPolicy::workspace_only(
+            request.sandbox_requested.clone(),
+        )),
     };
     let effective_policy_sha256 = deadreckon_core::flight::sha256_text(
         &serde_json::to_string(&policy).map_err(|source| DeadreckonError::Json {
@@ -129,7 +139,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         })?,
     );
     let source_tree_sha256 =
-        deadreckon_core::flight::build_working_file_index(&authority_source_cwd)?.tree_hash();
+        deadreckon_core::flight::build_deliverable_file_index(&authority_source_cwd)?.tree_hash();
     let authority = JobAuthority {
         schema_version: JobSchemaVersion::CURRENT,
         job_id: job_id.clone(),
@@ -489,38 +499,258 @@ pub(crate) fn cancel_job(
             detail: json!({ "stop_reason": StopReason::CancelRequested }),
         },
     )?;
-    if let Ok(state) = load_run(paths, view.job.job_id.as_ref()) {
-        write_cancel_marker(&state, "operator cancelled durable job")?;
+    let mut supervised = Vec::new();
+    let state = load_run(paths, view.job.job_id.as_ref()).ok();
+    if let Some(state) = state.as_ref() {
+        write_cancel_marker(state, "operator cancelled durable job")?;
     }
     let metadata_path = paths
         .job_dir(view.job.job_id.as_ref())
         .join("supervised-child.json");
     if let Ok(process) = deadreckon_core::read_supervised_process(&metadata_path) {
+        supervised.push(process);
+    }
+    supervised.sort_by_key(|process| (process.pid, process.pgid));
+    supervised.dedup();
+    let grace = if force {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    };
+    for process in supervised {
+        let outcome = terminate_supervised_process(process, grace);
+        if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "job {} cancellation was recorded but supervised process {} could not be stopped: {reason}",
+                view.job.job_id, process.pid,
+            ))));
+        }
+    }
+    if let Some(state) = state.as_ref() {
+        reconcile_run_supervised_processes(state, grace, false)?;
+    }
+    let updated = deadreckon_core::JobView::load(paths, view.job.job_id.as_ref())?;
+    print_job_status(&updated, false)
+}
+
+pub(crate) fn reconcile_run_supervised_processes(
+    state: &deadreckon_core::PipelineState,
+    grace: Duration,
+    boot_changed: bool,
+) -> Result<()> {
+    let directory = state.run_root.join("child-pids");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
+        match deadreckon_core::read_supervised_process_record(&path) {
+            Ok(record) => reconcile_guarded_process_record(&path, &record, grace)?,
+            Err(record_error) => {
+                let process = read_legacy_nested_supervised_process(&path).map_err(|error| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "cannot reconcile supervised process record {}: {record_error}; legacy parse also failed: {error}",
+                        path.display()
+                    )))
+                })?;
+                if boot_changed {
+                    remove_supervised_file(&path)?;
+                    continue;
+                }
+                if deadreckon_core::pid_is_alive(process.pid) {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "cannot prove legacy supervised process {} from {} is dead because it has no boot and process-start identity",
+                        process.pid,
+                        path.display()
+                    ))));
+                }
+                remove_supervised_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_legacy_nested_supervised_process(
+    path: &Path,
+) -> std::io::Result<deadreckon_core::SupervisedProcess> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacySupervisedProcess {
+        pid: u32,
+        #[serde(default)]
+        pgid: Option<u32>,
+    }
+
+    let raw = fs::read(path)?;
+    let process = if raw.iter().copied().find(|byte| !byte.is_ascii_whitespace()) == Some(b'{') {
+        let legacy: LegacySupervisedProcess = serde_json::from_slice(&raw)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        deadreckon_core::SupervisedProcess {
+            pid: legacy.pid,
+            pgid: legacy.pgid,
+        }
+    } else {
+        deadreckon_core::read_supervised_process(path)?
+    };
+    if process.pid == 0
+        || process
+            .pgid
+            .is_some_and(|pgid| pgid == 0 || pgid != process.pid)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid legacy supervised process identity",
+        ));
+    }
+    Ok(process)
+}
+
+fn reconcile_guarded_process_record(
+    path: &Path,
+    record: &deadreckon_core::SupervisedProcessRecord,
+    grace: Duration,
+) -> Result<()> {
+    use deadreckon_core::SupervisedProcessIdentity;
+
+    match record.identity() {
+        SupervisedProcessIdentity::DifferentBoot => {
+            // A machine restart makes the old process identity impossible.
+            // Remove stale control state without signalling a potentially
+            // reused numeric PID.
+        }
+        SupervisedProcessIdentity::Current => {
+            terminate_guarded_process(record, grace)?;
+        }
+        SupervisedProcessIdentity::Exited =>
+        {
+            #[cfg(unix)]
+            if let Some(pgid) = record.process.pgid {
+                use deadreckon_core::ChildTerminator as _;
+
+                let pgid = i32::try_from(pgid).map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "invalid process group in {}",
+                        path.display()
+                    )))
+                })?;
+                if let deadreckon_core::TerminationOutcome::Failed(reason) =
+                    deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace)
+                {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "could not reconcile residual evaluator group {pgid} from {}: {reason}",
+                        path.display()
+                    ))));
+                }
+            }
+        }
+        SupervisedProcessIdentity::Reused => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "refused to signal reused pid {} from stale evaluator record {}",
+                record.process.pid,
+                path.display()
+            ))));
+        }
+        SupervisedProcessIdentity::Unverifiable => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify evaluator identity in {}",
+                path.display()
+            ))));
+        }
+    }
+    let removed = deadreckon_core::remove_supervised_process_record_if_matches(
+        path,
+        &record.launch_id,
+        record.process.pid,
+    )?;
+    if !removed && path.exists() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "evaluator identity changed while reconciling {}",
+            path.display()
+        ))));
+    }
+    Ok(())
+}
+
+fn terminate_guarded_process(
+    record: &deadreckon_core::SupervisedProcessRecord,
+    grace: Duration,
+) -> Result<()> {
+    #[cfg(unix)]
+    {
         use deadreckon_core::ChildTerminator as _;
-        let grace = if force {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(2)
-        };
-        #[cfg(unix)]
-        let outcome = process
+
+        let pgid =
+            i32::try_from(record.process.pgid.unwrap_or(record.process.pid)).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "invalid guarded process group {}",
+                    record.process.pid
+                )))
+            })?;
+        // The prepared -> running transition changes the target from a raw
+        // child to a process-group leader. Sweep group, raw PID, then group
+        // again so cancellation cannot lose that transition race.
+        for outcome in [
+            deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(Duration::ZERO),
+            deadreckon_core::RawPidTerminator::new(record.process.pid).terminate(grace),
+            deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace),
+        ] {
+            if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "could not stop guarded evaluator {}: {reason}",
+                    record.process.pid
+                ))));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if let deadreckon_core::TerminationOutcome::Failed(reason) =
+            terminate_supervised_process(record.process, grace)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "could not stop guarded evaluator {}: {reason}",
+                record.process.pid
+            ))));
+        }
+        Ok(())
+    }
+}
+
+fn remove_supervised_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn terminate_supervised_process(
+    process: deadreckon_core::SupervisedProcess,
+    grace: Duration,
+) -> deadreckon_core::TerminationOutcome {
+    use deadreckon_core::ChildTerminator as _;
+
+    #[cfg(unix)]
+    {
+        process
             .pgid
             .and_then(|pgid| i32::try_from(pgid).ok())
             .map_or_else(
                 || deadreckon_core::RawPidTerminator::new(process.pid).terminate(grace),
                 |pgid| deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace),
-            );
-        #[cfg(not(unix))]
-        let outcome = deadreckon_core::RawPidTerminator::new(process.pid).terminate(grace);
-        if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
-            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "job {} cancellation was recorded but its child could not be stopped: {reason}",
-                view.job.job_id
-            ))));
-        }
+            )
     }
-    let updated = deadreckon_core::JobView::load(paths, view.job.job_id.as_ref())?;
-    print_job_status(&updated, false)
+    #[cfg(not(unix))]
+    {
+        deadreckon_core::RawPidTerminator::new(process.pid).terminate(grace)
+    }
 }
 
 fn authority_source_cwd(
@@ -704,6 +934,24 @@ mod tests {
                 .expect("contract digest")
         );
         assert_eq!(authority.semantic_judge_mode, SemanticJudgeMode::Required);
+        let execution = job
+            .policy
+            .execution
+            .as_ref()
+            .expect("immutable execution policy");
+        assert!(execution.require_containment);
+        assert_eq!(execution.sandbox_requested, "auto");
+        assert!(execution.tools.contains_key("bash"));
+        assert!(execution.tools.contains_key("write_file"));
+        assert!(execution.tools.values().all(|tool| {
+            tool.workspace_read && tool.workspace_write && tool.network_allowlist.is_empty()
+        }));
+        assert_eq!(
+            authority.effective_policy_sha256,
+            deadreckon_core::flight::sha256_text(
+                &serde_json::to_string(&job.policy).expect("policy json")
+            )
+        );
         assert_eq!(
             job.authority_sha256,
             deadreckon_core::flight::sha256_file(&authority_path).expect("authority digest")
@@ -742,6 +990,35 @@ mod tests {
             fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref())).expect("frozen");
         assert!(frozen.contains("{working_dir}"));
         assert!(!frozen.contains(&source.display().to_string()));
+    }
+
+    #[test]
+    fn durable_job_refuses_uncontained_policy_before_writing_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), "durable").expect("source file");
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: durable fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("contract");
+        let mut request = request(&paths, &source, Some(&contract));
+        request.sandbox_requested = "none".to_string();
+
+        let error = create_job(request).expect_err("uncontained Job must be refused");
+
+        assert!(error.to_string().contains("require containment"), "{error}");
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .next()
+                    .is_none(),
+            "refusal must happen before a durable identity is written"
+        );
     }
 
     #[test]
@@ -793,7 +1070,7 @@ mod tests {
         );
         assert_eq!(
             authority.source_tree_sha256,
-            deadreckon_core::flight::build_working_file_index(&job.source_cwd)
+            deadreckon_core::flight::build_deliverable_file_index(&job.source_cwd)
                 .expect("approved source index")
                 .tree_hash()
         );
@@ -843,11 +1120,20 @@ mod tests {
             .expect("unused launch mutation must not invalidate fresh authority");
         assert_eq!(
             authority.source_tree_sha256,
-            deadreckon_core::flight::build_working_file_index(&job.source_cwd)
+            deadreckon_core::flight::build_deliverable_file_index(&job.source_cwd)
                 .expect("approved source index after launch mutation")
                 .tree_hash(),
             "mutating the unused launch checkout must not invalidate a fresh job"
         );
+        fs::create_dir_all(job.source_cwd.join(".specstory/history"))
+            .expect("provider evidence directory");
+        fs::write(
+            job.source_cwd.join(".specstory/history/session.md"),
+            "provider-private evidence",
+        )
+        .expect("provider evidence");
+        super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect("provider-private source evidence must not invalidate authority");
         fs::write(job.source_cwd.join("unexpected.txt"), "mutation")
             .expect("mutate approved source");
         let error = super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
@@ -1300,5 +1586,137 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn supervised_state(temp: &TempDir) -> deadreckon_core::PipelineState {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("workspace");
+        fs::create_dir_all(&cwd).expect("workspace");
+        deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "reconcile guarded process".to_string(),
+                cwd,
+                sandbox: "auto".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some("guarded-process-test".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run state")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_guarded_process_is_stopped_before_its_record_is_removed() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let mut child = Command::new("sleep").arg("60").spawn().expect("sleep");
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("dr-gate-evaluate-attempt-launch.json");
+        let record = deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess {
+                pid: child.id(),
+                pgid: None,
+            },
+            "evaluator-launch".to_string(),
+            1,
+            Some("job-launch".to_string()),
+            "release-digest".to_string(),
+        )
+        .expect("process identity");
+        deadreckon_core::write_supervised_process_record(&path, &record).expect("record");
+
+        reconcile_run_supervised_processes(&state, Duration::ZERO, false)
+            .expect("reconcile evaluator");
+
+        let status = child.wait().expect("reap evaluator");
+        assert!(!status.success());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn reboot_stale_guarded_record_is_removed_without_signalling_reused_pid() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("dr-gate-evaluate-stale.json");
+        let mut record = deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess {
+                pid: std::process::id(),
+                pgid: None,
+            },
+            "stale-launch".to_string(),
+            1,
+            Some("old-job-launch".to_string()),
+            "release-digest".to_string(),
+        )
+        .expect("current identity");
+        record.boot_id = "different-boot".to_string();
+        deadreckon_core::write_supervised_process_record(&path, &record).expect("record");
+
+        reconcile_run_supervised_processes(&state, Duration::ZERO, true)
+            .expect("discard stale record");
+
+        assert!(deadreckon_core::pid_is_alive(std::process::id()));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn corrupt_nested_process_record_fails_closed_and_remains_for_recovery() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("dr-gate-evaluate-corrupt.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("child-pids");
+        fs::write(&path, b"{\"pid\":").expect("partial record");
+
+        let error = reconcile_run_supervised_processes(&state, Duration::ZERO, false)
+            .expect_err("corrupt identity must block");
+
+        assert!(error.to_string().contains("cannot reconcile"), "{error}");
+        assert!(path.exists(), "corrupt evidence must remain inspectable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_new_record_never_falls_back_to_legacy_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let mut child = Command::new("true").spawn().expect("short-lived child");
+        let pid = child.id();
+        child.wait().expect("reap short-lived child");
+        assert!(!deadreckon_core::pid_is_alive(pid));
+
+        for boot_changed in [false, true] {
+            let path = state
+                .run_root
+                .join("child-pids")
+                .join(format!("dr-gate-evaluate-corrupt-{boot_changed}.json"));
+            fs::create_dir_all(path.parent().expect("parent")).expect("child-pids");
+            fs::write(
+                &path,
+                format!(
+                    "{{\"schema_version\":99,\"pid\":{pid},\"launch_id\":\"corrupt-launch\",\"attempt\":1,\"release_token_sha256\":\"digest\",\"boot_id\":\"boot\",\"process_start_identity\":\"start\",\"phase\":\"prepared\"}}\n"
+                ),
+            )
+            .expect("malformed new record");
+
+            let error = reconcile_run_supervised_processes(&state, Duration::ZERO, boot_changed)
+                .expect_err("new-format corruption must never become legacy cleanup");
+
+            assert!(error.to_string().contains("cannot reconcile"), "{error}");
+            assert!(path.exists(), "corrupt evidence must remain inspectable");
+            fs::remove_file(&path).expect("remove fixture for next iteration");
+        }
     }
 }

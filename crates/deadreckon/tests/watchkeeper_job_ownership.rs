@@ -367,7 +367,11 @@ fn trusted_supervisor_can_mutate_and_merge_its_job_owned_plan() {
     assert_eq!(
         view.projection.outcome,
         Some(JobOutcome::NeedsReview),
-        "the scripted judge must fail closed after the deterministic graph succeeds"
+        "the scripted judge must fail closed after the deterministic graph succeeds\nJob:\n{view:#?}\nEvents:\n{:#?}\nSupervisor stderr:\n{supervisor_stderr}\nDriver stderr:\n{}",
+        read_job_history(&paths.job_events(job_id))
+            .map(|history| history.events().to_vec())
+            .unwrap_or_default(),
+        fs::read_to_string(paths.job_dir(job_id).join("supervisor.err")).unwrap_or_default(),
     );
     assert!(
         !supervisor_stderr.contains("belongs to durable Job"),
@@ -946,6 +950,7 @@ fn write_job_fixture(
                 max_attempts: 1,
                 deadline: None,
                 semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
             },
         },
     )

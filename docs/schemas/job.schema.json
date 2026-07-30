@@ -52,6 +52,28 @@
     }
   },
   "definitions": {
+    "JobExecutionPolicy": {
+      "type": "object",
+      "required": [
+        "require_containment",
+        "sandbox_requested",
+        "tools"
+      ],
+      "properties": {
+        "require_containment": {
+          "type": "boolean"
+        },
+        "sandbox_requested": {
+          "type": "string"
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/JobToolPolicy"
+          }
+        }
+      }
+    },
     "JobPolicy": {
       "type": "object",
       "required": [
@@ -67,6 +89,17 @@
             "null"
           ],
           "format": "date-time"
+        },
+        "execution": {
+          "description": "Resolved provider capability policy approved before the first turn.\n\n`None` is retained only for reading pre-Watchkeeper-policy jobs.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/JobExecutionPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "max_attempts": {
           "type": "integer",
@@ -95,6 +128,28 @@
         "legacy_chain",
         "legacy_campaign"
       ]
+    },
+    "JobToolPolicy": {
+      "type": "object",
+      "required": [
+        "workspace_read",
+        "workspace_write"
+      ],
+      "properties": {
+        "network_allowlist": {
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workspace_read": {
+          "type": "boolean"
+        },
+        "workspace_write": {
+          "type": "boolean"
+        }
+      }
     },
     "SemanticJudgeMode": {
       "type": "string",
