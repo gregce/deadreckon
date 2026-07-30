@@ -856,6 +856,39 @@ pub(crate) fn write_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+/// Durably replace a mutable controller-owned JSON projection.
+///
+/// Immutable authority files use `write_json_synced` and refuse replacement.
+/// A small number of active recovery pointers must advance atomically while
+/// their prior value remains in an immutable archive.
+pub(crate) fn replace_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "job artifact path has no parent: {}",
+            path.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, value).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    temp.write_all(b"\n")?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path).map_err(|error| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source: error.error,
+        })
+    })?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 fn sync_file(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
     Ok(())

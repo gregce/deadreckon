@@ -3,24 +3,27 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
-    CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, GoalCoverageStatus,
-    JobAuthority, JobOutcome, JobSchemaVersion, SemanticDecision, SemanticJudgment, StopReason,
+    CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, GoalCoverageStatus, Job,
+    JobAuthority, JobEvent, JobEventKind, JobOutcome, JobSchemaVersion, JobShape, SemanticDecision,
+    SemanticJudgment, StopReason,
 };
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::flight::{build_deliverable_file_index, sha256_file, sha256_text};
 use crate::gate::{
     AcceptanceCheck, AcceptanceMarker, acceptance_checks_from_yaml, read_gate_key,
-    validate_acceptance_marker,
+    validate_acceptance_marker_with_parent_repair_bytes,
 };
-use crate::job::load_job;
+use crate::job::{JobHistory, load_job, read_job_history, reduce_job_history};
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, atomic_write_json};
 use crate::{
@@ -29,6 +32,97 @@ use crate::{
 
 const RECEIPT_MAGIC: &[u8] = b"deadreckon.completion-receipt.v1\0";
 pub const SEMANTIC_JUDGMENT_JSON: &str = "proofs/semantic-judgment.json";
+const PARENT_REPAIR_INTENT_JSON: &str = "parent-repair.json";
+const PARENT_REPAIR_ARCHIVE_DIR: &str = "parent-repairs";
+const PARENT_REPAIR_ROUND_FILES: [&str; 5] = [
+    "intent.json",
+    "final-attempt.json",
+    "candidate.json",
+    "pre-repair-marker.json",
+    "revise-judgment.json",
+];
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentRepairIntentBinding {
+    schema_version: u32,
+    job_id: String,
+    shape: JobShape,
+    round: u32,
+    merged_run_id: String,
+    merged_tree_sha256: String,
+    pre_repair_tree_sha256: String,
+    revise_marker_sha256: String,
+    revise_judgment_sha256: String,
+    revise_input_sha256: String,
+    requested_after_attempt: u32,
+    requested_after_launch_id: String,
+    requested_after_lease_epoch: u64,
+    #[serde(rename = "provider")]
+    _provider: Option<String>,
+    #[serde(rename = "model")]
+    _model: Option<String>,
+    feedback: String,
+    previous_round_sha256: Option<String>,
+    #[serde(rename = "requested_at")]
+    _requested_at: DateTime<Utc>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentRepairManifestBinding {
+    schema_version: u32,
+    job_id: String,
+    shape: JobShape,
+    round: u32,
+    merged_run_id: String,
+    merged_tree_sha256: String,
+    pre_repair_tree_sha256: String,
+    intent_sha256: String,
+    attempt: u32,
+    launch_id: String,
+    lease_epoch: u64,
+    attempt_baseline_tree_sha256: String,
+    #[serde(rename = "started_at")]
+    _started_at: DateTime<Utc>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentRepairCandidateBinding {
+    schema_version: u32,
+    job_id: String,
+    run_id: String,
+    round: u32,
+    attempt: u32,
+    launch_id: String,
+    lease_epoch: u64,
+    intent_sha256: String,
+    manifest_sha256: String,
+    result_tree_sha256: String,
+    #[serde(rename = "turn")]
+    _turn: u32,
+    #[serde(rename = "ready_at")]
+    _ready_at: DateTime<Utc>,
+}
+
+struct TrustedFileSnapshot {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+struct ValidatedParentRepair {
+    manifest: TrustedFileSnapshot,
+    candidate: TrustedFileSnapshot,
+}
+
+struct ParentRepairRoundSnapshot {
+    intent: TrustedFileSnapshot,
+    manifest: TrustedFileSnapshot,
+    candidate: TrustedFileSnapshot,
+    marker: TrustedFileSnapshot,
+    judgment: TrustedFileSnapshot,
+}
 
 pub fn seal_completion_receipt(
     paths: &DeadreckonPaths,
@@ -44,7 +138,16 @@ pub fn seal_completion_receipt(
             "job, authority, and run identities do not agree",
         ));
     }
-    let validated_marker = validate_acceptance_marker(state)?;
+    let parent_repair = validate_parent_repair_lineage_if_present(paths, state)?;
+    let validated_marker = validate_acceptance_marker_with_parent_repair_bytes(
+        state,
+        parent_repair
+            .as_ref()
+            .map(|repair| repair.manifest.bytes.as_slice()),
+        parent_repair
+            .as_ref()
+            .map(|repair| repair.candidate.bytes.as_slice()),
+    )?;
     if validated_marker != *marker || !marker.is_native_gate_proof() {
         return Err(completion_error(
             authority.job_id.as_ref(),
@@ -178,7 +281,16 @@ pub fn validate_completion_receipt(
         ));
     }
     validate_achieved_judgment(&judgment, &state.run_id)?;
-    let marker = validate_acceptance_marker(state)?;
+    let parent_repair = validate_parent_repair_lineage_if_present(paths, state)?;
+    let marker = validate_acceptance_marker_with_parent_repair_bytes(
+        state,
+        parent_repair
+            .as_ref()
+            .map(|repair| repair.manifest.bytes.as_slice()),
+        parent_repair
+            .as_ref()
+            .map(|repair| repair.candidate.bytes.as_slice()),
+    )?;
     if !marker.is_native_gate_proof()
         || marker.contained != receipt.contained
         || marker.sandbox_backend != receipt.sandbox_backend
@@ -197,6 +309,547 @@ pub fn validate_completion_receipt(
     let key = read_gate_key(paths, &state.run_id)?;
     verify_receipt_signature(&receipt, &key)?;
     Ok(receipt)
+}
+
+fn validate_parent_repair_lineage_if_present(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+) -> Result<Option<ValidatedParentRepair>> {
+    let intent_path = paths.job_dir(&state.run_id).join(PARENT_REPAIR_INTENT_JSON);
+    let manifest_path = crate::parent_repair_manifest_path_for_run_root(&state.run_root);
+    let candidate_path = crate::parent_repair_candidate_path_for_run_root(&state.run_root);
+    let intent_snapshot = read_optional_trusted_file_snapshot(
+        &intent_path,
+        "active parent repair intent",
+        &state.run_id,
+    )?;
+    let manifest_snapshot = read_optional_trusted_file_snapshot(
+        &manifest_path,
+        "active parent repair manifest",
+        &state.run_id,
+    )?;
+    let candidate_snapshot = read_optional_trusted_file_snapshot(
+        &candidate_path,
+        "active parent repair candidate",
+        &state.run_id,
+    )?;
+    let (intent_snapshot, manifest_snapshot, candidate_snapshot) = match (
+        intent_snapshot,
+        manifest_snapshot,
+        candidate_snapshot,
+    ) {
+        (None, None, None) => return Ok(None),
+        (Some(intent), Some(manifest), Some(candidate)) => (intent, manifest, candidate),
+        _ => {
+            return Err(completion_error(
+                &state.run_id,
+                "parent repair authority is incomplete; intent, manifest and candidate must remain together",
+            ));
+        }
+    };
+
+    let job = load_job(paths, &state.run_id)?;
+    let history = read_job_history(&paths.job_events(&state.run_id))?;
+    let projection = reduce_job_history(&job.job_id, &history)?;
+    let active: ParentRepairIntentBinding =
+        parse_parent_repair_snapshot(&intent_snapshot, &intent_path)?;
+    let manifest: ParentRepairManifestBinding =
+        parse_parent_repair_snapshot(&manifest_snapshot, &manifest_path)?;
+    let candidate: ParentRepairCandidateBinding =
+        parse_parent_repair_snapshot(&candidate_snapshot, &candidate_path)?;
+    let round_dir = parent_repair_round_dir(state, active.round);
+    let marker_path = round_dir.join("pre-repair-marker.json");
+    let judgment_path = round_dir.join("revise-judgment.json");
+    let marker_snapshot = read_required_trusted_file_snapshot(
+        &marker_path,
+        "archived parent repair marker",
+        &state.run_id,
+    )?;
+    let judgment_snapshot = read_required_trusted_file_snapshot(
+        &judgment_path,
+        "archived parent repair judgment",
+        &state.run_id,
+    )?;
+
+    validate_parent_repair_intent(
+        state,
+        &job,
+        &history,
+        &active,
+        &intent_snapshot,
+        &marker_snapshot,
+        &marker_path,
+        &judgment_snapshot,
+        &judgment_path,
+    )?;
+    validate_parent_repair_attempt(
+        state,
+        &job,
+        &history,
+        &active,
+        &intent_snapshot,
+        &manifest,
+        &manifest_snapshot,
+        &candidate,
+        &candidate_snapshot,
+        Some(&parent_repair_result_tree_hash(state)?),
+    )?;
+    if manifest.attempt != projection.attempt_count {
+        return Err(completion_error(
+            &state.run_id,
+            "active parent repair candidate is not bound to the current Job attempt",
+        ));
+    }
+
+    let merged = crate::state::load_run(paths, &active.merged_run_id).map_err(|_| {
+        completion_error(
+            &state.run_id,
+            "parent repair no longer has its immutable merged result",
+        )
+    })?;
+    let merged_tree_sha256 = parent_repair_result_tree_hash(&merged)?;
+    if active.merged_tree_sha256 != merged_tree_sha256 {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair intent no longer matches the immutable merged result tree",
+        ));
+    }
+
+    let mut newer = active;
+    let mut current_round = newer.round;
+    while current_round > 1 {
+        let previous_round = current_round - 1;
+        let archive = read_parent_repair_round_snapshot(state, previous_round)?;
+        let expected = parent_repair_round_chain_sha256(&archive);
+        if newer.previous_round_sha256.as_deref() != Some(expected.as_str()) {
+            return Err(completion_error(
+                &state.run_id,
+                "parent repair archive no longer matches the signed round chain",
+            ));
+        }
+        let archive_dir = parent_repair_round_dir(state, previous_round);
+        let archived_intent_path = archive_dir.join("intent.json");
+        let archived_manifest_path = archive_dir.join("final-attempt.json");
+        let archived_candidate_path = archive_dir.join("candidate.json");
+        let archived_marker_path = archive_dir.join("pre-repair-marker.json");
+        let archived_judgment_path = archive_dir.join("revise-judgment.json");
+        let previous: ParentRepairIntentBinding =
+            parse_parent_repair_snapshot(&archive.intent, &archived_intent_path)?;
+        let previous_manifest: ParentRepairManifestBinding =
+            parse_parent_repair_snapshot(&archive.manifest, &archived_manifest_path)?;
+        let previous_candidate: ParentRepairCandidateBinding =
+            parse_parent_repair_snapshot(&archive.candidate, &archived_candidate_path)?;
+        validate_parent_repair_intent(
+            state,
+            &job,
+            &history,
+            &previous,
+            &archive.intent,
+            &archive.marker,
+            &archived_marker_path,
+            &archive.judgment,
+            &archived_judgment_path,
+        )?;
+        validate_parent_repair_attempt(
+            state,
+            &job,
+            &history,
+            &previous,
+            &archive.intent,
+            &previous_manifest,
+            &archive.manifest,
+            &previous_candidate,
+            &archive.candidate,
+            None,
+        )?;
+        if previous.round != previous_round
+            || previous.merged_run_id != newer.merged_run_id
+            || previous.merged_tree_sha256 != newer.merged_tree_sha256
+            || newer.requested_after_attempt != previous_candidate.attempt
+            || newer.requested_after_launch_id != previous_candidate.launch_id
+            || newer.requested_after_lease_epoch != previous_candidate.lease_epoch
+            || newer.pre_repair_tree_sha256 != previous_candidate.result_tree_sha256
+        {
+            return Err(completion_error(
+                &state.run_id,
+                "adjacent parent repair rounds do not preserve fenced candidate lineage",
+            ));
+        }
+        newer = previous;
+        current_round = previous_round;
+    }
+    if newer.previous_round_sha256.is_some()
+        || newer.pre_repair_tree_sha256 != newer.merged_tree_sha256
+    {
+        return Err(completion_error(
+            &state.run_id,
+            "first parent repair round does not start from the immutable merged result",
+        ));
+    }
+
+    Ok(Some(ValidatedParentRepair {
+        manifest: manifest_snapshot,
+        candidate: candidate_snapshot,
+    }))
+}
+
+fn parent_repair_round_dir(state: &PipelineState, round: u32) -> PathBuf {
+    state
+        .run_root
+        .join("proofs")
+        .join(PARENT_REPAIR_ARCHIVE_DIR)
+        .join(format!("round-{round}"))
+}
+
+fn parent_repair_round_chain_sha256(archive: &ParentRepairRoundSnapshot) -> String {
+    let mut bound = String::new();
+    for (name, digest) in PARENT_REPAIR_ROUND_FILES.into_iter().zip([
+        archive.intent.sha256.as_str(),
+        archive.manifest.sha256.as_str(),
+        archive.candidate.sha256.as_str(),
+        archive.marker.sha256.as_str(),
+        archive.judgment.sha256.as_str(),
+    ]) {
+        bound.push_str(name);
+        bound.push('=');
+        bound.push_str(digest);
+        bound.push('\n');
+    }
+    sha256_text(&bound)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_parent_repair_intent(
+    state: &PipelineState,
+    job: &Job,
+    history: &JobHistory,
+    intent: &ParentRepairIntentBinding,
+    intent_snapshot: &TrustedFileSnapshot,
+    marker_snapshot: &TrustedFileSnapshot,
+    marker_path: &Path,
+    judgment_snapshot: &TrustedFileSnapshot,
+    judgment_path: &Path,
+) -> Result<()> {
+    if intent.schema_version != 1
+        || intent.job_id != state.run_id
+        || intent.shape != job.shape
+        || !matches!(intent.shape, JobShape::Graph | JobShape::LegacyCampaign)
+        || intent.round == 0
+        || intent.round >= job.policy.max_attempts.max(1)
+        || intent.merged_run_id.is_empty()
+        || !is_sha256_digest(&intent.merged_tree_sha256)
+        || !is_sha256_digest(&intent.pre_repair_tree_sha256)
+        || !is_sha256_digest(&intent.revise_marker_sha256)
+        || !is_sha256_digest(&intent.revise_judgment_sha256)
+        || !is_sha256_digest(&intent.revise_input_sha256)
+        || intent.requested_after_attempt == 0
+        || intent.requested_after_attempt >= job.policy.max_attempts.max(1)
+        || intent.requested_after_lease_epoch == 0
+        || Uuid::parse_str(&intent.requested_after_launch_id).is_err()
+    {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair intent is malformed or crosses approved Job authority",
+        ));
+    }
+    require_digest(
+        &intent.revise_marker_sha256,
+        &marker_snapshot.sha256,
+        "archived parent repair marker",
+        &state.run_id,
+    )?;
+    require_digest(
+        &intent.revise_judgment_sha256,
+        &judgment_snapshot.sha256,
+        "archived parent repair judgment",
+        &state.run_id,
+    )?;
+    let marker: AcceptanceMarker = parse_parent_repair_snapshot(marker_snapshot, marker_path)?;
+    let judgment: SemanticJudgment =
+        parse_parent_repair_snapshot(judgment_snapshot, judgment_path)?;
+    if marker.run_id != state.run_id
+        || marker.status != "pass"
+        || !marker.is_native_gate_proof()
+        || !marker.contained
+        || marker.sandbox_backend == "none"
+        || judgment.job_id.as_ref() != state.run_id
+        || judgment.run_id.as_ref() != state.run_id
+        || judgment.decision != SemanticDecision::Revise
+        || judgment.input_sha256 != intent.revise_input_sha256
+        || parent_repair_feedback(&judgment) != intent.feedback
+    {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair intent is not backed by an archived same-Job revise decision",
+        ));
+    }
+
+    let requested_launch = history.events().iter().any(|event| {
+        event.kind == JobEventKind::ChildLinked
+            && event.lease_epoch == intent.requested_after_lease_epoch
+            && event_detail_u32(event, "attempt") == Some(intent.requested_after_attempt)
+            && event_detail_str(event, "launch_id")
+                == Some(intent.requested_after_launch_id.as_str())
+    });
+    let revise_event = history.events().iter().any(|event| {
+        event.kind == JobEventKind::SemanticJudgeRevise
+            && event.lease_epoch == intent.requested_after_lease_epoch
+            && event_detail_u32(event, "round") == Some(intent.round)
+            && event_detail_str(event, "intent_sha256") == Some(intent_snapshot.sha256.as_str())
+            && event_detail_str(event, "judgment_sha256")
+                == Some(intent.revise_judgment_sha256.as_str())
+            && event_detail_str(event, "merged_run_id") == Some(intent.merged_run_id.as_str())
+    });
+    if !requested_launch || !revise_event {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair intent is not backed by its fenced launch and revise event",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_parent_repair_attempt(
+    state: &PipelineState,
+    job: &Job,
+    history: &JobHistory,
+    intent: &ParentRepairIntentBinding,
+    intent_snapshot: &TrustedFileSnapshot,
+    manifest: &ParentRepairManifestBinding,
+    manifest_snapshot: &TrustedFileSnapshot,
+    candidate: &ParentRepairCandidateBinding,
+    candidate_snapshot: &TrustedFileSnapshot,
+    expected_result_tree: Option<&str>,
+) -> Result<()> {
+    if manifest.schema_version != 1
+        || candidate.schema_version != 1
+        || manifest.job_id != state.run_id
+        || candidate.job_id != state.run_id
+        || candidate.run_id != state.run_id
+        || manifest.shape != job.shape
+        || manifest.shape != intent.shape
+        || manifest.round != intent.round
+        || candidate.round != intent.round
+        || manifest.merged_run_id != intent.merged_run_id
+        || manifest.merged_tree_sha256 != intent.merged_tree_sha256
+        || manifest.pre_repair_tree_sha256 != intent.pre_repair_tree_sha256
+        || manifest.intent_sha256 != intent_snapshot.sha256
+        || candidate.intent_sha256 != intent_snapshot.sha256
+        || candidate.manifest_sha256 != manifest_snapshot.sha256
+        || candidate.attempt != manifest.attempt
+        || candidate.launch_id != manifest.launch_id
+        || candidate.lease_epoch != manifest.lease_epoch
+        || manifest.attempt <= intent.requested_after_attempt
+        || manifest.attempt <= intent.round
+        || manifest.attempt > job.policy.max_attempts.max(1)
+        || manifest.lease_epoch < intent.requested_after_lease_epoch
+        || manifest.lease_epoch == 0
+        || Uuid::parse_str(&manifest.launch_id).is_err()
+        || !is_sha256_digest(&manifest.attempt_baseline_tree_sha256)
+        || !is_sha256_digest(&candidate.result_tree_sha256)
+        || candidate_snapshot.bytes.is_empty()
+        || expected_result_tree
+            .is_some_and(|expected| candidate.result_tree_sha256.as_str() != expected)
+    {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair candidate does not match its fenced attempt and result authority",
+        ));
+    }
+    let attempt_started = history.events().iter().any(|event| {
+        event.kind == JobEventKind::AttemptStarted
+            && event.lease_epoch == manifest.lease_epoch
+            && event_detail_u32(event, "attempt") == Some(manifest.attempt)
+    });
+    let child_linked = history.events().iter().any(|event| {
+        event.kind == JobEventKind::ChildLinked
+            && event.lease_epoch == manifest.lease_epoch
+            && event_detail_u32(event, "attempt") == Some(manifest.attempt)
+            && event_detail_str(event, "launch_id") == Some(manifest.launch_id.as_str())
+    });
+    if !attempt_started || !child_linked {
+        return Err(completion_error(
+            &state.run_id,
+            "parent repair candidate is not backed by its fenced Job attempt and launch",
+        ));
+    }
+    Ok(())
+}
+
+fn parent_repair_feedback(judgment: &SemanticJudgment) -> String {
+    let missing = if judgment.missing.is_empty() {
+        "no explicit missing clauses supplied".to_string()
+    } else {
+        judgment.missing.join("; ")
+    };
+    format!(
+        "independent semantic judge requested parent revision: {}. Missing: {missing}",
+        judgment.summary
+    )
+}
+
+fn event_detail_u32(event: &JobEvent, key: &str) -> Option<u32> {
+    event
+        .detail
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn event_detail_str<'a>(event: &'a JobEvent, key: &str) -> Option<&'a str> {
+    event.detail.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn parent_repair_result_tree_hash(state: &PipelineState) -> Result<String> {
+    let mut index = build_deliverable_file_index(&state.working_dir)?;
+    index.files.remove(Path::new("manifest.json"));
+    Ok(index.tree_hash())
+}
+
+fn read_parent_repair_round_snapshot(
+    state: &PipelineState,
+    round: u32,
+) -> Result<ParentRepairRoundSnapshot> {
+    let archive = parent_repair_round_dir(state, round);
+    Ok(ParentRepairRoundSnapshot {
+        intent: read_required_trusted_file_snapshot(
+            &archive.join("intent.json"),
+            "archived parent repair intent",
+            &state.run_id,
+        )?,
+        manifest: read_required_trusted_file_snapshot(
+            &archive.join("final-attempt.json"),
+            "archived parent repair manifest",
+            &state.run_id,
+        )?,
+        candidate: read_required_trusted_file_snapshot(
+            &archive.join("candidate.json"),
+            "archived parent repair candidate",
+            &state.run_id,
+        )?,
+        marker: read_required_trusted_file_snapshot(
+            &archive.join("pre-repair-marker.json"),
+            "archived parent repair marker",
+            &state.run_id,
+        )?,
+        judgment: read_required_trusted_file_snapshot(
+            &archive.join("revise-judgment.json"),
+            "archived parent repair judgment",
+            &state.run_id,
+        )?,
+    })
+}
+
+fn parse_parent_repair_snapshot<T: serde::de::DeserializeOwned>(
+    snapshot: &TrustedFileSnapshot,
+    path: &Path,
+) -> Result<T> {
+    serde_json::from_slice(&snapshot.bytes).with_json_path(path)
+}
+
+fn read_required_trusted_file_snapshot(
+    path: &Path,
+    label: &str,
+    run_id: &str,
+) -> Result<TrustedFileSnapshot> {
+    read_optional_trusted_file_snapshot(path, label, run_id)?.ok_or_else(|| {
+        completion_error(run_id, &format!("{label} is missing at {}", path.display()))
+    })
+}
+
+fn read_optional_trusted_file_snapshot(
+    path: &Path,
+    label: &str,
+    run_id: &str,
+) -> Result<Option<TrustedFileSnapshot>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        return Err(completion_error(
+            run_id,
+            &format!(
+                "{label} at {} must be a regular non-symlink file",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|source| DeadreckonError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let opened = file.metadata().with_path(path)?;
+    if !trusted_file_metadata_matches(&before, &opened) {
+        return Err(completion_error(
+            run_id,
+            &format!("{label} changed identity while it was opened"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).with_path(path)?;
+    let after = file.metadata().with_path(path)?;
+    let post_path = fs::symlink_metadata(path).with_path(path)?;
+    if !trusted_file_metadata_matches(&opened, &after)
+        || !trusted_file_metadata_matches(&after, &post_path)
+        || u64::try_from(bytes.len()).ok() != Some(after.len())
+    {
+        return Err(completion_error(
+            run_id,
+            &format!("{label} changed while its trusted bytes were captured"),
+        ));
+    }
+    let sha256 = sha256_bytes(&bytes);
+    Ok(Some(TrustedFileSnapshot { bytes, sha256 }))
+}
+
+#[cfg(unix)]
+fn trusted_file_metadata_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn trusted_file_metadata_matches(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
 }
 
 fn validate_achieved_judgment(judgment: &SemanticJudgment, run_id: &str) -> Result<()> {
@@ -1060,10 +1713,12 @@ mod tests {
 
     use chrono::Utc;
     use deadreckon_protocol::{
-        AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobId, JobPolicy,
-        JobSchemaVersion, JobShape, RunId, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
+        AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent,
+        JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId,
+        SemanticDecision, SemanticJudgeMode, SemanticJudgment,
     };
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use super::{seal_completion_receipt, validate_completion_receipt};
     use crate::codebase::{
@@ -1074,7 +1729,7 @@ mod tests {
         AcceptanceCheckResult, AcceptanceContainment, read_gate_key,
         write_native_acceptance_marker_with_results_and_key,
     };
-    use crate::job::{load_job, write_job};
+    use crate::job::{append_job_event, load_job, write_job};
     use crate::paths::DeadreckonPaths;
     use crate::state::{RunOptions, atomic_write_json, create_run};
 
@@ -1216,6 +1871,537 @@ mod tests {
 
     fn fixture() -> Fixture {
         fixture_with_contract("name: result\nchecks:\n  - file_exists: result.txt\n")
+    }
+
+    struct RepairFixture {
+        fixture: Fixture,
+        intent_path: PathBuf,
+        manifest_path: PathBuf,
+        candidate_path: PathBuf,
+        archived_marker_path: PathBuf,
+        archived_judgment_path: PathBuf,
+    }
+
+    fn repair_fixture(max_attempts: u32) -> RepairFixture {
+        let mut fixture = fixture();
+        let mut job = load_job(&fixture.paths, "job-1").expect("job");
+        job.shape = JobShape::Graph;
+        job.policy.max_attempts = max_attempts;
+        fixture.authority.effective_policy_sha256 =
+            sha256_text(&serde_json::to_string(&job.policy).expect("updated policy json"));
+        atomic_write_json(&fixture.paths.job_authority("job-1"), &fixture.authority)
+            .expect("updated authority");
+        job.authority_sha256 =
+            sha256_file(&fixture.paths.job_authority("job-1")).expect("authority digest");
+        atomic_write_json(&fixture.paths.job_json("job-1"), &job).expect("updated job");
+
+        let merged = create_run(
+            &fixture.paths,
+            RunOptions {
+                goal: fixture.state.goal.clone(),
+                cwd: fixture.state.cwd.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: None,
+                skill_name: "test".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("merged-result".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("merged run");
+        fs::write(merged.working_dir.join("result.txt"), "verified\n").expect("merged result");
+        let merged_tree = super::parent_repair_result_tree_hash(&merged).expect("merged tree");
+        let initial_marker = fs::read(crate::marker_path_for_run_root(&fixture.state.run_root))
+            .expect("initial marker bytes");
+        let revise = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId("job-1".to_string()),
+            run_id: RunId("job-1".to_string()),
+            judged_at: Utc::now(),
+            provider: "independent-judge".to_string(),
+            model: "judge-model".to_string(),
+            decision: SemanticDecision::Revise,
+            summary: "the parent result needs one bounded repair".to_string(),
+            goal_coverage: vec![GoalCoverage {
+                claim: "ship verified change".to_string(),
+                status: GoalCoverageStatus::Missing,
+                evidence: vec!["initial-result".to_string()],
+            }],
+            missing: vec!["repair the parent result".to_string()],
+            input_sha256: sha256_text("revise evidence"),
+            spend_usd: 0.01,
+        };
+        let round_dir = super::parent_repair_round_dir(&fixture.state, 1);
+        fs::create_dir_all(&round_dir).expect("repair archive");
+        let archived_marker_path = round_dir.join("pre-repair-marker.json");
+        let archived_judgment_path = round_dir.join("revise-judgment.json");
+        fs::write(&archived_marker_path, initial_marker).expect("archived marker");
+        atomic_write_json(&archived_judgment_path, &revise).expect("archived revise judgment");
+
+        let launch_one = Uuid::new_v4().to_string();
+        append_repair_event(
+            &fixture.paths,
+            1,
+            1,
+            JobEventKind::LeaseAcquired,
+            serde_json::json!({ "owner": "repair-test" }),
+        );
+        append_repair_event(
+            &fixture.paths,
+            2,
+            1,
+            JobEventKind::AttemptStarted,
+            serde_json::json!({ "attempt": 1 }),
+        );
+        append_repair_event(
+            &fixture.paths,
+            3,
+            1,
+            JobEventKind::ChildLinked,
+            serde_json::json!({
+                "attempt": 1,
+                "launch_id": launch_one,
+                "run_id": "job-1",
+            }),
+        );
+
+        let intent_path = fixture.paths.job_dir("job-1").join("parent-repair.json");
+        let feedback = super::parent_repair_feedback(&revise);
+        atomic_write_json(
+            &intent_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "job_id": "job-1",
+                "shape": "graph",
+                "round": 1,
+                "merged_run_id": merged.run_id,
+                "merged_tree_sha256": merged_tree,
+                "pre_repair_tree_sha256": merged_tree,
+                "revise_marker_sha256": sha256_file(&archived_marker_path)
+                    .expect("marker digest"),
+                "revise_judgment_sha256": sha256_file(&archived_judgment_path)
+                    .expect("judgment digest"),
+                "revise_input_sha256": revise.input_sha256,
+                "requested_after_attempt": 1,
+                "requested_after_launch_id": launch_one,
+                "requested_after_lease_epoch": 1,
+                "provider": "smoke",
+                "model": null,
+                "feedback": feedback,
+                "previous_round_sha256": null,
+                "requested_at": Utc::now(),
+            }),
+        )
+        .expect("repair intent");
+        let intent_sha256 = sha256_file(&intent_path).expect("intent digest");
+        append_repair_event(
+            &fixture.paths,
+            4,
+            1,
+            JobEventKind::SemanticJudgeRevise,
+            serde_json::json!({
+                "round": 1,
+                "intent_sha256": intent_sha256,
+                "judgment_sha256": sha256_file(&archived_judgment_path)
+                    .expect("judgment digest"),
+                "merged_run_id": "merged-result",
+            }),
+        );
+        append_repair_event(
+            &fixture.paths,
+            5,
+            1,
+            JobEventKind::RetryScheduled,
+            serde_json::json!({ "after_attempt": 1, "round": 1 }),
+        );
+        append_repair_event(
+            &fixture.paths,
+            6,
+            1,
+            JobEventKind::AttemptStarted,
+            serde_json::json!({ "attempt": 2 }),
+        );
+        let launch_two = Uuid::new_v4().to_string();
+        append_repair_event(
+            &fixture.paths,
+            7,
+            1,
+            JobEventKind::ChildLinked,
+            serde_json::json!({
+                "attempt": 2,
+                "launch_id": launch_two,
+                "run_id": "job-1",
+            }),
+        );
+
+        fs::write(
+            fixture.state.working_dir.join("result.txt"),
+            "verified and repaired\n",
+        )
+        .expect("repaired result");
+        let manifest_path =
+            crate::parent_repair_manifest_path_for_run_root(&fixture.state.run_root);
+        atomic_write_json(
+            &manifest_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "job_id": "job-1",
+                "shape": "graph",
+                "round": 1,
+                "merged_run_id": "merged-result",
+                "merged_tree_sha256": merged_tree,
+                "pre_repair_tree_sha256": merged_tree,
+                "intent_sha256": intent_sha256,
+                "attempt": 2,
+                "launch_id": launch_two,
+                "lease_epoch": 1,
+                "attempt_baseline_tree_sha256": merged_tree,
+                "started_at": Utc::now(),
+            }),
+        )
+        .expect("repair manifest");
+        let candidate_path =
+            crate::parent_repair_candidate_path_for_run_root(&fixture.state.run_root);
+        atomic_write_json(
+            &candidate_path,
+            &serde_json::json!({
+                "schema_version": 1,
+                "job_id": "job-1",
+                "run_id": "job-1",
+                "round": 1,
+                "attempt": 2,
+                "launch_id": launch_two,
+                "lease_epoch": 1,
+                "intent_sha256": intent_sha256,
+                "manifest_sha256": sha256_file(&manifest_path).expect("manifest digest"),
+                "result_tree_sha256": super::parent_repair_result_tree_hash(&fixture.state)
+                    .expect("candidate tree"),
+                "turn": 1,
+                "ready_at": Utc::now(),
+            }),
+        )
+        .expect("repair candidate");
+        resign_repair_marker(&mut fixture);
+
+        RepairFixture {
+            fixture,
+            intent_path,
+            manifest_path,
+            candidate_path,
+            archived_marker_path,
+            archived_judgment_path,
+        }
+    }
+
+    fn append_repair_event(
+        paths: &DeadreckonPaths,
+        sequence: u64,
+        lease_epoch: u64,
+        kind: JobEventKind,
+        detail: serde_json::Value,
+    ) {
+        append_job_event(
+            paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId("job-1".to_string()),
+                sequence: JobEventSequence::new(sequence).expect("event sequence"),
+                event_id: Uuid::new_v4().to_string(),
+                causation_id: format!("repair-test-{sequence}"),
+                timestamp: Utc::now(),
+                lease_epoch,
+                kind,
+                detail,
+            },
+        )
+        .expect("append repair event");
+    }
+
+    fn refresh_repair_hashes_and_resign(repair: &mut RepairFixture) {
+        let intent_sha256 = sha256_file(&repair.intent_path).expect("intent digest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repair.manifest_path).expect("manifest bytes"))
+                .expect("manifest json");
+        manifest["intent_sha256"] = serde_json::Value::String(intent_sha256.clone());
+        atomic_write_json(&repair.manifest_path, &manifest).expect("updated manifest");
+        let mut candidate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repair.candidate_path).expect("candidate bytes"))
+                .expect("candidate json");
+        candidate["intent_sha256"] = serde_json::Value::String(intent_sha256);
+        candidate["manifest_sha256"] =
+            serde_json::Value::String(sha256_file(&repair.manifest_path).expect("manifest digest"));
+        atomic_write_json(&repair.candidate_path, &candidate).expect("updated candidate");
+        resign_repair_marker(&mut repair.fixture);
+    }
+
+    fn resign_repair_marker(fixture: &mut Fixture) {
+        let key = read_gate_key(&fixture.paths, "job-1").expect("gate key");
+        fixture.marker = write_native_acceptance_marker_with_results_and_key(
+            &fixture.state.run_root,
+            "job-1".to_string(),
+            fixture.state.working_dir.clone(),
+            fixture.marker.checks.clone(),
+            &key,
+            AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("repair-aware marker");
+    }
+
+    #[test]
+    fn repair_receipt_validates_full_fenced_parent_lineage() {
+        let repair = repair_fixture(3);
+        let receipt = seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect("seal valid repair");
+        assert_eq!(
+            validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+                .expect("validate valid repair"),
+            receipt
+        );
+    }
+
+    #[test]
+    fn repair_receipt_refuses_shape_mismatch_before_seal() {
+        for target in ["intent", "manifest"] {
+            let mut repair = repair_fixture(3);
+            let path = if target == "intent" {
+                &repair.intent_path
+            } else {
+                &repair.manifest_path
+            };
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).expect("repair bytes"))
+                    .expect("repair json");
+            value["shape"] = serde_json::Value::String("legacy_campaign".to_string());
+            atomic_write_json(path, &value).expect("shape mutation");
+            refresh_repair_hashes_and_resign(&mut repair);
+
+            let error = seal_completion_receipt(
+                &repair.fixture.paths,
+                &repair.fixture.state,
+                &repair.fixture.authority,
+                &repair.fixture.marker,
+                &repair.fixture.judgment,
+            )
+            .expect_err("cross-shape repair must not seal");
+            assert!(
+                error.to_string().contains("Job authority")
+                    || error.to_string().contains("result authority"),
+                "{target}: {error}"
+            );
+            assert!(!repair.fixture.paths.job_receipt("job-1").exists());
+        }
+    }
+
+    #[test]
+    fn repair_receipt_refuses_unfenced_attempt_launch_and_lease_before_seal() {
+        for mutation in ["candidate-attempt", "launch", "lease"] {
+            let mut repair = repair_fixture(3);
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&repair.manifest_path).expect("manifest bytes"))
+                    .expect("manifest json");
+            let mut candidate: serde_json::Value =
+                serde_json::from_slice(&fs::read(&repair.candidate_path).expect("candidate bytes"))
+                    .expect("candidate json");
+            match mutation {
+                "candidate-attempt" => {
+                    candidate["attempt"] = serde_json::Value::from(3);
+                }
+                "launch" => {
+                    let launch = Uuid::new_v4().to_string();
+                    manifest["launch_id"] = serde_json::Value::String(launch.clone());
+                    candidate["launch_id"] = serde_json::Value::String(launch);
+                }
+                "lease" => {
+                    manifest["lease_epoch"] = serde_json::Value::from(2);
+                    candidate["lease_epoch"] = serde_json::Value::from(2);
+                }
+                _ => unreachable!(),
+            }
+            atomic_write_json(&repair.manifest_path, &manifest).expect("manifest mutation");
+            atomic_write_json(&repair.candidate_path, &candidate).expect("candidate mutation");
+            refresh_repair_hashes_and_resign(&mut repair);
+
+            let error = seal_completion_receipt(
+                &repair.fixture.paths,
+                &repair.fixture.state,
+                &repair.fixture.authority,
+                &repair.fixture.marker,
+                &repair.fixture.judgment,
+            )
+            .expect_err("unfenced repair must not seal");
+            assert!(
+                error.to_string().contains("fenced attempt")
+                    || error.to_string().contains("fenced Job attempt"),
+                "{mutation}: {error}"
+            );
+            assert!(!repair.fixture.paths.job_receipt("job-1").exists());
+        }
+    }
+
+    #[test]
+    fn repair_receipt_refuses_candidate_result_tree_mismatch_before_seal() {
+        let mut repair = repair_fixture(3);
+        let mut candidate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repair.candidate_path).expect("candidate bytes"))
+                .expect("candidate json");
+        candidate["result_tree_sha256"] =
+            serde_json::Value::String(format!("sha256:{}", "0".repeat(64)));
+        atomic_write_json(&repair.candidate_path, &candidate).expect("tree mutation");
+        refresh_repair_hashes_and_resign(&mut repair);
+
+        let error = seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect_err("wrong repair result tree must not seal");
+        assert!(error.to_string().contains("result authority"), "{error}");
+        assert!(!repair.fixture.paths.job_receipt("job-1").exists());
+    }
+
+    #[test]
+    fn repair_receipt_enforces_round_and_attempt_bounds() {
+        let repair = repair_fixture(1);
+        let error = seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect_err("repair cannot consume an unapproved second attempt");
+        assert!(error.to_string().contains("Job authority"), "{error}");
+
+        let mut repair = repair_fixture(3);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repair.manifest_path).expect("manifest bytes"))
+                .expect("manifest json");
+        let mut candidate: serde_json::Value =
+            serde_json::from_slice(&fs::read(&repair.candidate_path).expect("candidate bytes"))
+                .expect("candidate json");
+        manifest["attempt"] = serde_json::Value::from(4);
+        candidate["attempt"] = serde_json::Value::from(4);
+        atomic_write_json(&repair.manifest_path, &manifest).expect("manifest attempt");
+        atomic_write_json(&repair.candidate_path, &candidate).expect("candidate attempt");
+        refresh_repair_hashes_and_resign(&mut repair);
+        let error = seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect_err("repair attempt cannot exceed the approved bound");
+        assert!(error.to_string().contains("result authority"), "{error}");
+
+        let repair = repair_fixture(3);
+        seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect("bounded repair control seals");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repair_receipt_refuses_byte_identical_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let repair = repair_fixture(3);
+        seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect("seal valid repair");
+        let paths = [
+            repair.intent_path.clone(),
+            repair.manifest_path.clone(),
+            repair.candidate_path.clone(),
+            repair.archived_marker_path.clone(),
+            repair.archived_judgment_path.clone(),
+        ];
+        for (index, path) in paths.into_iter().enumerate() {
+            let external = path.with_file_name(format!("trusted-copy-{index}.json"));
+            fs::rename(&path, &external).expect("move trusted bytes");
+            symlink(&external, &path).expect("substitute byte-identical symlink");
+            let error = validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+                .expect_err("symlinked repair evidence must fail closed");
+            assert!(
+                error.to_string().contains("regular non-symlink"),
+                "{}: {error}",
+                path.display()
+            );
+            fs::remove_file(&path).expect("remove symlink");
+            fs::rename(&external, &path).expect("restore regular file");
+            validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+                .expect("restored regular proof validates");
+        }
+    }
+
+    #[test]
+    fn repair_receipt_post_seal_mutation_matrix_fails_closed() {
+        let repair = repair_fixture(3);
+        seal_completion_receipt(
+            &repair.fixture.paths,
+            &repair.fixture.state,
+            &repair.fixture.authority,
+            &repair.fixture.marker,
+            &repair.fixture.judgment,
+        )
+        .expect("seal valid repair");
+        let paths = [
+            repair.intent_path.clone(),
+            repair.manifest_path.clone(),
+            repair.candidate_path.clone(),
+            repair.archived_marker_path.clone(),
+            repair.archived_judgment_path.clone(),
+        ];
+        for path in paths {
+            let original = fs::read(&path).expect("proof bytes");
+            let mut changed = original.clone();
+            changed.push(b'\n');
+            fs::write(&path, changed).expect("mutate proof");
+            validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+                .expect_err("post-seal repair mutation must fail closed");
+            fs::write(&path, original).expect("restore proof");
+            validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+                .expect("restored proof validates");
+        }
+
+        let active = [
+            repair.intent_path,
+            repair.manifest_path,
+            repair.candidate_path,
+        ];
+        let originals = active
+            .iter()
+            .map(|path| fs::read(path).expect("active proof"))
+            .collect::<Vec<_>>();
+        for path in &active {
+            fs::remove_file(path).expect("remove active repair proof");
+        }
+        validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+            .expect_err("removing the signed repair trio must fail closed");
+        for (path, bytes) in active.iter().zip(originals) {
+            fs::write(path, bytes).expect("restore active repair proof");
+        }
+        validate_completion_receipt(&repair.fixture.paths, &repair.fixture.state)
+            .expect("restored active proofs validate");
     }
 
     fn worktree_fixture() -> Fixture {

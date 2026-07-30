@@ -30,9 +30,12 @@ pub use semantic_judge::{
     SemanticJudgeBudget, SemanticJudgeResult, build_semantic_evidence,
     build_semantic_evidence_against_source, persist_semantic_judgment, run_semantic_judge,
     run_semantic_judge_against_source, run_semantic_judge_against_source_with_budget,
-    run_semantic_judge_with_budget, semantic_judgment_path,
+    run_semantic_judge_against_source_with_budget_and_cancellation, run_semantic_judge_with_budget,
+    semantic_judgment_path, validate_semantic_judgment_input,
+    validate_semantic_judgment_input_against_source,
 };
 pub use turn_loop::{
-    GateLaunchOwner, NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
-    run_deterministic_completion_gate, run_turn_loop,
+    GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
+    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_deterministic_completion_gate,
+    run_parent_repair_turn_loop, run_turn_loop,
 };

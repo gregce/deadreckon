@@ -22,6 +22,8 @@ use crate::tamper::AcceptanceTamperVerdict;
 pub const ACCEPTANCE_MARKER: &str = "turn-acceptance.json";
 pub const ACCEPTANCE_PROGRESS_JSONL: &str = "acceptance-progress.jsonl";
 pub const ACCEPTANCE_SPEC: &str = "acceptance.yaml";
+pub const PARENT_REPAIR_MANIFEST_JSON: &str = "proofs/parent-repair.json";
+pub const PARENT_REPAIR_CANDIDATE_JSON: &str = "proofs/parent-repair-candidate.json";
 pub const GATE_KEY_ENV: &str = "DEADRECKON_GATE_KEY";
 pub const GATE_CONTAINED_ENV: &str = "DEADRECKON_GATE_CONTAINED";
 pub const GATE_SANDBOX_BACKEND_ENV: &str = "DEADRECKON_GATE_SANDBOX_BACKEND";
@@ -228,6 +230,14 @@ pub fn acceptance_spec_path_for_run_root(run_root: &Path) -> PathBuf {
     run_root.join(ACCEPTANCE_SPEC)
 }
 
+pub fn parent_repair_manifest_path_for_run_root(run_root: &Path) -> PathBuf {
+    run_root.join(PARENT_REPAIR_MANIFEST_JSON)
+}
+
+pub fn parent_repair_candidate_path_for_run_root(run_root: &Path) -> PathBuf {
+    run_root.join(PARENT_REPAIR_CANDIDATE_JSON)
+}
+
 pub fn gate_nonce_path_for_run_root(run_root: &Path) -> PathBuf {
     run_root.join(GATE_NONCE)
 }
@@ -394,6 +404,27 @@ fn read_gate_key_at_path(path: &Path, run_id: &str) -> Result<Vec<u8>> {
 }
 
 pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMarker> {
+    validate_acceptance_marker_inner(state, None)
+}
+
+pub(crate) fn validate_acceptance_marker_with_parent_repair_bytes(
+    state: &PipelineState,
+    parent_repair: Option<&[u8]>,
+    parent_repair_candidate: Option<&[u8]>,
+) -> Result<AcceptanceMarker> {
+    validate_acceptance_marker_inner(
+        state,
+        Some(ParentRepairBoundBytes {
+            manifest: parent_repair,
+            candidate: parent_repair_candidate,
+        }),
+    )
+}
+
+fn validate_acceptance_marker_inner(
+    state: &PipelineState,
+    parent_repair: Option<ParentRepairBoundBytes<'_>>,
+) -> Result<AcceptanceMarker> {
     // AS-BUILT §8/§17: completion is accepted only from an external marker
     // written by a binary runner and bound to this run_id.
     let path = marker_path(state);
@@ -414,7 +445,12 @@ pub fn validate_acceptance_marker(state: &PipelineState) -> Result<AcceptanceMar
         1 => validate_legacy_marker_signature(&state.run_root, &marker)?,
         2 => {
             let key = read_gate_key_for_run_root(&state.run_root, &state.run_id)?;
-            verify_v2_marker_signature(&state.run_root, &marker, &key)?;
+            verify_v2_marker_signature_with_parent_repair(
+                &state.run_root,
+                &marker,
+                &key,
+                parent_repair,
+            )?;
         }
         version => {
             return Err(DeadreckonError::InvalidInput(format!(
@@ -1551,6 +1587,20 @@ fn legacy_marker_signature(run_root: &Path, marker: &AcceptanceMarker) -> Result
 }
 
 pub fn canonical_marker_bytes(run_root: &Path, marker: &AcceptanceMarker) -> Result<Vec<u8>> {
+    canonical_marker_bytes_with_parent_repair(run_root, marker, None)
+}
+
+#[derive(Clone, Copy)]
+struct ParentRepairBoundBytes<'a> {
+    manifest: Option<&'a [u8]>,
+    candidate: Option<&'a [u8]>,
+}
+
+fn canonical_marker_bytes_with_parent_repair(
+    run_root: &Path,
+    marker: &AcceptanceMarker,
+    parent_repair_override: Option<ParentRepairBoundBytes<'_>>,
+) -> Result<Vec<u8>> {
     if marker.schema_version != 2 {
         return Err(DeadreckonError::InvalidInput(format!(
             "canonical HMAC bytes require marker schema 2, got {}",
@@ -1562,6 +1612,16 @@ pub fn canonical_marker_bytes(run_root: &Path, marker: &AcceptanceMarker) -> Res
     ))?;
     let campaign_rollup =
         read_optional_bound_bytes(&crate::campaign::rollup_path_at_run_root(run_root))?;
+    let (parent_repair, parent_repair_candidate) = match parent_repair_override {
+        Some(bound) => (
+            bound.manifest.unwrap_or_default().to_vec(),
+            bound.candidate.unwrap_or_default().to_vec(),
+        ),
+        None => (
+            read_optional_bound_bytes(&parent_repair_manifest_path_for_run_root(run_root))?,
+            read_optional_bound_bytes(&parent_repair_candidate_path_for_run_root(run_root))?,
+        ),
+    };
     let mut checks = Vec::new();
     for check in &marker.checks {
         let bytes = serde_json::to_vec(check).map_err(|source| DeadreckonError::Json {
@@ -1614,6 +1674,20 @@ pub fn canonical_marker_bytes(run_root: &Path, marker: &AcceptanceMarker) -> Res
     append_canonical_field(&mut bytes, "checks", &checks)?;
     append_canonical_field(&mut bytes, "tamper", &tamper)?;
     append_canonical_field(&mut bytes, "campaign_rollup", &campaign_rollup)?;
+    // Preserve the exact v2 sequence for markers created before parent
+    // repair existed. A repaired parent appends these fields only when the
+    // trusted repair controller has materialized them, so deleting, changing
+    // or substituting either file invalidates the marker HMAC.
+    if !parent_repair.is_empty() {
+        append_canonical_field(&mut bytes, "parent_repair", &parent_repair)?;
+    }
+    if !parent_repair_candidate.is_empty() {
+        append_canonical_field(
+            &mut bytes,
+            "parent_repair_candidate",
+            &parent_repair_candidate,
+        )?;
+    }
     Ok(bytes)
 }
 
@@ -1635,6 +1709,15 @@ pub fn verify_v2_marker_signature(
     marker: &AcceptanceMarker,
     gate_key: &[u8],
 ) -> Result<()> {
+    verify_v2_marker_signature_with_parent_repair(run_root, marker, gate_key, None)
+}
+
+fn verify_v2_marker_signature_with_parent_repair(
+    run_root: &Path,
+    marker: &AcceptanceMarker,
+    gate_key: &[u8],
+    parent_repair: Option<ParentRepairBoundBytes<'_>>,
+) -> Result<()> {
     require_gate_key_length(gate_key)?;
     let signature = hex_decode(&marker.signature).map_err(|reason| {
         DeadreckonError::InvalidInput(format!(
@@ -1644,7 +1727,11 @@ pub fn verify_v2_marker_signature(
     let mut mac = Hmac::<Sha256>::new_from_slice(gate_key).map_err(|_| {
         DeadreckonError::InvalidInput("HMAC-SHA-256 refused the gate key".to_string())
     })?;
-    mac.update(&canonical_marker_bytes(run_root, marker)?);
+    mac.update(&canonical_marker_bytes_with_parent_repair(
+        run_root,
+        marker,
+        parent_repair,
+    )?);
     mac.verify_slice(&signature).map_err(|_| {
         DeadreckonError::InvalidInput(
             "acceptance marker signature is invalid; forged self-attestation refused".to_string(),
@@ -1830,6 +1917,70 @@ mod tests {
         let evaluation = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
             .expect("keyless evaluation");
         (temp, state, evaluation)
+    }
+
+    fn legacy_v2_canonical_bytes(marker: &AcceptanceMarker) -> Vec<u8> {
+        let mut checks = Vec::new();
+        for check in &marker.checks {
+            let bytes = serde_json::to_vec(check).expect("serialize check");
+            super::append_sized_bytes(&mut checks, &bytes).expect("append check");
+        }
+
+        let mut bytes = super::V2_CANONICAL_MAGIC.to_vec();
+        super::append_canonical_field(
+            &mut bytes,
+            "schema_version",
+            marker.schema_version.to_string().as_bytes(),
+        )
+        .expect("schema version");
+        super::append_canonical_field(&mut bytes, "run_id", marker.run_id.as_bytes())
+            .expect("run id");
+        super::append_canonical_field(&mut bytes, "status", marker.status.as_bytes())
+            .expect("status");
+        super::append_canonical_field(&mut bytes, "produced_by", marker.produced_by.as_bytes())
+            .expect("producer");
+        super::append_canonical_field(&mut bytes, "issuer", marker.issuer.as_bytes())
+            .expect("issuer");
+        super::append_canonical_field(
+            &mut bytes,
+            "proof_kind",
+            marker.proof_kind.canonical_name().as_bytes(),
+        )
+        .expect("proof kind");
+        super::append_canonical_field(
+            &mut bytes,
+            "checked_at",
+            marker.checked_at.to_rfc3339().as_bytes(),
+        )
+        .expect("checked at");
+        super::append_canonical_field(
+            &mut bytes,
+            "working_dir",
+            marker.working_dir.to_string_lossy().as_bytes(),
+        )
+        .expect("working dir");
+        super::append_canonical_field(
+            &mut bytes,
+            "contained",
+            if marker.contained { b"true" } else { b"false" },
+        )
+        .expect("contained");
+        super::append_canonical_field(
+            &mut bytes,
+            "sandbox_backend",
+            marker.sandbox_backend.as_bytes(),
+        )
+        .expect("sandbox backend");
+        super::append_canonical_field(
+            &mut bytes,
+            "check_count",
+            marker.check_count.to_string().as_bytes(),
+        )
+        .expect("check count");
+        super::append_canonical_field(&mut bytes, "checks", &checks).expect("checks");
+        super::append_canonical_field(&mut bytes, "tamper", b"").expect("tamper");
+        super::append_canonical_field(&mut bytes, "campaign_rollup", b"").expect("campaign rollup");
+        bytes
     }
 
     #[test]
@@ -2302,6 +2453,135 @@ mod tests {
                 "campaign_rollup",
             ]
         );
+    }
+
+    #[test]
+    fn no_parent_repair_preserves_legacy_v2_canonical_bytes() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = super::v2_test_marker(temp.path());
+
+        let canonical =
+            super::canonical_marker_bytes(temp.path(), &marker).expect("canonical bytes");
+
+        assert_eq!(canonical, legacy_v2_canonical_bytes(&marker));
+    }
+
+    #[test]
+    fn adding_parent_repair_proof_bytes_invalidates_an_existing_marker_hmac() {
+        let temp = TempDir::new().expect("tempdir");
+        let key = [17_u8; 32];
+        let mut marker = super::v2_test_marker(temp.path());
+        let baseline = super::canonical_marker_bytes(temp.path(), &marker).expect("baseline bytes");
+        marker.signature =
+            super::v2_marker_signature(temp.path(), &marker, &key).expect("baseline signature");
+        super::verify_v2_marker_signature(temp.path(), &marker, &key).expect("baseline validates");
+
+        let proofs = temp.path().join("proofs");
+        std::fs::create_dir_all(&proofs).expect("proofs");
+        for (path, contents) in [
+            (
+                super::parent_repair_manifest_path_for_run_root(temp.path()),
+                br#"{"round":1,"kind":"manifest"}"#.as_slice(),
+            ),
+            (
+                super::parent_repair_candidate_path_for_run_root(temp.path()),
+                br#"{"round":1,"kind":"candidate"}"#.as_slice(),
+            ),
+        ] {
+            std::fs::write(&path, contents).expect("repair proof");
+            let changed =
+                super::canonical_marker_bytes(temp.path(), &marker).expect("changed bytes");
+            assert_ne!(changed, baseline);
+            let error = super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect_err("added repair proof must invalidate prior signature");
+            assert!(
+                error.to_string().contains("signature is invalid"),
+                "{error}"
+            );
+
+            std::fs::remove_file(&path).expect("remove repair proof");
+            assert_eq!(
+                super::canonical_marker_bytes(temp.path(), &marker).expect("restored bytes"),
+                baseline
+            );
+            super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect("removing the post-sign addition restores the original bytes");
+        }
+    }
+
+    #[test]
+    fn mutating_or_removing_signed_parent_repair_proof_bytes_invalidates_the_hmac() {
+        let temp = TempDir::new().expect("tempdir");
+        let proofs = temp.path().join("proofs");
+        std::fs::create_dir_all(&proofs).expect("proofs");
+        let manifest_path = super::parent_repair_manifest_path_for_run_root(temp.path());
+        let candidate_path = super::parent_repair_candidate_path_for_run_root(temp.path());
+        let manifest = br#"{"round":1,"kind":"manifest"}"#.to_vec();
+        let candidate = br#"{"round":1,"kind":"candidate"}"#.to_vec();
+        std::fs::write(&manifest_path, &manifest).expect("manifest");
+        std::fs::write(&candidate_path, &candidate).expect("candidate");
+
+        let key = [23_u8; 32];
+        let mut marker = super::v2_test_marker(temp.path());
+        let signed_bytes =
+            super::canonical_marker_bytes(temp.path(), &marker).expect("signed bytes");
+        marker.signature =
+            super::v2_marker_signature(temp.path(), &marker, &key).expect("signature");
+        super::verify_v2_marker_signature(temp.path(), &marker, &key)
+            .expect("repair-bound marker validates");
+
+        for (path, original, changed) in [
+            (
+                manifest_path,
+                manifest,
+                br#"{"round":2,"kind":"manifest"}"#.to_vec(),
+            ),
+            (
+                candidate_path,
+                candidate,
+                br#"{"round":2,"kind":"candidate"}"#.to_vec(),
+            ),
+        ] {
+            std::fs::write(&path, &changed).expect("mutate repair proof");
+            assert_ne!(
+                super::canonical_marker_bytes(temp.path(), &marker).expect("mutated bytes"),
+                signed_bytes
+            );
+            let error = super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect_err("mutated repair proof must invalidate signature");
+            assert!(
+                error.to_string().contains("signature is invalid"),
+                "{error}"
+            );
+
+            std::fs::write(&path, &original).expect("restore repair proof");
+            assert_eq!(
+                super::canonical_marker_bytes(temp.path(), &marker).expect("restored bytes"),
+                signed_bytes
+            );
+            super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect("restored repair proof validates");
+
+            std::fs::remove_file(&path).expect("remove repair proof");
+            assert_ne!(
+                super::canonical_marker_bytes(temp.path(), &marker).expect("removed bytes"),
+                signed_bytes
+            );
+            let error = super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect_err("removed repair proof must invalidate signature");
+            assert!(
+                error.to_string().contains("signature is invalid"),
+                "{error}"
+            );
+
+            std::fs::write(&path, &original).expect("restore removed repair proof");
+            assert_eq!(
+                super::canonical_marker_bytes(temp.path(), &marker).expect("fully restored bytes"),
+                signed_bytes
+            );
+            super::verify_v2_marker_signature(temp.path(), &marker, &key)
+                .expect("fully restored repair proof validates");
+        }
     }
 
     #[test]

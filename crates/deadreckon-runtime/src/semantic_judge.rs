@@ -147,6 +147,41 @@ pub fn build_semantic_evidence_against_source(
     build_semantic_evidence_with_baseline(state, marker, Some(approved_source))
 }
 
+pub fn validate_semantic_judgment_input(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    judgment: &SemanticJudgment,
+) -> Result<()> {
+    validate_semantic_judgment_input_with_baseline(state, marker, judgment, None)
+}
+
+pub fn validate_semantic_judgment_input_against_source(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    approved_source: &Path,
+    judgment: &SemanticJudgment,
+) -> Result<()> {
+    validate_semantic_judgment_input_with_baseline(state, marker, judgment, Some(approved_source))
+}
+
+fn validate_semantic_judgment_input_with_baseline(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    judgment: &SemanticJudgment,
+    approved_source: Option<&Path>,
+) -> Result<()> {
+    let evidence = build_semantic_evidence_with_baseline(state, marker, approved_source)?;
+    let input = serde_json::to_string(&evidence).map_err(json_error("semantic evidence"))?;
+    let expected = deadreckon_core::flight::sha256_text(&input);
+    if judgment.input_sha256 != expected {
+        return Err(DeadreckonError::InvalidInput(
+            "semantic judgment does not bind the current result, deterministic marker and approved evidence"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_semantic_evidence_with_baseline(
     state: &PipelineState,
     marker: &AcceptanceMarker,
@@ -319,6 +354,27 @@ pub async fn run_semantic_judge_against_source_with_budget(
     approved_source: &Path,
     budget: SemanticJudgeBudget,
 ) -> Result<SemanticJudgeRun> {
+    run_semantic_judge_against_source_with_budget_and_cancellation(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        approved_source,
+        budget,
+        None,
+    )
+    .await
+}
+
+pub async fn run_semantic_judge_against_source_with_budget_and_cancellation(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    router: &ProviderRouter,
+    sandbox_backend: SandboxBackend,
+    approved_source: &Path,
+    budget: SemanticJudgeBudget,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<SemanticJudgeRun> {
     run_semantic_judge_with_baseline(
         state,
         marker,
@@ -326,7 +382,7 @@ pub async fn run_semantic_judge_against_source_with_budget(
         sandbox_backend,
         Some(approved_source),
         budget,
-        None,
+        cancellation_token,
     )
     .await
 }
@@ -962,12 +1018,16 @@ mod tests {
     use super::{
         EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SemanticBudgetExhaustion,
         SemanticDecision, SemanticJudgeAccounting, SemanticJudgeBudget, SemanticJudgeResult,
-        SemanticProviderCompletion, accounting_from_response, classify_semantic_response,
+        SemanticProviderCompletion, accounting_from_response,
+        build_semantic_evidence_against_source, classify_semantic_response,
         complete_with_semantic_wall_budget, provider_kind_is_cli, semantic_budget_overrun,
         semantic_guard_identity, semantic_output_schema, semantic_provider_request,
         strip_json_fence, validate_evidence_references,
+        validate_semantic_judgment_input_against_source,
     };
-    use deadreckon_protocol::{GoalCoverage, GoalCoverageStatus};
+    use deadreckon_protocol::{
+        GoalCoverage, GoalCoverageStatus, JobId, JobSchemaVersion, RunId, SemanticJudgment,
+    };
     use deadreckon_providers::ProviderKind;
 
     #[test]
@@ -1029,6 +1089,126 @@ mod tests {
             assert!(request.prompt.contains(evidence));
         }
         assert!(request.output_schema.is_some());
+    }
+
+    #[test]
+    fn semantic_input_freshness_rejects_a_stale_parent_judgment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+        let approved_source = temp.path().join("approved-source");
+        fs::create_dir_all(&approved_source).expect("approved source");
+        fs::write(approved_source.join("result.txt"), "approved baseline\n").expect("baseline");
+        let state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "repair the composed parent".to_string(),
+                cwd: approved_source.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("independent-test-judge".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("semantic-parent-freshness".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("parent run");
+        fs::write(state.working_dir.join("result.txt"), "candidate A\n").expect("candidate A");
+        fs::write(
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+            "name: parent\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/result.txt\"\n",
+        )
+        .expect("contract");
+        let authority_path = paths.job_authority(&state.run_id);
+        fs::create_dir_all(authority_path.parent().expect("authority parent"))
+            .expect("authority parent");
+        fs::write(
+            &authority_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "job_id": state.run_id,
+                "authority": "test"
+            }))
+            .expect("authority json"),
+        )
+        .expect("authority");
+        let marker_a = deadreckon_core::write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("candidate A marker");
+        let input_a = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence_against_source(&state, &marker_a, &approved_source)
+                    .expect("candidate A evidence"),
+            )
+            .expect("candidate A evidence json"),
+        );
+        let mut judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(state.run_id.clone()),
+            run_id: RunId(state.run_id.clone()),
+            judged_at: chrono::Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "candidate satisfies the goal".to_string(),
+            goal_coverage: vec![GoalCoverage {
+                claim: "repair the composed parent".to_string(),
+                status: GoalCoverageStatus::Met,
+                evidence: vec!["source-diff".to_string(), "deterministic-gate".to_string()],
+            }],
+            missing: Vec::new(),
+            input_sha256: input_a,
+            spend_usd: 0.0,
+        };
+        validate_semantic_judgment_input_against_source(
+            &state,
+            &marker_a,
+            &approved_source,
+            &judgment,
+        )
+        .expect("candidate A judgment is fresh");
+
+        fs::write(state.working_dir.join("result.txt"), "candidate B\n").expect("candidate B");
+        let marker_b = deadreckon_core::write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("candidate B marker");
+        let stale = validate_semantic_judgment_input_against_source(
+            &state,
+            &marker_b,
+            &approved_source,
+            &judgment,
+        )
+        .expect_err("candidate A judgment must not validate candidate B");
+        assert!(
+            stale
+                .to_string()
+                .contains("does not bind the current result"),
+            "{stale}"
+        );
+
+        let input_b = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence_against_source(&state, &marker_b, &approved_source)
+                    .expect("candidate B evidence"),
+            )
+            .expect("candidate B evidence json"),
+        );
+        assert_ne!(judgment.input_sha256, input_b);
+        judgment.input_sha256 = input_b;
+        validate_semantic_judgment_input_against_source(
+            &state,
+            &marker_b,
+            &approved_source,
+            &judgment,
+        )
+        .expect("fresh candidate B judgment validates");
     }
 
     #[test]

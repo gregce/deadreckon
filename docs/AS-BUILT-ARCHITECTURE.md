@@ -4304,7 +4304,9 @@ workspace posture. The response schema permits only:
   claim cites allowed evidence, and `missing` is empty; persist the judgment
   after accounting and attempt receipt sealing;
 - `revise`: for a Single Job, add bounded findings and continue within the
-  remaining budgets; for Graph and Campaign parents, stop `NEEDS_REVIEW`;
+  remaining budgets; for Graph and Campaign parents, start a new bounded,
+  fenced parent-only repair attempt over the merged result without rerunning
+  successful leaves;
 - `uncertain`: stop `NEEDS_REVIEW`.
 
 An unavailable or malformed strict judge also becomes `NEEDS_REVIEW`. The judge
@@ -4358,9 +4360,28 @@ supervisor validates the merged result marker, compares the stored and merged
 roll-ups, and rebuilds the worst-of roll-up from current leaf evidence. A
 refused, missing or changed roll-up fails the parent before the semantic judge.
 
-Semantic `revise` for Graph and Campaign remains `NEEDS_REVIEW`. A
-deterministic parent gate failure remains `FAILED`. Safe parent repair is
-deferred.
+Semantic `revise` for Graph and Campaign writes a fenced repair intent,
+manifest and candidate under the same parent Job. The repair turn receives the
+judge findings and edits only the merged parent result; completed leaf runs are
+not relaunched or rewritten. Each round consumes a new Job attempt and launch
+identity, stays inside the frozen attempt/spend/wall policy, and must finish
+before the next deterministic gate and fresh semantic judgment.
+
+The supervisor can recover a fully written candidate after an expired lease
+without spawning a duplicate repair worker. It archives each round's intent,
+manifest, candidate, deterministic marker and semantic judgment, and links
+adjacent rounds by attempt, launch, lease and result-tree identity. Receipt
+sealing and validation capture each proof file once, require a stable regular
+non-symlink file, validate the complete lineage against Job events and current
+result bytes, and bind the active repair manifest and candidate into the native
+marker HMAC. Mutation, removal, identity drift or byte-identical symlink
+substitution fails closed both before sealing and later in `finish`.
+
+Cancellation is observed during both the parent repair turn and semantic
+judging. Cancellation, budget exhaustion, retry exhaustion, provider failure
+and review-required outcomes remain distinct terminal reasons. A deterministic
+parent gate failure remains `FAILED`; `uncertain`, unavailable or malformed
+semantic evidence remains `NEEDS_REVIEW`.
 
 ### 58.8 Per-user service posture
 
@@ -4404,8 +4425,10 @@ Graph and Campaign identity,
 same-ID root mapping repair, guarded launch recovery, persisted Campaign
 sub-plan recovery and reserved identities, aggregate root-planner spend/wall
 enforcement, terminal budget recovery after sidecar loss, cancellation races,
-worst-of roll-up refusal, parent receipt crash recovery, service rendering,
-fault boundaries, and promotion enforcement.
+worst-of roll-up refusal, one- and multi-round Graph/Campaign semantic parent
+repair, candidate-ready crash adoption, repair-lineage mutation and symlink
+refusal, parent receipt crash recovery, service rendering, fault boundaries,
+and promotion enforcement.
 
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
@@ -4427,4 +4450,4 @@ open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

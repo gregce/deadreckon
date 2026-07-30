@@ -1,7 +1,8 @@
 # Map of DeadReckon
 
 Status: repository analysis updated 2026-07-30 through the Watchkeeper
-recovery/budget hardening and credential-free adversarial trials.
+parent-repair, recovery/budget hardening and credential-free adversarial
+trials.
 
 ## Executive map
 
@@ -94,9 +95,10 @@ Preview, explicit in-place/uncontained execution, historical `chain
 run|resume`, and chain extension remain process-owned and cannot issue a
 trusted Job receipt.
 
-The next consolidation step is safe Graph and Campaign repair after semantic
-`revise`, followed by dogfooding and retiring compatibility modes whose
-semantics can be represented truthfully by Jobs.
+Graph and Campaign parents can now act on semantic `revise` through bounded,
+fenced parent-only repair. The next consolidation step is dogfooding that
+promise and retiring compatibility modes whose semantics can be represented
+truthfully by Jobs.
 
 ## Capability portfolio
 
@@ -105,7 +107,7 @@ semantics can be represented truthfully by Jobs.
 | Guided `start` and Course | Turn an underspecified request into a bounded run contract | Interactive/non-interactive intake selects codebase, provider, budget and done conditions; Course can decompose scope before launch | A friendly entry to a rigorous outer harness | **Maturing**: strong surface, but accepted Course pieces influence count while the plan can re-decompose them | **Preserve and align**; keep planning advisory and make accepted decomposition authoritative enough to avoid surprise |
 | Definition-of-done compiler | Make acceptance executable instead of conversational | `def-done` and setup infer or generate the independent gate command and persist the contract | Converts repository conventions into a machine-checkable boundary | **Stable / bounded** | **Essential; extend** with rules-as-gate and clearer explanations |
 | Persisted run kernel | Retain work and evidence when a process fails | A run directory stores state, working tree, snapshots, events and evidence | File-backed facts survive their original terminal | **Hardened as persistence**, not by itself a relaunch guarantee | **Essential; keep rich run evidence below Job control** |
-| Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close repair and live recovery proof** |
+| Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close live recovery proof** |
 | Lifecycle control | Start, observe, cancel and finish Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason | Ordinary operations read persisted control truth | **Stable / bounded**: the cross-kind journey and Job resolver are tested | **Preserve one resolver and one Job event truth** |
 | Codebase isolation | Contain changes and make promotion deliberate | Worktree, copy, fresh-repo and in-place modes separate the agent's workspace from the user's target | Isolation is part of the run contract, not a provider feature | **Hardened** | **Essential; preserve** |
 | Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; live Linux and Docker gate proof remains outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
@@ -122,8 +124,8 @@ semantics can be represented truthfully by Jobs.
 | Docs and narration | Explain what happened at human scale | Deterministic docs plus optional provider-generated narrative summarize progress and artifacts | Evidence can be consumed without reading raw event streams | **Maturing / experimental**: several overlapping narrative paths | **Preserve one deterministic path; consolidate and validate model-generated variants** |
 | Import | Bring work from other agent harnesses into the same evidence model | Parsers ingest supported transcript/session formats into local run artifacts | A partial cross-tool memory bridge | **Stable / bounded**: deliberately one-way, not shared live state | **Preserve; do not claim the broader need is solved** |
 | Chains | Express sequential verified work | New supported chains compile into a durable linear Graph Job verified once at the end; historical `chain run|resume` and unsupported conductor policies remain explicitly legacy | Reuses one scheduler without pretending unsupported hooks/apply policy survived translation | **Maturing**: ordinary creation is Job-scheduled; historical and policy-rich compatibility paths remain | **Dogfood the durable path; preserve or retire legacy behavior explicitly** |
-| Plans, fork/merge and review | Coordinate dependent work and reconcile branches | A saved DAG launches child runs, reviews results and merges accepted work; direct orchestration and stored-plan fork force at-end delivery and verify the same-ID Graph parent | Established graph semantics under one parent lease and receipt | **Maturing**: verified parent completion and durable direct launch exist; semantic parent repair remains | **Add safe parent repair; keep compatibility modes honest** |
-| Campaigns and reshape | Lift orchestration one level for broad goals | Bounded depth-two sub-orchestrations can recover exact persisted sub-plans; durable direct/guided parent completion revalidates the worst-of roll-up before a two-key receipt | Worst-of roll-up and parent gate prevent child-result laundering | **Experimental / maturing**: durable parent recovery and receipt exist; live interruption drills do not | **Freeze depth; dogfood recovery and no-laundering behavior** |
+| Plans, fork/merge and review | Coordinate dependent work and reconcile branches | A saved DAG launches child runs, reviews results and merges accepted work; direct orchestration and stored-plan fork force at-end delivery, verify the same-ID Graph parent and can repair that parent after semantic `revise` without rerunning successful leaves | Established graph semantics under one parent lease and receipt | **Maturing**: verified parent completion, bounded parent repair and durable direct launch exist; live interruption drills do not | **Dogfood parent repair; keep compatibility modes honest** |
+| Campaigns and reshape | Lift orchestration one level for broad goals | Bounded depth-two sub-orchestrations can recover exact persisted sub-plans; durable direct/guided parent completion revalidates the worst-of roll-up and can repair the merged parent before a two-key receipt | Worst-of roll-up and parent gate prevent child-result laundering | **Experimental / maturing**: durable parent recovery, bounded parent repair and receipt exist; live interruption drills do not | **Freeze depth; dogfood recovery, repair and no-laundering behavior** |
 | Seams | Let policy hooks compose without taking over the kernel | Four fixed subprocess seams receive versioned input and produce bounded output; conformance tooling checks them | Extensibility at explicit control points | **Stable / bounded** | **Preserve the fixed model; resist universal hook proliferation** |
 | App-server steering | Control a live inner harness through a richer protocol | Codex app-server integration and a provider-neutral inbox support bounded steering/approvals | Moves beyond stdout scraping | **Experimental**, opt-in and Codex-led | **Preserve the neutral pattern; validate before broad surface investment** |
 | Learning and self-improve | Mine prior runs and propose changes to DeadReckon itself | Indexing and learning commands derive observations/proposals from artifacts | A self-hosted improvement loop | **Experimental**; weak connection to the original highest-priority needs | **Strong product-decision/deprecation candidate** unless usage and proposal quality justify it |
@@ -182,10 +184,11 @@ ordinary direct launches:
 The second key is semantic. Deterministic success triggers a fresh read-only
 provider request over bounded, supervisor-assembled evidence. Only
 `achieved` can seal the final receipt. A Single Job can use `revise` for
-another bounded worker turn. A Graph or Campaign parent records `revise` as
-`NEEDS_REVIEW`; safe parent repair is deferred. `uncertain`, unavailable or
-malformed results also stop `NEEDS_REVIEW`. Deterministic failure never calls
-the judge.
+another bounded worker turn. A Graph or Campaign parent uses `revise` to start
+a new fenced, bounded parent-only attempt over the merged result; successful
+leaf work is neither rerun nor rewritten. Repeated repair rounds are linked by
+attempt, launch, lease and tree identity. `uncertain`, unavailable or malformed
+results stop `NEEDS_REVIEW`. Deterministic failure never calls the judge.
 
 This boundary covers durable Jobs, not every compatibility path. Supported
 ordinary `run` and `orchestrate`, new chains, stored-plan `fork`, and direct
@@ -275,10 +278,15 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 
 ### Engineering work already chosen
 
-- **Graph and Campaign parent repair**: both guided shapes can verify, receipt
-  and promote the merged parent. A semantic `revise` still stops
-  `NEEDS_REVIEW` with stop reason `semantic_revise`; deterministic parent gate
-  failure stops `FAILED`.
+- **Graph and Campaign parent repair proof**: both guided shapes can verify,
+  repair, receipt and promote the merged parent. A semantic `revise` starts a
+  bounded parent-only attempt under the current Job lease. Its intent,
+  manifest, candidate and archived marker/judgment form a chained lineage;
+  recovery can adopt a fully written candidate without starting a duplicate
+  worker. Receipt sealing and `finish` reread that lineage as stable regular
+  files and fail closed on identity drift, mutation, removal or symlink
+  substitution. Hermetic Graph and Campaign tests cover one and repeated
+  revise rounds; live provider and interruption trials remain open.
 - **Remaining compatibility parity**: supported new direct and advanced
   execution is Job-scheduled. Historical chain execution, policy-rich chain
   modes, explicit in-place/uncontained execution, previews, and chain
@@ -336,19 +344,16 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 2. **Exercise crash and service recovery.** Kill workers and supervisors, remove
    network access, restart the machine, and attempt gate tampering. Close only
    the crash windows demonstrated by those drills.
-3. **Add safe parent repair.** Let Graph and Campaign parents act on semantic
-   `revise` without weakening their frozen authority, at-end delivery or
-   receipt boundary.
-4. **Resolve the remaining compatibility boundary.** Preserve or intentionally
+3. **Resolve the remaining compatibility boundary.** Preserve or intentionally
    retire historical chain, extension, preview and uncontained behaviors
    without weakening the Job lifecycle or labelling untrusted work verified.
-5. **Turn team policy into an acceptance input.** Deliver rules-as-gate on top
+4. **Turn team policy into an acceptance input.** Deliver rules-as-gate on top
    of the existing done contract and combined receipt.
-6. **Add resource leasing only after scheduler parity.** Keep cross-machine
+5. **Add resource leasing only after scheduler parity.** Keep cross-machine
    scheduling as a separate decision.
-7. **Expose, do not duplicate, the control plane.** Add MCP around the existing
+6. **Expose, do not duplicate, the control plane.** Add MCP around the existing
    lifecycle and projections.
-8. **Prune before expanding again.** Remove compatibility no-ops and
+7. **Prune before expanding again.** Remove compatibility no-ops and
    consolidate narration; require usage evidence for campaign and learning
    depth.
 

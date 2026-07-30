@@ -96,6 +96,14 @@ impl GateLaunchOwner {
             outer_launch_id,
         })
     }
+
+    pub const fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    pub fn outer_launch_id(&self) -> &str {
+        &self.outer_launch_id
+    }
 }
 
 /// Settings for the live narrator sidecar. Defaults mirror the
@@ -159,6 +167,46 @@ pub enum RunLoopOutcome {
     Failed,
 }
 
+/// Trusted context for the candidate produced by one fenced parent-repair
+/// attempt. The runtime writes this outside the provider-visible workspace
+/// immediately before returning `Done`, closing the candidate-ready crash
+/// window without giving the worker authority over lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRepairCandidateContext {
+    pub path: PathBuf,
+    pub job_id: String,
+    pub round: u32,
+    pub attempt: u32,
+    pub launch_id: String,
+    pub lease_epoch: u64,
+    pub intent_sha256: String,
+    pub manifest_sha256: String,
+    pub feedback: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParentRepairCandidate {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub run_id: String,
+    pub round: u32,
+    pub attempt: u32,
+    pub launch_id: String,
+    pub lease_epoch: u64,
+    pub intent_sha256: String,
+    pub manifest_sha256: String,
+    pub result_tree_sha256: String,
+    pub turn: u32,
+    pub ready_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+enum CompletionMode {
+    VerifyAndPromote,
+    ParentRepairCandidate(ParentRepairCandidateContext),
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum Action {
@@ -212,10 +260,45 @@ pub async fn run_turn_loop(
     router: &ProviderRouter,
     config: RunLoopConfig,
 ) -> Result<RunLoopOutcome> {
+    run_turn_loop_inner(state, router, config, CompletionMode::VerifyAndPromote).await
+}
+
+/// Run the ordinary bounded mutation loop for a composed parent, but stop at
+/// a durable candidate boundary. The supervisor—not this repair worker—then
+/// revalidates Graph/Campaign lineage, runs both completion keys and seals.
+pub async fn run_parent_repair_turn_loop(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: RunLoopConfig,
+    candidate: ParentRepairCandidateContext,
+) -> Result<RunLoopOutcome> {
+    run_turn_loop_inner(
+        state,
+        router,
+        config,
+        CompletionMode::ParentRepairCandidate(candidate),
+    )
+    .await
+}
+
+async fn run_turn_loop_inner(
+    state: &mut PipelineState,
+    router: &ProviderRouter,
+    config: RunLoopConfig,
+    completion_mode: CompletionMode,
+) -> Result<RunLoopOutcome> {
     let mut config = config;
     // AS-BUILT §9: the harness, not the model, owns the bounded mutation loop
     // and writes state after every turn boundary.
     let mut history = load_or_reconstruct_history(state, config.from_turn)?;
+    if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode
+        && !history.iter().any(|entry| entry == &candidate.feedback)
+    {
+        history.push(candidate.feedback.clone());
+        state.failure_reason = Some(candidate.feedback.clone());
+        save_history(state, &history)?;
+        save_state(state)?;
+    }
     ensure_sandbox_toml(state)?;
     let seam_config_path = config
         .docs
@@ -698,6 +781,13 @@ pub async fn run_turn_loop(
             save_state(state)?;
             complete_run_docs(state, router, &config).await?;
             commit_finalized_turn(state, turn)?;
+            if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode {
+                persist_parent_repair_candidate(state, turn, candidate)?;
+                state.failure_reason = None;
+                save_state(state)?;
+                emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
+                return Ok(RunLoopOutcome::Done);
+            }
             let Some(marker) = acceptance_gate_passed_or_record_failure(
                 state,
                 config.event_sender.as_ref(),
@@ -1133,6 +1223,13 @@ pub async fn run_turn_loop(
                 }
                 complete_run_docs(state, router, &config).await?;
                 commit_finalized_turn(state, turn)?;
+                if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode {
+                    persist_parent_repair_candidate(state, turn, candidate)?;
+                    state.failure_reason = None;
+                    save_state(state)?;
+                    emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
+                    return Ok(RunLoopOutcome::Done);
+                }
                 let Some(marker) = acceptance_gate_passed_or_record_failure(
                     state,
                     config.event_sender.as_ref(),
@@ -1233,6 +1330,74 @@ pub async fn run_turn_loop(
     save_state(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
+}
+
+fn persist_parent_repair_candidate(
+    state: &PipelineState,
+    turn: u32,
+    context: &ParentRepairCandidateContext,
+) -> Result<()> {
+    if context.job_id != state.run_id
+        || context.round == 0
+        || context.attempt == 0
+        || context.lease_epoch == 0
+        || Uuid::parse_str(&context.launch_id).is_err()
+        || context.intent_sha256.is_empty()
+        || context.manifest_sha256.is_empty()
+    {
+        return Err(DeadreckonError::InvalidInput(
+            "parent repair candidate context does not match the same-ID result run".to_string(),
+        ));
+    }
+    let expected_path = deadreckon_core::parent_repair_candidate_path_for_run_root(&state.run_root);
+    if context.path != expected_path {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "parent repair candidate path is outside the trusted proof location: {}",
+            context.path.display()
+        )));
+    }
+    let mut index = deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)?;
+    index.files.remove(Path::new("manifest.json"));
+    let candidate = ParentRepairCandidate {
+        schema_version: 1,
+        job_id: context.job_id.clone(),
+        run_id: state.run_id.clone(),
+        round: context.round,
+        attempt: context.attempt,
+        launch_id: context.launch_id.clone(),
+        lease_epoch: context.lease_epoch,
+        intent_sha256: context.intent_sha256.clone(),
+        manifest_sha256: context.manifest_sha256.clone(),
+        result_tree_sha256: index.tree_hash(),
+        turn,
+        ready_at: Utc::now(),
+    };
+    let parent = context.path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "parent repair candidate path has no parent: {}",
+            context.path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).with_path(parent)?;
+    serde_json::to_writer_pretty(&mut temp, &candidate).map_err(|source| {
+        DeadreckonError::Json {
+            path: context.path.clone(),
+            source,
+        }
+    })?;
+    temp.write_all(b"\n").with_path(&context.path)?;
+    temp.as_file_mut().sync_all().with_path(&context.path)?;
+    temp.persist(&context.path)
+        .map_err(|error| DeadreckonError::Io {
+            path: context.path.clone(),
+            source: error.error,
+        })?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_path(parent)?;
+    Ok(())
 }
 
 fn should_cancel_run(state: &PipelineState, token: &CancellationToken) -> bool {
@@ -2852,6 +3017,7 @@ fn seal_achieved_semantic_completion(
     history: &mut Vec<String>,
 ) -> Result<SemanticCompletionDisposition> {
     let seal_result = (|| -> Result<()> {
+        crate::semantic_judge::validate_semantic_judgment_input(state, marker, judgment)?;
         let authority_path = paths.job_authority(&state.run_id);
         let raw = std::fs::read(&authority_path).map_err(|source| DeadreckonError::Io {
             path: authority_path.clone(),
@@ -4163,16 +4329,18 @@ mod tests {
     };
 
     use super::{
-        GateLaunchOwner, NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
-        SemanticCompletionDisposition, append_provider_approval_traces, append_tool_refusal,
-        bash_policy_refusal, build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
+        GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
+        RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SemanticCompletionDisposition,
+        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
+        build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
         changed_files_since_snapshot, commit_finalized_turn, commit_worktree_turn,
         complete_within_wall_budget, deliverable_changed_files, ensure_sandbox_toml,
         implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
         load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, load_trusted_git_control,
-        non_deliverable_history_paths, policy_seam_refusal, policy_seam_refusal_message,
-        provider_failure_disposition, provider_output_name, read_turn_codebase_record,
-        record_semantic_judge_accounting, refuse_gitlinks, run_turn_loop, safe_working_path,
+        non_deliverable_history_paths, persist_parent_repair_candidate, policy_seam_refusal,
+        policy_seam_refusal_message, provider_failure_disposition, provider_output_name,
+        read_turn_codebase_record, record_semantic_judge_accounting, refuse_gitlinks,
+        run_parent_repair_turn_loop, run_turn_loop, safe_working_path,
         safe_working_path_with_policy, save_history, seal_achieved_semantic_completion,
         semantic_completion_disposition, write_workspace_file_no_follow,
     };
@@ -4310,6 +4478,130 @@ mod tests {
         )
         .expect("run");
         (paths, state)
+    }
+
+    #[tokio::test]
+    async fn parent_repair_candidate_mode_stops_before_proof_sealing_or_promotion() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "repair the composed parent");
+        let original_working_dir = state.working_dir.clone();
+        let candidate_path =
+            deadreckon_core::parent_repair_candidate_path_for_run_root(&state.run_root);
+        let marker_path = deadreckon_core::marker_path_for_run_root(&state.run_root);
+        let judgment_path = state.run_root.join(deadreckon_core::SEMANTIC_JUDGMENT_JSON);
+        let receipt_path = paths.job_receipt(&state.run_id);
+        let library_path = paths.library_dir(&state.scope, &state.run_id);
+        let job_id = state.run_id.clone();
+        let launch_id = uuid::Uuid::new_v4().to_string();
+        let router = ProviderRouter::smoke();
+        let mut config = base_run_loop_config();
+        config.max_turns = 3;
+        config.docs.home = paths.home().to_path_buf();
+
+        let outcome = run_parent_repair_turn_loop(
+            &mut state,
+            &router,
+            config,
+            ParentRepairCandidateContext {
+                path: candidate_path.clone(),
+                job_id,
+                round: 2,
+                attempt: 3,
+                launch_id: launch_id.clone(),
+                lease_epoch: 4,
+                intent_sha256: "sha256:repair-intent".to_string(),
+                manifest_sha256: "sha256:repair-manifest".to_string(),
+                feedback: "Address the independent judge's missing requirement.".to_string(),
+            },
+        )
+        .await
+        .expect("candidate-only repair loop");
+
+        assert_eq!(outcome, RunLoopOutcome::Done);
+        let candidate: ParentRepairCandidate =
+            serde_json::from_slice(&std::fs::read(&candidate_path).expect("candidate record"))
+                .expect("candidate json");
+        let mut result_index =
+            deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)
+                .expect("candidate result index");
+        result_index.files.remove(Path::new("manifest.json"));
+        assert_eq!(candidate.job_id, state.run_id);
+        assert_eq!(candidate.run_id, state.run_id);
+        assert_eq!(candidate.round, 2);
+        assert_eq!(candidate.attempt, 3);
+        assert_eq!(candidate.launch_id, launch_id);
+        assert_eq!(candidate.lease_epoch, 4);
+        assert_eq!(candidate.intent_sha256, "sha256:repair-intent");
+        assert_eq!(candidate.manifest_sha256, "sha256:repair-manifest");
+        assert_eq!(candidate.result_tree_sha256, result_index.tree_hash());
+        assert_eq!(candidate.turn, state.turn);
+
+        assert!(!marker_path.exists(), "candidate mode wrote a gate marker");
+        assert!(
+            !judgment_path.exists(),
+            "candidate mode wrote a semantic judgment"
+        );
+        assert!(
+            !receipt_path.exists(),
+            "candidate mode wrote a completion receipt"
+        );
+        assert!(
+            !library_path.exists(),
+            "candidate mode promoted the unverified parent"
+        );
+        assert_eq!(state.promoted_library_dir, None);
+        assert_eq!(state.working_dir, original_working_dir);
+    }
+
+    #[test]
+    fn parent_repair_candidate_refuses_unfenced_or_malformed_controller_context() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "repair the composed parent");
+        let candidate_path =
+            deadreckon_core::parent_repair_candidate_path_for_run_root(&state.run_root);
+        let valid = ParentRepairCandidateContext {
+            path: candidate_path.clone(),
+            job_id: state.run_id.clone(),
+            round: 1,
+            attempt: 2,
+            launch_id: uuid::Uuid::new_v4().to_string(),
+            lease_epoch: 3,
+            intent_sha256: "sha256:intent".to_string(),
+            manifest_sha256: "sha256:manifest".to_string(),
+            feedback: "repair the parent".to_string(),
+        };
+
+        for malformed in [
+            ParentRepairCandidateContext {
+                lease_epoch: 0,
+                ..valid.clone()
+            },
+            ParentRepairCandidateContext {
+                launch_id: "not-a-launch-id".to_string(),
+                ..valid.clone()
+            },
+            ParentRepairCandidateContext {
+                intent_sha256: String::new(),
+                ..valid.clone()
+            },
+            ParentRepairCandidateContext {
+                manifest_sha256: String::new(),
+                ..valid
+            },
+        ] {
+            let error = persist_parent_repair_candidate(&state, 1, &malformed)
+                .expect_err("malformed controller context must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match the same-ID result run"),
+                "{error}"
+            );
+            assert!(
+                !candidate_path.exists(),
+                "malformed context wrote a repair candidate"
+            );
+        }
     }
 
     fn write_required_semantic_job(

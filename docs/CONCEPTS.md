@@ -22,8 +22,9 @@ it*. For step-by-step usage, see [HOWTO](../HOWTO.md).
 6. **The trusted supervisor seals the final parent receipt.** Only a contained
    deterministic pass plus semantic `achieved` produces the HMAC-SHA-256
    two-key receipt required to promote a durable Job. A Single Job can use
-   `revise` for another bounded turn. A Graph or Campaign parent stops
-   `NEEDS_REVIEW` because safe parent repair is not implemented yet.
+   `revise` for another bounded turn. A Graph or Campaign Job can use `revise`
+   for a bounded parent-only repair attempt without rerunning successful
+   leaves.
 
 The loop is the product. The agent CLI does the coding. deadreckon owns the
 approved inputs, execution boundary, independent checks, and final receipt.
@@ -153,7 +154,7 @@ dr-gate watchdog            ◄── separate process, uses protected HMAC key
 read-only semantic judge    ◄── goal + contract + diff + cited evidence
   |
   | achieved? seal two-key receipt
-  | revise? another bounded turn
+  | revise? another bounded worker or parent-repair turn
   | uncertain/unavailable? NEEDS_REVIEW
   v
 promoted artifact           ◄── receipt, narrative, decisions, file lineage
@@ -168,9 +169,10 @@ chains, stored-plan `fork`, and campaigns put the established conductor under
 one durable parent Job and lease. Child results are evidence, not parent
 authority. The supervisor verifies the same-ID merged parent and promotes it
 only after a valid two-key receipt. A semantic request to revise that parent
-stops `NEEDS_REVIEW`; deterministic parent gate failure stops `FAILED`.
-Historical and explicitly uncontained compatibility paths remain
-process-owned.
+starts a fenced parent-only attempt, preserving the approved authority and
+successful leaf results; repeated rounds remain bounded and linked in the
+receipt evidence. A deterministic parent gate failure stops `FAILED`.
+Historical and explicitly uncontained compatibility paths remain process-owned.
 
 ## Compared with agentic coding CLIs
 
