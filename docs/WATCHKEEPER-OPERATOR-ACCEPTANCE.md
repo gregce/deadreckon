@@ -266,8 +266,10 @@ Accept when:
   `NEEDS_REVIEW`;
 - [ ] a Single Job `revise` event carries bounded findings and remains inside
   Job spend, wall-time, and attempt policy;
-- [ ] a Graph or Campaign parent `revise` stops `NEEDS_REVIEW` until safe
-  parent repair exists.
+- [ ] a Graph or Campaign parent `revise` starts a new fenced parent-only
+  attempt without rerunning successful leaves;
+- [ ] repeated parent repair stays inside Job attempt, spend and wall-time
+  policy, and only semantic `achieved` can proceed to a receipt.
 
 The public CLI has no deterministic switch that forces a real provider to
 return each semantic decision. Use real naturally occurring cases for operator
@@ -296,6 +298,13 @@ mv "$WK_JOB_DIR/receipt.operator-backup.json" "$WK_JOB_DIR/receipt.json"
 Repeat on separate disposable Jobs by changing one artifact at a time and then
 restoring it: `authority.json`, `launch-plan.json`, `acceptance.yaml`, the
 native marker, `proofs/semantic-judgment.json`, and one result file.
+
+For a Job that used parent repair, also change one item at a time and restore
+it: Job-local `parent-repair.json`, active
+`proofs/parent-repair.json`, active
+`proofs/parent-repair-candidate.json`, and each archived round under
+`proofs/parent-repairs/`. On Unix, repeat by replacing one archived regular
+file with a byte-identical symlink to a backup outside that round directory.
 
 Locate the same-ID run before changing run-owned evidence:
 
@@ -346,9 +355,12 @@ Accept when:
 - [ ] the parent native gate and semantic judgment produce `receipt.json`;
 - [ ] receipt validation happens before parent promotion;
 - [ ] `finish` delivers the receipt-bound parent output;
-- [ ] semantic `revise` stops `NEEDS_REVIEW`;
-- [ ] its typed stop reason is `semantic_revise`, distinct from judge
-  unavailability;
+- [ ] semantic `revise` starts a bounded parent-only repair attempt and does
+  not relaunch successful children;
+- [ ] every repair round has linked intent, manifest, candidate, marker and
+  judgment evidence;
+- [ ] a supervisor restart can adopt a candidate-ready repair without
+  launching a duplicate worker;
 - [ ] deterministic parent gate failure stops `FAILED`;
 - [ ] running direct `orchestrate` creates a durable Graph Job with the same
   parent verification boundary.
@@ -360,6 +372,8 @@ Run a separate guided Campaign selected by `start`. Accept when:
   sub-plan without launching a duplicate;
 - [ ] the supervisor rebuilds the worst-of roll-up from current leaf evidence;
 - [ ] a refused or changed roll-up stops before the semantic judge;
+- [ ] semantic `revise` repairs only the merged Campaign parent and retains the
+  completed sub-plan and leaf identities;
 - [ ] a clean roll-up proceeds to parent gate, semantic judgment, receipt,
   promotion and `finish`;
 - [ ] direct `campaign` creates a durable Campaign Job with the same roll-up

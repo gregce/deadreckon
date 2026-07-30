@@ -188,6 +188,10 @@ crate: deadreckon-core
   gate::gate_key_path_for_run_root
   gate::gate_nonce_path_for_run_root
   gate::marker_path_for_run_root
+  gate::PARENT_REPAIR_CANDIDATE_JSON
+  gate::PARENT_REPAIR_MANIFEST_JSON
+  gate::parent_repair_candidate_path_for_run_root
+  gate::parent_repair_manifest_path_for_run_root
   gate::read_gate_key
   gate::read_gate_key_for_run_root
   gate::sign_gate_evaluation_with_key
@@ -444,6 +448,7 @@ crate: deadreckon-runtime
   semantic_judge::run_semantic_judge
   semantic_judge::run_semantic_judge_against_source
   semantic_judge::run_semantic_judge_against_source_with_budget
+  semantic_judge::run_semantic_judge_against_source_with_budget_and_cancellation
   semantic_judge::run_semantic_judge_with_budget
   semantic_judge::SEMANTIC_JUDGMENT_PATH
   semantic_judge::semantic_judgment_path
@@ -451,9 +456,14 @@ crate: deadreckon-runtime
   semantic_judge::SemanticEvidencePack
   semantic_judge::SemanticJudgeBudget
   semantic_judge::SemanticJudgeResult
+  semantic_judge::validate_semantic_judgment_input
+  semantic_judge::validate_semantic_judgment_input_against_source
   turn_loop::GateLaunchOwner
   turn_loop::NarratorConfig
+  turn_loop::ParentRepairCandidate
+  turn_loop::ParentRepairCandidateContext
   turn_loop::run_deterministic_completion_gate
+  turn_loop::run_parent_repair_turn_loop
   turn_loop::run_turn_loop
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig

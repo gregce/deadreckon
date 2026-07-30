@@ -12,9 +12,10 @@ this tree. These are the remaining boundaries:
   Job-scheduled; historical `chain run|resume`, policy-rich chain modes, chain
   extension, previews, and explicitly in-place/uncontained execution remain
   process-owned.
-- Add safe parent repair for guided Graph and Campaign Jobs. A semantic
-  `revise` currently stops `NEEDS_REVIEW`, while a deterministic parent gate
-  failure stops `FAILED`.
+- Dogfood the bounded parent-repair path now implemented for Graph and
+  Campaign Jobs. Prove naturally occurring semantic `revise` decisions,
+  repeated parent-only repair, crash recovery from a candidate-ready state and
+  final receipt validation without rerunning successful leaves.
 - Prove guarded-launch and process-identity recovery through an active service
   and real machine restart before promising recovery from every interruption.
   Hermetic tests cover pre/post-release crashes, boot identity, PID reuse and
@@ -245,9 +246,9 @@ this tree. These are the remaining boundaries:
 - Semantic-judge evaluation and provider parity: a read-only judge now returns
   `achieved`, `revise`, or `uncertain` for guided Jobs after
   deterministic checks pass. V1 work is a measured evaluation set, calibrated
-  prompts/providers, explainable disagreement handling, and safe parent repair
-  for Graph and Campaign `revise`. Embedding-based contract compilation remains
-  out until privacy, cost and explainability are explicit.
+  prompts/providers, explainable disagreement handling, and live validation of
+  bounded Graph and Campaign parent repair. Embedding-based contract
+  compilation remains out until privacy, cost and explainability are explicit.
 - Auto-generating missing build/test harnesses in the target project: the
   compiler may propose helpers under `.deadreckon/acceptance/`, but scaffolding
   the project itself is V1.

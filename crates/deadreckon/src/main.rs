@@ -10035,11 +10035,45 @@ async fn trusted_supervisor_resume_command(job_id: String) -> Result<()> {
 
 async fn resume_loaded_command(
     paths: &DeadreckonPaths,
+    state: deadreckon_core::PipelineState,
+    from_turn: Option<u32>,
+    max_wall_seconds: Option<f64>,
+    no_docs: bool,
+    plain: bool,
+) -> Result<()> {
+    resume_loaded_command_with_mode(
+        paths,
+        state,
+        from_turn,
+        max_wall_seconds,
+        no_docs,
+        plain,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn resume_parent_repair_command(
+    paths: &DeadreckonPaths,
+    state: deadreckon_core::PipelineState,
+    model: Option<&str>,
+    candidate: deadreckon_runtime::ParentRepairCandidateContext,
+) -> Result<()> {
+    resume_loaded_command_with_mode(paths, state, None, None, true, true, model, Some(candidate))
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resume_loaded_command_with_mode(
+    paths: &DeadreckonPaths,
     mut state: deadreckon_core::PipelineState,
     from_turn: Option<u32>,
     max_wall_seconds: Option<f64>,
     no_docs: bool,
     plain: bool,
+    model: Option<&str>,
+    parent_repair: Option<deadreckon_runtime::ParentRepairCandidateContext>,
 ) -> Result<()> {
     if state.status == RunStatus::Completed {
         let id = run_prefix(&state.run_id);
@@ -10093,7 +10127,7 @@ async fn resume_loaded_command(
         &state,
         backend,
         provider.as_deref(),
-        None,
+        model,
         false,
     )
     .await?;
@@ -10120,41 +10154,42 @@ async fn resume_loaded_command(
         doc_provider_selection.provider.as_deref(),
         doc_provider_selection.source.as_str(),
     );
-    let outcome = with_cli_wait_status(
-        &wait_label,
-        run_turn_loop(
-            &mut state,
-            &router,
-            RunLoopConfig {
-                provider,
-                max_spend_usd,
-                max_wall_seconds,
-                sandbox_backend: backend,
-                no_seams: false,
-                max_turns: 12,
-                from_turn,
-                event_sender: None,
-                cancellation_token: None,
-                narrate: None,
-                docs: RunLoopDocsConfig {
-                    home: paths.home().to_path_buf(),
-                    config_path: Some(paths.config_path()),
-                    doc_provider: doc_provider_selection.provider,
-                    doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
-                    doc_subskills: effective_doc_subskills(&defaults),
-                    token_budget: defaults
-                        .doc_polish_token_budget
-                        .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
-                    budget_cap_usd: defaults.doc_polish_budget_cap_usd,
-                    doc_skill: defaults
-                        .doc_skill
-                        .unwrap_or_else(|| "run-narrator".to_string()),
-                    no_docs,
-                },
-            },
-        ),
-    )
-    .await?;
+    let config = RunLoopConfig {
+        provider,
+        max_spend_usd,
+        max_wall_seconds,
+        sandbox_backend: backend,
+        no_seams: false,
+        max_turns: 12,
+        from_turn,
+        event_sender: None,
+        cancellation_token: None,
+        narrate: None,
+        docs: RunLoopDocsConfig {
+            home: paths.home().to_path_buf(),
+            config_path: Some(paths.config_path()),
+            doc_provider: doc_provider_selection.provider,
+            doc_provider_source: Some(doc_provider_selection.source.as_str().to_string()),
+            doc_subskills: effective_doc_subskills(&defaults),
+            token_budget: defaults
+                .doc_polish_token_budget
+                .unwrap_or(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+            budget_cap_usd: defaults.doc_polish_budget_cap_usd,
+            doc_skill: defaults
+                .doc_skill
+                .unwrap_or_else(|| "run-narrator".to_string()),
+            no_docs,
+        },
+    };
+    let outcome = if let Some(candidate) = parent_repair {
+        with_cli_wait_status(
+            &wait_label,
+            deadreckon_runtime::run_parent_repair_turn_loop(&mut state, &router, config, candidate),
+        )
+        .await?
+    } else {
+        with_cli_wait_status(&wait_label, run_turn_loop(&mut state, &router, config)).await?
+    };
     state.child_pids.clear();
     save_state(&state)?;
     lock.release()?;

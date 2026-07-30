@@ -99,10 +99,10 @@ source and result tree digests, gate marker, judgment, confinement, and the
 sandbox backend that actually ran.
 
 A deterministic failure cannot be overruled. A Single Job can use semantic
-`revise` for another bounded worker turn. A Graph or Campaign parent records
-`revise` as `NEEDS_REVIEW` / `semantic_revise`; safe parent repair is deferred.
-Uncertainty, judge failure, missing containment or an invalid receipt also stop
-`NEEDS_REVIEW`.
+`revise` for another bounded worker turn. A Graph or Campaign parent uses
+`revise` for a new bounded, fenced parent-only repair attempt without rerunning
+successful leaves. Uncertainty, judge failure, missing containment or an
+invalid receipt still stop `NEEDS_REVIEW`.
 
 The supervisor now renews its fenced lease during source hashing and parent
 verification, not only while polling a child. Fresh Jobs bind authority to an
@@ -128,6 +128,16 @@ parent verification, it rebuilds the worst-of roll-up from current leaf
 evidence and compares it with the stored and merged copies. A refused or
 changed roll-up fails before the semantic judge. A clean campaign parent then
 uses the same gate, judgment, receipt and promotion sequence as a Graph.
+
+Graph and Campaign semantic repair now records an intent before launch and a
+fenced manifest/candidate before adopting the changed parent tree. Repeated
+rounds are linked by attempt, launch, lease and tree identity. Recovery can
+adopt a candidate-ready round without starting a duplicate worker. The marker
+HMAC binds the active repair evidence, while receipt sealing and `finish`
+validate the complete archived lineage from stable regular-file snapshots and
+refuse mutation, removal, identity drift or byte-identical symlink
+substitution. Cancellation and all Job budget limits remain authoritative
+during both repair and the following semantic judgment.
 
 ### The worker cannot mint its proof
 
