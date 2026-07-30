@@ -30,8 +30,9 @@ pub(crate) enum CliStreamEvent {
     Conversation(String),
     /// Token usage for the turn (+ optional reported cost, informational only).
     Usage(CliUsage),
-    /// The final answer text carried in the structured result (claude only;
-    /// codex answers arrive via `--output-last-message`).
+    /// The final answer text carried in the structured result. Claude includes
+    /// it in the result row; Codex emits it as an `agent_message` item (and may
+    /// also mirror it through `--output-last-message`).
     Answer(String),
     /// A tool/item row for the flight ledger.
     Tool(CliToolRow),

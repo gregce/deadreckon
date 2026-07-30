@@ -2026,6 +2026,66 @@ async fn semantic_judge_has_no_worker_session_or_write_capability() {
     assert_eq!(judgment.trace["workspace_access"], "read-only");
 }
 
+#[tokio::test]
+async fn read_only_codex_judge_without_session_uses_schema_and_clean_answer() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-codex");
+    let answer = serde_json::json!({
+        "decision": "achieved",
+        "summary": "the requested behavior is present",
+        "goal_coverage": [{
+            "claim": "greeting is exact",
+            "status": "met",
+            "evidence": ["source-diff", "deterministic-gate"]
+        }],
+        "missing": []
+    })
+    .to_string();
+    let jsonl = format!(
+        "{}\n{}\n{}",
+        r#"{"type":"thread.started","thread_id":"judge-1"}"#,
+        serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_1",
+                "type": "agent_message",
+                "text": answer
+            }
+        }),
+        r#"{"type":"turn.completed","usage":{"input_tokens":12,"cached_input_tokens":0,"output_tokens":8}}"#
+    );
+    write_fake_codex(&binary, &jsonl, "unused last-message");
+    let judge_workspace = temp.path().join("judge-workspace");
+    fs::create_dir_all(&judge_workspace).expect("judge workspace");
+    let schema = serde_json::json!({
+        "type": "object",
+        "required": ["decision", "summary", "goal_coverage", "missing"]
+    });
+
+    let judgment = codex_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "judge this evidence".to_string(),
+            cwd: Some(judge_workspace.clone()),
+            output_path: None,
+            session_dir: None,
+            output_schema: Some(schema),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            ..Default::default()
+        })
+        .await
+        .expect("read-only judgment");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&judgment.content).expect("clean semantic JSON");
+    assert_eq!(parsed["decision"], "achieved");
+    assert!(!judgment.content.contains("thread.started"));
+    let args = judgment.trace["args"].as_array().expect("args");
+    assert!(args.iter().any(|arg| arg == "--output-schema"));
+    assert!(!args.iter().any(|arg| arg == "-o"));
+    assert!(!args.iter().any(|arg| arg == "resume"));
+    assert!(judge_workspace.join("provider-output-schema.json").exists());
+}
+
 #[allow(clippy::expect_used)]
 fn write_fake_codex_vanishing(path: &std::path::Path) {
     let script = format!(

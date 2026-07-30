@@ -146,11 +146,11 @@ impl CliCodexProvider {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
 
-        let schema_file = match (
-            &request.output_schema,
-            caps.output_schema,
-            session_dir.as_deref(),
-        ) {
+        // A fresh read-only request deliberately has no resumable worker
+        // session. Its isolated cwd is still a safe place to stage the
+        // read-only schema before the provider sandbox starts.
+        let schema_dir = session_dir.as_deref().or(request.cwd.as_deref());
+        let schema_file = match (&request.output_schema, caps.output_schema, schema_dir) {
             (Some(schema), true, Some(dir)) => Some(write_schema_file(dir, schema).await?),
             _ => None,
         };
@@ -211,8 +211,9 @@ impl CliCodexProvider {
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        let content = match (&last_message, degraded) {
-            (Some(msg), false) => msg.clone(),
+        let content = match (&last_message, parsed.answer.as_ref(), degraded) {
+            (Some(msg), _, false) => msg.clone(),
+            (_, Some(answer), false) => answer.clone(),
             _ => output.stdout.clone(),
         };
 

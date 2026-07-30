@@ -156,6 +156,13 @@ pub(crate) fn parse_codex_line(line: &str) -> Option<Vec<CliStreamEvent>> {
 /// for narrative items (agent_message, reasoning) that are not tool calls.
 fn codex_item_event(item: &Value, raw: &str) -> CliStreamEvent {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    if item_type == "agent_message" {
+        return item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| CliStreamEvent::Answer(text.to_string()))
+            .unwrap_or(CliStreamEvent::Recognized);
+    }
     let id = item
         .get("id")
         .and_then(Value::as_str)
@@ -192,8 +199,8 @@ fn codex_item_event(item: &Value, raw: &str) -> CliStreamEvent {
                 .unwrap_or("collab tool")
                 .to_string(),
         ),
-        // agent_message, reasoning, todo_list, error, and anything else are not
-        // tool calls: recognized, but not appended to the flight ledger here.
+        // reasoning, todo_list, error, and anything else are not tool calls:
+        // recognized, but not appended to the flight ledger here.
         _ => return CliStreamEvent::Recognized,
     };
     CliStreamEvent::Tool(CliToolRow {
@@ -308,6 +315,20 @@ Options:
         let events =
             parse_codex_line(r#"{"type":"turn.aborted","reason":"user"}"#).expect("valid json");
         assert_eq!(events, vec![CliStreamEvent::Unknown]);
+    }
+
+    #[test]
+    fn codex_agent_message_is_the_structured_answer() {
+        let events = parse_codex_line(
+            r#"{"type":"item.completed","item":{"id":"item_7","type":"agent_message","text":"{\"decision\":\"achieved\"}"}}"#,
+        )
+        .expect("valid codex agent message");
+        assert_eq!(
+            events,
+            vec![CliStreamEvent::Answer(
+                r#"{"decision":"achieved"}"#.to_string()
+            )]
+        );
     }
 
     #[test]
