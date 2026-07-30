@@ -328,6 +328,20 @@ async fn run_semantic_judge_with_baseline(
 ) -> Result<SemanticJudgeRun> {
     let started = Instant::now();
     let selected = router.selected_route_info();
+    if selected
+        .as_ref()
+        .is_some_and(|route| route.kind == ProviderKind::ScriptedSmoke)
+    {
+        return Ok(unavailable_run(
+            "strict semantic judge unavailable: the scripted smoke provider is a transport fixture, not an independent semantic assessor"
+                .to_string(),
+            accounting_without_response(
+                selected.as_ref(),
+                sandbox_backend,
+                started.elapsed().as_secs_f64(),
+            ),
+        ));
+    }
     let evidence = match build_semantic_evidence_with_baseline(state, marker, approved_source) {
         Ok(evidence) => evidence,
         Err(error) => {
@@ -1212,5 +1226,62 @@ mod tests {
             "cli:pi".to_string()
         )));
         assert!(!provider_kind_is_cli(&ProviderKind::OpenAi));
+    }
+
+    #[tokio::test]
+    async fn scripted_smoke_cannot_act_as_the_independent_semantic_judge() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        let state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "exercise semantic refusal".to_string(),
+                cwd: source,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "test".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some("smoke-judge-refusal".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let marker = deadreckon_core::AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: deadreckon_core::AcceptanceProofKind::NativeGate,
+            checked_at: chrono::Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "unused-before-fixture-refusal".to_string(),
+            check_count: 1,
+            checks: Vec::new(),
+        };
+
+        let run = super::run_semantic_judge(
+            &state,
+            &marker,
+            &deadreckon_providers::ProviderRouter::smoke(),
+            SandboxBackend::SandboxExec,
+        )
+        .await
+        .expect("semantic result");
+
+        let SemanticJudgeResult::Unavailable(reason) = run.result else {
+            panic!("scripted smoke must never return a trusted semantic decision")
+        };
+        assert!(
+            reason.contains("not an independent semantic assessor"),
+            "{reason}"
+        );
+        assert_eq!(run.accounting.provider, "smoke");
+        assert_eq!(run.accounting.model, "local-scripted-smoke");
     }
 }

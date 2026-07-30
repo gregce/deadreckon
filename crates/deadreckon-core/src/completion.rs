@@ -12,7 +12,10 @@ use sha2::Sha256;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::flight::{build_working_file_index, sha256_file, sha256_text};
-use crate::gate::{AcceptanceMarker, read_gate_key, validate_acceptance_marker};
+use crate::gate::{
+    AcceptanceCheck, AcceptanceMarker, acceptance_checks_from_yaml, read_gate_key,
+    validate_acceptance_marker,
+};
 use crate::job::load_job;
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, atomic_write_json};
@@ -255,7 +258,51 @@ fn verify_authority_inputs(
         &sha256_file(&contract_path)?,
         "approved contract",
         job_id,
-    )
+    )?;
+    validate_strict_contract(&contract_path, job_id)
+}
+
+fn validate_strict_contract(contract_path: &Path, job_id: &str) -> Result<()> {
+    let raw = fs::read_to_string(contract_path).with_path(contract_path)?;
+    let checks = acceptance_checks_from_yaml(&raw)?;
+    if checks.is_empty() {
+        return Err(completion_error(
+            job_id,
+            "the approved deterministic contract contains no checks",
+        ));
+    }
+    let required = checks
+        .iter()
+        .filter(|check| check_is_required(check))
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return Err(completion_error(
+            job_id,
+            "the approved deterministic contract contains no required checks",
+        ));
+    }
+    if required.iter().all(|check| {
+        matches!(
+            check,
+            AcceptanceCheck::FileExists { path, .. } if path.trim() == "{working_dir}"
+        )
+    }) {
+        return Err(completion_error(
+            job_id,
+            "the approved deterministic contract only proves that its pre-created working directory exists",
+        ));
+    }
+    Ok(())
+}
+
+fn check_is_required(check: &AcceptanceCheck) -> bool {
+    match check {
+        AcceptanceCheck::CargoTest { must_pass, .. }
+        | AcceptanceCheck::FileExists { must_pass, .. }
+        | AcceptanceCheck::ContentMatch { must_pass, .. }
+        | AcceptanceCheck::BuildSuccess { must_pass, .. }
+        | AcceptanceCheck::Shell { must_pass, .. } => *must_pass,
+    }
 }
 
 fn result_tree_hash(state: &PipelineState) -> Result<String> {
@@ -405,7 +452,7 @@ mod tests {
         judgment: SemanticJudgment,
     }
 
-    fn fixture() -> Fixture {
+    fn fixture_with_contract(contract: &str) -> Fixture {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let source = temp.path().join("source");
@@ -428,11 +475,7 @@ mod tests {
         fs::create_dir_all(&state.working_dir).expect("working");
         fs::write(state.working_dir.join("result.txt"), "verified\n").expect("result");
         let contract_path = crate::acceptance_spec_path_for_run_root(&state.run_root);
-        fs::write(
-            &contract_path,
-            "name: result\nchecks:\n  - file_exists: result.txt\n",
-        )
-        .expect("contract");
+        fs::write(&contract_path, contract).expect("contract");
         fs::create_dir_all(paths.job_dir("job-1")).expect("job dir");
         let launch_path = paths.job_launch_plan("job-1");
         fs::write(
@@ -533,6 +576,10 @@ mod tests {
         }
     }
 
+    fn fixture() -> Fixture {
+        fixture_with_contract("name: result\nchecks:\n  - file_exists: result.txt\n")
+    }
+
     #[test]
     fn achieved_plus_gate_pass_seals_two_key_receipt() {
         let fixture = fixture();
@@ -603,6 +650,47 @@ mod tests {
             .to_string()
             .contains("requires a contained deterministic gate")
         );
+    }
+
+    #[test]
+    fn strict_job_cannot_seal_an_empty_deterministic_contract() {
+        let fixture = fixture_with_contract("name: empty\nchecks: []\n");
+
+        let error = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect_err("an empty contract is not a deterministic completion key");
+
+        assert!(error.to_string().contains("contains no checks"), "{error}");
+        assert!(!fixture.paths.job_receipt("job-1").exists());
+    }
+
+    #[test]
+    fn strict_job_cannot_seal_the_unknown_project_directory_noop() {
+        let fixture = fixture_with_contract(
+            "name: deadreckon detected unknown\nchecks:\n  - kind: file_exists\n    path: '{working_dir}'\n    must_pass: true\n",
+        );
+
+        let error = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect_err("the pre-created working directory is not a definition of done");
+
+        assert!(
+            error
+                .to_string()
+                .contains("only proves that its pre-created working directory exists"),
+            "{error}"
+        );
+        assert!(!fixture.paths.job_receipt("job-1").exists());
     }
 
     #[test]

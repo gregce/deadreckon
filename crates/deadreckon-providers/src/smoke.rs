@@ -74,11 +74,11 @@ impl Provider for ScriptedSmokeProvider {
                 && request.output_schema.is_some()
             {
                 let content = json!({
-                    "decision": "achieved",
-                    "summary": "the deterministic smoke result satisfies the approved fixture goal",
+                    "decision": "uncertain",
+                    "summary": "the scripted smoke provider can exercise the judge transport but cannot independently assess whether a goal was achieved",
                     "goal_coverage": [{
-                        "claim": "approved smoke goal",
-                        "status": "met",
+                        "claim": "approved goal",
+                        "status": "unclear",
                         "evidence": [
                             "approved-goal",
                             "approved-contract",
@@ -86,7 +86,9 @@ impl Provider for ScriptedSmokeProvider {
                             "deterministic-gate"
                         ]
                     }],
-                    "missing": []
+                    "missing": [
+                        "an independent semantic assessment from a non-scripted provider"
+                    ]
                 })
                 .to_string();
                 let usage = ProviderUsage {
@@ -146,7 +148,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn semantic_smoke_response_is_read_only_and_does_not_consume_worker_steps() {
+    async fn semantic_smoke_response_is_uncertain_and_does_not_consume_worker_steps() {
         let provider = ScriptedSmokeProvider::new();
         let semantic = provider
             .complete(&ProviderRequest {
@@ -156,7 +158,12 @@ mod tests {
             })
             .await
             .expect("semantic response");
-        assert!(semantic.content.contains("\"decision\":\"achieved\""));
+        assert!(semantic.content.contains("\"decision\":\"uncertain\""));
+        assert!(
+            semantic
+                .content
+                .contains("cannot independently assess whether a goal was achieved")
+        );
         assert_eq!(semantic.trace["workspace_access"], "read_only");
 
         let worker = provider
