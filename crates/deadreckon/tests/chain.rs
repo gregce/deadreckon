@@ -30,7 +30,13 @@ use tokio::net::TcpListener;
 
 mod common;
 
-use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
+use common::{assert_success, deadreckon as base_deadreckon, repo_tempdir, stderr, stdout};
+
+fn deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"));
+    command.env("DEADRECKON_HOME", paths.home());
+    command
+}
 
 #[test]
 fn chain_help_topics_use_one_next_footer() {
@@ -42,7 +48,7 @@ fn chain_help_topics_use_one_next_footer() {
         ("attach", "deadreckon chain status latest"),
         ("status", "deadreckon chain show latest"),
         ("show", "deadreckon chain show latest"),
-        ("pause", "deadreckon chain resume latest"),
+        ("pause", "deadreckon chain show latest --why-failed"),
         ("undo", "deadreckon chain show latest"),
         ("extend", "deadreckon chain show latest"),
     ];
@@ -64,6 +70,160 @@ fn chain_help_topics_use_one_next_footer() {
         assert!(stdout.contains(&format!("next {command}")), "{stdout}");
         assert!(!stdout.contains("next:"), "{stdout}");
         assert!(!stdout.contains("try:"), "{stdout}");
+    }
+}
+
+#[test]
+fn product_chain_start_refuses_the_uncontained_legacy_conductor() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = base_deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "first",
+            "second",
+        ])
+        .output()
+        .expect("product chain start");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("cannot create a durable Job"), "{stderr}");
+    assert!(stderr.contains("legacy conductor"), "{stderr}");
+    assert!(!paths.jobs_dir().exists());
+    assert!(!paths.chains_dir().exists());
+}
+
+#[test]
+fn product_debug_env_cannot_unlock_legacy_execution() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = base_deadreckon(&paths)
+        .env("DEADRECKON_TEST_FOREGROUND_ADVANCED", "1")
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "--yes",
+            "--provider",
+            "smoke",
+            "--sandbox",
+            "none",
+            "first",
+            "second",
+        ])
+        .output()
+        .expect("product chain with obsolete test environment");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(stderr.contains("cannot create a durable Job"), "{stderr}");
+    assert!(
+        !paths.chains_dir().exists()
+            || fs::read_dir(paths.chains_dir())
+                .expect("chains")
+                .next()
+                .is_none()
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn product_chain_run_refuses_without_mutating_the_stored_chain() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    chain.cwd = repo.clone();
+    save_test_chain(&paths, &chain);
+    let before = fs::read(paths.chain_json(&chain.chain_id)).expect("chain before");
+
+    let output = base_deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "run", &chain.chain_id, "--yes", "--plain"])
+        .output()
+        .expect("product chain run");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("legacy conductors are no longer a product execution route"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read(paths.chain_json(&chain.chain_id)).expect("chain after"),
+        before
+    );
+    assert!(!paths.chain_events(&chain.chain_id).exists());
+    assert!(!paths.conductor_json(&chain.chain_id).exists());
+}
+
+#[test]
+fn product_chain_status_never_recommends_refused_execution() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    chain.cwd = repo.clone();
+
+    for status in [ChainStatus::Pending, ChainStatus::Paused] {
+        chain.status = status;
+        chain.paused_reason = (status == ChainStatus::Paused).then(|| "operator pause".to_string());
+        save_test_chain(&paths, &chain);
+
+        let json_output = base_deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "show", &chain.chain_id[..8], "--json"])
+            .output()
+            .expect("product chain JSON status");
+        assert_success(&json_output);
+        let value: Value = serde_json::from_slice(&json_output.stdout).expect("status JSON");
+        let actions = value["next_actions"].as_array().expect("next actions");
+        assert!(
+            actions
+                .iter()
+                .all(|action| action.as_str().is_some_and(
+                    |action| !action.contains("chain run") && !action.contains("chain resume")
+                )),
+            "{value:#}"
+        );
+        assert!(
+            value["primary_action"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("deadreckon chain --yes")),
+            "{value:#}"
+        );
+
+        let human_output = base_deadreckon(&paths)
+            .current_dir(&repo)
+            .args(["chain", "show", &chain.chain_id[..8]])
+            .output()
+            .expect("product chain human status");
+        assert_success(&human_output);
+        let human = stdout(&human_output);
+        assert!(!human.contains("deadreckon chain run"), "{human}");
+        assert!(!human.contains("deadreckon chain resume"), "{human}");
+        assert!(
+            human.contains("Recommended\ndeadreckon chain --yes"),
+            "{human}"
+        );
     }
 }
 
@@ -201,7 +361,7 @@ fn chain_failed_surface_has_single_inspection_or_recovery_command() {
 }
 
 #[test]
-fn chain_paused_surface_recommends_resume_once() {
+fn chain_paused_surface_recommends_durable_migration_once() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let mut chain = sample_chain(&temp);
@@ -219,11 +379,23 @@ fn chain_paused_surface_recommends_resume_once() {
     assert_success(&output);
     let value: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(value["verdict"]["kind"], "paused");
-    assert_eq!(
-        value["primary_action"],
-        format!("deadreckon chain resume {}", &chain.chain_id[..8])
-    );
     assert_eq!(value["primary_action"], value["next_actions"][0]);
+    assert!(
+        value["primary_action"]
+            .as_str()
+            .is_some_and(|action| action.starts_with("deadreckon chain --yes")),
+        "{value:#}"
+    );
+    assert!(
+        value["next_actions"]
+            .as_array()
+            .expect("next actions")
+            .iter()
+            .all(|action| action.as_str().is_some_and(
+                |action| !action.contains("chain resume") && !action.contains("chain run")
+            )),
+        "{value:#}"
+    );
 
     let human = deadreckon(&paths)
         .current_dir(temp.path())
@@ -235,12 +407,11 @@ fn chain_paused_surface_recommends_resume_once() {
     assert!(stdout.starts_with("paused chain "), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "Recommended\ndeadreckon chain resume {}",
-            &chain.chain_id[..8]
-        )),
+        stdout.contains("Recommended\ndeadreckon chain --yes"),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
+    assert!(!stdout.contains("deadreckon chain run"), "{stdout}");
 }
 
 #[test]
@@ -638,7 +809,7 @@ fn chain_id_shorthand_refuses_with_verdict_surface() {
     assert!(stderr.contains("Evidence\n"), "{stderr}");
     assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
     assert!(
-        stderr.contains("Recommended\ndeadreckon chain run abc123"),
+        stderr.contains("Recommended\ndeadreckon chain show abc123"),
         "{stderr}"
     );
     assert!(!stderr.contains("try:"), "{stderr}");
@@ -990,15 +1161,15 @@ fn chain_on_promote_hook_pause_uses_reasoned_verdict_surface() {
     assert_success(&output);
     let stdout = stdout(&output);
     let chain = newest_chain(&paths);
-    let short_id = &chain.chain_id[..8];
     assert!(stdout.contains("paused chain"), "{stdout}");
     assert!(stdout.contains("Explanation\n"), "{stdout}");
     assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains(&format!("Recommended\ndeadreckon chain resume {short_id}")),
+        stdout.contains("Recommended\ndeadreckon chain --yes"),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
     assert!(
         stdout
             .contains("The chain paused because the on-promote hook requested an operator pause."),
@@ -1119,17 +1290,18 @@ fn apply_mode_auto_refuses_when_file_outside_allowlist() {
     assert_success(&output);
     let stdout = stdout(&output);
     let chain = newest_chain(&paths);
-    let short_id = &chain.chain_id[..8];
     assert!(stdout.contains("paused chain"), "{stdout}");
     assert!(stdout.contains("Explanation\n"), "{stdout}");
     assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
         stdout.contains(&format!(
-            "Recommended\ndeadreckon chain resume {short_id} --apply-mode preview"
+            "Recommended\ndeadreckon chain show {}",
+            &chain.chain_id[..8]
         )),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
     assert!(stdout.contains("outside_allowlist"), "{stdout}");
     assert!(!stdout.contains("try:"), "{stdout}");
     assert!(!stdout.contains("hint:"), "{stdout}");
@@ -1706,12 +1878,10 @@ fn chain_extend_appends_step_and_writes_event() {
     assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "Recommended\ndeadreckon chain resume {}",
-            &chain.chain_id[..8]
-        )),
+        stdout.contains("Recommended\ndeadreckon chain --yes \"one\" \"two\" \"three\""),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
     assert!(!stdout.contains("next:"), "{stdout}");
     let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
     assert!(events.contains("chain_step_extended"));
@@ -2048,12 +2218,10 @@ fn chain_pause_success_uses_paused_verdict_surface() {
     assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "Recommended\ndeadreckon chain resume {}",
-            &chain.chain_id[..8]
-        )),
+        stdout.contains("Recommended\ndeadreckon chain --yes"),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
     assert!(!stdout.contains("try:"), "{stdout}");
 }
 
@@ -2127,6 +2295,90 @@ fn chain_hooks_list_emits_resolution_tiers() {
     let stdout = stdout(&output);
     assert!(stdout.contains("pre-step\tproject"));
     assert!(stdout.contains("post-step\tmissing"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn product_chain_plan_refuses_unsupported_policy_before_provider_spend() {
+    let cases: &[&[&str]] = &[
+        &["--n", "7"],
+        &["--apply-mode", "manual"],
+        &["--sandbox", "none"],
+    ];
+
+    for extra_args in cases {
+        let temp = repo_tempdir();
+        let repo = clean_git_repo(&temp);
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let server = MockServer::start(r#"["one","two"]"#).await;
+        write_config(temp.path(), &server.base_url());
+        let mut command = base_deadreckon(&paths);
+        command
+            .current_dir(&repo)
+            .args(["chain", "plan", "build thing", "--provider", "mock"])
+            .args(*extra_args);
+
+        let output = command.output().expect("product chain plan preflight");
+
+        assert!(!output.status.success());
+        let stderr = stderr(&output);
+        assert!(stderr.contains("planner spend"), "{stderr}");
+        assert!(stderr.contains("$0.00"), "{stderr}");
+        assert!(server.journal().is_empty(), "{:?}", server.journal());
+        assert!(
+            !paths.chains_dir().exists()
+                || fs::read_dir(paths.chains_dir())
+                    .expect("chains")
+                    .next()
+                    .is_none()
+        );
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .next()
+                    .is_none()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn product_chain_plan_draft_remains_inert_with_legacy_policy_metadata() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let server = MockServer::start(r#"["one","two"]"#).await;
+    write_config(temp.path(), &server.base_url());
+
+    let output = base_deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "plan",
+            "build thing",
+            "--n",
+            "2",
+            "--draft",
+            "--provider",
+            "mock",
+            "--sandbox",
+            "none",
+        ])
+        .output()
+        .expect("product chain draft");
+
+    assert_success(&output);
+    assert_eq!(server.journal().len(), 1);
+    let chain = newest_chain(&paths);
+    assert_eq!(chain.status, ChainStatus::Pending);
+    assert!(chain.steps.iter().all(|step| step.run_id.is_none()));
+    assert!(!paths.conductor_json(&chain.chain_id).exists());
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2605,15 +2857,13 @@ fn chain_paused_footer_lists_one_recommended_command() {
     assert!(stdout.contains("paused chain "), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains("Recommended\ndeadreckon chain resume"),
+        stdout.contains("Recommended\ndeadreckon chain --yes"),
         "{stdout}"
     );
     assert!(stdout.contains("\nSecondary\n"), "{stdout}");
     assert!(stdout.contains("deadreckon chain show"), "{stdout}");
     assert!(
-        stdout.contains("deadreckon chain resume")
-            && stdout.contains("--apply-mode preview")
-            && stdout.contains("deadreckon chain undo"),
+        !stdout.contains("deadreckon chain resume") && stdout.contains("deadreckon chain undo"),
         "{stdout}"
     );
 }
@@ -3665,12 +3915,10 @@ fn chain_redo_default_picks_first_failed_step() {
     assert!(stdout.contains("Evidence\n"), "{stdout}");
     assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            "Recommended\ndeadreckon chain resume {}",
-            &chain.chain_id[..8]
-        )),
+        stdout.contains("Recommended\ndeadreckon chain --yes \"failed\" \"later\""),
         "{stdout}"
     );
+    assert!(!stdout.contains("deadreckon chain resume"), "{stdout}");
     assert!(!stdout.contains("next:"), "{stdout}");
 }
 

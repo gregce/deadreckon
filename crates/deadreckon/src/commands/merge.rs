@@ -22,6 +22,12 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let resolved_id = resolve_plan_id(&paths, &plan_id)
         .map_err(|_| super::reference::refusal_for_reference(&paths, &plan_id, "merge"))?;
     let mut plan = load_plan(&paths, &resolved_id)?;
+    commands::graph_job::require_current_driver_for_job_artifact(
+        &paths,
+        &plan.plan_id,
+        deadreckon_protocol::JobShape::Graph,
+        "merge",
+    )?;
     if !matches!(plan.status, PlanStatus::Forked | PlanStatus::Failed) {
         return Err(CliError::Surface {
             code: 1,

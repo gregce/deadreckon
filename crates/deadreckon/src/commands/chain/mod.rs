@@ -23,14 +23,14 @@ fn print_chain_help(topic: Option<&str>) {
             print_chain_help_recommended("deadreckon status latest");
         }
         "run" | "resume" => {
-            println!("{}", ui_heading("deadreckon chain run"));
+            println!("{}", ui_heading("deadreckon chain run/resume migration"));
             println!("usage: {}", ui_command("deadreckon chain run latest"));
             println!(
                 "usage: {}",
                 ui_command("deadreckon chain resume latest --from-step 2")
             );
             println!(
-                "purpose: inspect a legacy chain's migration command; unsafe conductor execution is refused"
+                "purpose: refuse the legacy conductor without mutation and print a durable Job migration command"
             );
             print_chain_help_recommended("deadreckon chain show latest");
         }
@@ -74,7 +74,7 @@ fn print_chain_help(topic: Option<&str>) {
             println!(
                 "purpose: stop the conductor intentionally; kill also cascades to the live inner run"
             );
-            print_chain_help_recommended("deadreckon chain resume latest");
+            print_chain_help_recommended("deadreckon chain show latest --why-failed");
         }
         "undo" | "redo" => {
             println!("{}", ui_heading("deadreckon chain undo/redo"));
@@ -390,7 +390,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                     ("chain".to_string(), maybe_id.to_string()),
                     ("verb".to_string(), "missing".to_string()),
                 ],
-                format!("deadreckon chain run {maybe_id}"),
+                format!("deadreckon chain show {maybe_id}"),
                 no_hints,
             ))
         }
@@ -476,6 +476,43 @@ struct ChainRunOptions {
 
 async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     let n = options.n.clamp(2, 12);
+    if !options.draft {
+        let unsupported = unsupported_durable_chain_policy(
+            usize::from(n),
+            parse_branch_policy(&options.branch_policy)?,
+            parse_apply_mode(&options.apply_mode)?,
+            parse_apply_strategy(&options.apply_strategy)?,
+            &options.apply_allowlist,
+            parse_on_fail(&options.on_fail)?,
+            options.circuit_breaker_threshold,
+            &options.sandbox,
+            options.base.as_deref(),
+        );
+        if !unsupported.is_empty() {
+            return Err(durable_chain_policy_refusal(
+                &unsupported,
+                durable_chain_plan_command(&options.root_goal, n, &options),
+                options.no_hints,
+            ));
+        }
+        let cwd = std::env::current_dir()?;
+        let git_root = deadreckon_core::find_git_root(&cwd)?.ok_or_else(|| {
+            chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
+                "DeadReckon did not plan this chain because chains require a git repo.",
+                "The request was refused before contacting the planner provider or writing state.",
+                [
+                    ("cwd".to_string(), cwd.display().to_string()),
+                    ("planner spend".to_string(), "$0.00".to_string()),
+                ],
+                "git init".to_string(),
+                options.no_hints,
+            )
+        })?;
+        let base_ref = options.base.as_deref().unwrap_or("HEAD");
+        git_stdout(&git_root, &["rev-parse", base_ref])?;
+    }
     let paths = options.paths.clone();
     let router = ProviderRouter::from_config_path_with_model(
         &paths.config_path(),
@@ -529,6 +566,35 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     .await?;
     append_chain_planner_spend(&paths, &chain_id, &response)?;
     Ok(())
+}
+
+fn durable_chain_plan_command(root_goal: &str, n: u8, options: &ChainCreateOptions) -> String {
+    let mut parts = vec![
+        "deadreckon start".to_string(),
+        quote_chain_goal_arg(root_goal),
+        "--mode full-plan".to_string(),
+        format!("--children {}", n.min(6)),
+        "--yes".to_string(),
+    ];
+    if let Some(provider) = options.provider.as_deref() {
+        parts.push(format!("--provider {}", quote_chain_goal_arg(provider)));
+    }
+    if let Some(model) = options.model.as_deref() {
+        parts.push(format!("--model {}", quote_chain_goal_arg(model)));
+    }
+    if options.sandbox != "none" && options.sandbox != "auto" {
+        parts.push(format!(
+            "--sandbox {}",
+            quote_chain_goal_arg(&options.sandbox)
+        ));
+    }
+    if let Some(max_spend) = options.max_spend {
+        parts.push(format!("--max-spend {max_spend:.6}"));
+    }
+    if let Some(max_wall_seconds) = options.max_wall_seconds {
+        parts.push(format!("--max-wall-seconds {max_wall_seconds:.3}"));
+    }
+    parts.join(" ")
 }
 
 async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
@@ -637,7 +703,25 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
     })
     .map_err(CliError::from)?;
-    if chain.sandbox == "none" {
+    if chain.sandbox == "none" && !draft {
+        if !commands::plan::internal_characterization_requested() {
+            return Err(chain_create_refusal_surface(
+                VerdictKind::Blocked,
+                None,
+                "DeadReckon did not start this chain because --sandbox none cannot create a durable Job.",
+                "The legacy foreground conductor is retained only by the test harness. Product chain execution must enter the same isolated, supervised, independently verified Job lifecycle as every other goal.",
+                [
+                    ("sandbox".to_string(), "none".to_string()),
+                    ("job state".to_string(), "not created".to_string()),
+                    (
+                        "legacy conductor".to_string(),
+                        "disabled in product execution".to_string(),
+                    ),
+                ],
+                durable_chain_start_command(&chain),
+                no_hints,
+            ));
+        }
         if acceptance.is_some() {
             return Err(chain_create_refusal_surface(
                 VerdictKind::Blocked,
@@ -994,33 +1078,22 @@ fn durable_chain_start_command(chain: &Chain) -> String {
 }
 
 fn durable_chain_migration_command(chain: &Chain) -> String {
-    durable_chain_start_command(chain)
-}
-
-fn legacy_chain_start_command(chain: &Chain, requested_base: Option<&str>) -> String {
+    if chain.steps.len() <= 6 {
+        return durable_chain_start_command(chain);
+    }
+    let ordered_goal = ordered_chain_goal(
+        &chain
+            .steps
+            .iter()
+            .map(|step| step.goal.clone())
+            .collect::<Vec<_>>(),
+    );
     let mut parts = vec![
-        "deadreckon chain --yes".to_string(),
-        "--sandbox none".to_string(),
-        format!(
-            "--branch-policy {}",
-            quote_chain_goal_arg(branch_policy_label(chain.branch_policy))
-        ),
-        format!(
-            "--apply-mode {}",
-            quote_chain_goal_arg(apply_mode_label(chain.apply_mode))
-        ),
-        format!(
-            "--apply-strategy {}",
-            quote_chain_goal_arg(apply_strategy_label(chain.apply_strategy))
-        ),
-        format!(
-            "--on-fail {}",
-            quote_chain_goal_arg(on_fail_label(chain.on_fail))
-        ),
-        format!(
-            "--circuit-breaker-threshold {}",
-            chain.circuit_breaker_threshold
-        ),
+        "deadreckon start".to_string(),
+        quote_chain_goal_arg(&ordered_goal),
+        "--mode full-plan".to_string(),
+        "--children 6".to_string(),
+        "--yes".to_string(),
     ];
     if let Some(provider) = chain.provider.as_deref() {
         parts.push(format!("--provider {}", quote_chain_goal_arg(provider)));
@@ -1028,25 +1101,83 @@ fn legacy_chain_start_command(chain: &Chain, requested_base: Option<&str>) -> St
     if let Some(model) = chain.model.as_deref() {
         parts.push(format!("--model {}", quote_chain_goal_arg(model)));
     }
-    for allow in &chain.apply_allowlist {
-        parts.push(format!("--apply-allowlist {}", quote_chain_goal_arg(allow)));
-    }
-    if let Some(max_spend) = chain.max_spend_usd {
-        parts.push(format!("--max-spend {max_spend:.6}"));
-    }
-    if let Some(max_wall) = chain.max_wall_seconds {
-        parts.push(format!("--max-wall-seconds {max_wall:.3}"));
-    }
-    if let Some(base) = requested_base {
-        parts.push(format!("--base {}", quote_chain_goal_arg(base)));
-    }
-    parts.extend(
-        chain
-            .steps
-            .iter()
-            .map(|step| quote_chain_goal_arg(&step.goal)),
-    );
     parts.join(" ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn unsupported_durable_chain_policy(
+    step_count: usize,
+    branch_policy: BranchPolicy,
+    apply_mode: ApplyMode,
+    apply_strategy: ApplyStrategy,
+    apply_allowlist: &[String],
+    on_fail: OnFail,
+    circuit_breaker_threshold: u32,
+    sandbox: &str,
+    requested_base: Option<&str>,
+) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    if step_count > 6 {
+        unsupported.push(format!(
+            "{step_count} steps (durable linear jobs currently support at most 6)"
+        ));
+    }
+    if branch_policy != BranchPolicy::Stack {
+        unsupported.push(format!(
+            "branch policy {}",
+            branch_policy_label(branch_policy)
+        ));
+    }
+    if apply_mode != ApplyMode::Auto {
+        unsupported.push(format!("apply mode {}", apply_mode_label(apply_mode)));
+    }
+    if apply_strategy != ApplyStrategy::Squash {
+        unsupported.push(format!(
+            "apply strategy {}",
+            apply_strategy_label(apply_strategy)
+        ));
+    }
+    if !apply_allowlist.is_empty() {
+        unsupported.push("apply allowlist".to_string());
+    }
+    if on_fail != OnFail::Stop {
+        unsupported.push(format!("on-fail {}", on_fail_label(on_fail)));
+    }
+    if circuit_breaker_threshold != 2 {
+        unsupported.push(format!(
+            "circuit breaker threshold {circuit_breaker_threshold}"
+        ));
+    }
+    if sandbox == "none" {
+        unsupported.push("sandbox none (durable trusted Jobs require isolation)".to_string());
+    }
+    if requested_base.is_some_and(|base| base != "HEAD") {
+        unsupported.push(format!("base {}", requested_base.unwrap_or("HEAD")));
+    }
+    unsupported
+}
+
+fn durable_chain_policy_refusal(
+    unsupported: &[String],
+    primary: String,
+    no_hints: bool,
+) -> CliError {
+    chain_create_refusal_surface(
+        VerdictKind::Blocked,
+        None,
+        "DeadReckon did not start this chain because it uses policies the durable Job executor cannot preserve.",
+        "These are legacy conductor-only policies. Executable chains now use the same isolated, supervised Job lifecycle as other goals. DeadReckon refused before execution rather than silently changing the requested policy. Recreate the work as a supported durable plan or remove the listed options.",
+        [
+            ("unsupported".to_string(), unsupported.join(", ")),
+            ("job state".to_string(), "not created".to_string()),
+            (
+                "planner spend".to_string(),
+                "$0.00 when refused during plan preflight".to_string(),
+            ),
+        ],
+        primary,
+        no_hints,
+    )
 }
 
 fn validate_durable_chain_compatibility(
@@ -1054,63 +1185,23 @@ fn validate_durable_chain_compatibility(
     requested_base: Option<&str>,
     no_hints: bool,
 ) -> Result<()> {
-    let mut unsupported = Vec::new();
-    if chain.steps.len() > 6 {
-        unsupported.push(format!(
-            "{} steps (durable linear jobs currently support at most 6)",
-            chain.steps.len()
-        ));
-    }
-    if chain.branch_policy != BranchPolicy::Stack {
-        unsupported.push(format!(
-            "branch policy {}",
-            branch_policy_label(chain.branch_policy)
-        ));
-    }
-    if chain.apply_mode != ApplyMode::Auto {
-        unsupported.push(format!("apply mode {}", apply_mode_label(chain.apply_mode)));
-    }
-    if chain.apply_strategy != ApplyStrategy::Squash {
-        unsupported.push(format!(
-            "apply strategy {}",
-            apply_strategy_label(chain.apply_strategy)
-        ));
-    }
-    if !chain.apply_allowlist.is_empty() {
-        unsupported.push("apply allowlist".to_string());
-    }
-    if chain.on_fail != OnFail::Stop {
-        unsupported.push(format!("on-fail {}", on_fail_label(chain.on_fail)));
-    }
-    if chain.circuit_breaker_threshold != 2 {
-        unsupported.push(format!(
-            "circuit breaker threshold {}",
-            chain.circuit_breaker_threshold
-        ));
-    }
-    if chain.sandbox == "none" {
-        unsupported.push("sandbox none (durable trusted Jobs require isolation)".to_string());
-    }
-    if requested_base.is_some_and(|base| base != "HEAD") {
-        unsupported.push(format!("base {}", requested_base.unwrap_or("HEAD")));
-    }
+    let unsupported = unsupported_durable_chain_policy(
+        chain.steps.len(),
+        chain.branch_policy,
+        chain.apply_mode,
+        chain.apply_strategy,
+        &chain.apply_allowlist,
+        chain.on_fail,
+        chain.circuit_breaker_threshold,
+        &chain.sandbox,
+        requested_base,
+    );
     if unsupported.is_empty() {
         return Ok(());
     }
-    Err(chain_create_refusal_surface(
-        VerdictKind::Blocked,
-        None,
-        "DeadReckon did not start this chain because it uses legacy conductor-only policies.",
-        "New chain execution is a durable linear Job verified once at the end. DeadReckon refuses options it cannot preserve truthfully instead of silently changing their meaning. The recommended command selects the explicitly uncontained legacy conductor and cannot produce a trusted Job receipt.",
-        [
-            ("unsupported".to_string(), unsupported.join(", ")),
-            ("job state".to_string(), "not created".to_string()),
-            (
-                "compatibility receipt".to_string(),
-                "untrusted; no verified Job receipt".to_string(),
-            ),
-        ],
-        legacy_chain_start_command(chain, requested_base),
+    Err(durable_chain_policy_refusal(
+        &unsupported,
+        durable_chain_migration_command(chain),
         no_hints,
     ))
 }
@@ -1323,6 +1414,33 @@ async fn chain_run_command(
 ) -> Result<()> {
     let chain_id = resolve_chain_id(paths, chain_id, false)?;
     let chain = load_chain(paths, &chain_id)?;
+    if !commands::plan::internal_characterization_requested() {
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                "DeadReckon did not run this stored chain because legacy conductors are no longer a product execution route.",
+                "Stored Chain state remains inspectable, but executable work must be recreated as one durable Job so leasing, interruption recovery, bounded stops, semantic verification, and the final receipt share one source of truth.",
+                vec![
+                    (
+                        "requested action".to_string(),
+                        "chain run or resume".to_string(),
+                    ),
+                    ("legacy chain".to_string(), id),
+                    ("state mutation".to_string(), "none".to_string()),
+                ],
+                durable_chain_migration_command(&chain),
+                vec![format!(
+                    "deadreckon chain show {}",
+                    chain_prefix(&chain.chain_id)
+                )],
+            )
+            .render_plain(!completion_hints_enabled(false)),
+        });
+    }
     append_chain_event(
         paths,
         &chain.chain_id,
@@ -2425,7 +2543,7 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         ChainStatus::Failed => (
             VerdictKind::Failed,
             "The chain stopped before all required steps completed.",
-            "Failure inspection is the safest next command before resuming, skipping, or applying any step.",
+            "Failure inspection is the safest next command before recreating unfinished work as a durable Job.",
         ),
         ChainStatus::Paused => (
             VerdictKind::Paused,
@@ -2445,7 +2563,7 @@ fn chain_verdict_surface(paths: &DeadreckonPaths, chain: &Chain) -> VerdictSurfa
         ChainStatus::Pending => (
             VerdictKind::Preview,
             "The chain has been planned but has not started running.",
-            "Resume starts or continues the stored chain state.",
+            "Legacy Chain state is inspectable but no longer executable. Recreate this schedule as one durable Job.",
         ),
         ChainStatus::Undone => (
             VerdictKind::Noop,
@@ -2594,9 +2712,9 @@ fn chain_primary_action(chain: &Chain) -> String {
             "deadreckon chain hooks list".to_string()
         }
         ChainStatus::Paused if chain_paused_for_outside_allowlist(chain) => {
-            format!("deadreckon chain resume {id} --apply-mode preview")
+            format!("deadreckon chain show {id}")
         }
-        ChainStatus::Paused | ChainStatus::Pending => format!("deadreckon chain resume {id}"),
+        ChainStatus::Paused | ChainStatus::Pending => durable_chain_migration_command(chain),
         ChainStatus::Running => format!("deadreckon chain attach {id}"),
         ChainStatus::Completed | ChainStatus::Undone => format!("deadreckon chain show {id}"),
         ChainStatus::Killed => format!("deadreckon chain show {id} --why-failed"),
@@ -2640,34 +2758,32 @@ fn chain_paused_what(reason: Option<&str>) -> &'static str {
 
 fn chain_paused_why(reason: Option<&str>) -> &'static str {
     if reason.is_some_and(|reason| reason.starts_with("apply_refused_by_hook_on_promote")) {
-        "The hook policy blocked promotion, so inspecting configured chain hooks is the primary next command before resuming."
+        "The hook policy blocked promotion, so inspect the configured hooks and stored result before choosing a durable replacement."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_paused_by_hook_on_promote")) {
-        "The hook requested a resumable pause, so resuming the chain is the primary next command after the operator check."
+        "The historical conductor stopped at an operator pause. Inspect it, then recreate unfinished work as a durable Job."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_dirty_target")) {
-        "The source repo has local changes, so inspecting the dirty state is the primary next command before stashing, committing, or resuming."
+        "The source repo has local changes, so inspect the dirty state before preserving it or recreating unfinished work."
     } else if reason.is_some_and(|reason| reason.starts_with("apply_refused_outside_allowlist")) {
         "Previewing the diff is the primary next command before widening the allowlist or manually applying the step."
     } else {
-        "The chain still has resumable state, so resume is the primary next command."
+        "The Chain has unfinished legacy state. Recreate it as one durable Job rather than restarting the old conductor."
     }
 }
 
 fn chain_secondary_actions(chain: &Chain, primary: &str) -> Vec<String> {
     let id = chain_prefix(&chain.chain_id);
     let mut actions = Vec::new();
-    // Order is priority: the supporting list is capped, so whatever is listed
-    // last is what an operator loses. A paused chain's recovery actions outrank
-    // generic inspection.
     let mut candidates = Vec::new();
     if chain.status == ChainStatus::Paused {
-        candidates.push(format!("deadreckon chain resume {id} --apply-mode preview"));
         candidates.push(format!("deadreckon chain undo {id}"));
+    }
+    if matches!(chain.status, ChainStatus::Paused | ChainStatus::Pending) {
+        candidates.push(durable_chain_migration_command(chain));
     }
     candidates.extend([
         format!("deadreckon chain show {id}"),
         format!("deadreckon chain attach {id}"),
         format!("deadreckon chain show {id} --why-failed"),
-        format!("deadreckon chain resume {id}"),
     ]);
     for command in candidates {
         if command != primary && !actions.contains(&command) {
@@ -3378,9 +3494,9 @@ fn chain_extend_command_inner(
                 &chain,
                 VerdictKind::Preview,
                 "DeadReckon queued a new chain step.",
-                "The chain has stored work that has not run yet, so resume is the safest next command.",
+                "The Chain now has unfinished legacy state. Recreate the updated schedule as one durable Job.",
                 vec![("inserted step".to_string(), (insert + 1).to_string())],
-                format!("deadreckon chain resume {id}"),
+                durable_chain_migration_command(&chain),
                 vec![format!("deadreckon chain show {id}")],
             )
             .render_plain(!completion_hints_enabled(false))
@@ -3507,9 +3623,9 @@ fn chain_redo_command(
             &chain,
             VerdictKind::Preview,
             "DeadReckon reset a chain step for redo.",
-            "The selected step is pending again, so resume is the safest next command.",
+            "The selected step is pending in legacy state. Recreate the remaining schedule as one durable Job.",
             vec![("redo step".to_string(), (index + 1).to_string())],
-            format!("deadreckon chain resume {id}"),
+            durable_chain_migration_command(&chain),
             vec![format!("deadreckon chain show {id}")],
         )
         .render_plain(!completion_hints_enabled(false))
@@ -4497,19 +4613,31 @@ mod tests {
 
         assert!(rendered.contains("legacy conductor-only policies"));
         assert!(rendered.contains("apply mode manual"));
-        for preserved in [
+        for refused in [
+            "branch policy base",
+            "apply mode manual",
+            "apply strategy cherry-pick",
+            "apply allowlist",
+            "on-fail continue",
+            "circuit breaker threshold 4",
+            "base release/base",
+        ] {
+            assert!(rendered.contains(refused), "missing {refused}: {rendered}");
+        }
+        assert!(rendered.contains("Recommended\ndeadreckon chain --yes"));
+        for legacy_option in [
             "--sandbox none",
-            "--branch-policy \"base\"",
-            "--apply-mode \"manual\"",
-            "--apply-strategy \"cherry-pick\"",
-            "--apply-allowlist \"src/**\"",
-            "--on-fail \"continue\"",
-            "--circuit-breaker-threshold 4",
-            "--base \"release/base\"",
+            "--branch-policy",
+            "--apply-mode",
+            "--apply-strategy",
+            "--apply-allowlist",
+            "--on-fail",
+            "--circuit-breaker-threshold",
+            "--base",
         ] {
             assert!(
-                rendered.contains(preserved),
-                "missing {preserved}: {rendered}"
+                !rendered.contains(legacy_option),
+                "migration loops through unsupported option {legacy_option}: {rendered}"
             );
         }
     }
@@ -4566,7 +4694,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_chain_run_records_untrusted_legacy_selection_before_child_work() {
+    async fn persisted_chain_run_refuses_before_recording_legacy_selection_or_child_work() {
         let temp = tempfile::tempdir().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path());
         let mut chain = sample_chain(&["first", "second"]);
@@ -4588,13 +4716,15 @@ mod tests {
             },
         )
         .await
-        .expect_err("fixture cwd is deliberately not a git repository");
+        .expect_err("product execution must refuse the legacy conductor");
         let rendered = error.to_string();
 
-        assert!(rendered.contains("rev-parse"), "{rendered}");
-        let events = fs::read_to_string(paths.chain_events(&chain.chain_id)).expect("events");
-        assert!(events.contains("legacy_execution_selected"), "{events}");
-        assert!(events.contains("\"trusted_job\":false"), "{events}");
+        assert!(
+            rendered.contains("legacy conductors are no longer a product execution route"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("state mutation: none"), "{rendered}");
+        assert!(!paths.chain_events(&chain.chain_id).exists());
         assert!(!paths.jobs_dir().exists());
         assert!(
             !paths

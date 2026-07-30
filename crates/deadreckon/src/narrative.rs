@@ -3493,6 +3493,25 @@ fn plan_event_summary_for_narrative(event: &PlanEventKind) -> String {
         PlanEventKind::TaskFailed {
             task_id, reason, ..
         } => format!("{task_id} failed: {reason}"),
+        PlanEventKind::TaskBudgetExhausted {
+            task_id,
+            dimension,
+            reason,
+            ..
+        } => {
+            let dimension = match dimension {
+                deadreckon_core::plan::BudgetDimension::Spend => "spend",
+                deadreckon_core::plan::BudgetDimension::Wall => "wall time",
+            };
+            format!("{task_id} {dimension} budget exhausted: {reason}")
+        }
+        PlanEventKind::RootBudgetExhausted { dimension, reason } => {
+            let dimension = match dimension {
+                deadreckon_core::plan::BudgetDimension::Spend => "spend",
+                deadreckon_core::plan::BudgetDimension::Wall => "wall time",
+            };
+            format!("root planner {dimension} budget exhausted: {reason}")
+        }
         PlanEventKind::TaskRetrying {
             task_id,
             attempt,

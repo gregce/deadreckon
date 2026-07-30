@@ -279,7 +279,6 @@ Chain subcommands:
   deadreckon chain status latest
   deadreckon chain show latest --why-failed
   deadreckon chain pause latest --reason \"waiting on review\"
-  deadreckon chain resume latest
   deadreckon chain kill latest
   deadreckon chain undo latest --step 2
   deadreckon chain extend latest \"new step goal\"

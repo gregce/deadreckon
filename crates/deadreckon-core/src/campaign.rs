@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{DeadreckonError, Result};
-use crate::plan::{PlanProviders, validate_task_count};
+use crate::plan::{PlanProviders, RootPlannerAccounting, validate_task_count};
 use crate::tamper::AcceptanceTamperVerdict;
 
 /// The hard cap on orchestration nesting. A campaign sits at depth 0; the
@@ -169,6 +169,11 @@ pub struct Campaign {
     pub tree_budget_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_wall_seconds: Option<f64>,
+    /// Crash-safe copy of root-planner usage. Campaign events remain the rich
+    /// reporting ledger, but recovery can rebuild a missing event from this
+    /// immutable creation fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_planner_accounting: Option<RootPlannerAccounting>,
     pub status: CampaignStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_run_id: Option<String>,
@@ -201,6 +206,7 @@ impl Campaign {
             sub_goals,
             tree_budget_usd,
             tree_wall_seconds,
+            root_planner_accounting: None,
             status: CampaignStatus::Pending,
             merged_run_id: None,
             created_at: Utc::now(),
@@ -295,6 +301,7 @@ pub const ENV_ROOT: &str = "DEADRECKON_CAMPAIGN_ROOT";
 pub const ENV_ANCESTOR_TASK_KEYS: &str = "DEADRECKON_CAMPAIGN_ANCESTOR_TASK_KEYS";
 pub const ENV_ANCESTOR_SCOPES: &str = "DEADRECKON_CAMPAIGN_ANCESTOR_SCOPES";
 pub const ENV_SUB_RESULT: &str = "DEADRECKON_CAMPAIGN_SUB_RESULT";
+pub const ENV_SUB_PLAN_ID: &str = "DEADRECKON_CAMPAIGN_SUB_PLAN_ID";
 
 const SUB_RESULT_FILE: &str = "sub-result.json";
 

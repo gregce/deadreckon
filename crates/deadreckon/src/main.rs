@@ -172,6 +172,8 @@ enum CliError {
     #[error("TOML encode error: {0}")]
     TomlSer(#[from] toml::ser::Error),
     #[error("{message}")]
+    RetryableInterruption { message: String },
+    #[error("{message}")]
     Exit {
         code: i32,
         message: String,
@@ -194,7 +196,8 @@ impl CliError {
             | Self::Io(_)
             | Self::Json(_)
             | Self::TomlDe(_)
-            | Self::TomlSer(_) => 1,
+            | Self::TomlSer(_)
+            | Self::RetryableInterruption { .. } => 1,
         }
     }
 }
@@ -248,6 +251,10 @@ fn error_hint(err: &CliError) -> String {
         ),
         CliError::Io(_) => "check that the referenced path exists and is writable".to_string(),
         CliError::Json(_) => "inspect the referenced JSON file for invalid syntax".to_string(),
+        CliError::RetryableInterruption { .. } => {
+            "deadreckon status latest; the durable Job will retry within its approved policy"
+                .to_string()
+        }
         // Errors that already carry a specific `try:` line (user_error packs
         // one into the message) must not get the generic doctor hint stacked
         // on top — it reads as a second, usually wrong, recommendation.
@@ -613,6 +620,7 @@ async fn main_inner() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    commands::graph_job::authorize_delegated_invocation_if_present()?;
     let Some(command) = cli.command else {
         return smart_bare_invocation().await;
     };
@@ -9189,6 +9197,10 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
             return Ok(());
         }
         commands::reference::ResolvedRef::Plan(plan) => {
+            if let Some(owner) = commands::graph_job::resolve_plan_owner(&paths, &plan)? {
+                let view = deadreckon_core::JobView::load(&paths, owner.job.job_id.as_ref())?;
+                return commands::job::cancel_job(&paths, &view, force);
+            }
             return kill_plan_command(&paths, &plan.plan_id, force);
         }
         commands::reference::ResolvedRef::Chain(chain) => {
@@ -9493,12 +9505,7 @@ async fn resume_command(
 
 async fn trusted_supervisor_resume_command(job_id: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    if std::env::var(commands::run::TRUSTED_SUPERVISOR_JOB_ID_ENV).as_deref() != Ok(job_id.as_str())
-    {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "job resume may only be launched by the durable supervisor".to_string(),
-        )));
-    }
+    let _authority = commands::supervisor::require_guarded_driver_launch(&paths, &job_id)?;
     let job = deadreckon_core::load_job(&paths, &job_id)?;
     if job.job_id.as_ref() != job_id || job.shape != deadreckon_protocol::JobShape::Single {
         return Err(CliError::Core(DeadreckonError::InvalidInput(

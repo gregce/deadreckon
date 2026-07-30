@@ -227,6 +227,18 @@ pub fn append_fenced_job_event(
             ),
         ));
     }
+    let history = read_job_history(&paths.job_events(event.job_id.as_ref()))?;
+    let projection = reduce_job_history(&event.job_id, &history)?;
+    if projection.is_terminal() {
+        return Ok(projection);
+    }
+    if projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested) {
+        let cancellation_stop = event.kind == JobEventKind::AttemptStopped
+            && event.detail.get("stop_reason").and_then(Value::as_str) == Some("cancel_requested");
+        if event.kind != JobEventKind::Cancelled && !cancellation_stop {
+            return Ok(projection);
+        }
+    }
     append_job_event_locked(paths, event)
 }
 

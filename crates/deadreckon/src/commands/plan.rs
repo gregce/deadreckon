@@ -171,8 +171,35 @@ pub(crate) async fn create_orchestration_plan(
         env!("CARGO_PKG_VERSION"),
     )
     .map_err(CliError::Core)?;
+    let reserved_campaign_plan_id = std::env::var(deadreckon_core::campaign::ENV_SUB_PLAN_ID)
+        .ok()
+        .filter(|plan_id| !plan_id.trim().is_empty());
     if let Some(job_id) = commands::graph_job::current_parent_job_id() {
-        plan.plan_id = job_id.to_string();
+        plan.owner_job_id = Some(job_id.to_string());
+        if commands::graph_job::current_driver_owns_root_artifact() {
+            if reserved_campaign_plan_id.is_some() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "a root Job driver cannot accept a Campaign child Plan identity".to_string(),
+                )));
+            }
+            plan.plan_id = job_id.to_string();
+        }
+    }
+    if let Some(reserved_plan_id) = reserved_campaign_plan_id {
+        if std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_none()
+            || uuid::Uuid::parse_str(&reserved_plan_id).is_err()
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "Campaign child Plan identity is malformed or missing its result scope".to_string(),
+            )));
+        }
+        let reserved_path = paths.plan_json(&reserved_plan_id);
+        if reserved_path.exists() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "reserved Campaign child Plan {reserved_plan_id} already exists"
+            ))));
+        }
+        plan.plan_id = reserved_plan_id;
     }
     plan.parent_cwd = Some(plan_cwd);
     // Per-node apply serializes execution and lands work incrementally, so a
@@ -184,6 +211,9 @@ pub(crate) async fn create_orchestration_plan(
     }
     plan.acceptance_path = acceptance_source.as_ref().map(|source| source.path.clone());
     plan.capability_preview = infer_capability_preview(&plan.root_goal);
+    let root_planner_accounting =
+        commands::graph_job::root_planner_accounting(planner_accounting.as_ref());
+    plan.root_planner_accounting = Some(root_planner_accounting.clone());
     // A node that is a project in its own right gets its own plan, linked by
     // id. This is campaign's nesting without campaign's separate id space,
     // sub-result sidecar, or lineage env vars — and unlike campaign, each
@@ -195,10 +225,17 @@ pub(crate) async fn create_orchestration_plan(
         write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
     }
     save_plan(&paths, &plan)?;
-    commands::graph_job::record_plan_planner_accounting(
+    if commands::graph_job::current_driver_owns_root_artifact() {
+        plan_test_failpoint("after_root_plan_saved_before_driver_state");
+    }
+    if std::env::var_os(deadreckon_core::campaign::ENV_SUB_PLAN_ID).is_some() {
+        commands::campaign::campaign_test_failpoint("after_sub_plan_saved_before_ownership_freeze");
+    }
+    commands::graph_job::record_owned_plan_tree(&paths, &plan)?;
+    commands::graph_job::record_plan_planner_accounting_snapshot(
         &paths,
         &plan.plan_id,
-        planner_accounting.as_ref(),
+        &root_planner_accounting,
     )?;
     let driver_kind = match plan_mode {
         PlanMode::Review => commands::graph_job::DriverKind::Review,
@@ -444,9 +481,12 @@ fn attach_subplans(
             continue;
         };
         child.parent_plan_id = Some(plan.plan_id.clone());
+        child.owner_job_id = plan.owner_job_id.clone();
         child.parent_cwd = plan.parent_cwd.clone();
         child.acceptance_path = plan.acceptance_path.clone();
         child.capability_preview = plan.capability_preview.clone();
+        let root_planner_accounting = commands::graph_job::root_planner_accounting(None);
+        child.root_planner_accounting = Some(root_planner_accounting.clone());
         child.apply = subplan.apply;
         if child.apply == deadreckon_core::plan::ApplyWhen::PerNode {
             child.on_fail = OnFail::Stop;
@@ -456,7 +496,11 @@ fn attach_subplans(
             write_worker_spec(paths, &child.plan_id, &task.task_id, &spec)?;
         }
         save_plan(paths, &child)?;
-        commands::graph_job::record_plan_planner_accounting(paths, &child.plan_id, None)?;
+        commands::graph_job::record_plan_planner_accounting_snapshot(
+            paths,
+            &child.plan_id,
+            &root_planner_accounting,
+        )?;
         append_plan_event(
             paths,
             &child.plan_id,
@@ -1860,12 +1904,9 @@ fn refresh_parent_aggregate(
 }
 
 pub(crate) async fn fork_command_from_cli(args: ForkCommandArgs) -> Result<()> {
-    let internal_sub_orchestration =
-        std::env::var_os(deadreckon_core::campaign::ENV_SUB_RESULT).is_some();
     if fork_execution_route(
         commands::graph_job::current_parent_job_id(),
-        internal_sub_orchestration,
-        test_foreground_advanced_requested(),
+        internal_characterization_requested(),
     ) == ForkExecutionRoute::DurableJob
     {
         return schedule_pending_plan_job(args).await;
@@ -1873,17 +1914,9 @@ pub(crate) async fn fork_command_from_cli(args: ForkCommandArgs) -> Result<()> {
     fork_command(args).await
 }
 
-#[cfg(debug_assertions)]
-const TEST_FOREGROUND_ADVANCED_ENV: &str = "DEADRECKON_TEST_FOREGROUND_ADVANCED";
-
-#[cfg(debug_assertions)]
-pub(crate) fn test_foreground_advanced_requested() -> bool {
-    std::env::var(TEST_FOREGROUND_ADVANCED_ENV).as_deref() == Ok("1")
-}
-
-#[cfg(not(debug_assertions))]
-pub(crate) const fn test_foreground_advanced_requested() -> bool {
-    false
+pub(crate) fn internal_characterization_requested() -> bool {
+    cfg!(feature = "internal-characterization")
+        && option_env!("CARGO_BIN_NAME") == Some("deadreckon-characterization")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1892,12 +1925,94 @@ enum ForkExecutionRoute {
     TrustedDriver,
 }
 
+struct PlanTaskBudgetShares {
+    spend: Vec<Option<f64>>,
+    wall: Vec<Option<f64>>,
+}
+
+enum PlanTaskBudgetDecision {
+    Shares(PlanTaskBudgetShares),
+    Exhausted(commands::graph_job::RootPlannerBudgetExhaustion),
+}
+
+fn plan_task_budget_shares(
+    plan: &Plan,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    aggregate_job_budget: bool,
+) -> Result<PlanTaskBudgetDecision> {
+    if !aggregate_job_budget {
+        return Ok(PlanTaskBudgetDecision::Shares(PlanTaskBudgetShares {
+            spend: vec![max_spend; plan.tasks.len()],
+            wall: vec![max_wall_seconds; plan.tasks.len()],
+        }));
+    }
+    let accounting = plan.root_planner_accounting.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Job-owned Plan {} has no root planner accounting",
+            plan.plan_id
+        )))
+    })?;
+    if let Some(exhaustion) = commands::graph_job::root_planner_budget_exhaustion(
+        accounting,
+        max_spend.unwrap_or(f64::INFINITY),
+        max_wall_seconds.unwrap_or(f64::INFINITY),
+    )? {
+        return Ok(PlanTaskBudgetDecision::Exhausted(exhaustion));
+    }
+    let spend = max_spend.map(|cap| {
+        deadreckon_core::campaign::allocate_budget(
+            (cap - accounting.cost_usd).max(0.0),
+            plan.tasks.len(),
+        )
+        .into_iter()
+        .map(Some)
+        .collect()
+    });
+    let wall = max_wall_seconds.map(|cap| {
+        deadreckon_core::campaign::allocate_budget(
+            (cap - accounting.wall_seconds).max(0.0),
+            plan.tasks.len(),
+        )
+        .into_iter()
+        .map(Some)
+        .collect()
+    });
+    Ok(PlanTaskBudgetDecision::Shares(PlanTaskBudgetShares {
+        spend: spend.unwrap_or_else(|| vec![None; plan.tasks.len()]),
+        wall: wall.unwrap_or_else(|| vec![None; plan.tasks.len()]),
+    }))
+}
+
+fn persist_root_plan_budget_exhaustion(
+    paths: &DeadreckonPaths,
+    plan: &mut Plan,
+    exhaustion: &commands::graph_job::RootPlannerBudgetExhaustion,
+) -> Result<()> {
+    if !deadreckon_core::read_plan_events(paths, &plan.plan_id)?
+        .iter()
+        .any(|event| matches!(event.event, PlanEventKind::RootBudgetExhausted { .. }))
+    {
+        append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::RootBudgetExhausted {
+                dimension: exhaustion.dimension,
+                reason: exhaustion.reason.clone(),
+            },
+        )?;
+    }
+    plan.status = PlanStatus::Failed;
+    plan.conductor_pid = None;
+    save_plan(paths, plan)?;
+    Ok(())
+}
+
 fn fork_execution_route(
     parent_job_id: Option<&str>,
-    internal_sub_orchestration: bool,
     test_foreground_advanced: bool,
 ) -> ForkExecutionRoute {
-    if parent_job_id.is_none() && !internal_sub_orchestration && !test_foreground_advanced {
+    if parent_job_id.is_none() && !test_foreground_advanced {
         ForkExecutionRoute::DurableJob
     } else {
         ForkExecutionRoute::TrustedDriver
@@ -1927,6 +2042,12 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
     let mut plan = load_plan(&paths, &resolved_id)?;
+    commands::graph_job::require_current_driver_for_job_artifact(
+        &paths,
+        &plan.plan_id,
+        deadreckon_protocol::JobShape::Graph,
+        "fork",
+    )?;
     // A Forked plan with unfinished work and a dead conductor is a crashed
     // fork, and the only recovery used to be none: fork refused re-entry
     // forever. The durable state (task statuses, attempts) is enough to pick
@@ -1961,6 +2082,21 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                 surface: fork_refusal_surface(&paths, &plan)
                     .render_plain(!completion_hints_enabled(no_hints)),
             });
+        }
+    };
+    let task_budgets = match plan_task_budget_shares(
+        &plan,
+        max_spend,
+        max_wall_seconds,
+        commands::graph_job::current_parent_job_id().is_some(),
+    )? {
+        PlanTaskBudgetDecision::Shares(shares) => shares,
+        PlanTaskBudgetDecision::Exhausted(exhaustion) => {
+            persist_root_plan_budget_exhaustion(&paths, &mut plan, &exhaustion)?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &exhaustion.reason,
+                "raise the approved Job budget or use a deterministic pre-approved decomposition",
+            )));
         }
     };
     apply_fork_provider_overrides(
@@ -2002,8 +2138,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         adopt_orphaned_children(AdoptOrphans {
             paths: &paths,
             plan: &mut plan,
-            max_spend,
-            max_wall_seconds,
+            task_spend_caps: &task_budgets.spend,
+            task_wall_caps: &task_budgets.wall,
             consecutive_failures: &mut consecutive_failures,
             halt: &mut halt,
             quiet,
@@ -2134,6 +2270,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             let sandbox_for_child = sandbox.clone();
             let signal_tx_for_child = signal_tx.clone();
             let narrator_model_for_child = narrator_model.clone();
+            let task_max_spend = task_budgets.spend[task_index];
+            let task_max_wall_seconds = task_budgets.wall[task_index];
             handles.push((
                 task_index,
                 tokio::task::spawn_blocking(move || {
@@ -2144,8 +2282,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         source_dir: &source_dir,
                         per_node_base,
                         sandbox: &sandbox_for_child,
-                        max_spend,
-                        max_wall_seconds,
+                        max_spend: task_max_spend,
+                        max_wall_seconds: task_max_wall_seconds,
                         quiet,
                         plain,
                         forward_output: false,
@@ -2274,8 +2412,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                                 failure_reason: structured_gate_reason(&state.run_root, state.turn)
                                     .or_else(|| first_line_reason(state.failure_reason.as_deref())),
                                 spend_usd: state.total_spend_usd,
-                                max_spend,
-                                max_wall_seconds,
+                                max_spend: task_budgets.spend[task_index],
+                                max_wall_seconds: task_budgets.wall[task_index],
                                 run_started_at: Some(state.started_at),
                                 run_finished_at: Some(state.updated_at),
                                 consecutive_failures: &mut consecutive_failures,
@@ -2419,8 +2557,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                         run_id: None,
                         failure_reason: Some(error.to_string()),
                         spend_usd: 0.0,
-                        max_spend,
-                        max_wall_seconds,
+                        max_spend: task_budgets.spend[task_index],
+                        max_wall_seconds: task_budgets.wall[task_index],
                         run_started_at: None,
                         run_finished_at: None,
                         consecutive_failures: &mut consecutive_failures,
@@ -2516,6 +2654,12 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let resolved_id = resolve_plan_id(&paths, &plan_id)?;
     let mut plan = load_plan(&paths, &resolved_id)?;
+    commands::graph_job::require_current_driver_for_job_artifact(
+        &paths,
+        &plan.plan_id,
+        deadreckon_protocol::JobShape::Graph,
+        "fork",
+    )?;
     if plan.status != PlanStatus::Pending {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!(
@@ -2755,8 +2899,8 @@ fn replay_consecutive_failures(events: &[deadreckon_core::PlanEvent]) -> u32 {
 struct AdoptOrphans<'a> {
     paths: &'a DeadreckonPaths,
     plan: &'a mut Plan,
-    max_spend: Option<f64>,
-    max_wall_seconds: Option<f64>,
+    task_spend_caps: &'a [Option<f64>],
+    task_wall_caps: &'a [Option<f64>],
     consecutive_failures: &'a mut u32,
     halt: &'a mut Option<String>,
     quiet: bool,
@@ -2774,8 +2918,8 @@ fn adopt_orphaned_children(context: AdoptOrphans<'_>) -> Result<()> {
     let AdoptOrphans {
         paths,
         plan,
-        max_spend,
-        max_wall_seconds,
+        task_spend_caps,
+        task_wall_caps,
         consecutive_failures,
         halt,
         quiet,
@@ -2806,8 +2950,8 @@ fn adopt_orphaned_children(context: AdoptOrphans<'_>) -> Result<()> {
                     "run state unreadable after the conductor was lost".to_string(),
                 ),
                 spend_usd: 0.0,
-                max_spend,
-                max_wall_seconds,
+                max_spend: task_spend_caps[task_index],
+                max_wall_seconds: task_wall_caps[task_index],
                 run_started_at: None,
                 run_finished_at: None,
                 consecutive_failures,
@@ -2880,8 +3024,8 @@ fn adopt_orphaned_children(context: AdoptOrphans<'_>) -> Result<()> {
                     failure_reason: structured_gate_reason(&state.run_root, state.turn)
                         .or_else(|| first_line_reason(state.failure_reason.as_deref())),
                     spend_usd: state.total_spend_usd,
-                    max_spend,
-                    max_wall_seconds,
+                    max_spend: task_spend_caps[task_index],
+                    max_wall_seconds: task_wall_caps[task_index],
                     run_started_at: Some(state.started_at),
                     run_finished_at: Some(state.updated_at),
                     consecutive_failures,
@@ -2940,8 +3084,8 @@ fn adopt_orphaned_children(context: AdoptOrphans<'_>) -> Result<()> {
                         run_prefix(&run_id)
                     )),
                     spend_usd: state.total_spend_usd,
-                    max_spend,
-                    max_wall_seconds,
+                    max_spend: task_spend_caps[task_index],
+                    max_wall_seconds: task_wall_caps[task_index],
                     run_started_at: Some(state.started_at),
                     run_finished_at: Some(state.updated_at),
                     consecutive_failures,
@@ -3129,18 +3273,28 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
     // retries, and re-running `fork` on a child plan that is now Forked or
     // Failed is refused on arrival — the retry would burn an attempt on a
     // guaranteed error.
-    let retry_refusal: Option<String> = if plan.tasks[task_index].subplan.is_some() {
-        Some("subplan nodes do not retry; their inner nodes already did".to_string())
+    let retry_refusal: Option<(String, Option<deadreckon_core::plan::BudgetDimension>)> = if plan
+        .tasks[task_index]
+        .subplan
+        .is_some()
+    {
+        Some((
+            "subplan nodes do not retry; their inner nodes already did".to_string(),
+            None,
+        ))
     } else if remaining_retry_budget(
         max_spend,
         plan.tasks[task_index].attempts_spend_usd(),
         MIN_RETRY_SPEND_USD,
     ) == RetryBudget::Exhausted
     {
-        Some(format!(
-            "spend cap exhausted: ${spent:.2} of ${cap:.2} used across {attempt_number} attempt(s)",
-            spent = plan.tasks[task_index].attempts_spend_usd(),
-            cap = max_spend.unwrap_or_default(),
+        Some((
+            format!(
+                "spend cap exhausted: ${spent:.2} of ${cap:.2} used across {attempt_number} attempt(s)",
+                spent = plan.tasks[task_index].attempts_spend_usd(),
+                cap = max_spend.unwrap_or_default(),
+            ),
+            Some(deadreckon_core::plan::BudgetDimension::Spend),
         ))
     } else if remaining_retry_budget(
         max_wall_seconds,
@@ -3148,15 +3302,30 @@ fn record_node_failure(context: RecordNodeFailure<'_>) -> Result<NodeFailureOutc
         MIN_RETRY_WALL_SECONDS,
     ) == RetryBudget::Exhausted
     {
-        Some(format!(
-            "wall cap exhausted: {spent:.0}s of {cap:.0}s used across {attempt_number} attempt(s)",
-            spent = plan.tasks[task_index].attempts_wall_seconds(),
-            cap = max_wall_seconds.unwrap_or_default(),
+        Some((
+            format!(
+                "wall cap exhausted: {spent:.0}s of {cap:.0}s used across {attempt_number} attempt(s)",
+                spent = plan.tasks[task_index].attempts_wall_seconds(),
+                cap = max_wall_seconds.unwrap_or_default(),
+            ),
+            Some(deadreckon_core::plan::BudgetDimension::Wall),
         ))
     } else {
         None
     };
-    if let Some(refusal) = retry_refusal {
+    if let Some((refusal, budget_dimension)) = retry_refusal {
+        if let Some(dimension) = budget_dimension {
+            append_plan_event(
+                paths,
+                &plan_id,
+                PlanEventKind::TaskBudgetExhausted {
+                    task_id: task_id.clone(),
+                    task_index,
+                    dimension,
+                    reason: refusal.clone(),
+                },
+            )?;
+        }
         append_plan_message(
             paths,
             &plan_id,
@@ -4142,21 +4311,62 @@ fn run_subplan_child(
     quiet: bool,
 ) -> Result<String> {
     let task_id = plan.tasks[task_index].task_id.clone();
+    match load_plan(paths, subplan_id)?.status {
+        PlanStatus::Merged => {
+            return merged_subplan_result(paths, subplan_id, &task_id, quiet);
+        }
+        PlanStatus::Failed => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "{task_id} subplan {} retained a failed result",
+                    run_prefix(subplan_id)
+                ),
+                &format!("deadreckon show {}", run_prefix(subplan_id)),
+            )));
+        }
+        PlanStatus::Pending | PlanStatus::Forked => {}
+    }
     for (verb, extra) in [
         ("fork", vec!["--sandbox", sandbox]),
         ("merge", vec!["--yes"]),
     ] {
+        let mut argv = vec![
+            verb.to_string(),
+            subplan_id.to_string(),
+            "--quiet".to_string(),
+            "--no-hints".to_string(),
+        ];
+        argv.extend(extra.into_iter().map(ToString::to_string));
         let mut command = std::process::Command::new(std::env::current_exe()?);
         command
             .current_dir(source_dir)
             .env("DEADRECKON_HOME", paths.home())
             .env("DEADRECKON_HINTS", "0")
-            .arg(verb)
-            .arg(subplan_id)
-            .arg("--quiet")
-            .arg("--no-hints")
-            .args(extra);
-        let status = command.status()?;
+            .env("DEADRECKON_SCOPE_ROOT", source_dir)
+            .args(&argv);
+        let subplan = load_plan(paths, subplan_id)?;
+        let action = if verb == "fork" {
+            commands::graph_job::DelegatedAction::PlanFork {
+                plan_id: subplan_id.to_string(),
+            }
+        } else {
+            commands::graph_job::DelegatedAction::PlanMerge {
+                plan_id: subplan_id.to_string(),
+            }
+        };
+        let delegation = commands::graph_job::prepare_delegated_invocation(
+            paths,
+            action,
+            &argv,
+            source_dir,
+            source_dir,
+            Some(&subplan),
+        )?;
+        let mut child = commands::graph_job::spawn_delegated(paths, &mut command, &delegation)?;
+        let status_result = child.wait();
+        let revoke_result = commands::graph_job::revoke_pending_delegation(paths, &delegation);
+        let status = status_result?;
+        revoke_result?;
         if !status.success() {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!(
@@ -4166,8 +4376,30 @@ fn run_subplan_child(
                 &format!("deadreckon show {}", run_prefix(subplan_id)),
             )));
         }
+        if verb == "merge" {
+            plan_test_failpoint("after_subplan_merge_before_parent_result");
+        }
     }
+    merged_subplan_result(paths, subplan_id, &task_id, quiet)
+}
+
+fn merged_subplan_result(
+    paths: &DeadreckonPaths,
+    subplan_id: &str,
+    task_id: &str,
+    quiet: bool,
+) -> Result<String> {
     let child = load_plan(paths, subplan_id)?;
+    if child.status != PlanStatus::Merged {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "{task_id} subplan {} stopped in {:?} instead of merging",
+                run_prefix(subplan_id),
+                child.status
+            ),
+            &format!("deadreckon show {}", run_prefix(subplan_id)),
+        )));
+    }
     let merged_run_id = child.merged_run_id.ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             &format!(
@@ -4189,6 +4421,16 @@ fn run_subplan_child(
     }
     Ok(merged_run_id)
 }
+
+#[cfg(debug_assertions)]
+fn plan_test_failpoint(name: &str) {
+    if std::env::var("DEADRECKON_TEST_PLAN_FAILPOINT").as_deref() == Ok(name) {
+        panic!("deadreckon plan test failpoint: {name}");
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn plan_test_failpoint(_name: &str) {}
 
 fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     let PlanChildLaunch {
@@ -4279,7 +4521,7 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
             .env(crate::narrator::NARRATE_CHILD_ENV, "1")
             .env("DEADRECKON_AUTH_PROBE", "0");
     }
-    command.args(child_argv(
+    let argv = child_argv(
         plan,
         task,
         &prompt,
@@ -4292,11 +4534,34 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         narrator_model.as_deref(),
         per_node_base.as_deref(),
         tamper_baseline.as_deref(),
-    ));
+    );
+    command.args(&argv);
+    let delegation = if commands::graph_job::current_parent_job_id().is_some() {
+        let prepared = commands::graph_job::prepare_delegated_invocation(
+            paths,
+            commands::graph_job::DelegatedAction::PlanChild {
+                plan_id: plan.plan_id.clone(),
+                task_id: task.task_id.clone(),
+                task_index: task.index,
+                task_attempt: task.attempts.len() as u32 + 1,
+            },
+            &argv,
+            source_dir,
+            &launch_dir,
+            Some(plan),
+        )?;
+        Some(prepared)
+    } else {
+        None
+    };
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn()?;
+    let mut child = if let Some(prepared) = delegation.as_ref() {
+        commands::graph_job::spawn_delegated(paths, &mut command, prepared)?
+    } else {
+        command.spawn()?
+    };
     if let Some(sender) = signal_sender.as_ref() {
         let _ = sender.send(PlanChildSignal::Pid {
             task_index,
@@ -4345,6 +4610,9 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    if let Some(prepared) = delegation.as_ref() {
+        commands::graph_job::revoke_pending_delegation(paths, prepared)?;
+    }
     let _ = stdout_thread.join();
     let _ = stderr_thread.join();
     while let Ok((is_stdout, line)) = rx.try_recv() {
@@ -4656,21 +4924,89 @@ mod tests {
     #[test]
     fn cli_fork_queues_a_job_while_trusted_drivers_use_the_inner_executor() {
         assert_eq!(
-            fork_execution_route(None, false, false),
+            fork_execution_route(None, false),
             ForkExecutionRoute::DurableJob
         );
         assert_eq!(
-            fork_execution_route(Some("job-123"), false, false),
+            fork_execution_route(Some("job-123"), false),
             ForkExecutionRoute::TrustedDriver
         );
         assert_eq!(
-            fork_execution_route(None, true, false),
+            fork_execution_route(None, true),
             ForkExecutionRoute::TrustedDriver
         );
+    }
+
+    fn budget_plan() -> Plan {
+        let mut plan = Plan::new(
+            "bounded graph",
+            PlanMode::FullPlan,
+            (0..3)
+                .map(|index| {
+                    PlanTask::new(
+                        index,
+                        format!("task {index}"),
+                        format!("do task {index}"),
+                        PlanRole::Child,
+                        None,
+                    )
+                })
+                .collect(),
+            PlanProviders::default(),
+            Some("scope".to_string()),
+            "test",
+        )
+        .expect("plan");
+        plan.root_planner_accounting = Some(deadreckon_core::plan::RootPlannerAccounting {
+            schema_version: 1,
+            planner_invoked: true,
+            provider: Some("planner".to_string()),
+            model: Some("planner-model".to_string()),
+            input_tokens: 10,
+            output_tokens: 5,
+            cost_usd: 2.0,
+            subscription: false,
+            wall_seconds: 10.0,
+            recorded_at: Utc::now(),
+        });
+        plan
+    }
+
+    #[test]
+    fn job_owned_plan_subtracts_root_planning_and_splits_the_remaining_tree_budget() {
+        let decision = plan_task_budget_shares(&budget_plan(), Some(5.0), Some(40.0), true)
+            .expect("budget shares");
+        let PlanTaskBudgetDecision::Shares(shares) = decision else {
+            panic!("planner should leave child budget");
+        };
+        let spend = shares.spend.into_iter().flatten().collect::<Vec<_>>();
+        let wall = shares.wall.into_iter().flatten().collect::<Vec<_>>();
+        assert!((spend.iter().sum::<f64>() - 3.0).abs() < 0.000_001);
+        assert!((wall.iter().sum::<f64>() - 30.0).abs() < 0.000_001);
+        assert!(spend.iter().all(|share| *share <= 1.0));
+        assert!(wall.iter().all(|share| *share <= 10.0));
+    }
+
+    #[test]
+    fn root_planner_exhaustion_uses_spend_precedence_and_legacy_caps_stay_per_child() {
+        let plan = budget_plan();
+        let PlanTaskBudgetDecision::Exhausted(exhaustion) =
+            plan_task_budget_shares(&plan, Some(2.0), Some(10.0), true).expect("budget decision")
+        else {
+            panic!("both approved dimensions are exhausted");
+        };
         assert_eq!(
-            fork_execution_route(None, false, true),
-            ForkExecutionRoute::TrustedDriver
+            exhaustion.stop_reason,
+            deadreckon_protocol::StopReason::SpendCap
         );
+
+        let PlanTaskBudgetDecision::Shares(legacy) =
+            plan_task_budget_shares(&plan, Some(5.0), Some(40.0), false).expect("legacy budget")
+        else {
+            panic!("legacy per-child caps do not subtract root planning");
+        };
+        assert_eq!(legacy.spend, vec![Some(5.0); 3]);
+        assert_eq!(legacy.wall, vec![Some(40.0); 3]);
     }
 
     const PLAN_JSON: &str = r#"{"tasks":[{"subject":"scaffold","goal":"g0","active_form":"scaffolding","depends_on":[]},{"subject":"sync","goal":"g1","active_form":"syncing","depends_on":["task-0"]}]}"#;
@@ -4806,6 +5142,13 @@ mod retry_gate_tests {
             })
             .count();
         assert_eq!(retries, 1, "only the affordable retry was offered");
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            deadreckon_core::PlanEventKind::TaskBudgetExhausted {
+                dimension: deadreckon_core::plan::BudgetDimension::Spend,
+                ..
+            }
+        )));
         let messages = read_plan_messages(&paths, &plan.plan_id).expect("messages");
         assert!(
             messages
@@ -4814,6 +5157,44 @@ mod retry_gate_tests {
                     && message.summary.contains("spend cap")),
             "the refusal names the money: {messages:?}"
         );
+    }
+
+    #[test]
+    fn a_node_that_used_its_wall_cap_persists_the_typed_dimension() {
+        let temp = tempfile::tempdir().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut plan = plan_on_disk(&paths);
+        let mut consecutive_failures = 0;
+        let mut halt = None;
+        let finished = Utc::now();
+
+        let outcome = record_node_failure(RecordNodeFailure {
+            paths: &paths,
+            plan: &mut plan,
+            task_index: 0,
+            run_id: Some("run-wall"),
+            failure_reason: Some("acceptance failed".to_string()),
+            spend_usd: 0.0,
+            max_spend: None,
+            max_wall_seconds: Some(10.0),
+            run_started_at: Some(finished - Duration::seconds(10)),
+            run_finished_at: Some(finished),
+            consecutive_failures: &mut consecutive_failures,
+            halt: &mut halt,
+            quiet: true,
+            plain: true,
+        })
+        .expect("record wall exhaustion");
+
+        assert_eq!(outcome, NodeFailureOutcome::Exhausted);
+        let events = read_plan_events(&paths, &plan.plan_id).expect("events");
+        assert!(events.iter().any(|event| matches!(
+            event.event,
+            deadreckon_core::PlanEventKind::TaskBudgetExhausted {
+                dimension: deadreckon_core::plan::BudgetDimension::Wall,
+                ..
+            }
+        )));
     }
 
     /// A subplan node never retries: re-running fork on a child plan that is

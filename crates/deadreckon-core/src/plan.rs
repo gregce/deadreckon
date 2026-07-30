@@ -35,6 +35,33 @@ pub enum PlanMode {
     Review,
 }
 
+/// Immutable accounting for the provider call that created a root Plan or
+/// Campaign decomposition.
+///
+/// This lives in the root artifact as well as the richer accounting sidecar so
+/// a crash after the artifact write cannot make recovery silently forget
+/// planner spend or wall time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RootPlannerAccounting {
+    pub schema_version: u32,
+    pub planner_invoked: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: f64,
+    pub subscription: bool,
+    pub wall_seconds: f64,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDimension {
+    Spend,
+    Wall,
+}
+
 impl PlanMode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -420,6 +447,18 @@ pub struct Plan {
     /// bounds nesting depth; see [`MAX_SUBPLAN_DEPTH`].
     #[serde(default)]
     pub parent_plan_id: Option<String>,
+    /// Durable Job that exclusively owns this Plan's executable lifecycle.
+    ///
+    /// `parent_plan_id` describes graph topology; this field is the authority
+    /// boundary shared by a root Plan and every descendant. Older standalone
+    /// Plans omit it and remain unowned compatibility artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_job_id: Option<String>,
+    /// Crash-safe copy of root-planner usage. The separate accounting sidecar
+    /// remains the reporting format; this copy lets the supervisor reconstruct
+    /// it without inventing zero usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_planner_accounting: Option<RootPlannerAccounting>,
     /// The process supervising this plan's fork, while one is. A Forked plan
     /// whose conductor is dead is resumable; one whose conductor is alive is
     /// not — the same liveness model chain's conductor uses.
@@ -463,6 +502,8 @@ impl Plan {
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             circuit_breaker_threshold: DEFAULT_CIRCUIT_BREAKER_THRESHOLD,
             parent_plan_id: None,
+            owner_job_id: None,
+            root_planner_accounting: None,
             conductor_pid: None,
             status: PlanStatus::Pending,
             created_at: Utc::now(),
@@ -601,6 +642,21 @@ pub enum PlanEventKind {
         reason: String,
         /// The run the retry extends, when the failed attempt produced one.
         parent_run_id: Option<String>,
+    },
+    /// A child could not be retried because its approved spend or wall
+    /// allowance was exhausted. The dimension is persisted as data so the
+    /// parent Job never has to infer a stop reason from prose.
+    TaskBudgetExhausted {
+        task_id: String,
+        task_index: usize,
+        dimension: BudgetDimension,
+        reason: String,
+    },
+    /// The provider call that decomposed the root goal consumed the approved
+    /// tree allowance before any child was launched.
+    RootBudgetExhausted {
+        dimension: BudgetDimension,
+        reason: String,
     },
     /// Consecutive node failures reached `circuit_breaker_threshold`; the
     /// plan stopped launching work rather than spend the rest of the budget.

@@ -650,6 +650,17 @@ fn fold_plan_event(model: &mut TreeModel, event: &PlanEvent) {
                 NodeStatus::Failed,
             );
         }
+        PlanEventKind::TaskBudgetExhausted { task_id, .. } => {
+            set_status(model, &NodeId::plan(&event.plan_id), NodeStatus::Failed);
+            set_status(
+                model,
+                &NodeId::task(&event.plan_id, task_id),
+                NodeStatus::Failed,
+            );
+        }
+        PlanEventKind::RootBudgetExhausted { .. } => {
+            set_status(model, &NodeId::plan(&event.plan_id), NodeStatus::Failed);
+        }
         PlanEventKind::TaskKilled {
             task_id, run_id, ..
         } => {

@@ -621,6 +621,8 @@ pub(crate) fn write_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<
     })?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    #[cfg(unix)]
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

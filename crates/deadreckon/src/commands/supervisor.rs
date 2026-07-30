@@ -42,6 +42,18 @@ const MAX_RELEASE_TOKEN_BYTES: u64 = 512;
 const GUARDED_CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const SUPERVISOR_FAILPOINT_ENABLE_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINTS";
 const SUPERVISOR_FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
+const TRUSTED_DRIVER_ATTEMPT_ENV: &str = "DEADRECKON_SUPERVISOR_ATTEMPT";
+const TRUSTED_DRIVER_LAUNCH_ID_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_ID";
+const TRUSTED_DRIVER_RELEASE_DIGEST_ENV: &str = "DEADRECKON_SUPERVISOR_RELEASE_TOKEN_SHA256";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct GuardedDriverAuthority {
+    pub(crate) job_id: String,
+    pub(crate) attempt: u32,
+    pub(crate) launch_id: String,
+    pub(crate) lease_epoch: u64,
+    pub(crate) release_token_sha256: String,
+}
 
 /// Keeps fenced ownership alive for the entire claimed operation, including
 /// synchronous source hashing and asynchronous parent verification. Child
@@ -169,7 +181,12 @@ struct SupervisorReleaseAck {
     job_id: String,
     attempt: u32,
     launch_id: String,
-    release_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_token_sha256: Option<String>,
+    /// Read-only migration support for acknowledgements written before the
+    /// digest-only format. New acknowledgements never serialize this secret.
+    #[serde(default, rename = "release_token", skip_serializing)]
+    legacy_release_token: Option<String>,
     pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_start_identity: Option<String>,
@@ -332,31 +349,41 @@ pub(crate) fn supervisor_launch_command(
         )));
     }
 
-    write_release_ack(
-        &paths,
-        &SupervisorReleaseAck {
-            launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
-            job_id: job_id.to_string(),
-            attempt,
-            launch_id,
-            release_token: release_token.to_string(),
-            pid: std::process::id(),
-            process_start_identity: process_start,
-            acknowledged_at: Utc::now(),
-        },
-    )?;
+    let release_ack = SupervisorReleaseAck {
+        launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+        job_id: job_id.to_string(),
+        attempt,
+        launch_id,
+        release_token_sha256: Some(release_token_sha256.to_string()),
+        legacy_release_token: None,
+        pid: std::process::id(),
+        process_start_identity: process_start,
+        acknowledged_at: Utc::now(),
+    };
+    write_release_ack(&paths, &release_ack)?;
     supervisor_test_failpoint("after_release_ack");
 
     let launch = load_launch_inputs(&paths, &job)?;
     let executable = std::env::current_exe()?;
     let mut command = build_job_driver_command(&paths, &job, &launch, &executable, attempt)?;
     apply_durable_scope_root(&mut command, &launch.plan);
+    apply_guarded_driver_metadata(&mut command, &release_ack, release_token_sha256);
     command
         .current_dir(&job.source_cwd)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let status = command.status()?;
+    let mut driver = command.spawn()?;
+    let mut driver_stdin = driver.stdin.take().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "guarded job driver did not expose its authentication pipe".to_string(),
+        ))
+    })?;
+    driver_stdin.write_all(release_token.as_bytes())?;
+    driver_stdin.write_all(b"\n")?;
+    driver_stdin.flush()?;
+    drop(driver_stdin);
+    let status = driver.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -364,6 +391,155 @@ pub(crate) fn supervisor_launch_command(
             "guarded job driver exited with status {status}"
         ))))
     }
+}
+
+pub(crate) fn require_guarded_driver_launch(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<GuardedDriverAuthority> {
+    if std::env::var(TRUSTED_SUPERVISOR_JOB_ID_ENV).as_deref() != Ok(job_id) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job driver identity does not match its durable supervisor".to_string(),
+        )));
+    }
+    let attempt = std::env::var(TRUSTED_DRIVER_ATTEMPT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "job driver is missing its guarded attempt identity".to_string(),
+            ))
+        })?;
+    let launch_id = std::env::var(TRUSTED_DRIVER_LAUNCH_ID_ENV)
+        .ok()
+        .filter(|value| Uuid::parse_str(value).is_ok())
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "job driver is missing its guarded launch identity".to_string(),
+            ))
+        })?;
+    let release_token_sha256 = std::env::var(TRUSTED_DRIVER_RELEASE_DIGEST_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "job driver is missing its guarded release digest".to_string(),
+            ))
+        })?;
+
+    let mut release_bytes = Vec::new();
+    std::io::stdin()
+        .take(MAX_RELEASE_TOKEN_BYTES + 1)
+        .read_to_end(&mut release_bytes)?;
+    if release_bytes.len() as u64 > MAX_RELEASE_TOKEN_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job driver authentication token exceeded its bounded size".to_string(),
+        )));
+    }
+    let release_token = std::str::from_utf8(&release_bytes)
+        .map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "job driver authentication token was not UTF-8".to_string(),
+            ))
+        })?
+        .trim();
+    if release_token.is_empty()
+        || deadreckon_core::flight::sha256_text(release_token) != release_token_sha256
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job driver did not receive the private guarded-launch capability".to_string(),
+        )));
+    }
+
+    let acknowledgement = release_ack(paths, job_id, &launch_id)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "job driver has no guarded-launch acknowledgement".to_string(),
+        ))
+    })?;
+    let lease_epoch = load_job_lease(paths, &JobId(job_id.to_string()))?.epoch;
+    let valid_ack = acknowledgement.launch_protocol == GUARDED_LAUNCH_PROTOCOL
+        && acknowledgement.job_id == job_id
+        && acknowledgement.attempt == attempt
+        && acknowledgement.launch_id == launch_id
+        && release_ack_token_sha256(&acknowledgement).as_deref()
+            == Some(release_token_sha256.as_str())
+        && launcher_link_is_durable(
+            paths,
+            job_id,
+            attempt,
+            &launch_id,
+            &release_token_sha256,
+            acknowledgement.pid,
+            acknowledgement.process_start_identity.as_deref(),
+        )?;
+    if !valid_ack {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job driver guarded-launch capability is not bound to the current fenced child"
+                .to_string(),
+        )));
+    }
+    Ok(GuardedDriverAuthority {
+        job_id: job_id.to_string(),
+        attempt,
+        launch_id,
+        lease_epoch,
+        release_token_sha256,
+    })
+}
+
+pub(crate) fn guarded_driver_authority_is_live(
+    paths: &DeadreckonPaths,
+    authority: &GuardedDriverAuthority,
+) -> Result<bool> {
+    let Some(acknowledgement) = release_ack(paths, &authority.job_id, &authority.launch_id)? else {
+        return Ok(false);
+    };
+    if acknowledgement.launch_protocol != GUARDED_LAUNCH_PROTOCOL
+        || acknowledgement.job_id != authority.job_id
+        || acknowledgement.attempt != authority.attempt
+        || acknowledgement.launch_id != authority.launch_id
+        || release_ack_token_sha256(&acknowledgement).as_deref()
+            != Some(authority.release_token_sha256.as_str())
+    {
+        return Ok(false);
+    }
+    let lease = load_job_lease(paths, &JobId(authority.job_id.clone()))?;
+    if lease.epoch != authority.lease_epoch {
+        return Ok(false);
+    }
+    launcher_link_is_durable(
+        paths,
+        &authority.job_id,
+        authority.attempt,
+        &authority.launch_id,
+        &authority.release_token_sha256,
+        acknowledgement.pid,
+        acknowledgement.process_start_identity.as_deref(),
+    )
+}
+
+fn apply_guarded_driver_metadata(
+    command: &mut Command,
+    acknowledgement: &SupervisorReleaseAck,
+    release_token_sha256: &str,
+) {
+    command
+        .env(
+            TRUSTED_DRIVER_ATTEMPT_ENV,
+            acknowledgement.attempt.to_string(),
+        )
+        .env(TRUSTED_DRIVER_LAUNCH_ID_ENV, &acknowledgement.launch_id)
+        .env(TRUSTED_DRIVER_RELEASE_DIGEST_ENV, release_token_sha256);
+}
+
+pub(crate) fn remove_guarded_driver_metadata(command: &mut Command) {
+    command
+        .env_remove(TRUSTED_SUPERVISOR_JOB_ID_ENV)
+        .env_remove(TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV)
+        .env_remove(TRUSTED_DRIVER_ATTEMPT_ENV)
+        .env_remove(TRUSTED_DRIVER_LAUNCH_ID_ENV)
+        .env_remove(TRUSTED_DRIVER_RELEASE_DIGEST_ENV);
 }
 
 fn launcher_link_is_durable(
@@ -376,7 +552,12 @@ fn launcher_link_is_durable(
     process_start_identity: Option<&str>,
 ) -> Result<bool> {
     let history = read_job_history(&paths.job_events(job_id))?;
-    let current_lease_epoch = load_job_lease(paths, &JobId(job_id.to_string()))?.epoch;
+    let lease = load_job_lease(paths, &JobId(job_id.to_string()))?;
+    let view = JobView::load(paths, job_id)?;
+    if lease.expires_at <= Utc::now() || !pid_is_alive(pid) || view.projection.is_terminal() {
+        return Ok(false);
+    }
+    let current_lease_epoch = lease.epoch;
     let mut prepared = false;
     for event in history.events() {
         if event.kind == JobEventKind::ChildLaunchPrepared
@@ -484,14 +665,9 @@ async fn supervise_one_job(
         LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
     );
     let claimed = JobView::load(paths, job_id)?;
-    if claimed.projection.stop_reason == Some(StopReason::CancelRequested) {
-        append_terminal_event(
-            paths,
-            &token,
-            JobEventKind::Cancelled,
-            StopReason::CancelRequested,
-            json!({ "reason": "operator cancelled before a child was launched" }),
-        )?;
+    if claimed.projection.stop_reason == Some(StopReason::CancelRequested)
+        && finish_cancel_requested(paths, &token, None)?
+    {
         return Ok(());
     }
     if initial
@@ -508,6 +684,48 @@ async fn supervise_one_job(
             json!({ "reason": "approved job deadline elapsed before the next attempt" }),
         )?;
         return Ok(());
+    }
+    match super::graph_job::recover_pending_driver_state(paths, &initial.job) {
+        Ok(super::graph_job::PendingDriverRecovery::BudgetExhausted {
+            stop_reason,
+            reason,
+        }) => {
+            let artifact = match initial.job.shape {
+                JobShape::Graph => "plan",
+                JobShape::LegacyCampaign => "campaign",
+                JobShape::Single | JobShape::LegacyChain => "job",
+            };
+            finish_advanced_budget_attempt(
+                paths,
+                &token,
+                ChildExit {
+                    status: None,
+                    adopted: true,
+                },
+                stop_reason,
+                artifact,
+                &reason,
+            )?;
+            return Ok(());
+        }
+        Ok(
+            super::graph_job::PendingDriverRecovery::Unchanged
+            | super::graph_job::PendingDriverRecovery::Recovered,
+        ) => {}
+        Err(error) => {
+            append_terminal_event(
+                paths,
+                &token,
+                JobEventKind::Blocked,
+                StopReason::CorruptHistory,
+                json!({
+                    "reason": format!(
+                        "could not safely recover a crash-partial advanced root artifact: {error}"
+                    )
+                }),
+            )?;
+            return Ok(());
+        }
     }
 
     let max_attempts = initial.job.policy.max_attempts.max(1);
@@ -597,54 +815,16 @@ async fn supervise_one_job(
                 monitor_child(paths, &token, MonitoredChild::Adopted(child.process.pid)).await?;
             let attempt = initial.projection.attempt_count.max(1);
             remove_child_control_files(paths, job_id, launch_id.as_deref())?;
-            if initial.job.shape == JobShape::Single
-                && maybe_schedule_leaf_retry(
-                    paths,
-                    &initial.job,
-                    &token,
-                    &exit,
-                    attempt,
-                    max_attempts,
-                )?
+            match reconcile_child_exit(paths, &initial.job, &token, exit, attempt, max_attempts)
+                .await?
             {
-                resuming_advanced = true;
-            } else {
-                return classify_job_attempt(
-                    paths,
-                    &initial.job,
-                    &token,
-                    exit,
-                    attempt >= max_attempts,
-                )
-                .await;
+                ChildReconciliation::Retry => resuming_advanced = true,
+                ChildReconciliation::Finished => return Ok(()),
             }
         }
-        if !resuming_advanced
-            && advanced_artifact_recoverable(paths, &initial.job)
-            && initial.projection.attempt_count < max_attempts
-        {
-            schedule_advanced_recovery(paths, &token, initial.projection.attempt_count)?;
+        if !resuming_advanced {
             remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
-            resuming_advanced = true;
-        } else if !resuming_advanced
-            && initial.job.shape == JobShape::Single
-            && maybe_schedule_leaf_retry(
-                paths,
-                &initial.job,
-                &token,
-                &ChildExit {
-                    status: None,
-                    adopted: true,
-                },
-                initial.projection.attempt_count.max(1),
-                max_attempts,
-            )?
-        {
-            remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
-            resuming_advanced = true;
-        } else if !resuming_advanced {
-            remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
-            return classify_job_attempt(
+            match reconcile_child_exit(
                 paths,
                 &initial.job,
                 &token,
@@ -652,20 +832,22 @@ async fn supervise_one_job(
                     status: None,
                     adopted: true,
                 },
-                initial.projection.attempt_count >= max_attempts,
+                initial.projection.attempt_count.max(1),
+                max_attempts,
             )
-            .await;
+            .await?
+            {
+                ChildReconciliation::Retry => resuming_advanced = true,
+                ChildReconciliation::Finished => return Ok(()),
+            }
         }
     }
 
-    // Plan merge is durable before the conductor exits. If the machine dies
-    // after that write but before the parent receipt is sealed, finish the
-    // parent verification directly instead of declaring an orphaned attempt.
-    if (initial.job.shape == JobShape::Graph
-        && merged_graph_waits_for_parent_completion(paths, &initial.job))
-        || (initial.job.shape == JobShape::LegacyCampaign
-            && merged_campaign_waits_for_parent_completion(paths, &initial.job))
-    {
+    // Advanced terminal evidence is durable before the conductor exits. If
+    // the machine dies after the child sidecar is removed but before the Job
+    // terminal is appended, classify that evidence instead of declaring a
+    // resumable result lost.
+    if advanced_artifact_waits_for_terminal_classification(paths, &initial.job) {
         return classify_advanced_attempt(
             paths,
             &initial.job,
@@ -676,6 +858,10 @@ async fn supervise_one_job(
             },
         )
         .await;
+    }
+
+    if finish_cancel_requested(paths, &token, None)? {
+        return Ok(());
     }
 
     // An attempt was durably started but no child identity survived. P6 cannot
@@ -703,13 +889,20 @@ async fn supervise_one_job(
     if initial.projection.attempt_count > 0
         && guarded_recovery.is_none()
         && !resuming_advanced
-        && advanced_artifact_recoverable(paths, &initial.job)
-        && initial.projection.attempt_count < max_attempts
+        && maybe_schedule_advanced_recovery(
+            paths,
+            &initial.job,
+            &token,
+            initial.projection.attempt_count,
+            max_attempts,
+        )?
     {
-        schedule_advanced_recovery(paths, &token, initial.projection.attempt_count)?;
         resuming_advanced = true;
     }
     if initial.projection.attempt_count > 0 && guarded_recovery.is_none() && !resuming_advanced {
+        if finish_cancel_requested(paths, &token, None)? {
+            return Ok(());
+        }
         append_attempt_stopped(
             paths,
             &token,
@@ -744,6 +937,9 @@ async fn supervise_one_job(
         |recovery| recovery.attempt,
     );
     for attempt in first_attempt..=max_attempts {
+        if finish_cancel_requested(paths, &token, None)? {
+            return Ok(());
+        }
         let attempt_already_started = guarded_recovery
             .as_ref()
             .is_some_and(|recovery| recovery.attempt == attempt && recovery.attempt_started);
@@ -771,6 +967,9 @@ async fn supervise_one_job(
         }
         guarded_recovery = None;
 
+        if finish_cancel_requested(paths, &token, None)? {
+            return Ok(());
+        }
         match spawn_job_driver(paths, &initial.job, &instance.executable, &prepared) {
             Ok(mut guarded) => {
                 append_control_event(
@@ -789,6 +988,9 @@ async fn supervise_one_job(
                 let exit =
                     monitor_child(paths, &token, MonitoredChild::Owned(guarded.child)).await?;
                 remove_child_control_files(paths, job_id, launch_id.as_deref())?;
+                if finish_cancel_requested(paths, &token, Some(&exit))? {
+                    return Ok(());
+                }
                 if let Some(error) = release_error {
                     append_attempt_stopped(
                         paths,
@@ -812,36 +1014,20 @@ async fn supervise_one_job(
                     )?;
                     return Ok(());
                 }
-                if initial.job.shape == JobShape::Single
-                    && maybe_schedule_leaf_retry(
-                        paths,
-                        &initial.job,
-                        &token,
-                        &exit,
-                        attempt,
-                        max_attempts,
-                    )?
+                match reconcile_child_exit(paths, &initial.job, &token, exit, attempt, max_attempts)
+                    .await?
                 {
-                    heartbeat_job_lease(paths, &token, Utc::now(), LEASE_TTL)?;
-                    continue;
+                    ChildReconciliation::Retry => {
+                        heartbeat_job_lease(paths, &token, Utc::now(), LEASE_TTL)?;
+                        continue;
+                    }
+                    ChildReconciliation::Finished => return Ok(()),
                 }
-                if initial.job.shape != JobShape::Single
-                    && advanced_artifact_recoverable(paths, &initial.job)
-                    && attempt < max_attempts
-                {
-                    schedule_advanced_recovery(paths, &token, attempt)?;
-                    continue;
-                }
-                return classify_job_attempt(
-                    paths,
-                    &initial.job,
-                    &token,
-                    exit,
-                    attempt >= max_attempts,
-                )
-                .await;
             }
             Err(error) => {
+                if finish_cancel_requested(paths, &token, None)? {
+                    return Ok(());
+                }
                 append_attempt_stopped(
                     paths,
                     &token,
@@ -909,43 +1095,49 @@ fn advanced_artifact_recoverable(paths: &DeadreckonPaths, job: &Job) -> bool {
     }
 }
 
-fn merged_graph_waits_for_parent_completion(paths: &DeadreckonPaths, job: &Job) -> bool {
-    if job.shape != JobShape::Graph {
-        return false;
-    }
+fn advanced_artifact_waits_for_terminal_classification(paths: &DeadreckonPaths, job: &Job) -> bool {
     let Ok(driver) = super::graph_job::load_driver_state(paths, job.job_id.as_ref()) else {
         return false;
     };
-    if driver.job_id != job.job_id
-        || driver.artifact_kind != "plan"
-        || driver.artifact_id != job.job_id.as_ref()
-    {
+    if driver.job_id != job.job_id || driver.artifact_id != job.job_id.as_ref() {
         return false;
     }
-    let Ok(plan) = deadreckon_core::plan::load_plan(paths, job.job_id.as_ref()) else {
-        return false;
-    };
-    plan.status == deadreckon_core::plan::PlanStatus::Merged
-}
-
-fn merged_campaign_waits_for_parent_completion(paths: &DeadreckonPaths, job: &Job) -> bool {
-    if job.shape != JobShape::LegacyCampaign {
-        return false;
+    match job.shape {
+        JobShape::Graph
+            if driver.artifact_kind == "plan"
+                && matches!(
+                    driver.kind,
+                    super::graph_job::DriverKind::Review | super::graph_job::DriverKind::FullPlan
+                ) =>
+        {
+            let Ok(plan) = deadreckon_core::plan::load_plan(paths, job.job_id.as_ref()) else {
+                return false;
+            };
+            matches!(
+                plan.status,
+                deadreckon_core::plan::PlanStatus::Merged
+                    | deadreckon_core::plan::PlanStatus::Failed
+            ) || !matches!(plan_budget_exhaustion(paths, &plan.plan_id), Ok(None))
+        }
+        JobShape::LegacyCampaign
+            if driver.artifact_kind == "campaign"
+                && driver.kind == super::graph_job::DriverKind::Campaign =>
+        {
+            let campaign_dir = paths.plan_dir(job.job_id.as_ref());
+            let Ok(campaign) = deadreckon_core::campaign::read_campaign(&campaign_dir) else {
+                return false;
+            };
+            matches!(
+                campaign.status,
+                deadreckon_core::campaign::CampaignStatus::Merged
+                    | deadreckon_core::campaign::CampaignStatus::Failed
+                    | deadreckon_core::campaign::CampaignStatus::Killed
+            ) || !matches!(campaign_budget_exhaustion(&campaign_dir), Ok(None))
+        }
+        JobShape::Single | JobShape::LegacyChain | JobShape::Graph | JobShape::LegacyCampaign => {
+            false
+        }
     }
-    let Ok(driver) = super::graph_job::load_driver_state(paths, job.job_id.as_ref()) else {
-        return false;
-    };
-    if driver.job_id != job.job_id
-        || driver.artifact_kind != "campaign"
-        || driver.artifact_id != job.job_id.as_ref()
-    {
-        return false;
-    }
-    let campaign_dir = paths.plan_dir(job.job_id.as_ref());
-    let Ok(campaign) = deadreckon_core::campaign::read_campaign(&campaign_dir) else {
-        return false;
-    };
-    campaign.status == deadreckon_core::campaign::CampaignStatus::Merged
 }
 
 fn schedule_advanced_recovery(
@@ -1463,6 +1655,14 @@ fn write_release_ack(paths: &DeadreckonPaths, ack: &SupervisorReleaseAck) -> Res
     )
 }
 
+fn release_ack_token_sha256(ack: &SupervisorReleaseAck) -> Option<String> {
+    ack.release_token_sha256.clone().or_else(|| {
+        ack.legacy_release_token
+            .as_deref()
+            .map(deadreckon_core::flight::sha256_text)
+    })
+}
+
 fn release_ack(
     paths: &DeadreckonPaths,
     job_id: &str,
@@ -1656,7 +1856,7 @@ fn recoverable_unlinked_guarded_launch(
                 && ack.job_id == job_id
                 && ack.attempt == attempt
                 && ack.launch_id == launch_id
-                && deadreckon_core::flight::sha256_text(&ack.release_token) == release_token_sha256
+                && release_ack_token_sha256(&ack).as_deref() == Some(release_token_sha256)
                 && linked;
             if !valid_ack {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -1777,6 +1977,9 @@ async fn classify_job_attempt(
     exit: ChildExit,
     attempts_exhausted: bool,
 ) -> Result<()> {
+    if finish_cancel_requested(paths, token, Some(&exit))? {
+        return Ok(());
+    }
     match job.shape {
         JobShape::Single => classify_persisted_attempt(paths, job, token, exit, attempts_exhausted),
         JobShape::Graph | JobShape::LegacyCampaign => {
@@ -1790,6 +1993,108 @@ async fn classify_job_attempt(
             "legacy chain execution is not available through the durable supervisor",
         ),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildReconciliation {
+    Retry,
+    Finished,
+}
+
+async fn reconcile_child_exit(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    token: &LeaseToken,
+    exit: ChildExit,
+    attempt: u32,
+    max_attempts: u32,
+) -> Result<ChildReconciliation> {
+    if finish_cancel_requested(paths, token, Some(&exit))? {
+        return Ok(ChildReconciliation::Finished);
+    }
+    if matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign) {
+        match super::graph_job::recover_pending_driver_state(paths, job) {
+            Ok(super::graph_job::PendingDriverRecovery::BudgetExhausted {
+                stop_reason,
+                reason,
+            }) => {
+                let artifact = if job.shape == JobShape::Graph {
+                    "plan"
+                } else {
+                    "campaign"
+                };
+                finish_advanced_budget_attempt(paths, token, exit, stop_reason, artifact, &reason)?;
+                return Ok(ChildReconciliation::Finished);
+            }
+            Ok(
+                super::graph_job::PendingDriverRecovery::Unchanged
+                | super::graph_job::PendingDriverRecovery::Recovered,
+            ) => {}
+            Err(error) => {
+                append_attempt_stopped(
+                    paths,
+                    token,
+                    StopReason::CorruptHistory,
+                    json!({
+                        "exit": exit_detail(&exit),
+                        "reason": format!(
+                            "could not safely recover a crash-partial advanced root artifact: {error}"
+                        ),
+                    }),
+                )?;
+                append_terminal_event(
+                    paths,
+                    token,
+                    JobEventKind::Blocked,
+                    StopReason::CorruptHistory,
+                    json!({
+                        "reason": format!(
+                            "could not safely recover a crash-partial advanced root artifact: {error}"
+                        ),
+                    }),
+                )?;
+                return Ok(ChildReconciliation::Finished);
+            }
+        }
+    }
+    let retry = match job.shape {
+        JobShape::Single => {
+            maybe_schedule_leaf_retry(paths, job, token, &exit, attempt, max_attempts)?
+        }
+        JobShape::Graph | JobShape::LegacyCampaign => {
+            maybe_schedule_advanced_recovery(paths, job, token, attempt, max_attempts)?
+        }
+        JobShape::LegacyChain => false,
+    };
+    if retry {
+        return Ok(ChildReconciliation::Retry);
+    }
+    classify_job_attempt(paths, job, token, exit, attempt >= max_attempts).await?;
+    Ok(ChildReconciliation::Finished)
+}
+
+fn maybe_schedule_advanced_recovery(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    token: &LeaseToken,
+    attempt: u32,
+    max_attempts: u32,
+) -> Result<bool> {
+    if !matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign)
+        || attempt >= max_attempts
+        || !advanced_artifact_recoverable(paths, job)
+    {
+        return Ok(false);
+    }
+    if JobView::load(paths, job.job_id.as_ref())?
+        .projection
+        .stop_reason
+        == Some(StopReason::CancelRequested)
+    {
+        return Ok(false);
+    }
+    schedule_advanced_recovery(paths, token, attempt)?;
+    Ok(true)
 }
 
 fn maybe_schedule_leaf_retry(
@@ -1863,6 +2168,9 @@ async fn classify_advanced_attempt(
     token: &LeaseToken,
     exit: ChildExit,
 ) -> Result<()> {
+    if finish_cancel_requested(paths, token, Some(&exit))? {
+        return Ok(());
+    }
     let driver = match super::graph_job::load_driver_state(paths, job.job_id.as_ref()) {
         Ok(driver) => driver,
         Err(error) => {
@@ -1913,6 +2221,28 @@ async fn classify_advanced_attempt(
                     );
                 }
             };
+            match plan_budget_exhaustion(paths, &plan.plan_id) {
+                Ok(Some((stop_reason, reason))) => {
+                    return finish_advanced_budget_attempt(
+                        paths,
+                        token,
+                        exit,
+                        stop_reason,
+                        "plan",
+                        &reason,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return fail_advanced_attempt(
+                        paths,
+                        token,
+                        exit,
+                        StopReason::CorruptHistory,
+                        &format!("graph budget history is malformed: {error}"),
+                    );
+                }
+            }
             match plan.status {
                 deadreckon_core::plan::PlanStatus::Merged => {
                     let launch = match load_launch_inputs(paths, job) {
@@ -2125,13 +2455,32 @@ async fn classify_advanced_attempt(
                         ),
                     }
                 }
-                deadreckon_core::plan::PlanStatus::Failed => fail_advanced_attempt(
-                    paths,
-                    token,
-                    exit,
-                    StopReason::FatalProvider,
-                    "graph conductor persisted a failed plan",
-                ),
+                deadreckon_core::plan::PlanStatus::Failed => {
+                    match plan_budget_exhaustion(paths, &plan.plan_id) {
+                        Ok(Some((stop_reason, reason))) => finish_advanced_budget_attempt(
+                            paths,
+                            token,
+                            exit,
+                            stop_reason,
+                            "plan",
+                            &reason,
+                        ),
+                        Ok(None) => fail_advanced_attempt(
+                            paths,
+                            token,
+                            exit,
+                            StopReason::FatalProvider,
+                            "graph conductor persisted a failed plan",
+                        ),
+                        Err(error) => fail_advanced_attempt(
+                            paths,
+                            token,
+                            exit,
+                            StopReason::CorruptHistory,
+                            &format!("graph budget history is malformed: {error}"),
+                        ),
+                    }
+                }
                 status => fail_advanced_attempt(
                     paths,
                     token,
@@ -2166,6 +2515,28 @@ async fn classify_advanced_attempt(
                     );
                 }
             };
+            match campaign_budget_exhaustion(&campaign_dir) {
+                Ok(Some((stop_reason, reason))) => {
+                    return finish_advanced_budget_attempt(
+                        paths,
+                        token,
+                        exit,
+                        stop_reason,
+                        "campaign",
+                        &reason,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return fail_advanced_attempt(
+                        paths,
+                        token,
+                        exit,
+                        StopReason::CorruptHistory,
+                        &format!("campaign budget history is malformed: {error}"),
+                    );
+                }
+            }
             match campaign.status {
                 deadreckon_core::campaign::CampaignStatus::Merged => {
                     let launch = match load_launch_inputs(paths, job) {
@@ -2394,40 +2765,32 @@ async fn classify_advanced_attempt(
                     )?;
                     Ok(())
                 }
-                deadreckon_core::campaign::CampaignStatus::Failed
-                    if deadreckon_core::campaign::read_campaign_events(&campaign_dir)?
-                        .iter()
-                        .any(|event| event.kind == "budget_exhausted") =>
-                {
-                    append_attempt_stopped(
-                        paths,
-                        token,
-                        StopReason::SpendCap,
-                        json!({
-                            "exit": exit_detail(&exit),
-                            "artifact": "campaign",
-                            "reason": "campaign tree spend budget was exhausted",
-                        }),
-                    )?;
-                    append_terminal_event(
-                        paths,
-                        token,
-                        JobEventKind::BudgetExhausted,
-                        StopReason::SpendCap,
-                        json!({
-                            "reason": "campaign tree spend budget was exhausted",
-                            "artifact": "campaign",
-                        }),
-                    )?;
-                    Ok(())
+                deadreckon_core::campaign::CampaignStatus::Failed => {
+                    match campaign_budget_exhaustion(&campaign_dir) {
+                        Ok(Some((stop_reason, reason))) => finish_advanced_budget_attempt(
+                            paths,
+                            token,
+                            exit,
+                            stop_reason,
+                            "campaign",
+                            &reason,
+                        ),
+                        Ok(None) => fail_advanced_attempt(
+                            paths,
+                            token,
+                            exit,
+                            StopReason::FatalProvider,
+                            "campaign conductor persisted a failed campaign",
+                        ),
+                        Err(error) => fail_advanced_attempt(
+                            paths,
+                            token,
+                            exit,
+                            StopReason::CorruptHistory,
+                            &format!("campaign budget history is malformed: {error}"),
+                        ),
+                    }
                 }
-                deadreckon_core::campaign::CampaignStatus::Failed => fail_advanced_attempt(
-                    paths,
-                    token,
-                    exit,
-                    StopReason::FatalProvider,
-                    "campaign conductor persisted a failed campaign",
-                ),
                 status => fail_advanced_attempt(
                     paths,
                     token,
@@ -2439,6 +2802,98 @@ async fn classify_advanced_attempt(
         }
         JobShape::Single | JobShape::LegacyChain => unreachable!("handled by caller"),
     }
+}
+
+fn plan_budget_exhaustion(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+) -> Result<Option<(StopReason, String)>> {
+    let event = deadreckon_core::read_plan_events(paths, plan_id)?
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.event {
+            deadreckon_core::PlanEventKind::TaskBudgetExhausted {
+                dimension, reason, ..
+            } => Some((dimension, reason)),
+            deadreckon_core::PlanEventKind::RootBudgetExhausted { dimension, reason } => {
+                Some((dimension, reason))
+            }
+            _ => None,
+        });
+    Ok(event.map(|(dimension, reason)| {
+        let stop_reason = match dimension {
+            deadreckon_core::plan::BudgetDimension::Spend => StopReason::SpendCap,
+            deadreckon_core::plan::BudgetDimension::Wall => StopReason::WallCap,
+        };
+        (stop_reason, reason)
+    }))
+}
+
+fn campaign_budget_exhaustion(campaign_dir: &Path) -> Result<Option<(StopReason, String)>> {
+    let event = deadreckon_core::campaign::read_campaign_events(campaign_dir)?
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "budget_exhausted");
+    let Some(event) = event else {
+        return Ok(None);
+    };
+    let stop_reason = match event.detail.get("stop_reason") {
+        Some(value) => serde_json::from_value::<StopReason>(value.clone())?,
+        None => StopReason::SpendCap,
+    };
+    if !matches!(stop_reason, StopReason::SpendCap | StopReason::WallCap) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "campaign budget event names non-budget stop reason {stop_reason:?}"
+        ))));
+    }
+    let reason = event
+        .detail
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| match stop_reason {
+            StopReason::SpendCap => "campaign tree spend budget was exhausted".to_string(),
+            StopReason::WallCap => "campaign tree wall-time budget was exhausted".to_string(),
+            _ => unreachable!(),
+        });
+    Ok(Some((stop_reason, reason)))
+}
+
+fn finish_advanced_budget_attempt(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    exit: ChildExit,
+    stop_reason: StopReason,
+    artifact: &str,
+    reason: &str,
+) -> Result<()> {
+    if attempt_is_active(paths, token.job_id.as_ref())? {
+        let projection = append_attempt_stopped(
+            paths,
+            token,
+            stop_reason,
+            json!({
+                "exit": exit_detail(&exit),
+                "artifact": artifact,
+                "reason": reason,
+            }),
+        )?;
+        if projection.stop_reason == Some(StopReason::CancelRequested) {
+            finish_cancel_requested(paths, token, Some(&exit))?;
+            return Ok(());
+        }
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::BudgetExhausted,
+        stop_reason,
+        json!({
+            "reason": reason,
+            "artifact": artifact,
+        }),
+    )?;
+    Ok(())
 }
 
 fn fail_advanced_attempt(
@@ -2782,13 +3237,107 @@ fn append_terminal_event(
     reason: StopReason,
     extra: Value,
 ) -> Result<JobProjection> {
-    append_control_event(
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(view.projection);
+    }
+    let cancelled = view.projection.stop_reason == Some(StopReason::CancelRequested);
+    let suppressed_kind = serde_json::to_value(kind)?;
+    let effective_kind = if cancelled {
+        JobEventKind::Cancelled
+    } else {
+        kind
+    };
+    let effective_reason = if cancelled {
+        StopReason::CancelRequested
+    } else {
+        reason
+    };
+    let effective_extra = if cancelled {
+        json!({
+            "reason": "operator cancellation won before terminal classification",
+            "suppressed_terminal_kind": suppressed_kind,
+        })
+    } else {
+        extra
+    };
+    let projection = append_control_event(
         paths,
         token,
-        kind,
+        effective_kind,
         format!("terminal:{}:{}", token.epoch, Uuid::new_v4()),
-        merge_stop_reason(reason, extra),
-    )
+        merge_stop_reason(effective_reason, effective_extra),
+    )?;
+    if !projection.is_terminal() && projection.stop_reason == Some(StopReason::CancelRequested) {
+        return append_control_event(
+            paths,
+            token,
+            JobEventKind::Cancelled,
+            format!("terminal-cancelled:{}:{}", token.epoch, Uuid::new_v4()),
+            merge_stop_reason(
+                StopReason::CancelRequested,
+                json!({
+                    "reason": "operator cancellation raced terminal classification and won",
+                    "suppressed_terminal_kind": suppressed_kind,
+                }),
+            ),
+        );
+    }
+    Ok(projection)
+}
+
+fn finish_cancel_requested(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    if view.projection.stop_reason != Some(StopReason::CancelRequested) {
+        return Ok(false);
+    }
+    let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
+    if attempt_active {
+        append_attempt_stopped(
+            paths,
+            token,
+            StopReason::CancelRequested,
+            json!({
+                "reason": "operator cancelled the active durable attempt",
+                "exit": exit.map(exit_detail),
+            }),
+        )?;
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::Cancelled,
+        StopReason::CancelRequested,
+        json!({
+            "reason": if attempt_active {
+                "operator cancelled the active durable attempt"
+            } else {
+                "operator cancelled before another attempt was launched"
+            },
+        }),
+    )?;
+    Ok(true)
+}
+
+fn attempt_is_active(paths: &DeadreckonPaths, job_id: &str) -> Result<bool> {
+    let history = read_job_history(&paths.job_events(job_id))?;
+    Ok(history
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event.kind {
+            JobEventKind::AttemptStopped => Some(false),
+            JobEventKind::AttemptStarted => Some(true),
+            _ => None,
+        })
+        .unwrap_or(false))
 }
 
 fn merge_stop_reason(reason: StopReason, extra: Value) -> Value {
@@ -2950,6 +3499,50 @@ mod tests {
         CourseBudget, CourseContract, CourseEscape, CourseProviders, CourseResolution,
         ResolutionSource,
     };
+
+    #[test]
+    fn release_ack_persists_only_the_capability_digest() {
+        let ack = SupervisorReleaseAck {
+            launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
+            job_id: "job".to_string(),
+            attempt: 1,
+            launch_id: "launch".to_string(),
+            release_token_sha256: Some("sha256:approved".to_string()),
+            legacy_release_token: Some("must-never-be-serialized".to_string()),
+            pid: 1,
+            process_start_identity: None,
+            acknowledged_at: Utc::now(),
+        };
+        let value = serde_json::to_value(&ack).expect("ack JSON");
+        assert_eq!(
+            value.get("release_token_sha256").and_then(Value::as_str),
+            Some("sha256:approved")
+        );
+        assert!(
+            value.get("release_token").is_none(),
+            "the guarded-launch secret leaked into its readable acknowledgement: {value}"
+        );
+
+        let legacy: SupervisorReleaseAck = serde_json::from_value(json!({
+            "launch_protocol": GUARDED_LAUNCH_PROTOCOL,
+            "job_id": "job",
+            "attempt": 1,
+            "launch_id": "launch",
+            "release_token": "legacy-private-token",
+            "pid": 1,
+            "acknowledged_at": Utc::now(),
+        }))
+        .expect("legacy ack");
+        assert_eq!(
+            release_ack_token_sha256(&legacy).as_deref(),
+            Some(deadreckon_core::flight::sha256_text("legacy-private-token").as_str())
+        );
+        let migrated = serde_json::to_value(&legacy).expect("migrated ack");
+        assert!(
+            migrated.get("release_token").is_none(),
+            "legacy secrets must not be reserialized"
+        );
+    }
 
     fn fixture(temp: &TempDir, max_attempts: u32) -> (DeadreckonPaths, Job) {
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -3228,6 +3821,12 @@ mod tests {
         )
         .expect("plan");
         plan.plan_id = job.job_id.as_ref().to_string();
+        plan.owner_job_id = Some(job.job_id.as_ref().to_string());
+        plan.parent_cwd = Some(job.source_cwd.clone());
+        plan.acceptance_path = Some(super::super::job::job_acceptance_path(
+            &paths,
+            job.job_id.as_ref(),
+        ));
         plan.tasks[2].depends_on =
             vec![plan.tasks[0].task_id.clone(), plan.tasks[1].task_id.clone()];
         plan.status = status;
@@ -3502,6 +4101,956 @@ mod tests {
             persisted.sub_goals[0].sub_plan_id.as_deref(),
             Some("existing-sub-plan")
         );
+    }
+
+    #[test]
+    fn missing_advanced_mapping_is_repaired_without_replanning_or_zeroing_usage() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, job, accounting) = match shape {
+                JobShape::Graph => {
+                    let (paths, job) =
+                        graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Pending);
+                    let mut plan = deadreckon_core::plan::load_plan(&paths, job.job_id.as_ref())
+                        .expect("plan");
+                    plan.owner_job_id = Some(job.job_id.as_ref().to_string());
+                    plan.parent_cwd = Some(job.source_cwd.clone());
+                    plan.acceptance_path = Some(super::super::job::job_acceptance_path(
+                        &paths,
+                        job.job_id.as_ref(),
+                    ));
+                    let accounting = deadreckon_core::plan::RootPlannerAccounting {
+                        schema_version: 1,
+                        planner_invoked: true,
+                        provider: Some("recovery-planner".to_string()),
+                        model: Some("recovery-model".to_string()),
+                        input_tokens: 101,
+                        output_tokens: 23,
+                        cost_usd: 0.42,
+                        subscription: false,
+                        wall_seconds: 1.5,
+                        recorded_at: Utc::now(),
+                    };
+                    plan.root_planner_accounting = Some(accounting.clone());
+                    deadreckon_core::plan::save_plan(&paths, &plan).expect("crash-partial plan");
+                    fs::remove_file(
+                        paths
+                            .plan_dir(job.job_id.as_ref())
+                            .join("root-planner-accounting.json"),
+                    )
+                    .expect("remove derived accounting");
+                    (paths, job, accounting)
+                }
+                JobShape::LegacyCampaign => {
+                    let (paths, job, mut campaign) =
+                        campaign_fixture(&temp, deadreckon_core::campaign::CampaignStatus::Pending);
+                    let accounting = deadreckon_core::plan::RootPlannerAccounting {
+                        schema_version: 1,
+                        planner_invoked: true,
+                        provider: Some("recovery-planner".to_string()),
+                        model: Some("recovery-model".to_string()),
+                        input_tokens: 101,
+                        output_tokens: 23,
+                        cost_usd: 0.42,
+                        subscription: false,
+                        wall_seconds: 1.5,
+                        recorded_at: Utc::now(),
+                    };
+                    campaign.root_planner_accounting = Some(accounting.clone());
+                    deadreckon_core::campaign::write_campaign(
+                        &paths.plan_dir(job.job_id.as_ref()),
+                        &campaign,
+                    )
+                    .expect("crash-partial campaign");
+                    (paths, job, accounting)
+                }
+                _ => unreachable!(),
+            };
+            let token = claim_started_attempt(&paths, &job, 1);
+            drop(token);
+            fs::remove_file(super::super::graph_job::driver_state_path(
+                &paths,
+                job.job_id.as_ref(),
+            ))
+            .expect("remove crash-partial mapping");
+
+            assert_eq!(
+                super::super::graph_job::recover_pending_driver_state(&paths, &job)
+                    .expect("repair mapping"),
+                super::super::graph_job::PendingDriverRecovery::Recovered
+            );
+            assert_eq!(
+                super::super::graph_job::recover_pending_driver_state(&paths, &job)
+                    .expect("idempotent mapping"),
+                super::super::graph_job::PendingDriverRecovery::Unchanged
+            );
+            let mapping = super::super::graph_job::load_driver_state(&paths, job.job_id.as_ref())
+                .expect("repaired mapping");
+            assert_eq!(mapping.job_id, job.job_id);
+            assert_eq!(mapping.artifact_id, job.job_id.as_ref());
+
+            match shape {
+                JobShape::Graph => {
+                    let restored: deadreckon_core::plan::RootPlannerAccounting =
+                        serde_json::from_slice(
+                            &fs::read(
+                                paths
+                                    .plan_dir(job.job_id.as_ref())
+                                    .join("root-planner-accounting.json"),
+                            )
+                            .expect("restored accounting"),
+                        )
+                        .expect("accounting JSON");
+                    assert_eq!(restored, accounting);
+                    assert!(
+                        paths
+                            .job_dir(job.job_id.as_ref())
+                            .join("owned-plans")
+                            .join(format!("{}.json", job.job_id))
+                            .is_file()
+                    );
+                }
+                JobShape::LegacyCampaign => {
+                    let events = deadreckon_core::campaign::read_campaign_events(
+                        &paths.plan_dir(job.job_id.as_ref()),
+                    )
+                    .expect("campaign events");
+                    let event = events
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == "root_planner_accounting")
+                        .expect("restored accounting event");
+                    assert_eq!(
+                        event.detail.get("cost_usd").and_then(Value::as_f64),
+                        Some(accounting.cost_usd)
+                    );
+                    assert_eq!(
+                        event.detail.get("wall_seconds").and_then(Value::as_f64),
+                        Some(accounting.wall_seconds)
+                    );
+                    let campaign = deadreckon_core::campaign::read_campaign(
+                        &paths.plan_dir(job.job_id.as_ref()),
+                    )
+                    .expect("campaign");
+                    super::super::graph_job::validate_owned_campaign(
+                        &paths,
+                        &campaign,
+                        job.job_id.as_ref(),
+                    )
+                    .expect("repaired ownership");
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_planner_budget_exhaustion_survives_mapping_creation_crash() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            for stop_reason in [StopReason::SpendCap, StopReason::WallCap] {
+                let temp = TempDir::new().expect("tempdir");
+                let (paths, job) = match shape {
+                    JobShape::Graph => {
+                        let (paths, job) =
+                            graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Pending);
+                        let mut plan =
+                            deadreckon_core::plan::load_plan(&paths, job.job_id.as_ref())
+                                .expect("plan");
+                        plan.owner_job_id = Some(job.job_id.as_ref().to_string());
+                        plan.parent_cwd = Some(job.source_cwd.clone());
+                        plan.acceptance_path = Some(super::super::job::job_acceptance_path(
+                            &paths,
+                            job.job_id.as_ref(),
+                        ));
+                        plan.root_planner_accounting =
+                            Some(deadreckon_core::plan::RootPlannerAccounting {
+                                schema_version: 1,
+                                planner_invoked: true,
+                                provider: Some("bounded-planner".to_string()),
+                                model: Some("bounded-model".to_string()),
+                                input_tokens: 10,
+                                output_tokens: 5,
+                                cost_usd: if stop_reason == StopReason::SpendCap {
+                                    job.policy.max_spend_usd
+                                } else {
+                                    0.25
+                                },
+                                subscription: false,
+                                wall_seconds: if stop_reason == StopReason::WallCap {
+                                    job.policy.max_wall_seconds as f64
+                                } else {
+                                    0.25
+                                },
+                                recorded_at: Utc::now(),
+                            });
+                        deadreckon_core::plan::save_plan(&paths, &plan)
+                            .expect("crash-partial plan");
+                        fs::remove_file(
+                            paths
+                                .plan_dir(job.job_id.as_ref())
+                                .join("root-planner-accounting.json"),
+                        )
+                        .expect("remove derived accounting");
+                        (paths, job)
+                    }
+                    JobShape::LegacyCampaign => {
+                        let (paths, job, mut campaign) = campaign_fixture(
+                            &temp,
+                            deadreckon_core::campaign::CampaignStatus::Pending,
+                        );
+                        campaign.root_planner_accounting =
+                            Some(deadreckon_core::plan::RootPlannerAccounting {
+                                schema_version: 1,
+                                planner_invoked: true,
+                                provider: Some("bounded-planner".to_string()),
+                                model: Some("bounded-model".to_string()),
+                                input_tokens: 10,
+                                output_tokens: 5,
+                                cost_usd: if stop_reason == StopReason::SpendCap {
+                                    job.policy.max_spend_usd
+                                } else {
+                                    0.25
+                                },
+                                subscription: false,
+                                wall_seconds: if stop_reason == StopReason::WallCap {
+                                    job.policy.max_wall_seconds as f64
+                                } else {
+                                    0.25
+                                },
+                                recorded_at: Utc::now(),
+                            });
+                        deadreckon_core::campaign::write_campaign(
+                            &paths.plan_dir(job.job_id.as_ref()),
+                            &campaign,
+                        )
+                        .expect("crash-partial campaign");
+                        (paths, job)
+                    }
+                    _ => unreachable!(),
+                };
+                fs::remove_file(super::super::graph_job::driver_state_path(
+                    &paths,
+                    job.job_id.as_ref(),
+                ))
+                .expect("remove crash-partial mapping");
+                let token = claim_started_attempt(&paths, &job, 1);
+
+                assert_eq!(
+                    reconcile_child_exit(
+                        &paths,
+                        &job,
+                        &token,
+                        ChildExit {
+                            status: None,
+                            adopted: true,
+                        },
+                        1,
+                        job.policy.max_attempts,
+                    )
+                    .await
+                    .expect("budget recovery"),
+                    ChildReconciliation::Finished
+                );
+
+                let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+                assert_eq!(
+                    view.projection.outcome,
+                    Some(deadreckon_protocol::JobOutcome::BudgetExhausted)
+                );
+                assert_eq!(view.projection.stop_reason, Some(stop_reason));
+                let history =
+                    read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+                assert_eq!(
+                    history
+                        .events()
+                        .iter()
+                        .filter(|event| event.kind == JobEventKind::BudgetExhausted)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    history
+                        .events()
+                        .iter()
+                        .filter(|event| is_terminal_kind(event.kind))
+                        .count(),
+                    1
+                );
+                assert!(history.events().iter().all(|event| {
+                    !matches!(
+                        event.kind,
+                        JobEventKind::RetryScheduled | JobEventKind::Failed | JobEventKind::Blocked
+                    )
+                }));
+                let mapping =
+                    super::super::graph_job::load_driver_state(&paths, job.job_id.as_ref())
+                        .expect("repaired mapping");
+                assert_eq!(mapping.job_id, job.job_id);
+                assert_eq!(mapping.artifact_id, job.job_id.as_ref());
+
+                match shape {
+                    JobShape::Graph => {
+                        let plan = deadreckon_core::plan::load_plan(&paths, job.job_id.as_ref())
+                            .expect("failed plan");
+                        assert_eq!(plan.status, deadreckon_core::plan::PlanStatus::Failed);
+                        assert!(plan.tasks.iter().all(|task| {
+                            task.status == deadreckon_core::plan::PlanTaskStatus::Pending
+                                && task.attempts.is_empty()
+                                && task.child_run_id.is_none()
+                        }));
+                        let events = deadreckon_core::read_plan_events(&paths, &plan.plan_id)
+                            .expect("plan events");
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| {
+                                    matches!(
+                                        event.event,
+                                        deadreckon_core::PlanEventKind::RootBudgetExhausted { .. }
+                                    )
+                                })
+                                .count(),
+                            1
+                        );
+                        assert!(!events.iter().any(|event| {
+                            matches!(
+                                event.event,
+                                deadreckon_core::PlanEventKind::TaskStarted { .. }
+                                    | deadreckon_core::PlanEventKind::TaskRunDiscovered { .. }
+                            )
+                        }));
+                    }
+                    JobShape::LegacyCampaign => {
+                        let campaign = deadreckon_core::campaign::read_campaign(
+                            &paths.plan_dir(job.job_id.as_ref()),
+                        )
+                        .expect("failed campaign");
+                        assert_eq!(
+                            campaign.status,
+                            deadreckon_core::campaign::CampaignStatus::Failed
+                        );
+                        assert!(campaign.sub_goals.iter().all(|sub| {
+                            sub.status == deadreckon_core::campaign::SubGoalStatus::Pending
+                                && sub.sub_plan_id.is_none()
+                                && sub.result_run_id.is_none()
+                        }));
+                        let events = deadreckon_core::campaign::read_campaign_events(
+                            &paths.plan_dir(job.job_id.as_ref()),
+                        )
+                        .expect("campaign events");
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| event.kind == "budget_exhausted")
+                                .count(),
+                            1
+                        );
+                        assert!(!events.iter().any(|event| {
+                            matches!(
+                                event.kind.as_str(),
+                                "sub_launch_prepared" | "sub_launched" | "sub_recovered"
+                            )
+                        }));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn persisted_advanced_budget_terminal_survives_child_sidecar_removal() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            for stop_reason in [StopReason::SpendCap, StopReason::WallCap] {
+                for attempt_already_stopped in [false, true] {
+                    let temp = TempDir::new().expect("tempdir");
+                    let (paths, mut job) = match shape {
+                        JobShape::Graph => {
+                            let (paths, job) =
+                                graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Failed);
+                            let dimension = match stop_reason {
+                                StopReason::SpendCap => {
+                                    deadreckon_core::plan::BudgetDimension::Spend
+                                }
+                                StopReason::WallCap => deadreckon_core::plan::BudgetDimension::Wall,
+                                _ => unreachable!(),
+                            };
+                            deadreckon_core::append_plan_event(
+                                &paths,
+                                job.job_id.as_ref(),
+                                deadreckon_core::PlanEventKind::RootBudgetExhausted {
+                                    dimension,
+                                    reason: format!(
+                                        "persisted {stop_reason:?} before supervisor restart"
+                                    ),
+                                },
+                            )
+                            .expect("typed Plan budget event");
+                            (paths, job)
+                        }
+                        JobShape::LegacyCampaign => {
+                            let (paths, job, _) = campaign_fixture(
+                                &temp,
+                                deadreckon_core::campaign::CampaignStatus::Failed,
+                            );
+                            deadreckon_core::campaign::append_campaign_event(
+                                &paths.plan_dir(job.job_id.as_ref()),
+                                "budget_exhausted",
+                                json!({
+                                    "reason": format!(
+                                        "persisted {stop_reason:?} before supervisor restart"
+                                    ),
+                                    "phase": "child_execution",
+                                    "stop_reason": stop_reason,
+                                }),
+                            )
+                            .expect("typed Campaign budget event");
+                            (paths, job)
+                        }
+                        JobShape::Single | JobShape::LegacyChain => unreachable!(),
+                    };
+                    job.policy.max_attempts = 2;
+                    fs::write(
+                        paths.job_json(job.job_id.as_ref()),
+                        serde_json::to_vec_pretty(&job).expect("job JSON"),
+                    )
+                    .expect("two-attempt job");
+                    let token = claim_started_attempt(&paths, &job, 1);
+                    if attempt_already_stopped {
+                        append_attempt_stopped(
+                            &paths,
+                            &token,
+                            stop_reason,
+                            json!({ "reason": "crashed before terminal event" }),
+                        )
+                        .expect("persisted attempt stop");
+                    }
+                    fs::remove_file(paths.job_lease(job.job_id.as_ref()))
+                        .expect("simulate lost supervisor checkpoint");
+
+                    supervise_one_job(
+                        &paths,
+                        &instance(temp.path().join("must-not-launch")),
+                        job.job_id.as_ref(),
+                    )
+                    .await
+                    .expect("restart classification");
+
+                    let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+                    assert_eq!(
+                        view.projection.outcome,
+                        Some(deadreckon_protocol::JobOutcome::BudgetExhausted)
+                    );
+                    assert_eq!(view.projection.stop_reason, Some(stop_reason));
+                    let history =
+                        read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+                    assert_eq!(
+                        history
+                            .events()
+                            .iter()
+                            .filter(|event| event.kind == JobEventKind::AttemptStopped)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        history
+                            .events()
+                            .iter()
+                            .filter(|event| event.kind == JobEventKind::BudgetExhausted)
+                            .count(),
+                        1
+                    );
+                    assert!(history.events().iter().all(|event| {
+                        !matches!(
+                            event.kind,
+                            JobEventKind::Blocked
+                                | JobEventKind::Failed
+                                | JobEventKind::RetryScheduled
+                        )
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_wins_when_it_arrives_during_budget_finalization() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Failed);
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::CancelRequested,
+            "cancel-during-budget-finalization".to_string(),
+            json!({ "stop_reason": StopReason::CancelRequested }),
+        )
+        .expect("cancel request");
+
+        finish_advanced_budget_attempt(
+            &paths,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: true,
+            },
+            StopReason::SpendCap,
+            "plan",
+            "budget finalization lost the cancellation race",
+        )
+        .expect("cancelled finalization");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Cancelled)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::CancelRequested)
+        );
+        let history = read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::Cancelled)
+                .count(),
+            1
+        );
+        let attempt_stops = history
+            .events()
+            .iter()
+            .filter(|event| event.kind == JobEventKind::AttemptStopped)
+            .collect::<Vec<_>>();
+        assert_eq!(attempt_stops.len(), 1);
+        assert_eq!(
+            attempt_stops[0]
+                .detail
+                .get("stop_reason")
+                .and_then(Value::as_str),
+            Some("cancel_requested")
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::BudgetExhausted)
+        );
+    }
+
+    #[test]
+    fn cancellation_wins_after_budget_attempt_stop_but_before_terminal() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Failed);
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_attempt_stopped(
+            &paths,
+            &token,
+            StopReason::WallCap,
+            json!({ "reason": "budget attempt stop was durable" }),
+        )
+        .expect("budget attempt stop");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::CancelRequested,
+            "cancel-before-budget-terminal".to_string(),
+            json!({ "stop_reason": StopReason::CancelRequested }),
+        )
+        .expect("cancel request");
+        append_terminal_event(
+            &paths,
+            &token,
+            JobEventKind::BudgetExhausted,
+            StopReason::WallCap,
+            json!({ "reason": "must be suppressed by cancellation" }),
+        )
+        .expect("cancelled terminal");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Cancelled)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::CancelRequested)
+        );
+        let history = read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::AttemptStopped)
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| is_terminal_kind(event.kind))
+                .count(),
+            1
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::BudgetExhausted)
+        );
+    }
+
+    fn is_terminal_kind(kind: JobEventKind) -> bool {
+        matches!(
+            kind,
+            JobEventKind::Verified
+                | JobEventKind::NeedsReview
+                | JobEventKind::Blocked
+                | JobEventKind::BudgetExhausted
+                | JobEventKind::DeadlineReached
+                | JobEventKind::Cancelled
+                | JobEventKind::Failed
+        )
+    }
+
+    #[tokio::test]
+    async fn advanced_budget_exhaustion_keeps_spend_and_wall_reasons_distinct() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            for stop_reason in [StopReason::SpendCap, StopReason::WallCap] {
+                let temp = TempDir::new().expect("tempdir");
+                let (paths, job) = match shape {
+                    JobShape::Graph => {
+                        let (paths, job) =
+                            graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Pending);
+                        let mut plan =
+                            deadreckon_core::plan::load_plan(&paths, job.job_id.as_ref())
+                                .expect("plan");
+                        plan.status = deadreckon_core::plan::PlanStatus::Failed;
+                        deadreckon_core::plan::save_plan(&paths, &plan).expect("failed plan");
+                        deadreckon_core::append_plan_event(
+                            &paths,
+                            &plan.plan_id,
+                            deadreckon_core::PlanEventKind::TaskBudgetExhausted {
+                                task_id: plan.tasks[0].task_id.clone(),
+                                task_index: 0,
+                                dimension: match stop_reason {
+                                    StopReason::SpendCap => {
+                                        deadreckon_core::plan::BudgetDimension::Spend
+                                    }
+                                    StopReason::WallCap => {
+                                        deadreckon_core::plan::BudgetDimension::Wall
+                                    }
+                                    _ => unreachable!(),
+                                },
+                                reason: format!("{stop_reason:?} exhausted"),
+                            },
+                        )
+                        .expect("typed Plan budget event");
+                        (paths, job)
+                    }
+                    JobShape::LegacyCampaign => {
+                        let (paths, job, mut campaign) = campaign_fixture(
+                            &temp,
+                            deadreckon_core::campaign::CampaignStatus::Pending,
+                        );
+                        campaign.status = deadreckon_core::campaign::CampaignStatus::Failed;
+                        let campaign_dir = paths.plan_dir(job.job_id.as_ref());
+                        deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign)
+                            .expect("failed campaign");
+                        deadreckon_core::campaign::append_campaign_event(
+                            &campaign_dir,
+                            "budget_exhausted",
+                            json!({
+                                "reason": format!("{stop_reason:?} exhausted"),
+                                "stop_reason": stop_reason,
+                            }),
+                        )
+                        .expect("typed Campaign budget event");
+                        (paths, job)
+                    }
+                    _ => unreachable!(),
+                };
+                let token = claim_started_attempt(&paths, &job, 1);
+                classify_advanced_attempt(
+                    &paths,
+                    &job,
+                    &token,
+                    ChildExit {
+                        status: None,
+                        adopted: true,
+                    },
+                )
+                .await
+                .expect("budget classification");
+
+                let view = JobView::load(&paths, job.job_id.as_ref()).expect("budget view");
+                assert_eq!(
+                    view.projection.outcome,
+                    Some(deadreckon_protocol::JobOutcome::BudgetExhausted)
+                );
+                assert_eq!(view.projection.stop_reason, Some(stop_reason));
+                let history =
+                    read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+                assert_eq!(
+                    history
+                        .events()
+                        .iter()
+                        .filter(|event| event.kind == JobEventKind::BudgetExhausted)
+                        .count(),
+                    1
+                );
+                assert!(
+                    !history
+                        .events()
+                        .iter()
+                        .any(|event| event.kind == JobEventKind::Failed)
+                );
+                assert_eq!(
+                    history
+                        .events()
+                        .iter()
+                        .filter(|event| is_terminal_kind(event.kind))
+                        .count(),
+                    1
+                );
+                assert!(
+                    history
+                        .events()
+                        .iter()
+                        .all(|event| event.job_id == job.job_id)
+                );
+                match shape {
+                    JobShape::Graph => {
+                        let plan = deadreckon_core::plan::load_plan(&paths, job.job_id.as_ref())
+                            .expect("same Plan");
+                        assert_eq!(plan.plan_id, job.job_id.as_ref());
+                    }
+                    JobShape::LegacyCampaign => {
+                        let campaign = deadreckon_core::campaign::read_campaign(
+                            &paths.plan_dir(job.job_id.as_ref()),
+                        )
+                        .expect("same Campaign");
+                        assert_eq!(campaign.campaign_id, job.job_id.as_ref());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn running_advanced_cancellation_never_retries_or_reclassifies() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, mut job) = match shape {
+                JobShape::Graph => graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Forked),
+                JobShape::LegacyCampaign => {
+                    let (paths, job, _) =
+                        campaign_fixture(&temp, deadreckon_core::campaign::CampaignStatus::Forked);
+                    (paths, job)
+                }
+                _ => unreachable!(),
+            };
+            job.policy.max_attempts = 2;
+            fs::write(
+                paths.job_json(job.job_id.as_ref()),
+                serde_json::to_vec_pretty(&job).expect("job JSON"),
+            )
+            .expect("two-attempt job");
+            let token = claim_started_attempt(&paths, &job, 1);
+            append_control_event(
+                &paths,
+                &token,
+                JobEventKind::CancelRequested,
+                format!("cancel-running-{shape:?}"),
+                json!({ "stop_reason": StopReason::CancelRequested }),
+            )
+            .expect("cancel request");
+
+            let decision = reconcile_child_exit(
+                &paths,
+                &job,
+                &token,
+                ChildExit {
+                    status: None,
+                    adopted: true,
+                },
+                1,
+                2,
+            )
+            .await
+            .expect("cancel reconciliation");
+            assert_eq!(decision, ChildReconciliation::Finished);
+
+            let history = read_job_history(&paths.job_events(job.job_id.as_ref()))
+                .expect("cancelled history");
+            let cancel_index = history
+                .events()
+                .iter()
+                .position(|event| event.kind == JobEventKind::CancelRequested)
+                .expect("cancel event");
+            assert!(history.events()[cancel_index + 1..].iter().all(|event| {
+                event.kind != JobEventKind::RetryScheduled
+                    && event.kind != JobEventKind::AttemptStarted
+            }));
+            assert_eq!(
+                history
+                    .events()
+                    .iter()
+                    .filter(|event| is_terminal_kind(event.kind))
+                    .count(),
+                1
+            );
+            assert!(
+                history
+                    .events()
+                    .iter()
+                    .all(|event| event.job_id == job.job_id)
+            );
+
+            let view = JobView::load(&paths, job.job_id.as_ref()).expect("cancelled view");
+            assert_eq!(view.projection.attempt_count, 1);
+            assert_eq!(
+                view.projection.outcome,
+                Some(deadreckon_protocol::JobOutcome::Cancelled)
+            );
+            assert_eq!(
+                view.projection.stop_reason,
+                Some(StopReason::CancelRequested)
+            );
+            let before = history.events().len();
+            assert!(finish_cancel_requested(&paths, &token, None).expect("idempotent cancel"));
+            assert_eq!(
+                read_job_history(&paths.job_events(job.job_id.as_ref()))
+                    .expect("replayed history")
+                    .events()
+                    .len(),
+                before
+            );
+            assert_eq!(
+                fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn adopted_advanced_children_use_the_same_bounded_recovery_path() {
+        for shape in [JobShape::Graph, JobShape::LegacyCampaign] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, mut job) = match shape {
+                JobShape::Graph => graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Forked),
+                JobShape::LegacyCampaign => {
+                    let (paths, job, _) =
+                        campaign_fixture(&temp, deadreckon_core::campaign::CampaignStatus::Forked);
+                    (paths, job)
+                }
+                _ => unreachable!(),
+            };
+            job.policy.max_attempts = 2;
+            fs::write(
+                paths.job_json(job.job_id.as_ref()),
+                serde_json::to_vec_pretty(&job).expect("job JSON"),
+            )
+            .expect("two-attempt job");
+            let token = claim_started_attempt(&paths, &job, 1);
+
+            let decision = reconcile_child_exit(
+                &paths,
+                &job,
+                &token,
+                ChildExit {
+                    status: None,
+                    adopted: true,
+                },
+                1,
+                2,
+            )
+            .await
+            .expect("adopted recovery");
+            assert_eq!(decision, ChildReconciliation::Retry);
+
+            let history =
+                read_job_history(&paths.job_events(job.job_id.as_ref())).expect("retry history");
+            assert_eq!(
+                history
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == JobEventKind::RetryScheduled)
+                    .count(),
+                1
+            );
+            assert!(
+                !history
+                    .events()
+                    .iter()
+                    .any(|event| is_terminal_kind(event.kind))
+            );
+            let view = JobView::load(&paths, job.job_id.as_ref()).expect("retry view");
+            assert_eq!(view.projection.attempt_count, 1);
+            assert_eq!(view.projection.outcome, None);
+
+            append_control_event(
+                &paths,
+                &token,
+                JobEventKind::AttemptStarted,
+                format!("last-attempt-{shape:?}"),
+                attempt_detail(&job, 2),
+            )
+            .expect("last attempt");
+            let decision = reconcile_child_exit(
+                &paths,
+                &job,
+                &token,
+                ChildExit {
+                    status: None,
+                    adopted: true,
+                },
+                2,
+                2,
+            )
+            .await
+            .expect("last-attempt classification");
+            assert_eq!(decision, ChildReconciliation::Finished);
+            let history =
+                read_job_history(&paths.job_events(job.job_id.as_ref())).expect("final history");
+            assert_eq!(
+                history
+                    .events()
+                    .iter()
+                    .filter(|event| is_terminal_kind(event.kind))
+                    .count(),
+                1
+            );
+            assert!(
+                history
+                    .events()
+                    .iter()
+                    .all(|event| event.job_id == job.job_id)
+            );
+            assert_eq!(
+                fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -4776,7 +6325,10 @@ mod tests {
                 job_id: job.job_id.as_ref().to_string(),
                 attempt: 1,
                 launch_id: prepared.launch_id.clone(),
-                release_token: "forged-visible-digest-preimage".to_string(),
+                release_token_sha256: Some(deadreckon_core::flight::sha256_text(
+                    "forged-visible-digest-preimage",
+                )),
+                legacy_release_token: None,
                 pid: std::process::id(),
                 process_start_identity: process_start.clone(),
                 acknowledged_at: Utc::now(),
@@ -4799,7 +6351,8 @@ mod tests {
                 job_id: job.job_id.as_ref().to_string(),
                 attempt: 1,
                 launch_id: prepared.launch_id.clone(),
-                release_token: prepared.release_token.clone(),
+                release_token_sha256: Some(prepared.release_token_sha256.clone()),
+                legacy_release_token: None,
                 pid: std::process::id(),
                 process_start_identity: process_start,
                 acknowledged_at: Utc::now(),
@@ -4871,7 +6424,8 @@ mod tests {
                     job_id: ack_job_id,
                     attempt: 1,
                     launch_id: ack_launch_id,
-                    release_token: ack_token,
+                    release_token_sha256: Some(deadreckon_core::flight::sha256_text(&ack_token)),
+                    legacy_release_token: None,
                     pid: std::process::id(),
                     process_start_identity: process_start,
                     acknowledged_at: Utc::now(),
@@ -4947,7 +6501,10 @@ mod tests {
                 job_id: job.job_id.as_ref().to_string(),
                 attempt: 1,
                 launch_id: prepared.launch_id,
-                release_token: "not-the-private-release-token".to_string(),
+                release_token_sha256: Some(deadreckon_core::flight::sha256_text(
+                    "not-the-private-release-token",
+                )),
+                legacy_release_token: None,
                 pid: std::process::id(),
                 process_start_identity: process_start,
                 acknowledged_at: Utc::now(),
