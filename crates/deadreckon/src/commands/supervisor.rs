@@ -2148,6 +2148,7 @@ mod tests {
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
         let job_id = JobId("1234567890abcdef1234567890abcdef".to_string());
         let plan = LaunchPlan {
             schema: super::super::course::LAUNCH_PLAN_SCHEMA,
@@ -2183,7 +2184,7 @@ mod tests {
         let contract_path = super::super::job::job_acceptance_path(&paths, job_id.as_ref());
         fs::write(
             &contract_path,
-            "name: fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}\"\n",
+            "name: fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/fixture-proof.txt\"\n",
         )
         .expect("contract");
         let policy = JobPolicy {

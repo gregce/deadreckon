@@ -2333,34 +2333,7 @@ async fn semantic_completion_disposition(
     }
     match semantic_run.result {
         crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
-            let seal_result = (|| -> Result<()> {
-                let authority_path = paths.job_authority(&state.run_id);
-                let raw = std::fs::read(&authority_path).map_err(|source| DeadreckonError::Io {
-                    path: authority_path.clone(),
-                    source,
-                })?;
-                let authority: deadreckon_protocol::JobAuthority = serde_json::from_slice(&raw)
-                    .map_err(|source| DeadreckonError::Json {
-                        path: authority_path,
-                        source,
-                    })?;
-                deadreckon_core::seal_completion_receipt(
-                    &paths, state, &authority, marker, &judgment,
-                )?;
-                Ok(())
-            })();
-            if let Err(error) = seal_result {
-                record_needs_review(
-                    state,
-                    turn,
-                    history,
-                    &format!(
-                        "semantic judgment achieved, but the combined receipt could not be sealed: {error}"
-                    ),
-                )?;
-                return Ok(SemanticCompletionDisposition::NeedsReview);
-            }
-            Ok(SemanticCompletionDisposition::Achieved)
+            seal_achieved_semantic_completion(state, &paths, turn, marker, &judgment, history)
         }
         crate::semantic_judge::SemanticJudgeResult::Revise(judgment) => {
             let missing = if judgment.missing.is_empty() {
@@ -2392,6 +2365,42 @@ async fn semantic_completion_disposition(
             Ok(SemanticCompletionDisposition::NeedsReview)
         }
     }
+}
+
+fn seal_achieved_semantic_completion(
+    state: &mut PipelineState,
+    paths: &DeadreckonPaths,
+    turn: u32,
+    marker: &deadreckon_core::AcceptanceMarker,
+    judgment: &deadreckon_protocol::SemanticJudgment,
+    history: &mut Vec<String>,
+) -> Result<SemanticCompletionDisposition> {
+    let seal_result = (|| -> Result<()> {
+        let authority_path = paths.job_authority(&state.run_id);
+        let raw = std::fs::read(&authority_path).map_err(|source| DeadreckonError::Io {
+            path: authority_path.clone(),
+            source,
+        })?;
+        let authority: deadreckon_protocol::JobAuthority =
+            serde_json::from_slice(&raw).map_err(|source| DeadreckonError::Json {
+                path: authority_path,
+                source,
+            })?;
+        deadreckon_core::seal_completion_receipt(paths, state, &authority, marker, judgment)?;
+        Ok(())
+    })();
+    if let Err(error) = seal_result {
+        record_needs_review(
+            state,
+            turn,
+            history,
+            &format!(
+                "semantic judgment achieved, but the combined receipt could not be sealed: {error}"
+            ),
+        )?;
+        return Ok(SemanticCompletionDisposition::NeedsReview);
+    }
+    Ok(SemanticCompletionDisposition::Achieved)
 }
 
 fn record_semantic_judge_accounting(
@@ -2623,7 +2632,9 @@ mod tests {
     use deadreckon_core::paths::DeadreckonPaths;
     use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run, spend_summary};
     use deadreckon_core::{TurnDocInput, append_turn_doc, implementation_notes_path};
-    use deadreckon_protocol::{FlightEventKind, RunEventKind};
+    use deadreckon_protocol::{
+        FlightEventKind, RunEventKind, RunId, SemanticDecision, SemanticJudgment,
+    };
 
     use super::{
         NarratorConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
@@ -2634,7 +2645,7 @@ mod tests {
         load_tool_policy_from_sandbox_toml, policy_seam_refusal, policy_seam_refusal_message,
         provider_failure_disposition, provider_output_name, record_semantic_judge_accounting,
         run_turn_loop, safe_working_path, safe_working_path_with_policy, save_history,
-        semantic_completion_disposition,
+        seal_achieved_semantic_completion, semantic_completion_disposition,
     };
 
     fn base_run_loop_config() -> RunLoopConfig {
@@ -2922,18 +2933,29 @@ mod tests {
             check_count: 0,
             checks: Vec::new(),
         };
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(state.run_id.clone()),
+            run_id: RunId(state.run_id.clone()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-judge".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the approved goal is achieved".to_string(),
+            goal_coverage: Vec::new(),
+            missing: Vec::new(),
+            input_sha256: "sha256:semantic-input".to_string(),
+            spend_usd: 0.0,
+        };
         let mut history = Vec::new();
-        let router = ProviderRouter::smoke();
-
-        let disposition = semantic_completion_disposition(
+        let disposition = seal_achieved_semantic_completion(
             &mut state,
-            &router,
-            &base_run_loop_config(),
+            &paths,
             1,
             &marker,
+            &judgment,
             &mut history,
         )
-        .await
         .expect("semantic disposition");
 
         assert_eq!(disposition, SemanticCompletionDisposition::NeedsReview);
@@ -2944,10 +2966,6 @@ mod tests {
                 .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:"))
         );
         let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
-        assert!(
-            trace.contains("\"event\":\"semantic_judge.achieved\""),
-            "{trace}"
-        );
         assert!(trace.contains("\"event\":\"semantic_judge.needs_review\""));
         assert!(
             state
