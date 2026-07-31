@@ -1,0 +1,645 @@
+#!/usr/bin/env node
+
+import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const HOST_TARGETS = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+];
+
+const EVALUATORS = [
+  {
+    name: "dr-gate-evaluator-aarch64-unknown-linux-musl",
+    target: "aarch64-unknown-linux-musl",
+    machine: 0xb7,
+  },
+  {
+    name: "dr-gate-evaluator-x86_64-unknown-linux-musl",
+    target: "x86_64-unknown-linux-musl",
+    machine: 0x3e,
+  },
+];
+
+const command = process.argv[2];
+const args = parseArgs(process.argv.slice(3));
+
+try {
+  switch (command) {
+    case "verify-sidecars":
+      writeJson(
+        verifySidecarDirectory(
+          required(args["sidecars-dir"], "--sidecars-dir"),
+          args.target ?? null,
+        ),
+      );
+      break;
+    case "assemble":
+      writeJson(assembleArchive(args));
+      break;
+    case "verify-archive":
+      writeJson(verifyArchiveCommand(args));
+      break;
+    case "refresh-checksum":
+      writeJson(refreshArchiveChecksum(args));
+      break;
+    case "manifest":
+      writeArchiveManifest(args);
+      break;
+    case "verify-manifest":
+      verifyArchiveManifest(args);
+      break;
+    case "patch-installers":
+      patchInstallers(required(args.dir, "--dir"));
+      break;
+    case "verify-installers":
+      verifyInstallers(required(args.dir, "--dir"));
+      break;
+    default:
+      throw new Error(
+        "usage: evaluator-sidecars.mjs <verify-sidecars|assemble|verify-archive|refresh-checksum|manifest|verify-manifest|patch-installers|verify-installers>",
+      );
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
+
+function parseArgs(values) {
+  const parsed = {};
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (!value.startsWith("--")) {
+      continue;
+    }
+    const name = value.slice(2);
+    const next = values[index + 1];
+    if (next && !next.startsWith("--")) {
+      parsed[name] = next;
+      index += 1;
+    } else {
+      parsed[name] = true;
+    }
+  }
+  return parsed;
+}
+
+function assembleArchive(localArgs) {
+  const dir = required(localArgs.dir, "--dir");
+  const target = requireHostTarget(localArgs.target);
+  const sidecarsDir = required(localArgs["sidecars-dir"], "--sidecars-dir");
+  const sidecars = verifySidecarDirectory(sidecarsDir);
+  const archive = oneTargetArchive(dir, target);
+  const membersBefore = listArchive(archive);
+  assertSafeArchiveMembers(archive, membersBefore);
+
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), `deadreckon-assemble-${target}-`));
+  const extractDir = path.join(temp, "extract");
+  fs.mkdirSync(extractDir);
+  extractArchive(archive, extractDir);
+  const payload = payloadDirectory(extractDir, target);
+  assertHostHelpers(payload, target);
+
+  for (const evaluator of EVALUATORS) {
+    const source = sidecars.find((entry) => entry.name === evaluator.name)?.path;
+    if (!source) {
+      throw new Error(`verified evaluator ${evaluator.name} disappeared before assembly`);
+    }
+    const destination = path.join(payload, evaluator.name);
+    fs.copyFileSync(source, destination);
+    fs.chmodSync(destination, 0o755);
+    // Keep evaluator archive headers stable across repeated assembly.
+    fs.utimesSync(destination, 0, 0);
+  }
+
+  repackArchive(archive, extractDir);
+  return archiveInventory(archive, target);
+}
+
+function verifyArchiveCommand(localArgs) {
+  const dir = required(localArgs.dir, "--dir");
+  const target = requireHostTarget(localArgs.target);
+  const archive = oneTargetArchive(dir, target);
+  assertArchiveChecksum(archive);
+  return archiveInventory(archive, target);
+}
+
+function refreshArchiveChecksum(localArgs) {
+  const dir = required(localArgs.dir, "--dir");
+  const target = requireHostTarget(localArgs.target);
+  const archive = oneTargetArchive(dir, target);
+  const checksum = `${archive}.sha256`;
+  if (!fs.existsSync(checksum)) {
+    throw new Error(`cargo-dist checksum sibling is missing for ${path.basename(archive)}`);
+  }
+  const digest = sha256File(archive);
+  fs.writeFileSync(checksum, `${digest} *${path.basename(archive)}\n`);
+  return {
+    archive: path.basename(archive),
+    checksum: path.basename(checksum),
+    sha256: digest,
+  };
+}
+
+function assertArchiveChecksum(archive) {
+  const checksum = `${archive}.sha256`;
+  if (!fs.existsSync(checksum)) {
+    throw new Error(`cargo-dist checksum sibling is missing for ${path.basename(archive)}`);
+  }
+  const raw = fs.readFileSync(checksum, "utf8").trim();
+  const match = /^([a-f0-9]{64})\s+[*]?(.+)$/.exec(raw);
+  if (!match || match[2] !== path.basename(archive)) {
+    throw new Error(`${path.basename(checksum)} is not a valid cargo-dist archive checksum`);
+  }
+  const actual = sha256File(archive);
+  if (match[1] !== actual) {
+    throw new Error(`${path.basename(checksum)} is stale for final archive ${path.basename(archive)}`);
+  }
+}
+
+function writeArchiveManifest(localArgs) {
+  const out = required(localArgs.out, "--out");
+  const manifest = buildArchiveManifest(
+    required(localArgs.dir, "--dir"),
+    localArgs.target ? [requireHostTarget(localArgs.target)] : HOST_TARGETS,
+  );
+  fs.writeFileSync(out, `${JSON.stringify(manifest, null, 2)}\n`);
+  writeJson({ ok: true, archives: manifest.archives.length, evaluators: manifest.evaluators.length });
+}
+
+function verifyArchiveManifest(localArgs) {
+  const manifestPath = required(localArgs.manifest, "--manifest");
+  const expected = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  if (expected.schema_version !== 1 || !Array.isArray(expected.archives)) {
+    throw new Error(`unsupported archive-member manifest schema in ${manifestPath}`);
+  }
+  const targets = expected.archives.map((archive) => requireHostTarget(archive.target));
+  const actual = buildArchiveManifest(required(localArgs.dir, "--dir"), targets);
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+    throw new Error(
+      "release-archive-members.json does not match the final release archives; regenerate it after assembly and signing",
+    );
+  }
+  writeJson({ ok: true, archives: actual.archives.length, evaluators: actual.evaluators.length });
+}
+
+function buildArchiveManifest(dir, targets) {
+  const uniqueTargets = [...new Set(targets)].sort();
+  const archives = uniqueTargets.map((target) => {
+    const archive = oneTargetArchive(dir, target);
+    assertArchiveChecksum(archive);
+    return archiveInventory(archive, target);
+  });
+  const evaluators = EVALUATORS.map((evaluator) => {
+    const occurrences = archives.map((archive) => {
+      const member = archive.members.find((entry) => entry.name === evaluator.name);
+      if (!member) {
+        throw new Error(`${archive.name} is missing ${evaluator.name}`);
+      }
+      return member;
+    });
+    const digests = new Set(occurrences.map((entry) => entry.sha256));
+    if (digests.size !== 1) {
+      throw new Error(`${evaluator.name} differs across release archives`);
+    }
+    const sizes = new Set(occurrences.map((entry) => entry.bytes));
+    if (sizes.size !== 1) {
+      throw new Error(`${evaluator.name} has inconsistent sizes across release archives`);
+    }
+    return {
+      name: evaluator.name,
+      target: evaluator.target,
+      sha256: occurrences[0].sha256,
+      bytes: occurrences[0].bytes,
+    };
+  });
+  return {
+    schema_version: 1,
+    evaluators,
+    archives: archives.sort((left, right) => left.name.localeCompare(right.name)),
+  };
+}
+
+function archiveInventory(archive, target) {
+  const listed = listArchive(archive);
+  assertSafeArchiveMembers(archive, listed);
+  const payloadName = `deadreckon-${target}`;
+  const requiredNames = [...hostHelpers(target), ...EVALUATORS.map((entry) => entry.name)];
+  for (const name of requiredNames) {
+    const expectedPath = `${payloadName}/${name}`;
+    const occurrences = listed.filter((entry) => entry === expectedPath);
+    if (occurrences.length !== 1) {
+      throw new Error(`${path.basename(archive)} must contain exactly one ${expectedPath}`);
+    }
+  }
+
+  const members = listed
+    .filter((entry) => !entry.endsWith("/"))
+    .map((entry) => {
+      const bytes = extractArchiveMember(archive, entry);
+      const name = path.posix.basename(entry);
+      const evaluator = EVALUATORS.find((candidate) => candidate.name === name);
+      if (evaluator) {
+        validateStaticLinuxElf(bytes, evaluator);
+      }
+      return {
+        path: entry,
+        name,
+        role: evaluator
+          ? "sandbox-evaluator"
+          : hostHelpers(target).includes(name)
+            ? "host-helper"
+            : "supporting-file",
+        sha256: sha256Bytes(bytes),
+        bytes: bytes.length,
+        target: evaluator?.target ?? (hostHelpers(target).includes(name) ? target : null),
+      };
+    })
+    .sort((left, right) => left.path.localeCompare(right.path));
+
+  return {
+    name: path.basename(archive),
+    target,
+    sha256: sha256File(archive),
+    bytes: fs.statSync(archive).size,
+    members,
+  };
+}
+
+function verifySidecarDirectory(dir, target = null) {
+  const evaluators = target
+    ? EVALUATORS.filter((evaluator) => evaluator.target === target)
+    : EVALUATORS;
+  if (evaluators.length === 0) {
+    throw new Error(`unsupported evaluator target ${target}`);
+  }
+  return evaluators.map((evaluator) => {
+    const matches = [];
+    walk(dir, (file) => {
+      if (path.basename(file) === evaluator.name) {
+        matches.push(file);
+      }
+    });
+    if (matches.length !== 1) {
+      throw new Error(`${dir} must contain exactly one ${evaluator.name}; found ${matches.length}`);
+    }
+    const bytes = fs.readFileSync(matches[0]);
+    validateStaticLinuxElf(bytes, evaluator);
+    return {
+      name: evaluator.name,
+      target: evaluator.target,
+      path: matches[0],
+      sha256: sha256Bytes(bytes),
+      bytes: bytes.length,
+    };
+  });
+}
+
+function validateStaticLinuxElf(bytes, evaluator) {
+  if (bytes.length < 64 || !bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+    throw new Error(`${evaluator.name} is not an ELF binary`);
+  }
+  if (bytes[4] !== 2 || bytes[5] !== 1) {
+    throw new Error(`${evaluator.name} must be a little-endian ELF64 binary`);
+  }
+  const machine = bytes.readUInt16LE(18);
+  if (machine !== evaluator.machine) {
+    throw new Error(
+      `${evaluator.name} has ELF machine 0x${machine.toString(16)}, expected 0x${evaluator.machine.toString(16)}`,
+    );
+  }
+  const programHeaderOffset = Number(bytes.readBigUInt64LE(32));
+  const programHeaderSize = bytes.readUInt16LE(54);
+  const programHeaderCount = bytes.readUInt16LE(56);
+  if (programHeaderOffset < 64 || programHeaderSize < 56 || programHeaderCount === 0) {
+    throw new Error(`${evaluator.name} has no valid ELF64 program-header table`);
+  }
+  const tableEnd = programHeaderOffset + programHeaderSize * programHeaderCount;
+  if (!Number.isSafeInteger(tableEnd) || tableEnd > bytes.length) {
+    throw new Error(`${evaluator.name} has an out-of-bounds ELF program-header table`);
+  }
+  for (let index = 0; index < programHeaderCount; index += 1) {
+    const offset = programHeaderOffset + index * programHeaderSize;
+    if (bytes.readUInt32LE(offset) === 3) {
+      throw new Error(`${evaluator.name} contains PT_INTERP and is not statically linked`);
+    }
+  }
+}
+
+function patchInstallers(dir) {
+  const shellInstallers = findNamedFiles(dir, "deadreckon-installer.sh");
+  const powershellInstallers = findNamedFiles(dir, "deadreckon-installer.ps1");
+  if (shellInstallers.length === 0 || powershellInstallers.length === 0) {
+    throw new Error(`${dir} must contain deadreckon-installer.sh and deadreckon-installer.ps1`);
+  }
+  for (const installer of shellInstallers) {
+    const original = fs.readFileSync(installer, "utf8");
+    const patched = original
+      .replace(/^(\s*_bins=")([^"]*deadreckon[^"]*)(")\s*$/gm, (_line, prefix, bins, suffix) => {
+        return `${prefix}${appendInstallerNames(bins, bins.includes(".exe"))}${suffix}`;
+      })
+      .replace(
+        /^(\s*_bins_js_array=')([^']*deadreckon[^']*)(')\s*$/gm,
+        (_line, prefix, bins, suffix) => {
+          const names = [...bins.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+          return `${prefix}${appendInstallerNames(names.join(" "), names.some((name) => name.endsWith(".exe")))
+            .split(/\s+/)
+            .map((name) => `"${name}"`)
+            .join(",")}${suffix}`;
+        },
+      );
+    fs.writeFileSync(installer, patched);
+  }
+  for (const installer of powershellInstallers) {
+    const original = fs.readFileSync(installer, "utf8");
+    const patched = original.replace(
+      /("bins"\s*=\s*@\()([^)]*deadreckon[^)]*)(\))/g,
+      (_line, prefix, bins, suffix) => {
+        const names = [...bins.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+        const patchedNames = appendInstallerNames(names.join(" "), true)
+          .split(/\s+/)
+          .map((name) => `"${name}"`)
+          .join(", ");
+        return `${prefix}${patchedNames}${suffix}`;
+      },
+    );
+    fs.writeFileSync(installer, patched);
+  }
+  verifyInstallers(dir);
+}
+
+function appendInstallerNames(value, windows) {
+  const names = value.trim().split(/\s+/).filter(Boolean);
+  const expected = [...hostHelpers(windows ? "x86_64-pc-windows-msvc" : "x86_64-apple-darwin"), ...EVALUATORS.map((entry) => entry.name)];
+  for (const name of expected) {
+    if (!names.includes(name)) {
+      names.push(name);
+    }
+  }
+  return names.join(" ");
+}
+
+function verifyInstallers(dir) {
+  const shellInstallers = findNamedFiles(dir, "deadreckon-installer.sh");
+  const powershellInstallers = findNamedFiles(dir, "deadreckon-installer.ps1");
+  if (shellInstallers.length === 0 || powershellInstallers.length === 0) {
+    throw new Error(`${dir} must contain deadreckon-installer.sh and deadreckon-installer.ps1`);
+  }
+  for (const installer of shellInstallers) {
+    const text = fs.readFileSync(installer, "utf8");
+    for (const target of HOST_TARGETS) {
+      const archiveName = target.endsWith("windows-msvc")
+        ? `deadreckon-${target}.zip`
+        : `deadreckon-${target}.tar.xz`;
+      const start = text.indexOf(`"${archiveName}")`);
+      if (start === -1) {
+        throw new Error(`${path.basename(installer)} has no case for ${archiveName}`);
+      }
+      const end = text.indexOf(";;", start);
+      const block = text.slice(start, end === -1 ? text.length : end);
+      const bins = /^\s*_bins="([^"]+)"/m.exec(block);
+      if (!bins) {
+        throw new Error(`${path.basename(installer)} has no _bins install list for ${target}`);
+      }
+      const installed = new Set(bins[1].split(/\s+/).filter(Boolean));
+      for (const name of [...hostHelpers(target), ...EVALUATORS.map((entry) => entry.name)]) {
+        if (!installed.has(name)) {
+          throw new Error(`${path.basename(installer)} does not install ${name} for ${target}`);
+        }
+      }
+    }
+  }
+  for (const installer of powershellInstallers) {
+    const text = fs.readFileSync(installer, "utf8");
+    const archiveName = "deadreckon-x86_64-pc-windows-msvc.zip";
+    const blocks = [...text.matchAll(new RegExp(`"artifact_name"\\s*=\\s*"${escapeRegExp(archiveName)}"[\\s\\S]*?"bins"\\s*=\\s*@\\(([^)]*)\\)`, "g"))];
+    if (blocks.length === 0) {
+      throw new Error(`${path.basename(installer)} has no install block for ${archiveName}`);
+    }
+    for (const block of blocks) {
+      for (const name of [
+        ...hostHelpers("x86_64-pc-windows-msvc"),
+        ...EVALUATORS.map((entry) => entry.name),
+      ]) {
+        if (!block[1].includes(`"${name}"`)) {
+          throw new Error(`${path.basename(installer)} does not install ${name}`);
+        }
+      }
+    }
+  }
+  writeJson({
+    ok: true,
+    shell_installers: shellInstallers.length,
+    powershell_installers: powershellInstallers.length,
+  });
+}
+
+function hostHelpers(target) {
+  return target.endsWith("windows-msvc")
+    ? ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"]
+    : ["deadreckon", "dr-gate", "dr-capture"];
+}
+
+function assertHostHelpers(payload, target) {
+  for (const name of hostHelpers(target)) {
+    const file = path.join(payload, name);
+    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      throw new Error(`${path.basename(payload)} is missing native helper ${name}`);
+    }
+  }
+}
+
+function payloadDirectory(extractDir, target) {
+  const expected = path.join(extractDir, `deadreckon-${target}`);
+  if (!fs.existsSync(expected) || !fs.statSync(expected).isDirectory()) {
+    throw new Error(`archive must contain top-level directory deadreckon-${target}`);
+  }
+  const topLevel = fs.readdirSync(extractDir).filter((name) => name !== ".DS_Store");
+  if (topLevel.length !== 1 || topLevel[0] !== `deadreckon-${target}`) {
+    throw new Error(`archive must contain only top-level directory deadreckon-${target}`);
+  }
+  return expected;
+}
+
+function oneTargetArchive(dir, target) {
+  const matches = [];
+  walk(dir, (file) => {
+    const basename = path.basename(file);
+    if (
+      basename === `deadreckon-${target}.tar.xz` ||
+      basename === `deadreckon-${target}.tar.gz` ||
+      basename === `deadreckon-${target}.tgz` ||
+      basename === `deadreckon-${target}.zip`
+    ) {
+      matches.push(file);
+    }
+  });
+  if (matches.length === 0) {
+    throw new Error(`no release archive found for ${target} under ${dir}`);
+  }
+  const byDigest = new Map(matches.map((file) => [sha256File(file), file]));
+  if (byDigest.size !== 1) {
+    throw new Error(`conflicting duplicate release archives found for ${target} under ${dir}`);
+  }
+  return [...byDigest.values()][0];
+}
+
+function listArchive(archive) {
+  const result = archive.endsWith(".zip")
+    ? process.platform === "win32"
+      ? spawnSync("tar", ["-tf", archive], { encoding: "utf8" })
+      : spawnSync("unzip", ["-Z1", archive], { encoding: "utf8" })
+    : spawnSync("tar", ["-tf", archive], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`could not list ${archive}: ${result.stderr}`);
+  }
+  return result.stdout.split(/\r?\n/).filter(Boolean);
+}
+
+function extractArchive(archive, destination) {
+  if (archive.endsWith(".zip") && process.platform !== "win32") {
+    run("unzip", ["-q", archive, "-d", destination]);
+  } else {
+    run("tar", ["-xf", archive, "-C", destination]);
+  }
+}
+
+function extractArchiveMember(archive, member) {
+  const result = archive.endsWith(".zip")
+    ? process.platform === "win32"
+      ? spawnSync("tar", ["-xOf", archive, member], { encoding: "buffer" })
+      : spawnSync("unzip", ["-p", archive, member], { encoding: "buffer" })
+    : spawnSync("tar", ["-xOf", archive, member], { encoding: "buffer" });
+  if (result.status !== 0) {
+    throw new Error(`could not extract ${member} from ${archive}: ${result.stderr}`);
+  }
+  return result.stdout;
+}
+
+function repackArchive(archive, sourceDir) {
+  const entries = fs.readdirSync(sourceDir).filter((name) => name !== ".DS_Store").sort();
+  if (entries.length === 0) {
+    throw new Error(`nothing to repack in ${sourceDir}`);
+  }
+  const suffix = archiveSuffix(archive);
+  const staged = `${archive.slice(0, -suffix.length)}.assembled-${process.pid}${suffix}`;
+  if (fs.existsSync(staged)) {
+    fs.unlinkSync(staged);
+  }
+  if (suffix === ".zip") {
+    if (process.platform === "win32") {
+      const literal = entries.map((entry) => `'${escapePowerShell(path.join(sourceDir, entry))}'`).join(",");
+      run("powershell", [
+        "-NoProfile",
+        "-Command",
+        `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath @(${literal}) -DestinationPath '${escapePowerShell(staged)}' -CompressionLevel Optimal -Force`,
+      ]);
+    } else {
+      run("zip", ["-X", "-q", "-r", staged, ...entries], { cwd: sourceDir });
+    }
+  } else {
+    const flag = suffix === ".tar.xz" ? "-cJf" : "-czf";
+    run("tar", [flag, staged, "-C", sourceDir, ...entries], {
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
+  }
+  fs.copyFileSync(staged, archive);
+  fs.unlinkSync(staged);
+}
+
+function archiveSuffix(archive) {
+  for (const suffix of [".tar.xz", ".tar.gz", ".tgz", ".zip"]) {
+    if (archive.endsWith(suffix)) {
+      return suffix;
+    }
+  }
+  throw new Error(`unsupported release archive: ${archive}`);
+}
+
+function assertSafeArchiveMembers(archive, members) {
+  for (const member of members) {
+    const normalized = member.replaceAll("\\", "/");
+    if (
+      normalized === "." ||
+      normalized === "./" ||
+      normalized.startsWith("./") ||
+      normalized.startsWith("/") ||
+      normalized.split("/").includes("..")
+    ) {
+      throw new Error(`${path.basename(archive)} contains unsafe archive member ${member}`);
+    }
+  }
+}
+
+function findNamedFiles(dir, name) {
+  const matches = [];
+  walk(dir, (file) => {
+    if (path.basename(file) === name) {
+      matches.push(file);
+    }
+  });
+  return matches.sort();
+}
+
+function walk(dir, visitor) {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walk(fullPath, visitor);
+    } else {
+      visitor(fullPath);
+    }
+  }
+}
+
+function requireHostTarget(target) {
+  if (!HOST_TARGETS.includes(target)) {
+    throw new Error(`unsupported host target ${target ?? ""}; expected one of ${HOST_TARGETS.join(", ")}`);
+  }
+  return target;
+}
+
+function run(program, programArgs, options = {}) {
+  const result = spawnSync(program, programArgs, { encoding: "utf8", ...options });
+  if (result.status !== 0) {
+    throw new Error(
+      `${program} ${programArgs.join(" ")} failed\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`,
+    );
+  }
+}
+
+function sha256File(file) {
+  return sha256Bytes(fs.readFileSync(file));
+}
+
+function sha256Bytes(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
+}
+
+function escapePowerShell(value) {
+  return value.replaceAll("'", "''");
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function required(value, name) {
+  if (!value) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function writeJson(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}

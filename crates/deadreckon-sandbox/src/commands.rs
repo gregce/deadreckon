@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::backend::{Result, SandboxBackend, backend_executable, resolve_backend};
+use crate::docker::DockerExecution;
 use crate::policy::ProtectedPathPolicy;
 use crate::spec::{SandboxSpec, WorkspaceAccess};
 
@@ -25,6 +26,11 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
     // REPORT.md: Disposable Sandboxes are selected per run and degrade to an
     // explicit unsafe warning only when requested or unsupported.
     let (backend, warning) = resolve_backend(spec.backend)?;
+    if spec.docker.is_some() && backend != SandboxBackend::Docker {
+        return Err(crate::SandboxError::InvalidDockerExecution(
+            "Docker execution configuration requires the Docker backend".to_string(),
+        ));
+    }
     if spec.workspace_access != WorkspaceAccess::ReadWrite && backend == SandboxBackend::None {
         return Err(crate::SandboxError::ReadOnlyUnavailable(
             spec.backend.to_string(),
@@ -35,7 +41,7 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
             sandbox_exec_command(spec, backend_executable(backend)?, warning)
         }
         SandboxBackend::Bwrap => bwrap_command(spec, backend_executable(backend)?, warning),
-        SandboxBackend::Docker => Ok(docker_command(spec, backend_executable(backend)?, warning)),
+        SandboxBackend::Docker => docker_command(spec, backend_executable(backend)?, warning),
         SandboxBackend::None => Ok(SandboxCommand {
             backend,
             program: spec.program.clone(),
@@ -182,7 +188,11 @@ fn bwrap_command(
     })
 }
 
-fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>) -> SandboxCommand {
+fn docker_command(
+    spec: &SandboxSpec,
+    wrapper: PathBuf,
+    warning: Option<String>,
+) -> Result<SandboxCommand> {
     let cwd = spec.cwd.to_string_lossy().to_string();
     let mut args = vec![
         "run".into(),
@@ -196,6 +206,23 @@ fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>)
         "-w".into(),
         cwd.into(),
     ];
+    if let Some(docker) = spec.docker.as_ref() {
+        validate_docker_execution(docker)?;
+        args.extend([
+            "--pull=never".into(),
+            format!("--platform={}", docker.image().platform().as_str()).into(),
+            "--entrypoint".into(),
+            docker.container_program().into(),
+            "--name".into(),
+            docker.container_name().into(),
+            "--cidfile".into(),
+            docker.cid_file().as_os_str().into(),
+        ]);
+        for (key, value) in docker.labels() {
+            args.push("--label".into());
+            args.push(format!("{key}={value}").into());
+        }
+    }
     let mut mounted = vec![spec.cwd.clone()];
     for path in spec
         .read_allowlist
@@ -203,6 +230,9 @@ fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>)
         .filter(|path| path.is_absolute() && path.exists() && !path.starts_with(&spec.cwd))
     {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if exact_path_is_protected(&canonical, &spec.read_denylist) {
+            continue;
+        }
         if mounted
             .iter()
             .any(|root| canonical == *root || canonical.starts_with(root))
@@ -220,6 +250,11 @@ fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>)
         .filter(|path| path.is_absolute() && path.exists() && !path.starts_with(&spec.cwd))
     {
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if exact_path_is_protected(&canonical, &spec.read_denylist)
+            || exact_path_is_protected(&canonical, &spec.write_denylist)
+        {
+            continue;
+        }
         if mounted
             .iter()
             .any(|root| canonical == *root || canonical.starts_with(root))
@@ -235,22 +270,62 @@ fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>)
         args.push("--network".into());
         args.push("none".into());
     }
-    for (key, value) in &spec.env {
+    for (key, value) in spec.env.iter().filter(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            deadreckon_core::GATE_KEY_ENV
+                | deadreckon_core::GATE_CONTAINED_ENV
+                | deadreckon_core::GATE_SANDBOX_BACKEND_ENV
+        )
+    }) {
         args.push("-e".into());
         args.push(format!("{key}={value}").into());
     }
     append_docker_protected_mounts(&mut args, spec, &mounted);
-    args.push("rust:1".into());
-    args.push(spec.program.clone());
+    if let Some(docker) = spec.docker.as_ref() {
+        let source = docker.sidecar_host_path().to_string_lossy();
+        args.push("--mount".into());
+        args.push(
+            format!(
+                "type=bind,source={source},destination={},readonly",
+                docker.container_program()
+            )
+            .into(),
+        );
+        args.push(docker.image().id().into());
+    } else {
+        args.push("rust:1".into());
+        args.push(spec.program.clone());
+    }
     args.extend(spec.args.clone());
-    SandboxCommand {
+    Ok(SandboxCommand {
         backend: SandboxBackend::Docker,
         program: wrapper.into_os_string(),
         args,
         env: BTreeMap::new(),
         cwd: spec.cwd.clone(),
         warning,
+    })
+}
+
+fn validate_docker_execution(docker: &DockerExecution) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(docker.sidecar_host_path())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(crate::SandboxError::InvalidDockerExecution(format!(
+            "Docker evaluator sidecar changed after configuration: {}",
+            docker.sidecar_host_path().display()
+        )));
     }
+    if docker.cid_file().exists() {
+        let cid_metadata = std::fs::symlink_metadata(docker.cid_file())?;
+        if cid_metadata.file_type().is_symlink() || !cid_metadata.is_file() {
+            return Err(crate::SandboxError::InvalidDockerExecution(format!(
+                "Docker cidfile is not a regular non-symlink file: {}",
+                docker.cid_file().display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn append_bwrap_protected_mounts(
@@ -312,6 +387,15 @@ fn path_is_exposed(path: &Path, mounts: &[PathBuf]) -> bool {
     mounts
         .iter()
         .any(|mount| path == mount || path.starts_with(mount))
+}
+
+fn exact_path_is_protected(path: &Path, protected: &[PathBuf]) -> bool {
+    protected.iter().any(|candidate| {
+        candidate == path
+            || candidate
+                .canonicalize()
+                .is_ok_and(|resolved| resolved == path)
+    })
 }
 
 pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
@@ -483,12 +567,16 @@ mod tests {
         bwrap_command, docker_command, sandbox_exec_profile, system_read_allowlist,
         with_protected_boundary,
     };
-    use crate::{ProtectedPathPolicy, SandboxBackend, SandboxSpec, WorkspaceAccess};
+    use crate::{
+        DOCKER_SIDECAR_CONTAINER_PROGRAM, DockerExecution, DockerImage, DockerPlatform,
+        ProtectedPathPolicy, SandboxBackend, SandboxSpec, WorkspaceAccess,
+    };
     use tempfile::TempDir;
 
     fn read_only_spec(backend: SandboxBackend) -> SandboxSpec {
         SandboxSpec {
             backend,
+            docker: None,
             cwd: PathBuf::from("/work/project"),
             program: OsString::from("judge"),
             args: Vec::new(),
@@ -568,7 +656,8 @@ mod tests {
     #[test]
     fn read_only_docker_mounts_workspace_ro() {
         let spec = read_only_spec(SandboxBackend::Docker);
-        let command = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
         let args = command
             .args
             .iter()
@@ -596,7 +685,8 @@ mod tests {
         spec.read_allowlist = vec![run_root.clone(), gate_bin.clone()];
         spec.write_allowlist = vec![runtime.clone()];
 
-        let command = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
         let args = command
             .args
             .iter()
@@ -620,6 +710,148 @@ mod tests {
             }),
             "missing writable Docker runtime mount for {rendered}: {args:?}"
         );
+    }
+
+    #[test]
+    fn docker_does_not_duplicate_exact_allow_and_deny_mount_destinations() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let ordinary_read = temp.path().join("ordinary-read");
+        let protected_read = temp.path().join("gate-keys");
+        let protected_write = temp.path().join("controller-proof");
+        for directory in [&workspace, &ordinary_read, &protected_read] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        std::fs::write(&protected_write, b"controller").expect("protected write fixture");
+        let mut spec = read_only_spec(SandboxBackend::Docker);
+        spec.cwd = workspace;
+        spec.workspace_access = WorkspaceAccess::Disposable;
+        spec.read_allowlist = vec![ordinary_read.clone(), protected_read.clone()];
+        spec.write_allowlist = vec![protected_write.clone()];
+        spec.read_denylist = vec![protected_read.clone()];
+        spec.write_denylist = vec![protected_write.clone()];
+
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let ordinary_read = ordinary_read.canonicalize().expect("ordinary read");
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "type=bind,source={},destination={},readonly",
+                ordinary_read.display(),
+                ordinary_read.display()
+            )
+        }));
+        for protected in [protected_read, protected_write] {
+            let protected = protected.canonicalize().expect("protected path");
+            let destination = format!("destination={}", protected.display());
+            assert!(
+                args.iter().all(|arg| !arg.contains(&destination)),
+                "an exactly denied path must remain unmounted instead of producing duplicate Docker destinations: {args:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_docker_execution_uses_immutable_image_sidecar_identity_and_labels() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let sidecar = temp.path().join("dr-gate-linux");
+        let cid_file = temp.path().join("gate.cid");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(&sidecar, b"sidecar").expect("sidecar");
+        let mut permissions = std::fs::metadata(&sidecar).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&sidecar, permissions).expect("permissions");
+        let image_id = format!("sha256:{}", "a".repeat(64));
+        let image = DockerImage::new(&image_id, DockerPlatform::LinuxArm64).expect("image");
+        let execution = DockerExecution::new(
+            image,
+            &sidecar,
+            "deadreckon-gate-launch-1",
+            &cid_file,
+            "job-1",
+            "launch-1",
+            2,
+            Some("owner-1".to_string()),
+        )
+        .expect("execution");
+        let mut spec = read_only_spec(SandboxBackend::Docker);
+        spec.cwd = workspace;
+        spec.workspace_access = WorkspaceAccess::Disposable;
+        spec.docker = Some(execution);
+
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "--pull=never",
+            "--platform=linux/arm64",
+            "--name",
+            "deadreckon-gate-launch-1",
+            "--cidfile",
+            cid_file.to_str().expect("cidfile"),
+            "io.deadreckon.managed=gate-evaluator",
+            "io.deadreckon.job-id=job-1",
+            "io.deadreckon.launch-id=launch-1",
+            "io.deadreckon.attempt=2",
+            "io.deadreckon.owner-launch-id=owner-1",
+            &image_id,
+            DOCKER_SIDECAR_CONTAINER_PROGRAM,
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{expected}: {args:?}"
+            );
+        }
+        let sidecar = sidecar.canonicalize().expect("canonical sidecar");
+        assert!(args.iter().any(|arg| {
+            arg == &format!(
+                "type=bind,source={},destination={DOCKER_SIDECAR_CONTAINER_PROGRAM},readonly",
+                sidecar.display()
+            )
+        }));
+        let image_index = args
+            .iter()
+            .position(|arg| arg == &image_id)
+            .expect("image ID");
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--entrypoint", DOCKER_SIDECAR_CONTAINER_PROGRAM] })
+        );
+        assert!(
+            !args[..image_index].iter().any(|arg| arg == "judge")
+                && !args[image_index + 1..].iter().any(|arg| arg == "judge"),
+            "host program crossed into the container: {args:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_docker_without_typed_execution_keeps_legacy_program_shape() {
+        let spec = read_only_spec(SandboxBackend::Docker);
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(args.windows(2).any(|pair| pair == ["rust:1", "judge"]));
+        assert!(!args.iter().any(|arg| arg == "--pull=never"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--platform=")));
     }
 
     #[test]
@@ -679,9 +911,14 @@ mod tests {
         ] {
             spec.env.insert(name.to_string(), value.to_string());
         }
+        spec.env
+            .insert("DEADRECKON_SAFE_INPUT".to_string(), "ordinary".to_string());
 
-        let protected = with_protected_boundary(&spec);
-        let command = docker_command(&protected, PathBuf::from("/usr/bin/docker"), None);
+        // Exercise the final serializer directly as a second boundary behind
+        // `with_protected_boundary`; Docker guest env is encoded into argv and
+        // cannot be removed later by `Command::env_remove`.
+        let command =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
         let args = command
             .args
             .iter()
@@ -700,6 +937,11 @@ mod tests {
                 "{forbidden} crossed the Docker command boundary: {command:?}"
             );
         }
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-e", "DEADRECKON_SAFE_INPUT=ordinary"]),
+            "ordinary Docker guest env was removed: {args:?}"
+        );
     }
 
     #[test]
@@ -799,7 +1041,8 @@ mod tests {
         );
 
         spec.backend = SandboxBackend::Docker;
-        let docker = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
+        let docker =
+            docker_command(&spec, PathBuf::from("/usr/bin/docker"), None).expect("command");
         let docker_args = docker
             .args
             .iter()

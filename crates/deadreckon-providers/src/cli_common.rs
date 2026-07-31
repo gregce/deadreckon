@@ -100,6 +100,7 @@ pub(crate) async fn run_cli_with_options(
             ToolSandboxPolicy::cli_provider(cwd.clone(), resolved.read_allowlist, write_allowlist);
         let output = run_sandbox(SandboxSpec {
             backend,
+            docker: None,
             cwd,
             program,
             args: args.iter().map(OsString::from).collect(),

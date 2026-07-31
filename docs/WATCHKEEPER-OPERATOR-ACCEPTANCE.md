@@ -29,6 +29,54 @@ The current acceptance boundary is:
 - launchd/systemd definitions and commands exist, but machine recovery becomes
   an accepted claim only after the live drill below.
 
+## Current phase quick acceptance
+
+This short script accepts the durable Docker cleanup and complete release
+payload added in the current phase. It is safe to run from this repository: the
+tests create disposable Jobs and delete only containers whose labels match
+those Jobs.
+
+From an arm64 Mac with Docker running and `rust:1` already cached:
+
+```bash
+cd /path/to/deadreckon
+
+test -x target/debug/deadreckon
+test -x target/debug/dr-gate
+test -x target/debug/dr-capture
+test -x target/debug/dr-gate-evaluator-aarch64-unknown-linux-musl
+file target/debug/dr-gate-evaluator-aarch64-unknown-linux-musl
+docker image inspect rust:1 --format '{{.Id}} {{.Architecture}}/{{.Os}}'
+
+DEADRECKON_LIVE_DOCKER_TEST=1 \
+  cargo test -p deadreckon \
+  --test watchkeeper_trust_boundary \
+  live_docker_ \
+  -- --ignored --nocapture
+
+docker ps -a \
+  --filter label=io.deadreckon.managed=true \
+  --format '{{.ID}} {{.Status}} {{.Names}}'
+
+cargo test -p deadreckon \
+  --test release_plan \
+  --test npm_wrapper
+```
+
+Accept when:
+
+- [ ] `file` reports a statically linked ARM aarch64 ELF evaluator;
+- [ ] Docker reports a `sha256:` image ID and `arm64/linux`;
+- [ ] the three `live_docker_` tests pass;
+- [ ] the managed-container query prints nothing after the tests;
+- [ ] `release_plan` and `npm_wrapper` pass, including archive assembly,
+  member-manifest, installer, Homebrew and npm payload assertions.
+
+This quick script does not accept a real semantic `achieved`, Linux/bubblewrap,
+machine reboot, 20–30-task dogfood matrix, Apple notarization, Windows
+Authenticode signing, npm publication or GitHub attestation. Those require the
+later operator and protected-CI steps.
+
 ## Safety and prerequisites
 
 Use two disposable clones. `finish` changes the selected checkout. Do not use a
@@ -403,9 +451,36 @@ DEADRECKON_LIVE_DOCKER_TEST=1 \
 Accept when the exact test reports `ok`. This command does not pull an image.
 It proves the real container denies key visibility, signing inputs, network
 routes, Job/proof/gate/Git control writes and still permits an ordinary
-deliverable write. It does not prove that a host-built macOS `dr-gate` can
-execute inside Linux; that remains the separate public strict Docker Job
-trial.
+deliverable write.
+
+To exercise the public strict-Job path on an arm64 host, build or install the
+static Linux evaluator beside the test `deadreckon` binary, then run:
+
+```bash
+DEADRECKON_LIVE_DOCKER_TEST=1 \
+  cargo test -p deadreckon \
+  --test watchkeeper_trust_boundary \
+  live_docker_ \
+  -- --ignored --nocapture
+```
+
+Accept only when all three tests pass:
+
+- [ ] normal completion produces a contained native Docker marker with passing
+  deterministic checks, then stops `NEEDS_REVIEW` because the smoke semantic
+  transport is not an independent judge;
+- [ ] public `kill --escalate` removes the container and durable execution
+  record, records `Cancelled`, and produces no marker, receipt or retry;
+- [ ] worker `SIGKILL` removes the stale container before a replacement starts,
+  schedules exactly one bounded retry, and reaches deterministic verification;
+- [ ] `docker ps -a --filter label=io.deadreckon.managed=true` and the
+  per-Job label query show no residual containers.
+
+These tests prove the strict Docker lifecycle on the host and daemon used.
+They do not prove Linux/bubblewrap parity, a real semantic `achieved`, a
+machine reboot, or a signed cross-platform release. Record the command,
+source revision and output before promoting the result from local evidence to
+the clean-source dogfood record.
 
 Do this before `finish`. First preserve the receipt:
 

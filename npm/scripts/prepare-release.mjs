@@ -12,6 +12,10 @@ const platforms = [
   { name: "deadreckon-linux-x64", target: "x86_64-unknown-linux-gnu", binary: "deadreckon" },
   { name: "deadreckon-win32-x64", target: "x86_64-pc-windows-msvc", binary: "deadreckon.exe" },
 ];
+const evaluatorSidecars = [
+  "dr-gate-evaluator-aarch64-unknown-linux-musl",
+  "dr-gate-evaluator-x86_64-unknown-linux-musl",
+];
 
 function argValue(name) {
   const index = process.argv.indexOf(name);
@@ -63,11 +67,21 @@ function extractArchive(archive, entry) {
   throw new Error(`failed to extract ${entry} from ${archive}`);
 }
 
-function binaryBytes(artifactRoot, platform) {
+function packageFiles(platform) {
+  const extension = platform.target.endsWith("windows-msvc") ? ".exe" : "";
+  return [
+    platform.binary,
+    `dr-gate${extension}`,
+    `dr-capture${extension}`,
+    ...evaluatorSidecars,
+  ];
+}
+
+function artifactBytes(artifactRoot, platform, binary) {
   const files = walk(artifactRoot);
   const extracted = files.find((file) => {
     const normalized = file.replaceAll(path.sep, "/");
-    return normalized.includes(platform.target) && path.basename(file) === platform.binary;
+    return normalized.includes(platform.target) && path.basename(file) === binary;
   });
   if (extracted) {
     return fs.readFileSync(extracted);
@@ -84,12 +98,12 @@ function binaryBytes(artifactRoot, platform) {
     );
   });
   for (const archive of archives) {
-    const entry = listArchive(archive).find((candidate) => path.basename(candidate) === platform.binary);
+    const entry = listArchive(archive).find((candidate) => path.basename(candidate) === binary);
     if (entry) {
       return extractArchive(archive, entry);
     }
   }
-  throw new Error(`could not find ${platform.binary} for ${platform.target} under ${artifactRoot}`);
+  throw new Error(`could not find ${binary} for ${platform.target} under ${artifactRoot}`);
 }
 
 function writePlatformPackage(platform) {
@@ -98,9 +112,11 @@ function writePlatformPackage(platform) {
   fs.rmSync(binDir, { force: true, recursive: true });
   fs.mkdirSync(binDir, { recursive: true });
 
-  const binaryPath = path.join(binDir, platform.binary);
-  fs.writeFileSync(binaryPath, binaryBytes(path.resolve(artifacts), platform));
-  fs.chmodSync(binaryPath, 0o755);
+  for (const binary of packageFiles(platform)) {
+    const binaryPath = path.join(binDir, binary);
+    fs.writeFileSync(binaryPath, artifactBytes(path.resolve(artifacts), platform, binary));
+    fs.chmodSync(binaryPath, 0o755);
+  }
 
   const template = fs.readFileSync(path.join(packageDir, "package.json.template"), "utf8");
   fs.writeFileSync(path.join(packageDir, "package.json"), template.replaceAll("__VERSION__", version));

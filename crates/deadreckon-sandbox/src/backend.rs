@@ -13,6 +13,8 @@ pub enum SandboxError {
     Unavailable(String),
     #[error("sandbox backend {0} cannot enforce read-only workspace access")]
     ReadOnlyUnavailable(String),
+    #[error("invalid Docker execution: {0}")]
+    InvalidDockerExecution(String),
     #[error("I/O error while running sandbox command: {0}")]
     Io(#[from] std::io::Error),
     #[error("sandboxed command cancelled")]
@@ -26,6 +28,7 @@ impl SandboxError {
             SandboxError::InvalidBackend(_) => false,
             SandboxError::Unavailable(_) => false,
             SandboxError::ReadOnlyUnavailable(_) => false,
+            SandboxError::InvalidDockerExecution(_) => false,
             SandboxError::Io(source) => is_retryable_io_kind(source.kind()),
             SandboxError::Cancelled => false,
         }
@@ -37,6 +40,7 @@ impl SandboxError {
             SandboxError::InvalidBackend(_) => true,
             SandboxError::Unavailable(_) => true,
             SandboxError::ReadOnlyUnavailable(_) => true,
+            SandboxError::InvalidDockerExecution(_) => true,
             SandboxError::Io(source) => !is_retryable_io_kind(source.kind()),
             SandboxError::Cancelled => true,
         }

@@ -86,7 +86,7 @@ fn homebrew_formula_writes_install_receipt() {
   end
 
   def install
-    bin.install "deadreckon"
+    bin.install "deadreckon", "dr-gate", "dr-capture"
     install_binary_aliases!
   end
 end
@@ -112,6 +112,15 @@ end
         "{patched}"
     );
     assert!(patched.contains("write_deadreckon_receipt!"), "{patched}");
+    for binary in [
+        "deadreckon",
+        "dr-gate",
+        "dr-capture",
+        "dr-gate-evaluator-aarch64-unknown-linux-musl",
+        "dr-gate-evaluator-x86_64-unknown-linux-musl",
+    ] {
+        assert!(patched.contains(&format!("\"{binary}\"")), "{patched}");
+    }
 }
 
 #[test]
@@ -148,7 +157,7 @@ fn homebrew_formula_pins_release_sha256() {
   end
 
   def install
-    bin.install "deadreckon"
+    bin.install "deadreckon", "dr-gate", "dr-capture"
     install_binary_aliases!
   end
 end
@@ -171,6 +180,75 @@ end
         template.contains(r#"sha256 "abc123""#),
         "formula patching must preserve cargo-dist release archive sha256s"
     );
+}
+
+#[test]
+fn homebrew_formula_installs_complete_runtime_on_every_supported_platform() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let formula = temp.path().join("deadreckon.rb");
+    let install_blocks = [
+        ("OS.mac? && Hardware::CPU.arm?", "aarch64-apple-darwin"),
+        ("OS.mac? && Hardware::CPU.intel?", "x86_64-apple-darwin"),
+        (
+            "OS.linux? && Hardware::CPU.arm?",
+            "aarch64-unknown-linux-gnu",
+        ),
+        (
+            "OS.linux? && Hardware::CPU.intel?",
+            "x86_64-unknown-linux-gnu",
+        ),
+    ];
+    let mut fixture = String::from(
+        "class Deadreckon < Formula\n  version \"9.8.7\"\n\n  def install_binary_aliases!\n  end\n\n  def install\n",
+    );
+    for (condition, _) in install_blocks {
+        fixture.push_str(&format!(
+            "    if {condition}\n      bin.install \"deadreckon\", \"dr-gate\", \"dr-capture\"\n    end\n"
+        ));
+    }
+    fixture.push_str("    install_binary_aliases!\n  end\nend\n");
+    fs::write(&formula, fixture).expect("formula");
+
+    let output = Command::new("node")
+        .arg(workspace_root().join("release/homebrew/patch-formula.mjs"))
+        .arg(&formula)
+        .output()
+        .expect("patch formula");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patched = fs::read_to_string(&formula).expect("patched formula");
+    for evaluator in [
+        "dr-gate-evaluator-aarch64-unknown-linux-musl",
+        "dr-gate-evaluator-x86_64-unknown-linux-musl",
+    ] {
+        assert_eq!(
+            4,
+            patched.matches(&format!("\"{evaluator}\"")).count(),
+            "{patched}"
+        );
+    }
+    for (condition, _) in install_blocks {
+        let block = patched
+            .split(&format!("if {condition}"))
+            .nth(1)
+            .expect("platform install block")
+            .split("end")
+            .next()
+            .expect("platform block end");
+        for binary in [
+            "deadreckon",
+            "dr-gate",
+            "dr-capture",
+            "dr-gate-evaluator-aarch64-unknown-linux-musl",
+            "dr-gate-evaluator-x86_64-unknown-linux-musl",
+        ] {
+            assert!(block.contains(&format!("\"{binary}\"")), "{block}");
+        }
+    }
 }
 
 #[test]
@@ -615,6 +693,11 @@ fn release_manifest_covers_artifacts_and_checksums() {
     }
     fs::create_dir_all(distrib.join("trust")).expect("trust dir");
     fs::write(
+        distrib.join("release-archive-members.json"),
+        r#"{"schema_version":1,"evaluators":[],"archives":[]}"#,
+    )
+    .expect("archive member manifest");
+    fs::write(
         distrib.join("trust/macos-aarch64-apple-darwin.json"),
         r#"{"target":"aarch64-apple-darwin","signed":true,"notarized":true}"#,
     )
@@ -698,6 +781,12 @@ fn release_manifest_covers_artifacts_and_checksums() {
                 == Some("release.spdx.json")),
         "{manifest:#?}"
     );
+    assert!(
+        artifacts.iter().any(|artifact| {
+            artifact.get("name").and_then(JsonValue::as_str) == Some("release-archive-members.json")
+        }),
+        "{manifest:#?}"
+    );
 }
 
 #[test]
@@ -712,6 +801,62 @@ fn release_workflow_runs_dist_plan_on_every_push() {
     assert!(
         workflow.contains("cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh"),
         "{workflow}"
+    );
+}
+
+#[test]
+fn release_plan_is_read_only_and_only_final_publisher_mutates_github_release() {
+    let workflow = release_workflow();
+    let dist_plan = workflow
+        .split_once("  dist-plan:")
+        .and_then(|(_, tail)| tail.split_once("\n  release-verify:"))
+        .map(|(job, _)| job)
+        .expect("dist-plan job");
+    assert!(
+        dist_plan.contains("dist plan --output-format=json"),
+        "{dist_plan}"
+    );
+    for forbidden in [
+        "dist host",
+        "--steps=create",
+        "gh release",
+        "contents: write",
+        "GH_TOKEN",
+    ] {
+        assert!(
+            !dist_plan.contains(forbidden),
+            "dist-plan must be read-only; found {forbidden}:\n{dist_plan}"
+        );
+    }
+
+    let publisher = workflow
+        .split_once("  publish-github-release:")
+        .and_then(|(_, tail)| tail.split_once("\n  publish-homebrew-formula:"))
+        .map(|(job, _)| job)
+        .expect("GitHub Release publisher job");
+    assert!(
+        publisher.contains("permissions:\n      contents: write"),
+        "{publisher}"
+    );
+    assert!(
+        publisher.contains("- release-trust-artifacts")
+            && publisher.contains("- attest-release-artifacts"),
+        "publisher must wait for trust and attestation: {publisher}"
+    );
+    for mutation in ["gh release create", "gh release edit", "gh release upload"] {
+        assert!(
+            publisher.contains(mutation),
+            "{mutation} missing: {publisher}"
+        );
+        assert_eq!(
+            1,
+            workflow.matches(mutation).count(),
+            "{mutation} must exist only in the final publisher"
+        );
+    }
+    assert!(
+        !workflow.contains("dist host") && !workflow.contains("--steps=create"),
+        "cargo-dist must never own GitHub Release creation: {workflow}"
     );
 }
 
@@ -783,12 +928,15 @@ fn release_workflow_codesigns_packaged_apple_artifacts_after_dist_build() {
     let build_step = workflow
         .find("- name: Build target artifacts")
         .expect("build target artifacts step");
+    let assembly_step = workflow
+        .find("- name: Assemble complete target archive")
+        .expect("complete archive assembly step");
     let codesign_step = workflow
         .find("- name: Sign and verify packaged macOS artifacts")
         .expect("packaged macOS signing step");
     assert!(
-        build_step < codesign_step,
-        "macOS signing must happen after dist build so the uploaded archive is proven"
+        build_step < assembly_step && assembly_step < codesign_step,
+        "musl evaluators must be assembled after dist build and before macOS signing"
     );
     let codesign_step = workflow
         .split("- name: Sign and verify packaged macOS artifacts")
@@ -802,13 +950,18 @@ fn release_workflow_codesigns_packaged_apple_artifacts_after_dist_build() {
         codesign_step.contains("release/trust/sign-macos-artifacts.mjs"),
         "{codesign_step}"
     );
+    let signer =
+        fs::read_to_string(workspace_root().join("release/trust/sign-macos-artifacts.mjs"))
+            .expect("macOS signer");
     assert!(
-        codesign_step.contains("codesign --verify --verbose"),
-        "{codesign_step}"
+        signer.contains("\"codesign\"") && signer.contains("\"--verify\""),
+        "{signer}"
     );
     assert!(
-        codesign_step.contains("xcrun notarytool submit"),
-        "{codesign_step}"
+        signer.contains("\"xcrun\"")
+            && signer.contains("\"notarytool\"")
+            && signer.contains("\"submit\""),
+        "{signer}"
     );
 }
 
@@ -835,6 +988,8 @@ fn release_workflow_generates_trust_artifacts_and_attestations() {
     let workflow = release_workflow();
     for needle in [
         "release-trust-artifacts:",
+        "node release/evaluator-sidecars.mjs manifest",
+        "node release/evaluator-sidecars.mjs verify-manifest",
         "node release/trust/release-trust.mjs sbom",
         "node release/trust/release-trust.mjs checksums",
         "node release/trust/release-trust.mjs manifest",
@@ -844,6 +999,7 @@ fn release_workflow_generates_trust_artifacts_and_attestations() {
         "attestations: write",
         "artifact-metadata: write",
         "release-manifest.json",
+        "release-archive-members.json",
         "SHA256SUMS",
         "release.spdx.json",
         "gh release upload",
@@ -883,6 +1039,420 @@ fn stable_windows_artifact_requires_signing_or_is_withheld() {
         fs::read_to_string(workspace_root().join("release/trust/sign-windows-artifacts.mjs"))
             .expect("windows signer script");
     assert!(signer.contains("signtool"), "{signer}");
+    for binary in ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"] {
+        assert!(signer.contains(binary), "{binary} missing from {signer}");
+    }
+}
+
+#[test]
+fn release_workflow_builds_static_evaluators_and_assembles_them_before_trust() {
+    let workflow = release_workflow();
+    for needle in [
+        "build-evaluator-sidecars:",
+        "aarch64-unknown-linux-musl",
+        "x86_64-unknown-linux-musl",
+        "--bin dr-gate",
+        "release/evaluator-sidecars.mjs verify-sidecars",
+        "release/evaluator-sidecars.mjs assemble",
+        "release/evaluator-sidecars.mjs refresh-checksum",
+        "release/evaluator-sidecars.mjs verify-archive",
+        "release/evaluator-sidecars.mjs patch-installers",
+        "release/evaluator-sidecars.mjs verify-installers",
+    ] {
+        assert!(workflow.contains(needle), "{needle} missing from workflow");
+    }
+
+    let assemble = workflow
+        .find("release/evaluator-sidecars.mjs assemble")
+        .expect("archive assembly");
+    let mac_sign = workflow
+        .find("release/trust/sign-macos-artifacts.mjs")
+        .expect("mac signing");
+    let checksums = workflow
+        .find("release/trust/release-trust.mjs checksums")
+        .expect("release checksums");
+    assert!(assemble < mac_sign && mac_sign < checksums, "{workflow}");
+
+    let mac_signer =
+        fs::read_to_string(workspace_root().join("release/trust/sign-macos-artifacts.mjs"))
+            .expect("mac signer");
+    for binary in ["deadreckon", "dr-gate", "dr-capture"] {
+        assert!(
+            mac_signer.contains(&format!("\"{binary}\"")),
+            "{mac_signer}"
+        );
+    }
+    assert!(
+        mac_signer.contains("payloadRoot(extractDir)"),
+        "notarization must cover the complete assembled payload"
+    );
+}
+
+#[test]
+fn evaluator_sidecar_tool_assembles_and_manifests_static_linux_helpers() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let sidecars = temp.path().join("sidecars");
+    let target = "aarch64-apple-darwin";
+    let payload = temp
+        .path()
+        .join("payload")
+        .join(format!("deadreckon-{target}"));
+    fs::create_dir_all(&distrib).expect("distrib");
+    fs::create_dir_all(&sidecars).expect("sidecars");
+    fs::create_dir_all(&payload).expect("payload");
+
+    for helper in ["deadreckon", "dr-gate", "dr-capture"] {
+        fs::write(payload.join(helper), format!("{helper} native")).expect("native helper");
+    }
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
+        0xb7,
+        false,
+    );
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-x86_64-unknown-linux-musl"),
+        0x3e,
+        false,
+    );
+
+    let archive = distrib.join(format!("deadreckon-{target}.tar.xz"));
+    let output = Command::new("tar")
+        .args([
+            "-cJf",
+            archive.to_str().expect("archive path"),
+            "-C",
+            temp.path().join("payload").to_str().expect("payload path"),
+            &format!("deadreckon-{target}"),
+        ])
+        .output()
+        .expect("create archive");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(
+        format!("{}.sha256", archive.display()),
+        format!(
+            "{} *{}\n",
+            "0".repeat(64),
+            archive.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .expect("checksum sibling");
+
+    assert_evaluator_tool_success([
+        "assemble",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+        "--sidecars-dir",
+        sidecars.to_str().expect("sidecars path"),
+    ]);
+    let stale = evaluator_tool([
+        "verify-archive",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+    ]);
+    assert!(
+        !stale.status.success(),
+        "final archive verification must reject a stale cargo-dist checksum sibling"
+    );
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("is stale"),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+    assert_evaluator_tool_success([
+        "refresh-checksum",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+    ]);
+    assert_evaluator_tool_success([
+        "verify-archive",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+    ]);
+
+    let member_manifest = distrib.join("release-archive-members.json");
+    assert_evaluator_tool_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+        "--out",
+        member_manifest.to_str().expect("manifest path"),
+    ]);
+    assert_evaluator_tool_success([
+        "verify-manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--manifest",
+        member_manifest.to_str().expect("manifest path"),
+    ]);
+
+    let manifest = read_json(&member_manifest);
+    assert_eq!(Some(1), manifest["schema_version"].as_u64());
+    assert_eq!(Some(1), manifest["archives"].as_array().map(Vec::len));
+    assert_eq!(Some(2), manifest["evaluators"].as_array().map(Vec::len));
+    let members = manifest["archives"][0]["members"]
+        .as_array()
+        .expect("archive members");
+    for required in [
+        "deadreckon",
+        "dr-gate",
+        "dr-capture",
+        "dr-gate-evaluator-aarch64-unknown-linux-musl",
+        "dr-gate-evaluator-x86_64-unknown-linux-musl",
+    ] {
+        assert!(
+            members
+                .iter()
+                .any(|member| member["name"].as_str() == Some(required)),
+            "{required} missing from {manifest:#}"
+        );
+    }
+    let checksum =
+        fs::read_to_string(format!("{}.sha256", archive.display())).expect("refreshed checksum");
+    assert!(
+        checksum.ends_with(&format!(" *deadreckon-{target}.tar.xz\n")),
+        "{checksum}"
+    );
+}
+
+#[test]
+fn evaluator_sidecar_tool_rejects_dynamically_linked_evaluator() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    write_fake_static_elf(
+        &temp
+            .path()
+            .join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
+        0xb7,
+        true,
+    );
+    write_fake_static_elf(
+        &temp
+            .path()
+            .join("dr-gate-evaluator-x86_64-unknown-linux-musl"),
+        0x3e,
+        false,
+    );
+    let output = evaluator_tool([
+        "verify-sidecars",
+        "--sidecars-dir",
+        temp.path().to_str().expect("temp path"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "dynamic evaluator must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("PT_INTERP"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let sidecars = temp.path().join("sidecars");
+    let payloads = temp.path().join("payloads");
+    fs::create_dir_all(&distrib).expect("distrib");
+    fs::create_dir_all(&sidecars).expect("sidecars");
+    fs::create_dir_all(&payloads).expect("payloads");
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
+        0xb7,
+        false,
+    );
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-x86_64-unknown-linux-musl"),
+        0x3e,
+        false,
+    );
+
+    for target in DIST_TARGETS {
+        let payload_name = format!("deadreckon-{target}");
+        let payload = payloads.join(&payload_name);
+        fs::create_dir_all(&payload).expect("payload");
+        let extension = if target.ends_with("windows-msvc") {
+            ".exe"
+        } else {
+            ""
+        };
+        for helper in [
+            format!("deadreckon{extension}"),
+            format!("dr-gate{extension}"),
+            format!("dr-capture{extension}"),
+        ] {
+            fs::write(payload.join(&helper), format!("{helper} for {target}"))
+                .expect("native helper");
+        }
+
+        let archive = if target.ends_with("windows-msvc") {
+            let archive = distrib.join(format!("deadreckon-{target}.zip"));
+            let output = Command::new("zip")
+                .args(["-X", "-q", "-r"])
+                .arg(&archive)
+                .arg(&payload_name)
+                .current_dir(&payloads)
+                .output()
+                .expect("create Windows zip");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            archive
+        } else {
+            let archive = distrib.join(format!("deadreckon-{target}.tar.xz"));
+            let output = Command::new("tar")
+                .args(["-cJf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(&payloads)
+                .arg(&payload_name)
+                .output()
+                .expect("create target tarball");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            archive
+        };
+        fs::write(
+            format!("{}.sha256", archive.display()),
+            format!(
+                "{} *{}\n",
+                "0".repeat(64),
+                archive.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .expect("stale cargo-dist checksum");
+
+        assert_evaluator_tool_success([
+            "assemble",
+            "--dir",
+            distrib.to_str().expect("distrib path"),
+            "--target",
+            target,
+            "--sidecars-dir",
+            sidecars.to_str().expect("sidecars path"),
+        ]);
+        assert_evaluator_tool_success([
+            "refresh-checksum",
+            "--dir",
+            distrib.to_str().expect("distrib path"),
+            "--target",
+            target,
+        ]);
+        assert_evaluator_tool_success([
+            "verify-archive",
+            "--dir",
+            distrib.to_str().expect("distrib path"),
+            "--target",
+            target,
+        ]);
+    }
+
+    let manifest_path = distrib.join("release-archive-members.json");
+    assert_evaluator_tool_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--out",
+        manifest_path.to_str().expect("manifest path"),
+    ]);
+    assert_evaluator_tool_success([
+        "verify-manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--manifest",
+        manifest_path.to_str().expect("manifest path"),
+    ]);
+
+    let manifest = read_json(&manifest_path);
+    assert_eq!(Some(5), manifest["archives"].as_array().map(Vec::len));
+    assert_eq!(Some(2), manifest["evaluators"].as_array().map(Vec::len));
+    for archive in manifest["archives"].as_array().expect("archive inventory") {
+        let members = archive["members"].as_array().expect("member inventory");
+        assert_eq!(
+            2,
+            members
+                .iter()
+                .filter(|member| member["role"] == "sandbox-evaluator")
+                .count(),
+            "{archive:#}"
+        );
+        assert_eq!(
+            3,
+            members
+                .iter()
+                .filter(|member| member["role"] == "host-helper")
+                .count(),
+            "{archive:#}"
+        );
+    }
+}
+
+#[test]
+fn generated_installers_are_patched_for_native_helpers_and_both_evaluators() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let shell = temp.path().join("deadreckon-installer.sh");
+    let powershell = temp.path().join("deadreckon-installer.ps1");
+    let mut shell_fixture = String::from("case \"$_archive\" in\n");
+    for target in DIST_TARGETS {
+        let windows = target.ends_with("windows-msvc");
+        let suffix = if windows { ".zip" } else { ".tar.xz" };
+        let extension = if windows { ".exe" } else { "" };
+        shell_fixture.push_str(&format!(
+            "  \"deadreckon-{target}{suffix}\")\n    _bins=\"deadreckon{extension} dr-gate{extension} dr-capture{extension}\"\n    _bins_js_array='\"deadreckon{extension}\",\"dr-gate{extension}\",\"dr-capture{extension}\"'\n    ;;\n"
+        ));
+    }
+    shell_fixture.push_str("esac\n");
+    fs::write(&shell, shell_fixture).expect("shell installer");
+    fs::write(
+        &powershell,
+        r#"$platform = @{
+  "artifact_name" = "deadreckon-x86_64-pc-windows-msvc.zip"
+  "bins" = @("deadreckon.exe", "dr-gate.exe", "dr-capture.exe")
+}
+"#,
+    )
+    .expect("PowerShell installer");
+
+    assert_evaluator_tool_success([
+        "patch-installers",
+        "--dir",
+        temp.path().to_str().expect("temp path"),
+    ]);
+    assert_evaluator_tool_success([
+        "verify-installers",
+        "--dir",
+        temp.path().to_str().expect("temp path"),
+    ]);
+
+    for installer in [&shell, &powershell] {
+        let text = fs::read_to_string(installer).expect("patched installer");
+        for evaluator in [
+            "dr-gate-evaluator-aarch64-unknown-linux-musl",
+            "dr-gate-evaluator-x86_64-unknown-linux-musl",
+        ] {
+            assert!(text.contains(evaluator), "{}: {text}", installer.display());
+        }
+    }
 }
 
 #[test]
@@ -1152,6 +1722,42 @@ fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
         "--checksums",
         sums.to_str().expect("utf8 path"),
     ]);
+}
+
+fn write_fake_static_elf(path: &Path, machine: u16, with_interp: bool) {
+    let mut bytes = vec![0_u8; 64 + 56];
+    bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    bytes[4] = 2; // ELFCLASS64
+    bytes[5] = 1; // little endian
+    bytes[6] = 1; // ELF version
+    bytes[16..18].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN/static PIE
+    bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+    bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+    bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+    bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+    bytes[64..68].copy_from_slice(&(if with_interp { 3_u32 } else { 1_u32 }).to_le_bytes());
+    fs::write(path, bytes).expect("write fake ELF");
+}
+
+fn evaluator_tool<const N: usize>(args: [&str; N]) -> std::process::Output {
+    Command::new("node")
+        .arg(workspace_root().join("release/evaluator-sidecars.mjs"))
+        .args(args)
+        .current_dir(workspace_root())
+        .output()
+        .expect("run evaluator-sidecars")
+}
+
+fn assert_evaluator_tool_success<const N: usize>(args: [&str; N]) {
+    let output = evaluator_tool(args);
+    assert!(
+        output.status.success(),
+        "evaluator-sidecars failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn release_trust<const N: usize>(args: [&str; N]) -> std::process::Output {

@@ -200,7 +200,7 @@ pub fn boot_identity() -> String {
         }
     }
     #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("sysctl")
+    if let Ok(output) = Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.boottime"])
         .output()
         && output.status.success()
@@ -230,7 +230,7 @@ pub fn process_start_identity(pid: u32) -> Option<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("ps")
+        let output = Command::new("/bin/ps")
             .args(["-p", &pid.to_string(), "-o", "lstart="])
             .output()
             .ok()?;

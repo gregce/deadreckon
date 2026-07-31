@@ -44,6 +44,14 @@ pub struct LeaseToken {
     pub boot_id: String,
 }
 
+/// Event metadata committed with one fenced controller-owned JSON projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FencedJobJsonEvent {
+    pub kind: JobEventKind,
+    pub causation_id: String,
+    pub detail: Value,
+}
+
 impl From<&JobLease> for LeaseToken {
     fn from(lease: &JobLease) -> Self {
         Self {
@@ -253,9 +261,7 @@ pub fn replace_fenced_job_json_and_append_event<T: serde::Serialize>(
     token: &LeaseToken,
     now: DateTime<Utc>,
     artifact_path: &std::path::Path,
-    kind: JobEventKind,
-    causation_id: String,
-    detail: Value,
+    event: FencedJobJsonEvent,
     value: &T,
 ) -> Result<JobProjection> {
     let job_dir = paths.job_dir(token.job_id.as_ref());
@@ -301,11 +307,11 @@ pub fn replace_fenced_job_json_and_append_event<T: serde::Serialize>(
         job_id: token.job_id.clone(),
         sequence,
         event_id: Uuid::new_v4().to_string(),
-        causation_id,
+        causation_id: event.causation_id,
         timestamp: now,
         lease_epoch: token.epoch,
-        kind,
-        detail,
+        kind: event.kind,
+        detail: event.detail,
     };
     atomic_write_json(artifact_path, value)?;
     append_job_event_locked(paths, &event)
@@ -455,8 +461,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, append_fenced_job_event,
-        claim_job_lease, heartbeat_job_lease, replace_fenced_job_json_and_append_event,
+        FencedJobJsonEvent, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason,
+        append_fenced_job_event, claim_job_lease, heartbeat_job_lease,
+        replace_fenced_job_json_and_append_event,
     };
     use crate::job::{load_job_projection, read_job_history};
     use crate::paths::DeadreckonPaths;
@@ -619,9 +626,11 @@ mod tests {
             &stale,
             now + TimeDelta::seconds(17),
             &artifact,
-            JobEventKind::CampaignSubAuthorityChanged,
-            "stale-artifact".to_string(),
-            json!({"transition": "prepared"}),
+            FencedJobJsonEvent {
+                kind: JobEventKind::CampaignSubAuthorityChanged,
+                causation_id: "stale-artifact".to_string(),
+                detail: json!({"transition": "prepared"}),
+            },
             &json!({"authority": "stale"}),
         )
         .expect_err("stale worker must not replace the projection");
@@ -654,9 +663,11 @@ mod tests {
             &token,
             now + TimeDelta::seconds(1),
             &outside,
-            JobEventKind::CampaignSubAuthorityChanged,
-            "escaped-artifact".to_string(),
-            json!({"transition": "prepared"}),
+            FencedJobJsonEvent {
+                kind: JobEventKind::CampaignSubAuthorityChanged,
+                causation_id: "escaped-artifact".to_string(),
+                detail: json!({"transition": "prepared"}),
+            },
             &json!({"authority": "escaped"}),
         )
         .expect_err("fenced projection must remain under its Job directory");

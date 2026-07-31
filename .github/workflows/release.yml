@@ -87,8 +87,6 @@ jobs:
     runs-on: ubuntu-22.04
     needs:
       - release-policy
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,11 +98,9 @@ jobs:
       - name: Plan release artifacts
         shell: bash
         run: |
-          if [[ "${{ needs.release-policy.outputs.build_artifacts }}" == "true" ]]; then
-            dist host --steps=create --tag="${GITHUB_REF_NAME}" --output-format=json > dist-plan.json
-          else
-            dist plan --output-format=json > dist-plan.json
-          fi
+          # Planning is read-only on branches, pull requests, and release tags.
+          # Only publish-github-release owns GitHub Release mutations.
+          dist plan --output-format=json > dist-plan.json
           jq . dist-plan.json > /dev/null
       - name: Upload dist plan
         uses: actions/upload-artifact@v4
@@ -142,6 +138,57 @@ jobs:
           cargo test --release -p deadreckon --features internal-characterization --test chain --test orchestrate --locked
           make size-check
 
+  build-evaluator-sidecars:
+    name: build evaluator ${{ matrix.target }}
+    if: needs.release-policy.outputs.build_artifacts == 'true'
+    needs:
+      - release-policy
+      - release-preflight
+      - release-verify
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install evaluator Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install cargo-zigbuild for static Linux evaluators
+        shell: bash
+        run: |
+          python3 -m pip install --user cargo-zigbuild==0.23.0 ziglang==0.14.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build static evaluator
+        shell: bash
+        run: |
+          cargo zigbuild \
+            --release \
+            --locked \
+            --no-default-features \
+            -p deadreckon \
+            --bin dr-gate \
+            --target ${{ matrix.target }}
+          mkdir -p target/evaluator-sidecars
+          install -m 0755 \
+            "target/${{ matrix.target }}/release/dr-gate" \
+            "target/evaluator-sidecars/dr-gate-evaluator-${{ matrix.target }}"
+          node release/evaluator-sidecars.mjs verify-sidecars \
+            --sidecars-dir target/evaluator-sidecars \
+            --target ${{ matrix.target }}
+      - name: Upload static evaluator
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluator-sidecar-${{ matrix.target }}
+          path: target/evaluator-sidecars/**
+
   build-local-artifacts:
     name: build ${{ matrix.target }}
     if: needs.release-policy.outputs.build_artifacts == 'true'
@@ -149,6 +196,7 @@ jobs:
       - release-policy
       - release-preflight
       - release-verify
+      - build-evaluator-sidecars
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +218,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Check Windows stable signing secrets
         if: matrix.target == 'x86_64-pc-windows-msvc' && needs.release-policy.outputs.requires_windows_signing == 'true'
         shell: bash
@@ -203,11 +254,26 @@ jobs:
         if: matrix.zigbuild == true
         shell: bash
         run: |
-          python3 -m pip install --user cargo-zigbuild
+          python3 -m pip install --user cargo-zigbuild==0.23.0 ziglang==0.14.1
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build target artifacts
         run: |
           dist build --tag=${{ github.ref_name }} --artifacts=local --target=${{ matrix.target }} --output-format=json > dist-manifest-${{ matrix.target }}.json
+      - name: Download static evaluator sidecars
+        uses: actions/download-artifact@v4
+        with:
+          pattern: evaluator-sidecar-*
+          path: target/evaluator-sidecars
+          merge-multiple: true
+      - name: Assemble complete target archive
+        shell: bash
+        run: |
+          node release/evaluator-sidecars.mjs verify-sidecars \
+            --sidecars-dir target/evaluator-sidecars
+          node release/evaluator-sidecars.mjs assemble \
+            --dir target/distrib \
+            --target ${{ matrix.target }} \
+            --sidecars-dir target/evaluator-sidecars
       - name: Decode Windows signing certificate
         if: matrix.target == 'x86_64-pc-windows-msvc' && needs.release-policy.outputs.requires_windows_signing == 'true'
         shell: pwsh
@@ -253,13 +319,22 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PWD: ${{ secrets.APPLE_APP_PWD }}
         run: |
-          # The helper extracts the cargo-dist archive, signs the packaged binary,
-          # runs codesign --verify --verbose, submits with xcrun notarytool submit,
-          # then repacks the archive that will be uploaded.
+          # The helper signs and verifies every native executable, submits the
+          # complete assembled payload with xcrun notarytool submit, then
+          # repacks the exact archive that will be checksummed and uploaded.
           node release/trust/sign-macos-artifacts.mjs \
             --dir target/distrib \
             --target ${{ matrix.target }} \
             --identity "Developer ID Application"
+      - name: Refresh checksum and verify final target archive
+        shell: bash
+        run: |
+          node release/evaluator-sidecars.mjs refresh-checksum \
+            --dir target/distrib \
+            --target ${{ matrix.target }}
+          node release/evaluator-sidecars.mjs verify-archive \
+            --dir target/distrib \
+            --target ${{ matrix.target }}
       - name: Upload target artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -298,6 +373,12 @@ jobs:
       - name: Patch Homebrew formula receipt
         run: |
           node release/homebrew/patch-formula.mjs target/distrib
+      - name: Patch and verify generated installers
+        run: |
+          node release/evaluator-sidecars.mjs patch-installers \
+            --dir target/distrib
+          node release/evaluator-sidecars.mjs verify-installers \
+            --dir target/distrib
       - name: Upload global artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -332,6 +413,14 @@ jobs:
         with:
           name: dist-global
           path: target/distrib
+      - name: Generate and verify archive-member manifest
+        run: |
+          node release/evaluator-sidecars.mjs manifest \
+            --dir target/distrib \
+            --out target/distrib/release-archive-members.json
+          node release/evaluator-sidecars.mjs verify-manifest \
+            --dir target/distrib \
+            --manifest target/distrib/release-archive-members.json
       - name: Generate release SBOM
         run: |
           node release/trust/release-trust.mjs sbom \
@@ -406,10 +495,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install dist
-        shell: bash
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
       - name: Download release trust bundle
         uses: actions/download-artifact@v4
         with:
@@ -419,11 +504,10 @@ jobs:
         shell: bash
         run: |
           tag="${{ github.ref_name }}"
-          # cargo-dist's hosting backend is not wired into this hand-maintained
-          # workflow (hosting stays null, so `dist host` cannot create the
-          # release), so publish the release directly with gh. Collect every
-          # release artifact from the trust bundle, de-duplicated by basename
-          # (the global artifact layout nests some files twice).
+          # This is the workflow's sole GitHub Release mutation boundary. It
+          # runs only after the trust bundle and attestations succeed. Collect
+          # every release artifact, de-duplicated by basename (the global
+          # artifact layout nests some files twice), then publish with gh.
           declare -A seen
           files=()
           while IFS= read -r f; do
@@ -437,13 +521,15 @@ jobs:
               -o -name '*.sha256' -o -name 'sha256.sum' -o -name 'SHA256SUMS' \
               -o -name 'deadreckon-installer.sh' -o -name 'deadreckon-installer.ps1' \
               -o -name '*.rb' -o -name 'release-manifest.json' \
+              -o -name 'release-archive-members.json' \
               -o -name 'release.spdx.json' -o -path '*/trust/*.json' \) | sort)
           notes="target/distrib/release-body.md"
           cat > "$notes" <<'EOF'
           ## Verify artifacts
 
-          Download `SHA256SUMS`, `release-manifest.json`, and `release.spdx.json`
-          from this release, then verify artifacts with:
+          Download `SHA256SUMS`, `release-manifest.json`,
+          `release-archive-members.json`, and `release.spdx.json` from this
+          release, then verify artifacts with:
 
           ```sh
           shasum -a 256 -c SHA256SUMS

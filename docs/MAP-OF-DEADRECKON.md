@@ -119,7 +119,7 @@ truthfully by Jobs.
 | Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close live recovery proof** |
 | Lifecycle control | Start, observe, cancel and finish Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason | Ordinary operations read persisted control truth | **Stable / bounded**: the cross-kind journey and Job resolver are tested | **Preserve one resolver and one Job event truth** |
 | Codebase isolation | Contain changes and make promotion deliberate | Worktree, copy, fresh-repo and in-place modes separate the agent's workspace from the user's target | Isolation is part of the run contract, not a provider feature | **Hardened** | **Essential; preserve** |
-| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; a real Docker test proves the common control boundary, while a public strict Docker Job and live Linux gate proof remain outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
+| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; real Docker tests prove the common control boundary and the public strict-Job completion, cancellation and worker-recovery paths on macOS arm64. Clean-source recording and live Linux gate proof remain outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
 | Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event and steering parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
 | Structured provider contracts | Replace output scraping with declared event semantics | Pi/Copilot and app-server paths emit/consume typed events; other adapters retain parsing gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
 | Budgets and context | Bound delegated work and reveal consumption | Wall-time, turn and API-spend caps plus spend/context records drive status and stopping | Budget is enforced by the outer harness | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
@@ -217,9 +217,12 @@ path denial, gate-input scrubbing, residual cleanup and signed observed backend;
 it also cancels a held-open evaluator and SIGKILLs the outer launcher, proving
 the old group is reaped before cancellation or one bounded retry. An opt-in
 real Docker test separately proves the common key, environment, network and
-control-path boundary. Live Linux/bubblewrap proof, a public strict Docker Job
-with a platform-compatible gate, and a real service-backed reboot remain
-outstanding.
+control-path boundary. Three public strict Docker Job tests using a static
+Linux evaluator sidecar also pass on macOS arm64: deterministic completion
+followed by semantic `NEEDS_REVIEW`, operator cancellation without retry or
+receipt, and worker `SIGKILL` cleanup before exactly one bounded retry. Those
+new results still need a clean-source evidence artifact. Live
+Linux/bubblewrap proof and a real service-backed reboot remain outstanding.
 
 ## Original unmet needs: current outcome
 
@@ -327,7 +330,9 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   for protocol corruption, lease races and reclaim, protected paths, receipt
   tampering, promotion refusal and service rendering. The real macOS
   public-command end-to-end test proves the contained two-phase Seatbelt gate,
-  and a real Docker test proves the common control boundary. The committed
+  and real Docker tests prove the common control boundary plus public strict
+  Job completion, cancellation and one bounded worker-death recovery on macOS
+  arm64. The committed
   credential-free adversarial result records 12 passes and 0 failures. The
   24-row live operator kit records 2 attempted tasks, 22 not run, and 0
   verified. A passive recorder defines evidence and oracles for all 9
@@ -335,8 +340,10 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   protected `dr-capture` mode authenticates the exact Job, append-only history,
   deterministic evaluation and HMAC publication receipt; operator-supplied
   compatibility captures remain explicitly inconclusive.
-  There is no live Linux/bubblewrap or public strict Docker Job result, reboot
-  result, or measured false-accept and false-reject rate.
+  The newer public strict Docker results are local implementation evidence and
+  are not yet bound to a clean committed source in that result artifact. There
+  is no live Linux/bubblewrap result, reboot result, or measured false-accept
+  and false-reject rate.
 
 ### Product bets needing validation
 
@@ -414,11 +421,12 @@ paths, tests, changelog, goal and rider history, [`PRODUCT.md`](../PRODUCT.md),
 The map is intentionally stricter than milestone labels such as “closed” or
 “stable”: those labels demonstrate implementation progress, while this
 document asks whether the operator outcome is actually met. The real macOS
-public-command gate trial proves the contained two-phase Seatbelt path, and the
-opt-in Docker trial proves the common container control boundary. Unit and
-integration tests and the 24-row dogfood result, with 2 attempted tasks, 22 not
-run and 0 verified, do not establish live Linux/bubblewrap or a public strict
-Docker Job, successful reboot recovery, live cross-provider behavior, or
-false-accept and false-reject rates. Market maturity, frequency of use and
-willingness to pay cannot be inferred from this repository and remain
-validation questions.
+public-command gate trial proves the contained two-phase Seatbelt path. Opt-in
+Docker trials prove the common container control boundary and, on macOS arm64,
+public strict-Job completion, cancellation and worker-death recovery. The
+newer Docker results are not yet recorded against a clean committed source.
+Unit and integration tests and the 24-row dogfood result, with 2 attempted
+tasks, 22 not run and 0 verified, do not establish live Linux/bubblewrap,
+successful reboot recovery, live cross-provider behavior, or false-accept and
+false-reject rates. Market maturity, frequency of use and willingness to pay
+cannot be inferred from this repository and remain validation questions.

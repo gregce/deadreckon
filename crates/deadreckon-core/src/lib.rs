@@ -125,8 +125,8 @@ pub use job::{
     reduce_job_history, write_job,
 };
 pub use job_lease::{
-    LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, LeaseToken,
-    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease,
+    FencedJobJsonEvent, LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason,
+    LeaseToken, append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease,
     replace_fenced_job_json_and_append_event,
 };
 pub use lock::{
@@ -162,12 +162,12 @@ pub use run_view::{
     WhyBand,
 };
 pub use sandbox_observation::{
-    SANDBOX_BOUNDARY_OBSERVATION_JSON, sandbox_boundary_observation_sha256,
-    sandbox_boundary_result_tree_sha256, seal_sandbox_boundary_observation,
-    validate_sandbox_boundary_observation,
+    SANDBOX_BOUNDARY_OBSERVATION_JSON, gate_evaluator_identity_sha256,
+    sandbox_boundary_observation_sha256, sandbox_boundary_result_tree_sha256,
+    seal_sandbox_boundary_observation, validate_sandbox_boundary_observation,
 };
 pub use state::{
-    CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, ProviderFailureDisposition,
-    RunListEntry, RunOptions, RunOwnership, RunOwnershipArtifact, RunStatus, create_owned_run,
-    create_run, list_runs, load_run, save_state,
+    CurrentRunPointer, MergeRepairOwnership, PhaseId, PhaseState, PhaseStatus, PipelineState,
+    ProviderFailureDisposition, RunListEntry, RunOptions, RunOwnership, RunOwnershipArtifact,
+    RunStatus, create_owned_run, create_run, list_runs, load_run, save_state,
 };

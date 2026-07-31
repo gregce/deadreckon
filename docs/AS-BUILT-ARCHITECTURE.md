@@ -1002,7 +1002,25 @@ Optionally writes the profile to `spec.profile_dir` for debugging (`commands.rs:
 
 ### 11.6 Docker
 
-`commands.rs:118-147`. Constructs `docker run --rm -v <cwd>:<cwd> -w <cwd> [--network none] [-e KEY=VAL]... rust:1 <program> <args...>`. Hardcoded base image is `rust:1`. Only the cwd is mounted.
+Docker remains opt-in. Ordinary sandbox calls use the configured image and
+mount policy. A strict Job gate uses a typed Docker execution identity instead
+of trusting a mutable image name: the policy binds an immutable image ID,
+Linux platform, static evaluator digest and fixed guest path. The controller
+mounts the working tree and approved gate inputs with explicit read/write
+roles, masks protected Job, proof, key, operator-capture and Git-control paths,
+scrubs signing inputs, and applies the requested network policy.
+
+Before launch, the controller durably records the Job ID, attempt, launch ID,
+container name, expected labels, image ID, platform and cidfile. Reconciliation
+inspects those labels before removing anything. Normal completion,
+cancellation, abandoned-lease recovery and retry all prove the container is
+absent before deleting the record. A missing or mismatched identity fails
+closed as lost containment; it is never treated as reassuring cleanup.
+
+Release archives carry both static Linux evaluator sidecars beside
+`deadreckon`: arm64 and x86-64 musl builds. This lets a macOS or Windows
+controller launch the platform-compatible evaluator inside a Linux container
+without attempting to execute its host-native `dr-gate`.
 
 ### 11.7 None
 
@@ -1664,9 +1682,10 @@ Every commit is expected to leave the workspace green on:
 
 ```zsh
 cargo build --release
-cargo test --workspace
+cargo test --workspace --all-targets
+cargo check --workspace --all-targets
 cargo clippy --workspace -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
 ```
 
 ---

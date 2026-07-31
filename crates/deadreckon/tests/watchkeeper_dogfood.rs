@@ -112,6 +112,7 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "network_denial",
         "gate_key_search_and_forgery",
         "docker_control_boundary",
+        "docker_gate_boundary",
         "receipt_mutation",
         "result_delivery",
         "unified_job_journey",
@@ -130,7 +131,6 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "live_provider_parent_repair",
         "live_campaign_interruption_recovery",
         "linux_bubblewrap_gate_boundary",
-        "docker_gate_boundary",
     ] {
         assert!(
             source.contains(unproven),
@@ -150,10 +150,147 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
             "missing unified Job proof {unified_job_proof}"
         );
     }
+    for public_docker_proof in [
+        "live_docker_public_job_completes_deterministic_gate_and_cleans_daemon_state",
+        "live_docker_public_cancel_removes_container_record_and_prevents_retry",
+        "live_docker_worker_sigkill_reconciles_stale_container_before_one_retry",
+    ] {
+        assert!(
+            source.contains(public_docker_proof),
+            "missing public Docker proof {public_docker_proof}"
+        );
+    }
     assert!(source.contains("\"status\": \"unproven\""));
     assert!(source.contains("\"matrix_status\": matrix_status(repo)"));
     assert!(source.contains("\"seatbelt_preflight\": seatbelt"));
     assert!(source.contains("\"docker_preflight\": docker"));
+    assert!(source.contains("\"public_docker_preflight\": public_docker"));
+    assert!(source.contains("DEADRECKON_LIVE_DOCKER_TEST=1"));
+    assert!(source.contains("dr-gate-evaluator-aarch64-unknown-linux-musl"));
+    assert!(source.contains("arm64/linux"));
+}
+
+#[test]
+fn public_docker_preflight_gates_prerequisites_and_runs_all_three_proofs_when_ready() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake_bin = temp.path().join("bin");
+    let target = temp.path().join("target");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    let docker = fake_bin.join("docker");
+    fs::write(
+        &docker,
+        r#"#!/bin/sh
+case "$1" in
+  version) printf '%s\n' '27.0.0' ;;
+  image) printf 'sha256:fixture %s\n' "${WK_FAKE_DOCKER_PLATFORM:-arm64/linux}" ;;
+  *) exit 2 ;;
+esac
+"#,
+    )
+    .expect("fake docker");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).expect("docker executable");
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let runner = dogfood_dir().join("adversarial.py");
+    let run = |name: &str, platform: &str| {
+        let output = temp.path().join(format!("{name}.json"));
+        let status = Command::new("python3")
+            .arg(&runner)
+            .arg("--repo")
+            .arg(&repo)
+            .arg("--output")
+            .arg(&output)
+            .args(["--only", "docker_gate_boundary"])
+            .env("PATH", &path)
+            .env("CARGO_TARGET_DIR", &target)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("WK_FAKE_DOCKER_PLATFORM", platform)
+            .status()
+            .expect("credential-free runner");
+        assert!(status.success(), "an unavailable prerequisite is unproven");
+        serde_json::from_slice::<Value>(&fs::read(output).expect("runner output"))
+            .expect("runner JSON")
+    };
+
+    let wrong_image = run("wrong-image", "amd64/linux");
+    assert_eq!(wrong_image["trials"][0]["status"], "unproven");
+    assert_eq!(
+        wrong_image["trials"][0]["reason"],
+        "the cached rust:1 image is not arm64/linux"
+    );
+    assert_eq!(wrong_image["trials"][0]["commands"], json!([]));
+
+    let missing_sidecar = run("missing-sidecar", "arm64/linux");
+    assert_eq!(missing_sidecar["trials"][0]["status"], "unproven");
+    assert!(
+        missing_sidecar["trials"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("sidecar is not installed"))
+    );
+
+    let sidecar = target
+        .join("debug")
+        .join("dr-gate-evaluator-aarch64-unknown-linux-musl");
+    fs::create_dir_all(sidecar.parent().expect("sidecar parent")).expect("sidecar parent");
+    fs::write(&sidecar, "not an ELF executable").expect("invalid sidecar");
+    fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o755)).expect("sidecar executable");
+    let dynamic_or_invalid = run("invalid-sidecar", "arm64/linux");
+    assert_eq!(dynamic_or_invalid["trials"][0]["status"], "unproven");
+    assert_eq!(
+        dynamic_or_invalid["trials"][0]["reason"],
+        "the evaluator sidecar is not a static Linux arm64 ELF binary"
+    );
+    assert_eq!(
+        dynamic_or_invalid["live_claims"].as_array().map(Vec::len),
+        Some(8)
+    );
+    assert!(
+        dynamic_or_invalid["live_claims"]
+            .as_array()
+            .is_some_and(|claims| {
+                claims
+                    .iter()
+                    .all(|claim| claim["id"] != "docker_gate_boundary")
+            })
+    );
+
+    let cargo = fake_bin.join("cargo");
+    fs::write(
+        &cargo,
+        r#"#!/bin/sh
+for argument in "$@"; do
+  case "$argument" in
+    live_docker_*) printf 'test %s ... ok\n' "$argument"; exit 0 ;;
+  esac
+done
+exit 2
+"#,
+    )
+    .expect("fake cargo");
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("cargo executable");
+    let mut static_arm64_elf = vec![0_u8; 120];
+    static_arm64_elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    static_arm64_elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
+    static_arm64_elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    static_arm64_elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    static_arm64_elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    static_arm64_elf[64..68].copy_from_slice(&1_u32.to_le_bytes());
+    fs::write(&sidecar, static_arm64_elf).expect("static arm64 sidecar");
+    let ready = run("ready", "arm64/linux");
+    assert_eq!(ready["trials"][0]["status"], "passed");
+    let commands = ready["trials"][0]["commands"]
+        .as_array()
+        .expect("public Docker commands");
+    assert_eq!(commands.len(), 3);
+    assert!(
+        commands
+            .iter()
+            .all(|command| command["observed_pass"] == true)
+    );
 }
 
 #[test]
@@ -420,6 +557,7 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         "network_denial",
         "gate_key_search_and_forgery",
         "docker_control_boundary",
+        "docker_gate_boundary",
         "receipt_mutation",
         "result_delivery",
         "unified_job_journey",
@@ -438,11 +576,35 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
             "checked adversarial result {id} must pass"
         );
     }
+    let public_docker = trials
+        .iter()
+        .find(|trial| trial["id"] == "docker_gate_boundary")
+        .expect("public Docker result");
+    let public_docker_commands = public_docker["commands"]
+        .as_array()
+        .expect("public Docker commands");
+    assert_eq!(public_docker_commands.len(), 3);
+    for (command, expected) in public_docker_commands.iter().zip([
+        "live_docker_public_job_completes_deterministic_gate_and_cleans_daemon_state",
+        "live_docker_public_cancel_removes_container_record_and_prevents_retry",
+        "live_docker_worker_sigkill_reconciles_stale_container_before_one_retry",
+    ]) {
+        assert_eq!(command["expected_test"], expected);
+        assert_eq!(command["observed_pass"], true);
+    }
+    assert_eq!(
+        payload["host"]["public_docker_preflight"]["operational"],
+        true
+    );
     let live = payload["live_claims"].as_array().expect("live claims");
-    assert_eq!(live.len(), 9);
+    assert_eq!(live.len(), 8);
     assert!(
         live.iter()
             .all(|claim| claim["status"].as_str() == Some("unproven"))
+    );
+    assert!(
+        live.iter()
+            .all(|claim| claim["id"].as_str() != Some("docker_gate_boundary"))
     );
 }
 

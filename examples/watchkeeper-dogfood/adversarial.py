@@ -10,6 +10,8 @@ import json
 import os
 import platform
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import time
@@ -33,6 +35,7 @@ class Trial:
     limitation: str
     macos_sandbox_required: bool = False
     docker_required: bool = False
+    public_docker_required: bool = False
 
 
 TRIALS = (
@@ -184,8 +187,39 @@ TRIALS = (
                 "tests::live_docker_denies_control_tampering_and_gate_inputs",
             ),
         ),
-        "This executes the common boundary in a real Linux container. A macOS host cannot execute its Mach-O dr-gate inside that container, so the public strict Docker Job path remains a separate live claim.",
+        "This executes the common boundary in a real Linux container. Public strict Docker Job completion, cancellation and crash recovery remain a separate proof group.",
         docker_required=True,
+    ),
+    Trial(
+        "docker_gate_boundary",
+        "Public strict Docker Jobs complete deterministic verification, clean up after operator cancellation, and reconcile a killed worker before exactly one bounded retry.",
+        "public_strict_docker_job",
+        tuple(
+            ProofCommand(
+                (
+                    "env",
+                    "DEADRECKON_LIVE_DOCKER_TEST=1",
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon",
+                    "--test",
+                    "watchkeeper_trust_boundary",
+                    test_name,
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ),
+                test_name,
+            )
+            for test_name in (
+                "live_docker_public_job_completes_deterministic_gate_and_cleans_daemon_state",
+                "live_docker_public_cancel_removes_container_record_and_prevents_retry",
+                "live_docker_worker_sigkill_reconciles_stale_container_before_one_retry",
+            )
+        ),
+        "This uses real local Docker with credential-free smoke transports. It proves public deterministic containment, cancellation and crash recovery, not live provider execution or semantic achievement.",
+        public_docker_required=True,
     ),
     Trial(
         "receipt_mutation",
@@ -625,11 +659,6 @@ UNPROVEN = (
         "status": "unproven",
         "reason": "requires a Linux host with an operational bubblewrap backend",
     },
-    {
-        "id": "docker_gate_boundary",
-        "status": "unproven",
-        "reason": "the real Docker control boundary is covered separately; this claim requires a public strict Job whose platform-compatible dr-gate runs inside the container",
-    },
 )
 
 
@@ -722,16 +751,29 @@ def docker_preflight() -> dict[str, Any]:
         check=False,
     )
     image = subprocess.run(
-        (binary, "image", "inspect", "rust:1", "--format", "{{.Id}}"),
+        (
+            binary,
+            "image",
+            "inspect",
+            "rust:1",
+            "--format",
+            "{{.Id}} {{.Architecture}}/{{.Os}}",
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
     )
-    operational = daemon.returncode == 0 and image.returncode == 0
+    image_fields = image.stdout.decode("utf-8", errors="replace").strip().split()
+    image_id = image_fields[0] if image.returncode == 0 and image_fields else None
+    image_platform = image_fields[1] if len(image_fields) == 2 else None
+    image_cached = image.returncode == 0 and image_id is not None
+    operational = daemon.returncode == 0 and image_cached
     return {
         "available": True,
         "operational": operational,
-        "image_cached": image.returncode == 0,
+        "image_cached": image_cached,
+        "image_id_sha256": digest(image_id.encode()) if image_id is not None else None,
+        "image_platform": image_platform,
         "daemon_returncode": daemon.returncode,
         "image_returncode": image.returncode,
         "daemon_stdout_sha256": digest(daemon.stdout),
@@ -746,11 +788,99 @@ def docker_preflight() -> dict[str, Any]:
     }
 
 
+def cargo_target_directory(repo: Path) -> Path:
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    if configured is None:
+        return repo / "target"
+    target = Path(configured)
+    return target if target.is_absolute() else repo / target
+
+
+def static_linux_arm64_elf(data: bytes) -> bool:
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        return False
+    try:
+        machine = struct.unpack_from("<H", data, 18)[0]
+        program_offset = struct.unpack_from("<Q", data, 32)[0]
+        entry_size = struct.unpack_from("<H", data, 54)[0]
+        entry_count = struct.unpack_from("<H", data, 56)[0]
+    except struct.error:
+        return False
+    if machine != 183 or program_offset < 64 or entry_size < 56 or entry_count == 0:
+        return False
+    if program_offset + entry_size * entry_count > len(data):
+        return False
+    for index in range(entry_count):
+        start = program_offset + index * entry_size
+        if struct.unpack_from("<I", data, start)[0] == 3:
+            return False
+    return True
+
+
+def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any]:
+    sidecar_name = "dr-gate-evaluator-aarch64-unknown-linux-musl"
+    sidecar = cargo_target_directory(repo) / "debug" / sidecar_name
+    sidecar_present = False
+    sidecar_regular = False
+    sidecar_executable = False
+    sidecar_compatible = False
+    sidecar_sha256 = None
+    try:
+        metadata = sidecar.lstat()
+        sidecar_present = True
+        sidecar_regular = stat.S_ISREG(metadata.st_mode)
+        sidecar_executable = sidecar_regular and bool(metadata.st_mode & 0o111)
+        if sidecar_regular and 0 < metadata.st_size <= 256 * 1024 * 1024:
+            sidecar_bytes = sidecar.read_bytes()
+            sidecar_sha256 = digest(sidecar_bytes)
+            sidecar_compatible = static_linux_arm64_elf(sidecar_bytes)
+    except OSError:
+        pass
+
+    image_compatible = docker.get("image_platform") == "arm64/linux"
+    operational = (
+        bool(docker.get("operational"))
+        and image_compatible
+        and sidecar_regular
+        and sidecar_executable
+        and sidecar_compatible
+    )
+    if not docker.get("operational"):
+        reason = docker.get("reason")
+    elif not image_compatible:
+        reason = "the cached rust:1 image is not arm64/linux"
+    elif not sidecar_present:
+        reason = (
+            "the static Linux arm64 evaluator sidecar is not installed beside "
+            "Cargo's debug deadreckon binary"
+        )
+    elif not sidecar_regular:
+        reason = "the static Linux arm64 evaluator sidecar is not a regular non-symlink file"
+    elif not sidecar_executable:
+        reason = "the static Linux arm64 evaluator sidecar is not executable"
+    elif not sidecar_compatible:
+        reason = "the evaluator sidecar is not a static Linux arm64 ELF binary"
+    else:
+        reason = None
+    return {
+        "operational": operational,
+        "image_compatible": image_compatible,
+        "sidecar_name": sidecar_name,
+        "sidecar_present": sidecar_present,
+        "sidecar_regular": sidecar_regular,
+        "sidecar_executable": sidecar_executable,
+        "sidecar_compatible": sidecar_compatible,
+        "sidecar_sha256": sidecar_sha256,
+        "reason": reason,
+    }
+
+
 def run_trial(
     repo: Path,
     trial: Trial,
     seatbelt: dict[str, Any],
     docker: dict[str, Any],
+    public_docker: dict[str, Any],
 ) -> dict[str, Any]:
     if trial.macos_sandbox_required and not seatbelt["operational"]:
         return {
@@ -769,6 +899,16 @@ def run_trial(
             "proof_type": trial.proof_type,
             "status": "unproven",
             "reason": docker["reason"],
+            "limitation": trial.limitation,
+            "commands": [],
+        }
+    if trial.public_docker_required and not public_docker["operational"]:
+        return {
+            "id": trial.trial_id,
+            "claim": trial.claim,
+            "proof_type": trial.proof_type,
+            "status": "unproven",
+            "reason": public_docker["reason"],
             "limitation": trial.limitation,
             "commands": [],
         }
@@ -834,7 +974,8 @@ def main() -> int:
     ]
     seatbelt = seatbelt_preflight()
     docker = docker_preflight()
-    trials = [run_trial(repo, trial, seatbelt, docker) for trial in selected]
+    public_docker = public_docker_preflight(repo, docker)
+    trials = [run_trial(repo, trial, seatbelt, docker, public_docker) for trial in selected]
     payload = {
         "schema_version": 1,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -850,6 +991,7 @@ def main() -> int:
             "python": platform.python_version(),
             "seatbelt_preflight": seatbelt,
             "docker_preflight": docker,
+            "public_docker_preflight": public_docker,
         },
         "runner_sha256": digest(Path(__file__).read_bytes()),
         "summary": {

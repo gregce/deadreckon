@@ -49,9 +49,9 @@ fn materialize_command_with_paths(
     let (state, plan_context, dest, authority) = match resolved {
         super::reference::ResolvedRef::Job(job) => {
             let state = finish_job_state(paths, &job)?;
-            let authority = MaterializeDeliveryAuthority::Verified(
+            let authority = MaterializeDeliveryAuthority::Verified(Box::new(
                 VerifiedDeliveryAuthority::from_finished_job(paths, &job, &state)?,
-            );
+            ));
             (state, None, dest, authority)
         }
         super::reference::ResolvedRef::Run(state)
@@ -381,7 +381,7 @@ impl VerifiedDeliveryAuthority {
 #[derive(Debug)]
 enum MaterializeDeliveryAuthority {
     LegacyUnowned,
-    Verified(VerifiedDeliveryAuthority),
+    Verified(Box<VerifiedDeliveryAuthority>),
 }
 
 fn materialize_delivery_authority(
@@ -419,9 +419,9 @@ fn materialize_delivery_authority(
             &format!("deadreckon finish {}", run_prefix(&owner_job_id)),
         )));
     }
-    Ok(MaterializeDeliveryAuthority::Verified(
+    Ok(MaterializeDeliveryAuthority::Verified(Box::new(
         VerifiedDeliveryAuthority::from_finished_job(paths, &job, &finished)?,
-    ))
+    )))
 }
 
 pub(crate) fn materialize_completed_run(
@@ -510,7 +510,7 @@ fn materialize_completed_run_with_authority(
             paths,
             state,
             &library_dir,
-            dest,
+            &dest,
             force,
             include_manifest,
             authority,
@@ -636,7 +636,7 @@ fn materialize_verified_completed_run(
     paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
     library_dir: &Path,
-    dest: PathBuf,
+    dest: &Path,
     force: bool,
     include_manifest: bool,
     authority: &VerifiedDeliveryAuthority,
@@ -647,7 +647,7 @@ fn materialize_verified_completed_run(
     // `absolute_dest` can retain an empty unresolved suffix when a previously
     // absent directory now exists. Normalize that representation so the same
     // canonical destination produces the same durable transaction on retry.
-    let dest = lexical_normalize_path(&dest);
+    let dest = lexical_normalize_path(dest);
     let parent = dest.parent().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
             "export destination {} has no parent directory",
@@ -711,7 +711,7 @@ fn materialize_verified_completed_run(
         parent_identity,
         stage,
         backup,
-        journal_path,
+        &journal_path,
     );
     match (result, lock.release()) {
         (Ok(materialized), Ok(())) => Ok(materialized),
@@ -735,7 +735,7 @@ fn materialize_verified_completed_run_locked(
     parent_identity: String,
     stage: PathBuf,
     backup: PathBuf,
-    journal_path: PathBuf,
+    journal_path: &Path,
 ) -> Result<MaterializedRun> {
     let marker = VerifiedExportMarker {
         schema_version: VERIFIED_EXPORT_SCHEMA_VERSION,
@@ -749,8 +749,8 @@ fn materialize_verified_completed_run_locked(
         include_manifest,
         manifest_sha256: None,
     };
-    let mut transaction = if path_lexically_present(&journal_path)? {
-        let transaction = read_verified_export_transaction(&journal_path, authority)?;
+    let mut transaction = if path_lexically_present(journal_path)? {
+        let transaction = read_verified_export_transaction(journal_path, authority)?;
         validate_verified_export_transaction(
             &transaction,
             &marker,
@@ -799,7 +799,7 @@ fn materialize_verified_completed_run_locked(
             backup,
             phase: VerifiedExportPhase::Prepared,
         };
-        write_verified_export_transaction(&journal_path, &transaction)?;
+        write_verified_export_transaction(journal_path, &transaction)?;
         transaction
     };
     let marker = VerifiedExportMarker {
@@ -823,7 +823,7 @@ fn materialize_verified_completed_run_locked(
             library_dir,
             authority,
             failpoint,
-            &journal_path,
+            journal_path,
             &marker,
             &mut transaction,
             stage_state,
@@ -875,7 +875,7 @@ fn materialize_verified_completed_run_locked(
                 sync_verified_export_parent(&transaction)?;
             }
             if destination_state == VerifiedDestinationState::Missing && backup_present {
-                restore_verified_export_backup(&mut transaction, &journal_path, authority)?;
+                restore_verified_export_backup(&mut transaction, journal_path, authority)?;
             }
             return Err(error);
         }
@@ -888,7 +888,7 @@ fn materialize_verified_completed_run_locked(
         require_verified_export_identity(&transaction.stage, &marker, authority)
     })() {
         if destination_state == VerifiedDestinationState::Missing && backup_present {
-            restore_verified_export_backup(&mut transaction, &journal_path, authority)?;
+            restore_verified_export_backup(&mut transaction, journal_path, authority)?;
         }
         if verified_export_marker_matches(&transaction.stage, &marker)? {
             remove_owned_verified_export_path(&transaction.stage, &marker, authority)?;
@@ -904,7 +904,7 @@ fn materialize_verified_completed_run_locked(
         sync_verified_export_parent(&transaction)?;
         verified_export_fail(failpoint, VerifiedExportFailpoint::AfterBackupRename)?;
         transaction.phase = VerifiedExportPhase::BackupMoved;
-        write_verified_export_transaction(&journal_path, &transaction)?;
+        write_verified_export_transaction(journal_path, &transaction)?;
         destination_state = VerifiedDestinationState::Missing;
     }
     if destination_state != VerifiedDestinationState::Missing {
@@ -923,14 +923,14 @@ fn materialize_verified_completed_run_locked(
     sync_verified_export_parent(&transaction)?;
     verified_export_fail(failpoint, VerifiedExportFailpoint::AfterPublish)?;
     transaction.phase = VerifiedExportPhase::Published;
-    write_verified_export_transaction(&journal_path, &transaction)?;
+    write_verified_export_transaction(journal_path, &transaction)?;
 
     if let Err(error) = (|| {
         authority.revalidate(paths, state)?;
         validate_verified_export_manifest(library_dir, &transaction)?;
         require_verified_export_identity(dest, &marker, authority)
     })() {
-        rollback_published_verified_export(&mut transaction, &journal_path, &marker, authority)?;
+        rollback_published_verified_export(&mut transaction, journal_path, &marker, authority)?;
         return Err(error);
     }
     let backup_present = transaction.previous_destination_sha256.is_some();
@@ -940,7 +940,7 @@ fn materialize_verified_completed_run_locked(
         library_dir,
         authority,
         failpoint,
-        &journal_path,
+        journal_path,
         &marker,
         &mut transaction,
         VerifiedStageState::Missing,
@@ -1054,10 +1054,16 @@ fn create_verified_export_stage(stage: &Path, marker: &VerifiedExportMarker) -> 
 
 fn write_verified_export_marker(root: &Path, marker: &VerifiedExportMarker) -> Result<()> {
     let path = root.join(".deadreckon").join("export.json");
-    fs::create_dir_all(path.parent().expect("export marker parent"))?;
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "export marker {} has no parent directory",
+            path.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
     fs::write(&path, serde_json::to_vec_pretty(marker)?)?;
     fs::File::open(&path)?.sync_all()?;
-    sync_directory(path.parent().expect("export marker parent"))
+    sync_directory(parent)
 }
 
 fn verified_export_marker_matches(root: &Path, expected: &VerifiedExportMarker) -> Result<bool> {
@@ -3346,7 +3352,9 @@ pub(crate) async fn extend_command_with_launch_plan(
     } else {
         match materialize_delivery_authority(&paths, &parent)? {
             MaterializeDeliveryAuthority::LegacyUnowned => None,
-            MaterializeDeliveryAuthority::Verified(authority) => Some(authority.receipt_sha256),
+            MaterializeDeliveryAuthority::Verified(authority) => {
+                Some(authority.receipt_sha256.clone())
+            }
         }
     };
     if parent.status != RunStatus::Completed {
@@ -4749,6 +4757,7 @@ mod tests {
             source_revision: None,
             sandbox_requested: "sandbox-exec".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         fs::write(
             paths.job_authority(&job_id),
@@ -4831,6 +4840,7 @@ mod tests {
                 .expect("result tree"),
             sandbox_requested: authority.sandbox_requested.clone(),
             sandbox_backend: "sandbox-exec".to_string(),
+            gate_evaluator_sha256: authority.gate_evaluator_sha256.clone(),
             contained: true,
             gate_key_read_denied: true,
             proof_write_denied: true,
@@ -5150,7 +5160,7 @@ mod tests {
             &paths,
             &state,
             &state.working_dir,
-            verified_dest,
+            &verified_dest,
             true,
             false,
             &authority,
@@ -5187,7 +5197,7 @@ mod tests {
             &paths,
             &state,
             &state.working_dir,
-            verified_dest,
+            &verified_dest,
             false,
             false,
             &authority,
@@ -5253,7 +5263,7 @@ mod tests {
                 &paths,
                 &state,
                 &state.working_dir,
-                verified_dest,
+                &verified_dest,
                 true,
                 false,
                 &authority,
@@ -5334,7 +5344,7 @@ mod tests {
             &paths,
             &state,
             &state.working_dir,
-            verified_dest,
+            &verified_dest,
             false,
             false,
             &authority,

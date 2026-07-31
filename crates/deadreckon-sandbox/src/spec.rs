@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use crate::backend::SandboxBackend;
+use crate::docker::DockerExecution;
 
 /// Trusted release helper used when the sandboxed command must move into a
 /// separately recoverable process group.
@@ -47,6 +48,9 @@ impl WorkspaceAccess {
 #[derive(Debug, Clone)]
 pub struct SandboxSpec {
     pub backend: SandboxBackend,
+    /// Trusted container-only execution identity. When absent, Docker retains
+    /// its historical generic-command behavior.
+    pub docker: Option<DockerExecution>,
     pub cwd: PathBuf,
     pub program: OsString,
     pub args: Vec<OsString>,

@@ -306,6 +306,7 @@ fn seam_sandbox_spec(
     }
     SandboxSpec {
         backend: ctx.sandbox_backend,
+        docker: None,
         cwd: ctx.working_dir.clone(),
         program: OsString::from(&command.command[0]),
         args: command.command[1..].iter().map(OsString::from).collect(),

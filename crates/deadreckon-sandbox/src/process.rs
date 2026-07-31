@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::backend::{Result, SandboxBackend, SandboxError};
 use crate::commands::build_command;
+use crate::docker::{DockerExecution, reconcile_docker_execution};
 use crate::spec::{GuardedLaunchSpec, SandboxSpec, WorkspaceAccess};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +26,17 @@ pub struct SandboxRunOutput {
 pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let command = build_command(&spec)?;
     let guarded = validate_guarded_launch(&spec)?;
+    let docker_execution = if command.backend == SandboxBackend::Docker {
+        spec.docker.clone()
+    } else {
+        None
+    };
+    if let Some(docker) = docker_execution.as_ref() {
+        validate_docker_guard_identity(&spec, docker, guarded.as_ref())?;
+        // Reusing an approved launch identity after a worker crash must first
+        // reconcile the daemon-owned container, not merely its old host client.
+        reconcile_docker_execution(docker)?;
+    }
     let guarded_release = guarded.as_ref().map(|guard| {
         let token = format!("{}:{}", guard.launch_id, Uuid::new_v4());
         let digest = deadreckon_core::flight::sha256_text(&token);
@@ -111,18 +123,21 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             Err(error) => {
                 signal_process(pid, true, false);
                 let _ = child.wait().await;
+                reconcile_optional_docker(docker_execution.as_ref())?;
                 return Err(error.into());
             }
         };
         if let Err(error) = deadreckon_core::write_supervised_process_record(pid_file, &record) {
             signal_process(pid, true, false);
             let _ = child.wait().await;
+            reconcile_optional_docker(docker_execution.as_ref())?;
             return Err(error.into());
         }
         guarded_identity = Some((guard.launch_id.clone(), pid));
         let Some(mut release) = child.stdin.take() else {
             signal_process(pid, true, false);
             let _ = child.wait().await;
+            reconcile_optional_docker(docker_execution.as_ref())?;
             remove_pid_file(&spec, guarded_identity.as_ref()).await?;
             return Err(SandboxError::Io(std::io::Error::other(
                 "guarded sandbox helper did not expose its release pipe",
@@ -137,6 +152,8 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         {
             signal_process(pid, true, false);
             let _ = child.wait().await;
+            let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
+            docker_cleanup?;
             remove_pid_file(&spec, guarded_identity.as_ref()).await?;
             return Err(error.into());
         }
@@ -192,9 +209,16 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
                     }
                 }
                 let _ = child.wait().await;
-                if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
-                    cleanup_residual_process_tree(pid).await?;
-                }
+                let process_cleanup = if let Some(pid) =
+                    pid.filter(|_| spec.cleanup_process_group)
+                {
+                    cleanup_residual_process_tree(pid).await
+                } else {
+                    Ok(())
+                };
+                let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
+                process_cleanup?;
+                docker_cleanup?;
                 remove_pid_file(&spec, guarded_identity.as_ref()).await?;
                 return Err(SandboxError::Cancelled);
             }
@@ -202,13 +226,19 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         }
     } else {
         child.wait().await
-    }?;
+    };
     // A check can exit its direct shell while leaving background descendants
     // alive. Clean the process group before consuming output or returning
     // control to a caller that may subsequently read a signing key.
-    if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
-        cleanup_residual_process_tree(pid).await?;
-    }
+    let process_cleanup = if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
+        cleanup_residual_process_tree(pid).await
+    } else {
+        Ok(())
+    };
+    let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
+    process_cleanup?;
+    docker_cleanup?;
+    let status = status?;
     let stdout = stdout_task
         .await
         .unwrap_or_else(|err| Ok(format!("stdout join error: {err}")))?;
@@ -229,6 +259,52 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         stderr,
         warning: command.warning,
     })
+}
+
+fn reconcile_optional_docker(execution: Option<&DockerExecution>) -> Result<()> {
+    execution.map_or(Ok(()), reconcile_docker_execution)
+}
+
+fn validate_docker_guard_identity(
+    spec: &SandboxSpec,
+    docker: &DockerExecution,
+    guarded: Option<&GuardedLaunchSpec>,
+) -> Result<()> {
+    if spec.workspace_access != WorkspaceAccess::Disposable {
+        return Err(SandboxError::InvalidDockerExecution(
+            "trusted Docker execution requires disposable workspace access".to_string(),
+        ));
+    }
+    let guard = guarded.ok_or_else(|| {
+        SandboxError::InvalidDockerExecution(
+            "trusted Docker execution requires a guarded launch".to_string(),
+        )
+    })?;
+    if docker.launch_id() != guard.launch_id
+        || docker.attempt() != guard.attempt
+        || docker.owner_launch_id() != guard.owner_launch_id.as_deref()
+    {
+        return Err(SandboxError::InvalidDockerExecution(
+            "Docker container labels do not match the guarded launch identity".to_string(),
+        ));
+    }
+    let pid_file = spec.pid_file.as_deref().ok_or_else(|| {
+        SandboxError::InvalidDockerExecution(
+            "trusted Docker execution requires a guarded process record".to_string(),
+        )
+    })?;
+    if docker.cid_file().parent() != pid_file.parent() {
+        return Err(SandboxError::InvalidDockerExecution(
+            "Docker cidfile must share the guarded process-record directory".to_string(),
+        ));
+    }
+    let workspace = spec.cwd.canonicalize().unwrap_or_else(|_| spec.cwd.clone());
+    if docker.sidecar_host_path().starts_with(&workspace) {
+        return Err(SandboxError::InvalidDockerExecution(
+            "Docker evaluator sidecar must live outside the writable workspace".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_guarded_launch(spec: &SandboxSpec) -> Result<Option<GuardedLaunchSpec>> {

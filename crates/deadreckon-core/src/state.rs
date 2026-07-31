@@ -155,6 +155,17 @@ pub enum RunOwnershipArtifact {
     ParentResult,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeRepairOwnership {
+    pub root_artifact_id: String,
+    pub repair_id: String,
+    pub repair_round: u32,
+    pub run_id: String,
+    pub proof_dir: PathBuf,
+    pub repair_request_sha256: String,
+    pub repair_plan_sha256: String,
+}
+
 impl RunOwnership {
     pub fn plan_task(
         job_id: impl Into<String>,
@@ -195,27 +206,18 @@ impl RunOwnership {
         }
     }
 
-    pub fn merge_repair(
-        job_id: impl Into<String>,
-        root_artifact_id: impl Into<String>,
-        repair_id: impl Into<String>,
-        repair_round: u32,
-        run_id: impl Into<String>,
-        proof_dir: PathBuf,
-        repair_request_sha256: impl Into<String>,
-        repair_plan_sha256: impl Into<String>,
-    ) -> Self {
+    pub fn merge_repair(job_id: impl Into<String>, repair: MergeRepairOwnership) -> Self {
         Self {
             schema_version: 1,
             job_id: job_id.into(),
             artifact: RunOwnershipArtifact::MergeRepair {
-                root_artifact_id: root_artifact_id.into(),
-                repair_id: repair_id.into(),
-                repair_round,
-                run_id: run_id.into(),
-                proof_dir,
-                repair_request_sha256: repair_request_sha256.into(),
-                repair_plan_sha256: repair_plan_sha256.into(),
+                root_artifact_id: repair.root_artifact_id,
+                repair_id: repair.repair_id,
+                repair_round: repair.repair_round,
+                run_id: repair.run_id,
+                proof_dir: repair.proof_dir,
+                repair_request_sha256: repair.repair_request_sha256,
+                repair_plan_sha256: repair.repair_plan_sha256,
             },
         }
     }

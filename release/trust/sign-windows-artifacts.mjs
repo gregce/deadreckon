@@ -11,6 +11,7 @@ const target = required(args.target, "--target");
 const cert = required(args.cert, "--cert");
 const password = required(args.password, "--password");
 const timestampUrl = args.timestamp ?? "http://timestamp.digicert.com";
+const NATIVE_BINARIES = ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"];
 
 const archives = findArchives(dir, target);
 if (archives.length === 0) {
@@ -34,6 +35,7 @@ fs.writeFileSync(
       signature_kind: "Authenticode",
       notarized: false,
       artifacts: signedArtifacts,
+      signed_binaries: NATIVE_BINARIES,
       verified_at: new Date().toISOString(),
     },
     null,
@@ -46,22 +48,24 @@ function signArchive(archive) {
   const extractDir = path.join(temp, "extract");
   fs.mkdirSync(extractDir);
   extractArchive(archive, extractDir);
-  const binary = findBinary(extractDir);
-  run("signtool", [
-    "sign",
-    "/f",
-    cert,
-    "/p",
-    password,
-    "/fd",
-    "SHA256",
-    "/tr",
-    timestampUrl,
-    "/td",
-    "SHA256",
-    binary,
-  ]);
-  run("signtool", ["verify", "/pa", "/v", binary]);
+  const binaries = findBinaries(extractDir);
+  for (const binary of binaries) {
+    run("signtool", [
+      "sign",
+      "/f",
+      cert,
+      "/p",
+      password,
+      "/fd",
+      "SHA256",
+      "/tr",
+      timestampUrl,
+      "/td",
+      "SHA256",
+      binary,
+    ]);
+    run("signtool", ["verify", "/pa", "/v", binary]);
+  }
   repackArchive(archive, extractDir);
 }
 
@@ -93,17 +97,21 @@ function repackArchive(archive, sourceDir) {
   ]);
 }
 
-function findBinary(root) {
-  const candidates = [];
-  walk(root, (file) => {
-    if (path.basename(file) === "deadreckon.exe") {
-      candidates.push(file);
+function findBinaries(root) {
+  return NATIVE_BINARIES.map((name) => {
+    const candidates = [];
+    walk(root, (file) => {
+      if (path.basename(file) === name) {
+        candidates.push(file);
+      }
+    });
+    if (candidates.length !== 1) {
+      throw new Error(
+        `expected exactly one ${name} in extracted ${target} archive; found ${candidates.length}`,
+      );
     }
+    return candidates[0];
   });
-  if (candidates.length === 0) {
-    throw new Error(`no deadreckon.exe found in extracted ${target} archive`);
-  }
-  return candidates[0];
 }
 
 function walk(dir, visitor) {

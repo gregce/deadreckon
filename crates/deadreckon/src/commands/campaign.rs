@@ -42,7 +42,7 @@ pub(crate) struct CampaignSubLaunch<'a> {
 
 enum CampaignSubChildProcess {
     Plain(std::process::Child),
-    Durable(commands::graph_job::CampaignSubProcess),
+    Durable(Box<commands::graph_job::CampaignSubProcess>),
 }
 
 impl CampaignSubChildProcess {
@@ -2530,11 +2530,11 @@ async fn execute_campaign_state(
                             launch_dir,
                             None,
                         )?;
-                        CampaignSubChildProcess::Durable(
+                        CampaignSubChildProcess::Durable(Box::new(
                             commands::graph_job::spawn_campaign_sub_delegated(
                                 paths, command, prepared,
                             )?,
-                        )
+                        ))
                     }
                 }
             } else {

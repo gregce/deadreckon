@@ -31,6 +31,13 @@
     "effective_policy_sha256": {
       "type": "string"
     },
+    "gate_evaluator_sha256": {
+      "description": "SHA-256 of the canonical serialized `GateEvaluatorIdentity`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "goal_sha256": {
       "type": "string"
     },

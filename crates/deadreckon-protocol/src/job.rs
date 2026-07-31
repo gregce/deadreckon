@@ -18,6 +18,9 @@ use crate::{JobId, RunId};
 
 /// The only job wire version understood by this release.
 pub const JOB_SCHEMA_VERSION: u32 = 1;
+pub const GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION: u32 = 1;
+pub const GATE_EVALUATOR_PROTOCOL_VERSION: u32 = 1;
+pub const DOCKER_GATE_GUEST_PATH: &str = "/usr/local/bin/dr-gate-evaluate";
 
 /// A checked numeric discriminator for every persisted job artifact.
 ///
@@ -103,6 +106,13 @@ pub struct JobExecutionPolicy {
     pub sandbox_requested: String,
     pub require_containment: bool,
     pub tools: BTreeMap<String, JobToolPolicy>,
+    /// Exact controller/evaluator toolchain approved before the first turn.
+    ///
+    /// `None` keeps pre-identity Jobs readable. A new strict Job must persist
+    /// this field together with matching authority and boundary-observation
+    /// digests; partial identity state fails closed during verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_evaluator: Option<GateEvaluatorIdentity>,
 }
 
 impl JobExecutionPolicy {
@@ -124,8 +134,50 @@ impl JobExecutionPolicy {
             sandbox_requested: sandbox_requested.into(),
             require_containment: true,
             tools,
+            gate_evaluator: None,
         }
     }
+}
+
+/// Content identity of one trusted `dr-gate` executable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GateBinaryIdentity {
+    /// SHA-256 of the exact executable bytes.
+    pub sha256: String,
+    /// Operating system expected by the executable, for example `macos` or
+    /// `linux`.
+    pub os: String,
+    /// Architecture expected by the executable, for example `aarch64` or
+    /// `x86_64`.
+    pub arch: String,
+}
+
+/// Immutable Docker execution identity for a Linux gate evaluator.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DockerGateIdentity {
+    /// Content-addressed Docker image ID, never a mutable tag.
+    pub image_id: String,
+    /// Explicit Docker platform in `<os>/<architecture>` form.
+    pub platform: String,
+    /// Fixed absolute path of the evaluator inside the immutable image.
+    pub guest_path: PathBuf,
+}
+
+/// Versioned controller/evaluator identity approved for one durable Job.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GateEvaluatorIdentity {
+    pub schema_version: u32,
+    pub protocol_version: u32,
+    /// Host-compatible binary used for guarded release and trusted signing.
+    pub controller: GateBinaryIdentity,
+    /// Binary that executes deterministic checks inside containment.
+    pub evaluator: GateBinaryIdentity,
+    /// Required for Docker evaluation and absent for native containment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker: Option<DockerGateIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -332,6 +384,9 @@ pub struct JobAuthority {
     pub source_revision: Option<String>,
     pub sandbox_requested: String,
     pub semantic_judge_mode: SemanticJudgeMode,
+    /// SHA-256 of the canonical serialized `GateEvaluatorIdentity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_evaluator_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -453,6 +508,9 @@ pub struct SandboxBoundaryObservation {
     pub operator_capture_write_denied: bool,
     pub signing_env_scrubbed: bool,
     pub probe_sha256: String,
+    /// Evaluator identity digest approved by policy and authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_evaluator_sha256: Option<String>,
     pub signature: String,
 }
 
@@ -466,7 +524,11 @@ pub enum SandboxBoundaryObservationIssuer {
 mod tests {
     use serde_json::json;
 
-    use super::SandboxBoundaryObservation;
+    use super::{
+        DOCKER_GATE_GUEST_PATH, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+        GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, JobAuthority,
+        JobExecutionPolicy, SandboxBoundaryObservation,
+    };
 
     fn observation_json() -> serde_json::Value {
         json!({
@@ -512,5 +574,72 @@ mod tests {
             .remove("gate_key_read_denied");
         serde_json::from_value::<SandboxBoundaryObservation>(incomplete)
             .expect_err("each denial fact is required");
+    }
+
+    #[test]
+    fn legacy_policy_authority_and_observation_remain_readable_without_evaluator_identity() {
+        let policy: JobExecutionPolicy = serde_json::from_value(json!({
+            "sandbox_requested": "sandbox-exec",
+            "require_containment": true,
+            "tools": {}
+        }))
+        .expect("legacy execution policy");
+        assert!(policy.gate_evaluator.is_none());
+
+        let authority: JobAuthority = serde_json::from_value(json!({
+            "schema_version": 1,
+            "job_id": "job-1",
+            "run_id": "job-1",
+            "approved_at": "2026-07-30T12:00:00Z",
+            "accepted_by": "operator",
+            "goal_sha256": format!("sha256:{}", "1".repeat(64)),
+            "contract_sha256": format!("sha256:{}", "2".repeat(64)),
+            "effective_policy_sha256": format!("sha256:{}", "3".repeat(64)),
+            "launch_plan_sha256": format!("sha256:{}", "4".repeat(64)),
+            "source_tree_sha256": format!("sha256:{}", "5".repeat(64)),
+            "source_revision": null,
+            "sandbox_requested": "sandbox-exec",
+            "semantic_judge_mode": "required"
+        }))
+        .expect("legacy authority");
+        assert!(authority.gate_evaluator_sha256.is_none());
+
+        let observation: SandboxBoundaryObservation =
+            serde_json::from_value(observation_json()).expect("legacy observation");
+        assert!(observation.gate_evaluator_sha256.is_none());
+    }
+
+    #[test]
+    fn evaluator_identity_wire_shape_is_versioned_and_closed() {
+        let identity = GateEvaluatorIdentity {
+            schema_version: GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            protocol_version: GATE_EVALUATOR_PROTOCOL_VERSION,
+            controller: GateBinaryIdentity {
+                sha256: format!("sha256:{}", "1".repeat(64)),
+                os: "macos".to_string(),
+                arch: "aarch64".to_string(),
+            },
+            evaluator: GateBinaryIdentity {
+                sha256: format!("sha256:{}", "2".repeat(64)),
+                os: "linux".to_string(),
+                arch: "aarch64".to_string(),
+            },
+            docker: Some(DockerGateIdentity {
+                image_id: format!("sha256:{}", "3".repeat(64)),
+                platform: "linux/arm64".to_string(),
+                guest_path: DOCKER_GATE_GUEST_PATH.into(),
+            }),
+        };
+        let encoded = serde_json::to_value(&identity).expect("identity JSON");
+        assert_eq!(
+            serde_json::from_value::<GateEvaluatorIdentity>(encoded.clone())
+                .expect("identity round trip"),
+            identity
+        );
+
+        let mut unknown = encoded;
+        unknown["controller"]["path"] = json!("/tmp/agent-selected");
+        serde_json::from_value::<GateEvaluatorIdentity>(unknown)
+            .expect_err("nested evaluator identity is a closed wire shape");
     }
 }

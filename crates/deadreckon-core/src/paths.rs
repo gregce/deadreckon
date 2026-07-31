@@ -112,6 +112,22 @@ impl DeadreckonPaths {
         self.job_dir(job_id).join("authority.json")
     }
 
+    pub fn job_gate_artifacts_dir(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("gate-artifacts")
+    }
+
+    pub fn job_frozen_controller_gate(&self, job_id: &str) -> PathBuf {
+        self.job_gate_artifacts_dir(job_id)
+            .join("controller")
+            .join(format!("dr-gate{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    pub fn job_frozen_evaluator_gate(&self, job_id: &str) -> PathBuf {
+        self.job_gate_artifacts_dir(job_id)
+            .join("evaluator")
+            .join("dr-gate")
+    }
+
     pub fn job_receipt(&self, job_id: &str) -> PathBuf {
         self.job_dir(job_id).join("receipt.json")
     }
@@ -434,6 +450,9 @@ mod tests {
             paths.job_lease("job-1"),
             paths.job_launch_plan("job-1"),
             paths.job_authority("job-1"),
+            paths.job_gate_artifacts_dir("job-1"),
+            paths.job_frozen_controller_gate("job-1"),
+            paths.job_frozen_evaluator_gate("job-1"),
             paths.job_receipt("job-1"),
         ] {
             assert!(
@@ -442,5 +461,20 @@ mod tests {
                 path.display()
             );
         }
+        let controller_name = format!("dr-gate{}", std::env::consts::EXE_SUFFIX);
+        assert_eq!(
+            paths
+                .job_frozen_controller_gate("job-1")
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some(controller_name.as_str()),
+        );
+        assert_eq!(
+            paths
+                .job_frozen_evaluator_gate("job-1")
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("dr-gate"),
+        );
     }
 }

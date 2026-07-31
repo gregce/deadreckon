@@ -7468,12 +7468,19 @@ async fn execute_merge_repair_child(
     } else {
         None
     };
+    // Product merge repair is always delegated by its owning Job. The private
+    // characterization binary also retains the historical unowned inner
+    // executor; keep that test-only child synchronous so its parent can
+    // observe the Run result instead of accidentally queuing a detached Job.
+    if prepared.is_none() && commands::plan::internal_characterization_requested() {
+        command.env(commands::run::LEGACY_CHAIN_FOREGROUND_ENV, "1");
+    }
     let launch_authority = merge_repair_launch_record(
         plan,
         context,
         &repair_id,
         repair_round,
-        &repair_run_id,
+        prepared.as_ref().map(|_| repair_run_id.as_str()),
         &repair_request_sha256,
         &repair_plan_sha256,
         inherited_sandbox,
@@ -7524,15 +7531,17 @@ async fn execute_merge_repair_child(
         paths,
         plan,
         context,
-        &run_id,
-        status,
-        &repair_id,
-        repair_round,
-        &repair_request_sha256,
-        &repair_plan_sha256,
-        inherited_sandbox,
-        repair_plan.planner_spend_usd,
-        repair_plan.planner_wall_seconds,
+        &MergeRepairRunRecordUpdate {
+            run_id: &run_id,
+            status,
+            repair_id: &repair_id,
+            repair_round,
+            repair_request_sha256: &repair_request_sha256,
+            repair_plan_sha256: &repair_plan_sha256,
+            sandbox_requested: inherited_sandbox,
+            planner_spend_usd: repair_plan.planner_spend_usd,
+            planner_wall_seconds: repair_plan.planner_wall_seconds,
+        },
     )?;
     if !output.status.success() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -7560,7 +7569,7 @@ fn merge_repair_launch_record(
     context: &MergeRepairContext,
     repair_id: &str,
     repair_round: u32,
-    run_id: &str,
+    run_id: Option<&str>,
     repair_request_sha256: &str,
     repair_plan_sha256: &str,
     sandbox_requested: deadreckon_sandbox::SandboxBackend,
@@ -7705,22 +7714,26 @@ async fn recover_existing_merge_repair_child(
     }
 }
 
+struct MergeRepairRunRecordUpdate<'a> {
+    run_id: &'a str,
+    status: &'a str,
+    repair_id: &'a str,
+    repair_round: u32,
+    repair_request_sha256: &'a str,
+    repair_plan_sha256: &'a str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+    planner_spend_usd: f64,
+    planner_wall_seconds: f64,
+}
+
 fn write_merge_repair_run_record(
     paths: &DeadreckonPaths,
     plan: &Plan,
     context: &MergeRepairContext,
-    run_id: &str,
-    status: &str,
-    repair_id: &str,
-    repair_round: u32,
-    repair_request_sha256: &str,
-    repair_plan_sha256: &str,
-    sandbox_requested: deadreckon_sandbox::SandboxBackend,
-    planner_spend_usd: f64,
-    planner_wall_seconds: f64,
+    update: &MergeRepairRunRecordUpdate<'_>,
 ) -> Result<()> {
     let path = context.proof_dir.join("repair-run.json");
-    let state = load_run(paths, run_id).ok();
+    let state = load_run(paths, update.run_id).ok();
     let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
     let object = value.as_object_mut().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
@@ -7728,35 +7741,43 @@ fn write_merge_repair_run_record(
         ))
     })?;
     if object.get("plan_id").and_then(Value::as_str) != Some(plan.plan_id.as_str())
-        || object.get("repair_id").and_then(Value::as_str) != Some(repair_id)
-        || object.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
+        || object.get("repair_id").and_then(Value::as_str) != Some(update.repair_id)
+        || object.get("repair_round").and_then(Value::as_u64)
+            != Some(u64::from(update.repair_round))
         || object.get("repair_request_sha256").and_then(Value::as_str)
-            != Some(repair_request_sha256)
-        || object.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
+            != Some(update.repair_request_sha256)
+        || object.get("repair_plan_sha256").and_then(Value::as_str)
+            != Some(update.repair_plan_sha256)
         || object.get("sandbox_requested").and_then(Value::as_str)
-            != Some(sandbox_requested.to_string().as_str())
+            != Some(update.sandbox_requested.to_string().as_str())
         || object
             .get("run_id")
             .and_then(Value::as_str)
-            .is_some_and(|existing| existing != run_id)
+            .is_some_and(|existing| existing != update.run_id)
     {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "merge repair completion crossed its durable launch authority".to_string(),
         )));
     }
-    object.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    object.insert(
+        "run_id".to_string(),
+        Value::String(update.run_id.to_string()),
+    );
     object.insert(
         "scope".to_string(),
         serde_json::to_value(state.as_ref().map(|state| state.scope.clone()))?,
     );
-    object.insert("status".to_string(), Value::String(status.to_string()));
+    object.insert(
+        "status".to_string(),
+        Value::String(update.status.to_string()),
+    );
     object.insert(
         "planner_spend_usd".to_string(),
-        serde_json::to_value(planner_spend_usd)?,
+        serde_json::to_value(update.planner_spend_usd)?,
     );
     object.insert(
         "planner_wall_seconds".to_string(),
-        serde_json::to_value(planner_wall_seconds)?,
+        serde_json::to_value(update.planner_wall_seconds)?,
     );
     object.insert("updated_at".to_string(), serde_json::to_value(Utc::now())?);
     commands::job::replace_json_synced(&path, &value)
@@ -7791,14 +7812,16 @@ fn validate_merge_repair_child(
             state.ownership.as_ref()
                 != Some(&deadreckon_core::RunOwnership::merge_repair(
                     job_id,
-                    job_id,
-                    repair_id,
-                    repair_round,
-                    run_id,
-                    fs::canonicalize(&context.proof_dir)
-                        .unwrap_or_else(|_| context.proof_dir.clone()),
-                    repair_request_sha256,
-                    repair_plan_sha256,
+                    deadreckon_core::MergeRepairOwnership {
+                        root_artifact_id: job_id.to_string(),
+                        repair_id: repair_id.to_string(),
+                        repair_round,
+                        run_id: run_id.to_string(),
+                        proof_dir: fs::canonicalize(&context.proof_dir)
+                            .unwrap_or_else(|_| context.proof_dir.clone()),
+                        repair_request_sha256: repair_request_sha256.to_string(),
+                        repair_plan_sha256: repair_plan_sha256.to_string(),
+                    },
                 ))
         })
     {

@@ -17,6 +17,10 @@
     "deadreckon": "bin/deadreckon"
   },
   "files": [
-    "bin/deadreckon"
+    "bin/deadreckon",
+    "bin/dr-gate",
+    "bin/dr-capture",
+    "bin/dr-gate-evaluator-aarch64-unknown-linux-musl",
+    "bin/dr-gate-evaluator-x86_64-unknown-linux-musl"
   ]
 }

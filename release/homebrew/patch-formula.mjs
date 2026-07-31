@@ -8,6 +8,12 @@ if (!target) {
   throw new Error("usage: patch-formula.mjs <formula-file-or-directory>");
 }
 
+const HOST_HELPERS = ["deadreckon", "dr-gate", "dr-capture"];
+const EVALUATOR_SIDECARS = [
+  "dr-gate-evaluator-aarch64-unknown-linux-musl",
+  "dr-gate-evaluator-x86_64-unknown-linux-musl",
+];
+
 function walk(root) {
   const stat = fs.statSync(root);
   if (stat.isFile()) {
@@ -67,6 +73,32 @@ function withReceiptCall(formula) {
   return formula.replace(anchor, `${anchor}\n    write_deadreckon_receipt!\n`);
 }
 
+function withCompleteBinaryInstall(formula) {
+  let installLines = 0;
+  const patched = formula.replace(/^(\s*)bin\.install\s+(.+)$/gm, (line, indent, rawNames) => {
+    const names = [...rawNames.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+    if (!names.includes("deadreckon")) {
+      return line;
+    }
+    installLines += 1;
+    for (const helper of HOST_HELPERS) {
+      if (!names.includes(helper)) {
+        throw new Error(`formula bin.install is missing native helper ${helper}`);
+      }
+    }
+    for (const evaluator of EVALUATOR_SIDECARS) {
+      if (!names.includes(evaluator)) {
+        names.push(evaluator);
+      }
+    }
+    return `${indent}bin.install ${names.map((name) => `"${name}"`).join(", ")}`;
+  });
+  if (installLines === 0) {
+    throw new Error("formula has no deadreckon bin.install lines");
+  }
+  return patched;
+}
+
 const formulae = walk(path.resolve(target));
 if (formulae.length === 0) {
   throw new Error(`no Homebrew formulae found under ${target}`);
@@ -74,6 +106,8 @@ if (formulae.length === 0) {
 
 for (const formulaPath of formulae) {
   const original = fs.readFileSync(formulaPath, "utf8");
-  const patched = withReceiptCall(withReceiptMethod(withRequires(original)));
+  const patched = withReceiptCall(
+    withReceiptMethod(withRequires(withCompleteBinaryInstall(original))),
+  );
   fs.writeFileSync(formulaPath, patched);
 }

@@ -210,6 +210,13 @@ pub struct GateEvaluation {
     pub run_id: String,
     pub working_dir: PathBuf,
     pub contract_sha256: String,
+    /// Digest of the immutable gate toolchain approved for this Job.
+    ///
+    /// This value is echoed by the keyless evaluator and compared with trusted
+    /// Job authority before the signing key is read. Older compatibility
+    /// evaluations have no such identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_evaluator_sha256: Option<String>,
     pub results: Vec<AcceptanceCheckResult>,
     pub tamper: crate::tamper::AcceptanceTamper,
 }
@@ -597,6 +604,20 @@ pub fn run_acceptance_gate_and_write_marker(
 /// The caller is responsible for running this function inside the resolved
 /// sandbox and transporting the returned value directly to a trusted signer.
 pub fn evaluate_gate(run_id: &str, run_root: &Path, working_dir: &Path) -> Result<GateEvaluation> {
+    evaluate_gate_with_identity(run_id, run_root, working_dir, None)
+}
+
+/// Evaluate an approved contract while echoing the trusted evaluator identity
+/// supplied by the controller.
+///
+/// The echo is not authority by itself. The controller and signer compare it
+/// with immutable Job policy before signing any result.
+pub fn evaluate_gate_with_identity(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    gate_evaluator_sha256: Option<String>,
+) -> Result<GateEvaluation> {
     let canonical_working_dir = canonical_working_dir(working_dir)?;
     let (checks, contract_sha256) = approved_acceptance_contract(run_root)?;
     let mut results = Vec::with_capacity(checks.len());
@@ -609,6 +630,7 @@ pub fn evaluate_gate(run_id: &str, run_root: &Path, working_dir: &Path) -> Resul
         run_id: run_id.to_string(),
         working_dir: canonical_working_dir,
         contract_sha256,
+        gate_evaluator_sha256,
         results,
         tamper,
     })
@@ -1932,6 +1954,34 @@ mod tests {
         let evaluation = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
             .expect("keyless evaluation");
         (temp, state, evaluation)
+    }
+
+    #[test]
+    fn keyless_evaluation_echoes_identity_and_legacy_json_defaults_to_absent() {
+        let (_temp, state, legacy_evaluation) = keyless_evaluation_fixture();
+        assert!(legacy_evaluation.gate_evaluator_sha256.is_none());
+
+        let identity_sha256 = format!("sha256:{}", "a".repeat(64));
+        let evaluation = super::evaluate_gate_with_identity(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            Some(identity_sha256.clone()),
+        )
+        .expect("identity-bound evaluation");
+        assert_eq!(
+            evaluation.gate_evaluator_sha256.as_deref(),
+            Some(identity_sha256.as_str())
+        );
+
+        let mut legacy_json = serde_json::to_value(evaluation).expect("evaluation JSON");
+        legacy_json
+            .as_object_mut()
+            .expect("evaluation object")
+            .remove("gate_evaluator_sha256");
+        let decoded: GateEvaluation =
+            serde_json::from_value(legacy_json).expect("legacy evaluation JSON");
+        assert!(decoded.gate_evaluator_sha256.is_none());
     }
 
     fn legacy_v2_canonical_bytes(marker: &AcceptanceMarker) -> Vec<u8> {

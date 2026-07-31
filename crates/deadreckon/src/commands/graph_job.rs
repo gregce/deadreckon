@@ -303,7 +303,7 @@ pub(crate) struct CampaignSubProcess {
 
 pub(crate) enum CampaignSubLaunchRecovery {
     Relaunch,
-    Adopted(CampaignSubProcess),
+    Adopted(Box<CampaignSubProcess>),
     RecoverLinkedArtifacts,
 }
 
@@ -1298,14 +1298,16 @@ fn replace_merge_repair_authority_fenced(
         &token,
         Utc::now(),
         &path,
-        JobEventKind::RepairChildAuthorityChanged,
-        format!("merge-repair-authority:{repair_id}:{transition}"),
-        json!({
-            "repair_id": repair_id,
-            "transition": transition,
-            "run_id": value.get("run_id"),
-            "authority": value,
-        }),
+        deadreckon_core::FencedJobJsonEvent {
+            kind: JobEventKind::RepairChildAuthorityChanged,
+            causation_id: format!("merge-repair-authority:{repair_id}:{transition}"),
+            detail: json!({
+                "repair_id": repair_id,
+                "transition": transition,
+                "run_id": value.get("run_id"),
+                "authority": value,
+            }),
+        },
         value,
     )?;
     Ok(())
@@ -1594,12 +1596,14 @@ fn write_campaign_sub_launch_fenced(
         token,
         Utc::now(),
         &path,
-        JobEventKind::CampaignSubAuthorityChanged,
-        format!(
-            "campaign-sub-authority:{}:{}:{transition}",
-            launch.sub_id, launch.launch_id
-        ),
-        detail,
+        deadreckon_core::FencedJobJsonEvent {
+            kind: JobEventKind::CampaignSubAuthorityChanged,
+            causation_id: format!(
+                "campaign-sub-authority:{}:{}:{transition}",
+                launch.sub_id, launch.launch_id
+            ),
+            detail,
+        },
         launch,
     )?;
     Ok(())
@@ -2772,11 +2776,13 @@ pub(crate) fn recover_campaign_sub_launch(
             launch.adopted_at = Some(Utc::now());
             write_campaign_sub_launch_fenced(paths, &launch, &token, "adopted")?;
             append_campaign_sub_launch_event(paths, &launch, "sub_process_adopted")?;
-            Ok(CampaignSubLaunchRecovery::Adopted(CampaignSubProcess {
-                launch,
-                child: None,
-                prepared: None,
-            }))
+            Ok(CampaignSubLaunchRecovery::Adopted(Box::new(
+                CampaignSubProcess {
+                    launch,
+                    child: None,
+                    prepared: None,
+                },
+            )))
         }
         CampaignSubRecoveryDisposition::RecoverLinkedArtifacts => {
             recover_linked_campaign_sub_artifacts(paths, &launch, identity)
@@ -2789,23 +2795,17 @@ pub(crate) fn spawn_campaign_sub_delegated(
     mut command: Command,
     prepared: PreparedDelegation,
 ) -> Result<CampaignSubProcess> {
-    let campaign = match prepared.campaign_sub.clone() {
-        Some(campaign) => campaign,
-        None => {
-            revoke_pending_delegation(paths, &prepared)?;
-            return Err(CliError::Core(DeadreckonError::InvalidInput(
-                "Campaign sub-process launch requires a Campaign delegation".to_string(),
-            )));
-        }
+    let Some(campaign) = prepared.campaign_sub.clone() else {
+        revoke_pending_delegation(paths, &prepared)?;
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process launch requires a Campaign delegation".to_string(),
+        )));
     };
-    let context = match DRIVER_CONTEXT.get() {
-        Some(context) => context,
-        None => {
-            revoke_pending_delegation(paths, &prepared)?;
-            return Err(CliError::Core(DeadreckonError::InvalidInput(
-                "only an authenticated Job driver can launch a Campaign sub-process".to_string(),
-            )));
-        }
+    let Some(context) = DRIVER_CONTEXT.get() else {
+        revoke_pending_delegation(paths, &prepared)?;
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "only an authenticated Job driver can launch a Campaign sub-process".to_string(),
+        )));
     };
     if context.job_id != campaign.campaign_id {
         revoke_pending_delegation(paths, &prepared)?;
@@ -3411,13 +3411,15 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
             DELEGATED_PLAN_CHILD
                 .set(deadreckon_core::RunOwnership::merge_repair(
                     record.job_id,
-                    root_artifact_id.clone(),
-                    repair_id.clone(),
-                    *repair_round,
-                    run_id.clone(),
-                    proof_dir.clone(),
-                    repair_request_sha256.clone(),
-                    repair_plan_sha256.clone(),
+                    deadreckon_core::MergeRepairOwnership {
+                        root_artifact_id: root_artifact_id.clone(),
+                        repair_id: repair_id.clone(),
+                        repair_round: *repair_round,
+                        run_id: run_id.clone(),
+                        proof_dir: proof_dir.clone(),
+                        repair_request_sha256: repair_request_sha256.clone(),
+                        repair_plan_sha256: repair_plan_sha256.clone(),
+                    },
                 ))
                 .map_err(|_| {
                     CliError::Core(DeadreckonError::InvalidInput(
@@ -7327,6 +7329,7 @@ mod tests {
             source_revision: None,
             sandbox_requested: "none".to_string(),
             semantic_judge_mode: deadreckon_protocol::SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         let authority_path = paths.job_authority(job.job_id.as_ref());
         fs::write(
@@ -8849,13 +8852,15 @@ mod tests {
         let plan_sha = deadreckon_core::flight::sha256_text("plan");
         let ownership = deadreckon_core::RunOwnership::merge_repair(
             "parent-job",
-            "parent-job",
-            "repair-id",
-            1,
-            "dependency-repair-run",
-            proof_dir.clone(),
-            request_sha.clone(),
-            plan_sha.clone(),
+            deadreckon_core::MergeRepairOwnership {
+                root_artifact_id: "parent-job".to_string(),
+                repair_id: "repair-id".to_string(),
+                repair_round: 1,
+                run_id: "dependency-repair-run".to_string(),
+                proof_dir: proof_dir.clone(),
+                repair_request_sha256: request_sha.clone(),
+                repair_plan_sha256: plan_sha.clone(),
+            },
         );
         let state = deadreckon_core::create_owned_run(
             &paths,
