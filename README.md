@@ -60,9 +60,14 @@ Everything else (budgets, undo, multi-step chains, provider routing) is optional
 > native gate and a fresh read-only semantic judge before it validates a
 > receipt and promotes the result. A follow-up freezes the parent state,
 > promoted artifact, and verified receipt before queueing its isolated Single
-> Job. Explicit uncontained/in-place execution, historical `chain
-> run|resume`, previews, and chain extension remain labelled compatibility
-> paths.
+> Job. Preview and explicit uncontained/in-place execution remain foreground,
+> untrusted escape hatches. Public historical `chain run|resume` refuses
+> before state mutation or execution. Public `chain extend` and `chain redo
+> --extend` refuse before mutation and show the updated schedule to launch as
+> a durable chain. Unsupported policy-rich chain creation also refuses instead
+> of silently falling back to the old process-owned conductor. That conductor
+> and its mutation paths remain available only in the characterization binary
+> for tests.
 
 ## Why it's different
 
@@ -100,6 +105,7 @@ operator work, not completed claims.
 
 DeadReckon is maintained as production-release software. New execution through
 the ordinary direct verbs and guided `start` shares one parent Job lifecycle
-and a parent two-key receipt before promotion. Narrow compatibility paths
-retain their established run/plan/chain/campaign state and are explicitly
-labelled process-owned or untrusted.
+and a parent two-key receipt before promotion. Preview and explicit
+in-place/uncontained execution are foreground and untrusted. Stored historical
+chains remain inspectable, but their public execution and mutation commands
+refuse and direct the operator toward a new durable chain.

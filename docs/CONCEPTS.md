@@ -86,12 +86,17 @@ guided `deadreckon start` and the ordinary direct execution verbs. Review and
 full-plan work merges at the end, then becomes a same-ID Graph parent result.
 Campaign completion also revalidates the worst-of leaf roll-up. Both paths
 then run the native parent gate, ask a fresh read-only semantic judge, validate
-the parent receipt and promote. Preview, explicit uncontained/in-place runs,
-historical `chain run|resume`, and chain extension retain process-owned
-compatibility behavior; their artifacts must not be described as two-key Job
-receipts. Public `extend` and guided follow-up instead queue a parent-bound
-Single Job that freezes and revalidates the completed parent's state,
-promoted-artifact tree, and verified receipt when one exists.
+the parent receipt and promote. Preview and explicit uncontained/in-place runs
+remain foreground, untrusted escape hatches; their artifacts must not be
+described as two-key Job receipts. Public historical `chain run|resume`
+refuses before state mutation or execution. Public `chain extend` and `chain
+redo --extend` refuse before mutation and offer the resulting schedule as a
+new durable chain. Unsupported policy-rich chain creation also refuses rather
+than silently using the process-owned conductor. Only the characterization
+binary retains that legacy execution and mutation behavior for tests. Public
+`deadreckon extend` and guided follow-up instead queue a parent-bound Single Job that
+freezes and revalidates the completed parent's state, promoted-artifact tree,
+and verified receipt when one exists.
 
 If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present). Supported check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. Full reference, packs, and the compiled YAML format: [HOWTO § Done Criteria](../HOWTO.md#done-criteria).
 
@@ -120,17 +125,20 @@ Each of these is a first-class capability; usage lives in [HOWTO](../HOWTO.md):
   also have an append-only lifecycle, a fenced renewable lease, process-group
   metadata, and a detached supervisor. The optional user service adds
   restart-at-login posture. Graphs and campaigns wrap their established
-  conductor under that lease and verify the parent after merge. Explicit
-  compatibility modes remain process-owned.
+  conductor under that lease and verify the parent after merge. Preview and
+  explicit in-place/uncontained execution remain foreground and untrusted.
 - **Budgets and time limits.** `--max-spend 15` and `--max-wall-seconds 1800` cap a run, then walk away. High spend requires explicit confirmation.
 - **Undo a single bad turn.** Snapshot-based rollback to any turn (`deadreckon undo <id> --turn 3`), recorded in the run trace, not just a `git reset`. The same verb unwinds a chain's last applied step.
 - **Resume, kill, extend, or export any run.** Runs are lifecycle objects, not one terminal session.
 - **Ordered multi-step work.** A new `deadreckon chain` compiles the steps into
   a linear Graph Job. Each child depends on the previous child. DeadReckon
   composes the result at the end, then verifies the same-ID parent once with
-  both completion keys. Historical `chain run|resume` compatibility uses the
-  older stepwise gate and apply model and does not produce this trusted parent
-  receipt.
+  both completion keys. Stored historical chains remain available for
+  inspection, but public `chain run|resume` refuses before mutation or
+  execution and points to a new durable chain. Public `chain extend` and
+  `chain redo --extend` likewise refuse before mutation and show the updated
+  durable schedule. The older stepwise gate, apply, and mutation model is
+  reachable only through the characterization binary used by tests.
 - **Retries instead of a pause.** A step that misses its done criteria is told exactly what failed and tried again — twice by default — before the plan decides whether the rest of the work continues. An unattended run should not stop and wait for someone who walked away.
 
 ## The mental model
@@ -175,7 +183,10 @@ only after a valid two-key receipt. A semantic request to revise that parent
 starts a fenced parent-only attempt, preserving the approved authority and
 successful leaf results; repeated rounds remain bounded and linked in the
 receipt evidence. A deterministic parent gate failure stops `FAILED`.
-Historical and explicitly uncontained compatibility paths remain process-owned.
+Stored historical chains are inspectable, but their public execution and
+mutation paths refuse. Preview and explicitly uncontained/in-place execution
+remains foreground and untrusted; the characterization binary alone retains
+the old process-owned chain behavior for tests.
 
 ## Compared with agentic coding CLIs
 

@@ -38,9 +38,11 @@ The repository now contains three different things which should not be judged al
 2. Established graph/campaign conductors, direct advanced commands, reports,
    imports, and narration. Ordinary direct orchestration, new chains,
    stored-plan forks and campaigns now run those conductors under a parent Job
-   and verify the merged parent. Explicit compatibility modes and chain
-   extension remain process-owned. Public and guided run follow-ups use a
-   parent-bound durable Single Job.
+   and verify the merged parent. Preview and explicit in-place/uncontained
+   execution remain foreground and untrusted. Historical chain execution and
+   mutation refuse at the public boundary; the characterization binary alone
+   retains the old process-owned behavior for tests. Public and guided run
+   follow-ups use a parent-bound durable Single Job.
 3. Compatibility layers, speculative depth, and incomplete bets. Deprecate or
    quarantine these rather than allowing them to obscure the kernel.
 
@@ -92,11 +94,15 @@ Direct `run` creates a durable Single Job. Direct `orchestrate`, stored-plan
 creates a durable Campaign Job. A Graph always merges at the end. A Campaign
 can recover exact persisted sub-plans and revalidates its worst-of roll-up. The
 supervisor then verifies, receipts and promotes the same-ID parent result.
-Preview, explicit in-place/uncontained execution, historical `chain
-run|resume`, and chain extension remain process-owned and cannot issue a
-trusted Job receipt. Public `extend` and a follow-up selected by guided
-`start` freeze the completed parent state, promoted-artifact tree and verified
-receipt, then queue a durable Single Job.
+Preview and explicit in-place/uncontained execution remain foreground and
+untrusted, so they cannot issue a trusted Job receipt. Public historical
+`chain run|resume` refuses before mutation or execution. Public `chain extend`
+and `chain redo --extend` refuse before mutation and offer an updated durable
+schedule. Unsupported policy-rich chain launch also refuses rather than
+silently choosing the old conductor. Only the characterization binary retains
+that legacy behavior for tests. Public `deadreckon extend` and a follow-up
+selected by guided `start` freeze the completed parent state,
+promoted-artifact tree and verified receipt, then queue a durable Single Job.
 
 Graph and Campaign parents can now act on semantic `revise` through bounded,
 fenced parent-only repair. The next consolidation step is dogfooding that
@@ -126,7 +132,7 @@ truthfully by Jobs.
 | Show, status, history and static report | Turn durable evidence into an inspectable artifact | Deterministic summaries and HTML reports render the shared projection | Strong local-first auditability without a service | **Stable / bounded** | **Preserve deterministic core; treat richer rendering as optional** |
 | Docs and narration | Explain what happened at human scale | Deterministic docs plus optional provider-generated narrative summarize progress and artifacts | Evidence can be consumed without reading raw event streams | **Maturing / experimental**: several overlapping narrative paths | **Preserve one deterministic path; consolidate and validate model-generated variants** |
 | Import | Bring work from other agent harnesses into the same evidence model | Parsers ingest supported transcript/session formats into local run artifacts | A partial cross-tool memory bridge | **Stable / bounded**: deliberately one-way, not shared live state | **Preserve; do not claim the broader need is solved** |
-| Chains | Express sequential verified work | New supported chains compile into a durable linear Graph Job verified once at the end; historical `chain run|resume` and unsupported conductor policies remain explicitly legacy | Reuses one scheduler without pretending unsupported hooks/apply policy survived translation | **Maturing**: ordinary creation is Job-scheduled; historical and policy-rich compatibility paths remain | **Dogfood the durable path; preserve or retire legacy behavior explicitly** |
+| Chains | Express sequential verified work | New supported chains compile into a durable linear Graph Job verified once at the end; public historical execution, mutating extension, and unsupported conductor policies refuse before execution or mutation and offer a durable migration where possible | Reuses one scheduler without pretending unsupported hooks/apply policy survived translation | **Maturing**: ordinary creation is Job-scheduled; stored historical state is inspectable and legacy behavior is characterization-only | **Dogfood the durable path; decide the stored-state and characterization retirement policy** |
 | Plans, fork/merge and review | Coordinate dependent work and reconcile branches | A saved DAG launches child runs, reviews results and merges accepted work; direct orchestration and stored-plan fork force at-end delivery, verify the same-ID Graph parent and can repair that parent after semantic `revise` without rerunning successful leaves | Established graph semantics under one parent lease and receipt | **Maturing**: verified parent completion, bounded parent repair and durable direct launch exist; live interruption drills do not | **Dogfood parent repair; keep compatibility modes honest** |
 | Campaigns and reshape | Lift orchestration one level for broad goals | Bounded depth-two sub-orchestrations can recover exact persisted sub-plans; durable direct/guided parent completion revalidates the worst-of roll-up and can repair the merged parent before a two-key receipt | Worst-of roll-up and parent gate prevent child-result laundering | **Experimental / maturing**: durable parent recovery, bounded parent repair and receipt exist; live interruption drills do not | **Freeze depth; dogfood recovery, repair and no-laundering behavior** |
 | Seams | Let policy hooks compose without taking over the kernel | Four fixed subprocess seams receive versioned input and produce bounded output; conformance tooling checks them | Extensibility at explicit control points | **Stable / bounded** | **Preserve the fixed model; resist universal hook proliferation** |
@@ -136,7 +142,7 @@ truthfully by Jobs.
 | Supervisor service operations | Restore local work after the worker shell or supervisor disappears | Explicit managed launchd/systemd definitions pin binary, home and PATH; install/start/status/stop refuse unmanaged conflicts | Machine-level posture is opt-in and inspectable | **Implemented definitions and commands; live cross-platform reboot acceptance outstanding** | **Dogfood before making restart-at-login a default claim** |
 | Doctor, setup, update and release trust | Make the binary installable and diagnosable | Environment checks, provider setup, update flow, signing/attestation and packaging support operations | Necessary for trusting a local supervisor binary | **Stable / maturing** | **Add service/containment preflight; otherwise maintain as infrastructure** |
 
-## Durable Job gates are closed; compatibility paths remain
+## Durable Job gates are closed; refused legacy routes and foreground escapes remain
 
 Watchkeeper closes the concrete trust gaps identified by the previous map for
 durable Single, Graph and Campaign Jobs created through guided or supported
@@ -196,13 +202,17 @@ results stop `NEEDS_REVIEW`. Deterministic failure never calls the judge.
 This boundary covers durable Jobs, not every compatibility path. Supported
 ordinary `run` and `orchestrate`, new chains, stored-plan `fork`, and direct
 campaigns, public `extend`, and guided follow-ups enter the same Job scheduler.
-Preview, explicit in-place or uncontained work, historical `chain run|resume`,
-unsupported conductor-only policies, and chain extension retain process-owned
-compatibility semantics. Host
-configuration also matters: strict verification needs a real resolved
-sandbox. The repository contains hostile-path, forgery and fault tests. Live
-adversarial trials across providers and host versions remain operator work. The
-real macOS public-command suite proves the two-phase Seatbelt gate, protected
+Preview and explicit in-place or uncontained work remain foreground, untrusted
+escape hatches. Public historical `chain run|resume` refuses before state
+mutation or execution. Public `chain extend` and `chain redo --extend` refuse
+before mutation while offering the updated schedule as a durable launch.
+Unsupported conductor-only policies refuse before Job creation, planning, or
+legacy execution. The characterization binary alone retains the old conductor
+and mutation behavior for tests. Host configuration also matters: strict
+verification needs a real resolved sandbox. The repository contains
+hostile-path, forgery and fault tests. Live adversarial trials across providers
+and host versions remain operator work. The real macOS public-command suite
+proves the two-phase Seatbelt gate, protected
 path denial, gate-input scrubbing, residual cleanup and signed observed backend;
 it also cancels a held-open evaluator and SIGKILLs the outer launcher, proving
 the old group is reaped before cancellation or one bounded retry. An opt-in
@@ -218,7 +228,7 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 | # | Unmet need | Current outcome | Assessment |
 |---:|---|---|---|
 | 1 | Live context and spend visibility | Spend records, caps, context meter and status exist; subscription/model telemetry remains uneven | **Partly met** |
-| 2 | Multi-agent worktree coordination | Plans, new chains, stored-plan forks and campaigns coordinate isolated runs under a durable verified parent Job; policy-rich legacy paths and resource leasing remain | **Mostly met; live outcome unvalidated** |
+| 2 | Multi-agent worktree coordination | Plans, supported new chains, stored-plan forks and campaigns coordinate isolated runs under a durable verified parent Job; unsupported policy-rich chain launch now refuses, while resource leasing remains | **Mostly met; live outcome unvalidated** |
 | 3 | Undo for agent changes | Snapshots, diff, undo and file rewind exist | **Strongly met**, within file-state scope |
 | 4 | Provenance for generated code | Events, traces, artifacts and lineage are persisted | **Strongly met** |
 | 5 | Searchable team memory | Local library, docs and import are searchable; shared team memory and automatic carryover are absent | **Partly met** |
@@ -241,7 +251,7 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 | 22 | Meeting-to-code traceability | No dedicated workflow | **Absent / intentionally out of scope so far** |
 | 23 | Prompt and team standards | Skills, contracts and seams provide primitives; rules-as-gate is drafted but not implemented | **Partly met** |
 | 24 | Efficiency evaluation | Per-run spend/time/evidence exist; cross-run efficiency analysis and RCA do not | **Partly met** |
-| 25 | Agent inventory and run queue | Guided and ordinary Single, Graph and Campaign Jobs—including run follow-ups—are queued, listed, leased and supervised locally; historical chain extension and port/env/resource leasing remain outside it | **Mostly met locally, with resource leasing absent** |
+| 25 | Agent inventory and run queue | Guided and ordinary Single, Graph and Campaign Jobs—including run follow-ups—are queued, listed, leased and supervised locally; public historical chain mutation refuses and offers a durable schedule, while port/env/resource leasing remains absent | **Mostly met locally, with resource leasing absent** |
 
 ## What is essential
 
@@ -254,9 +264,9 @@ These capabilities form the product's defensible spine and should be preserved, 
 4. **Provider-neutral outer control**: one contract across direct APIs, CLI harnesses and structured app-server protocols.
 5. **Evidence as a protocol**: append-only records, provenance, spend, flight data and composed `RunView`/`JobView` projections.
 6. **Operator control without UI ownership**: attach/status/finish surfaces that read durable truth rather than holding it in memory.
-7. **A migration path from verified runs to Jobs**: preserve chain and plan
-   behavior while deciding the remaining historical chain ownership under one
-   scheduler.
+7. **A migration path from verified runs to Jobs**: keep public chain
+   execution on the Job scheduler, retain read-only access to historical chain
+   state, and turn refused legacy mutations into explicit durable schedules.
 8. **Local-first inspectability**: reports, library artifacts and import/export that do not require a hosted service.
 
 The uniqueness is not any individual command. It is the combination: provider-independent delegation + durable evidence + independent acceptance + recoverable promotion.
@@ -295,9 +305,11 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   revise rounds; live provider and interruption trials remain open.
 - **Remaining compatibility parity**: supported new direct and advanced
   execution and run continuation are Job-scheduled. Historical chain
-  execution, policy-rich chain modes, explicit in-place/uncontained execution,
-  previews, and chain extension remain process-owned and need preservation or
-  intentional retirement.
+  execution and mutation, including policy-rich launch, now refuse at the
+  public boundary; only the characterization binary retains their old
+  behavior for tests. Stored chain-state and characterization retirement still
+  need a decision. Explicit in-place/uncontained execution and previews remain
+  foreground, untrusted escape hatches.
 - **Outer-worker crash-window closure**: the supervisor records the prepared
   launch and attempt before spawn. The worker blocks on a private pipe until
   its metadata and `ChildLinked` event are durable. A pre-release crash can
@@ -356,10 +368,12 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 2. **Exercise crash and service recovery.** Kill workers and supervisors, remove
    network access, restart the machine, and attempt gate tampering. Close only
    the crash windows demonstrated by those drills.
-3. **Resolve the remaining compatibility boundary.** Preserve or intentionally
-   retire historical chain execution and extension, preview and uncontained
-   behaviors without weakening the Job lifecycle or labelling untrusted work
-   verified.
+3. **Finish the compatibility migration.** The public historical chain
+   execution and mutation boundary is closed. Decide when to retire the
+   characterization-only conductor and stored legacy schema, and whether
+   printed migration schedules need a first-class import command. Keep preview
+   and explicit in-place/uncontained behavior foreground and untrusted without
+   weakening the Job lifecycle.
 4. **Turn team policy into an acceptance input.** Deliver rules-as-gate on top
    of the existing done contract and combined receipt.
 5. **Add resource leasing only after scheduler parity.** Keep cross-machine
