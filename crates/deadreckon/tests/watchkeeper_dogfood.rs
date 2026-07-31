@@ -264,7 +264,11 @@ esac
         r#"#!/bin/sh
 for argument in "$@"; do
   case "$argument" in
-    live_docker_*) printf 'test %s ... ok\n' "$argument"; exit 0 ;;
+    live_docker_*)
+      printf 'test %s ... 28.0.4\n' "$argument"
+      printf 'ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out\n'
+      exit 0
+      ;;
   esac
 done
 exit 2
