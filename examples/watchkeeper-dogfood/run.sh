@@ -3,6 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 matrix_path="${DEADRECKON_DOGFOOD_MATRIX:-$script_dir/matrix.json}"
+expected_matrix_sha256="${DEADRECKON_DOGFOOD_MATRIX_SHA256:-}"
 task_id="${1:-}"
 
 if [[ "${DEADRECKON_DOGFOOD_EXECUTE:-}" != "1" ]]; then
@@ -24,31 +25,45 @@ max_polls="${DEADRECKON_DOGFOOD_MAX_POLLS:-720}"
 artifact_root="${DEADRECKON_DOGFOOD_ARTIFACTS:-$script_dir/artifacts}"
 
 task_row="$(
-  python3 - "$matrix_path" "$task_id" <<'PY'
-import json
+  python3 - "$script_dir" "$matrix_path" "$task_id" "$artifact_root" "$expected_matrix_sha256" <<'PY'
 import sys
+from pathlib import Path
 
-matrix_path, task_id = sys.argv[1:]
-with open(matrix_path, encoding="utf-8") as handle:
-    matrix = json.load(handle)
-tasks = {task["id"]: task for task in matrix["tasks"]}
+script_dir, matrix_path, task_id, artifact_root, expected_matrix_sha256 = sys.argv[1:]
+sys.path.insert(0, script_dir)
+from dogfood_common import load_matrix, validated_task_artifact_root
+
+manifest = load_matrix(Path(matrix_path))
+if expected_matrix_sha256 and manifest.sha256 != expected_matrix_sha256:
+    raise SystemExit(
+        "refusing dogfood execution because matrix bytes changed after batch planning: "
+        f"expected {expected_matrix_sha256}, observed {manifest.sha256}"
+    )
+tasks = manifest.tasks_by_id
 if task_id not in tasks:
     raise SystemExit(f"unknown dogfood task: {task_id}")
 task = tasks[task_id]
-repositories = {entry["slot"]: entry for entry in matrix["repositories"]}
-providers = {entry["slot"]: entry for entry in matrix["providers"]}
+task_root = validated_task_artifact_root(Path(artifact_root), task_id)
+if task_root.is_dir() and any(task_root.iterdir()):
+    raise SystemExit(
+        f"refusing to start a duplicate Job for {task_id}: {task_root} is non-empty; "
+        "inspect the recorded Job, then archive or repair these artifacts"
+    )
 fields = [
-    repositories[task["repository"]]["path_env"],
-    providers[task["provider"]]["route_env"],
-    task["goal"],
-    str(task["max_spend_usd"]),
+    manifest.repository_path_env[task.repository_slot],
+    manifest.provider_route_env[task.provider_slot],
+    task.repository_slot,
+    task.provider_slot,
+    manifest.sha256,
+    task.goal,
+    str(task.max_spend_usd),
 ]
 if any("\t" in field or "\n" in field for field in fields):
     raise SystemExit("matrix fields used by the harness must be one-line tab-free strings")
 print("\t".join(fields))
 PY
 )"
-IFS=$'\t' read -r repository_env provider_env goal max_spend_usd <<<"$task_row"
+IFS=$'\t' read -r repository_env provider_env repository_slot provider_slot matrix_sha256 goal max_spend_usd <<<"$task_row"
 repository="${!repository_env:-}"
 provider="${!provider_env:-}"
 
@@ -61,7 +76,11 @@ if [[ -z "$provider" ]]; then
   exit 64
 fi
 
-mkdir -p "$artifact_root/$task_id"
+mkdir -p "$artifact_root"
+if ! mkdir "$artifact_root/$task_id"; then
+  echo "refusing to start a duplicate Job for $task_id: the task artifact directory already exists; inspect the recorded Job, then archive or repair these artifacts" >&2
+  exit 65
+fi
 start_tmp="$artifact_root/$task_id/start.tmp.json"
 
 (
@@ -77,16 +96,20 @@ start_tmp="$artifact_root/$task_id/start.tmp.json"
 ) >"$start_tmp"
 
 job_id="$(
-  python3 - "$start_tmp" <<'PY'
+  python3 - "$script_dir" "$start_tmp" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as handle:
+script_dir, start_path = sys.argv[1:]
+sys.path.insert(0, script_dir)
+from dogfood_common import validated_path_id
+
+with open(start_path, encoding="utf-8") as handle:
     payload = json.load(handle)
 ids = payload.get("dispatched", {}).get("ids", [])
-if not ids:
-    raise SystemExit("public start output did not contain a dispatched job id")
-print(ids[0])
+if not isinstance(ids, list) or len(ids) != 1:
+    raise SystemExit("public start output must contain exactly one dispatched job id")
+print(validated_path_id(ids[0], "public start job id"))
 PY
 )"
 observation_dir="$artifact_root/$task_id/$job_id"
@@ -121,12 +144,22 @@ PY
   sleep "$poll_seconds"
 done
 
-python3 - "$observation_dir/operator-run.json" "$observation_dir/job-view.json" "$task_id" "$job_id" "$repository" "$provider" <<'PY'
+python3 - "$observation_dir/operator-run.json" "$observation_dir/job-view.json" "$task_id" "$job_id" "$repository_slot" "$provider_slot" "$matrix_sha256" "$repository" "$provider" <<'PY'
 import datetime
 import json
 import sys
 
-output, job_view_path, task_id, job_id, repository, provider = sys.argv[1:]
+(
+    output,
+    job_view_path,
+    task_id,
+    job_id,
+    repository_slot,
+    provider_slot,
+    matrix_sha256,
+    repository,
+    provider,
+) = sys.argv[1:]
 with open(job_view_path, encoding="utf-8") as handle:
     job_view = json.load(handle)
 projection = job_view["job"]["projection"]
@@ -134,6 +167,9 @@ record = {
     "schema_version": 1,
     "task_id": task_id,
     "job_id": job_id,
+    "matrix_sha256": matrix_sha256,
+    "repository_slot": repository_slot,
+    "provider_slot": provider_slot,
     "repository": repository,
     "provider_slot_value": provider,
     "terminal_observed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

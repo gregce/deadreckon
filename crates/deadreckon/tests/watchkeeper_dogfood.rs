@@ -352,6 +352,7 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
         "parent_only_repair",
         "parent_repair_bound",
         "campaign_recovery_bound",
+        "sandbox_boundary_observation_bound",
         "structurally_inconclusive",
     ]
     .into_iter()
@@ -441,6 +442,19 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
                     && oracle["evidence"] == "job-report"
                     && oracle["expected"] == "valid"),
             "{id} trusts worker observation without a valid public receipt"
+        );
+        assert!(
+            trial["oracles"]
+                .as_array()
+                .expect("oracles")
+                .iter()
+                .any(|oracle| oracle["id"] == "authoritative_attack_observation"
+                    && oracle["type"] == "sandbox_boundary_observation_bound"
+                    && oracle["authority_evidence"] == "authority"
+                    && oracle["job_evidence"] == "job-view-after"
+                    && oracle["events_evidence"] == "events-after"
+                    && oracle["report_evidence"] == "job-report"),
+            "{id} does not bind the authenticated boundary observation"
         );
     }
     let reboot = trials
@@ -834,16 +848,45 @@ fn metrics_are_derived_from_job_view_not_narrative() {
     let home = temp.path().join("home");
     let observations = temp.path().join("observations/task-1/job-1");
     let job_dir = home.join("jobs/job-1");
-    let proofs = temp.path().join("run/proofs");
+    let proofs = home.join("runstate/scope-1/runs/job-1/proofs");
+    let matrix = temp.path().join("matrix.json");
     fs::create_dir_all(&observations).expect("observations");
     fs::create_dir_all(&job_dir).expect("job dir");
     fs::create_dir_all(&proofs).expect("proofs");
+    fs::write(
+        &matrix,
+        serde_json::to_vec_pretty(&json!({
+            "repositories": [{
+                "slot": "repo",
+                "path_env": "WATCHKEEPER_TEST_REPO"
+            }],
+            "providers": [{
+                "slot": "provider",
+                "route_env": "WATCHKEEPER_TEST_PROVIDER"
+            }],
+            "tasks": [{
+                "id": "task-1",
+                "repository": "repo",
+                "provider": "provider",
+                "goal": "derive factual metrics",
+                "max_spend_usd": 1.0
+            }]
+        }))
+        .expect("matrix JSON"),
+    )
+    .expect("matrix");
+    let matrix_sha256 = deadreckon_core::flight::sha256_file(&matrix).expect("matrix digest");
 
     let marker = proofs.join("turn-acceptance.json");
     fs::write(&marker, "{}\n").expect("marker");
     fs::write(
         proofs.join("semantic-judgment.json"),
-        serde_json::to_vec_pretty(&json!({ "spend_usd": 0.05 })).expect("judgment JSON"),
+        serde_json::to_vec_pretty(&json!({
+            "job_id": "job-1",
+            "run_id": "job-1",
+            "spend_usd": 0.05
+        }))
+        .expect("judgment JSON"),
     )
     .expect("judgment");
     fs::write(
@@ -858,6 +901,11 @@ fn metrics_are_derived_from_job_view_not_narrative() {
                     "stop_reason": "verified"
                 },
                 "attempts": [{
+                    "id": {
+                        "scope": "scope-1",
+                        "run_id": "job-1",
+                        "short": "job-1"
+                    },
                     "spend": {
                         "total_usd": 1.25,
                         "wall_seconds": 12.5
@@ -907,7 +955,11 @@ fn metrics_are_derived_from_job_view_not_narrative() {
     fs::write(
         observations.join("operator-run.json"),
         serde_json::to_vec_pretty(&json!({
+            "task_id": "task-1",
             "job_id": "job-1",
+            "matrix_sha256": matrix_sha256,
+            "repository_slot": "repo",
+            "provider_slot": "provider",
             "terminal_outcome": "verified",
             "terminal_stop_reason": "verified",
             "public_commands": ["start", "status", "report", "finish"],
@@ -966,6 +1018,8 @@ fn metrics_are_derived_from_job_view_not_narrative() {
         .arg(&home)
         .arg("--observations")
         .arg(temp.path().join("observations"))
+        .arg("--matrix")
+        .arg(&matrix)
         .arg("--output")
         .arg(&output_path)
         .output()

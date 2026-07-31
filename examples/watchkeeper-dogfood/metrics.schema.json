@@ -5,10 +5,13 @@
   "required": [
     "schema_version",
     "generated_at",
+    "matrix",
+    "campaign_completion",
     "basis",
     "jobs_observed",
     "persisted_facts",
-    "human_review"
+    "human_review",
+    "data_quality"
   ],
   "properties": {
     "schema_version": {
@@ -17,6 +20,99 @@
     "generated_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "matrix": {
+      "type": "object",
+      "required": ["sha256", "task_count", "tasks"],
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "task_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "tasks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "repository_slot", "provider_slot"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "repository_slot": {"type": "string", "minLength": 1},
+              "provider_slot": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "campaign_completion": {
+      "type": "object",
+      "required": [
+        "status",
+        "assessment_status",
+        "claim_allowed",
+        "minimum_completed_tasks",
+        "completed_repository_slots",
+        "completed_provider_slots",
+        "completed_repository_slot_count",
+        "completed_provider_slot_count",
+        "counts",
+        "task_ids"
+      ],
+      "properties": {
+        "status": {"enum": ["complete", "incomplete"]},
+        "assessment_status": {"enum": ["ready", "incomplete"]},
+        "claim_allowed": {"type": "boolean"},
+        "minimum_completed_tasks": {"const": 20},
+        "completed_repository_slots": {"$ref": "#/$defs/slot_ids"},
+        "completed_provider_slots": {"$ref": "#/$defs/slot_ids"},
+        "completed_repository_slot_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_provider_slot_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "counts": {
+          "type": "object",
+          "required": [
+            "total",
+            "missing",
+            "attempted",
+            "completed",
+            "verified",
+            "reviewed"
+          ],
+          "properties": {
+            "total": {"type": "integer", "minimum": 1},
+            "missing": {"type": "integer", "minimum": 0},
+            "attempted": {"type": "integer", "minimum": 0},
+            "completed": {"type": "integer", "minimum": 0},
+            "verified": {"type": "integer", "minimum": 0},
+            "reviewed": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        },
+        "task_ids": {
+          "type": "object",
+          "required": ["missing", "attempted", "completed", "verified", "reviewed"],
+          "properties": {
+            "missing": {"$ref": "#/$defs/task_ids"},
+            "attempted": {"$ref": "#/$defs/task_ids"},
+            "completed": {"$ref": "#/$defs/task_ids"},
+            "verified": {"$ref": "#/$defs/task_ids"},
+            "reviewed": {"$ref": "#/$defs/task_ids"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     },
     "basis": {
       "type": "array",
@@ -34,9 +130,19 @@
     "human_review": {
       "type": "object"
     },
-    "data_quality": {
-      "type": "object"
-    }
+    "data_quality": {"type": "object"}
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "task_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "slot_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    }
+  }
 }

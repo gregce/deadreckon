@@ -4377,9 +4377,11 @@ under Seatbelt. It proves protected-path denial, inherited `GATE_*` scrubbing,
 residual process-group cleanup and signing of the observed `sandbox-exec`
 backend. An opt-in real Docker test separately proves the common key,
 environment, network and control-path boundary while preserving ordinary
-deliverable writes. It never pulls the required image. A public strict Docker
-Job with a platform-compatible `dr-gate` and live Linux/bubblewrap remain
-outstanding. Host sandbox availability still matters: an `auto` request that
+deliverable writes. It never pulls the required image. Three public strict
+Docker Job tests use a statically linked Linux `dr-gate` to prove deterministic
+completion followed by `NEEDS_REVIEW`, cancellation without retry or receipt,
+and worker `SIGKILL` cleanup before one bounded retry. Live Linux/bubblewrap
+remains outstanding. Host sandbox availability still matters: an `auto` request that
 resolves to no real backend cannot produce a verified strict Job.
 
 ### 58.6 Independent semantic judge
@@ -4524,7 +4526,7 @@ and promotion enforcement.
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
 human-review template, a credential-free adversarial runner, and a passive
-operator-gated recorder for the 9 remaining live fault claims. The recorder
+operator-gated recorder for the 8 remaining live fault claims. The recorder
 declares prerequisites, interventions, objective oracles, sanitized evidence
 and cleanup, but never starts providers, signals processes, controls services,
 changes networking, reboots, or calls `finish`.
@@ -4540,16 +4542,18 @@ evaluation digest, protected receipt digest and HMAC publication proof.
 Operator-selected manual files remain a compatibility documentation path and
 can never produce `passed`.
 
-The committed credential-free result records 12 passes, 0 failures, and 9
+The committed credential-free result records 13 passes, 0 failures, and 8
 explicitly unproven live/host claims. The sanitized live result records 2
 attempted tasks, 22 not run, and 0 verified.
 
 The macOS public-command end-to-end gate trial and the common Docker
 control-boundary trial are real host evidence, not hermetic backend
-simulations. The repository still does not report verified completion rates
-from the planned live tasks, prove false-acceptance or false-rejection rates,
-demonstrate live Linux/bubblewrap or a public strict Docker Job, demonstrate a
-real machine restart, or demonstrate live Campaign interruption recovery.
+simulations. The public strict Docker completion, cancellation and worker-death
+rows are also bound to the committed clean source. The repository still does
+not report verified completion rates from the planned live tasks, prove
+false-acceptance or false-rejection rates, demonstrate live Linux/bubblewrap,
+demonstrate a real machine restart, or demonstrate live Campaign interruption
+recovery.
 Direct run, orchestration, stored-plan fork, supported new chain, campaign, and
 run-follow-up launches now share the Job scheduler. Public historical chain
 execution and mutation refuse; their process-owned implementation is retained

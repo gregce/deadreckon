@@ -249,13 +249,25 @@ export DEADRECKON_DOGFOOD_PROVIDER_B="$WK_PROVIDER_B"
 export DEADRECKON_BIN="$WK_BIN"
 export DEADRECKON_DOGFOOD_ARTIFACTS="$WK_ARTIFACTS"
 
-python3 examples/watchkeeper-dogfood/collect-metrics.py --help
+python3 examples/watchkeeper-dogfood/batch.py
 DEADRECKON_DOGFOOD_EXECUTE=1 \
-  examples/watchkeeper-dogfood/run.sh dr-self-01
+  python3 examples/watchkeeper-dogfood/batch.py --execute
 ```
 
-The final command prints an observation directory. Inspect the persisted public
-outputs:
+The first command only prints the matrix plan. The second stops on the first
+non-zero task result and can be rerun to resume; it skips only observations
+bound to the exact matrix digest and task, repository, provider and Job
+identities. The batch passes that reviewed matrix path, artifact root and
+digest to each runner; a byte change after planning is a refusal before
+provider execution. A successful one-task runner prints an observation directory.
+Inspect the persisted public outputs:
+
+If a task is `blocked_partial` or `blocked_invalid`, do not rerun it directly.
+Inspect the existing `start.json`, latest status, and Job state first, then
+archive or repair the task artifacts. The batch deliberately refuses to create
+a second Job from an ambiguous task directory. The direct runner claims the
+task directory atomically, so an existing empty directory also blocks a new
+start. Symlinked task and Job artifact directories are rejected.
 
 ```bash
 export WK_OBSERVATION="/path/printed/by/the/harness"
@@ -283,6 +295,7 @@ rates. Generate the metrics artifact only from captured observations:
 python3 examples/watchkeeper-dogfood/collect-metrics.py \
   --home "$DEADRECKON_HOME" \
   --observations "$WK_ARTIFACTS" \
+  --matrix examples/watchkeeper-dogfood/matrix.json \
   --output "$WK_ARTIFACTS/metrics.json"
 python3 -m json.tool "$WK_ARTIFACTS/metrics.json"
 ```
@@ -291,6 +304,15 @@ The collector derives machine facts from `JobView`, Job events, receipts, and
 semantic judgments. Human comprehension, intervention, false acceptance, and
 false rejection remain unset until an operator supplies
 `human-review.json` from the included template.
+The collector rejects unknown or duplicate observed task IDs and reports the
+missing, attempted, completed, verified and reviewed task sets. Its execution
+status can become `complete` only for all 20–30 tasks across at least two
+repository slots and two provider slots, with no ambiguous terminal artifacts.
+Its separate assessment status becomes `ready`, and
+`campaign_completion.claim_allowed` becomes true, only after every completed
+task has an exact, fully populated, valid human review. The untouched template
+does not count as a review. Missing factual artifacts, invalid event rows, and
+symlinked or non-file Job event histories keep the assessment incomplete.
 
 ## 2. Prove terminal detachment
 

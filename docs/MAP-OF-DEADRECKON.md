@@ -221,7 +221,7 @@ control-path boundary. Three public strict Docker Job tests using a static
 Linux evaluator sidecar also pass on macOS arm64: deterministic completion
 followed by semantic `NEEDS_REVIEW`, operator cancellation without retry or
 receipt, and worker `SIGKILL` cleanup before exactly one bounded retry. Those
-new results still need a clean-source evidence artifact. Live
+results are bound to clean source `d76ffc6` by evidence commit `761b001`. Live
 Linux/bubblewrap proof and a real service-backed reboot remain outstanding.
 
 ## Original unmet needs: current outcome
@@ -333,17 +333,16 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   and real Docker tests prove the common control boundary plus public strict
   Job completion, cancellation and one bounded worker-death recovery on macOS
   arm64. The committed
-  credential-free adversarial result records 12 passes and 0 failures. The
+  credential-free adversarial result records 13 passes and 0 failures. The
   24-row live operator kit records 2 attempted tasks, 22 not run, and 0
-  verified. A passive recorder defines evidence and oracles for all 9
+  verified. A passive recorder defines evidence and oracles for all 8
   remaining live claims without initiating their destructive actions. Its
   protected `dr-capture` mode authenticates the exact Job, append-only history,
   deterministic evaluation and HMAC publication receipt; operator-supplied
-  compatibility captures remain explicitly inconclusive.
-  The newer public strict Docker results are local implementation evidence and
-  are not yet bound to a clean committed source in that result artifact. There
-  is no live Linux/bubblewrap result, reboot result, or measured false-accept
-  and false-reject rate.
+  compatibility captures remain explicitly inconclusive. The public strict
+  Docker results are bound to the clean committed source named by that result
+  artifact. There is no live Linux/bubblewrap result, reboot result, or
+  measured false-accept and false-reject rate.
 
 ### Product bets needing validation
 
@@ -424,7 +423,8 @@ document asks whether the operator outcome is actually met. The real macOS
 public-command gate trial proves the contained two-phase Seatbelt path. Opt-in
 Docker trials prove the common container control boundary and, on macOS arm64,
 public strict-Job completion, cancellation and worker-death recovery. The
-newer Docker results are not yet recorded against a clean committed source.
+Docker results are recorded against clean source `d76ffc6` by evidence commit
+`761b001`.
 Unit and integration tests and the 24-row dogfood result, with 2 attempted
 tasks, 22 not run and 0 verified, do not establish live Linux/bubblewrap,
 successful reboot recovery, live cross-provider behavior, or false-accept and

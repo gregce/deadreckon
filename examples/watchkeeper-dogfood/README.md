@@ -34,13 +34,39 @@ export DEADRECKON_BIN=/path/to/deadreckon
 export DEADRECKON_DOGFOOD_ARTIFACTS=/path/to/dogfood-observations
 ```
 
-Inspect a task, then explicitly enable execution:
+Plan the whole matrix first. This command is read-only: it does not start a
+provider even if `DEADRECKON_DOGFOOD_EXECUTE=1` is already present in the
+environment.
 
 ```sh
-python3 examples/watchkeeper-dogfood/collect-metrics.py --help
-DEADRECKON_DOGFOOD_EXECUTE=1 \
-  examples/watchkeeper-dogfood/run.sh dr-self-01
+python3 examples/watchkeeper-dogfood/batch.py
 ```
+
+After reviewing that plan, execution requires both the command flag and the
+existing environment gate:
+
+```sh
+DEADRECKON_DOGFOOD_EXECUTE=1 \
+  python3 examples/watchkeeper-dogfood/batch.py --execute
+```
+
+The batch stops on the first non-zero task result. Run the planning command
+again to inspect the resume posture. It skips a task only when its terminal `JobView` and
+`operator-run.json` agree on the exact matrix digest, task ID, Job ID,
+repository slot and provider slot. Partial or malformed artifacts are never
+treated as completed. Any non-empty task directory without exactly one valid
+terminal observation blocks execution until its recorded Job is inspected and
+the artifacts are archived or repaired. This fail-closed boundary prevents a
+batch killed after `start` from launching a second Job on restart. Keep
+`matrix.json` frozen once execution begins because any byte change
+intentionally invalidates prior observations. The batch passes the reviewed
+matrix path, artifact root, and digest into every runner invocation; the runner
+refuses if the matrix bytes change after planning. To run one reviewed task directly, the compatible
+single-task command remains
+`DEADRECKON_DOGFOOD_EXECUTE=1 ./examples/watchkeeper-dogfood/run.sh TASK_ID`.
+The direct runner atomically claims a new task artifact directory before
+calling `deadreckon start`. Even an existing empty directory is treated as an
+existing attempt and must be inspected and archived rather than reused.
 
 The harness writes the public command outputs and a final `job-view.json` under
 `$DEADRECKON_DOGFOOD_ARTIFACTS`. Keep that directory outside either disposable
@@ -53,6 +79,7 @@ Generate metrics from the persisted observations:
 python3 examples/watchkeeper-dogfood/collect-metrics.py \
   --home "$DEADRECKON_HOME" \
   --observations "$DEADRECKON_DOGFOOD_ARTIFACTS" \
+  --matrix examples/watchkeeper-dogfood/matrix.json \
   --output "$DEADRECKON_DOGFOOD_ARTIFACTS/metrics.json"
 ```
 
@@ -60,7 +87,27 @@ The collector reads the public `status --json` JobView, append-only job events,
 completion receipt, and semantic judgment. It never reads narrative or
 implementation-note prose. Human-only measurements remain `null` until an
 operator writes a structured `human-review.json` based on
-`human-review.template.json`.
+`human-review.template.json`. Copying the untouched template is not a review:
+the collector requires the exact fields, matching Job ID, timezone-aware
+timestamp, named reviewer, booleans, and finite nonnegative measurements.
+
+The metrics artifact binds the raw matrix bytes by SHA-256 and lists every
+task's repository and provider slots. It reports missing, attempted, completed,
+verified, and reviewed task IDs separately. Execution is `complete` only when
+all 20–30 matrix tasks have one unambiguous terminal observation spanning at
+least two repository slots and two provider slots. Assessment is `ready`, and
+`campaign_completion.claim_allowed` becomes true, only when every completed
+task also has a valid human review. This keeps execution completeness separate
+from the evidence needed to make the product claim. Missing factual artifacts,
+invalid event rows, and symlinked or non-file event histories also keep the
+assessment incomplete rather than being interpreted as zero activity. Copied
+reports cannot be symlinks, and semantic spend is read only from the Run
+identity's exact path under `$DEADRECKON_HOME/runstate`.
+
+The batch, direct runner, and collector share one matrix parser. Task and slot
+IDs must be safe path components, environment-variable references must be safe
+names, spend must be finite and nonnegative, and an optional `task_count` must
+equal the number of task rows.
 
 All 24 matrix entries started as `not_run`. The sanitized
 `trial-results.json` now records two operator attempts:
@@ -151,12 +198,10 @@ invalidate that source binding. `E` cannot name its own commit hash because
 adding that hash to the JSON changes `E` and therefore changes the hash again.
 Git parentage, or a later signed attestation, identifies `E`.
 
-The checked-in historical result records 12 passing credential-free proof
-groups, no failures and nine unproven claims against its named clean source.
-It predates the expanded runner and remains evidence for that source rather
-than for later changes. The current runner defines 13 proof groups and eight
-standing live claims. On the same capable macOS arm64 host, a fresh complete
-recording is expected to report 13 passed, no failures and eight unproven.
+The checked-in result records 13 passing credential-free proof groups, no
+failures and eight unproven claims against clean source `d76ffc6`; evidence
+commit `761b001` has that source as its parent. Later changes still require a
+fresh source/evidence pair before inheriting those claims.
 
 The proof groups directly cover supported
 creation routes entering one Job journey, one- and two-round Graph semantic
@@ -169,9 +214,8 @@ trial additionally proves the real container's key, environment, network and
 control-path boundary when `rust:1` is already cached; it never pulls an image
 implicitly. A second Docker group now runs three public strict Jobs: normal
 deterministic completion, operator cancellation, and worker `SIGKILL` followed
-by stale-container cleanup and exactly one retry. Rerun and bind the expanded
-matrix to a clean source revision before treating that public Docker row as
-checked dogfood evidence.
+by stale-container cleanup and exactly one retry. Those three rows are included
+in the checked clean-source evidence described above.
 
 The JSON output records each command, duration, exit status, matched test line,
 and stdout/stderr digest. It labels proof by scope. The runner first proves

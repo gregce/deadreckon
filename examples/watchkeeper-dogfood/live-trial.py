@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,56 @@ SUPERVISED_IDENTITY_FIELDS = (
     "process_start_identity",
 )
 MAX_IMMUTABLE_ARTIFACT_BYTES = 256 * 1024 * 1024
+SANDBOX_BOUNDARY_OBSERVATION_REQUIRED_FIELDS = {
+    "schema_version",
+    "job_id",
+    "run_id",
+    "observed_at",
+    "issuer",
+    "probe_id",
+    "attempt",
+    "outer_launch_id",
+    "authority_sha256",
+    "contract_sha256",
+    "result_tree_sha256",
+    "sandbox_requested",
+    "sandbox_backend",
+    "contained",
+    "gate_key_read_denied",
+    "proof_write_denied",
+    "control_write_denied",
+    "operator_capture_read_denied",
+    "operator_capture_write_denied",
+    "signing_env_scrubbed",
+    "probe_sha256",
+    "signature",
+}
+SANDBOX_BOUNDARY_OBSERVATION_OPTIONAL_FIELDS = {"gate_evaluator_sha256"}
+JOB_AUTHORITY_REQUIRED_FIELDS = {
+    "schema_version",
+    "job_id",
+    "run_id",
+    "approved_at",
+    "accepted_by",
+    "goal_sha256",
+    "contract_sha256",
+    "effective_policy_sha256",
+    "launch_plan_sha256",
+    "source_tree_sha256",
+    "source_revision",
+    "sandbox_requested",
+    "semantic_judge_mode",
+}
+JOB_AUTHORITY_OPTIONAL_FIELDS = {"gate_evaluator_sha256"}
+SANDBOX_BOUNDARY_DENIAL_FIELDS = (
+    "contained",
+    "gate_key_read_denied",
+    "proof_write_denied",
+    "control_write_denied",
+    "operator_capture_read_denied",
+    "operator_capture_write_denied",
+    "signing_env_scrubbed",
+)
 
 
 class TrialError(RuntimeError):
@@ -326,6 +377,7 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]
         or not set(intervention_sources.values()).issubset(
             TRUSTED_INTERVENTION_SOURCES
         )
+        or not valid_digest(trusted_capture.get("sandbox_boundary_probe_sha256"))
     ):
         raise TrialError("manifest trusted_capture guidance is malformed")
     return manifest, indexed
@@ -1035,6 +1087,265 @@ def reference_value(
     return json_pointer(load_captured_value(trial_dir, state, evidence), pointer)
 
 
+def closed_object_fields(
+    value: Any,
+    required: set[str],
+    optional: set[str],
+) -> bool:
+    return (
+        isinstance(value, dict)
+        and required.issubset(value)
+        and set(value).issubset(required | optional)
+    )
+
+
+def valid_hex_signature(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def valid_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except ValueError:
+        return False
+    return str(parsed) == value.lower()
+
+
+def load_trusted_sandbox_boundary_observation(
+    trial_dir: Path,
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], bytes]:
+    if state.get("capture_mode") != "trusted":
+        raise TrialError("sandbox boundary observation lacks trusted capture provenance")
+    trusted_capture = state.get("trusted_capture")
+    if not isinstance(trusted_capture, dict) or trusted_capture.get("backend") not in {
+        "sandbox-exec",
+        "bwrap",
+        "docker",
+    }:
+        raise TrialError("sandbox boundary observation lacks a contained capture binding")
+    intervention = state.get("intervention")
+    if not isinstance(intervention, dict) or intervention.get("status") != "performed":
+        raise TrialError("sandbox boundary intervention was not performed")
+    path = trial_dir / RAW_DIR / "intervention.json"
+    raw = stable_regular_bytes(path, "trusted sandbox boundary observation")
+    if intervention.get("detail_sha256") != digest_bytes(raw):
+        raise TrialError("sandbox boundary observation changed after trusted capture")
+    try:
+        observation = json.loads(
+            raw,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError(f"non-finite JSON number {token}")
+            ),
+        )
+    except (UnicodeDecodeError, ValueError) as error:
+        raise TrialError("sandbox boundary observation is malformed") from error
+    if not isinstance(observation, dict):
+        raise TrialError("sandbox boundary observation is not a JSON object")
+    return observation, raw
+
+
+def sandbox_boundary_observation_facts(
+    trial_dir: Path,
+    state: dict[str, Any],
+    declaration: dict[str, Any],
+    sandbox_boundary_probe_sha256: str | None,
+) -> tuple[bool, dict[str, Any]]:
+    observation, observation_raw = load_trusted_sandbox_boundary_observation(trial_dir, state)
+    authority_name = declaration.get("authority_evidence")
+    job_name = declaration.get("job_evidence")
+    events_name = declaration.get("events_evidence")
+    report_name = declaration.get("report_evidence")
+    if not all(
+        isinstance(name, str)
+        for name in (authority_name, job_name, events_name, report_name)
+    ):
+        raise TrialError("sandbox boundary oracle lacks its canonical evidence declarations")
+    authority = load_captured_value(trial_dir, state, authority_name)
+    job_view = load_captured_value(trial_dir, state, job_name)
+    events = load_captured_value(trial_dir, state, events_name)
+    report = load_captured_value(trial_dir, state, report_name)
+    authority_capture = state.get("captures", {}).get(authority_name)
+    if not isinstance(authority_capture, dict):
+        raise TrialError("sandbox boundary authority capture state is absent")
+    authority_path = captured_file_path(trial_dir, authority_capture)
+
+    observation_closed = closed_object_fields(
+        observation,
+        SANDBOX_BOUNDARY_OBSERVATION_REQUIRED_FIELDS,
+        SANDBOX_BOUNDARY_OBSERVATION_OPTIONAL_FIELDS,
+    )
+    authority_closed = closed_object_fields(
+        authority,
+        JOB_AUTHORITY_REQUIRED_FIELDS,
+        JOB_AUTHORITY_OPTIONAL_FIELDS,
+    )
+    trusted_capture = state["trusted_capture"]
+    expected_backend = declaration.get("backend", trusted_capture.get("backend"))
+    declared_backend = trusted_capture.get("backend")
+
+    job_id = None
+    projection = None
+    attempts = None
+    try:
+        job_id = job_id_from_view(job_view)
+        projection = json_pointer(job_view, "/job/projection")
+        attempts = json_pointer(job_view, "/job/attempts")
+    except TrialError:
+        pass
+    receipt = None
+    try:
+        receipt = json_pointer(report, "/receipt/receipt")
+    except TrialError:
+        pass
+
+    run_id = observation.get("run_id")
+    attempt = observation.get("attempt")
+    outer_launch_id = observation.get("outer_launch_id")
+    matching_attempts = []
+    if isinstance(attempts, list):
+        matching_attempts = [
+            item
+            for item in attempts
+            if isinstance(item, dict)
+            and item.get("id", {}).get("run_id") == run_id
+        ]
+    attempt_backends = {
+        item.get("sandbox", {}).get("backend")
+        for item in matching_attempts
+        if isinstance(item.get("sandbox"), dict)
+    }
+
+    started = []
+    linked = []
+    if isinstance(events, list):
+        started = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("kind") == "attempt_started"
+            and isinstance(event.get("detail"), dict)
+            and event["detail"].get("attempt") == attempt
+            and event["detail"].get("run_id") == run_id
+        ]
+        linked = [
+            event
+            for event in events
+            if isinstance(event, dict)
+            and event.get("kind") == "child_linked"
+            and isinstance(event.get("detail"), dict)
+            and event["detail"].get("attempt") == attempt
+            and event["detail"].get("run_id") == run_id
+        ]
+    linked_launch_ids = {
+        event["detail"].get("launch_id")
+        for event in linked
+        if isinstance(event["detail"].get("launch_id"), str)
+    }
+
+    authority_identity = (
+        authority.get("gate_evaluator_sha256") if isinstance(authority, dict) else None
+    )
+    observation_identity = observation.get("gate_evaluator_sha256")
+    # These live trials exercise the current strict Job path, not the legacy
+    # compatibility shape where evaluator identity was absent.  Requiring the
+    # digest on both sides prevents a pair of missing values from being
+    # mistaken for an independently bound evaluator.
+    identity_valid = (
+        isinstance(authority_identity, str)
+        and valid_digest(authority_identity)
+        and authority_identity == observation_identity
+    )
+    digests_valid = all(
+        valid_digest(observation.get(name))
+        for name in (
+            "authority_sha256",
+            "contract_sha256",
+            "result_tree_sha256",
+            "probe_sha256",
+        )
+    )
+    observed_at_valid = False
+    observed_at = observation.get("observed_at")
+    if isinstance(observed_at, str):
+        try:
+            observed_at_valid = datetime.datetime.fromisoformat(
+                observed_at.replace("Z", "+00:00")
+            ).tzinfo is not None
+        except ValueError:
+            pass
+
+    requested_backend = authority.get("sandbox_requested")
+    backend_bound = (
+        expected_backend in {"sandbox-exec", "bwrap", "docker"}
+        and declared_backend == expected_backend
+        and observation.get("sandbox_backend") == expected_backend
+        and requested_backend in {"auto", expected_backend}
+        # RunView records the approved request (`auto` or an explicit
+        # backend), while the controller observation and receipt record the
+        # concrete backend selected for the gate.
+        and attempt_backends == {requested_backend}
+    )
+    if declaration.get("backend") is not None:
+        backend_bound = backend_bound and requested_backend == expected_backend
+
+    facts = {
+        "observation_schema_closed": observation_closed,
+        "authority_schema_closed": authority_closed,
+        "trusted_intervention_digest_bound": True,
+        "signature_present": valid_hex_signature(observation.get("signature")),
+        "issuer_valid": observation.get("issuer") == "deadreckon-controller",
+        "schema_version_valid": observation.get("schema_version") == 1,
+        "timestamp_valid": observed_at_valid,
+        "probe_identity_valid": (
+            valid_uuid(observation.get("probe_id"))
+            and valid_digest(sandbox_boundary_probe_sha256)
+            and observation.get("probe_sha256") == sandbox_boundary_probe_sha256
+        ),
+        "authority_bound": (
+            authority_closed
+            and observation.get("authority_sha256")
+            == digest_bytes(authority_path.read_bytes())
+            and observation.get("job_id") == authority.get("job_id") == job_id
+            and run_id == authority.get("run_id")
+            and observation.get("contract_sha256") == authority.get("contract_sha256")
+            and observation.get("sandbox_requested") == authority.get("sandbox_requested")
+        ),
+        "attempt_bound": (
+            isinstance(attempt, int)
+            and not isinstance(attempt, bool)
+            and attempt > 0
+            and isinstance(projection, dict)
+            and projection.get("attempt_count") == attempt
+            and len(matching_attempts) == 1
+            and bool(started)
+            and linked_launch_ids == {outer_launch_id}
+            and valid_uuid(outer_launch_id)
+        ),
+        "backend_bound": backend_bound,
+        "evaluator_identity_bound": identity_valid,
+        "digests_well_formed": digests_valid,
+        "completion_receipt_bound": (
+            isinstance(receipt, dict)
+            and receipt.get("job_id") == observation.get("job_id")
+            and receipt.get("run_id") == run_id
+            and receipt.get("authority_sha256") == observation.get("authority_sha256")
+            and receipt.get("contract_sha256") == observation.get("contract_sha256")
+            and receipt.get("result_tree_sha256") == observation.get("result_tree_sha256")
+            and receipt.get("sandbox_backend") == observation.get("sandbox_backend")
+            and receipt.get("contained") is True
+            and receipt.get("sandbox_boundary_observation_sha256")
+            == digest_bytes(observation_raw)
+        ),
+        "all_denials_observed": all(
+            observation.get(field) is True for field in SANDBOX_BOUNDARY_DENIAL_FIELDS
+        ),
+    }
+    return all(facts.values()), facts
+
+
 def event_indices(events: list[dict[str, Any]], kind: str) -> list[int]:
     return [index for index, event in enumerate(events) if event.get("kind") == kind]
 
@@ -1293,7 +1604,11 @@ def oracle_result(
 
 
 def evaluate_oracle(
-    trial_dir: Path, state: dict[str, Any], declaration: dict[str, Any]
+    trial_dir: Path,
+    state: dict[str, Any],
+    declaration: dict[str, Any],
+    *,
+    sandbox_boundary_probe_sha256: str | None = None,
 ) -> dict[str, Any]:
     oracle_type = declaration.get("type")
     try:
@@ -2017,6 +2332,29 @@ def evaluate_oracle(
                     "matching_recoveries": len(recovered),
                 },
             )
+        if oracle_type == "sandbox_boundary_observation_bound":
+            try:
+                passed, facts = sandbox_boundary_observation_facts(
+                    trial_dir,
+                    state,
+                    declaration,
+                    sandbox_boundary_probe_sha256,
+                )
+            except (KeyError, TypeError, TrialError, ValueError):
+                return oracle_result(
+                    declaration,
+                    "failed",
+                    "the trusted sandbox boundary observation was absent, malformed, or unbound",
+                    None,
+                )
+            return oracle_result(
+                declaration,
+                "passed" if passed else "failed",
+                "the authenticated controller probe is bound to the exact Job, attempt, backend, evaluator, receipt, and denial facts"
+                if passed
+                else "the sandbox boundary observation contradicted at least one required binding or denial fact",
+                facts,
+            )
         if oracle_type == "structurally_inconclusive":
             return oracle_result(
                 declaration,
@@ -2378,6 +2716,8 @@ def validate_result_payload(payload: dict[str, Any]) -> None:
 
 def trusted_capture_inspect(
     state: dict[str, Any],
+    trial_dir: Path,
+    expected_intervention_source: str,
 ) -> dict[str, Any]:
     response = run_capture_helper(
         state,
@@ -2410,9 +2750,15 @@ def trusted_capture_inspect(
             raise TrialError(
                 f"trusted capture inspection does not cover canonical subject {name}"
             )
-    for key, subject, phase in (
-        ("intervention", "intervention", "intervention"),
-        ("cleanup", "cleanup", "cleanup"),
+    for key, subject, phase, source, kind in (
+        (
+            "intervention",
+            "intervention",
+            "intervention",
+            expected_intervention_source,
+            "intervention-recorded",
+        ),
+        ("cleanup", "cleanup", "cleanup", "job-cleanup", "cleanup-recorded"),
     ):
         lifecycle = state.get(key, {})
         if lifecycle.get("status") not in {"performed", "completed"}:
@@ -2423,9 +2769,18 @@ def trusted_capture_inspect(
             if isinstance(event, dict)
             and event.get("subject") == subject
             and normalized_helper_name(event.get("phase")) == phase
+            and normalized_helper_name(event.get("source")) == source
+            and normalized_helper_name(event.get("kind")) == kind
+            and normalized_helper_name(event.get("provenance")) == "trusted-supervisor"
             and event.get("content_sha256") == lifecycle.get("detail_sha256")
         ]
-        if len(matches) != 1:
+        evidence_path = trial_dir / RAW_DIR / f"{subject}.json"
+        evidence = stable_regular_bytes(evidence_path, f"trusted {subject} observation")
+        if (
+            len(matches) != 1
+            or matches[0].get("content_bytes") != len(evidence)
+            or matches[0].get("content_sha256") != digest_bytes(evidence)
+        ):
             raise TrialError(f"trusted capture inspection does not cover {key}")
     return response
 
@@ -2438,11 +2793,18 @@ def build_evaluation(
     trusted_pass_ready: bool,
     generated_at: str | None = None,
 ) -> dict[str, Any]:
-    _, trials = load_manifest(manifest_path)
+    manifest, trials = load_manifest(manifest_path)
     trial = trials[state["trial_id"]]
     declarations = evidence_index(trial)
     assertions = [
-        evaluate_oracle(trial_dir, state, declaration)
+        evaluate_oracle(
+            trial_dir,
+            state,
+            declaration,
+            sandbox_boundary_probe_sha256=manifest["trusted_capture"].get(
+                "sandbox_boundary_probe_sha256"
+            ),
+        )
         for declaration in trial["oracles"]
     ]
     missing_required = [
@@ -2545,7 +2907,17 @@ def command_finalize(
 ) -> None:
     state = load_state(trial_dir)
     trusted = state.get("capture_mode") == "trusted"
-    inspection = trusted_capture_inspect(state) if trusted else None
+    manifest, _ = load_manifest(manifest_path)
+    expected_intervention_source = manifest["trusted_capture"][
+        "intervention_sources"
+    ].get(state.get("trial_id"))
+    if trusted and expected_intervention_source not in TRUSTED_INTERVENTION_SOURCES:
+        raise TrialError("trusted capture manifest has no intervention source for this trial")
+    inspection = (
+        trusted_capture_inspect(state, trial_dir, expected_intervention_source)
+        if trusted
+        else None
+    )
     trusted_pass_ready = bool(
         inspection
         and inspection.get("capture_coverage", {}).get("pass_ready") is True
