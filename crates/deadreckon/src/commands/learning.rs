@@ -337,21 +337,10 @@ async fn learn_propose_command(
             "deadreckon config provider",
         ))
     })?;
-    let response = router
-        .complete(&ProviderRequest {
-            prompt,
-            max_output_tokens: 8_000,
-            cwd: Some(std::env::current_dir()?),
-            output_path: Some(paths.learning_dir().join("reflection.out")),
-            sandbox_backend: None,
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token: None,
-            session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-        })
-        .await?;
+    let mut request =
+        ProviderRequest::enforceably_read_only(prompt, 8_000, std::env::current_dir()?);
+    request.output_path = Some(paths.learning_dir().join("reflection.out"));
+    let response = router.complete(&request).await?;
     let reflection_provider = LearningInsightProvider {
         route: response.provider,
         model: response.model,

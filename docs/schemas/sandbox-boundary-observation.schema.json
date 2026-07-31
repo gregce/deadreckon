@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SandboxBoundaryObservation",
+  "description": "Controller-produced result of actively probing the exact containment backend used for strict deterministic verification.\n\nThis artifact lives in protected Job state, not in the coding workspace. Its HMAC is independent of the final receipt HMAC; the receipt additionally binds the exact persisted observation bytes.",
+  "type": "object",
+  "required": [
+    "attempt",
+    "authority_sha256",
+    "contained",
+    "contract_sha256",
+    "control_write_denied",
+    "gate_key_read_denied",
+    "issuer",
+    "job_id",
+    "observed_at",
+    "operator_capture_read_denied",
+    "operator_capture_write_denied",
+    "outer_launch_id",
+    "probe_id",
+    "probe_sha256",
+    "proof_write_denied",
+    "result_tree_sha256",
+    "run_id",
+    "sandbox_backend",
+    "sandbox_requested",
+    "schema_version",
+    "signature",
+    "signing_env_scrubbed"
+  ],
+  "properties": {
+    "attempt": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "authority_sha256": {
+      "type": "string"
+    },
+    "contained": {
+      "type": "boolean"
+    },
+    "contract_sha256": {
+      "type": "string"
+    },
+    "control_write_denied": {
+      "type": "boolean"
+    },
+    "gate_key_read_denied": {
+      "type": "boolean"
+    },
+    "issuer": {
+      "$ref": "#/definitions/SandboxBoundaryObservationIssuer"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "operator_capture_read_denied": {
+      "type": "boolean"
+    },
+    "operator_capture_write_denied": {
+      "type": "boolean"
+    },
+    "outer_launch_id": {
+      "type": "string"
+    },
+    "probe_id": {
+      "type": "string"
+    },
+    "probe_sha256": {
+      "type": "string"
+    },
+    "proof_write_denied": {
+      "type": "boolean"
+    },
+    "result_tree_sha256": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "sandbox_backend": {
+      "type": "string"
+    },
+    "sandbox_requested": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "signature": {
+      "type": "string"
+    },
+    "signing_env_scrubbed": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "SandboxBoundaryObservationIssuer": {
+      "type": "string",
+      "enum": [
+        "deadreckon-controller"
+      ]
+    }
+  }
+}

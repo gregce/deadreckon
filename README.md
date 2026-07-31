@@ -55,13 +55,14 @@ Everything else (budgets, undo, multi-step chains, provider routing) is optional
 
 > [!TIP]
 > `start`, ordinary direct `run` and `orchestrate`, new chains, stored-plan
-> `fork`, and direct campaigns now enter the same durable Job scheduler. Each
-> shape verifies its same-ID parent result with a native gate and a fresh
-> read-only semantic judge before it validates a receipt and promotes the
-> result. Explicit uncontained/in-place execution, historical `chain
-> run|resume`, previews, and `extend` remain labelled compatibility paths. A
-> guided follow-up refuses before work and prints the exact legacy `extend`
-> command.
+> `fork`, direct campaigns, and public or guided follow-ups now enter the same
+> durable Job scheduler. Each shape verifies its same-ID parent result with a
+> native gate and a fresh read-only semantic judge before it validates a
+> receipt and promotes the result. A follow-up freezes the parent state,
+> promoted artifact, and verified receipt before queueing its isolated Single
+> Job. Explicit uncontained/in-place execution, historical `chain
+> run|resume`, previews, and chain extension remain labelled compatibility
+> paths.
 
 ## Why it's different
 

@@ -575,10 +575,7 @@ fn orchestrate_review_preview_shows_coder_reviewer_providers_without_forking() {
     assert!(out.contains("mode         : review"), "{out}");
     assert!(out.contains("coder smoke:coder"), "{out}");
     assert!(out.contains("reviewer smoke:reviewer"), "{out}");
-    let plan = newest_plan(&paths);
-    assert_eq!(plan.mode, PlanMode::Review);
-    assert_eq!(plan.status, PlanStatus::Pending);
-    assert!(plan.tasks.iter().all(|task| task.child_run_id.is_none()));
+    assert_eq!(saved_plan_count(&paths), 0);
 }
 
 #[test]
@@ -613,10 +610,7 @@ fn orchestrate_full_plan_preview_shows_planner_child_providers_without_forking()
     assert!(out.contains("planner smoke:planner"), "{out}");
     assert!(out.contains("default child smoke:child"), "{out}");
     assert!(out.contains("provider=smoke:reviewer"), "{out}");
-    let plan = newest_plan(&paths);
-    assert_eq!(plan.mode, PlanMode::FullPlan);
-    assert_eq!(plan.status, PlanStatus::Pending);
-    assert!(plan.tasks.iter().all(|task| task.child_run_id.is_none()));
+    assert_eq!(saved_plan_count(&paths), 0);
 }
 
 #[test]
@@ -1813,12 +1807,14 @@ fn orchestrate_acceptance_override_is_passed_to_child_runs() {
 }
 
 #[test]
-fn orchestrate_init_git_initializes_plain_directory_before_preview() {
+fn orchestrate_preview_with_init_git_keeps_plain_source_and_home_unchanged() {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("plain-init");
     fs::create_dir_all(&workspace).expect("workspace");
     fs::write(workspace.join("README.md"), "hello").expect("readme");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let source_before = filesystem_snapshot(&workspace);
+    let home_before = filesystem_snapshot(paths.home());
 
     let output = deadreckon(&paths)
         .current_dir(&workspace)
@@ -1826,6 +1822,10 @@ fn orchestrate_init_git_initializes_plain_directory_before_preview() {
             "orchestrate",
             "review",
             "initialize before planning",
+            "--coder-provider",
+            "smoke:coder",
+            "--reviewer-provider",
+            "smoke:reviewer",
             "--init-git",
             "--preview",
         ])
@@ -1833,13 +1833,14 @@ fn orchestrate_init_git_initializes_plain_directory_before_preview() {
         .expect("orchestrate preview");
 
     assert_success(&output);
-    assert!(workspace.join(".git").is_dir());
-    let plan = newest_plan(&paths);
-    assert_eq!(plan.status, PlanStatus::Pending);
-    assert_eq!(
-        plan.parent_cwd.as_deref(),
-        Some(workspace.canonicalize().expect("canonical").as_path())
-    );
+    let out = stdout(&output);
+    assert!(out.contains("orchestrate preflight"), "{out}");
+    assert!(out.contains("Implement requested change"), "{out}");
+    assert!(out.contains("Review and fix implementation"), "{out}");
+    assert_eq!(filesystem_snapshot(&workspace), source_before);
+    assert_eq!(filesystem_snapshot(paths.home()), home_before);
+    assert!(!workspace.join(".git").exists());
+    assert_eq!(saved_plan_count(&paths), 0);
 }
 
 #[test]
@@ -2700,10 +2701,22 @@ fn fork_writes_plan_started_event_once() {
 }
 
 #[test]
-fn orchestrate_preview_writes_plan_created_without_fork_events() {
+fn orchestrate_full_plan_preview_keeps_source_and_state_unchanged_and_starts_no_child() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("preview-child-provider");
+    let child_marker = temp.path().join("preview-child-ran");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "preview-child",
+        &format!(
+            "printf '%s\\n' child-ran > '{}'\nexit 99",
+            child_marker.display()
+        ),
+    );
+    let filesystem_before = filesystem_snapshot(temp.path());
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -2714,7 +2727,7 @@ fn orchestrate_preview_writes_plan_created_without_fork_events() {
             "--planner-provider",
             "smoke:planner",
             "--provider",
-            "smoke:child",
+            "preview-child",
             "--n",
             "2",
             "--preview",
@@ -2722,26 +2735,14 @@ fn orchestrate_preview_writes_plan_created_without_fork_events() {
         .output()
         .expect("orchestrate preview");
     assert_success(&output);
-    let plan = newest_plan(&paths);
-    let events = read_plan_events(&paths, &plan.plan_id).expect("events");
-
-    assert!(events.iter().any(|event| matches!(
-        &event.event,
-        PlanEventKind::PlanCreated {
-            mode: PlanMode::FullPlan,
-            task_count: 2
-        }
-    )));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(&event.event, PlanEventKind::PlanStarted))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(&event.event, PlanEventKind::TaskStarted { .. }))
-    );
+    let out = stdout(&output);
+    assert!(out.contains("orchestrate preflight"), "{out}");
+    assert!(out.contains("Create foundation"), "{out}");
+    assert!(out.contains("Add behavior"), "{out}");
+    assert!(out.contains("preview-child"), "{out}");
+    assert_eq!(filesystem_snapshot(temp.path()), filesystem_before);
+    assert!(!child_marker.exists());
+    assert_eq!(saved_plan_count(&paths), 0);
 }
 
 #[test]
@@ -7956,6 +7957,64 @@ fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn filesystem_snapshot(root: &std::path::Path) -> Vec<(PathBuf, &'static str, u32, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        path: &std::path::Path,
+        snapshot: &mut Vec<(PathBuf, &'static str, u32, Vec<u8>)>,
+    ) {
+        let metadata = fs::symlink_metadata(path)
+            .unwrap_or_else(|source| panic!("metadata {}: {source}", path.display()));
+        let relative = path
+            .strip_prefix(root)
+            .expect("snapshot path under root")
+            .to_path_buf();
+        let relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative
+        };
+        let mode = metadata.permissions().mode();
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(path)
+                .unwrap_or_else(|source| panic!("read link {}: {source}", path.display()));
+            snapshot.push((
+                relative,
+                "symlink",
+                mode,
+                target.to_string_lossy().as_bytes().to_vec(),
+            ));
+        } else if metadata.is_dir() {
+            snapshot.push((relative, "directory", mode, Vec::new()));
+            let mut children = fs::read_dir(path)
+                .unwrap_or_else(|source| panic!("read dir {}: {source}", path.display()))
+                .map(|entry| entry.expect("snapshot entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                visit(root, &child, snapshot);
+            }
+        } else if metadata.is_file() {
+            snapshot.push((
+                relative,
+                "file",
+                mode,
+                fs::read(path)
+                    .unwrap_or_else(|source| panic!("read file {}: {source}", path.display())),
+            ));
+        } else {
+            snapshot.push((relative, "other", mode, Vec::new()));
+        }
+    }
+
+    if !root.exists() {
+        return Vec::new();
+    }
+    let mut snapshot = Vec::new();
+    visit(root, root, &mut snapshot);
+    snapshot
 }
 
 fn newest_plan(paths: &DeadreckonPaths) -> Plan {

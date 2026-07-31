@@ -371,22 +371,15 @@ impl NarratorEngine {
                 self.window.rolling_summary(),
             )
         {
-            let request = ProviderRequest {
-                prompt: bundle.prompt,
-                max_output_tokens: NARRATOR_MAX_TOKENS,
-                cwd: None,
-                output_path: None,
-                sandbox_backend: None,
-                workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-                pid_file: None,
-                // Interruptible: a shutdown cancel aborts the in-flight beat call
-                // so emit() falls through to a floor beat instead of the task
-                // being killed mid-call with no beat written.
-                cancellation_token: Some(self.cancel.clone()),
-                session_dir: None,
-                output_schema: None,
-                capability_posture: None,
-            };
+            let mut request = ProviderRequest::enforceably_read_only(
+                bundle.prompt,
+                NARRATOR_MAX_TOKENS,
+                self.ctx.run_root.clone(),
+            );
+            // Interruptible: a shutdown cancel aborts the in-flight beat call
+            // so emit() falls through to a floor beat instead of the task
+            // being killed mid-call with no beat written.
+            request.cancellation_token = Some(self.cancel.clone());
             if let Ok(response) = router.complete(&request).await
                 && self.commit_model_beat(&response, now).is_ok()
             {

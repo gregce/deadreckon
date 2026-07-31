@@ -104,9 +104,10 @@ Common provider/model changes:
   deadreckon config model gpt-5.1-codex --provider cli:codex
 
 Headless:
-  deadreckon run \"goal\" --plain --quiet --sandbox none
-  Explicit `--sandbox none` uses the uncontained foreground compatibility path;
-  it does not create a durable Job or trusted completion receipt.
+  deadreckon run \"goal\" --plain --quiet --sandbox none --untrusted
+  `--untrusted` explicitly selects the foreground compatibility path for
+  `--sandbox none` or `--in-place`. It cannot create a durable Job or issue a
+  trusted Job receipt.
 
 Done criteria:
   deadreckon def-done \"build, test, and open in a browser\"
@@ -116,7 +117,8 @@ Done criteria:
 
 Modes:
   In a git repo, the default is an isolated worktree.
-  Use `--fresh`, `--from <dir>`, `--worktree`, or `--in-place --i-know-its-a-lot` to force a mode.";
+  Use `--fresh`, `--from <dir>`, or `--worktree` to force an isolated mode.
+  Direct checkout edits require `--in-place --i-know-its-a-lot --untrusted`.";
 
 const TRY_HELP: &str = "\
 Lifecycle:
@@ -858,6 +860,11 @@ pub(crate) enum Commands {
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
+        #[arg(
+            long,
+            help = "Allow an in-place or sandbox-none foreground Run that cannot issue a trusted Job receipt"
+        )]
+        untrusted: bool,
         #[arg(long, help = "Provider route override")]
         provider: Option<String>,
         #[arg(long, help = "Model override for this run")]
@@ -1562,8 +1569,19 @@ pub(crate) enum Commands {
         parent_run_id: String,
         #[arg(help = "Follow-up coding goal")]
         new_goal: String,
-        #[arg(long, help = "Destination working directory for copy/fresh extensions")]
+        #[arg(
+            long,
+            help = "Deprecated foreground destination; durable extensions are delivered with finish"
+        )]
         dest: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Approved done criteria for the follow-up; defaults to the parent's frozen contract"
+        )]
+        acceptance: Option<PathBuf>,
+        #[arg(long, help = "Approve and queue the immutable continuation Job")]
+        yes: bool,
         #[arg(long, help = "Maximum parent turns to include in context")]
         max_context_turns: Option<u32>,
         #[arg(long, help = "Do not include parent context")]
@@ -2638,7 +2656,10 @@ pub(crate) enum SupervisorCommand {
     #[command(about = "Enable and start the installed per-user supervisor service")]
     Start,
     #[command(about = "Show the installed per-user supervisor service state")]
-    Status,
+    Status {
+        #[arg(long, help = "Print typed machine-readable service evidence")]
+        json: bool,
+    },
     #[command(about = "Disable and stop the per-user supervisor service")]
     Stop,
 }
@@ -2646,6 +2667,11 @@ pub(crate) enum SupervisorCommand {
 pub(crate) struct RunCommandArgs {
     pub(crate) goal: String,
     pub(crate) run_id: Option<String>,
+    /// Internal-only source root used when another lifecycle command compiles
+    /// into a durable Single Job. It is never populated from public CLI input.
+    pub(crate) durable_source_cwd: Option<PathBuf>,
+    /// Immutable continuation evidence to freeze into a durable leaf launch.
+    pub(crate) continuation: Option<crate::commands::run::DurableContinuationSpec>,
     /// A retry judges tamper against its node's FIRST attempt's snapshot, so
     /// files edited in an earlier attempt to game the gate stay visible.
     pub(crate) tamper_baseline: Option<PathBuf>,
@@ -2667,6 +2693,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) sandbox: Option<String>,
+    pub(crate) untrusted: bool,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) doc_provider: Option<String>,
@@ -2818,6 +2845,8 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) parent_run_id: String,
     pub(crate) new_goal: String,
     pub(crate) dest: Option<PathBuf>,
+    pub(crate) acceptance: Option<PathBuf>,
+    pub(crate) yes: bool,
     pub(crate) max_context_turns: Option<u32>,
     pub(crate) no_context: bool,
     pub(crate) max_spend: Option<f64>,

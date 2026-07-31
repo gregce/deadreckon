@@ -1,0 +1,208 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OperatorCaptureBinding",
+  "description": "Immutable identity approved before the first capture event.",
+  "type": "object",
+  "required": [
+    "capture_binary",
+    "capture_binary_sha256",
+    "created_at",
+    "deadreckon_binary",
+    "deadreckon_binary_sha256",
+    "deadreckon_source_revision",
+    "deadreckon_version",
+    "declared_backend",
+    "declared_shape",
+    "job_id",
+    "manifest_sha256",
+    "pass_capable",
+    "provider_routes",
+    "recorder_interpreter",
+    "recorder_interpreter_sha256",
+    "recorder_sha256",
+    "replay_sha256",
+    "required_captures",
+    "result_schema_sha256",
+    "schema_version",
+    "session_id",
+    "signature",
+    "source_revision",
+    "source_tree_sha256",
+    "trial_id"
+  ],
+  "properties": {
+    "capture_binary": {
+      "type": "string"
+    },
+    "capture_binary_sha256": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "deadreckon_binary": {
+      "type": "string"
+    },
+    "deadreckon_binary_sha256": {
+      "type": "string"
+    },
+    "deadreckon_source_revision": {
+      "type": "string"
+    },
+    "deadreckon_version": {
+      "type": "string"
+    },
+    "declared_backend": {
+      "type": "string"
+    },
+    "declared_shape": {
+      "$ref": "#/definitions/JobShape"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "manifest_sha256": {
+      "type": "string"
+    },
+    "pass_capable": {
+      "type": "boolean"
+    },
+    "provider_routes": {
+      "description": "Approved provider routes keyed by manifest-declared execution role.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "recorder_interpreter": {
+      "description": "Absolute interpreter route approved for deterministic recorder replay.",
+      "type": "string"
+    },
+    "recorder_interpreter_sha256": {
+      "type": "string"
+    },
+    "recorder_sha256": {
+      "type": "string"
+    },
+    "replay_sha256": {
+      "type": "string"
+    },
+    "required_captures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/OperatorCaptureRequirement"
+      }
+    },
+    "result_schema_sha256": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    },
+    "source_revision": {
+      "type": "string"
+    },
+    "source_tree_sha256": {
+      "type": "string"
+    },
+    "trial_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "JobShape": {
+      "type": "string",
+      "enum": [
+        "single",
+        "graph",
+        "legacy_chain",
+        "legacy_campaign"
+      ]
+    },
+    "OperatorCapturePhase": {
+      "description": "Operator-capture phase, kept separate from Job lifecycle state.",
+      "type": "string",
+      "enum": [
+        "prepared",
+        "before",
+        "intervention",
+        "after",
+        "cleanup",
+        "finalized"
+      ]
+    },
+    "OperatorCaptureRequirement": {
+      "type": "object",
+      "required": [
+        "media_type",
+        "phase",
+        "source",
+        "subject"
+      ],
+      "properties": {
+        "media_type": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/definitions/OperatorCapturePhase"
+        },
+        "source": {
+          "$ref": "#/definitions/OperatorCaptureSource"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperatorCaptureSource": {
+      "description": "Closed source vocabulary. Only `ManualFile` accepts a caller-provided path.",
+      "type": "string",
+      "enum": [
+        "binding",
+        "job_view",
+        "job_events",
+        "job_intervention",
+        "job_cleanup",
+        "job",
+        "authority",
+        "launch_plan",
+        "lease",
+        "job_report",
+        "receipt",
+        "supervised_child",
+        "host_boot_id",
+        "semantic_judgment",
+        "parent_repair_manifest",
+        "parent_repair_candidate",
+        "doctor",
+        "supervisor_service_status",
+        "parent_artifact",
+        "parent_events",
+        "campaign",
+        "campaign_events",
+        "active_plan",
+        "active_plan_events",
+        "sandbox_boundary_observation",
+        "campaign_intervention",
+        "result_envelope",
+        "manual_file",
+        "unavailable_objective"
+      ]
+    }
+  }
+}

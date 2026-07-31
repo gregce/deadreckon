@@ -28,27 +28,72 @@ pub(crate) fn materialize_command(
     include_manifest: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
-    let (state, plan_context, dest) =
-        match super::reference::try_resolve_run(&paths, &run_id, "export")? {
-            Some(state) => (state, None, dest),
-            None => match resolve_plan_result_run(&paths, &run_id, "export")? {
-                Some(result) => {
-                    let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
-                    (result.state, Some(result.plan), dest)
-                }
-                None => {
-                    return Err(super::reference::refusal_for_reference(
-                        &paths, &run_id, "export",
-                    ));
-                }
-            },
-        };
+    materialize_command_with_paths(&paths, &run_id, dest, force, include_manifest)
+}
+
+fn materialize_command_with_paths(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    dest: Option<PathBuf>,
+    force: bool,
+    include_manifest: bool,
+) -> Result<()> {
+    let resolved = super::reference::resolve_ref(
+        paths,
+        super::reference::RefQuery {
+            reference: Some(run_id),
+            all_scopes: false,
+            verb: "export",
+        },
+    )?;
+    let (state, plan_context, dest, authority) = match resolved {
+        super::reference::ResolvedRef::Job(job) => {
+            let state = finish_job_state(paths, &job)?;
+            let authority = MaterializeDeliveryAuthority::Verified(
+                VerifiedDeliveryAuthority::from_finished_job(paths, &job, &state)?,
+            );
+            (state, None, dest, authority)
+        }
+        super::reference::ResolvedRef::Run(state)
+        | super::reference::ResolvedRef::PlanChild { state, .. } => {
+            let state = *state;
+            let authority = materialize_delivery_authority(paths, &state)?;
+            (state, None, dest, authority)
+        }
+        super::reference::ResolvedRef::Plan(plan) => {
+            let plan_id = plan.plan_id.clone();
+            let Some(result) = resolve_plan_result_run(paths, &plan_id, "export")? else {
+                return Err(super::reference::refusal_for(
+                    super::reference::RefKind::Plan,
+                    "export",
+                    &plan_id,
+                ));
+            };
+            let authority = materialize_delivery_authority(paths, &result.state)?;
+            let dest = dest.or_else(|| Some(default_plan_materialize_dest(&result.plan)));
+            (result.state, Some(result.plan), dest, authority)
+        }
+        other => {
+            return Err(super::reference::refusal_for(
+                other.kind(),
+                "export",
+                &super::reference::resolved_id(&other),
+            ));
+        }
+    };
     if let Some(plan) = plan_context.as_ref() {
         print_plan_result_context(plan, &state);
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
-        materialize_plan_docs_to_working(&paths, plan, &library_dir, None)?;
+        materialize_plan_docs_to_working(paths, plan, &library_dir, None)?;
     }
-    let materialized = materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
+    let materialized = materialize_completed_run_with_authority(
+        paths,
+        &state,
+        dest,
+        force,
+        include_manifest,
+        &authority,
+    )?;
     print_materialized(&materialized);
     Ok(())
 }
@@ -165,16 +210,6 @@ pub(crate) fn finish_command(
             let materialized =
                 materialize_completed_run(&paths, &state, dest, force, include_manifest)?;
             print_materialized(&materialized);
-            if let Some(job_id) = finished_job_id.as_deref() {
-                let revision = delivered_git_revision(&materialized.dest);
-                super::job::record_job_delivery(
-                    &paths,
-                    job_id,
-                    super::job::JobDeliveryKind::Exported,
-                    &materialized.dest,
-                    revision.as_deref(),
-                )?;
-            }
             Ok(())
         }
         CodebaseMode::InPlace => {
@@ -291,6 +326,104 @@ pub(crate) struct MaterializedRun {
     dest: PathBuf,
 }
 
+#[derive(Debug)]
+pub(crate) struct VerifiedDeliveryAuthority {
+    job_id: String,
+    run_id: String,
+    receipt: deadreckon_protocol::CompletionReceipt,
+    receipt_sha256: String,
+}
+
+impl VerifiedDeliveryAuthority {
+    fn from_finished_job(
+        paths: &DeadreckonPaths,
+        job: &deadreckon_core::JobView,
+        state: &deadreckon_core::PipelineState,
+    ) -> Result<Self> {
+        if job.job.job_id.as_ref() != state.run_id {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified Job {} resolved a different delivery Run {}",
+                job.job.job_id, state.run_id
+            ))));
+        }
+        let receipt = deadreckon_core::validate_completion_receipt(paths, state)?;
+        let receipt_sha256 =
+            deadreckon_core::flight::sha256_file(&paths.job_receipt(job.job.job_id.as_ref()))?;
+        Ok(Self {
+            job_id: job.job.job_id.as_ref().to_string(),
+            run_id: state.run_id.clone(),
+            receipt,
+            receipt_sha256,
+        })
+    }
+
+    fn revalidate(
+        &self,
+        paths: &DeadreckonPaths,
+        state: &deadreckon_core::PipelineState,
+    ) -> Result<()> {
+        let receipt = deadreckon_core::validate_completion_receipt(paths, state)?;
+        let receipt_sha256 =
+            deadreckon_core::flight::sha256_file(&paths.job_receipt(&self.job_id))?;
+        if receipt != self.receipt || receipt_sha256 != self.receipt_sha256 {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "job {} completion receipt changed while its result was being exported",
+                    self.job_id
+                ),
+                &format!("deadreckon verdict {}", run_prefix(&self.job_id)),
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum MaterializeDeliveryAuthority {
+    LegacyUnowned,
+    Verified(VerifiedDeliveryAuthority),
+}
+
+fn materialize_delivery_authority(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<MaterializeDeliveryAuthority> {
+    let owner_job_id = if paths.job_json(&state.run_id).is_file() {
+        Some(state.run_id.clone())
+    } else {
+        super::graph_job::resolve_run_owner(paths, state)?
+            .map(|owner| owner.job.job_id.as_ref().to_string())
+    };
+    let Some(owner_job_id) = owner_job_id else {
+        return Ok(MaterializeDeliveryAuthority::LegacyUnowned);
+    };
+    if owner_job_id != state.run_id {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "delivery cannot use {} because it belongs to durable Job {}",
+                run_prefix(&state.run_id),
+                run_prefix(&owner_job_id)
+            ),
+            &format!("deadreckon attach {}", run_prefix(&owner_job_id)),
+        )));
+    }
+    let job = deadreckon_core::JobView::load(paths, &owner_job_id)?;
+    let finished = finish_job_state(paths, &job)?;
+    if finished.run_id != state.run_id {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "export cannot deliver Run {} because Job {} verified a different result",
+                run_prefix(&state.run_id),
+                run_prefix(&owner_job_id)
+            ),
+            &format!("deadreckon finish {}", run_prefix(&owner_job_id)),
+        )));
+    }
+    Ok(MaterializeDeliveryAuthority::Verified(
+        VerifiedDeliveryAuthority::from_finished_job(paths, &job, &finished)?,
+    ))
+}
+
 pub(crate) fn materialize_completed_run(
     paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
@@ -298,6 +431,33 @@ pub(crate) fn materialize_completed_run(
     force: bool,
     include_manifest: bool,
 ) -> Result<MaterializedRun> {
+    let authority = materialize_delivery_authority(paths, state)?;
+    materialize_completed_run_with_authority(
+        paths,
+        state,
+        dest,
+        force,
+        include_manifest,
+        &authority,
+    )
+}
+
+fn materialize_completed_run_with_authority(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    dest: Option<PathBuf>,
+    force: bool,
+    include_manifest: bool,
+    authority: &MaterializeDeliveryAuthority,
+) -> Result<MaterializedRun> {
+    if let MaterializeDeliveryAuthority::Verified(authority) = authority
+        && authority.run_id != state.run_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "delivery authority for Job {} does not authorize Run {}",
+            authority.job_id, state.run_id
+        ))));
+    }
     ensure_completed_run(state, "materialize")?;
     let record = lifecycle_codebase_record(paths, state)?;
     match record.mode {
@@ -344,6 +504,21 @@ pub(crate) fn materialize_completed_run(
             .join(run_prefix(&state.run_id))
     }))?;
     refuse_dest_inside_home(paths, &dest, "export")?;
+
+    if let MaterializeDeliveryAuthority::Verified(authority) = authority {
+        return materialize_verified_completed_run(
+            paths,
+            state,
+            &library_dir,
+            dest,
+            force,
+            include_manifest,
+            authority,
+            VerifiedExportFailpoint::None,
+            None,
+        );
+    }
+
     prepare_empty_dest(&dest, force)?;
 
     copy_deliverable_tree(&library_dir, &dest)?;
@@ -358,11 +533,1038 @@ pub(crate) fn materialize_completed_run(
     normalize_permissions(&dest)?;
     append_materialized_marker(&library_dir, &dest)?;
 
-    Ok(MaterializedRun {
+    let materialized = MaterializedRun {
         run_id: state.run_id.clone(),
         source: library_dir,
         dest,
+    };
+    if let MaterializeDeliveryAuthority::Verified(authority) = authority {
+        let revision = delivered_git_revision(&materialized.dest);
+        super::job::record_job_delivery(
+            paths,
+            &authority.job_id,
+            super::job::JobDeliveryKind::Exported,
+            &materialized.dest,
+            revision.as_deref(),
+        )?;
+    }
+    Ok(materialized)
+}
+
+const VERIFIED_EXPORT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VerifiedExportPhase {
+    Prepared,
+    BackupMoved,
+    Published,
+    Recorded,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedExportMarker {
+    schema_version: u32,
+    kind: String,
+    transaction_id: String,
+    job_id: String,
+    run_id: String,
+    destination: PathBuf,
+    receipt_sha256: String,
+    result_tree_sha256: String,
+    include_manifest: bool,
+    manifest_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifiedExportTransaction {
+    schema_version: u32,
+    transaction_id: String,
+    job_id: String,
+    run_id: String,
+    destination: PathBuf,
+    destination_parent_identity: String,
+    receipt_sha256: String,
+    result_tree_sha256: String,
+    include_manifest: bool,
+    manifest_sha256: Option<String>,
+    previous_destination_sha256: Option<String>,
+    stage: PathBuf,
+    backup: PathBuf,
+    phase: VerifiedExportPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct VerifiedExportBinding<'a> {
+    schema_version: u32,
+    job_id: &'a str,
+    run_id: &'a str,
+    destination: &'a Path,
+    receipt_sha256: &'a str,
+    result_tree_sha256: &'a str,
+    include_manifest: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifiedExportFailpoint {
+    None,
+    AfterStageSync,
+    AfterBackupRename,
+    AfterPublish,
+    AfterEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifiedDestinationState {
+    Missing,
+    Previous,
+    Exported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifiedStageState {
+    Missing,
+    PartialOwned,
+    Complete,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_verified_completed_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    library_dir: &Path,
+    dest: PathBuf,
+    force: bool,
+    include_manifest: bool,
+    authority: &VerifiedDeliveryAuthority,
+    failpoint: VerifiedExportFailpoint,
+    after_initial_validation: Option<&mut dyn FnMut()>,
+) -> Result<MaterializedRun> {
+    authority.revalidate(paths, state)?;
+    // `absolute_dest` can retain an empty unresolved suffix when a previously
+    // absent directory now exists. Normalize that representation so the same
+    // canonical destination produces the same durable transaction on retry.
+    let dest = lexical_normalize_path(&dest);
+    let parent = dest.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "export destination {} has no parent directory",
+            dest.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if canonical_parent != parent {
+        return Err(verified_export_refusal(
+            authority,
+            &format!(
+                "destination parent {} changed identity while export was being prepared",
+                parent.display()
+            ),
+        ));
+    }
+    let parent_identity = verified_directory_identity(parent)?;
+    let binding = VerifiedExportBinding {
+        schema_version: VERIFIED_EXPORT_SCHEMA_VERSION,
+        job_id: &authority.job_id,
+        run_id: &authority.run_id,
+        destination: &dest,
+        receipt_sha256: &authority.receipt_sha256,
+        result_tree_sha256: &authority.receipt.result_tree_sha256,
+        include_manifest,
+    };
+    let transaction_id = deadreckon_core::flight::sha256_text(
+        &serde_json::to_string(&binding).map_err(CliError::from)?,
+    );
+    let transaction_id = transaction_id
+        .strip_prefix("sha256:")
+        .unwrap_or(&transaction_id)
+        .to_string();
+    let stage = parent.join(format!(".deadreckon-export-{transaction_id}.stage"));
+    let backup = parent.join(format!(".deadreckon-export-{transaction_id}.backup"));
+    let journal_path = paths
+        .job_dir(&authority.job_id)
+        .join("export-transactions")
+        .join(format!("{transaction_id}.json"));
+    let lock_key = format!("export-{transaction_id}");
+    let lock = acquire_lock(
+        paths,
+        &lock_key,
+        &authority.run_id,
+        &state.scope,
+        "verified-export",
+        Duration::from_secs(30 * 60),
+    )?;
+    let result = materialize_verified_completed_run_locked(
+        paths,
+        state,
+        library_dir,
+        &dest,
+        force,
+        include_manifest,
+        authority,
+        failpoint,
+        after_initial_validation,
+        transaction_id,
+        parent_identity,
+        stage,
+        backup,
+        journal_path,
+    );
+    match (result, lock.release()) {
+        (Ok(materialized), Ok(())) => Ok(materialized),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(CliError::Core(error)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_verified_completed_run_locked(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    library_dir: &Path,
+    dest: &Path,
+    force: bool,
+    include_manifest: bool,
+    authority: &VerifiedDeliveryAuthority,
+    failpoint: VerifiedExportFailpoint,
+    mut after_initial_validation: Option<&mut dyn FnMut()>,
+    transaction_id: String,
+    parent_identity: String,
+    stage: PathBuf,
+    backup: PathBuf,
+    journal_path: PathBuf,
+) -> Result<MaterializedRun> {
+    let marker = VerifiedExportMarker {
+        schema_version: VERIFIED_EXPORT_SCHEMA_VERSION,
+        kind: "verified_export".to_string(),
+        transaction_id: transaction_id.clone(),
+        job_id: authority.job_id.clone(),
+        run_id: authority.run_id.clone(),
+        destination: dest.to_path_buf(),
+        receipt_sha256: authority.receipt_sha256.clone(),
+        result_tree_sha256: authority.receipt.result_tree_sha256.clone(),
+        include_manifest,
+        manifest_sha256: None,
+    };
+    let mut transaction = if path_lexically_present(&journal_path)? {
+        let transaction = read_verified_export_transaction(&journal_path, authority)?;
+        validate_verified_export_transaction(
+            &transaction,
+            &marker,
+            &parent_identity,
+            &stage,
+            &backup,
+            authority,
+        )?;
+        transaction
+    } else {
+        if path_lexically_present(&stage)? || path_lexically_present(&backup)? {
+            return Err(verified_export_refusal(
+                authority,
+                "derived export staging paths exist without a trusted transaction journal",
+            ));
+        }
+        let previous_destination_sha256 = if path_lexically_present(dest)? {
+            if !force && !path_is_empty_dir(dest)? {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "dest {} is not empty (use --overwrite or pass a fresh path)",
+                    dest.display()
+                ))));
+            }
+            Some(verified_path_identity(dest)?)
+        } else {
+            None
+        };
+        let manifest_sha256 = if include_manifest {
+            regular_file_sha256_if_present(&library_dir.join("manifest.json"))?
+        } else {
+            None
+        };
+        let transaction = VerifiedExportTransaction {
+            schema_version: VERIFIED_EXPORT_SCHEMA_VERSION,
+            transaction_id,
+            job_id: authority.job_id.clone(),
+            run_id: authority.run_id.clone(),
+            destination: dest.to_path_buf(),
+            destination_parent_identity: parent_identity,
+            receipt_sha256: authority.receipt_sha256.clone(),
+            result_tree_sha256: authority.receipt.result_tree_sha256.clone(),
+            include_manifest,
+            manifest_sha256,
+            previous_destination_sha256,
+            stage,
+            backup,
+            phase: VerifiedExportPhase::Prepared,
+        };
+        write_verified_export_transaction(&journal_path, &transaction)?;
+        transaction
+    };
+    let marker = VerifiedExportMarker {
+        manifest_sha256: transaction.manifest_sha256.clone(),
+        ..marker
+    };
+    validate_verified_export_parent(&transaction)?;
+    if let Some(hook) = after_initial_validation.as_mut() {
+        hook();
+    }
+
+    let mut destination_state =
+        inspect_verified_destination(dest, &transaction, &marker, authority)?;
+    let mut stage_state = inspect_verified_stage(&transaction.stage, &marker, authority)?;
+    let backup_present = inspect_verified_backup(&transaction, authority)?;
+
+    if destination_state == VerifiedDestinationState::Exported {
+        return finish_published_verified_export(
+            paths,
+            state,
+            library_dir,
+            authority,
+            failpoint,
+            &journal_path,
+            &marker,
+            &mut transaction,
+            stage_state,
+            backup_present,
+        );
+    }
+    if destination_state == VerifiedDestinationState::Previous && backup_present {
+        return Err(verified_export_refusal(
+            authority,
+            "both the destination and backup contain the pre-export tree",
+        ));
+    }
+    if destination_state == VerifiedDestinationState::Missing
+        && transaction.previous_destination_sha256.is_some()
+        && !backup_present
+    {
+        return Err(verified_export_refusal(
+            authority,
+            "the prior destination disappeared without the receipt-bound backup",
+        ));
+    }
+
+    if stage_state == VerifiedStageState::PartialOwned {
+        remove_owned_verified_export_path(&transaction.stage, &marker, authority)?;
+        sync_verified_export_parent(&transaction)?;
+        stage_state = VerifiedStageState::Missing;
+    }
+    if stage_state == VerifiedStageState::Missing {
+        create_verified_export_stage(&transaction.stage, &marker)?;
+        let stage_result = (|| {
+            copy_deliverable_tree(library_dir, &transaction.stage)?;
+            if !include_manifest {
+                remove_if_exists(&transaction.stage.join("manifest.json"))?;
+            }
+            remove_if_exists(&transaction.stage.join(".materialized-to"))?;
+            write_parent_marker(
+                &transaction.stage.join(".deadreckon").join("parent.json"),
+                &materialized_parent_marker(state),
+            )?;
+            normalize_permissions(&transaction.stage)?;
+            sync_verified_tree(&transaction.stage)?;
+            authority.revalidate(paths, state)?;
+            validate_verified_export_manifest(library_dir, &transaction)?;
+            require_verified_export_identity(&transaction.stage, &marker, authority)
+        })();
+        if let Err(error) = stage_result {
+            if verified_export_marker_matches(&transaction.stage, &marker)? {
+                remove_owned_verified_export_path(&transaction.stage, &marker, authority)?;
+                sync_verified_export_parent(&transaction)?;
+            }
+            if destination_state == VerifiedDestinationState::Missing && backup_present {
+                restore_verified_export_backup(&mut transaction, &journal_path, authority)?;
+            }
+            return Err(error);
+        }
+        verified_export_fail(failpoint, VerifiedExportFailpoint::AfterStageSync)?;
+    }
+
+    if let Err(error) = (|| {
+        authority.revalidate(paths, state)?;
+        validate_verified_export_manifest(library_dir, &transaction)?;
+        require_verified_export_identity(&transaction.stage, &marker, authority)
+    })() {
+        if destination_state == VerifiedDestinationState::Missing && backup_present {
+            restore_verified_export_backup(&mut transaction, &journal_path, authority)?;
+        }
+        if verified_export_marker_matches(&transaction.stage, &marker)? {
+            remove_owned_verified_export_path(&transaction.stage, &marker, authority)?;
+            sync_verified_export_parent(&transaction)?;
+        }
+        return Err(error);
+    }
+    validate_verified_export_parent(&transaction)?;
+
+    if destination_state == VerifiedDestinationState::Previous {
+        require_previous_destination_identity(&transaction, authority)?;
+        fs::rename(dest, &transaction.backup)?;
+        sync_verified_export_parent(&transaction)?;
+        verified_export_fail(failpoint, VerifiedExportFailpoint::AfterBackupRename)?;
+        transaction.phase = VerifiedExportPhase::BackupMoved;
+        write_verified_export_transaction(&journal_path, &transaction)?;
+        destination_state = VerifiedDestinationState::Missing;
+    }
+    if destination_state != VerifiedDestinationState::Missing {
+        return Err(verified_export_refusal(
+            authority,
+            "destination changed before atomic export publication",
+        ));
+    }
+    if path_lexically_present(dest)? {
+        return Err(verified_export_refusal(
+            authority,
+            "destination appeared before atomic export publication",
+        ));
+    }
+    fs::rename(&transaction.stage, dest)?;
+    sync_verified_export_parent(&transaction)?;
+    verified_export_fail(failpoint, VerifiedExportFailpoint::AfterPublish)?;
+    transaction.phase = VerifiedExportPhase::Published;
+    write_verified_export_transaction(&journal_path, &transaction)?;
+
+    if let Err(error) = (|| {
+        authority.revalidate(paths, state)?;
+        validate_verified_export_manifest(library_dir, &transaction)?;
+        require_verified_export_identity(dest, &marker, authority)
+    })() {
+        rollback_published_verified_export(&mut transaction, &journal_path, &marker, authority)?;
+        return Err(error);
+    }
+    let backup_present = transaction.previous_destination_sha256.is_some();
+    finish_published_verified_export(
+        paths,
+        state,
+        library_dir,
+        authority,
+        failpoint,
+        &journal_path,
+        &marker,
+        &mut transaction,
+        VerifiedStageState::Missing,
+        backup_present,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_published_verified_export(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    library_dir: &Path,
+    authority: &VerifiedDeliveryAuthority,
+    failpoint: VerifiedExportFailpoint,
+    journal_path: &Path,
+    marker: &VerifiedExportMarker,
+    transaction: &mut VerifiedExportTransaction,
+    stage_state: VerifiedStageState,
+    backup_present: bool,
+) -> Result<MaterializedRun> {
+    validate_verified_export_parent(transaction)?;
+    require_verified_export_identity(&transaction.destination, marker, authority)?;
+    authority.revalidate(paths, state)?;
+    validate_verified_export_manifest(library_dir, transaction)?;
+    append_materialized_marker_idempotent(library_dir, &transaction.destination)?;
+    let revision = delivered_git_revision(&transaction.destination);
+    super::job::record_job_delivery(
+        paths,
+        &authority.job_id,
+        super::job::JobDeliveryKind::Exported,
+        &transaction.destination,
+        revision.as_deref(),
+    )?;
+    verified_export_fail(failpoint, VerifiedExportFailpoint::AfterEvent)?;
+    transaction.phase = VerifiedExportPhase::Recorded;
+    write_verified_export_transaction(journal_path, transaction)?;
+
+    if backup_present {
+        require_verified_export_backup_identity(transaction, authority)?;
+        remove_if_exists(&transaction.backup)?;
+        sync_verified_export_parent(transaction)?;
+    }
+    if stage_state != VerifiedStageState::Missing {
+        remove_owned_verified_export_path(&transaction.stage, marker, authority)?;
+        sync_verified_export_parent(transaction)?;
+    }
+    transaction.phase = VerifiedExportPhase::Completed;
+    write_verified_export_transaction(journal_path, transaction)?;
+    Ok(MaterializedRun {
+        run_id: state.run_id.clone(),
+        source: library_dir.to_path_buf(),
+        dest: transaction.destination.clone(),
     })
+}
+
+fn rollback_published_verified_export(
+    transaction: &mut VerifiedExportTransaction,
+    journal_path: &Path,
+    marker: &VerifiedExportMarker,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    validate_verified_export_parent(transaction)?;
+    require_verified_export_identity(&transaction.destination, marker, authority)?;
+    remove_if_exists(&transaction.destination)?;
+    sync_verified_export_parent(transaction)?;
+    if transaction.previous_destination_sha256.is_some() {
+        require_verified_export_backup_identity(transaction, authority)?;
+        if path_lexically_present(&transaction.destination)? {
+            return Err(verified_export_refusal(
+                authority,
+                "destination appeared while restoring the prior export target",
+            ));
+        }
+        fs::rename(&transaction.backup, &transaction.destination)?;
+        sync_verified_export_parent(transaction)?;
+    }
+    transaction.phase = VerifiedExportPhase::Prepared;
+    write_verified_export_transaction(journal_path, transaction)
+}
+
+fn restore_verified_export_backup(
+    transaction: &mut VerifiedExportTransaction,
+    journal_path: &Path,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    validate_verified_export_parent(transaction)?;
+    require_verified_export_backup_identity(transaction, authority)?;
+    if path_lexically_present(&transaction.destination)? {
+        return Err(verified_export_refusal(
+            authority,
+            "destination appeared while restoring the prior export target",
+        ));
+    }
+    fs::rename(&transaction.backup, &transaction.destination)?;
+    sync_verified_export_parent(transaction)?;
+    transaction.phase = VerifiedExportPhase::Prepared;
+    write_verified_export_transaction(journal_path, transaction)
+}
+
+fn create_verified_export_stage(stage: &Path, marker: &VerifiedExportMarker) -> Result<()> {
+    if path_lexically_present(stage)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "refusing to replace unexpected export staging path {}",
+            stage.display()
+        ))));
+    }
+    fs::create_dir(stage)?;
+    write_verified_export_marker(stage, marker)?;
+    sync_verified_tree(stage)
+}
+
+fn write_verified_export_marker(root: &Path, marker: &VerifiedExportMarker) -> Result<()> {
+    let path = root.join(".deadreckon").join("export.json");
+    fs::create_dir_all(path.parent().expect("export marker parent"))?;
+    fs::write(&path, serde_json::to_vec_pretty(marker)?)?;
+    fs::File::open(&path)?.sync_all()?;
+    sync_directory(path.parent().expect("export marker parent"))
+}
+
+fn verified_export_marker_matches(root: &Path, expected: &VerifiedExportMarker) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(CliError::Io(source)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+    let path = root.join(".deadreckon").join("export.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(CliError::Io(source)),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(CliError::Io(source)),
+    };
+    Ok(
+        serde_json::from_slice::<VerifiedExportMarker>(&raw)
+            .is_ok_and(|marker| marker == *expected),
+    )
+}
+
+fn verified_export_identity_matches(root: &Path, marker: &VerifiedExportMarker) -> Result<bool> {
+    if !verified_export_marker_matches(root, marker)? {
+        return Ok(false);
+    }
+    if marker.include_manifest {
+        match marker.manifest_sha256.as_deref() {
+            Some(expected)
+                if regular_file_sha256_if_present(&root.join("manifest.json"))?.as_deref()
+                    == Some(expected) => {}
+            None if regular_file_sha256_if_present(&root.join("manifest.json"))?.is_none() => {}
+            _ => return Ok(false),
+        }
+    } else if path_lexically_present(&root.join("manifest.json"))? {
+        return Ok(false);
+    }
+    if path_lexically_present(&root.join(".materialized-to"))? {
+        return Ok(false);
+    }
+    if !verified_export_has_only_expected_paths(root)? {
+        return Ok(false);
+    }
+    let mut index = deadreckon_core::flight::build_deliverable_file_index(root)?;
+    index.files.remove(Path::new("manifest.json"));
+    index.files.remove(Path::new(".materialized-to"));
+    Ok(index.tree_hash() == marker.result_tree_sha256)
+}
+
+fn verified_export_has_only_expected_paths(root: &Path) -> Result<bool> {
+    fn inspect(root: &Path, directory: &Path) -> Result<bool> {
+        let mut entries = fs::read_dir(directory)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(CliError::Io)?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let relative = path.strip_prefix(root).map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "export path escaped its root: {error}"
+                )))
+            })?;
+            let metadata = fs::symlink_metadata(&path)?;
+            match deadreckon_core::classify_workspace_path(relative) {
+                deadreckon_core::WorkspacePathClass::Deliverable => {}
+                deadreckon_core::WorkspacePathClass::LifecycleMetadata
+                    if relative == Path::new(".deadreckon")
+                        || relative == Path::new(".deadreckon/export.json")
+                        || relative == Path::new(".deadreckon/parent.json") => {}
+                deadreckon_core::WorkspacePathClass::LifecycleMetadata
+                | deadreckon_core::WorkspacePathClass::EvidenceOnly
+                | deadreckon_core::WorkspacePathClass::RuntimeOnly => return Ok(false),
+            }
+            if metadata.file_type().is_dir() && !inspect(root, &path)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    inspect(root, root)
+}
+
+fn require_verified_export_identity(
+    root: &Path,
+    marker: &VerifiedExportMarker,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    if verified_export_identity_matches(root, marker)? {
+        return Ok(());
+    }
+    Err(verified_export_refusal(
+        authority,
+        &format!(
+            "export tree {} does not match the exact signed receipt",
+            root.display()
+        ),
+    ))
+}
+
+fn validate_verified_export_manifest(
+    library_dir: &Path,
+    transaction: &VerifiedExportTransaction,
+) -> Result<()> {
+    let path = library_dir.join("manifest.json");
+    let current = regular_file_sha256_if_present(&path)?;
+    if transaction.include_manifest && current != transaction.manifest_sha256 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "the requested library manifest changed while verified export was running",
+            &format!("deadreckon verdict {}", run_prefix(&transaction.job_id)),
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_verified_destination(
+    dest: &Path,
+    transaction: &VerifiedExportTransaction,
+    marker: &VerifiedExportMarker,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<VerifiedDestinationState> {
+    if !path_lexically_present(dest)? {
+        return Ok(VerifiedDestinationState::Missing);
+    }
+    if verified_export_identity_matches(dest, marker)? {
+        return Ok(VerifiedDestinationState::Exported);
+    }
+    if let Some(expected) = transaction.previous_destination_sha256.as_deref() {
+        let actual = verified_path_identity(dest)?;
+        if actual == expected {
+            return Ok(VerifiedDestinationState::Previous);
+        }
+    }
+    Err(verified_export_refusal(
+        authority,
+        &format!(
+            "destination {} changed outside the receipt-bound export transaction",
+            dest.display()
+        ),
+    ))
+}
+
+fn inspect_verified_stage(
+    stage: &Path,
+    marker: &VerifiedExportMarker,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<VerifiedStageState> {
+    if !path_lexically_present(stage)? {
+        return Ok(VerifiedStageState::Missing);
+    }
+    if verified_export_identity_matches(stage, marker)? {
+        return Ok(VerifiedStageState::Complete);
+    }
+    if verified_export_marker_matches(stage, marker)? {
+        return Ok(VerifiedStageState::PartialOwned);
+    }
+    Err(verified_export_refusal(
+        authority,
+        &format!(
+            "staging path {} was substituted outside the trusted export transaction",
+            stage.display()
+        ),
+    ))
+}
+
+fn inspect_verified_backup(
+    transaction: &VerifiedExportTransaction,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<bool> {
+    if !path_lexically_present(&transaction.backup)? {
+        return Ok(false);
+    }
+    require_verified_export_backup_identity(transaction, authority)?;
+    Ok(true)
+}
+
+fn require_previous_destination_identity(
+    transaction: &VerifiedExportTransaction,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    let Some(expected) = transaction.previous_destination_sha256.as_deref() else {
+        return Err(verified_export_refusal(
+            authority,
+            "export transaction has no prior destination to move",
+        ));
+    };
+    if verified_path_identity(&transaction.destination)? != expected {
+        return Err(verified_export_refusal(
+            authority,
+            "destination changed before its transactional backup was created",
+        ));
+    }
+    Ok(())
+}
+
+fn require_verified_export_backup_identity(
+    transaction: &VerifiedExportTransaction,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    let Some(expected) = transaction.previous_destination_sha256.as_deref() else {
+        return Err(verified_export_refusal(
+            authority,
+            "an export backup exists for a transaction that had no prior destination",
+        ));
+    };
+    if verified_path_identity(&transaction.backup)? != expected {
+        return Err(verified_export_refusal(
+            authority,
+            &format!(
+                "backup {} changed outside the trusted export transaction",
+                transaction.backup.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_owned_verified_export_path(
+    path: &Path,
+    marker: &VerifiedExportMarker,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    if !verified_export_marker_matches(path, marker)? {
+        return Err(verified_export_refusal(
+            authority,
+            &format!(
+                "refusing to clean staging path {} without its exact transaction marker",
+                path.display()
+            ),
+        ));
+    }
+    remove_if_exists(path)
+}
+
+fn validate_verified_export_transaction(
+    transaction: &VerifiedExportTransaction,
+    marker: &VerifiedExportMarker,
+    parent_identity: &str,
+    stage: &Path,
+    backup: &Path,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<()> {
+    let valid = transaction.schema_version == VERIFIED_EXPORT_SCHEMA_VERSION
+        && transaction.transaction_id == marker.transaction_id
+        && transaction.job_id == marker.job_id
+        && transaction.run_id == marker.run_id
+        && transaction.destination == marker.destination
+        && transaction.destination_parent_identity == parent_identity
+        && transaction.receipt_sha256 == marker.receipt_sha256
+        && transaction.result_tree_sha256 == marker.result_tree_sha256
+        && transaction.include_manifest == marker.include_manifest
+        && transaction.stage == stage
+        && transaction.backup == backup;
+    if valid {
+        Ok(())
+    } else {
+        Err(verified_export_refusal(
+            authority,
+            "trusted export transaction journal does not match this exact request",
+        ))
+    }
+}
+
+fn validate_verified_export_parent(transaction: &VerifiedExportTransaction) -> Result<()> {
+    let parent = transaction.destination.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "verified export destination has no parent".to_string(),
+        ))
+    })?;
+    if fs::canonicalize(parent)? != parent
+        || verified_directory_identity(parent)? != transaction.destination_parent_identity
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "verified export destination parent changed identity",
+            &format!("deadreckon verdict {}", run_prefix(&transaction.job_id)),
+        )));
+    }
+    Ok(())
+}
+
+fn read_verified_export_transaction(
+    path: &Path,
+    authority: &VerifiedDeliveryAuthority,
+) -> Result<VerifiedExportTransaction> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err(verified_export_refusal(
+            authority,
+            "trusted export transaction journal is not a regular file",
+        ));
+    }
+    let raw = fs::read(path)?;
+    let after = fs::symlink_metadata(path)?;
+    if !same_verified_file_identity(&before, &after) {
+        return Err(verified_export_refusal(
+            authority,
+            "trusted export transaction journal changed while it was read",
+        ));
+    }
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+#[cfg(unix)]
+fn same_verified_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_verified_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn regular_file_sha256_if_present(path: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            Ok(Some(deadreckon_core::flight::sha256_file(path)?))
+        }
+        Ok(_) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified export metadata is not a regular file: {}",
+            path.display()
+        )))),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn write_verified_export_transaction(
+    path: &Path,
+    transaction: &VerifiedExportTransaction,
+) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "verified export journal has no parent".to_string(),
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, transaction)?;
+    temp.write_all(b"\n")?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| CliError::Io(error.error))?;
+    sync_directory(parent)
+}
+
+fn sync_verified_export_parent(transaction: &VerifiedExportTransaction) -> Result<()> {
+    let parent = transaction.destination.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "verified export destination has no parent".to_string(),
+        ))
+    })?;
+    sync_directory(parent)
+}
+
+fn sync_verified_tree(root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.file_type().is_dir() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified export tree is not a directory: {}",
+            root.display()
+        ))));
+    }
+    let mut entries = fs::read_dir(root)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(CliError::Io)?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_dir() {
+            sync_verified_tree(&path)?;
+        } else if metadata.file_type().is_file() {
+            fs::File::open(&path)?.sync_all()?;
+        }
+    }
+    sync_directory(root)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn path_lexically_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CliError::Io(source)),
+    }
+}
+
+fn verified_path_identity(path: &Path) -> Result<String> {
+    fn update(hasher: &mut Sha256, root: &Path, path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        let relative = path.strip_prefix(root).unwrap_or(Path::new(""));
+        let relative = relative.as_os_str().as_encoded_bytes();
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            hasher.update(metadata.mode().to_le_bytes());
+            hasher.update(metadata.dev().to_le_bytes());
+            hasher.update(metadata.ino().to_le_bytes());
+            hasher.update(metadata.uid().to_le_bytes());
+            hasher.update(metadata.gid().to_le_bytes());
+        }
+        if metadata.file_type().is_dir() {
+            hasher.update(b"directory\0");
+            let mut entries = fs::read_dir(path)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(CliError::Io)?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                update(hasher, root, &entry.path())?;
+            }
+        } else if metadata.file_type().is_file() {
+            hasher.update(b"file\0");
+            hasher.update(deadreckon_core::flight::sha256_file(path)?.as_bytes());
+        } else if metadata.file_type().is_symlink() {
+            hasher.update(b"symlink\0");
+            let target = fs::read_link(path)?;
+            let target = target.as_os_str().as_encoded_bytes();
+            hasher.update((target.len() as u64).to_le_bytes());
+            hasher.update(target);
+        } else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "unsupported filesystem entry in export destination: {}",
+                path.display()
+            ))));
+        }
+        Ok(())
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"deadreckon-verified-export-path-v1\0");
+    update(&mut hasher, path, path)?;
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn verified_directory_identity(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified export parent is not a directory: {}",
+            path.display()
+        ))));
+    }
+    let canonical = fs::canonicalize(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"deadreckon-verified-export-parent-v1\0");
+    let encoded = canonical.as_os_str().as_encoded_bytes();
+    hasher.update((encoded.len() as u64).to_le_bytes());
+    hasher.update(encoded);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn verified_export_fail(
+    selected: VerifiedExportFailpoint,
+    current: VerifiedExportFailpoint,
+) -> Result<()> {
+    if selected == current {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "injected verified export crash after {current:?}"
+        ))));
+    }
+    Ok(())
+}
+
+fn verified_export_refusal(authority: &VerifiedDeliveryAuthority, detail: &str) -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        detail,
+        &format!("deadreckon verdict {}", run_prefix(&authority.job_id)),
+    ))
 }
 
 pub(crate) fn print_materialized(materialized: &MaterializedRun) {
@@ -925,6 +2127,12 @@ fn resolve_apply_state(
             Some(state) => state,
             None => match resolve_plan_result_run(paths, run_id, "apply")? {
                 Some(result) => {
+                    super::graph_job::require_current_driver_for_job_artifact(
+                        paths,
+                        &result.plan.plan_id,
+                        deadreckon_protocol::JobShape::Graph,
+                        "apply",
+                    )?;
                     if !quiet {
                         print_plan_result_context(&result.plan, &result.state);
                     }
@@ -2089,10 +3297,22 @@ fn apply_mode_error(state: &deadreckon_core::PipelineState, mode: CodebaseMode) 
 }
 
 pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
+    extend_command_with_launch_plan(args, None, false)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn extend_command_with_launch_plan(
+    args: ExtendCommandArgs,
+    launch_plan: Option<commands::course::LaunchPlan>,
+    quiet: bool,
+) -> Result<Option<deadreckon_protocol::JobId>> {
     let ExtendCommandArgs {
         parent_run_id,
         new_goal,
         dest,
+        acceptance,
+        yes,
         max_context_turns,
         no_context,
         max_spend,
@@ -2119,7 +3339,16 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
 
     let paths = DeadreckonPaths::discover();
     let parent = super::reference::resolve_run_like(&paths, Some(&parent_run_id), "extend")?;
-    super::graph_job::require_current_driver_for_job_owned_run(&paths, &parent, "extend")?;
+    let private_characterization = commands::plan::internal_characterization_requested();
+    let parent_receipt_sha256 = if private_characterization {
+        super::graph_job::require_current_driver_for_job_owned_run(&paths, &parent, "extend")?;
+        None
+    } else {
+        match materialize_delivery_authority(&paths, &parent)? {
+            MaterializeDeliveryAuthority::LegacyUnowned => None,
+            MaterializeDeliveryAuthority::Verified(authority) => Some(authority.receipt_sha256),
+        }
+    };
     if parent.status != RunStatus::Completed {
         return Err(CliError::Surface {
             code: 1,
@@ -2143,6 +3372,32 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
         return Err(CliError::Core(DeadreckonError::NotFound(
             "parent library missing; cannot extend".to_string(),
         )));
+    }
+    let context_turns = context_turns(max_context_turns, no_context);
+    if !private_characterization {
+        return schedule_durable_extension(DurableExtensionRequest {
+            parent,
+            parent_library,
+            new_goal,
+            dest,
+            acceptance,
+            yes,
+            max_spend,
+            max_wall_seconds,
+            provider,
+            model,
+            sandbox,
+            no_docs,
+            doc_skill,
+            narrate,
+            no_narrate,
+            narrator_model,
+            context_turns,
+            parent_receipt_sha256,
+            launch_plan,
+            quiet,
+        })
+        .await;
     }
 
     let defaults = config_defaults(&paths)?;
@@ -2201,7 +3456,6 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     } else {
         std::env::current_dir()?
     };
-    let context_turns = context_turns(max_context_turns, no_context);
     if let Some(parent_record) = parent_codebase
         .as_ref()
         .filter(|record| record.mode == CodebaseMode::Worktree)
@@ -2231,7 +3485,8 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
             no_narrate,
             narrator_model: narrator_model.clone(),
         })
-        .await;
+        .await
+        .map(|_| None);
     }
     let mut state = create_run(
         &paths,
@@ -2404,6 +3659,219 @@ pub(crate) async fn extend_command(args: ExtendCommandArgs) -> Result<()> {
     if completed && post_actions {
         Box::pin(complete_run_actions(&state, true, true)).await?;
     }
+    Ok(None)
+}
+
+struct DurableExtensionRequest {
+    parent: deadreckon_core::PipelineState,
+    parent_library: PathBuf,
+    new_goal: String,
+    dest: Option<PathBuf>,
+    acceptance: Option<PathBuf>,
+    yes: bool,
+    max_spend: Option<f64>,
+    max_wall_seconds: Option<f64>,
+    provider: Option<String>,
+    model: Option<String>,
+    sandbox: Option<String>,
+    no_docs: bool,
+    doc_skill: Option<String>,
+    narrate: bool,
+    no_narrate: bool,
+    narrator_model: Option<String>,
+    context_turns: Option<u32>,
+    parent_receipt_sha256: Option<String>,
+    launch_plan: Option<commands::course::LaunchPlan>,
+    quiet: bool,
+}
+
+async fn schedule_durable_extension(
+    request: DurableExtensionRequest,
+) -> Result<Option<deadreckon_protocol::JobId>> {
+    let DurableExtensionRequest {
+        parent,
+        parent_library,
+        new_goal,
+        dest,
+        acceptance,
+        yes,
+        max_spend,
+        max_wall_seconds,
+        provider,
+        model,
+        sandbox,
+        no_docs,
+        doc_skill,
+        narrate,
+        no_narrate,
+        narrator_model,
+        context_turns,
+        parent_receipt_sha256,
+        launch_plan,
+        quiet,
+    } = request;
+    if dest.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "durable extensions choose an isolated Job workspace; --dest is no longer a launch-time mutation",
+            "queue the extension without --dest, then use `deadreckon finish <job-id> --export <path>` after verification",
+        )));
+    }
+
+    let operator_cwd = std::env::current_dir()?;
+    let source_cwd = if parent.cwd.is_dir() {
+        parent.cwd.clone()
+    } else {
+        operator_cwd.clone()
+    };
+    let acceptance = acceptance
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                operator_cwd.join(path)
+            }
+        })
+        .or_else(|| {
+            let frozen = parent.run_root.join("acceptance.yaml");
+            frozen.is_file().then_some(frozen)
+        });
+    let continuation = commands::run::DurableContinuationSpec {
+        parent_run_id: parent.run_id.clone(),
+        parent_scope: parent.scope.clone(),
+        parent_state_sha256: deadreckon_core::flight::sha256_file(&parent.state_path())?,
+        parent_library_tree_sha256: deadreckon_core::flight::build_deliverable_file_index(
+            &parent_library,
+        )?
+        .tree_hash(),
+        parent_receipt_sha256,
+        context_turns,
+    };
+
+    let run_args = RunCommandArgs {
+        goal: new_goal,
+        run_id: None,
+        durable_source_cwd: Some(source_cwd),
+        continuation: Some(continuation),
+        tamper_baseline: None,
+        fresh: false,
+        worktree: false,
+        from: Some(parent_library),
+        in_place: false,
+        base: None,
+        branch: None,
+        allow_dirty: false,
+        init_git: false,
+        yes,
+        preview: false,
+        brief: false,
+        no_seams: false,
+        plain: false,
+        prevent_sleep: Some("off".to_string()),
+        quiet,
+        max_spend,
+        max_wall_seconds,
+        sandbox,
+        untrusted: false,
+        provider,
+        model,
+        doc_provider: None,
+        acceptance,
+        skill: parent.skill_name,
+        smoke: false,
+        i_know_its_a_lot: false,
+        no_confirm: false,
+        no_hints: false,
+        no_docs,
+        doc_skill,
+        narrate,
+        no_narrate,
+        narrator_model,
+        infer_contract: false,
+    };
+    if let Some(launch_plan) = launch_plan {
+        commands::run::schedule_durable_run_with_launch_plan(run_args, launch_plan).await
+    } else {
+        commands::run::run_command_with_job_id(run_args).await
+    }
+}
+
+pub(crate) fn prepare_durable_continuation(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    continuation: &commands::run::DurableContinuationSpec,
+) -> Result<()> {
+    let parent = deadreckon_core::load_run(paths, &continuation.parent_run_id)?;
+    if parent.run_id != continuation.parent_run_id
+        || parent.scope != continuation.parent_scope
+        || parent.status != RunStatus::Completed
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "durable continuation parent {} no longer matches its frozen completed identity",
+            continuation.parent_run_id
+        ))));
+    }
+    let state_sha256 = deadreckon_core::flight::sha256_file(&parent.state_path())?;
+    if state_sha256 != continuation.parent_state_sha256 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "durable continuation parent {} changed after approval",
+            continuation.parent_run_id
+        ))));
+    }
+    let parent_library = paths.library_dir(&parent.scope, &parent.run_id);
+    let library_tree_sha256 =
+        deadreckon_core::flight::build_deliverable_file_index(&parent_library)?.tree_hash();
+    if library_tree_sha256 != continuation.parent_library_tree_sha256 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "durable continuation library for {} changed after approval",
+            continuation.parent_run_id
+        ))));
+    }
+    match (
+        continuation.parent_receipt_sha256.as_deref(),
+        materialize_delivery_authority(paths, &parent)?,
+    ) {
+        (Some(expected), MaterializeDeliveryAuthority::Verified(authority)) => {
+            if authority.receipt_sha256 != expected {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "durable continuation receipt for {} changed after approval",
+                    continuation.parent_run_id
+                ))));
+            }
+        }
+        (None, MaterializeDeliveryAuthority::LegacyUnowned) => {}
+        _ => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "durable continuation ownership for {} changed after approval",
+                continuation.parent_run_id
+            ))));
+        }
+    }
+
+    write_parent_marker(
+        &state.working_dir.join(".deadreckon").join("parent.json"),
+        &extended_parent_marker(&parent, &state.goal, continuation.context_turns),
+    )?;
+    write_parent_history(state, &parent, continuation.context_turns)?;
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn: 0,
+            event: "durable_continuation_bound".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "parent_run_id": parent.run_id,
+                "parent_scope": parent.scope,
+                "parent_goal": parent.goal,
+                "parent_completed_at": parent.updated_at,
+                "parent_state_sha256": continuation.parent_state_sha256,
+                "parent_library_tree_sha256": continuation.parent_library_tree_sha256,
+                "parent_receipt_sha256": continuation.parent_receipt_sha256,
+                "context_turns_included": continuation.context_turns,
+            }),
+        },
+    )?;
     Ok(())
 }
 
@@ -2440,7 +3908,7 @@ fn in_place_parent_extend_surface(
     new_goal: &str,
 ) -> VerdictSurface {
     let id = run_prefix(&parent.run_id);
-    let primary = format!("deadreckon run --in-place --i-know-its-a-lot {new_goal:?}");
+    let primary = format!("deadreckon run --in-place --i-know-its-a-lot --untrusted {new_goal:?}");
     let secondary = format!("deadreckon show {id}");
     VerdictSurface::must_new(
         VerdictKind::Blocked,
@@ -2991,6 +4459,28 @@ fn append_materialized_marker(library_dir: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+fn append_materialized_marker_idempotent(library_dir: &Path, dest: &Path) -> Result<()> {
+    let path = library_dir.join(".materialized-to");
+    let destination = dest.display().to_string();
+    let already_recorded = match fs::read_to_string(&path) {
+        Ok(raw) => raw.lines().any(|line| {
+            line.split_once('\t')
+                .is_some_and(|(_, recorded)| recorded == destination)
+        }),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => false,
+        Err(source) => return Err(CliError::Io(source)),
+    };
+    if already_recorded {
+        return Ok(());
+    }
+    append_materialized_marker(library_dir, dest)?;
+    fs::File::open(&path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
 fn write_abandoned_marker(
     state: &deadreckon_core::PipelineState,
     reason: CleanupReason,
@@ -3041,10 +4531,14 @@ pub(crate) fn default_materialize_dest(state: &deadreckon_core::PipelineState) -
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
     use deadreckon_core::{JobProjection, JobView};
     use deadreckon_protocol::{
-        CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, Job, JobId, JobOutcome,
-        JobPhase, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
+        AuthorityAcceptedBy, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
+        GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent, JobEventKind,
+        JobEventSequence, JobId, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion, JobShape,
+        RunId, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
+        SemanticJudgeMode, SemanticJudgment, StopReason,
     };
     use tempfile::TempDir;
 
@@ -3120,6 +4614,7 @@ mod tests {
             result_revision: None,
             deterministic_marker_sha256: "marker".to_string(),
             semantic_judgment_sha256: "semantic".to_string(),
+            sandbox_boundary_observation_sha256: "sandbox-observation".to_string(),
             contained: false,
             sandbox_backend: "none".to_string(),
             signature: "not-trusted".to_string(),
@@ -3161,6 +4656,229 @@ mod tests {
             deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
             doc_polish_hash: None,
         }
+    }
+
+    fn append_test_job_event(
+        paths: &DeadreckonPaths,
+        job_id: &str,
+        sequence: u64,
+        kind: JobEventKind,
+    ) {
+        deadreckon_core::append_job_event(
+            paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                sequence: JobEventSequence::new(sequence).expect("nonzero sequence"),
+                event_id: format!("test-{sequence}-{kind:?}"),
+                causation_id: "materialize-authority-test".to_string(),
+                timestamp: Utc::now(),
+                lease_epoch: 0,
+                kind,
+                detail: json!({}),
+            },
+        )
+        .expect("append Job event");
+    }
+
+    fn signed_verified_export_fixture(
+        temp: &TempDir,
+    ) -> (DeadreckonPaths, deadreckon_core::PipelineState, String) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job_id = "efefefefefefefefefefefefefefefef".to_string();
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "export the exact verified Job result".to_string(),
+                cwd: source,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("judge".to_string()),
+                skill_name: "deadreckon".to_string(),
+                max_spend_usd: Some(2.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some(job_id.clone()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(state.working_dir.join("result.txt"), "verified result\n").expect("result");
+        let contract_path = deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root);
+        fs::write(
+            &contract_path,
+            "name: result\nchecks:\n  - file_exists: result.txt\n",
+        )
+        .expect("contract");
+        fs::create_dir_all(paths.job_dir(&job_id)).expect("job dir");
+        let launch_path = paths.job_launch_plan(&job_id);
+        fs::write(
+            &launch_path,
+            "{\"schema\":1,\"goal\":\"export the exact verified Job result\"}\n",
+        )
+        .expect("launch");
+        let policy = JobPolicy {
+            max_spend_usd: 2.0,
+            max_wall_seconds: 60,
+            max_attempts: 3,
+            deadline: None,
+            semantic_judge: SemanticJudgeMode::Required,
+            execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
+                "sandbox-exec",
+            )),
+        };
+        let authority = JobAuthority {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(job_id.clone()),
+            run_id: RunId(job_id.clone()),
+            approved_at: Utc::now(),
+            accepted_by: AuthorityAcceptedBy::Operator,
+            goal_sha256: deadreckon_core::flight::sha256_text(&state.goal),
+            contract_sha256: deadreckon_core::flight::sha256_file(&contract_path)
+                .expect("contract digest"),
+            effective_policy_sha256: deadreckon_core::flight::sha256_text(
+                &serde_json::to_string(&policy).expect("policy json"),
+            ),
+            launch_plan_sha256: deadreckon_core::flight::sha256_file(&launch_path)
+                .expect("launch digest"),
+            source_tree_sha256: deadreckon_core::flight::build_deliverable_file_index(
+                &state.working_dir,
+            )
+            .expect("source index")
+            .tree_hash(),
+            source_revision: None,
+            sandbox_requested: "sandbox-exec".to_string(),
+            semantic_judge_mode: SemanticJudgeMode::Required,
+        };
+        fs::write(
+            paths.job_authority(&job_id),
+            serde_json::to_vec_pretty(&authority).expect("authority json"),
+        )
+        .expect("authority");
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(job_id.clone()),
+            scope: state.scope.clone(),
+            goal: state.goal.clone(),
+            shape: JobShape::Single,
+            created_at: Utc::now(),
+            source_cwd: state.cwd.clone(),
+            launch_plan_sha256: authority.launch_plan_sha256.clone(),
+            authority_sha256: deadreckon_core::flight::sha256_file(&paths.job_authority(&job_id))
+                .expect("authority digest"),
+            policy,
+        };
+        deadreckon_core::write_job(&paths, &job).expect("job");
+        append_test_job_event(&paths, &job_id, 1, JobEventKind::Created);
+        append_test_job_event(&paths, &job_id, 2, JobEventKind::Verified);
+        let key = deadreckon_core::read_gate_key(&paths, &job_id).expect("gate key");
+        let marker = deadreckon_core::write_native_acceptance_marker_with_results_and_key(
+            &state.run_root,
+            job_id.clone(),
+            state.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("native marker");
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(job_id.clone()),
+            run_id: RunId(job_id.clone()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the signed result satisfies the approved goal".to_string(),
+            goal_coverage: vec![GoalCoverage {
+                claim: state.goal.clone(),
+                status: GoalCoverageStatus::Met,
+                evidence: vec!["deterministic-gate".to_string()],
+            }],
+            missing: Vec::new(),
+            input_sha256: deadreckon_core::flight::sha256_text("test evidence"),
+            spend_usd: 0.0,
+        };
+        fs::create_dir_all(state.run_root.join("proofs")).expect("proof dir");
+        fs::write(
+            state.run_root.join(deadreckon_core::SEMANTIC_JUDGMENT_JSON),
+            serde_json::to_vec_pretty(&judgment).expect("judgment json"),
+        )
+        .expect("judgment");
+        let observation = SandboxBoundaryObservation {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: authority.job_id.clone(),
+            run_id: authority.run_id.clone(),
+            observed_at: Utc::now(),
+            issuer: SandboxBoundaryObservationIssuer::DeadreckonController,
+            probe_id: Uuid::new_v4().to_string(),
+            attempt: 1,
+            outer_launch_id: Uuid::new_v4().to_string(),
+            authority_sha256: deadreckon_core::flight::sha256_file(&paths.job_authority(&job_id))
+                .expect("authority digest"),
+            contract_sha256: authority.contract_sha256.clone(),
+            result_tree_sha256: deadreckon_core::sandbox_boundary_result_tree_sha256(&state)
+                .expect("result tree"),
+            sandbox_requested: authority.sandbox_requested.clone(),
+            sandbox_backend: "sandbox-exec".to_string(),
+            contained: true,
+            gate_key_read_denied: true,
+            proof_write_denied: true,
+            control_write_denied: true,
+            operator_capture_read_denied: true,
+            operator_capture_write_denied: true,
+            signing_env_scrubbed: true,
+            probe_sha256: deadreckon_core::flight::sha256_text("fixed controller probe"),
+            signature: String::new(),
+        };
+        deadreckon_core::seal_sandbox_boundary_observation(
+            &paths,
+            &state,
+            &authority,
+            &observation,
+        )
+        .expect("boundary observation");
+        deadreckon_core::seal_completion_receipt(&paths, &state, &authority, &marker, &judgment)
+            .expect("signed receipt");
+        state.status = RunStatus::Completed;
+        save_state(&state).expect("completed state");
+        deadreckon_core::promote_completed_run(&paths, &mut state).expect("promotion");
+        deadreckon_core::validate_completion_receipt(&paths, &state)
+            .expect("receipt remains valid after promotion");
+        (paths, state, job_id)
+    }
+
+    fn signed_export_authority(
+        paths: &DeadreckonPaths,
+        state: &deadreckon_core::PipelineState,
+        job_id: &str,
+    ) -> VerifiedDeliveryAuthority {
+        let view = deadreckon_core::JobView::load(paths, job_id).expect("verified Job view");
+        VerifiedDeliveryAuthority::from_finished_job(paths, &view, state)
+            .expect("signed export authority")
+    }
+
+    fn only_export_transaction(paths: &DeadreckonPaths, job_id: &str) -> VerifiedExportTransaction {
+        let directory = paths.job_dir(job_id).join("export-transactions");
+        let entries = fs::read_dir(&directory)
+            .expect("transaction directory")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("transaction entries");
+        assert_eq!(entries.len(), 1, "one export transaction");
+        serde_json::from_slice(
+            &fs::read(entries[0].path()).expect("trusted export transaction journal"),
+        )
+        .expect("transaction JSON")
     }
 
     #[test]
@@ -3285,6 +5003,420 @@ mod tests {
         let resolved = resolve_apply_state(&paths, job_id, true, Some(state))
             .expect("finish already validated the Job and may retain its backing Run");
         assert_eq!(resolved.run_id, job_id);
+    }
+
+    #[test]
+    fn export_refuses_a_job_owned_plan_result_before_docs_or_destination_mutation() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let job_id = "dededededededededededededededede";
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(job_id.to_string()),
+            scope: "materialize-authority-test".to_string(),
+            goal: "deliver only the sealed result".to_string(),
+            shape: JobShape::Graph,
+            created_at: Utc::now(),
+            source_cwd: workspace.clone(),
+            launch_plan_sha256: "launch".to_string(),
+            authority_sha256: "authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 1.0,
+                max_wall_seconds: 60,
+                max_attempts: 1,
+                deadline: None,
+                semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
+            },
+        };
+        deadreckon_core::write_job(&paths, &job).expect("Job identity");
+        let mut plan = deadreckon_core::plan::Plan::new(
+            job.goal.clone(),
+            deadreckon_core::plan::PlanMode::FullPlan,
+            vec![
+                deadreckon_core::plan::PlanTask::new(
+                    0,
+                    "first",
+                    "first task",
+                    deadreckon_core::plan::PlanRole::Child,
+                    None,
+                ),
+                deadreckon_core::plan::PlanTask::new(
+                    1,
+                    "second",
+                    "second task",
+                    deadreckon_core::plan::PlanRole::Child,
+                    None,
+                ),
+            ],
+            deadreckon_core::plan::PlanProviders::default(),
+            Some(job.scope.clone()),
+            "test",
+        )
+        .expect("Plan");
+        plan.plan_id = job_id.to_string();
+        plan.owner_job_id = Some(job_id.to_string());
+        plan.parent_cwd = Some(workspace.clone());
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("owned Plan");
+        let mut result = deadreckon_core::create_owned_run(
+            &paths,
+            RunOptions {
+                goal: job.goal.clone(),
+                cwd: workspace,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("dfdfdfdfdfdfdfdfdfdfdfdfdfdfdfdf".to_string()),
+                codebase: None,
+            },
+            deadreckon_core::RunOwnership::plan_result(job_id, job_id),
+        )
+        .expect("owned result Run");
+        result.status = RunStatus::Completed;
+        save_state(&result).expect("completed result");
+        plan.status = deadreckon_core::plan::PlanStatus::Merged;
+        plan.merged_run_id = Some(result.run_id.clone());
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("merged Plan");
+        let plan_before = fs::read(paths.plan_json(job_id)).expect("Plan bytes before");
+        let dest = temp.path().join("forbidden-export");
+
+        let error =
+            materialize_command_with_paths(&paths, job_id, Some(dest.clone()), false, false)
+                .expect_err("unverified Job result must not be exported");
+
+        assert!(error.to_string().contains("no verified receipt"), "{error}");
+        assert!(!dest.exists(), "refused export created its destination");
+        assert_eq!(
+            fs::read(paths.plan_json(job_id)).expect("Plan bytes after"),
+            plan_before
+        );
+        assert!(
+            !plan_docs_dir(&paths, job_id).exists(),
+            "refused export generated Plan docs before authority validation"
+        );
+    }
+
+    #[test]
+    fn verified_delivery_authority_exports_the_exact_job_result_and_records_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        let dest = temp.path().join("verified-export");
+
+        materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+            .expect("authorized export");
+
+        assert_eq!(
+            fs::read_to_string(dest.join("result.txt")).expect("delivered result"),
+            "verified result\n"
+        );
+        let delivered = deadreckon_core::JobView::load(&paths, &job_id).expect("delivered view");
+        let canonical_dest = fs::canonicalize(&dest).expect("canonical destination");
+        assert_eq!(
+            delivered
+                .projection
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.destination.as_path()),
+            Some(canonical_dest.as_path())
+        );
+        assert_eq!(
+            super::super::inspection::materialized_marker_count(
+                &paths.library_dir(&state.scope, &job_id)
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn verified_export_refuses_post_validation_source_mutation_without_touching_destination() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        let authority = signed_export_authority(&paths, &state, &job_id);
+        let dest = temp.path().join("existing-destination");
+        fs::create_dir(&dest).expect("existing destination");
+        fs::write(dest.join("operator.txt"), "preserve this\n").expect("operator file");
+        let verified_dest = absolute_dest(dest.clone()).expect("canonical destination");
+        let library = state.working_dir.clone();
+        let mut mutate_after_validation = || {
+            fs::write(library.join("result.txt"), "mutated after validation\n")
+                .expect("post-validation mutation");
+        };
+
+        let error = materialize_verified_completed_run(
+            &paths,
+            &state,
+            &state.working_dir,
+            verified_dest,
+            true,
+            false,
+            &authority,
+            VerifiedExportFailpoint::None,
+            Some(&mut mutate_after_validation),
+        )
+        .expect_err("post-validation mutation must be refused");
+
+        assert!(error.to_string().contains("result tree"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dest.join("operator.txt")).expect("preserved destination"),
+            "preserve this\n"
+        );
+        assert!(!dest.join("result.txt").exists());
+        let transaction = only_export_transaction(&paths, &job_id);
+        assert!(!transaction.stage.exists(), "owned partial stage cleaned");
+        assert!(
+            !transaction.backup.exists(),
+            "prior destination was never moved"
+        );
+        let view = deadreckon_core::JobView::load(&paths, &job_id).expect("Job view");
+        assert!(view.projection.delivery.is_none());
+    }
+
+    #[test]
+    fn verified_export_crash_after_publication_retries_to_one_marker_and_one_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        let authority = signed_export_authority(&paths, &state, &job_id);
+        let dest = temp.path().join("published-before-event");
+        let verified_dest = absolute_dest(dest.clone()).expect("canonical destination");
+
+        let error = materialize_verified_completed_run(
+            &paths,
+            &state,
+            &state.working_dir,
+            verified_dest,
+            false,
+            false,
+            &authority,
+            VerifiedExportFailpoint::AfterPublish,
+            None,
+        )
+        .expect_err("injected publication crash");
+        assert!(error.to_string().contains("AfterPublish"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dest.join("result.txt")).expect("atomically published result"),
+            "verified result\n"
+        );
+        assert!(
+            deadreckon_core::JobView::load(&paths, &job_id)
+                .expect("pre-retry Job")
+                .projection
+                .delivery
+                .is_none(),
+            "publication happened before its factual event"
+        );
+
+        materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+            .expect("retry records factual publication");
+        materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+            .expect("duplicate retry converges");
+
+        let library = paths.library_dir(&state.scope, &job_id);
+        assert_eq!(
+            super::super::inspection::materialized_marker_count(&library),
+            1
+        );
+        let history =
+            deadreckon_core::read_job_history(&paths.job_events(&job_id)).expect("Job history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::ResultExported)
+                .count(),
+            1
+        );
+        let transaction = only_export_transaction(&paths, &job_id);
+        assert_eq!(transaction.phase, VerifiedExportPhase::Completed);
+        assert!(!transaction.stage.exists());
+        assert!(!transaction.backup.exists());
+    }
+
+    #[test]
+    fn verified_export_recovers_each_forced_replace_and_event_window() {
+        for failpoint in [
+            VerifiedExportFailpoint::AfterBackupRename,
+            VerifiedExportFailpoint::AfterEvent,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+            let authority = signed_export_authority(&paths, &state, &job_id);
+            let dest = temp.path().join("forced-destination");
+            fs::create_dir(&dest).expect("prior destination");
+            fs::write(dest.join("prior.txt"), "prior operator tree\n").expect("prior tree");
+            let verified_dest = absolute_dest(dest.clone()).expect("canonical destination");
+
+            materialize_verified_completed_run(
+                &paths,
+                &state,
+                &state.working_dir,
+                verified_dest,
+                true,
+                false,
+                &authority,
+                failpoint,
+                None,
+            )
+            .expect_err("injected transactional crash");
+
+            let transaction = only_export_transaction(&paths, &job_id);
+            assert!(
+                transaction.backup.exists(),
+                "prior tree is retained through {failpoint:?}"
+            );
+            materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+                .expect("ordinary retry completes the existing transaction");
+            assert_eq!(
+                fs::read_to_string(dest.join("result.txt")).expect("verified result"),
+                "verified result\n"
+            );
+            assert!(!dest.join("prior.txt").exists());
+            let completed = only_export_transaction(&paths, &job_id);
+            assert_eq!(completed.phase, VerifiedExportPhase::Completed);
+            assert!(!completed.backup.exists());
+            let history =
+                deadreckon_core::read_job_history(&paths.job_events(&job_id)).expect("Job history");
+            assert_eq!(
+                history
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == JobEventKind::ResultExported)
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn signed_receipt_refusal_never_mutates_an_explicit_destination() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        fs::write(
+            state.working_dir.join("result.txt"),
+            "tampered before export\n",
+        )
+        .expect("tamper signed result");
+        let dest = temp.path().join("must-remain");
+        fs::create_dir(&dest).expect("destination");
+        fs::write(dest.join("operator.txt"), "untouched\n").expect("operator file");
+
+        let error =
+            materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), true, false)
+                .expect_err("tampered signed result is refused");
+
+        assert!(error.to_string().contains("result tree"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dest.join("operator.txt")).expect("operator file"),
+            "untouched\n"
+        );
+        assert!(!dest.join("result.txt").exists());
+        assert!(
+            !paths.job_dir(&job_id).join("export-transactions").exists(),
+            "authority refusal happened before transaction creation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_export_refuses_staging_symlink_substitution_and_preserves_unrelated_tree() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        let authority = signed_export_authority(&paths, &state, &job_id);
+        let dest = temp.path().join("symlink-substitution-destination");
+        let verified_dest = absolute_dest(dest.clone()).expect("canonical destination");
+
+        materialize_verified_completed_run(
+            &paths,
+            &state,
+            &state.working_dir,
+            verified_dest,
+            false,
+            false,
+            &authority,
+            VerifiedExportFailpoint::AfterStageSync,
+            None,
+        )
+        .expect_err("injected stage crash");
+        let transaction = only_export_transaction(&paths, &job_id);
+        fs::remove_dir_all(&transaction.stage).expect("replace owned stage in adversarial test");
+        let unrelated = temp.path().join("unrelated");
+        fs::create_dir(&unrelated).expect("unrelated tree");
+        fs::write(unrelated.join("sentinel.txt"), "preserve\n").expect("sentinel");
+        symlink(&unrelated, &transaction.stage).expect("substitute stage symlink");
+
+        let error =
+            materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+                .expect_err("substituted stage is refused");
+
+        assert!(error.to_string().contains("substituted"), "{error}");
+        assert!(!dest.exists());
+        assert_eq!(
+            fs::read_to_string(unrelated.join("sentinel.txt")).expect("unrelated sentinel"),
+            "preserve\n"
+        );
+        assert!(
+            fs::symlink_metadata(&transaction.stage)
+                .expect("substituted symlink remains")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_export_aliases_bind_and_record_the_canonical_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _state, job_id) = signed_verified_export_fixture(&temp);
+        let real_parent = temp.path().join("real-parent");
+        fs::create_dir(&real_parent).expect("real parent");
+        let alias_parent = temp.path().join("alias-parent");
+        symlink(&real_parent, &alias_parent).expect("destination alias");
+        let aliased_dest = alias_parent.join("delivered");
+        let canonical_dest = fs::canonicalize(&real_parent)
+            .expect("canonical real parent")
+            .join("delivered");
+
+        materialize_command_with_paths(&paths, &job_id, Some(aliased_dest), false, false)
+            .expect("alias export");
+
+        let view = deadreckon_core::JobView::load(&paths, &job_id).expect("delivered Job");
+        assert_eq!(
+            view.projection
+                .delivery
+                .as_ref()
+                .map(|delivery| delivery.destination.as_path()),
+            Some(canonical_dest.as_path())
+        );
+        let transaction = only_export_transaction(&paths, &job_id);
+        assert_eq!(transaction.destination, canonical_dest);
+    }
+
+    #[test]
+    fn materialize_public_aliases_parse_to_the_same_export_command() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                for command in ["materialize", "export", "copy-out"] {
+                    let parsed =
+                        crate::cli::Cli::try_parse_from(["deadreckon", command, "job-123"])
+                            .expect("public export alias parses");
+                    let Some(crate::cli::Commands::Materialize { run_id, .. }) = parsed.command
+                    else {
+                        panic!("{command} did not resolve to materialize")
+                    };
+                    assert_eq!(run_id, "job-123");
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
     }
 
     #[test]
@@ -3564,5 +5696,148 @@ mod tests {
             fs::read_to_string(repo.join("signed.txt")).expect("restored file"),
             "base\n"
         );
+    }
+
+    fn durable_continuation_fixture(
+        temp: &TempDir,
+    ) -> (
+        DeadreckonPaths,
+        deadreckon_core::PipelineState,
+        deadreckon_core::PipelineState,
+        commands::run::DurableContinuationSpec,
+        String,
+    ) {
+        let (paths, parent, job_id) = signed_verified_export_fixture(temp);
+        let child_source = temp.path().join("continuation-source");
+        fs::create_dir_all(&child_source).expect("child source");
+        let child = create_run(
+            &paths,
+            RunOptions {
+                goal: "continue the verified result".to_string(),
+                cwd: child_source,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("test".to_string()),
+                skill_name: "deadreckon".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("child run");
+        let parent_library = paths.library_dir(&parent.scope, &parent.run_id);
+        let continuation = commands::run::DurableContinuationSpec {
+            parent_run_id: parent.run_id.clone(),
+            parent_scope: parent.scope.clone(),
+            parent_state_sha256: deadreckon_core::flight::sha256_file(&parent.state_path())
+                .expect("parent state digest"),
+            parent_library_tree_sha256: deadreckon_core::flight::build_deliverable_file_index(
+                &parent_library,
+            )
+            .expect("parent library index")
+            .tree_hash(),
+            parent_receipt_sha256: Some(
+                deadreckon_core::flight::sha256_file(&paths.job_receipt(&job_id))
+                    .expect("parent receipt digest"),
+            ),
+            context_turns: Some(2),
+        };
+        (paths, parent, child, continuation, job_id)
+    }
+
+    fn assert_continuation_left_no_child_evidence(state: &deadreckon_core::PipelineState) {
+        assert!(
+            !state
+                .working_dir
+                .join(".deadreckon")
+                .join("parent.json")
+                .exists()
+        );
+        assert!(!state.run_root.join("history.json").exists());
+    }
+
+    #[test]
+    fn durable_continuation_binds_verified_parent_receipt_and_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, parent, child, continuation, _) = durable_continuation_fixture(&temp);
+
+        prepare_durable_continuation(&paths, &child, &continuation)
+            .expect("unchanged verified parent");
+
+        let marker: ParentMarker = serde_json::from_slice(
+            &fs::read(child.working_dir.join(".deadreckon").join("parent.json"))
+                .expect("parent marker"),
+        )
+        .expect("parent marker json");
+        assert_eq!(marker.parent_run_id, parent.run_id);
+        assert!(child.run_root.join("history.json").is_file());
+        let trace = read_jsonl::<TraceRecord>(&child.run_root.join("traces.jsonl"))
+            .expect("continuation trace");
+        assert!(
+            trace
+                .iter()
+                .any(|record| record.event == "durable_continuation_bound")
+        );
+    }
+
+    #[test]
+    fn durable_continuation_refuses_parent_state_change_before_child_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, parent, child, continuation, _) = durable_continuation_fixture(&temp);
+        let mut changed = parent;
+        changed.updated_at = Utc::now() + chrono::Duration::seconds(1);
+        save_state(&changed).expect("changed parent state");
+
+        let error = prepare_durable_continuation(&paths, &child, &continuation)
+            .expect_err("changed parent state must fail closed");
+
+        assert!(
+            error.to_string().contains("changed after approval"),
+            "{error}"
+        );
+        assert_continuation_left_no_child_evidence(&child);
+    }
+
+    #[test]
+    fn durable_continuation_refuses_parent_library_change_before_child_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, parent, child, continuation, _) = durable_continuation_fixture(&temp);
+        fs::write(
+            paths
+                .library_dir(&parent.scope, &parent.run_id)
+                .join("unapproved.txt"),
+            "changed after continuation approval\n",
+        )
+        .expect("changed parent library");
+
+        let error = prepare_durable_continuation(&paths, &child, &continuation)
+            .expect_err("changed parent library must fail closed");
+
+        assert!(
+            error.to_string().contains("library")
+                && error.to_string().contains("changed after approval"),
+            "{error}"
+        );
+        assert_continuation_left_no_child_evidence(&child);
+    }
+
+    #[test]
+    fn durable_continuation_refuses_parent_receipt_change_before_child_evidence() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _, child, continuation, job_id) = durable_continuation_fixture(&temp);
+        let receipt_path = paths.job_receipt(&job_id);
+        let mut bytes = fs::read(&receipt_path).expect("receipt");
+        bytes.push(b'\n');
+        fs::write(&receipt_path, bytes).expect("changed receipt bytes");
+
+        let error = prepare_durable_continuation(&paths, &child, &continuation)
+            .expect_err("changed parent receipt must fail closed");
+
+        assert!(
+            error.to_string().contains("receipt")
+                && error.to_string().contains("changed after approval"),
+            "{error}"
+        );
+        assert_continuation_left_no_child_evidence(&child);
     }
 }

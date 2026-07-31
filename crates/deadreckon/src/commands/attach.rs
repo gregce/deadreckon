@@ -351,12 +351,14 @@ fn print_steer_inbox_state(state: &deadreckon_core::PipelineState) -> Result<()>
 }
 
 pub(crate) fn dispatch_run_command_mode(
+    paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
     action: RunCommandModeAction,
 ) -> Result<String> {
     match action {
         RunCommandModeAction::Steer(text) => {
             commands::steer::queue_steer_for_state(
+                paths,
                 state,
                 deadreckon_core::steer_inbox::SteerSource::Tui,
                 text,
@@ -1190,7 +1192,7 @@ async fn attach_tui_with_parent(
                         || (key.code == KeyCode::Char(':') && key.modifiers.is_empty()) =>
                 {
                     if let Some(action) = tui_state.handle_run_command_key(key) {
-                        match dispatch_run_command_mode(&state, action) {
+                        match dispatch_run_command_mode(paths, &state, action) {
                             Ok(notice) => {
                                 tui_state.open_run_command_notice("steer queued", notice);
                             }
@@ -1525,7 +1527,9 @@ fn wait_for_return(message: &str) -> Result<()> {
 #[cfg(test)]
 mod job_attach_tests {
     use chrono::Utc;
-    use deadreckon_protocol::JobId;
+    use deadreckon_protocol::{
+        Job, JobId, JobPolicy, JobSchemaVersion, JobShape, SemanticJudgeMode,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -1581,6 +1585,73 @@ mod job_attach_tests {
             error
                 .to_string()
                 .contains("does not retain the Job identity")
+        );
+    }
+
+    #[test]
+    fn attach_steer_refuses_a_job_backing_run_before_writing_the_inbox() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let job_id = "78787878787878787878787878787878";
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "keep the approved goal immutable".to_string(),
+                cwd: workspace.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("cli:codex-server".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some(job_id.to_string()),
+                codebase: None,
+            },
+        )
+        .expect("backing Run");
+        state.status = RunStatus::Executing;
+        save_state(&state).expect("executing state");
+        deadreckon_core::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: workspace,
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+        )
+        .expect("Job identity");
+
+        let error = dispatch_run_command_mode(
+            &paths,
+            &state,
+            RunCommandModeAction::Steer("change the approved scope".to_string()),
+        )
+        .expect_err("attach must not bypass Job ownership");
+
+        assert!(
+            error.to_string().contains("belongs to durable Job"),
+            "{error}"
+        );
+        assert!(
+            deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root)
+                .expect("inbox")
+                .is_empty(),
+            "refused steering wrote an inbox entry"
         );
     }
 }

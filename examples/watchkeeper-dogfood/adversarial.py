@@ -32,6 +32,7 @@ class Trial:
     commands: tuple[ProofCommand, ...]
     limitation: str
     macos_sandbox_required: bool = False
+    docker_required: bool = False
 
 
 TRIALS = (
@@ -160,6 +161,31 @@ TRIALS = (
         ),
         "This proves the local Seatbelt backend only; other hosts need their own live backend trial.",
         macos_sandbox_required=True,
+    ),
+    Trial(
+        "docker_control_boundary",
+        "A real Docker worker cannot read gate signing material, mutate Job, proof, gate or Git control paths, inherit signing inputs, or retain a network route.",
+        "host_docker_sandbox",
+        (
+            ProofCommand(
+                (
+                    "env",
+                    "DEADRECKON_LIVE_DOCKER_TEST=1",
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon-sandbox",
+                    "--lib",
+                    "tests::live_docker_denies_control_tampering_and_gate_inputs",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ),
+                "tests::live_docker_denies_control_tampering_and_gate_inputs",
+            ),
+        ),
+        "This executes the common boundary in a real Linux container. A macOS host cannot execute its Mach-O dr-gate inside that container, so the public strict Docker Job path remains a separate live claim.",
+        docker_required=True,
     ),
     Trial(
         "receipt_mutation",
@@ -510,7 +536,7 @@ UNPROVEN = (
     {
         "id": "docker_gate_boundary",
         "status": "unproven",
-        "reason": "requires a host with an operational Docker backend",
+        "reason": "the real Docker control boundary is covered separately; this claim requires a public strict Job whose platform-compatible dr-gate runs inside the container",
     },
 )
 
@@ -588,8 +614,51 @@ def seatbelt_preflight() -> dict[str, Any]:
     }
 
 
+def docker_preflight() -> dict[str, Any]:
+    binary = shutil.which("docker")
+    if binary is None:
+        return {
+            "available": False,
+            "operational": False,
+            "image_cached": False,
+            "reason": "docker is unavailable",
+        }
+    daemon = subprocess.run(
+        (binary, "version", "--format", "{{.Server.Version}}"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    image = subprocess.run(
+        (binary, "image", "inspect", "rust:1", "--format", "{{.Id}}"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    operational = daemon.returncode == 0 and image.returncode == 0
+    return {
+        "available": True,
+        "operational": operational,
+        "image_cached": image.returncode == 0,
+        "daemon_returncode": daemon.returncode,
+        "image_returncode": image.returncode,
+        "daemon_stdout_sha256": digest(daemon.stdout),
+        "daemon_stderr_sha256": digest(daemon.stderr),
+        "image_stdout_sha256": digest(image.stdout),
+        "image_stderr_sha256": digest(image.stderr),
+        "reason": (
+            None
+            if operational
+            else "docker daemon is unavailable or rust:1 is not already cached; the credential-free runner never pulls images implicitly"
+        ),
+    }
+
+
 def run_trial(
-    repo: Path, trial: Trial, seatbelt: dict[str, Any]
+    repo: Path,
+    trial: Trial,
+    seatbelt: dict[str, Any],
+    docker: dict[str, Any],
 ) -> dict[str, Any]:
     if trial.macos_sandbox_required and not seatbelt["operational"]:
         return {
@@ -598,6 +667,16 @@ def run_trial(
             "proof_type": trial.proof_type,
             "status": "unproven",
             "reason": seatbelt["reason"],
+            "limitation": trial.limitation,
+            "commands": [],
+        }
+    if trial.docker_required and not docker["operational"]:
+        return {
+            "id": trial.trial_id,
+            "claim": trial.claim,
+            "proof_type": trial.proof_type,
+            "status": "unproven",
+            "reason": docker["reason"],
             "limitation": trial.limitation,
             "commands": [],
         }
@@ -662,7 +741,8 @@ def main() -> int:
         trial for trial in TRIALS if args.only is None or trial.trial_id in args.only
     ]
     seatbelt = seatbelt_preflight()
-    trials = [run_trial(repo, trial, seatbelt) for trial in selected]
+    docker = docker_preflight()
+    trials = [run_trial(repo, trial, seatbelt, docker) for trial in selected]
     payload = {
         "schema_version": 1,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -677,6 +757,7 @@ def main() -> int:
             "machine": platform.machine(),
             "python": platform.python_version(),
             "seatbelt_preflight": seatbelt,
+            "docker_preflight": docker,
         },
         "runner_sha256": digest(Path(__file__).read_bytes()),
         "summary": {

@@ -5,9 +5,13 @@ const STEERABLE_PROVIDER_ROUTE: &str = "cli:codex-server";
 pub(crate) fn steer_command(run_id: &str, text: String) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let state = super::reference::resolve_run_like(&paths, Some(run_id), "steer")?;
-    super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "steer")?;
     let prefix = run_prefix(&state.run_id);
-    queue_steer_for_state(&state, deadreckon_core::steer_inbox::SteerSource::Cli, text)?;
+    queue_steer_for_state(
+        &paths,
+        &state,
+        deadreckon_core::steer_inbox::SteerSource::Cli,
+        text,
+    )?;
 
     println!("{} {}", ui_ok("queued steer for"), ui_id(&prefix));
     println!(
@@ -23,10 +27,21 @@ pub(crate) fn steer_command(run_id: &str, text: String) -> Result<()> {
 }
 
 pub(crate) fn queue_steer_for_state(
+    paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
     source: deadreckon_core::steer_inbox::SteerSource,
     text: String,
 ) -> Result<deadreckon_core::steer_inbox::SteerInboxEntry> {
+    if paths.job_json(&state.run_id).is_file() {
+        let job = deadreckon_core::load_job(paths, &state.run_id)?;
+        super::graph_job::require_current_driver_for_job_artifact(
+            paths,
+            &state.run_id,
+            job.shape,
+            "steer",
+        )?;
+    }
+    super::graph_job::require_current_driver_for_job_owned_run(paths, state, "steer")?;
     let prefix = run_prefix(&state.run_id);
     if text.trim().is_empty() {
         return Err(CliError::Core(deadreckon_core::user_error(

@@ -231,13 +231,13 @@ async fn doc_plan_command(paths: &DeadreckonPaths, args: DocPlanCommandArgs) -> 
             "deadreckon doc <plan-id> --kind narrative",
         )));
     };
+    super::graph_job::require_current_driver_for_job_artifact(
+        paths,
+        &target.plan.plan_id,
+        deadreckon_protocol::JobShape::Graph,
+        if polish { "doc polish" } else { "doc" },
+    )?;
     if polish {
-        super::graph_job::require_current_driver_for_job_artifact(
-            paths,
-            &target.plan.plan_id,
-            deadreckon_protocol::JobShape::Graph,
-            "doc polish",
-        )?;
         let selection = select_plan_doc_provider(paths, &target.plan, doc_provider.as_deref())?;
         let defaults = config_defaults(paths)?;
         refresh_plan_docs(
@@ -602,5 +602,97 @@ fn polish_subcall_cost_label(
         "not metered (subscription)".to_string()
     } else {
         format!("${:.6}", subcall.cost_usd)
+    }
+}
+
+#[cfg(test)]
+mod job_plan_doc_tests {
+    use chrono::Utc;
+    use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, save_plan};
+    use deadreckon_protocol::{
+        Job, JobId, JobPolicy, JobSchemaVersion, JobShape, SemanticJudgeMode,
+    };
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn plain_doc_refuses_a_job_owned_plan_before_creating_docs() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let job_id = "89898989898989898989898989898989";
+        deadreckon_core::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                scope: "doc-ownership-test".to_string(),
+                goal: "keep sealed docs immutable".to_string(),
+                shape: JobShape::Graph,
+                created_at: Utc::now(),
+                source_cwd: workspace.clone(),
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+        )
+        .expect("Job identity");
+        let mut plan = Plan::new(
+            "keep sealed docs immutable",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(0, "first", "first task", PlanRole::Child, None),
+                PlanTask::new(1, "second", "second task", PlanRole::Child, None),
+            ],
+            PlanProviders::default(),
+            Some("doc-ownership-test".to_string()),
+            "test",
+        )
+        .expect("Plan");
+        plan.plan_id = job_id.to_string();
+        plan.owner_job_id = Some(job_id.to_string());
+        plan.parent_cwd = Some(workspace);
+        save_plan(&paths, &plan).expect("owned Plan");
+        let plan_before = fs::read(paths.plan_json(job_id)).expect("Plan bytes before");
+
+        let error = doc_plan_command(
+            &paths,
+            DocPlanCommandArgs {
+                target: PlanDocTarget {
+                    plan,
+                    wrapper: None,
+                },
+                kind: CliDocKind::Narrative,
+                export: None,
+                polish: false,
+                force: false,
+                doc_provider: None,
+                budget_cap: None,
+            },
+        )
+        .await
+        .expect_err("plain doc must not mutate a sealed Plan");
+
+        assert!(
+            error.to_string().contains("belongs to durable Job"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(paths.plan_json(job_id)).expect("Plan bytes after"),
+            plan_before
+        );
+        assert!(
+            !plan_docs_dir(&paths, job_id).exists(),
+            "refused plain doc created deterministic docs"
+        );
     }
 }

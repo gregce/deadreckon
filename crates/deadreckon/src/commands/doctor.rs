@@ -517,19 +517,8 @@ async fn collect_doctor_provider_ping(
     kind_label: &str,
 ) -> Result<DoctorFinding> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
-    let request = ProviderRequest {
-        prompt: "Reply with OK only.".to_string(),
-        max_output_tokens: 8,
-        cwd: None,
-        output_path: None,
-        sandbox_backend: None,
-        workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-        pid_file: None,
-        cancellation_token: None,
-        session_dir: None,
-        output_schema: None,
-        capability_posture: None,
-    };
+    let request =
+        ProviderRequest::enforceably_read_only("Reply with OK only.", 8, std::env::current_dir()?);
     let subject = format!("provider {name} kind={kind_label}");
     match tokio::time::timeout(
         std::time::Duration::from_secs(20),

@@ -752,8 +752,8 @@ async fn main_inner() -> Result<()> {
             SupervisorCommand::Start => {
                 commands::supervisor_service::supervisor_service_start_command()
             }
-            SupervisorCommand::Status => {
-                commands::supervisor_service::supervisor_service_status_command()
+            SupervisorCommand::Status { json } => {
+                commands::supervisor_service::supervisor_service_status_command(json)
             }
             SupervisorCommand::Stop => {
                 commands::supervisor_service::supervisor_service_stop_command()
@@ -782,6 +782,7 @@ async fn main_inner() -> Result<()> {
             max_spend,
             max_wall_seconds,
             sandbox,
+            untrusted,
             provider,
             model,
             doc_provider,
@@ -808,6 +809,8 @@ async fn main_inner() -> Result<()> {
             commands::run::run_command(RunCommandArgs {
                 goal,
                 run_id,
+                durable_source_cwd: None,
+                continuation: None,
                 tamper_baseline,
                 fresh,
                 worktree,
@@ -827,6 +830,7 @@ async fn main_inner() -> Result<()> {
                 max_spend,
                 max_wall_seconds,
                 sandbox,
+                untrusted,
                 provider,
                 model,
                 doc_provider,
@@ -1269,6 +1273,8 @@ async fn main_inner() -> Result<()> {
             parent_run_id,
             new_goal,
             dest,
+            acceptance,
+            yes,
             max_context_turns,
             no_context,
             max_spend,
@@ -1288,6 +1294,8 @@ async fn main_inner() -> Result<()> {
                 parent_run_id,
                 new_goal,
                 dest,
+                acceptance,
+                yes,
                 max_context_turns,
                 no_context,
                 max_spend,
@@ -3488,6 +3496,8 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
     let run_result = commands::run::run_command(RunCommandArgs {
         goal: TRY_GOAL.to_string(),
         run_id: None,
+        durable_source_cwd: None,
+        continuation: None,
         tamper_baseline: None,
         fresh: true,
         worktree: false,
@@ -3507,6 +3517,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         max_spend: Some(1.0),
         max_wall_seconds: Some(60.0),
         sandbox: Some("none".to_string()),
+        untrusted: true,
         provider: None,
         model: None,
         doc_provider: None,
@@ -3553,7 +3564,9 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "run_id": state.run_id,
-                "gate": "SIGNED by dr-gate",
+                "trust": "untrusted local smoke diagnostic",
+                "trusted_job_receipt": false,
+                "gate": "local smoke gate evidence only; not a trusted Job receipt",
                 "proof": proof.proof_path,
                 "story": proof.story_path,
                 "lineage": proof.lineage,
@@ -3561,6 +3574,9 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
             }))?
         );
     } else {
+        println!(
+            "UNTRUSTED LOCAL SMOKE DIAGNOSTIC\nThis checks the local Run path only; it cannot issue a trusted Job receipt."
+        );
         print!("{}", proof.render_text());
     }
     Ok(())
@@ -5081,21 +5097,14 @@ async fn refresh_plan_docs(
         "provider_requested",
         &json!({ "provider": provider, "input_hash": input_hash }),
     )?;
-    let response = router
-        .complete(&ProviderRequest {
-            prompt: plan_doc_provider_prompt(&input)?,
-            max_output_tokens: 16_384,
-            cwd: plan.parent_cwd.clone(),
-            output_path: Some(plan_doc_path(paths, &plan.plan_id, "plan-doc-provider.out")),
-            sandbox_backend: Some(SandboxBackend::None),
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token: None,
-            session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-        })
-        .await;
+    let provider_cwd = plan.parent_cwd.clone().unwrap_or(std::env::current_dir()?);
+    let mut request = ProviderRequest::enforceably_read_only(
+        plan_doc_provider_prompt(&input)?,
+        16_384,
+        provider_cwd,
+    );
+    request.output_path = Some(plan_doc_path(paths, &plan.plan_id, "plan-doc-provider.out"));
+    let response = router.complete(&request).await;
     let response = match response {
         Ok(response) => response,
         Err(err) => {
@@ -6762,6 +6771,10 @@ fn write_merge_repair_request(
     conflicts: &[PlanMergeConflict],
 ) -> Result<PathBuf> {
     fs::create_dir_all(&context.proof_dir)?;
+    let path = context.proof_dir.join("repair-request.json");
+    if context.proof_dir.join("repair-run.json").is_file() && path.is_file() {
+        return Ok(path);
+    }
     let worker_specs = plan
         .tasks
         .iter()
@@ -6825,7 +6838,6 @@ fn write_merge_repair_request(
         recent_events,
         conflicts,
     };
-    let path = context.proof_dir.join("repair-request.json");
     fs::write(&path, serde_json::to_vec_pretty(&request)?)?;
     Ok(path)
 }
@@ -6840,6 +6852,10 @@ struct MergeRepairPlan {
     actions: Vec<MergeRepairAction>,
     #[serde(default)]
     repair_goal: Option<String>,
+    #[serde(skip)]
+    planner_spend_usd: f64,
+    #[serde(skip)]
+    planner_wall_seconds: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -6882,18 +6898,25 @@ async fn run_merge_repair(
         )));
     }
     let request_path = context.proof_dir.join("repair-request.json");
-    let repair_plan = invoke_merge_repair_planner(
-        paths,
-        plan,
-        options.provider,
-        options.mode,
-        &request_path,
-        options.quiet,
-    )
-    .await?;
-    validate_merge_repair_plan(&repair_plan, &merge.unresolved_conflicts(), options.mode)?;
     let repair_plan_path = context.proof_dir.join("repair-plan.json");
-    fs::write(&repair_plan_path, serde_json::to_vec_pretty(&repair_plan)?)?;
+    let repair_plan =
+        if context.proof_dir.join("repair-run.json").is_file() && repair_plan_path.is_file() {
+            serde_json::from_slice(&fs::read(&repair_plan_path)?)?
+        } else {
+            invoke_merge_repair_planner(
+                paths,
+                plan,
+                options.provider,
+                options.mode,
+                &request_path,
+                options.quiet,
+            )
+            .await?
+        };
+    validate_merge_repair_plan(&repair_plan, &merge.unresolved_conflicts(), options.mode)?;
+    if !repair_plan_path.is_file() {
+        fs::write(&repair_plan_path, serde_json::to_vec_pretty(&repair_plan)?)?;
+    }
     match repair_plan.decision.as_str() {
         "prefer_child" => {
             apply_prefer_child_repair(&repair_plan, merge)?;
@@ -6972,10 +6995,14 @@ async fn invoke_merge_repair_planner(
         .unwrap_or(deadreckon_sandbox::SandboxBackend::Auto);
     let request =
         ProviderRequest::enforceably_read_only_with_backend(prompt, 8192, cwd, sandbox_backend);
+    let started_at = std::time::Instant::now();
     let response =
         maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
             .await?;
-    parse_merge_repair_response(&response.content)
+    let mut plan = parse_merge_repair_response(&response.content)?;
+    plan.planner_spend_usd = response.spend.cost_usd;
+    plan.planner_wall_seconds = started_at.elapsed().as_secs_f64();
+    Ok(plan)
 }
 
 fn parse_merge_repair_response(content: &str) -> Result<MergeRepairPlan> {
@@ -7224,6 +7251,45 @@ async fn execute_merge_repair_child(
 ) -> Result<String> {
     let repair_scope = context.repair_scope.clone();
     fs::create_dir_all(&repair_scope)?;
+    let request_path = context.proof_dir.join("repair-request.json");
+    let repair_plan_path = context.proof_dir.join("repair-plan.json");
+    let repair_request_sha256 = deadreckon_core::flight::sha256_file(&request_path)?;
+    let repair_plan_sha256 = deadreckon_core::flight::sha256_file(&repair_plan_path)?;
+    let repair_id = deadreckon_core::flight::sha256_text(&format!(
+        "{}\0{}\0{}",
+        plan.plan_id, repair_request_sha256, repair_plan_sha256
+    ));
+    let repair_round = 1;
+    let inherited_sandbox = commands::graph_job::current_driver_sandbox_backend(paths)?
+        .unwrap_or(deadreckon_sandbox::SandboxBackend::Auto);
+    if inherited_sandbox == deadreckon_sandbox::SandboxBackend::None {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair child refused an uncontained parent sandbox".to_string(),
+        )));
+    }
+    let remaining_budget = commands::graph_job::current_driver_remaining_repair_budget(
+        paths,
+        plan,
+        repair_plan.planner_spend_usd,
+        repair_plan.planner_wall_seconds,
+    )?;
+    if let Some((existing, library)) = recover_existing_merge_repair_child(
+        paths,
+        plan,
+        context,
+        &repair_id,
+        repair_round,
+        &repair_request_sha256,
+        &repair_plan_sha256,
+        inherited_sandbox,
+        remaining_budget.map(|(_, wall)| wall),
+    )
+    .await?
+    {
+        copy_repair_library_to_working(&context.working_dir, &library)?;
+        return Ok(existing);
+    }
+    let repair_run_id = Uuid::new_v4().simple().to_string();
     let repair_goal = format!(
         "{}\n\nRoot goal: {}\nPlan: {}\nRepair request: {}\nRepair plan: {}\n\nResolve only the merge conflict paths named in the repair plan unless a build/test update is strictly required to make the repaired artifact coherent. Preserve completed child behavior and report files changed.",
         repair_plan
@@ -7232,35 +7298,100 @@ async fn execute_merge_repair_child(
             .unwrap_or("Resolve orchestration merge conflicts."),
         plan.root_goal,
         plan.plan_id,
-        context.proof_dir.join("repair-request.json").display(),
-        context.proof_dir.join("repair-plan.json").display()
+        request_path.display(),
+        repair_plan_path.display()
     );
     let merge_working = context.working_dir.clone();
+    let mut argv = vec![
+        "run".to_string(),
+        repair_goal,
+        "--from".to_string(),
+        merge_working.display().to_string(),
+        "--yes".to_string(),
+        "--no-confirm".to_string(),
+        "--no-hints".to_string(),
+        "--no-docs".to_string(),
+        "--sandbox".to_string(),
+        inherited_sandbox.to_string(),
+    ];
+    if let Some((remaining_spend, remaining_wall)) = remaining_budget {
+        argv.extend([
+            "--max-spend".to_string(),
+            remaining_spend.to_string(),
+            "--max-wall-seconds".to_string(),
+            remaining_wall.to_string(),
+        ]);
+    }
+    if provider == "smoke" || provider.starts_with("smoke:") {
+        argv.push("--smoke".to_string());
+    } else {
+        argv.extend(["--provider".to_string(), provider.to_string()]);
+    }
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .current_dir(&merge_working)
         .env("DEADRECKON_HOME", paths.home())
         .env("DEADRECKON_HINTS", "0")
         .env("DEADRECKON_SCOPE_ROOT", &repair_scope)
-        .arg("run")
-        .arg(repair_goal)
-        .arg("--from")
-        .arg(&merge_working)
-        .arg("--yes")
-        .arg("--no-confirm")
-        .arg("--no-hints")
-        .arg("--no-docs")
-        .arg("--sandbox")
-        .arg("none");
-    if provider == "smoke" || provider.starts_with("smoke:") {
-        command.arg("--smoke");
-    } else {
-        command.arg("--provider").arg(provider);
-    }
+        .args(&argv);
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let child = command.spawn()?;
+    let durable_parent_expected = commands::graph_job::resolve_plan_owner(paths, plan)?.is_some();
+    if durable_parent_expected && commands::graph_job::current_parent_job_id().is_none() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Job-owned merge repair cannot fall back to an unguarded child launch".to_string(),
+        )));
+    }
+    let prepared = if let Some(parent_job_id) =
+        commands::graph_job::current_parent_job_id().map(str::to_string)
+    {
+        let canonical_proof = fs::canonicalize(&context.proof_dir)?;
+        Some(commands::graph_job::prepare_delegated_invocation(
+            paths,
+            commands::graph_job::DelegatedAction::MergeRepair {
+                root_artifact_id: parent_job_id,
+                repair_id: repair_id.clone(),
+                repair_round,
+                run_id: repair_run_id.clone(),
+                proof_dir: canonical_proof,
+                repair_request_sha256: repair_request_sha256.clone(),
+                repair_plan_sha256: repair_plan_sha256.clone(),
+            },
+            &argv,
+            &merge_working,
+            &repair_scope,
+            None,
+        )?)
+    } else {
+        None
+    };
+    let launch_authority = merge_repair_launch_record(
+        plan,
+        context,
+        &repair_id,
+        repair_round,
+        &repair_run_id,
+        &repair_request_sha256,
+        &repair_plan_sha256,
+        inherited_sandbox,
+        prepared.as_ref().map(|prepared| prepared.capability_id()),
+        repair_plan.planner_spend_usd,
+        repair_plan.planner_wall_seconds,
+    )?;
+    let authority_path = context.proof_dir.join("repair-run.json");
+    let child = if let Some(prepared) = prepared.as_ref() {
+        commands::graph_job::spawn_merge_repair_delegated(
+            paths,
+            command,
+            prepared,
+            &authority_path,
+            launch_authority,
+        )?
+    } else {
+        commands::job::write_json_synced(&authority_path, &launch_authority)?;
+        command.spawn()?
+    };
     let pid = child.id();
     let output = maybe_with_cli_wait_status(!quiet, "running merge repair child", async move {
         child.wait_with_output()
@@ -7287,22 +7418,189 @@ async fn execute_merge_repair_child(
     } else {
         "failed"
     };
-    write_merge_repair_run_record(paths, plan, context, &run_id, status)?;
+    write_merge_repair_run_record(
+        paths,
+        plan,
+        context,
+        &run_id,
+        status,
+        &repair_id,
+        repair_round,
+        &repair_request_sha256,
+        &repair_plan_sha256,
+        inherited_sandbox,
+        repair_plan.planner_spend_usd,
+        repair_plan.planner_wall_seconds,
+    )?;
     if !output.status.success() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "repair child failed: {stdout}{stderr}"
         ))));
     }
-    let state = load_run(paths, &run_id)?;
-    let library = paths.library_dir(&state.scope, &state.run_id);
-    if !library.is_dir() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!("repair run {} has no promoted library", run_prefix(&run_id)),
-            &format!("deadreckon attach {}", run_prefix(&run_id)),
-        )));
-    }
+    let library = validate_merge_repair_child(
+        paths,
+        plan,
+        context,
+        &run_id,
+        &repair_id,
+        repair_round,
+        &repair_request_sha256,
+        &repair_plan_sha256,
+        inherited_sandbox,
+    )?;
     copy_repair_library_to_working(&context.working_dir, &library)?;
     Ok(run_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn merge_repair_launch_record(
+    plan: &Plan,
+    context: &MergeRepairContext,
+    repair_id: &str,
+    repair_round: u32,
+    run_id: &str,
+    repair_request_sha256: &str,
+    repair_plan_sha256: &str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+    capability_id: Option<&str>,
+    planner_spend_usd: f64,
+    planner_wall_seconds: f64,
+) -> Result<Value> {
+    let path = context.proof_dir.join("repair-run.json");
+    if path.exists() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair launch already has durable authority; refusing a duplicate child"
+                .to_string(),
+        )));
+    }
+    Ok(json!({
+        "schema_version": 2,
+        "plan_id": &plan.plan_id,
+        "root_artifact_id": commands::graph_job::current_parent_job_id()
+            .unwrap_or(&plan.plan_id),
+        "repair_id": repair_id,
+        "repair_round": repair_round,
+        "repair_request_sha256": repair_request_sha256,
+        "repair_plan_sha256": repair_plan_sha256,
+        "capability_id": capability_id,
+        "run_id": run_id,
+        "status": "launch_prepared",
+        "sandbox_requested": sandbox_requested.to_string(),
+        "planner_spend_usd": planner_spend_usd,
+        "planner_wall_seconds": planner_wall_seconds,
+        "source": &context.working_dir,
+        "created_at": Utc::now(),
+        "updated_at": Utc::now(),
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_existing_merge_repair_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    context: &MergeRepairContext,
+    repair_id: &str,
+    repair_round: u32,
+    repair_request_sha256: &str,
+    repair_plan_sha256: &str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+    remaining_wall_seconds: Option<f64>,
+) -> Result<Option<(String, PathBuf)>> {
+    let path = context.proof_dir.join("repair-run.json");
+    if commands::graph_job::current_parent_job_id().is_some() {
+        commands::graph_job::restore_merge_repair_projection_if_needed(paths, repair_id, &path)?;
+    }
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "persisted merge repair authority is not a regular file".to_string(),
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let wait_seconds = remaining_wall_seconds.unwrap_or(120.0).clamp(0.25, 120.0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(wait_seconds);
+    loop {
+        let record: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if record.get("repair_id").and_then(Value::as_str) != Some(repair_id)
+            || record.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
+            || record.get("repair_request_sha256").and_then(Value::as_str)
+                != Some(repair_request_sha256)
+            || record.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
+            || record.get("sandbox_requested").and_then(Value::as_str)
+                != Some(sandbox_requested.to_string().as_str())
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "persisted merge repair authority changed immutable request identity".to_string(),
+            )));
+        }
+        let run_id = record
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|run_id| !run_id.trim().is_empty())
+            .map(str::to_string);
+        if let Some(run_id) = run_id.as_deref()
+            && let Ok(library) = validate_merge_repair_child(
+                paths,
+                plan,
+                context,
+                run_id,
+                repair_id,
+                repair_round,
+                repair_request_sha256,
+                repair_plan_sha256,
+                sandbox_requested,
+            )
+        {
+            return Ok(Some((run_id.to_string(), library)));
+        }
+        let process: deadreckon_core::SupervisedProcessRecord =
+            serde_json::from_value(record.get("process").cloned().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "persisted merge repair authority has no supervised child identity".to_string(),
+                ))
+            })?)?;
+        match process.identity() {
+            deadreckon_core::SupervisedProcessIdentity::Current => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "timed out adopting the exact supervised merge repair child".to_string(),
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            deadreckon_core::SupervisedProcessIdentity::Exited
+            | deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {
+                let Some(run_id) = run_id else {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "supervised merge repair child exited before linking a Run; refusing a duplicate launch"
+                            .to_string(),
+                    )));
+                };
+                let library = validate_merge_repair_child(
+                    paths,
+                    plan,
+                    context,
+                    &run_id,
+                    repair_id,
+                    repair_round,
+                    repair_request_sha256,
+                    repair_plan_sha256,
+                    sandbox_requested,
+                )?;
+                return Ok(Some((run_id, library)));
+            }
+            deadreckon_core::SupervisedProcessIdentity::Reused
+            | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "supervised merge repair child identity is conflicting or unverifiable"
+                        .to_string(),
+                )));
+            }
+        }
+    }
 }
 
 fn write_merge_repair_run_record(
@@ -7311,21 +7609,154 @@ fn write_merge_repair_run_record(
     context: &MergeRepairContext,
     run_id: &str,
     status: &str,
+    repair_id: &str,
+    repair_round: u32,
+    repair_request_sha256: &str,
+    repair_plan_sha256: &str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+    planner_spend_usd: f64,
+    planner_wall_seconds: f64,
 ) -> Result<()> {
     let path = context.proof_dir.join("repair-run.json");
     let state = load_run(paths, run_id).ok();
-    let value = json!({
-        "schema_version": 1,
-        "plan_id": &plan.plan_id,
-        "run_id": run_id,
-        "scope": state.as_ref().map(|state| state.scope.clone()),
-        "status": status,
-        "source": &context.working_dir,
-        "created_at": Utc::now(),
-        "updated_at": Utc::now(),
-    });
-    fs::write(path, serde_json::to_vec_pretty(&value)?)?;
-    Ok(())
+    let mut value: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair launch authority is not an object".to_string(),
+        ))
+    })?;
+    if object.get("plan_id").and_then(Value::as_str) != Some(plan.plan_id.as_str())
+        || object.get("repair_id").and_then(Value::as_str) != Some(repair_id)
+        || object.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
+        || object.get("repair_request_sha256").and_then(Value::as_str)
+            != Some(repair_request_sha256)
+        || object.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
+        || object.get("sandbox_requested").and_then(Value::as_str)
+            != Some(sandbox_requested.to_string().as_str())
+        || object
+            .get("run_id")
+            .and_then(Value::as_str)
+            .is_some_and(|existing| existing != run_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair completion crossed its durable launch authority".to_string(),
+        )));
+    }
+    object.insert("run_id".to_string(), Value::String(run_id.to_string()));
+    object.insert(
+        "scope".to_string(),
+        serde_json::to_value(state.as_ref().map(|state| state.scope.clone()))?,
+    );
+    object.insert("status".to_string(), Value::String(status.to_string()));
+    object.insert(
+        "planner_spend_usd".to_string(),
+        serde_json::to_value(planner_spend_usd)?,
+    );
+    object.insert(
+        "planner_wall_seconds".to_string(),
+        serde_json::to_value(planner_wall_seconds)?,
+    );
+    object.insert("updated_at".to_string(), serde_json::to_value(Utc::now())?);
+    commands::job::replace_json_synced(&path, &value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_merge_repair_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    context: &MergeRepairContext,
+    run_id: &str,
+    repair_id: &str,
+    repair_round: u32,
+    repair_request_sha256: &str,
+    repair_plan_sha256: &str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+) -> Result<PathBuf> {
+    if sandbox_requested == deadreckon_sandbox::SandboxBackend::None
+        || deadreckon_core::flight::sha256_file(&context.proof_dir.join("repair-request.json"))?
+            != repair_request_sha256
+        || deadreckon_core::flight::sha256_file(&context.proof_dir.join("repair-plan.json"))?
+            != repair_plan_sha256
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair proof changed before parent consumption".to_string(),
+        )));
+    }
+    let state = load_run(paths, run_id)?;
+    let expected_job_id = commands::graph_job::current_parent_job_id();
+    if state.sandbox != sandbox_requested.to_string()
+        || expected_job_id.is_some_and(|job_id| {
+            state.ownership.as_ref()
+                != Some(&deadreckon_core::RunOwnership::merge_repair(
+                    job_id,
+                    job_id,
+                    repair_id,
+                    repair_round,
+                    run_id,
+                    fs::canonicalize(&context.proof_dir)
+                        .unwrap_or_else(|_| context.proof_dir.clone()),
+                    repair_request_sha256,
+                    repair_plan_sha256,
+                ))
+        })
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "repair Run {} is not owned by its exact durable parent request",
+            run_prefix(run_id)
+        ))));
+    }
+    let marker = validate_acceptance_marker(&state)?;
+    if !marker.is_native_gate_proof() || !marker.contained || marker.sandbox_backend == "none" {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "repair Run {} has no signed contained native gate proof",
+            run_prefix(run_id)
+        ))));
+    }
+    let library = paths.library_dir(&state.scope, &state.run_id);
+    if !library.is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("repair run {} has no promoted library", run_prefix(run_id)),
+            &format!("deadreckon attach {}", run_prefix(run_id)),
+        )));
+    }
+    let result_tree_sha256 =
+        deadreckon_core::flight::build_deliverable_file_index(&library)?.tree_hash();
+    let path = context.proof_dir.join("repair-run.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let object = record.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair record is not an object".to_string(),
+        ))
+    })?;
+    if object.get("run_id").and_then(Value::as_str) != Some(run_id)
+        || object.get("repair_id").and_then(Value::as_str) != Some(repair_id)
+        || object.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
+        || object.get("repair_request_sha256").and_then(Value::as_str)
+            != Some(repair_request_sha256)
+        || object.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
+        || object.get("plan_id").and_then(Value::as_str) != Some(plan.plan_id.as_str())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair record crosses immutable request identities".to_string(),
+        )));
+    }
+    object.insert(
+        "acceptance_marker_sha256".to_string(),
+        Value::String(deadreckon_core::flight::sha256_file(
+            &deadreckon_core::marker_path_for_run_root(&state.run_root),
+        )?),
+    );
+    object.insert(
+        "result_tree_sha256".to_string(),
+        Value::String(result_tree_sha256),
+    );
+    object.insert("trusted".to_string(), Value::Bool(true));
+    object.insert(
+        "validated_at".to_string(),
+        serde_json::to_value(Utc::now())?,
+    );
+    commands::job::replace_json_synced(&path, &record)?;
+    Ok(library)
 }
 
 fn copy_repair_library_to_working(working_dir: &Path, library: &Path) -> Result<()> {
@@ -10028,7 +10459,34 @@ async fn resume_command(
     let paths = DeadreckonPaths::discover();
     let state = commands::reference::resolve_run_like(&paths, Some(&run_id), "resume")?;
     commands::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "resume")?;
-    resume_loaded_command(&paths, state, from_turn, max_wall_seconds, no_docs, plain).await
+    let _ = (from_turn, max_wall_seconds, no_docs, plain);
+    Err(retired_public_resume_error(&state))
+}
+
+fn retired_public_resume_error(state: &deadreckon_core::PipelineState) -> CliError {
+    let source = if state.working_dir.is_dir() {
+        format!(
+            "--from {}",
+            quote_shell_command_argument(&state.working_dir.display().to_string())
+        )
+    } else {
+        "--fresh".to_string()
+    };
+    let replacement = format!(
+        "deadreckon start {} --mode run {source} --yes",
+        quote_shell_command_argument(&state.goal)
+    );
+    CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "public resume is retired for legacy Run {}; no Run state was changed and no provider was started",
+            run_prefix(&state.run_id)
+        ),
+        &replacement,
+    ))
+}
+
+fn quote_shell_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 async fn trusted_supervisor_resume_command(job_id: String) -> Result<()> {
@@ -12785,18 +13243,12 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         println!("extend skipped; follow-up goal was empty");
         return Ok(());
     }
-    let dest = prompt::open("extension working dest [runstate working dir]: ", None)?;
-    let dest = if dest.trim().is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(dest.trim()))
-    };
-    let paths = DeadreckonPaths::discover();
-    let dest = resolve_external_dest(&paths, dest, "extend")?;
-    commands::lifecycle::extend_command(ExtendCommandArgs {
+    Box::pin(commands::lifecycle::extend_command(ExtendCommandArgs {
         parent_run_id: state.run_id.clone(),
         new_goal: goal,
-        dest,
+        dest: None,
+        acceptance: None,
+        yes: true,
         max_context_turns: None,
         no_context: false,
         max_spend: state.max_spend_usd,
@@ -12810,7 +13262,7 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         narrate: false,
         no_narrate: false,
         narrator_model: None,
-    })
+    }))
     .await
 }
 
@@ -15258,22 +15710,14 @@ async fn refresh_narrative_projection_with_provider(
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let response = match router
-        .complete(&ProviderRequest {
-            prompt: prompt.prompt,
-            max_output_tokens: 2_000,
-            cwd,
-            output_path: Some(output_path),
-            sandbox_backend: None,
-            workspace_access: deadreckon_providers::WorkspaceAccess::ReadWrite,
-            pid_file: None,
-            cancellation_token,
-            session_dir: None,
-            output_schema: None,
-            capability_posture: None,
-        })
-        .await
-    {
+    let mut provider_request = ProviderRequest::enforceably_read_only(
+        prompt.prompt,
+        2_000,
+        cwd.unwrap_or_else(|| paths.home().to_path_buf()),
+    );
+    provider_request.output_path = Some(output_path);
+    provider_request.cancellation_token = cancellation_token;
+    let response = match router.complete(&provider_request).await {
         Ok(response) => response,
         Err(err) => {
             return Ok(narrative::projection_with_provider_failure(

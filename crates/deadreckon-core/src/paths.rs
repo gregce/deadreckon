@@ -116,6 +116,38 @@ impl DeadreckonPaths {
         self.job_dir(job_id).join("receipt.json")
     }
 
+    pub fn job_sandbox_boundary_observation(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id)
+            .join("sandbox-boundary-observation.json")
+    }
+
+    /// Trusted operator captures live under DeadReckon home, never in an
+    /// agent-visible run workspace.
+    pub fn operator_captures_dir(&self) -> PathBuf {
+        self.home.join("operator-captures")
+    }
+
+    pub fn operator_capture_dir(&self, job_id: &str, session_id: &str) -> PathBuf {
+        self.operator_captures_dir()
+            .join(operator_capture_component(job_id))
+            .join(operator_capture_component(session_id))
+    }
+
+    pub fn operator_capture_binding(&self, job_id: &str, session_id: &str) -> PathBuf {
+        self.operator_capture_dir(job_id, session_id)
+            .join("binding.json")
+    }
+
+    pub fn operator_capture_events(&self, job_id: &str, session_id: &str) -> PathBuf {
+        self.operator_capture_dir(job_id, session_id)
+            .join("capture-events.jsonl")
+    }
+
+    pub fn operator_capture_receipt(&self, job_id: &str, session_id: &str) -> PathBuf {
+        self.operator_capture_dir(job_id, session_id)
+            .join("capture-receipt.json")
+    }
+
     pub fn chains_dir(&self) -> PathBuf {
         self.home.join("chains")
     }
@@ -307,6 +339,23 @@ pub fn sanitize_slug(input: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+fn operator_capture_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().max(1));
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_') {
+            output.push(char::from(*byte));
+        } else {
+            output.push('%');
+            output.push_str(&format!("{byte:02x}"));
+        }
+    }
+    if output.is_empty() {
+        "%00".to_string()
+    } else {
+        output
+    }
 }
 
 fn find_git_root(start: &Path) -> Option<PathBuf> {

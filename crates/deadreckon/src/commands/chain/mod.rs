@@ -523,11 +523,12 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     let planner_started = std::time::Instant::now();
     let response = with_cli_wait_status(
         "drafting chain plan",
-        router.complete(&ProviderRequest::enforceably_read_only(
+        router.complete(&chain_planner_request(
             prompt,
             u32::from(n) * 96,
             std::env::current_dir()?,
-        )),
+            &options.sandbox,
+        )?),
     )
     .await
     .map_err(|err| {
@@ -558,6 +559,21 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     .await?;
     append_chain_planner_spend(&paths, &chain_id, &response)?;
     Ok(())
+}
+
+fn chain_planner_request(
+    prompt: String,
+    max_output_tokens: u32,
+    cwd: PathBuf,
+    sandbox: &str,
+) -> Result<ProviderRequest> {
+    let sandbox_backend = sandbox.parse::<deadreckon_sandbox::SandboxBackend>()?;
+    Ok(ProviderRequest::enforceably_read_only_with_backend(
+        prompt,
+        max_output_tokens,
+        cwd,
+        sandbox_backend,
+    ))
 }
 
 fn durable_chain_plan_command(root_goal: &str, n: u8, options: &ChainCreateOptions) -> String {
@@ -4445,6 +4461,56 @@ fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_planner_request_preserves_explicit_sandbox_selection() {
+        for (selector, expected) in [
+            ("docker", deadreckon_sandbox::SandboxBackend::Docker),
+            ("bwrap", deadreckon_sandbox::SandboxBackend::Bwrap),
+            (
+                "sandbox-exec",
+                deadreckon_sandbox::SandboxBackend::SandboxExec,
+            ),
+        ] {
+            let request = chain_planner_request(
+                "plan the chain".to_string(),
+                512,
+                PathBuf::from("/tmp/deadreckon-chain-planner"),
+                selector,
+            )
+            .expect("chain planner request");
+
+            assert_eq!(request.sandbox_backend, Some(expected));
+            assert_eq!(
+                request.workspace_access,
+                deadreckon_sandbox::WorkspaceAccess::ReadOnly
+            );
+        }
+    }
+
+    #[test]
+    fn chain_planner_request_never_weakens_none_to_uncontained() {
+        let request = chain_planner_request(
+            "plan the chain".to_string(),
+            512,
+            PathBuf::from("/tmp/deadreckon-chain-planner"),
+            "none",
+        )
+        .expect("chain planner request");
+
+        assert_eq!(
+            request.sandbox_backend,
+            Some(deadreckon_sandbox::SandboxBackend::Auto)
+        );
+        assert_ne!(
+            request.sandbox_backend,
+            Some(deadreckon_sandbox::SandboxBackend::None)
+        );
+        assert_eq!(
+            request.workspace_access,
+            deadreckon_sandbox::WorkspaceAccess::ReadOnly
+        );
+    }
 
     fn sample_chain(goals: &[&str]) -> Chain {
         Chain::new(ChainNewOptions {

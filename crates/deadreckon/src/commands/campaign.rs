@@ -40,6 +40,32 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) ancestor_scopes: &'a [String],
 }
 
+enum CampaignSubChildProcess {
+    Plain(std::process::Child),
+    Durable(commands::graph_job::CampaignSubProcess),
+}
+
+impl CampaignSubChildProcess {
+    fn try_wait(&mut self) -> Result<Option<Option<bool>>> {
+        match self {
+            Self::Plain(child) => Ok(child.try_wait()?.map(|status| Some(status.success()))),
+            Self::Durable(child) => match child.try_wait()? {
+                commands::graph_job::CampaignSubProcessPoll::Running => Ok(None),
+                commands::graph_job::CampaignSubProcessPoll::Exited { success } => {
+                    Ok(Some(success))
+                }
+            },
+        }
+    }
+
+    fn revoke_pending(&self, paths: &DeadreckonPaths) -> Result<()> {
+        if let Self::Durable(child) = self {
+            child.revoke_pending(paths)?;
+        }
+        Ok(())
+    }
+}
+
 #[allow(dead_code)] // reserved campaign-fork seam; tests pin the exact sub-orchestrator argv/env
 pub(crate) fn build_sub_orchestrator_command(
     launch: &CampaignSubLaunch<'_>,
@@ -131,12 +157,15 @@ fn recover_persisted_campaign_sub(
     use deadreckon_core::plan::PlanStatus;
 
     if let Some(result) = discover_sub_result(launch_dir)? {
-        if result.sub_id != sub.sub_id
-            || sub
-                .sub_plan_id
-                .as_ref()
-                .zip(result.plan_id.as_ref())
-                .is_some_and(|(expected, actual)| expected != actual)
+        let expected_plan_id = sub.sub_plan_id.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "campaign sub-result {} has no protected reserved Plan identity",
+                result.sub_id
+            )))
+        })?;
+        if result.schema_version != 1
+            || result.sub_id != sub.sub_id
+            || result.plan_id.as_deref() != Some(expected_plan_id)
             || sub
                 .result_run_id
                 .as_ref()
@@ -146,6 +175,34 @@ fn recover_persisted_campaign_sub(
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                 "campaign sub-result identity {} does not match persisted {}",
                 result.sub_id, sub.sub_id
+            ))));
+        }
+        let plan = deadreckon_core::plan::load_plan(paths, expected_plan_id)?;
+        if plan.plan_id != expected_plan_id || plan.root_goal != sub.goal {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "campaign sub-result {} does not match protected Plan {expected_plan_id}",
+                result.sub_id
+            ))));
+        }
+        if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+            if plan.owner_job_id.as_deref() != Some(job_id) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "campaign sub-result Plan {expected_plan_id} does not retain Campaign Job {job_id}"
+                ))));
+            }
+            commands::graph_job::record_owned_plan_tree(paths, &plan)?;
+        }
+        let plan_proves_result = if result.ok {
+            plan.status == PlanStatus::Merged
+                && result.result_run_id.as_deref() == plan.merged_run_id.as_deref()
+                && result.result_run_id.is_some()
+        } else {
+            plan.status == PlanStatus::Failed
+        };
+        if !plan_proves_result {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "campaign sub-result {} is not corroborated by protected Plan {expected_plan_id}",
+                result.sub_id
             ))));
         }
         return Ok(Some(result));
@@ -2332,6 +2389,38 @@ async fn execute_campaign_state(
                     sub.sub_id
                 )))
             })?;
+            if discover_sub_result(launch_dir)?.is_some() {
+                // A finalized result is authoritative recovery evidence even
+                // if the launch PID has since been reused or can no longer be
+                // verified on this boot.
+                return recover_persisted_campaign_sub(
+                    paths,
+                    cwd,
+                    launch_dir,
+                    sub,
+                    &sandbox,
+                    per_sub
+                        .as_ref()
+                        .and_then(|shares| shares.get(position).copied()),
+                    per_sub_wall
+                        .as_ref()
+                        .and_then(|shares| shares.get(position).copied()),
+                );
+            }
+            if let Some(plan_id) = sub.sub_plan_id.as_deref()
+                && commands::graph_job::current_parent_job_id().is_some()
+                && commands::graph_job::campaign_sub_launch_process_is_live(
+                    paths,
+                    &campaign_id,
+                    &sub.sub_id,
+                    plan_id,
+                )?
+            {
+                // A prior driver may have left the exact guarded
+                // sub-orchestrator alive. Let the launch closure adopt it
+                // instead of racing it through Plan-level recovery.
+                return Ok(None);
+            }
             recover_persisted_campaign_sub(
                 paths,
                 cwd,
@@ -2395,38 +2484,68 @@ async fn execute_campaign_state(
                     sub.sub_id
                 );
             }
-            let delegation = if commands::graph_job::current_parent_job_id().is_some() {
-                let argv = command
-                    .get_args()
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>();
-                let prepared = commands::graph_job::prepare_delegated_invocation(
+            let mut child = if commands::graph_job::current_parent_job_id().is_some() {
+                match commands::graph_job::recover_campaign_sub_launch(
                     paths,
-                    commands::graph_job::DelegatedAction::CampaignSub {
-                        campaign_id: campaign_id.clone(),
-                        sub_id: sub.sub_id.clone(),
-                        plan_id: sub_plan_id.to_string(),
-                    },
-                    &argv,
-                    cwd,
-                    launch_dir,
-                    None,
-                )?;
-                Some(prepared)
+                    &campaign_id,
+                    &sub.sub_id,
+                    sub_plan_id,
+                )? {
+                    commands::graph_job::CampaignSubLaunchRecovery::Adopted(child) => {
+                        CampaignSubChildProcess::Durable(child)
+                    }
+                    commands::graph_job::CampaignSubLaunchRecovery::RecoverLinkedArtifacts => {
+                        if let Some(result) = recover_persisted_campaign_sub(
+                            paths,
+                            cwd,
+                            launch_dir,
+                            sub,
+                            &sandbox,
+                            share,
+                            per_sub_wall
+                                .as_ref()
+                                .and_then(|shares| shares.get(sub_index).copied()),
+                        )? {
+                            return Ok(result);
+                        }
+                        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                            "Campaign sub-process {} crossed its durable execution boundary but left no recoverable reserved Plan {sub_plan_id}; refusing a duplicate launch",
+                            sub.sub_id
+                        ))));
+                    }
+                    commands::graph_job::CampaignSubLaunchRecovery::Relaunch => {
+                        let argv = command
+                            .get_args()
+                            .map(ToOwned::to_owned)
+                            .collect::<Vec<_>>();
+                        let prepared = commands::graph_job::prepare_delegated_invocation(
+                            paths,
+                            commands::graph_job::DelegatedAction::CampaignSub {
+                                campaign_id: campaign_id.clone(),
+                                sub_id: sub.sub_id.clone(),
+                                plan_id: sub_plan_id.to_string(),
+                            },
+                            &argv,
+                            cwd,
+                            launch_dir,
+                            None,
+                        )?;
+                        CampaignSubChildProcess::Durable(
+                            commands::graph_job::spawn_campaign_sub_delegated(
+                                paths, command, prepared,
+                            )?,
+                        )
+                    }
+                }
             } else {
-                None
-            };
-            let mut child = if let Some(prepared) = delegation.as_ref() {
-                commands::graph_job::spawn_delegated(paths, &mut command, prepared)?
-            } else {
-                command.spawn()?
+                CampaignSubChildProcess::Plain(command.spawn()?)
             };
             let mut last_tick = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(2))
                 .unwrap_or_else(std::time::Instant::now);
-            let status = loop {
-                if let Some(status) = child.try_wait()? {
-                    break status;
+            let success = loop {
+                if let Some(success) = child.try_wait()? {
+                    break success;
                 }
                 if aggregate_on && last_tick.elapsed() >= std::time::Duration::from_secs(2) {
                     let headline = read_sub_plan_id(launch_dir)
@@ -2458,10 +2577,8 @@ async fn execute_campaign_state(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             };
-            if let Some(prepared) = delegation.as_ref() {
-                commands::graph_job::revoke_pending_delegation(paths, prepared)?;
-            }
-            if !status.success() {
+            child.revoke_pending(paths)?;
+            if success == Some(false) {
                 if aggregate_on {
                     eprintln!(
                         "campaign {campaign_prefix} · {} ({position}/{n_subs}) failed",
@@ -2490,16 +2607,36 @@ async fn execute_campaign_state(
                     });
                 }
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                    "sub-orchestrator {} exited with {status}",
+                    "sub-orchestrator {} exited unsuccessfully",
                     sub.sub_id
                 ))));
             }
-            let result = discover_sub_result(launch_dir)?.ok_or_else(|| {
-                CliError::Core(DeadreckonError::InvalidInput(format!(
-                    "sub-orchestrator {} produced no result",
-                    sub.sub_id
-                )))
-            })?;
+            let result = match discover_sub_result(launch_dir)? {
+                Some(result) => result,
+                None if success.is_none() => recover_persisted_campaign_sub(
+                    paths,
+                    cwd,
+                    launch_dir,
+                    sub,
+                    &sandbox,
+                    share,
+                    per_sub_wall
+                        .as_ref()
+                        .and_then(|shares| shares.get(sub_index).copied()),
+                )?
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "adopted sub-orchestrator {} exited without a recoverable result",
+                        sub.sub_id
+                    )))
+                })?,
+                None => {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "sub-orchestrator {} produced no result",
+                        sub.sub_id
+                    ))));
+                }
+            };
             if aggregate_on {
                 let run = result
                     .result_run_id
@@ -2728,12 +2865,21 @@ pub(crate) async fn campaign_repair_command(args: CampaignRepairArgs) -> Result<
             "deadreckon list --all",
         )));
     };
-    commands::graph_job::require_current_driver_for_job_artifact(
+    let job_owned = commands::graph_job::require_current_driver_for_job_artifact(
         &paths,
         &campaign_obj.campaign_id,
         deadreckon_protocol::JobShape::LegacyCampaign,
         "campaign repair",
     )?;
+    if !job_owned && !commands::plan::internal_characterization_requested() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "campaign repair cannot mutate legacy Campaign {} because it has no durable Job owner",
+                run_prefix(&campaign_obj.campaign_id)
+            ),
+            "start a new durable Job with `deadreckon start`",
+        )));
+    }
     match campaign_obj.status {
         campaign::CampaignStatus::Failed => {}
         campaign::CampaignStatus::Merged => {

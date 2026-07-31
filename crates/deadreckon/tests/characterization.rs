@@ -144,7 +144,7 @@ fn characterization_goldens_unchanged_after_split() {
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
-    let run = deadreckon(&paths)
+    let run = characterization_deadreckon(&paths)
         .current_dir(&repo)
         .args([
             "run",
@@ -193,7 +193,7 @@ fn assert_attach_characterization_golden() {
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
 
-    let run = deadreckon(&paths)
+    let run = characterization_deadreckon(&paths)
         .current_dir(&repo)
         .args([
             "run",
@@ -297,7 +297,7 @@ fn doc_default_output_matches_characterization_golden() {
 }
 
 fn smoke_run(paths: &DeadreckonPaths, repo: &Path) -> Output {
-    let run = deadreckon(paths)
+    let run = characterization_deadreckon(paths)
         .current_dir(repo)
         .args([
             "run",
@@ -394,6 +394,16 @@ fn deadreckon(paths: &DeadreckonPaths) -> Command {
         .env_remove("DEADRECKON_CAMPAIGN_ANCESTOR_TASK_KEYS")
         .env_remove("DEADRECKON_CAMPAIGN_ANCESTOR_SCOPES")
         .env_remove("DEADRECKON_CAMPAIGN_SUB_RESULT");
+    command
+}
+
+fn characterization_deadreckon(paths: &DeadreckonPaths) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"));
+    command
+        .env("DEADRECKON_HOME", paths.home())
+        .env("NO_COLOR", "1")
+        .env("COLUMNS", "120")
+        .env("RUST_BACKTRACE", "0");
     command
 }
 

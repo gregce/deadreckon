@@ -580,7 +580,9 @@ fn reduce_event(
         JobEventKind::ResultExported => {
             projection.delivery = Some(job_delivery(event, JobDeliveryKind::Exported)?);
         }
-        JobEventKind::ContractApproved => {}
+        JobEventKind::ContractApproved
+        | JobEventKind::CampaignSubAuthorityChanged
+        | JobEventKind::RepairChildAuthorityChanged => {}
     }
     Ok(())
 }

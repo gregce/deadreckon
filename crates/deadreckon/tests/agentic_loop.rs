@@ -49,6 +49,7 @@ async fn mock_provider_records_three_turns_and_artifacts_match() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -98,6 +99,7 @@ async fn transient_provider_error_retries_once_and_run_completes() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -147,6 +149,7 @@ async fn exhausted_retries_persist_failed_status_with_reason() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -207,6 +210,7 @@ command = "{}"
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -275,6 +279,7 @@ command = "{}"
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -316,6 +321,7 @@ async fn kill_run_across_processes_terminates_in_5s() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .env("DEADRECKON_HOME", &home)
@@ -368,6 +374,7 @@ async fn kill_during_http_streaming_aborts_request() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .env("DEADRECKON_HOME", &home)
@@ -408,6 +415,7 @@ async fn resume_preserves_history_file() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -445,6 +453,7 @@ async fn cli_subagent_without_file_changes_fails_run() {
         .arg("cli:codex")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .env("DEADRECKON_HOME", temp.path().join("home"))
@@ -530,6 +539,7 @@ fi
         .arg("cli:codex")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--acceptance")
@@ -605,6 +615,7 @@ printf 'changed attempt %s\n' "$count"
         .arg("cli:codex")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--acceptance")
@@ -689,6 +700,7 @@ async fn init_config_and_default_spend_work() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .env("DEADRECKON_HOME", &home)
         .output()
         .expect("run");
@@ -719,6 +731,7 @@ async fn high_spend_requires_confirmation_flag_in_scripts() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("51")
         .env("DEADRECKON_HOME", temp.path().join("home"))
@@ -765,6 +778,7 @@ printf 'changed notes\n'
         .arg("cli:codex")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--max-wall-seconds")
@@ -797,6 +811,14 @@ printf 'changed notes\n'
     );
     let spend = fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
     assert!(spend.contains("wall_time_seconds"));
+    let state_before = fs::read(state.state_path()).expect("state before refused resume");
+    let resume_provider_sentinel = temp.path().join("resume-provider-started");
+    fs::write(
+        &fake_codex,
+        "#!/bin/sh\nprintf started >\"${DEADRECKON_RESUME_SENTINEL:?}\"\nexit 99\n",
+    )
+    .expect("replace provider with resume sentinel");
+    chmod_exec(&fake_codex);
 
     let resume = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .arg("resume")
@@ -805,17 +827,32 @@ printf 'changed notes\n'
         .arg("10")
         .arg("--no-docs")
         .env("DEADRECKON_HOME", &home)
+        .env("DEADRECKON_RESUME_SENTINEL", &resume_provider_sentinel)
         .output()
         .expect("resume");
     assert!(
-        resume.status.success(),
+        !resume.status.success(),
         "{}{}",
         String::from_utf8_lossy(&resume.stdout),
         String::from_utf8_lossy(&resume.stderr)
     );
     let state = load_run(&paths, &run.run_id).expect("state");
-    assert_eq!(state.status, RunStatus::Completed);
-    assert!(state.working_dir.join("notes.md").exists());
+    assert_eq!(
+        fs::read(state.state_path()).expect("state after refused resume"),
+        state_before
+    );
+    assert!(
+        !resume_provider_sentinel.exists(),
+        "the provider launched despite public resume retirement"
+    );
+    assert_ne!(state.status, RunStatus::Completed);
+    let stderr = String::from_utf8_lossy(&resume.stderr);
+    assert!(stderr.contains("public resume is retired"), "{stderr}");
+    assert!(stderr.contains("no provider was started"), "{stderr}");
+    assert!(stderr.contains("deadreckon start"), "{stderr}");
+    assert!(stderr.contains("--mode run"), "{stderr}");
+    assert!(stderr.contains("--from"), "{stderr}");
+    assert!(stderr.contains("--yes"), "{stderr}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -838,6 +875,7 @@ async fn kill_storm_no_leaks() {
             .arg("mock")
             .arg("--sandbox")
             .arg("none")
+            .arg("--untrusted")
             .arg("--max-spend")
             .arg("1")
             .env("DEADRECKON_HOME", &home)
@@ -1917,6 +1955,7 @@ printf 'done\n'
                 .arg("cli:codex")
                 .arg("--sandbox")
                 .arg("none")
+                .arg("--untrusted")
                 .arg("--max-spend")
                 .arg("1")
                 .arg("--max-wall-seconds")
@@ -2573,6 +2612,7 @@ async fn reshape_action_writes_inert_proposal_and_event() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")

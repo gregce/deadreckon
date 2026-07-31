@@ -47,6 +47,7 @@ const TRUSTED_DRIVER_LAUNCH_ID_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_ID";
 const TRUSTED_DRIVER_RELEASE_DIGEST_ENV: &str = "DEADRECKON_SUPERVISOR_RELEASE_TOKEN_SHA256";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GuardedDriverAuthority {
     pub(crate) job_id: String,
     pub(crate) attempt: u32,
@@ -3725,12 +3726,35 @@ fn append_attempt_stopped(
     reason: StopReason,
     extra: Value,
 ) -> Result<JobProjection> {
+    let attempt = JobView::load(paths, token.job_id.as_ref())?
+        .projection
+        .attempt_count;
+    if attempt == 0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "cannot stop a Job attempt before an attempt has started".to_string(),
+        )));
+    }
+    let mut detail = match merge_stop_reason(reason, extra) {
+        Value::Object(detail) => detail,
+        _ => unreachable!("merge_stop_reason always returns an object"),
+    };
+    match detail.get("attempt").and_then(Value::as_u64) {
+        Some(recorded) if recorded != u64::from(attempt) => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "attempt stop names attempt {recorded}, but the active Job attempt is {attempt}"
+            ))));
+        }
+        Some(_) => {}
+        None => {
+            detail.insert("attempt".to_string(), Value::from(attempt));
+        }
+    }
     append_control_event(
         paths,
         token,
         JobEventKind::AttemptStopped,
         format!("attempt-stopped:{}:{}", token.epoch, Uuid::new_v4()),
-        merge_stop_reason(reason, extra),
+        Value::Object(detail),
     )
 }
 
@@ -3809,6 +3833,13 @@ fn finish_cancel_requested(
     }
     if let Err(error) =
         reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
+            .and_then(|()| {
+                super::graph_job::reconcile_campaign_sub_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
     {
         block_for_lost_containment(
             paths,
@@ -4365,6 +4396,47 @@ mod tests {
             .expect("parent index");
         index.files.remove(Path::new("manifest.json"));
         index.tree_hash()
+    }
+
+    fn seal_test_sandbox_boundary_observation(
+        paths: &DeadreckonPaths,
+        parent: &deadreckon_core::PipelineState,
+        authority: &JobAuthority,
+        attempt: u32,
+        backend: &str,
+    ) {
+        let observation = deadreckon_protocol::SandboxBoundaryObservation {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: authority.job_id.clone(),
+            run_id: authority.run_id.clone(),
+            observed_at: Utc::now(),
+            issuer: deadreckon_protocol::SandboxBoundaryObservationIssuer::DeadreckonController,
+            probe_id: Uuid::new_v4().to_string(),
+            attempt,
+            outer_launch_id: Uuid::new_v4().to_string(),
+            authority_sha256: deadreckon_core::flight::sha256_file(
+                &paths.job_authority(authority.job_id.as_ref()),
+            )
+            .expect("authority digest"),
+            contract_sha256: authority.contract_sha256.clone(),
+            result_tree_sha256: deadreckon_core::sandbox_boundary_result_tree_sha256(parent)
+                .expect("result tree"),
+            sandbox_requested: authority.sandbox_requested.clone(),
+            sandbox_backend: backend.to_string(),
+            contained: true,
+            gate_key_read_denied: true,
+            proof_write_denied: true,
+            control_write_denied: true,
+            operator_capture_read_denied: true,
+            operator_capture_write_denied: true,
+            signing_env_scrubbed: true,
+            probe_sha256: deadreckon_core::flight::sha256_text(
+                "supervisor crash-resume fixture boundary probe",
+            ),
+            signature: String::new(),
+        };
+        deadreckon_core::seal_sandbox_boundary_observation(paths, parent, authority, &observation)
+            .expect("sandbox boundary observation");
     }
 
     fn graph_fixture(
@@ -5961,6 +6033,7 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("native parent marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 1, "sandbox-exec");
         let judgment = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job.job_id.clone(),
@@ -6150,6 +6223,7 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("native marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 1, "sandbox-exec");
         let judgment = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job.job_id.clone(),
@@ -6466,6 +6540,7 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("post-repair marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 2, "sandbox-exec");
         let achieved = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job.job_id.clone(),
@@ -7029,6 +7104,7 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("final post-repair marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 3, "sandbox-exec");
         let achieved = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job.job_id.clone(),
@@ -7458,6 +7534,7 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("post-repair marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 2, "sandbox-exec");
         let achieved = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job.job_id.clone(),
@@ -7791,6 +7868,7 @@ mod tests {
             narrate: false,
             no_narrate: true,
             narrator_model: Some("narrator-model".to_string()),
+            continuation: None,
         };
         let mut signals = launch.plan.signals.as_object().cloned().unwrap_or_default();
         signals.insert(
@@ -7986,6 +8064,10 @@ mod tests {
         assert_eq!(
             stopped.detail.get("stop_reason").and_then(Value::as_str),
             Some("transient_provider")
+        );
+        assert_eq!(
+            stopped.detail.get("attempt").and_then(Value::as_u64),
+            Some(1)
         );
         assert!(
             history

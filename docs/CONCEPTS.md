@@ -87,8 +87,11 @@ full-plan work merges at the end, then becomes a same-ID Graph parent result.
 Campaign completion also revalidates the worst-of leaf roll-up. Both paths
 then run the native parent gate, ask a fresh read-only semantic judge, validate
 the parent receipt and promote. Preview, explicit uncontained/in-place runs,
-historical `chain run|resume`, and `extend` retain process-owned compatibility
-behavior; their artifacts must not be described as two-key Job receipts.
+historical `chain run|resume`, and chain extension retain process-owned
+compatibility behavior; their artifacts must not be described as two-key Job
+receipts. Public `extend` and guided follow-up instead queue a parent-bound
+Single Job that freezes and revalidates the completed parent's state,
+promoted-artifact tree, and verified receipt when one exists.
 
 If no acceptance file is configured, the default is "the working directory exists and `cargo test` passes" (when `Cargo.toml` is present). Supported check kinds are `cargo_test`, `file_exists`, `content_match`, `build_success`, and `shell`. Full reference, packs, and the compiled YAML format: [HOWTO § Done Criteria](../HOWTO.md#done-criteria).
 

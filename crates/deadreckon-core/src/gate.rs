@@ -624,8 +624,23 @@ pub fn validate_gate_evaluation(
     working_dir: &Path,
     evaluation: &GateEvaluation,
 ) -> Result<()> {
-    let checks = validate_gate_evaluation_integrity(run_id, run_root, working_dir, evaluation)?;
+    let checks = validated_gate_evaluation_checks(run_id, run_root, working_dir, evaluation)?;
     ensure_gate_evaluation_accepted(evaluation, &checks)
+}
+
+/// Validate that a keyless evaluation is bound to the approved contract and
+/// current filesystem evidence without requiring its checks to have passed.
+///
+/// Independent inspection commands need trustworthy failure results too. This
+/// performs the same structural, contract, result, and tamper validation as
+/// signing, but deliberately does not apply the acceptance decision.
+pub fn validate_gate_evaluation_integrity(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    evaluation: &GateEvaluation,
+) -> Result<()> {
+    validated_gate_evaluation_checks(run_id, run_root, working_dir, evaluation).map(drop)
 }
 
 /// Validate, persist trusted evidence, and sign a keyless gate evaluation.
@@ -642,7 +657,7 @@ pub fn sign_gate_evaluation_with_key(
 ) -> Result<AcceptanceMarker> {
     require_gate_key_length(gate_key)?;
     validate_signing_containment(&containment)?;
-    let checks = validate_gate_evaluation_integrity(run_id, run_root, working_dir, &evaluation)?;
+    let checks = validated_gate_evaluation_checks(run_id, run_root, working_dir, &evaluation)?;
     crate::tamper::write_acceptance_tamper(run_root, &evaluation.tamper)?;
     write_reconstructed_acceptance_progress(run_root, &evaluation.results)?;
     ensure_gate_evaluation_accepted(&evaluation, &checks)?;
@@ -768,7 +783,7 @@ fn canonical_working_dir(working_dir: &Path) -> Result<PathBuf> {
         })
 }
 
-fn validate_gate_evaluation_integrity(
+fn validated_gate_evaluation_checks(
     run_id: &str,
     run_root: &Path,
     working_dir: &Path,
@@ -2006,6 +2021,34 @@ mod tests {
         assert!(!super::marker_path(&state).exists());
         assert!(!super::acceptance_progress_path_for_run_root(&state.run_root).exists());
         assert!(!crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root).exists());
+    }
+
+    #[test]
+    fn integrity_validation_preserves_a_legitimate_failed_result_for_inspection() {
+        let (_temp, state, _) = keyless_evaluation_fixture();
+        std::fs::remove_file(state.working_dir.join("README.md")).expect("remove required file");
+        let evaluation = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect("keyless failed evaluation");
+
+        assert!(!evaluation.results[0].passed);
+        super::validate_gate_evaluation_integrity(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &evaluation,
+        )
+        .expect("failed result remains trustworthy evidence");
+        let error = super::validate_gate_evaluation(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            &evaluation,
+        )
+        .expect_err("failed result is not acceptable for signing");
+        assert!(
+            error.to_string().contains("acceptance check failed"),
+            "{error}"
+        );
     }
 
     #[test]

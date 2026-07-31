@@ -1,9 +1,9 @@
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use deadreckon_core::is_retryable_io_kind;
 use serde::{Deserialize, Serialize};
-use which::which;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
@@ -88,7 +88,7 @@ pub fn resolve_backend(backend: SandboxBackend) -> Result<(SandboxBackend, Optio
         SandboxBackend::Auto => {
             #[cfg(target_os = "macos")]
             {
-                if which("sandbox-exec").is_ok() {
+                if backend_executable(SandboxBackend::SandboxExec).is_ok() {
                     return Ok((SandboxBackend::SandboxExec, None));
                 }
                 Ok((
@@ -98,7 +98,7 @@ pub fn resolve_backend(backend: SandboxBackend) -> Result<(SandboxBackend, Optio
             }
             #[cfg(target_os = "linux")]
             {
-                if which("bwrap").is_ok() {
+                if backend_executable(SandboxBackend::Bwrap).is_ok() {
                     return Ok((SandboxBackend::Bwrap, None));
                 }
                 Ok((
@@ -114,17 +114,81 @@ pub fn resolve_backend(backend: SandboxBackend) -> Result<(SandboxBackend, Optio
                 ))
             }
         }
-        SandboxBackend::SandboxExec => require_binary("sandbox-exec", SandboxBackend::SandboxExec),
-        SandboxBackend::Bwrap => require_binary("bwrap", SandboxBackend::Bwrap),
-        SandboxBackend::Docker => require_binary("docker", SandboxBackend::Docker),
+        SandboxBackend::SandboxExec | SandboxBackend::Bwrap | SandboxBackend::Docker => {
+            backend_executable(backend)?;
+            Ok((backend, None))
+        }
         SandboxBackend::None => Ok((SandboxBackend::None, None)),
     }
 }
 
-fn require_binary(name: &str, backend: SandboxBackend) -> Result<(SandboxBackend, Option<String>)> {
-    if which(name).is_ok() {
-        Ok((backend, None))
-    } else {
-        Err(SandboxError::Unavailable(backend.to_string()))
+/// Resolve a sandbox wrapper independently of ambient `PATH`.
+///
+/// The wrapper is part of the containment claim, so a repository- or
+/// direnv-provided shim must never be accepted merely because `which` found it.
+pub(crate) fn backend_executable(backend: SandboxBackend) -> Result<PathBuf> {
+    let candidates = backend_candidates(backend);
+    candidates
+        .iter()
+        .map(Path::new)
+        .find_map(trusted_executable)
+        .ok_or_else(|| SandboxError::Unavailable(backend.to_string()))
+}
+
+fn trusted_executable(candidate: &Path) -> Option<PathBuf> {
+    if !candidate.is_absolute() {
+        return None;
     }
+    let canonical = candidate.canonicalize().ok()?;
+    let metadata = canonical.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn backend_candidates(backend: SandboxBackend) -> &'static [&'static str] {
+    match backend {
+        SandboxBackend::SandboxExec => &["/usr/bin/sandbox-exec"],
+        SandboxBackend::Docker => &[
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+        ],
+        SandboxBackend::Bwrap | SandboxBackend::Auto | SandboxBackend::None => &[],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn backend_candidates(backend: SandboxBackend) -> &'static [&'static str] {
+    match backend {
+        SandboxBackend::Bwrap => &["/usr/bin/bwrap", "/bin/bwrap"],
+        SandboxBackend::Docker => &["/usr/bin/docker", "/bin/docker", "/usr/local/bin/docker"],
+        SandboxBackend::SandboxExec | SandboxBackend::Auto | SandboxBackend::None => &[],
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn backend_candidates(backend: SandboxBackend) -> &'static [&'static str] {
+    match backend {
+        SandboxBackend::Docker => &[r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"],
+        SandboxBackend::SandboxExec
+        | SandboxBackend::Bwrap
+        | SandboxBackend::Auto
+        | SandboxBackend::None => &[],
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+fn backend_candidates(_backend: SandboxBackend) -> &'static [&'static str] {
+    &[]
 }

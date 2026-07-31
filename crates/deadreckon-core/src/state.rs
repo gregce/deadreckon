@@ -143,6 +143,15 @@ pub enum RunOwnershipArtifact {
     CampaignResult {
         campaign_id: String,
     },
+    MergeRepair {
+        root_artifact_id: String,
+        repair_id: String,
+        repair_round: u32,
+        run_id: String,
+        proof_dir: PathBuf,
+        repair_request_sha256: String,
+        repair_plan_sha256: String,
+    },
     ParentResult,
 }
 
@@ -186,6 +195,31 @@ impl RunOwnership {
         }
     }
 
+    pub fn merge_repair(
+        job_id: impl Into<String>,
+        root_artifact_id: impl Into<String>,
+        repair_id: impl Into<String>,
+        repair_round: u32,
+        run_id: impl Into<String>,
+        proof_dir: PathBuf,
+        repair_request_sha256: impl Into<String>,
+        repair_plan_sha256: impl Into<String>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            job_id: job_id.into(),
+            artifact: RunOwnershipArtifact::MergeRepair {
+                root_artifact_id: root_artifact_id.into(),
+                repair_id: repair_id.into(),
+                repair_round,
+                run_id: run_id.into(),
+                proof_dir,
+                repair_request_sha256: repair_request_sha256.into(),
+                repair_plan_sha256: repair_plan_sha256.into(),
+            },
+        }
+    }
+
     pub fn parent_result(job_id: impl Into<String>) -> Self {
         Self {
             schema_version: 1,
@@ -207,6 +241,23 @@ impl RunOwnership {
             } => !plan_id.trim().is_empty() && !task_id.trim().is_empty() && *task_attempt > 0,
             RunOwnershipArtifact::PlanResult { plan_id } => !plan_id.trim().is_empty(),
             RunOwnershipArtifact::CampaignResult { campaign_id } => !campaign_id.trim().is_empty(),
+            RunOwnershipArtifact::MergeRepair {
+                root_artifact_id,
+                repair_id,
+                repair_round,
+                run_id,
+                proof_dir,
+                repair_request_sha256,
+                repair_plan_sha256,
+            } => {
+                !root_artifact_id.trim().is_empty()
+                    && !repair_id.trim().is_empty()
+                    && *repair_round > 0
+                    && !run_id.trim().is_empty()
+                    && proof_dir.is_absolute()
+                    && repair_request_sha256.starts_with("sha256:")
+                    && repair_plan_sha256.starts_with("sha256:")
+            }
             RunOwnershipArtifact::ParentResult => true,
         }
     }

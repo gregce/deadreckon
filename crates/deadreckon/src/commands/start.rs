@@ -2977,14 +2977,25 @@ async fn dispatch_start_command(
             Ok(StartDispatch::job(&job.job_id))
         }
         StartSelectedMode::Extend => {
-            // `extend` still owns a process-bound parent-artifact state
-            // machine. Pretending that it is a durable Single Job would bind
-            // authority to the current checkout while the child actually
-            // starts from a promoted parent artifact. Refuse before either
-            // state machine writes anything and give the exact compatibility
-            // command instead.
-            let _ = (args, args_snapshot, launch_plan);
-            Err(guided_extend_requires_explicit_legacy_command(decision))
+            let extension = guided_extension_args(&args, decision)?;
+            let job_id = commands::lifecycle::extend_command_with_launch_plan(
+                extension,
+                Some(launch_plan),
+                true,
+            )
+            .await?
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "approved guided follow-up ended before Job creation".to_string(),
+                ))
+            })?;
+            if !args.quiet {
+                print_start_lifecycle_footer("job", job_id.as_ref(), StartLaunchState::InFlight);
+            }
+            if !args_snapshot.json {
+                maybe_start_attach(job_id.as_ref(), &args_snapshot).await;
+            }
+            Ok(StartDispatch::job(&job_id))
         }
         StartSelectedMode::Campaign => {
             dispatch_advanced_start_job(
@@ -3009,21 +3020,47 @@ async fn dispatch_start_command(
     }
 }
 
-fn guided_extend_requires_explicit_legacy_command(decision: &StartLaunchDecision) -> CliError {
-    let command = decision.base_run_id.as_ref().map_or_else(
-        || "deadreckon list".to_string(),
-        |parent| {
-            format!(
-                "deadreckon extend {} \"{}\"",
-                run_prefix(parent),
-                shell_display_quote(&decision.goal)
-            )
-        },
-    );
-    CliError::Core(deadreckon_core::user_error(
-        "guided start cannot durably continue a parent artifact yet; no work was started",
-        &command,
-    ))
+fn guided_extension_args(
+    args: &StartCommandArgs,
+    decision: &StartLaunchDecision,
+) -> Result<crate::cli::ExtendCommandArgs> {
+    if start_source_flags_present(args) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "a guided follow-up starts from its frozen parent artifact",
+            "omit --fresh, --worktree, --from, and --allow-dirty",
+        )));
+    }
+    let parent_run_id = decision.base_run_id.clone().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "guided follow-up is missing its selected parent run".to_string(),
+        ))
+    })?;
+    Ok(crate::cli::ExtendCommandArgs {
+        parent_run_id,
+        new_goal: decision.goal.clone(),
+        dest: None,
+        acceptance: decision
+            .done_contract
+            .as_ref()
+            .map(|contract| contract.source_path.clone()),
+        yes: true,
+        max_context_turns: None,
+        no_context: false,
+        max_spend: args.max_spend,
+        max_wall_seconds: None,
+        provider: decision
+            .provider_route
+            .clone()
+            .or_else(|| args.provider.clone()),
+        model: decision.model.clone().or_else(|| args.model.clone()),
+        sandbox: None,
+        no_docs: false,
+        doc_skill: None,
+        post_actions: false,
+        narrate: false,
+        no_narrate: false,
+        narrator_model: None,
+    })
 }
 
 async fn dispatch_advanced_start_job(
@@ -3265,7 +3302,7 @@ fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchS
 #[cfg(test)]
 mod start_footer_tests {
     use super::{
-        StartLaunchInput, StartLaunchState, StartSelectedMode, dispatch_start_command,
+        StartLaunchInput, StartLaunchState, StartSelectedMode, guided_extension_args,
         plan_launch_state_from, run_launch_state, start_footer_content, start_launch_decision,
     };
     use crate::cli::{CliStartMode, StartCommandArgs};
@@ -3286,8 +3323,8 @@ mod start_footer_tests {
         assert_eq!(verb, "attach");
     }
 
-    #[tokio::test]
-    async fn guided_history_continuation_refuses_before_foreground_extend() {
+    #[test]
+    fn guided_history_continuation_builds_parent_bound_durable_request() {
         let mut decision = start_launch_decision(StartLaunchInput {
             goal: "add a durable follow-up",
             requested_mode: CliStartMode::Auto,
@@ -3295,18 +3332,13 @@ mod start_footer_tests {
         });
         decision.selected_mode = StartSelectedMode::Extend;
         decision.base_run_id = Some("1234567890abcdef".to_string());
-        let plan = crate::commands::course::trivial_operator_plan(
-            &decision.goal,
-            crate::commands::course::CourseShape::Single,
-            "test",
-        );
-
-        let error = dispatch_start_command(
-            StartCommandArgs {
+        decision.provider_route = Some("cli:codex".to_string());
+        let extension = guided_extension_args(
+            &StartCommandArgs {
                 goal: decision.goal.clone(),
                 mode: CliStartMode::Auto,
                 plan: None,
-                max_spend: None,
+                max_spend: Some(3.0),
                 provider: None,
                 model: None,
                 children: None,
@@ -3327,17 +3359,15 @@ mod start_footer_tests {
                 json: false,
             },
             &decision,
-            plan,
         )
-        .await
-        .expect_err("guided continuation must not enter foreground extend");
-        let message = error.to_string();
+        .expect("guided extension request");
 
-        assert!(message.contains("no work was started"), "{message}");
-        assert!(
-            message.contains("deadreckon extend 12345678 \"add a durable follow-up\""),
-            "{message}"
-        );
+        assert_eq!(extension.parent_run_id, "1234567890abcdef");
+        assert_eq!(extension.new_goal, "add a durable follow-up");
+        assert_eq!(extension.provider.as_deref(), Some("cli:codex"));
+        assert_eq!(extension.max_spend, Some(3.0));
+        assert!(extension.yes);
+        assert!(extension.dest.is_none());
     }
 
     #[test]

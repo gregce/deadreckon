@@ -12,13 +12,15 @@ use deadreckon_core::{
     AcceptanceCheckResult, AcceptanceContainment, DeadreckonPaths, JobHistory, LeaseOwner,
     PipelineState, RunOptions, append_fenced_job_event, append_job_event, claim_job_lease,
     create_run, promote_completed_run, read_gate_key, read_job_history, reduce_job_history,
-    seal_completion_receipt, validate_completion_receipt, write_job,
+    sandbox_boundary_result_tree_sha256, seal_completion_receipt,
+    seal_sandbox_boundary_observation, validate_completion_receipt, write_job,
     write_native_acceptance_marker_with_results_and_key,
 };
 use deadreckon_protocol::{
     AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent,
     JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId,
-    SemanticDecision, SemanticJudgeMode, SemanticJudgment,
+    SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
+    SemanticJudgeMode, SemanticJudgment,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -191,6 +193,37 @@ fn completion_fixture() -> CompletionFixture {
         &state.run_root.join(deadreckon_core::SEMANTIC_JUDGMENT_JSON),
         &judgment,
     );
+    seal_sandbox_boundary_observation(
+        &paths,
+        &state,
+        &authority,
+        &SandboxBoundaryObservation {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: authority.job_id.clone(),
+            run_id: authority.run_id.clone(),
+            observed_at: Utc::now(),
+            issuer: SandboxBoundaryObservationIssuer::DeadreckonController,
+            probe_id: uuid::Uuid::new_v4().to_string(),
+            attempt: 1,
+            outer_launch_id: uuid::Uuid::new_v4().to_string(),
+            authority_sha256: sha256_file(&paths.job_authority(authority.job_id.as_ref()))
+                .expect("authority digest"),
+            contract_sha256: authority.contract_sha256.clone(),
+            result_tree_sha256: sandbox_boundary_result_tree_sha256(&state).expect("result tree"),
+            sandbox_requested: authority.sandbox_requested.clone(),
+            sandbox_backend: "sandbox-exec".to_string(),
+            contained: true,
+            gate_key_read_denied: true,
+            proof_write_denied: true,
+            control_write_denied: true,
+            operator_capture_read_denied: true,
+            operator_capture_write_denied: true,
+            signing_env_scrubbed: true,
+            probe_sha256: sha256_text("fixed controller probe"),
+            signature: String::new(),
+        },
+    )
+    .expect("sandbox boundary observation");
 
     CompletionFixture {
         _temp: temp,

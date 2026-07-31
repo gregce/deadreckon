@@ -219,6 +219,57 @@ fn verify_checks_size_only_after_building_the_release_binary() {
 }
 
 #[test]
+fn response_only_provider_routes_require_an_enforceable_read_only_boundary() {
+    let root = workspace_root();
+    for relative in [
+        "crates/deadreckon/src/narrator.rs",
+        "crates/deadreckon/src/commands/doctor.rs",
+        "crates/deadreckon/src/commands/learning.rs",
+    ] {
+        let source = fs::read_to_string(root.join(relative)).expect("read response-only route");
+        assert!(
+            source.contains("ProviderRequest::enforceably_read_only("),
+            "{relative} does not construct its provider request through the read-only boundary"
+        );
+        assert!(
+            !source.contains("sandbox_backend: None")
+                && !source.contains("WorkspaceAccess::ReadWrite"),
+            "{relative} can still spawn a response-only provider without containment"
+        );
+    }
+
+    let main = fs::read_to_string(root.join("crates/deadreckon/src/main.rs")).expect("read main.rs");
+    for (start, end, route) in [
+        (
+            "async fn refresh_plan_docs(",
+            "fn manifest_from_plan_doc_input(",
+            "plan document polish",
+        ),
+        (
+            "async fn refresh_narrative_projection_with_provider(",
+            "fn narrative_refresh_notice(",
+            "attach narrative refresh",
+        ),
+    ] {
+        let body = main
+            .split_once(start)
+            .and_then(|(_, tail)| tail.split_once(end))
+            .map(|(body, _)| body)
+            .expect("response-only provider function");
+        assert!(
+            body.contains("ProviderRequest::enforceably_read_only("),
+            "{route} does not construct its provider request through the read-only boundary"
+        );
+        assert!(
+            !body.contains("sandbox_backend: None")
+                && !body.contains("WorkspaceAccess::ReadWrite")
+                && !body.contains("SandboxBackend::None"),
+            "{route} can still spawn its provider without containment"
+        );
+    }
+}
+
+#[test]
 fn ci_and_release_verification_run_the_fresh_size_gate() {
     let root = workspace_root();
     for relative in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {

@@ -110,9 +110,10 @@ Durable Single, Graph and Campaign Jobs use a strict two-key completion rule:
 
 The semantic judge cannot override failed checks. For a Single Job, `revise`
 gives the worker another bounded correction opportunity. For a Graph or
-Campaign parent, `revise` stops `NEEDS_REVIEW`; safe parent repair is not
-implemented yet. `uncertain`, an unavailable judge, an uncontained gate, or a
-receipt-sealing error also produces `NEEDS_REVIEW`.
+Campaign parent, `revise` starts a fenced, bounded parent-only repair attempt
+over the merged result without rerunning successful children. `uncertain`, an
+unavailable judge, an uncontained gate, or a receipt-sealing error produces
+`NEEDS_REVIEW`.
 
 Durable review and full-plan work always use at-end delivery. The conductor
 first merges in isolation. The supervisor then copies the merged result into a
@@ -126,9 +127,14 @@ parent verification, it rebuilds the campaign's worst-of roll-up from the leaf
 evidence and compares it with the stored roll-up. A refused or changed roll-up
 fails the parent gate and never reaches the semantic judge.
 
-Guided `start` does not create a durable continuation Job. If it selects a
-follow-up, it refuses before work and prints the exact process-owned
-`deadreckon extend <run-id> "<goal>"` command.
+Public `deadreckon extend <run-id> "<goal>"` and a follow-up selected through
+guided `start` create a durable Single Job. Before queueing, DeadReckon freezes
+the completed parent identity, parent state digest, promoted artifact tree
+digest, and—when the parent is a verified Job—its receipt digest. The child
+revalidates those facts before it writes continuation evidence. Use
+`deadreckon finish <job-id>` after the follow-up verifies; launch-time `--dest`
+is refused so continuation cannot mutate an operator destination before
+verification.
 
 ## Normal Single Run
 
@@ -166,16 +172,17 @@ orchestration machinery when you want the guided front door first. Ordinary
 direct orchestration also creates a durable Graph Job. Its child graph still
 uses the established conductor under one parent lease. The supervisor
 verifies, receipts and promotes the same-ID parent result after the merge. A
-semantic `revise` stops `NEEDS_REVIEW`; it does not yet repair and rerun the
-parent graph. Its typed stop reason is `semantic_revise`, distinct from an
-unavailable judge.
+semantic `revise` starts a bounded parent-only repair turn and retains the
+successful child results. Repeated repair rounds are linked into the receipt
+evidence; `uncertain` remains distinct from a requested revision.
 
 New `chain` execution compiles supported chain policy into a durable linear
 Graph Job; explicit `--sandbox none` and historical `chain run|resume
 <chain-id>` remain untrusted legacy conductors. Direct `campaign` creates a
 durable Campaign Job. Executing a stored plan with `fork` creates a durable
 Graph Job. Preview and internal child modes remain foreground by design.
-`extend` is still process-owned.
+Historical chain extension remains process-owned; run follow-ups use durable
+Single Jobs.
 
 ## Build And Install Alias
 

@@ -465,9 +465,11 @@ mod tests {
     use chrono::Utc;
     use deadreckon_protocol::{
         AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobId, JobPolicy,
-        JobSchemaVersion, JobShape, RunId, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
+        JobSchemaVersion, JobShape, RunId, SandboxBoundaryObservation,
+        SandboxBoundaryObservationIssuer, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
     };
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     use crate::codebase::{
         CODEBASE_RECORD_VERSION, CodebaseMode, CodebaseRecord, TRUSTED_CODEBASE_RECORD,
@@ -672,6 +674,7 @@ mod tests {
         };
         atomic_write_json(&state.run_root.join(SEMANTIC_JUDGMENT_JSON), &judgment)
             .expect("judgment");
+        seal_boundary_observation(&paths, &state, &authority);
         seal_completion_receipt(&paths, &state, &authority, &marker, &judgment)
             .expect("seal receipt");
         Fixture {
@@ -740,6 +743,7 @@ mod tests {
         let judgment: SemanticJudgment =
             serde_json::from_slice(&fs::read(&judgment_path).expect("judgment"))
                 .expect("judgment json");
+        seal_boundary_observation(&fixture.paths, &fixture.state, &authority);
         seal_completion_receipt(
             &fixture.paths,
             &fixture.state,
@@ -749,6 +753,41 @@ mod tests {
         )
         .expect("reseal worktree receipt");
         fixture
+    }
+
+    fn seal_boundary_observation(
+        paths: &DeadreckonPaths,
+        state: &crate::PipelineState,
+        authority: &JobAuthority,
+    ) {
+        let observation = SandboxBoundaryObservation {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: authority.job_id.clone(),
+            run_id: authority.run_id.clone(),
+            observed_at: Utc::now(),
+            issuer: SandboxBoundaryObservationIssuer::DeadreckonController,
+            probe_id: Uuid::new_v4().to_string(),
+            attempt: 1,
+            outer_launch_id: Uuid::new_v4().to_string(),
+            authority_sha256: sha256_file(&paths.job_authority(authority.job_id.as_ref()))
+                .expect("authority digest"),
+            contract_sha256: authority.contract_sha256.clone(),
+            result_tree_sha256: crate::sandbox_boundary_result_tree_sha256(state)
+                .expect("result tree"),
+            sandbox_requested: authority.sandbox_requested.clone(),
+            sandbox_backend: "sandbox-exec".to_string(),
+            contained: true,
+            gate_key_read_denied: true,
+            proof_write_denied: true,
+            control_write_denied: true,
+            operator_capture_read_denied: true,
+            operator_capture_write_denied: true,
+            signing_env_scrubbed: true,
+            probe_sha256: sha256_text("fixed controller probe"),
+            signature: String::new(),
+        };
+        crate::seal_sandbox_boundary_observation(paths, state, authority, &observation)
+            .expect("sandbox boundary observation");
     }
 
     fn git_ok(cwd: &Path, args: &[&str]) {

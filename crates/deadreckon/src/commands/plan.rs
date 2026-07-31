@@ -44,6 +44,36 @@ pub(crate) async fn create_orchestration_plan(
     args: PlanCommandArgs,
     seed_pieces: &[commands::course::CoursePiece],
 ) -> Result<Plan> {
+    create_orchestration_plan_with_persistence(args, seed_pieces, PlanPersistence::Persistent).await
+}
+
+pub(crate) async fn preview_orchestration_plan(
+    args: PlanCommandArgs,
+    seed_pieces: &[commands::course::CoursePiece],
+) -> Result<Plan> {
+    // The read-only planner still runs when no launch seed exists: its task
+    // graph is part of the preview contract. Only the durable materialization
+    // of that graph is suppressed.
+    create_orchestration_plan_with_persistence(args, seed_pieces, PlanPersistence::Preview).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlanPersistence {
+    Persistent,
+    Preview,
+}
+
+impl PlanPersistence {
+    fn writes_state(self) -> bool {
+        self == Self::Persistent
+    }
+}
+
+async fn create_orchestration_plan_with_persistence(
+    args: PlanCommandArgs,
+    seed_pieces: &[commands::course::CoursePiece],
+    persistence: PlanPersistence,
+) -> Result<Plan> {
     let PlanCommandArgs {
         goal,
         n,
@@ -134,7 +164,7 @@ pub(crate) async fn create_orchestration_plan(
         &goal,
         acceptance_provider,
         None,
-        skip_acceptance_prompt,
+        skip_acceptance_prompt || !persistence.writes_state(),
         "orchestration",
     )
     .await?;
@@ -225,37 +255,41 @@ pub(crate) async fn create_orchestration_plan(
     // sub-result sidecar, or lineage env vars — and unlike campaign, each
     // subplan carries its own apply mode, so a sub-project may be sequential
     // while its parent is parallel.
-    attach_subplans(&paths, &mut plan, seed_pieces)?;
-    for task in &plan.tasks {
-        let spec = render_worker_spec(&plan, task);
-        write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
+    attach_subplans(&paths, &mut plan, seed_pieces, persistence)?;
+    if persistence.writes_state() {
+        for task in &plan.tasks {
+            let spec = render_worker_spec(&plan, task);
+            write_worker_spec(&paths, &plan.plan_id, &task.task_id, &spec)?;
+        }
+        save_plan(&paths, &plan)?;
+        if commands::graph_job::current_driver_owns_root_artifact() {
+            plan_test_failpoint("after_root_plan_saved_before_driver_state");
+        }
+        if std::env::var_os(deadreckon_core::campaign::ENV_SUB_PLAN_ID).is_some() {
+            commands::campaign::campaign_test_failpoint(
+                "after_sub_plan_saved_before_ownership_freeze",
+            );
+        }
+        commands::graph_job::record_owned_plan_tree(&paths, &plan)?;
+        commands::graph_job::record_plan_planner_accounting_snapshot(
+            &paths,
+            &plan.plan_id,
+            &root_planner_accounting,
+        )?;
+        let driver_kind = match plan_mode {
+            PlanMode::Review => commands::graph_job::DriverKind::Review,
+            PlanMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
+        };
+        commands::graph_job::record_current_artifact(&paths, driver_kind, "plan", &plan.plan_id)?;
+        append_plan_event(
+            &paths,
+            &plan.plan_id,
+            PlanEventKind::PlanCreated {
+                mode: plan.mode,
+                task_count: plan.tasks.len(),
+            },
+        )?;
     }
-    save_plan(&paths, &plan)?;
-    if commands::graph_job::current_driver_owns_root_artifact() {
-        plan_test_failpoint("after_root_plan_saved_before_driver_state");
-    }
-    if std::env::var_os(deadreckon_core::campaign::ENV_SUB_PLAN_ID).is_some() {
-        commands::campaign::campaign_test_failpoint("after_sub_plan_saved_before_ownership_freeze");
-    }
-    commands::graph_job::record_owned_plan_tree(&paths, &plan)?;
-    commands::graph_job::record_plan_planner_accounting_snapshot(
-        &paths,
-        &plan.plan_id,
-        &root_planner_accounting,
-    )?;
-    let driver_kind = match plan_mode {
-        PlanMode::Review => commands::graph_job::DriverKind::Review,
-        PlanMode::FullPlan => commands::graph_job::DriverKind::FullPlan,
-    };
-    commands::graph_job::record_current_artifact(&paths, driver_kind, "plan", &plan.plan_id)?;
-    append_plan_event(
-        &paths,
-        &plan.plan_id,
-        PlanEventKind::PlanCreated {
-            mode: plan.mode,
-            task_count: plan.tasks.len(),
-        },
-    )?;
     Ok(plan)
 }
 
@@ -437,6 +471,7 @@ fn attach_subplans(
     paths: &DeadreckonPaths,
     plan: &mut Plan,
     seed: &[commands::course::CoursePiece],
+    persistence: PlanPersistence,
 ) -> Result<()> {
     if seed.len() != plan.tasks.len() {
         return Ok(());
@@ -497,24 +532,26 @@ fn attach_subplans(
         if child.apply == deadreckon_core::plan::ApplyWhen::PerNode {
             child.on_fail = OnFail::Stop;
         }
-        for task in &child.tasks {
-            let spec = render_worker_spec(&child, task);
-            write_worker_spec(paths, &child.plan_id, &task.task_id, &spec)?;
+        if persistence.writes_state() {
+            for task in &child.tasks {
+                let spec = render_worker_spec(&child, task);
+                write_worker_spec(paths, &child.plan_id, &task.task_id, &spec)?;
+            }
+            save_plan(paths, &child)?;
+            commands::graph_job::record_plan_planner_accounting_snapshot(
+                paths,
+                &child.plan_id,
+                &root_planner_accounting,
+            )?;
+            append_plan_event(
+                paths,
+                &child.plan_id,
+                PlanEventKind::PlanCreated {
+                    mode: child.mode,
+                    task_count: child.tasks.len(),
+                },
+            )?;
         }
-        save_plan(paths, &child)?;
-        commands::graph_job::record_plan_planner_accounting_snapshot(
-            paths,
-            &child.plan_id,
-            &root_planner_accounting,
-        )?;
-        append_plan_event(
-            paths,
-            &child.plan_id,
-            PlanEventKind::PlanCreated {
-                mode: child.mode,
-                task_count: child.tasks.len(),
-            },
-        )?;
         plan.tasks[index].subplan = Some(child.plan_id);
     }
     Ok(())

@@ -1,8 +1,8 @@
 # Map of DeadReckon
 
-Status: repository analysis updated 2026-07-30 through the Watchkeeper
-parent-repair, recovery/budget hardening and credential-free adversarial
-trials.
+Status: repository analysis updated 2026-07-31 through Watchkeeper durable
+continuation, protected operator capture, trust-boundary hardening and
+credential-free adversarial trials.
 
 ## Executive map
 
@@ -39,7 +39,8 @@ The repository now contains three different things which should not be judged al
    imports, and narration. Ordinary direct orchestration, new chains,
    stored-plan forks and campaigns now run those conductors under a parent Job
    and verify the merged parent. Explicit compatibility modes and chain
-   extension remain process-owned.
+   extension remain process-owned. Public and guided run follow-ups use a
+   parent-bound durable Single Job.
 3. Compatibility layers, speculative depth, and incomplete bets. Deprecate or
    quarantine these rather than allowing them to obscure the kernel.
 
@@ -93,7 +94,9 @@ can recover exact persisted sub-plans and revalidates its worst-of roll-up. The
 supervisor then verifies, receipts and promotes the same-ID parent result.
 Preview, explicit in-place/uncontained execution, historical `chain
 run|resume`, and chain extension remain process-owned and cannot issue a
-trusted Job receipt.
+trusted Job receipt. Public `extend` and a follow-up selected by guided
+`start` freeze the completed parent state, promoted-artifact tree and verified
+receipt, then queue a durable Single Job.
 
 Graph and Campaign parents can now act on semantic `revise` through bounded,
 fenced parent-only repair. The next consolidation step is dogfooding that
@@ -110,7 +113,7 @@ truthfully by Jobs.
 | Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close live recovery proof** |
 | Lifecycle control | Start, observe, cancel and finish Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason | Ordinary operations read persisted control truth | **Stable / bounded**: the cross-kind journey and Job resolver are tested | **Preserve one resolver and one Job event truth** |
 | Codebase isolation | Contain changes and make promotion deliberate | Worktree, copy, fresh-repo and in-place modes separate the agent's workspace from the user's target | Isolation is part of the run contract, not a provider feature | **Hardened** | **Essential; preserve** |
-| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; live Linux and Docker gate proof remains outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
+| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; a real Docker test proves the common control boundary, while a public strict Docker Job and live Linux gate proof remain outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
 | Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event and steering parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
 | Structured provider contracts | Replace output scraping with declared event semantics | Pi/Copilot and app-server paths emit/consume typed events; other adapters retain parsing gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
 | Budgets and context | Bound delegated work and reveal consumption | Wall-time, turn and API-spend caps plus spend/context records drive status and stopping | Budget is enforced by the outer harness | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
@@ -192,17 +195,20 @@ results stop `NEEDS_REVIEW`. Deterministic failure never calls the judge.
 
 This boundary covers durable Jobs, not every compatibility path. Supported
 ordinary `run` and `orchestrate`, new chains, stored-plan `fork`, and direct
-campaigns enter the same Job scheduler. Preview, explicit in-place or
-uncontained work, historical `chain run|resume`, unsupported conductor-only
-policies, and `extend` retain process-owned compatibility semantics. Host
+campaigns, public `extend`, and guided follow-ups enter the same Job scheduler.
+Preview, explicit in-place or uncontained work, historical `chain run|resume`,
+unsupported conductor-only policies, and chain extension retain process-owned
+compatibility semantics. Host
 configuration also matters: strict verification needs a real resolved
 sandbox. The repository contains hostile-path, forgery and fault tests. Live
 adversarial trials across providers and host versions remain operator work. The
 real macOS public-command suite proves the two-phase Seatbelt gate, protected
 path denial, gate-input scrubbing, residual cleanup and signed observed backend;
 it also cancels a held-open evaluator and SIGKILLs the outer launcher, proving
-the old group is reaped before cancellation or one bounded retry. Equivalent
-live Linux/bubblewrap and Docker proof, and a real service-backed reboot, remain
+the old group is reaped before cancellation or one bounded retry. An opt-in
+real Docker test separately proves the common key, environment, network and
+control-path boundary. Live Linux/bubblewrap proof, a public strict Docker Job
+with a platform-compatible gate, and a real service-backed reboot remain
 outstanding.
 
 ## Original unmet needs: current outcome
@@ -227,7 +233,7 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 | 14 | Structural verification of completion | Durable Single, Graph and Campaign Jobs created through guided or ordinary direct launches require contained deterministic checks plus independent semantic `achieved` and a combined parent receipt | **Strongly met in implementation; live false-decision rates unvalidated** |
 | 15 | Discoverable hooks and gates | `def-done`, doctor, four seams and conformance tooling exist | **Strongly met** |
 | 16 | Provider routing | Registry, capabilities, descriptors and routing cover several providers | **Mostly met; provider parity remains** |
-| 17 | Handoff and continuity | Attach, status, extend and docs help a human resume; no first-class handoff artifact or memory carryover | **Partly met** |
+| 17 | Handoff and continuity | Attach, status and docs help a human resume; public and guided follow-ups now freeze verified parent identity and context into a durable child Job, while first-class handoff export and selective memory carryover remain absent | **Mostly met for local continuation** |
 | 18 | Port and environment isolation | Worktrees and process sandboxes isolate files/processes; there is no port/env lease broker | **Partly met** |
 | 19 | Governance receipts | Durable Jobs bind approved authority, checks, semantic judgment, optional revisions, result digest and confinement in an HMAC receipt; rules/skill receipts remain absent | **Mostly met; live cross-provider proof remains** |
 | 20 | Paid-review continuity | Review runs exist, but no specific paid-review workflow or continuity layer | **Mostly absent / not prioritized** |
@@ -235,7 +241,7 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 | 22 | Meeting-to-code traceability | No dedicated workflow | **Absent / intentionally out of scope so far** |
 | 23 | Prompt and team standards | Skills, contracts and seams provide primitives; rules-as-gate is drafted but not implemented | **Partly met** |
 | 24 | Efficiency evaluation | Per-run spend/time/evidence exist; cross-run efficiency analysis and RCA do not | **Partly met** |
-| 25 | Agent inventory and run queue | Guided single, graph and campaign Jobs are queued, listed, leased and supervised locally; direct advanced commands, chain extension and port/env/resource leasing remain outside it | **Partly met, with a real bounded queue** |
+| 25 | Agent inventory and run queue | Guided and ordinary Single, Graph and Campaign Jobs—including run follow-ups—are queued, listed, leased and supervised locally; historical chain extension and port/env/resource leasing remain outside it | **Mostly met locally, with resource leasing absent** |
 
 ## What is essential
 
@@ -249,7 +255,7 @@ These capabilities form the product's defensible spine and should be preserved, 
 5. **Evidence as a protocol**: append-only records, provenance, spend, flight data and composed `RunView`/`JobView` projections.
 6. **Operator control without UI ownership**: attach/status/finish surfaces that read durable truth rather than holding it in memory.
 7. **A migration path from verified runs to Jobs**: preserve chain and plan
-   behavior while moving remaining direct and chain ownership under one
+   behavior while deciding the remaining historical chain ownership under one
    scheduler.
 8. **Local-first inspectability**: reports, library artifacts and import/export that do not require a hosted service.
 
@@ -288,10 +294,10 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   substitution. Hermetic Graph and Campaign tests cover one and repeated
   revise rounds; live provider and interruption trials remain open.
 - **Remaining compatibility parity**: supported new direct and advanced
-  execution is Job-scheduled. Historical chain execution, policy-rich chain
-  modes, explicit in-place/uncontained execution, previews, and chain
-  extension remain process-owned and need preservation or intentional
-  retirement.
+  execution and run continuation are Job-scheduled. Historical chain
+  execution, policy-rich chain modes, explicit in-place/uncontained execution,
+  previews, and chain extension remain process-owned and need preservation or
+  intentional retirement.
 - **Outer-worker crash-window closure**: the supervisor records the prepared
   launch and attempt before spawn. The worker blocks on a private pipe until
   its metadata and `ChildLinked` event are durable. A pre-release crash can
@@ -308,11 +314,17 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 - **Fault injection and measurement**: the repository has deterministic tests
   for protocol corruption, lease races and reclaim, protected paths, receipt
   tampering, promotion refusal and service rendering. The real macOS
-  public-command end-to-end test proves the contained two-phase Seatbelt gate.
-  The credential-free adversarial runner records 11 passes and 0 failures. The
+  public-command end-to-end test proves the contained two-phase Seatbelt gate,
+  and a real Docker test proves the common control boundary. The committed
+  credential-free adversarial result records 12 passes and 0 failures. The
   24-row live operator kit records 2 attempted tasks, 22 not run, and 0
-  verified. It has no live Linux/bubblewrap or Docker gate trial, reboot trial,
-  or measured false-accept and false-reject rates.
+  verified. A passive recorder defines evidence and oracles for all 9
+  remaining live claims without initiating their destructive actions. Its
+  protected `dr-capture` mode authenticates the exact Job, append-only history,
+  deterministic evaluation and HMAC publication receipt; operator-supplied
+  compatibility captures remain explicitly inconclusive.
+  There is no live Linux/bubblewrap or public strict Docker Job result, reboot
+  result, or measured false-accept and false-reject rate.
 
 ### Product bets needing validation
 
@@ -345,8 +357,9 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
    network access, restart the machine, and attempt gate tampering. Close only
    the crash windows demonstrated by those drills.
 3. **Resolve the remaining compatibility boundary.** Preserve or intentionally
-   retire historical chain, extension, preview and uncontained behaviors
-   without weakening the Job lifecycle or labelling untrusted work verified.
+   retire historical chain execution and extension, preview and uncontained
+   behaviors without weakening the Job lifecycle or labelling untrusted work
+   verified.
 4. **Turn team policy into an acceptance input.** Deliver rules-as-gate on top
    of the existing done contract and combined receipt.
 5. **Add resource leasing only after scheduler parity.** Keep cross-machine
@@ -387,10 +400,11 @@ paths, tests, changelog, goal and rider history, [`PRODUCT.md`](../PRODUCT.md),
 The map is intentionally stricter than milestone labels such as “closed” or
 “stable”: those labels demonstrate implementation progress, while this
 document asks whether the operator outcome is actually met. The real macOS
-public-command gate trial proves the contained two-phase Seatbelt path. Unit and
+public-command gate trial proves the contained two-phase Seatbelt path, and the
+opt-in Docker trial proves the common container control boundary. Unit and
 integration tests and the 24-row dogfood result, with 2 attempted tasks, 22 not
-run and 0 verified, do not establish live Linux/bubblewrap or Docker gate
-containment, successful reboot recovery, live cross-provider behavior, or
+run and 0 verified, do not establish live Linux/bubblewrap or a public strict
+Docker Job, successful reboot recovery, live cross-provider behavior, or
 false-accept and false-reject rates. Market maturity, frequency of use and
 willingness to pay cannot be inferred from this repository and remain
 validation questions.

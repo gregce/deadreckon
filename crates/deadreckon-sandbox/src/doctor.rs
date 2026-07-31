@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
+use crate::backend::{SandboxBackend, backend_executable};
 use serde::{Deserialize, Serialize};
-use which::which;
-
-use crate::backend::SandboxBackend;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendAvailability {
@@ -15,12 +13,12 @@ pub struct BackendAvailability {
 
 pub fn doctor() -> Vec<BackendAvailability> {
     [
-        (SandboxBackend::SandboxExec, "sandbox-exec"),
-        (SandboxBackend::Bwrap, "bwrap"),
-        (SandboxBackend::Docker, "docker"),
+        SandboxBackend::SandboxExec,
+        SandboxBackend::Bwrap,
+        SandboxBackend::Docker,
     ]
     .into_iter()
-    .map(|(backend, binary)| match which(binary) {
+    .map(|backend| match backend_executable(backend) {
         Ok(path) => BackendAvailability {
             backend,
             available: true,
@@ -45,7 +43,9 @@ pub fn doctor() -> Vec<BackendAvailability> {
 
 fn missing_hint(backend: SandboxBackend) -> String {
     match backend {
-        SandboxBackend::SandboxExec => "macOS sandbox-exec is not on PATH".to_string(),
+        SandboxBackend::SandboxExec => {
+            "macOS sandbox-exec is unavailable at its trusted system path".to_string()
+        }
         SandboxBackend::Bwrap => {
             "install bubblewrap (bwrap) for Linux native sandboxing".to_string()
         }

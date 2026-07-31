@@ -1,10 +1,10 @@
-//! `deadreckon verdict` — a read-only "did it actually work?" report for any run.
+//! `deadreckon verdict` — a non-authoritative "did it actually work?" report.
 //!
-//! Verdict re-verifies a run NOW by re-running its acceptance checks through the
-//! same engine the gate uses (`evaluate_acceptance_checks`), reads (never
-//! overwrites) the original signed marker, and renders one of three honest
-//! states with evidence and a single next action. It NEVER mutates run state,
-//! advances a phase, or promotes — the result is a sidecar audit file only.
+//! Verdict re-verifies a run NOW through the gate's contained, keyless
+//! evaluator in a disposable workspace, reads (never overwrites) the original
+//! signed marker, and renders one of three honest states with evidence and a
+//! single next action. It NEVER mutates run state, advances a phase, or
+//! promotes — the result is a sidecar audit file only.
 
 use super::super::*;
 use deadreckon_core::gate::AcceptanceCheckResult;
@@ -29,11 +29,12 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let _ = args.plain; // applied via ui::set_plain_output at the dispatch site
     let paths = DeadreckonPaths::discover();
     if args.all {
-        return verdict_all_command(&paths, args.limit.unwrap_or(10), args.json);
+        return verdict_all_command(&paths, args.limit.unwrap_or(10), args.json).await;
     }
     let state =
         crate::commands::reference::resolve_run_like(&paths, args.run_id.as_deref(), "verdict")?;
-    let report = build_verdict_report(&state);
+    super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "verdict")?;
+    let report = evaluate_verdict_report(&state).await?;
     // The sidecar is an additive audit artifact; a read-only filesystem must not
     // turn a verdict into a hard failure, so a write error is swallowed.
     let cached = cache_verdict_report(&state, &report).ok();
@@ -65,6 +66,32 @@ pub(crate) struct VerdictSummary {
 
 /// Re-verify the most recent `limit` runs (across scopes) into compact summaries
 /// so "several at once" collapses to one screen. Newest first.
+async fn evaluate_verdict_all_summaries(
+    paths: &DeadreckonPaths,
+    limit: usize,
+) -> Result<Vec<VerdictSummary>> {
+    let mut runs = deadreckon_core::list_runs(paths, None)?;
+    runs.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+    runs.truncate(limit);
+    let mut summaries = Vec::new();
+    for entry in runs {
+        let state = deadreckon_core::load_run(paths, &entry.run_id)?;
+        super::graph_job::require_current_driver_for_job_owned_run(paths, &state, "verdict")?;
+        let report = evaluate_verdict_report(&state).await?;
+        let checks_passed = report.checks.iter().filter(|check| check.passed).count();
+        summaries.push(VerdictSummary {
+            run_id: entry.run_id,
+            goal: entry.goal,
+            state: report.state,
+            checks_passed,
+            checks_total: report.checks.len(),
+            spend_usd: state.total_spend_usd,
+        });
+    }
+    Ok(summaries)
+}
+
+#[cfg(test)]
 pub(crate) fn verdict_all_summaries(
     paths: &DeadreckonPaths,
     limit: usize,
@@ -89,8 +116,8 @@ pub(crate) fn verdict_all_summaries(
     Ok(summaries)
 }
 
-fn verdict_all_command(paths: &DeadreckonPaths, limit: usize, json: bool) -> Result<()> {
-    let summaries = verdict_all_summaries(paths, limit)?;
+async fn verdict_all_command(paths: &DeadreckonPaths, limit: usize, json: bool) -> Result<()> {
+    let summaries = evaluate_verdict_all_summaries(paths, limit).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&summaries)?);
         return Ok(());
@@ -256,10 +283,18 @@ pub(crate) fn render_verdict_surface(
     )
 }
 
-/// Build the full verdict for a run: re-run its checks, read (never overwrite)
-/// the signed marker, and combine through `compute_verdict`. Read-only.
-pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> VerdictReport {
-    let rerun = rerun_acceptance(state);
+async fn evaluate_verdict_report(state: &deadreckon_core::PipelineState) -> Result<VerdictReport> {
+    let rerun = rerun_acceptance_contained(state).await?;
+    Ok(assemble_verdict_report(state, rerun))
+}
+
+/// Build the full verdict from independently obtained acceptance evidence,
+/// read (never overwrite) the signed marker, and combine through
+/// `compute_verdict`.
+fn assemble_verdict_report(
+    state: &deadreckon_core::PipelineState,
+    rerun: RerunResult,
+) -> VerdictReport {
     if let Ok(view) = deadreckon_core::RunView::from_state(state) {
         return build_verdict_report_from_view(state, &view, rerun);
     }
@@ -279,6 +314,11 @@ pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> Ve
             VerdictSource::Native
         },
     }
+}
+
+#[cfg(test)]
+pub(crate) fn build_verdict_report(state: &deadreckon_core::PipelineState) -> VerdictReport {
+    assemble_verdict_report(state, rerun_acceptance(state))
 }
 
 fn build_verdict_report_from_view(
@@ -371,17 +411,33 @@ fn changed_file_counts(state: &deadreckon_core::PipelineState) -> ChangedFiles {
     counts
 }
 
-/// The result of re-running a run's acceptance checks NOW. Read-only: it runs
-/// the same checks the gate uses but writes no spec, no progress, and no state.
+/// The result of re-running a run's acceptance checks NOW.
 pub(crate) struct RerunResult {
     pub(crate) checks: Vec<AcceptanceCheckResult>,
     pub(crate) all_must_pass: bool,
 }
 
-/// Re-run the run's acceptance checks against its recorded working dir via the
-/// same `evaluate_acceptance_checks` path dr-gate uses (no early-exit, full
-/// per-check results). A missing working dir (exported/cleaned) yields no checks
-/// (a caller treats empty + missing dir as "working dir unavailable").
+/// Re-run the approved checks through keyless `dr-gate evaluate` in a
+/// disposable, contained workspace. A missing working dir (exported/cleaned)
+/// yields no checks; a missing sandbox fails closed before any check executes.
+async fn rerun_acceptance_contained(state: &deadreckon_core::PipelineState) -> Result<RerunResult> {
+    if !state.working_dir.is_dir() {
+        return Ok(RerunResult {
+            checks: Vec::new(),
+            all_must_pass: false,
+        });
+    }
+    let evaluation = deadreckon_runtime::run_contained_verdict_evaluation(state, None).await?;
+    let checks = evaluation.results;
+    let all_must_pass = checks.iter().all(|check| !check.must_pass || check.passed);
+    Ok(RerunResult {
+        checks,
+        all_must_pass,
+    })
+}
+
+/// Unit-test fixture evaluator. Production verdicts never call this host path.
+#[cfg(test)]
 pub(crate) fn rerun_acceptance(state: &deadreckon_core::PipelineState) -> RerunResult {
     if !state.working_dir.is_dir() {
         return RerunResult {

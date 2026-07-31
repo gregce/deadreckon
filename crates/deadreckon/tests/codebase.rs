@@ -134,6 +134,7 @@ fn worktree_run_creates_dr_prefixed_branch_in_worktrees_dir() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -374,6 +375,7 @@ fn allow_dirty_seeds_uncommitted_into_worktree() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--allow-dirty")
@@ -855,6 +857,7 @@ fn yes_flag_skips_confirm_prompt() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -964,6 +967,7 @@ fn non_git_choice_init_runs_git_init_then_worktree() {
             "--smoke",
             "--sandbox",
             "none",
+            "--untrusted",
             "--max-spend",
             "1",
             "--yes",
@@ -1008,6 +1012,7 @@ fn non_git_choice_copy_resolves_to_copy_mode() {
             "--smoke",
             "--sandbox",
             "none",
+            "--untrusted",
             "--max-spend",
             "1",
             "--yes",
@@ -1096,6 +1101,7 @@ fn copy_mode_respects_gitignore() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1132,6 +1138,7 @@ fn copy_mode_succeeds_in_non_git_dir() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1165,6 +1172,7 @@ fn copy_mode_materialize_writes_dest_unchanged_from_today() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1208,6 +1216,7 @@ fn in_place_requires_double_confirm_or_i_know_flag() {
         .arg("run")
         .arg("in-place refused")
         .arg("--in-place")
+        .arg("--untrusted")
         .arg("--smoke")
         .arg("--yes")
         .output()
@@ -1218,7 +1227,167 @@ fn in_place_requires_double_confirm_or_i_know_flag() {
     assert!(stderr.contains("--in-place requires --i-know-its-a-lot"));
     assert_blocked_run_surface(
         &stderr,
-        "deadreckon run \"in-place refused\" --in-place --i-know-its-a-lot --yes",
+        "deadreckon run \"in-place refused\" --in-place --i-know-its-a-lot --untrusted --yes",
+    );
+}
+
+#[test]
+fn unsafe_public_run_refuses_before_source_or_state_mutation() {
+    for (label, unsafe_args) in [
+        (
+            "in-place",
+            vec!["--in-place", "--i-know-its-a-lot", "--init-git"],
+        ),
+        ("sandbox-none", vec!["--sandbox", "none", "--init-git"]),
+    ] {
+        let temp = repo_tempdir();
+        let source = temp.path().join(format!("{label}-source"));
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("sentinel.txt"), "unchanged").expect("sentinel");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut command = deadreckon(&paths);
+        command
+            .current_dir(&source)
+            .env("DEADRECKON_LEGACY_CHAIN_STEP_FOREGROUND", "1")
+            .arg("run")
+            .arg(format!("{label} mutation boundary"))
+            .args(&unsafe_args)
+            .arg("--smoke")
+            .arg("--yes");
+
+        let output = command.output().expect("run refusal");
+
+        assert!(!output.status.success());
+        assert!(
+            stderr(&output).contains("untrusted foreground compatibility modes"),
+            "{}",
+            stderr(&output)
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("sentinel.txt")).expect("sentinel"),
+            "unchanged"
+        );
+        assert!(!source.join(".git").exists(), "{label} initialized Git");
+        assert!(
+            !source.join(".deadreckon").exists(),
+            "{label} wrote source state"
+        );
+        assert!(!paths.home().exists(), "{label} wrote DeadReckon state");
+    }
+}
+
+#[test]
+fn run_help_names_the_explicit_untrusted_foreground_capability() {
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .args(["run", "--help"])
+        .output()
+        .expect("run help");
+
+    assert_success(&output);
+    let help = stdout(&output);
+    assert!(help.contains("--sandbox none --untrusted"), "{help}");
+    assert!(
+        help.contains("`--untrusted` explicitly selects the foreground compatibility path"),
+        "{help}"
+    );
+    assert!(
+        help.contains("cannot issue a trusted Job receipt"),
+        "{help}"
+    );
+}
+
+#[test]
+fn untrusted_capability_without_an_unsafe_mode_refuses_before_job_creation() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "run",
+            "irrelevant untrusted capability",
+            "--untrusted",
+            "--smoke",
+            "--yes",
+        ])
+        .output()
+        .expect("run refusal");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("--untrusted is valid only"));
+    assert!(
+        !paths.home().exists(),
+        "irrelevant capability created Job state"
+    );
+}
+
+#[test]
+fn trusted_supervisor_child_cannot_request_untrusted_execution() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("supervisor-source");
+    fs::create_dir_all(&source).expect("source");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .args([
+            "run",
+            "trusted child cannot become untrusted",
+            "--run-id",
+            "11111111111111111111111111111111",
+            "--in-place",
+            "--untrusted",
+            "--i-know-its-a-lot",
+            "--smoke",
+            "--yes",
+        ])
+        .output()
+        .expect("run refusal");
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("trusted supervisor or delegated Job child"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!paths.home().exists(), "trusted child refusal wrote state");
+}
+
+#[test]
+fn unsafe_preview_remains_read_only_without_untrusted_capability() {
+    let temp = repo_tempdir();
+    let source = temp.path().join("preview-source");
+    fs::create_dir_all(&source).expect("source");
+    fs::write(source.join("sentinel.txt"), "unchanged").expect("sentinel");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+
+    let output = deadreckon(&paths)
+        .current_dir(&source)
+        .args([
+            "run",
+            "preview unsafe compatibility mode",
+            "--in-place",
+            "--i-know-its-a-lot",
+            "--sandbox",
+            "none",
+            "--smoke",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("run preview");
+
+    assert_success(&output);
+    assert_eq!(
+        fs::read_to_string(source.join("sentinel.txt")).expect("sentinel"),
+        "unchanged"
+    );
+    assert!(!source.join(".git").exists());
+    assert!(!source.join(".deadreckon").exists());
+    assert!(
+        list_runs(&paths, None).expect("run list").is_empty(),
+        "preview created Run state"
     );
 }
 
@@ -1238,6 +1407,7 @@ fn in_place_run_edits_source_path_directly() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1245,6 +1415,11 @@ fn in_place_run_edits_source_path_directly() {
         .expect("run");
 
     assert_success(&output);
+    assert!(
+        stderr(&output).contains(
+            "UNTRUSTED FOREGROUND RUN: no durable Job is created and this Run cannot issue a trusted Job receipt."
+        )
+    );
     assert!(source.join("Cargo.toml").exists());
     assert!(source.join("README.md").exists());
     assert!(source.join(".deadreckon/codebase.json").exists());
@@ -1254,6 +1429,18 @@ fn in_place_run_edits_source_path_directly() {
         .next()
         .expect("run");
     let state = load_run(&paths, &run.run_id).expect("state");
+    let launch_plan: serde_json::Value = serde_json::from_slice(
+        &fs::read(state.run_root.join("launch-plan.json")).expect("untrusted launch plan"),
+    )
+    .expect("launch plan json");
+    assert_eq!(
+        launch_plan["signals"]["untrusted_foreground"]["durable_job"],
+        false
+    );
+    assert_eq!(
+        launch_plan["signals"]["untrusted_foreground"]["trusted_job_receipt"],
+        false
+    );
     let record = read_codebase_record(&state.working_dir).expect("codebase");
     assert_eq!(record.mode, CodebaseMode::InPlace);
 }
@@ -1275,6 +1462,7 @@ fn in_place_undo_reverts_via_runstate_snapshot() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1323,6 +1511,7 @@ fn materialize_in_place_refuses_with_undo_hint() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1370,6 +1559,7 @@ fn in_place_refuses_apply_with_try_undo_hint() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -1744,6 +1934,7 @@ fn apply_refuses_non_worktree_with_mode_specific_hint() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -2077,6 +2268,7 @@ fn abandon_in_place_refuses_with_undo_hint() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -2397,6 +2589,7 @@ fn post_run_hint_lists_apply_and_abandon_lines() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -2434,6 +2627,7 @@ fn run_worktree_smoke(paths: &DeadreckonPaths, repo: &std::path::Path) -> String
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")

@@ -46,8 +46,8 @@ impl ToolSandboxPolicy {
 /// The distinction between the two lists is intentional. The approved
 /// contract, deterministic evidence, authority, and receipt remain readable so
 /// an independent judge and an operator can inspect them. They are not
-/// writable by provider or tool processes. The HMAC key store is neither
-/// readable nor writable by those processes.
+/// writable by provider or tool processes. The HMAC key store and operator
+/// capture store are neither readable nor writable by those processes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProtectedPathPolicy {
     pub read_denylist: Vec<PathBuf>,
@@ -62,8 +62,8 @@ impl ProtectedPathPolicy {
     pub fn for_paths(paths: &DeadreckonPaths) -> Self {
         let key_store = paths.home().join("gate-keys");
         let mut policy = Self {
-            read_denylist: vec![key_store.clone()],
-            write_denylist: vec![key_store, paths.jobs_dir()],
+            read_denylist: vec![key_store.clone(), paths.operator_captures_dir()],
+            write_denylist: vec![key_store, paths.jobs_dir(), paths.operator_captures_dir()],
         };
 
         for run_root in discover_run_roots(paths) {
@@ -250,9 +250,15 @@ mod tests {
                 .read_denylist
                 .contains(&paths.home().join("gate-keys"))
         );
+        assert!(
+            policy
+                .read_denylist
+                .contains(&paths.operator_captures_dir())
+        );
         for protected in [
             paths.home().join("gate-keys"),
             paths.jobs_dir(),
+            paths.operator_captures_dir(),
             run_root.join("acceptance.yaml"),
             run_root.join(deadreckon_core::TRUSTED_CODEBASE_RECORD),
             run_root.join("gate"),

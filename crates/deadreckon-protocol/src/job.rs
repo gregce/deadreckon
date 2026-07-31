@@ -279,6 +279,8 @@ pub enum JobEventKind {
     ChildLaunchPrepared,
     AttemptStarted,
     ChildLinked,
+    CampaignSubAuthorityChanged,
+    RepairChildAuthorityChanged,
     AttemptStopped,
     RetryScheduled,
     DeterministicGatePassed,
@@ -403,6 +405,7 @@ pub struct CompletionReceipt {
     pub result_revision: Option<String>,
     pub deterministic_marker_sha256: String,
     pub semantic_judgment_sha256: String,
+    pub sandbox_boundary_observation_sha256: String,
     pub contained: bool,
     pub sandbox_backend: String,
     pub signature: String,
@@ -418,4 +421,96 @@ pub enum CompletionReceiptIssuer {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionProofKind {
     TwoKeyCompletion,
+}
+
+/// Controller-produced result of actively probing the exact containment
+/// backend used for strict deterministic verification.
+///
+/// This artifact lives in protected Job state, not in the coding workspace.
+/// Its HMAC is independent of the final receipt HMAC; the receipt additionally
+/// binds the exact persisted observation bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxBoundaryObservation {
+    pub schema_version: JobSchemaVersion,
+    pub job_id: JobId,
+    pub run_id: RunId,
+    pub observed_at: DateTime<Utc>,
+    pub issuer: SandboxBoundaryObservationIssuer,
+    pub probe_id: String,
+    pub attempt: u32,
+    pub outer_launch_id: String,
+    pub authority_sha256: String,
+    pub contract_sha256: String,
+    pub result_tree_sha256: String,
+    pub sandbox_requested: String,
+    pub sandbox_backend: String,
+    pub contained: bool,
+    pub gate_key_read_denied: bool,
+    pub proof_write_denied: bool,
+    pub control_write_denied: bool,
+    pub operator_capture_read_denied: bool,
+    pub operator_capture_write_denied: bool,
+    pub signing_env_scrubbed: bool,
+    pub probe_sha256: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxBoundaryObservationIssuer {
+    DeadreckonController,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::SandboxBoundaryObservation;
+
+    fn observation_json() -> serde_json::Value {
+        json!({
+            "schema_version": 1,
+            "job_id": "job-1",
+            "run_id": "job-1",
+            "observed_at": "2026-07-30T12:00:00Z",
+            "issuer": "deadreckon-controller",
+            "probe_id": "2cd4df44-a9ce-4594-aa77-831245e05486",
+            "attempt": 1,
+            "outer_launch_id": "76ebebba-6d43-4c43-aaf4-690a6bd7ad6c",
+            "authority_sha256": format!("sha256:{}", "1".repeat(64)),
+            "contract_sha256": format!("sha256:{}", "2".repeat(64)),
+            "result_tree_sha256": format!("sha256:{}", "3".repeat(64)),
+            "sandbox_requested": "auto",
+            "sandbox_backend": "sandbox-exec",
+            "contained": true,
+            "gate_key_read_denied": true,
+            "proof_write_denied": true,
+            "control_write_denied": true,
+            "operator_capture_read_denied": true,
+            "operator_capture_write_denied": true,
+            "signing_env_scrubbed": true,
+            "probe_sha256": format!("sha256:{}", "4".repeat(64)),
+            "signature": "00".repeat(32)
+        })
+    }
+
+    #[test]
+    fn sandbox_observation_wire_shape_is_closed_and_complete() {
+        serde_json::from_value::<SandboxBoundaryObservation>(observation_json())
+            .expect("complete observation");
+
+        let mut unknown = observation_json();
+        unknown["agent_claim"] = json!(true);
+        serde_json::from_value::<SandboxBoundaryObservation>(unknown)
+            .expect_err("agent-selected fields are not part of the trusted wire shape");
+
+        let mut incomplete = observation_json();
+        incomplete
+            .as_object_mut()
+            .expect("object")
+            .remove("gate_key_read_denied");
+        serde_json::from_value::<SandboxBoundaryObservation>(incomplete)
+            .expect_err("each denial fact is required");
+    }
 }

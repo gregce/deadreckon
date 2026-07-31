@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeadReckon Watchkeeper immutable pre-seal live fault-trial evaluation",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "sanitized",
+    "trial_id",
+    "status",
+    "source_revision",
+    "host",
+    "backend",
+    "provider_slots",
+    "job_id_prefix",
+    "capture_provenance",
+    "intervention",
+    "oracle_assertions",
+    "evidence",
+    "cleanup",
+    "limitations"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "sanitized": {"const": true},
+    "trial_id": {
+      "enum": [
+        "live_provider_worker_kill",
+        "live_provider_supervisor_restart",
+        "live_provider_network_loss",
+        "machine_reboot",
+        "cross_provider_gate_attack",
+        "live_provider_parent_repair",
+        "live_campaign_interruption_recovery",
+        "linux_bubblewrap_gate_boundary",
+        "docker_gate_boundary"
+      ]
+    },
+    "status": {
+      "enum": ["not_run", "passed", "failed", "inconclusive"]
+    },
+    "source_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "host": {
+      "type": "object",
+      "required": ["system", "release", "machine", "python"],
+      "properties": {
+        "system": {"type": "string"},
+        "release": {"type": "string"},
+        "machine": {"type": "string"},
+        "python": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "backend": {
+      "enum": ["sandbox-exec", "bwrap", "docker", "none", "unknown"]
+    },
+    "provider_slots": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]*$"
+      }
+    },
+    "job_id_prefix": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9_-]{4,12}$"
+    },
+    "capture_provenance": {
+      "type": "object",
+      "required": ["status", "receipt_sha256"],
+      "properties": {
+        "status": {
+          "enum": ["operator_attested", "trusted_preseal"]
+        },
+        "receipt_sha256": {
+          "const": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "intervention": {
+      "type": "object",
+      "required": ["kind", "status", "recorded_at", "detail_sha256"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "terminate_live_worker",
+            "terminate_live_supervisor",
+            "host_network_disconnect",
+            "machine_reboot",
+            "hostile_cross_provider_goal",
+            "observe_natural_semantic_revise",
+            "terminate_campaign_supervisor",
+            "explicit_backend_hostile_goal"
+          ]
+        },
+        "status": {
+          "enum": ["not_performed", "performed", "failed"]
+        },
+        "recorded_at": {"type": ["string", "null"], "format": "date-time"},
+        "detail_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "oracle_assertions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "description",
+          "status",
+          "reason",
+          "observed_sha256"
+        ],
+        "properties": {
+          "id": {"type": "string"},
+          "description": {"type": "string"},
+          "status": {
+            "enum": ["passed", "failed", "inconclusive"]
+          },
+          "reason": {"type": "string"},
+          "observed_sha256": {
+            "type": ["string", "null"],
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "declared_source", "sha256", "bytes", "media_type"],
+        "properties": {
+          "name": {"type": "string"},
+          "declared_source": {
+            "enum": [
+              "job-view",
+              "job-events",
+              "job-intervention",
+              "job-cleanup",
+              "job",
+              "authority",
+              "launch-plan",
+              "lease",
+              "job-report",
+              "receipt",
+              "supervised-child",
+              "host-boot-id",
+              "semantic-judgment",
+              "parent-repair-manifest",
+              "parent-repair-candidate",
+              "doctor",
+              "supervisor-service-status",
+              "parent-artifact",
+              "parent-events",
+              "campaign",
+              "campaign-events",
+              "active-plan",
+              "active-plan-events",
+              "unavailable-objective"
+            ]
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "bytes": {"type": "integer", "minimum": 0},
+          "media_type": {
+            "enum": [
+              "application/json",
+              "application/x-ndjson",
+              "text/plain; charset=utf-8"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "required": ["status", "recorded_at", "detail_sha256", "instructions"],
+      "properties": {
+        "status": {
+          "enum": ["not_run", "completed", "failed"]
+        },
+        "recorded_at": {"type": ["string", "null"], "format": "date-time"},
+        "detail_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "instructions": {
+          "type": "array",
+          "items": {"type": "string"}
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {"status": {"const": "completed"}},
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "detail_sha256": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "limitations": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "passed"}},
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "backend": {
+            "enum": ["sandbox-exec", "bwrap", "docker"]
+          },
+          "capture_provenance": {
+            "properties": {
+              "status": {"const": "trusted_preseal"},
+              "receipt_sha256": {"const": null}
+            }
+          },
+          "intervention": {
+            "properties": {
+              "status": {"const": "performed"},
+              "detail_sha256": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "cleanup": {
+            "properties": {
+              "status": {"const": "completed"},
+              "detail_sha256": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            }
+          },
+          "oracle_assertions": {
+            "minItems": 1,
+            "items": {
+              "properties": {"status": {"const": "passed"}}
+            }
+          },
+          "evidence": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

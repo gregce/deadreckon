@@ -28,6 +28,10 @@ pub enum WorkspaceAccess {
     /// Independent verification posture: the workspace may be inspected but
     /// must not be mutated by the provider or its tools.
     ReadOnly,
+    /// Independent evaluation posture: only this disposable workspace may be
+    /// written. Unlike ordinary read-write execution, macOS uses a deny-by-
+    /// default profile so absolute paths cannot escape the scratch tree.
+    Disposable,
 }
 
 impl WorkspaceAccess {
@@ -35,6 +39,7 @@ impl WorkspaceAccess {
         match self {
             Self::ReadWrite => "read-write",
             Self::ReadOnly => "read-only",
+            Self::Disposable => "disposable",
         }
     }
 }
