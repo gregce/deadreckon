@@ -1301,6 +1301,30 @@ fn validate_trusted_recorder_evaluation(
         .events()
         .iter()
         .find(|event| event.kind == OperatorCaptureEventKind::CleanupRecorded);
+    if let Some(event) = intervention {
+        let expected_source = expected_operator_intervention_source(&binding.trial_id)
+            .ok_or_else(|| refused("trusted recorder replay has no intervention policy"))?;
+        if event.subject != "intervention"
+            || event.phase != OperatorCapturePhase::Intervention
+            || event.source != expected_source
+            || event.provenance != OperatorCaptureProvenance::TrustedSupervisor
+        {
+            return Err(refused(
+                "trusted recorder replay intervention has mismatched identity or provenance",
+            )
+            .into());
+        }
+        let bytes = stable_regular_bytes(
+            &protected_evidence_path(&context.paths, binding, "intervention"),
+            "protected canonical intervention",
+        )?;
+        if sha256_bytes(&bytes) != event.content_sha256
+            || u64::try_from(bytes.len()).ok() != Some(event.content_bytes)
+        {
+            return Err(refused("trusted recorder replay intervention changed").into());
+        }
+        fs::write(raw_dir.join("intervention.json"), bytes)?;
+    }
     let lifecycle = |event: Option<&deadreckon_protocol::OperatorCaptureEvent>,
                      completed: &str,
                      absent: &str| {
@@ -1332,6 +1356,9 @@ fn validate_trusted_recorder_evaluation(
             "status": "trusted_prepared",
             "receipt_sha256": null,
             "reason": "trusted deterministic replay",
+        },
+        "trusted_capture": {
+            "backend": binding.declared_backend,
         },
         "captures": captures,
         "intervention": lifecycle(intervention, "performed", "not_performed"),

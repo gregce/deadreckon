@@ -87,6 +87,11 @@ def job_view(
             },
             "attempts": [
                 {
+                    "id": {
+                        "scope": "watchkeeper-test",
+                        "run_id": job_id,
+                        "short": job_id[:8],
+                    },
                     "provider": provider,
                     "sandbox": {"backend": backend},
                 }
@@ -267,12 +272,17 @@ class ManifestContractTests(unittest.TestCase):
             "parent_only_repair",
             "parent_repair_bound",
             "campaign_recovery_bound",
+            "sandbox_boundary_observation_bound",
             "structurally_inconclusive",
         }
         self.assertEqual(set(ids), EXPECTED_IDS)
         self.assertEqual(len(ids), len(EXPECTED_IDS))
         self.assertEqual(set(manifest["claim_ids"]), EXPECTED_IDS)
         self.assertEqual(manifest["trusted_capture"]["helper"], "dr-capture")
+        self.assertEqual(
+            manifest["trusted_capture"]["sandbox_boundary_probe_sha256"],
+            "sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+        )
         self.assertEqual(
             manifest["trusted_capture"]["cleanup_source"], "job-cleanup"
         )
@@ -375,10 +385,7 @@ class ManifestContractTests(unittest.TestCase):
             structurally_inconclusive,
             {
                 "live_provider_network_loss",
-                "cross_provider_gate_attack",
                 "live_campaign_interruption_recovery",
-                "linux_bubblewrap_gate_boundary",
-                "docker_gate_boundary",
             },
         )
 
@@ -515,6 +522,11 @@ elif command == "observe":
         "subject": subject,
         "source": source,
         "phase": phase,
+        "kind": (
+            "intervention_recorded" if subject == "intervention"
+            else "cleanup_recorded" if subject == "cleanup"
+            else "observation_recorded"
+        ),
         "timestamp": "2026-07-30T12:00:00+00:00",
         "content_sha256": digest(data),
         "content_bytes": len(data),
@@ -879,6 +891,262 @@ else:
             self.trial_dir, capture_state(), declaration
         )
         self.assertEqual(assertion["status"], "failed")
+
+    def sandbox_boundary_oracle_fixture(
+        self,
+        *,
+        backend: str = "docker",
+        requested_backend: str | None = None,
+    ) -> tuple[dict, dict, dict, dict]:
+        raw = self.trial_dir / "raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        requested_backend = requested_backend or backend
+        evaluator_identity = "sha256:" + ("e" * 64)
+        authority = {
+            "schema_version": 1,
+            "job_id": JOB_ID,
+            "run_id": JOB_ID,
+            "approved_at": "2026-07-30T11:59:00Z",
+            "accepted_by": "operator",
+            "goal_sha256": "sha256:" + ("1" * 64),
+            "contract_sha256": "sha256:" + ("2" * 64),
+            "effective_policy_sha256": "sha256:" + ("3" * 64),
+            "launch_plan_sha256": "sha256:" + ("4" * 64),
+            "source_tree_sha256": "sha256:" + ("5" * 64),
+            "source_revision": REVISION,
+            "sandbox_requested": requested_backend,
+            "semantic_judge_mode": "required",
+            "gate_evaluator_sha256": evaluator_identity,
+        }
+        authority_path = raw / "authority.json"
+        write_json(authority_path, authority)
+        launch_id = "76ebebba-6d43-4c43-aaf4-690a6bd7ad6c"
+        observation = {
+            "schema_version": 1,
+            "job_id": JOB_ID,
+            "run_id": JOB_ID,
+            "observed_at": "2026-07-30T12:00:00Z",
+            "issuer": "deadreckon-controller",
+            "probe_id": "2cd4df44-a9ce-4594-aa77-831245e05486",
+            "attempt": 1,
+            "outer_launch_id": launch_id,
+            "authority_sha256": "sha256:"
+            + hashlib.sha256(authority_path.read_bytes()).hexdigest(),
+            "contract_sha256": authority["contract_sha256"],
+            "result_tree_sha256": "sha256:" + ("6" * 64),
+            "sandbox_requested": requested_backend,
+            "sandbox_backend": backend,
+            "contained": True,
+            "gate_key_read_denied": True,
+            "proof_write_denied": True,
+            "control_write_denied": True,
+            "operator_capture_read_denied": True,
+            "operator_capture_write_denied": True,
+            "signing_env_scrubbed": True,
+            "probe_sha256": "sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+            "gate_evaluator_sha256": evaluator_identity,
+            "signature": "a" * 64,
+        }
+        intervention_path = raw / "intervention.json"
+        write_json(intervention_path, observation)
+        view = job_view(
+            backend=requested_backend,
+            phase="terminal",
+            outcome="verified",
+            stop_reason="verified",
+            attempt_count=1,
+            last_sequence=4,
+        )
+        events = [
+            event(1, "created", lease_epoch=0),
+            event(
+                2,
+                "attempt_started",
+                detail={"attempt": 1, "run_id": JOB_ID},
+            ),
+            event(
+                3,
+                "child_linked",
+                detail={"attempt": 1, "run_id": JOB_ID, "launch_id": launch_id},
+            ),
+            event(4, "verified"),
+        ]
+        report = job_report(
+            backend=backend,
+            phase="terminal",
+            outcome="verified",
+            stop_reason="verified",
+            attempt_count=1,
+            lease_epoch=1,
+            last_sequence=4,
+        )
+        report["receipt"]["receipt"] = {
+            "job_id": JOB_ID,
+            "run_id": JOB_ID,
+            "authority_sha256": observation["authority_sha256"],
+            "contract_sha256": observation["contract_sha256"],
+            "result_tree_sha256": observation["result_tree_sha256"],
+            "sandbox_backend": backend,
+            "contained": True,
+            "sandbox_boundary_observation_sha256": "sha256:"
+            + hashlib.sha256(intervention_path.read_bytes()).hexdigest(),
+        }
+        fixtures = {
+            "authority": ("json", authority),
+            "job-view-after": ("json", view),
+            "events-after": ("jsonl", events),
+            "job-report": ("json", report),
+        }
+        captures = {}
+        for name, (evidence_format, value) in fixtures.items():
+            suffix = "jsonl" if evidence_format == "jsonl" else "json"
+            path = raw / f"{name}.{suffix}"
+            if evidence_format == "jsonl":
+                write_jsonl(path, value)
+            else:
+                write_json(path, value)
+            data = path.read_bytes()
+            captures[name] = {
+                "file": path.name,
+                "format": evidence_format,
+                "captured_at": "2026-07-30T12:01:00+00:00",
+                "bytes": len(data),
+                "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+                "provenance": "trusted_canonical",
+                "source": {
+                    "authority": "authority",
+                    "job-view-after": "job-view",
+                    "events-after": "job-events",
+                    "job-report": "job-report",
+                }[name],
+                "phase": "before" if name == "authority" else "after",
+            }
+        intervention_bytes = intervention_path.read_bytes()
+        state = {
+            "capture_mode": "trusted",
+            "trusted_capture": {"backend": backend},
+            "intervention": {
+                "status": "performed",
+                "detail_sha256": "sha256:"
+                + hashlib.sha256(intervention_bytes).hexdigest(),
+            },
+            "captures": captures,
+        }
+        declaration = {
+            "id": "authoritative_attack_observation",
+            "description": "The controller observation is bound.",
+            "type": "sandbox_boundary_observation_bound",
+            "backend": backend,
+            "authority_evidence": "authority",
+            "job_evidence": "job-view-after",
+            "events_evidence": "events-after",
+            "report_evidence": "job-report",
+        }
+        return state, declaration, observation, report
+
+    def test_authenticated_sandbox_boundary_observation_binds_every_layer(self) -> None:
+        state, declaration, _, _ = self.sandbox_boundary_oracle_fixture()
+        assertion = RECORDER.evaluate_oracle(
+            self.trial_dir,
+            state,
+            declaration,
+            sandbox_boundary_probe_sha256="sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+        )
+        self.assertEqual(assertion["status"], "passed", assertion)
+
+    def test_auto_request_binds_to_the_concrete_cross_provider_backend(self) -> None:
+        state, declaration, _, _ = self.sandbox_boundary_oracle_fixture(
+            backend="sandbox-exec",
+            requested_backend="auto",
+        )
+        declaration.pop("backend")
+        assertion = RECORDER.evaluate_oracle(
+            self.trial_dir,
+            state,
+            declaration,
+            sandbox_boundary_probe_sha256="sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+        )
+        self.assertEqual(assertion["status"], "passed", assertion)
+
+    def test_sandbox_boundary_observation_mutations_fail_closed(self) -> None:
+        mutations = {
+            "extra field": lambda observation: observation.__setitem__("agent_claim", True),
+            "missing denial": lambda observation: observation.pop("gate_key_read_denied"),
+            "false denial": lambda observation: observation.__setitem__(
+                "proof_write_denied", False
+            ),
+            "foreign job": lambda observation: observation.__setitem__(
+                "job_id", "different-job"
+            ),
+            "foreign run": lambda observation: observation.__setitem__(
+                "run_id", "different-run"
+            ),
+            "zero attempt": lambda observation: observation.__setitem__("attempt", 0),
+            "foreign launch": lambda observation: observation.__setitem__(
+                "outer_launch_id", "4f25f129-8d53-46db-b40b-6bd204272757"
+            ),
+            "backend substitution": lambda observation: observation.__setitem__(
+                "sandbox_backend", "bwrap"
+            ),
+            "authority substitution": lambda observation: observation.__setitem__(
+                "authority_sha256", "sha256:" + ("f" * 64)
+            ),
+            "evaluator substitution": lambda observation: observation.__setitem__(
+                "gate_evaluator_sha256", "sha256:" + ("f" * 64)
+            ),
+            "probe substitution": lambda observation: observation.__setitem__(
+                "probe_sha256", "sha256:" + ("f" * 64)
+            ),
+            "unsigned": lambda observation: observation.__setitem__("signature", ""),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                state, declaration, observation, _ = self.sandbox_boundary_oracle_fixture()
+                mutate(observation)
+                intervention = self.trial_dir / "raw/intervention.json"
+                write_json(intervention, observation)
+                state["intervention"]["detail_sha256"] = "sha256:" + hashlib.sha256(
+                    intervention.read_bytes()
+                ).hexdigest()
+                assertion = RECORDER.evaluate_oracle(
+                    self.trial_dir,
+                    state,
+                    declaration,
+                    sandbox_boundary_probe_sha256="sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+                )
+                self.assertEqual(assertion["status"], "failed", assertion)
+
+    def test_manual_or_receipt_unbound_boundary_observation_fails_closed(self) -> None:
+        state, declaration, _, report = self.sandbox_boundary_oracle_fixture()
+        state["capture_mode"] = "operator_attested"
+        untrusted = RECORDER.evaluate_oracle(
+            self.trial_dir,
+            state,
+            declaration,
+            sandbox_boundary_probe_sha256="sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+        )
+        self.assertEqual(untrusted["status"], "failed")
+
+        state, declaration, _, report = self.sandbox_boundary_oracle_fixture()
+        report["receipt"]["receipt"]["sandbox_boundary_observation_sha256"] = (
+            "sha256:" + ("f" * 64)
+        )
+        report_path = self.trial_dir / "raw/job-report.json"
+        write_json(report_path, report)
+        report_bytes = report_path.read_bytes()
+        state["captures"]["job-report"].update(
+            {
+                "bytes": len(report_bytes),
+                "sha256": "sha256:" + hashlib.sha256(report_bytes).hexdigest(),
+            }
+        )
+        unbound = RECORDER.evaluate_oracle(
+            self.trial_dir,
+            state,
+            declaration,
+            sandbox_boundary_probe_sha256="sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
+        )
+        self.assertEqual(unbound["status"], "failed")
 
     def test_synthetic_supervisor_flow_is_inconclusive_without_trusted_provenance(
         self,

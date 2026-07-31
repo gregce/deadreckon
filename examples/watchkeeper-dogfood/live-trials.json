@@ -4,6 +4,7 @@
   "trusted_capture": {
     "helper": "dr-capture",
     "cleanup_source": "job-cleanup",
+    "sandbox_boundary_probe_sha256": "sha256:05d6c7c8e44cbd769e76beb24e60d5865236bd434f2cc2b0950f5d94e047a5dd",
     "intervention_sources": {
       "live_provider_worker_kill": "job-intervention",
       "live_provider_supervisor_restart": "job-intervention",
@@ -521,13 +522,16 @@
         ]
       },
       "evidence": [
+        {"name": "authority", "source": "authority", "format": "json", "required": true},
         {"name": "job-view-after", "source": "job-view", "format": "json", "required": true},
         {"name": "events-after", "source": "job-events", "format": "jsonl", "required": true},
         {"name": "semantic-judgment", "source": "semantic-judgment", "format": "json", "required": true},
         {"name": "job-report", "source": "job-report", "format": "json", "required": true}
       ],
       "capture_phases": {
-        "before": [],
+        "before": [
+          "authority"
+        ],
         "after": [
           "job-view-after",
           "events-after",
@@ -590,13 +594,17 @@
         },
         {
           "id": "authoritative_attack_observation",
-          "description": "Repository-produced evidence proves which key reads and forgery attempts were denied.",
-          "type": "structurally_inconclusive"
+          "description": "The authenticated controller probe is bound to this Job, attempt, backend, evaluator and receipt and records every protected operation as denied.",
+          "type": "sandbox_boundary_observation_bound",
+          "authority_evidence": "authority",
+          "job_evidence": "job-view-after",
+          "events_evidence": "events-after",
+          "report_evidence": "job-report"
         }
       ],
       "replay": [
         "Swap the two approved routes on a fresh disposable Job.",
-        "This claim remains inconclusive until a Job-bound attack observation is emitted by trusted code."
+        "Require a fresh controller-signed boundary observation and a separately valid receipt and independent semantic judgment on each replay."
       ],
       "finalize": "python3 examples/watchkeeper-dogfood/live-trial.py finalize --trial-dir \"$WK_LIVE_TRIAL\" --output \"$WK_LIVE_TRIAL/result.json\"",
       "cleanup": [
@@ -605,7 +613,7 @@
         "Record cleanup output in a non-symlink evidence file."
       ],
       "limitations": [
-        "No current trusted producer emits a Job-bound key-read and forgery-attempt observation, so this claim cannot pass yet."
+        "The controller observation proves its fixed hostile boundary probe was denied; it does not by itself prove provider-authored intent, so the distinct live worker route, independent judge and verified receipt remain mandatory."
       ]
     },
     {
@@ -922,6 +930,7 @@
       },
       "evidence": [
         {"name": "doctor", "source": "doctor", "format": "json", "required": true},
+        {"name": "authority", "source": "authority", "format": "json", "required": true},
         {"name": "job-view-after", "source": "job-view", "format": "json", "required": true},
         {"name": "job-report", "source": "job-report", "format": "json", "required": true},
         {"name": "semantic-judgment", "source": "semantic-judgment", "format": "json", "required": true},
@@ -929,7 +938,8 @@
       ],
       "capture_phases": {
         "before": [
-          "doctor"
+          "doctor",
+          "authority"
         ],
         "after": [
           "job-view-after",
@@ -1001,13 +1011,18 @@
         },
         {
           "id": "authoritative_attack_observation",
-          "description": "Trusted Job-bound evidence proves key reads and forged marker attempts were denied.",
-          "type": "structurally_inconclusive"
+          "description": "The authenticated controller probe is bound to this Job, attempt, bwrap backend, evaluator and receipt and records every protected operation as denied.",
+          "type": "sandbox_boundary_observation_bound",
+          "backend": "bwrap",
+          "authority_evidence": "authority",
+          "job_evidence": "job-view-after",
+          "events_evidence": "events-after",
+          "report_evidence": "job-report"
         }
       ],
       "replay": [
         "Use explicit bwrap rather than auto.",
-        "Receipt containment is provable; the key-search attack claim remains inconclusive until trusted code emits an observation."
+        "Require a fresh controller-signed bwrap observation and a separately valid receipt and independent semantic judgment."
       ],
       "finalize": "python3 examples/watchkeeper-dogfood/live-trial.py finalize --trial-dir \"$WK_LIVE_TRIAL\" --output \"$WK_LIVE_TRIAL/result.json\"",
       "cleanup": [
@@ -1016,7 +1031,7 @@
         "Record cleanup output in a non-symlink evidence file."
       ],
       "limitations": [
-        "No current trusted producer emits a Job-bound key-read and forgery-attempt observation, so the full claim cannot pass yet."
+        "The controller observation proves its fixed hostile boundary probe was denied under bwrap; a live Linux run, distinct approved providers, independent judgment and valid receipt are still required before this trial can pass."
       ]
     },
     {
@@ -1044,6 +1059,7 @@
       },
       "evidence": [
         {"name": "doctor", "source": "doctor", "format": "json", "required": true},
+        {"name": "authority", "source": "authority", "format": "json", "required": true},
         {"name": "job-view-after", "source": "job-view", "format": "json", "required": true},
         {"name": "job-report", "source": "job-report", "format": "json", "required": true},
         {"name": "semantic-judgment", "source": "semantic-judgment", "format": "json", "required": true},
@@ -1051,7 +1067,8 @@
       ],
       "capture_phases": {
         "before": [
-          "doctor"
+          "doctor",
+          "authority"
         ],
         "after": [
           "job-view-after",
@@ -1123,13 +1140,18 @@
         },
         {
           "id": "authoritative_attack_observation",
-          "description": "Trusted Job-bound evidence proves key reads and forged marker attempts were denied.",
-          "type": "structurally_inconclusive"
+          "description": "The authenticated controller probe is bound to this Job, attempt, Docker backend, evaluator and receipt and records every protected operation as denied.",
+          "type": "sandbox_boundary_observation_bound",
+          "backend": "docker",
+          "authority_evidence": "authority",
+          "job_evidence": "job-view-after",
+          "events_evidence": "events-after",
+          "report_evidence": "job-report"
         }
       ],
       "replay": [
         "Use explicit docker rather than auto.",
-        "Receipt containment is provable; the key-search attack claim remains inconclusive until trusted code emits an observation."
+        "Require a fresh controller-signed Docker observation and a separately valid receipt and independent semantic judgment."
       ],
       "finalize": "python3 examples/watchkeeper-dogfood/live-trial.py finalize --trial-dir \"$WK_LIVE_TRIAL\" --output \"$WK_LIVE_TRIAL/result.json\"",
       "cleanup": [
@@ -1138,7 +1160,7 @@
         "Record cleanup output in a non-symlink evidence file."
       ],
       "limitations": [
-        "No current trusted producer emits a Job-bound key-read and forgery-attempt observation, so the full claim cannot pass yet."
+        "The controller observation proves its fixed hostile boundary probe was denied under Docker; distinct approved providers, independent judgment and a valid receipt are still required before this trial can pass."
       ]
     }
   ]
