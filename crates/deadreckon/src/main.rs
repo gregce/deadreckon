@@ -1759,6 +1759,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         all_group: Some(HelpAllGroup::PowerUserLaunch),
     },
     CommandHelpEntry {
+        display: "campaign",
+        clap_name: Some("campaign"),
+        purpose: "parallel multi-orchestrator power tool",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::PowerUserLaunch),
+    },
+    CommandHelpEntry {
         display: "chain",
         clap_name: Some("chain"),
         purpose: "serial multi-step power tool",
@@ -1823,9 +1831,25 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         all_group: Some(HelpAllGroup::Orchestration),
     },
     CommandHelpEntry {
+        display: "reshape",
+        clap_name: Some("reshape"),
+        purpose: "accept a run's reshape proposal as a plan",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::Orchestration),
+    },
+    CommandHelpEntry {
         display: "extend",
         clap_name: Some("extend"),
         purpose: "continue from a completed run",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "supervisor",
+        clap_name: Some("supervisor"),
+        purpose: "manage the durable local Job supervisor",
         audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
@@ -1866,6 +1890,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         display: "undo",
         clap_name: Some("undo"),
         purpose: "restore an in-place snapshot",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "rewind",
+        clap_name: Some("rewind"),
+        purpose: "preview or apply a provider checkpoint rewind",
         audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
@@ -1951,6 +1983,22 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
+        display: "verdict",
+        clap_name: Some("verdict"),
+        purpose: "re-verify current result evidence",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::ResultsInspect),
+    },
+    CommandHelpEntry {
+        display: "report",
+        clap_name: Some("report"),
+        purpose: "write a static Job or run evidence report",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::ResultsInspect),
+    },
+    CommandHelpEntry {
         display: "import",
         clap_name: Some("import"),
         purpose: "import other tool history",
@@ -1983,6 +2031,60 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         all_group: None,
     },
 ];
+
+#[cfg(test)]
+mod command_help_catalog_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn every_visible_top_level_command_is_discoverable_in_the_catalog() {
+        // The production command tree is large enough to overflow the test
+        // harness's default thread stack while clap derives every nested
+        // subcommand. Build it on an explicitly bounded larger stack.
+        let visible = std::thread::Builder::new()
+            .name("help-catalog-clap-tree".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                Cli::command()
+                    .get_subcommands()
+                    .filter(|command| !command.is_hide_set())
+                    .map(|command| command.get_name().to_string())
+                    .collect::<BTreeSet<_>>()
+            })
+            .expect("spawn clap command-tree builder")
+            .join()
+            .expect("build clap command tree");
+        let catalog = COMMAND_HELP_CATALOG
+            .iter()
+            .filter_map(|entry| entry.clap_name)
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let missing = visible.difference(&catalog).cloned().collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "visible top-level commands missing from help-all catalog: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn every_advanced_catalog_command_has_a_help_all_section() {
+        let missing = COMMAND_HELP_CATALOG
+            .iter()
+            .filter(|entry| {
+                command_discovery(entry) == CommandDiscovery::Advanced && entry.all_group.is_none()
+            })
+            .map(|entry| entry.display)
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "advanced commands missing a help-all section: {missing:?}"
+        );
+    }
+}
 
 const HELP_ALL_GROUPS: &[(HelpAllGroup, &str)] = &[
     (HelpAllGroup::ProductionFlow, "production flow"),

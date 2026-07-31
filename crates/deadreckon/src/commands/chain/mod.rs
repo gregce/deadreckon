@@ -3450,6 +3450,30 @@ fn chain_extend_command_inner(
 ) -> Result<()> {
     let id = resolve_chain_id(paths, id, false)?;
     let mut chain = load_chain(paths, &id)?;
+    if !commands::plan::internal_characterization_requested() {
+        let mut proposed = chain.clone();
+        let insert = extend_chain_schedule(&mut proposed, step_goal, insert_at, max_spend_add);
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                "DeadReckon did not extend this stored chain because legacy chain mutation is no longer a product route.",
+                "Stored Chain state remains inspectable, but an extension must start as a new durable Graph Job so the updated schedule, approval, lease, verification, and receipt share one source of truth.",
+                vec![
+                    ("requested action".to_string(), "chain extend".to_string()),
+                    ("legacy chain".to_string(), id.clone()),
+                    ("requested step".to_string(), (insert + 1).to_string()),
+                    ("state mutation".to_string(), "none".to_string()),
+                ],
+                durable_chain_migration_command(&proposed),
+                vec![format!("deadreckon chain show {id}")],
+            )
+            .render_plain(!completion_hints_enabled(false)),
+        });
+    }
     if chain.status == ChainStatus::Completed && insert_at.is_none() {
         let id = chain_prefix(&chain.chain_id);
         return Err(CliError::Surface {
@@ -3467,24 +3491,7 @@ fn chain_extend_command_inner(
             .render_plain(!completion_hints_enabled(false)),
         });
     }
-    if let Some(add) = max_spend_add {
-        chain.max_spend_usd = Some(chain.max_spend_usd.unwrap_or(0.0) + add);
-    }
-    let insert = insert_at
-        .map(|value| value.saturating_sub(1) as usize)
-        .unwrap_or(chain.steps.len())
-        .min(chain.steps.len());
-    chain.steps.insert(
-        insert,
-        deadreckon_core::ChainStep::new(insert as u32, step_goal),
-    );
-    for (index, step) in chain.steps.iter_mut().enumerate() {
-        step.index = index as u32;
-    }
-    if chain.status == ChainStatus::Completed {
-        chain.status = ChainStatus::Paused;
-        chain.paused_reason = Some("extended".to_string());
-    }
+    let insert = extend_chain_schedule(&mut chain, step_goal, insert_at, max_spend_add);
     save_chain(paths, &chain)?;
     append_chain_event(
         paths,
@@ -3511,6 +3518,33 @@ fn chain_extend_command_inner(
         );
     }
     Ok(())
+}
+
+fn extend_chain_schedule(
+    chain: &mut Chain,
+    step_goal: String,
+    insert_at: Option<u32>,
+    max_spend_add: Option<f64>,
+) -> usize {
+    if let Some(add) = max_spend_add {
+        chain.max_spend_usd = Some(chain.max_spend_usd.unwrap_or(0.0) + add);
+    }
+    let insert = insert_at
+        .map(|value| value.saturating_sub(1) as usize)
+        .unwrap_or(chain.steps.len())
+        .min(chain.steps.len());
+    chain.steps.insert(
+        insert,
+        deadreckon_core::ChainStep::new(insert as u32, step_goal),
+    );
+    for (index, step) in chain.steps.iter_mut().enumerate() {
+        step.index = index as u32;
+    }
+    if chain.status == ChainStatus::Completed {
+        chain.status = ChainStatus::Paused;
+        chain.paused_reason = Some("extended".to_string());
+    }
+    insert
 }
 
 fn chain_redo_command(
@@ -3576,6 +3610,35 @@ fn chain_redo_command(
             .render_plain(!completion_hints_enabled(false)),
         }
     })?;
+    if let Some(replacement_goal) = extend.as_ref()
+        && !commands::plan::internal_characterization_requested()
+    {
+        let mut proposed = chain.clone();
+        proposed.steps[index].goal.clone_from(replacement_goal);
+        let id = chain_prefix(&chain.chain_id);
+        return Err(CliError::Surface {
+            code: 1,
+            surface: chain_transition_surface(
+                paths,
+                &chain,
+                VerdictKind::Blocked,
+                "DeadReckon did not replace this stored chain step because legacy chain mutation is no longer a product route.",
+                "Stored Chain state remains inspectable, but a replacement goal must start as a new durable Graph Job so the updated schedule, approval, lease, verification, and receipt share one source of truth.",
+                vec![
+                    (
+                        "requested action".to_string(),
+                        "chain redo --extend".to_string(),
+                    ),
+                    ("legacy chain".to_string(), id.clone()),
+                    ("requested step".to_string(), (index + 1).to_string()),
+                    ("state mutation".to_string(), "none".to_string()),
+                ],
+                durable_chain_migration_command(&proposed),
+                vec![format!("deadreckon chain show {id}")],
+            )
+            .render_plain(!completion_hints_enabled(false)),
+        });
+    }
     if selected_step.status == ChainStepStatus::Applied && !reapply {
         let step_number = index + 1;
         let primary = format!(

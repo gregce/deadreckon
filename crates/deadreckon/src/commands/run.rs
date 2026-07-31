@@ -137,7 +137,7 @@ pub(crate) async fn run_command_with_job_id(
         mark_untrusted_foreground(&mut plan);
     }
     match route {
-        DirectRunRoute::DurableJob => schedule_direct_run(args, &mut plan).await,
+        DirectRunRoute::DurableJob => schedule_direct_run(args, &mut plan, None).await,
         DirectRunRoute::Foreground => run_command_with_launch_plan(args, plan).await.map(|_| None),
     }
 }
@@ -171,7 +171,25 @@ pub(crate) async fn schedule_durable_run_with_launch_plan(
             "guided continuation is missing its frozen durable parent inputs".to_string(),
         )));
     }
-    schedule_direct_run(args, &mut launch_plan).await
+    let accepted_by = approved_launch_authority(&launch_plan)?;
+    schedule_direct_run(args, &mut launch_plan, Some(accepted_by)).await
+}
+
+fn approved_launch_authority(
+    launch_plan: &commands::course::LaunchPlan,
+) -> Result<deadreckon_protocol::AuthorityAcceptedBy> {
+    match launch_plan.accepted_by.as_deref() {
+        Some("operator") => Ok(deadreckon_protocol::AuthorityAcceptedBy::Operator),
+        Some("yes-flag-guardrail") => {
+            Ok(deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail)
+        }
+        Some(other) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "approved guided launch plan has unsupported acceptance provenance {other}"
+        )))),
+        None => Err(CliError::Core(DeadreckonError::InvalidInput(
+            "approved guided launch plan is missing acceptance provenance".to_string(),
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -235,6 +253,7 @@ fn mark_untrusted_foreground(plan: &mut commands::course::LaunchPlan) {
 async fn schedule_direct_run(
     mut args: RunCommandArgs,
     launch_plan: &mut commands::course::LaunchPlan,
+    accepted_by_override: Option<deadreckon_protocol::AuthorityAcceptedBy>,
 ) -> Result<Option<deadreckon_protocol::JobId>> {
     if args.infer_contract {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -405,7 +424,9 @@ async fn schedule_direct_run(
     signals.insert(DURABLE_LEAF_SIGNAL.to_string(), serde_json::to_value(leaf)?);
     launch_plan.signals = serde_json::Value::Object(signals);
 
-    let accepted_by = if explicitly_approved {
+    let accepted_by = if let Some(accepted_by) = accepted_by_override {
+        accepted_by
+    } else if explicitly_approved {
         deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
     } else {
         if !prompt::confirm("queue this durable job?", true)? {
@@ -1377,6 +1398,34 @@ mod durable_direct_tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn guided_continuation_preserves_approved_authority_provenance() {
+        let mut plan = commands::course::trivial_operator_plan(
+            "continue the approved result",
+            commands::course::CourseShape::ChainExtend,
+            "guided start",
+        );
+
+        assert_eq!(
+            approved_launch_authority(&plan).expect("interactive approval"),
+            deadreckon_protocol::AuthorityAcceptedBy::Operator
+        );
+
+        plan.accepted_by = Some("yes-flag-guardrail".to_string());
+        assert_eq!(
+            approved_launch_authority(&plan).expect("yes guardrail approval"),
+            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
+        );
+
+        plan.accepted_by = Some("replay".to_string());
+        assert!(
+            approved_launch_authority(&plan)
+                .expect_err("unsupported approval provenance")
+                .to_string()
+                .contains("unsupported acceptance provenance")
+        );
+    }
 
     #[test]
     fn direct_run_persists_one_bounded_job_with_the_same_run_identity() {

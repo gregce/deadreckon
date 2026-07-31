@@ -1778,7 +1778,15 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - Opt-in lifecycle notifications: `[notify]` supports native, command, and webhook channels for accepted, paused-at-cap, and failed outcomes; records append to run-local `notify.jsonl`; command notification failures include a recovery `try:` detail.
 - Goal-shape recommendations: `start` performs one bounded provider-backed classifier call through existing provider routing (with deterministic fallback) to suggest single run, orchestration, or campaign + count; campaign `--n` is optional and editable before launch.
 - Vocabulary and error-footers: user-facing copy treats a passed run as a "verified run" (verified by `dr-gate`) and groups `def-done` / `acceptance.yaml` wording under the "done contract"; P10 coverage asserts the shared glossary and a parameterized refusal table with final `try:` footers.
-- Autonomous sequential chains: `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`, and `chain redo`; chains use `latest`/`last` aliases, `chain.json`, `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps, green-policy auto-apply, and a multi-step ratatui timeline with single-run chain context.
+- Autonomous sequential chains (historical implementation, now
+  characterization-only for execution and mutation): the stored model includes
+  `chain "..."`, `chain plan`/`expand`, `chain run`, `chain attach`, `chain
+  status/show/list`, `chain pause/resume/kill`, `chain undo`, `chain extend`,
+  and `chain redo`; chains use `latest`/`last` aliases, `chain.json`,
+  `chain-events.jsonl`, a conductor lock, chain hooks, aggregate spend caps,
+  green-policy auto-apply, and a multi-step ratatui timeline with single-run
+  chain context. The public product creates supported chains as Graph Jobs;
+  public historical execution and mutation refuse before changing state.
 - Plan observability: orchestration plans now write `plan-events.jsonl`; `attach <plan-id>` renders plan events, drills into child run attach, and returns to the plan context; plain attach, `history grep --plan`, and `show --why-failed <plan-id>` include plan event evidence.
 - Campaign observability: `attach <campaign-id>` opens a live campaign ratatui TUI on TTYs with sub-plan cards, roll-up/budget header, campaign/sub-plan feed rows, and `Enter` drill-in to the existing plan attach TUI; plan child drill-in then reaches the normal run attach TUI, and backing out twice returns to the campaign frame. Off-TTY/`--plain` remains the read-only summary, and `--json` emits a structured campaign attach object.
 - Consolidated plan-result docs: completed plans write provider-backed or deterministic `PLAN-NARRATIVE.md`, `PLAN-AS-BUILT.md`, `PLAN-DECISIONS.md`, `PLAN-CHILDREN.md`, and `PLAN-DOCS-MANIFEST.json`; merged libraries, apply worktrees, and exports carry those docs, and synthetic plan-result apply runs expose wrapper `RUN-*` docs that point at the consolidated plan story.
@@ -2096,6 +2104,8 @@ Sleep state is file-based, not a `PipelineState` field: `working/.deadreckon/sle
 ### 27.5 In-Frame Control Polish
 
 Helm moves chain attach's destructive confirm, extend input, and command-mode input into ratatui modals instead of suspending the alternate screen. The modal primitive swallows keys until submit/cancel, `Esc` cancels, and confirmed commands dispatch to existing CLI verb paths. The remaining "press Enter to return" overlays around nested command output stay deferred in `docs/V1-CANDIDATES.md` because they need an explicit output-capture design.
+The extend path now returns the public non-mutating refusal and durable
+migration schedule; it does not update the stored chain.
 
 Motion is policy-gated: `[ui] motion = full|reduced|off` resolves to reduced under non-TTY/replay defaults, all effects are under 800ms and input-preemptible, and `off` removes effect frames without hiding information.
 
@@ -2103,9 +2113,25 @@ Motion is policy-gated: `[ui] motion = full|reduced|off` resolves to reduced und
 
 ## 28. Chains & Autonomous Goal Chaining
 
+This section is a historical implementation reference for the stored-chain
+model. The public product no longer enters its conductor or mutation path:
+supported ordinary chain creation compiles one linear Graph Job; unsupported
+policy-rich creation refuses before Job creation, planning, or state mutation;
+historical `chain run|resume` refuses before state mutation or execution; and
+`chain extend` plus `chain redo --extend` computes a proposed schedule but
+refuses before saving it. Only the `deadreckon-characterization` binary can
+exercise the conductor and mutations described below for tests. Read-only
+inspection of stored historical chains remains public.
+
 ### 28.1 Mental Model
 
-A chain is an ordered list of step goals plus branch, apply, budget, and stop policy. The conductor is a CLI process entered by `deadreckon chain ...` or `deadreckon chain run <id>`. It acquires a chain lock, spawns each step as a normal `deadreckon run --worktree`, waits for that run to complete and pass acceptance, applies it to the source branch when policy allows, then bases the next step on the updated head.
+In the historical model, a chain is an ordered list of step goals plus branch,
+apply, budget, and stop policy. The conductor is a CLI process entered only by
+the characterization binary's `deadreckon chain ...` or `deadreckon chain run
+<id>` path. It acquires a chain lock, spawns each step as a normal `deadreckon
+run --worktree`, waits for that run to complete and pass acceptance, applies it
+to the source branch when policy allows, then bases the next step on the
+updated head.
 
 Chain state is separate from `PipelineState`: no run schema fields were added. Files live under `~/.deadreckon/chains/<chain-id>/`.
 
@@ -2115,16 +2141,21 @@ Chain state is separate from `PipelineState`: no run schema fields were added. F
 
 Each `ChainStep` records index, goal, status, run id, applied timestamp/SHA, failure reason, step cap, and actual spend. `ConductorState` is the live-process pointer in `conductor.json`: conductor pid, live step, live run id, and live child pid.
 
-### 28.3 Create And Run Shape
+### 28.3 Historical Create And Run Shape
 
-The common path mirrors `run`:
+The characterization-only path mirrors the old `run`:
 
 ```bash
 deadreckon chain "step one" "step two" "step three" --yes
 deadreckon chain plan "build a chess app" --n 6 --yes
 ```
 
-`chain expand` is an alias for `chain plan`. `--from-file` and `--from-stdin` accept newline-separated steps. `--draft` writes `chain.json` without starting the conductor. Bare `deadreckon chain` prints scoped status; `deadreckon chain run` resumes `latest`; `latest` and `last` are accepted anywhere a chain id is expected.
+In this historical model, `chain expand` is an alias for `chain plan`.
+`--from-file` and `--from-stdin` accept newline-separated steps. `--draft`
+writes `chain.json` without starting the conductor. Bare `deadreckon chain`
+prints scoped status; `deadreckon chain run` resumes `latest`; `latest` and
+`last` are accepted anywhere a chain id is expected. In the public binary,
+supported new creation compiles a Graph Job and stored-chain execution refuses.
 
 ### 28.4 Branch Policy
 
@@ -2154,9 +2185,15 @@ Supported hooks are `pre-step`, `post-step`, `on-promote`, and `on-chain-end`. P
 
 `chain-events.jsonl` is the chain audit log: created, step started, run completed, apply started, applied/refused, step failed, paused/resumed/killed/completed, undo, hooks, extend, and redo. `promotion.rs` also emits `RunPromoted { library_dir }`, so a chain can attach provenance to the promoted inner run artifact. Chain attach reads this file through an attach-local JSONL tail cache after the first load; redraws parse appended complete rows only, tolerate a partial final line, and keep the previous activity rows visible if a read is delayed.
 
-### 28.9 Lifecycle Verbs
+### 28.9 Historical Lifecycle Verbs
 
-`chain pause`, `resume`, `kill`, `undo`, `extend`, and `redo` compose with the existing run lifecycle. Undo reverts applied SHAs in reverse order. Extend inserts or appends a step and can reopen a completed chain when inserting. Redo chooses a specified step, the first failed step, or the latest applied step; applied-step redo requires `--reapply`, which reverts before requeueing.
+The retained model defines `chain pause`, `resume`, `kill`, `undo`, `extend`,
+and `redo` against the old run lifecycle. Undo reverts applied SHAs in reverse
+order. Extend inserts or appends a step and can reopen a completed chain when
+inserting. Redo chooses a specified step, the first failed step, or the latest
+applied step; applied-step redo requires `--reapply`, which reverts before
+requeueing. Public historical execution and mutation refuse before these
+effects; only the characterization binary exercises them.
 
 ### 28.10 TUI Surfaces
 
@@ -2801,8 +2838,8 @@ explicit guard that the decompose work did not change CLI output shape.
 
 `crates/deadreckon/src/commands/mod.rs` exposes only crate-private modules:
 
-- `commands/chain/` owns the chain command family, conductor entrypoints, chain
-  attach loop, and chain lifecycle verbs.
+- `commands/chain/` owns the chain command family, characterization-only
+  conductor entrypoints, the chain attach loop, and chain lifecycle verbs.
 - `commands/acceptance.rs` owns `acceptance` and `def-done` command handling.
 - `commands/run.rs` owns the supervised `run` command body.
 - `commands/init.rs` owns `init` setup wiring.
@@ -3474,7 +3511,9 @@ the focused context while preserving detach on narrow terminals. A first-session
 cue points at panes, why, and command mode.
 
 Chain attach owns the general in-frame modal/input path: kill confirm, extend
-input, and `:` command mode are ratatui modals backed by `tui-textarea`.
+input, and `:` command mode are ratatui modals backed by `tui-textarea`. The
+extend modal dispatches to the public non-mutating refusal, which reports the
+updated durable schedule rather than modifying the stored chain.
 Its fixed table contains the existing chain verbs only (`attach`, `kill`,
 `motion`, `q`, `reshape`, `resume`, `verdict`, `why`), with confirm preserved
 for dispatching/destructive paths and nearest-match `try:` guidance for unknown
@@ -4077,7 +4116,12 @@ approved, queued, leased and supervised parent Job ID. Every durable shape
 verifies a same-ID parent result with a native deterministic gate and a fresh
 read-only semantic judge. The supervisor validates the combined receipt before
 promotion. Explicit preview, in-place/uncontained, historical chain, and chain
-extension paths remain callable process-owned compatibility paths.
+extension paths do not share one posture: preview and explicit
+in-place/uncontained execution remain callable foreground, untrusted escape
+hatches; public historical chain execution refuses before mutation or
+execution; and public chain extension refuses before mutation while offering a
+durable replacement schedule. The old chain conductor and mutation path remain
+reachable only from the characterization binary used by tests.
 
 ### 58.1 Current execution boundary
 
@@ -4086,9 +4130,12 @@ extension paths remain callable process-owned compatibility paths.
 | `deadreckon start --mode run "<goal>"` | Writes a Job before the first turn, then detaches `supervisor serve --once <job-id>` | Contained native gate plus fresh read-only semantic `achieved`, sealed into one two-key receipt | Durable Single Job; survives the launching terminal |
 | `start --mode review|full-plan` | Writes a `Graph` Job, normalizes delivery to `AtEnd`, and supervises the established conductor under the same parent ID | Copies the merged result into the same-ID parent run, then runs the native gate, fresh semantic judge, receipt validation and promotion | Durable and verified Graph parent; `finish` exports the receipt-bound parent |
 | An auto-selected guided campaign | Writes a `LegacyCampaign` Job and supervises the established conductor under the same parent ID | Recovers exact persisted sub-plans, revalidates the worst-of roll-up, then runs the parent gate, semantic judge, receipt validation and promotion | Durable and verified Campaign parent; live recovery drills remain outstanding |
-| Ordinary `deadreckon run "<goal>"` | Freezes direct-run options into a Single Job and detaches the same supervisor path | The same contained native gate, semantic judgment and combined receipt as guided Single | Durable by default; preview, explicit `--in-place`, explicit `--sandbox none`, and historical chain-child execution stay foreground and untrusted |
+| Ordinary `deadreckon run "<goal>"` | Freezes direct-run options into a Single Job and detaches the same supervisor path | The same contained native gate, semantic judgment and combined receipt as guided Single | Durable by default; preview, explicit `--in-place`, and explicit `--sandbox none` stay foreground and untrusted |
 | Direct `orchestrate` and stored-plan `fork` | Freeze the graph into a `Graph` Job and supervise the established conductor under the parent lease | At-end same-ID parent gate, semantic judgment, receipt and promotion | Durable by default; preview and trusted internal child execution remain foreground |
-| New `chain` | Compiles supported chain policy into a linear `Graph` Job | Verifies the composed parent once at the end with both completion keys | Durable by default; explicit `--sandbox none`, historical `chain run|resume`, and unsupported conductor-only policies remain labelled untrusted |
+| New `chain` with supported policy | Compiles the schedule into a linear `Graph` Job | Verifies the composed parent once at the end with both completion keys | Durable by default |
+| Unsupported policy-rich new `chain` | Refuses before Job creation, planning, state mutation, or execution | None | No silent fallback to the process-owned conductor |
+| Historical `chain run|resume` | Public binary refuses before state mutation or execution and prints a durable migration command | None | Stored chain remains inspectable; legacy conductor is characterization-only |
+| `chain extend` or `chain redo --extend` | Public binary computes the proposed schedule without saving it, then refuses and prints a durable migration command | None | No mutation; legacy mutation is characterization-only |
 | Direct `campaign` | Writes a `LegacyCampaign` Job before the conductor starts | Rebuilds the worst-of roll-up, then uses the same parent two-key sequence | Durable by default; preview remains foreground and live recovery drills remain outstanding |
 | Installed `deadreckon supervisor` user service | launchd or systemd starts `supervisor serve`, which scans supported nonterminal Jobs | Uses the same shape-specific classifiers and receipt validators as detached one-shot supervision | Conditional restart-at-login posture; live active-service and reboot acceptance remain |
 | Public `extend` or a follow-up selected by guided `start` | Freezes the completed parent state, promoted-artifact tree and verified receipt, then writes a Single Job before child work | Revalidates the frozen parent inputs before continuation evidence, then uses the normal two-key child receipt | Durable parent-bound continuation; launch-time `--dest` is refused and delivery remains a later `finish` |
@@ -4485,11 +4532,13 @@ from the planned live tasks, prove false-acceptance or false-rejection rates,
 demonstrate live Linux/bubblewrap or a public strict Docker Job, demonstrate a
 real machine restart, or demonstrate live Campaign interruption recovery.
 Direct run, orchestration, stored-plan fork, supported new chain, campaign, and
-run-follow-up launches now share the Job scheduler; historical and explicitly
-untrusted compatibility paths do not. The operator script in
+run-follow-up launches now share the Job scheduler. Public historical chain
+execution and mutation refuse; their process-owned implementation is retained
+only for characterization tests. Preview and explicit in-place/uncontained
+execution remain foreground and untrusted. The operator script in
 `docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available now from
 open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-31 for Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

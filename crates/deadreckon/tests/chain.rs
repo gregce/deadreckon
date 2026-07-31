@@ -175,6 +175,109 @@ fn product_chain_run_refuses_without_mutating_the_stored_chain() {
 }
 
 #[test]
+fn product_chain_extend_refuses_without_mutation_and_preserves_the_requested_goal() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    chain.cwd = repo.clone();
+    save_test_chain(&paths, &chain);
+    let existing_events = b"{\"kind\":\"existing-chain-history\"}\n";
+    fs::write(paths.chain_events(&chain.chain_id), existing_events).expect("existing events");
+    let before = fs::read(paths.chain_json(&chain.chain_id)).expect("chain before");
+
+    let output = base_deadreckon(&paths)
+        .current_dir(&repo)
+        .args(["chain", "extend", &chain.chain_id, "third durable goal"])
+        .output()
+        .expect("product chain extend");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("legacy chain mutation is no longer a product route"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("state mutation: none"), "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain --yes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\"third durable goal\""), "{stderr}");
+    assert_eq!(
+        fs::read(paths.chain_json(&chain.chain_id)).expect("chain after"),
+        before
+    );
+    assert_eq!(
+        fs::read(paths.chain_events(&chain.chain_id)).expect("events after"),
+        existing_events
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn product_chain_redo_extend_refuses_before_state_or_event_mutation() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let mut chain = sample_chain(&temp);
+    chain.scope = deadreckon_core::paths::workspace_scope(&repo).expect("scope");
+    chain.cwd = repo.clone();
+    chain.steps[0].status = ChainStepStatus::Failed;
+    save_test_chain(&paths, &chain);
+    let existing_events = b"{\"kind\":\"existing-redo-history\"}\n";
+    fs::write(paths.chain_events(&chain.chain_id), existing_events).expect("existing events");
+    let before = fs::read(paths.chain_json(&chain.chain_id)).expect("chain before");
+
+    let output = base_deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "chain",
+            "redo",
+            &chain.chain_id,
+            "--extend",
+            "replacement durable goal",
+        ])
+        .output()
+        .expect("product chain redo extend");
+
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("legacy chain mutation is no longer a product route"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("state mutation: none"), "{stderr}");
+    assert!(
+        stderr.contains("Recommended\ndeadreckon chain --yes"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\"replacement durable goal\""), "{stderr}");
+    assert_eq!(
+        fs::read(paths.chain_json(&chain.chain_id)).expect("chain after"),
+        before
+    );
+    assert_eq!(
+        fs::read(paths.chain_events(&chain.chain_id)).expect("events after"),
+        existing_events
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs")
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
 fn product_chain_status_never_recommends_refused_execution() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

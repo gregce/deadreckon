@@ -7,11 +7,16 @@ supervisor, two-key completion for guided Single, Graph and Campaign Jobs,
 fault harness, and explicit per-user service operations are implemented in
 this tree. These are the remaining boundaries:
 
-- Resolve the remaining compatibility boundary. Direct `orchestrate`,
-  supported new chains, stored-plan `fork`, and direct `campaign` are
-  Job-scheduled; historical `chain run|resume`, policy-rich chain modes, chain
-  extension, previews, and explicitly in-place/uncontained execution remain
-  process-owned.
+- Finish the migration after closing the public legacy-chain boundary. Direct
+  `orchestrate`, supported new chains, stored-plan `fork`, and direct
+  `campaign` are Job-scheduled. Historical `chain run|resume` now refuses
+  before state mutation or execution; `chain extend` and `chain redo --extend`
+  refuse before mutation while showing the updated durable schedule; and
+  unsupported policy-rich chain launch refuses before Job creation, planning,
+  or legacy execution. Only the characterization binary retains the old
+  conductor and mutation behavior for tests. Decide when to retire that test
+  path and how long to retain the stored historical chain schema. Preview and
+  explicitly in-place/uncontained execution remain foreground and untrusted.
 - Dogfood the bounded parent-repair path now implemented for Graph and
   Campaign Jobs. Prove naturally occurring semantic `revise` decisions,
   repeated parent-only repair, crash recovery from a candidate-ready state and
@@ -219,8 +224,10 @@ this tree. These are the remaining boundaries:
   human checkpoint. Revisit only with a blast-radius story.
 - Campaign-level reshaping and planner-chosen per-sub breadth beyond the
   existing clamp.
-- Chain-extend replay: a `--plan` replay of a continuation needs its parent
-  run; refused today.
+- Legacy chain schedule replay: refused `chain extend` and `chain redo
+  --extend` requests now print the updated schedule for a new durable chain,
+  but there is no first-class command that imports and launches that schedule.
+  Add one only if repeated migration use justifies it.
 - Config keys for the guardrail knobs (`shape_confidence_floor`,
   `shape_auto_spend_ceiling`, `campaign_confirm_line`) — compiled defaults
   ship first; keys land when real use proves the defaults wrong.
