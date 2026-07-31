@@ -199,9 +199,9 @@ adding that hash to the JSON changes `E` and therefore changes the hash again.
 Git parentage, or a later signed attestation, identifies `E`.
 
 The checked-in result records 13 passing credential-free proof groups, no
-failures and eight unproven claims against clean source `d76ffc6`; evidence
-commit `761b001` has that source as its parent. Later changes still require a
-fresh source/evidence pair before inheriting those claims.
+failures and eight unproven claims against clean source `e87c70f`; evidence
+commit `e7b9bb2` has that source as its parent. Later functional changes still
+require a fresh source/evidence pair before inheriting those claims.
 
 The proof groups directly cover supported
 creation routes entering one Job journey, one- and two-round Graph semantic
