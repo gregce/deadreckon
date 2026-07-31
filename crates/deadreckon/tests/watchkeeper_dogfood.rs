@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
@@ -11,6 +11,61 @@ use tempfile::TempDir;
 
 fn dogfood_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/watchkeeper-dogfood")
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run git {args:?} in {}: {error}", repo.display()))
+}
+
+fn validate_credential_free_source(payload: &Value, repo: &Path) -> Result<String, String> {
+    match payload["repository"]["dirty"].as_bool() {
+        Some(false) => {}
+        Some(true) => {
+            return Err(
+                "checked credential-free evidence was generated from a dirty repository"
+                    .to_string(),
+            );
+        }
+        None => {
+            return Err(
+                "checked credential-free evidence has no boolean repository.dirty".to_string(),
+            );
+        }
+    }
+
+    let revision = payload["repository"]["revision"]
+        .as_str()
+        .filter(|revision| {
+            matches!(revision.len(), 40 | 64)
+                && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| {
+            "checked credential-free evidence has no full hexadecimal source revision".to_string()
+        })?;
+    let commit = format!("{revision}^{{commit}}");
+    let exists = git_output(repo, &["rev-parse", "--verify", &commit]);
+    if !exists.status.success() {
+        let shallow = git_output(repo, &["rev-parse", "--is-shallow-repository"]);
+        if !shallow.status.success() || String::from_utf8_lossy(&shallow.stdout).trim() != "true" {
+            return Err(format!(
+                "checked credential-free source revision {revision} is not present in the repository"
+            ));
+        }
+        return Ok(revision.to_string());
+    }
+
+    let ancestor = git_output(repo, &["merge-base", "--is-ancestor", revision, "HEAD"]);
+    if !ancestor.status.success() {
+        return Err(format!(
+            "checked credential-free source revision {revision} is not an ancestor of HEAD"
+        ));
+    }
+    Ok(revision.to_string())
 }
 
 #[test]
@@ -80,6 +135,19 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         assert!(
             source.contains(unproven),
             "missing live boundary {unproven}"
+        );
+    }
+    for unified_job_proof in [
+        "guided_continuation_preserves_approved_authority_provenance",
+        "durable_chain_freezes_one_graph_job_with_at_end_verification",
+        "public_resume_of_unowned_legacy_run_refuses_without_state_mutation",
+        "product_chain_run_refuses_without_mutating_the_stored_chain",
+        "product_chain_extend_refuses_without_mutation_and_preserves_the_requested_goal",
+        "product_chain_redo_extend_refuses_before_state_or_event_mutation",
+    ] {
+        assert!(
+            source.contains(unified_job_proof),
+            "missing unified Job proof {unified_job_proof}"
         );
     }
     assert!(source.contains("\"status\": \"unproven\""));
@@ -324,6 +392,11 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         serde_json::from_slice(&fs::read(&result_path).expect("results")).expect("results JSON");
     assert_eq!(payload["schema_version"], 1);
     assert_eq!(payload["credential_free"], true);
+    validate_credential_free_source(
+        &payload,
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(payload["matrix_status"]["total_tasks"], tasks.len());
     for (status, count) in expected_counts {
         assert_eq!(
@@ -370,6 +443,64 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
     assert!(
         live.iter()
             .all(|claim| claim["status"].as_str() == Some("unproven"))
+    );
+}
+
+#[test]
+fn dirty_credential_free_evidence_is_rejected() {
+    let payload = json!({
+        "repository": {
+            "revision": "0123456789012345678901234567890123456789",
+            "dirty": true
+        }
+    });
+
+    let error = validate_credential_free_source(&payload, Path::new("."))
+        .expect_err("dirty evidence must be rejected");
+    assert!(error.contains("generated from a dirty repository"));
+}
+
+#[test]
+fn clean_source_evidence_remains_valid_in_a_descendant_commit() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = temp.path();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "watchkeeper@example.invalid"][..],
+        &["config", "user.name", "Watchkeeper fixture"][..],
+        &["config", "commit.gpgsign", "false"][..],
+    ] {
+        let output = git_output(repo, args);
+        assert!(output.status.success(), "git {args:?} failed");
+    }
+    fs::write(repo.join("source"), "source\n").expect("source fixture");
+    assert!(git_output(repo, &["add", "source"]).status.success());
+    assert!(
+        git_output(repo, &["commit", "-q", "-m", "source"])
+            .status
+            .success()
+    );
+    let source = String::from_utf8(git_output(repo, &["rev-parse", "HEAD"]).stdout)
+        .expect("UTF-8 revision")
+        .trim()
+        .to_string();
+    fs::write(repo.join("evidence"), "evidence\n").expect("evidence fixture");
+    assert!(git_output(repo, &["add", "evidence"]).status.success());
+    assert!(
+        git_output(repo, &["commit", "-q", "-m", "evidence"])
+            .status
+            .success()
+    );
+    let payload = json!({
+        "repository": {
+            "revision": source,
+            "dirty": false
+        }
+    });
+
+    assert_eq!(
+        validate_credential_free_source(&payload, repo).expect("clean ancestor source"),
+        payload["repository"]["revision"]
     );
 }
 

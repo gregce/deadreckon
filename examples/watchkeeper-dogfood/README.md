@@ -80,12 +80,45 @@ checked-in result.
 ## Run the credential-free adversarial matrix
 
 The adversarial runner executes the repository's focused process, recovery,
-sandbox, receipt and delivery tests. It does not read provider credentials:
+sandbox, receipt and delivery tests. It does not read provider credentials.
+Generate checked evidence from a clean detached worktree and write the first
+result outside that worktree:
 
 ```sh
-python3 examples/watchkeeper-dogfood/adversarial.py \
-  --output examples/watchkeeper-dogfood/credential-free-results.json
+WK_SOURCE_REV=$(git rev-parse HEAD)
+WK_PROOF_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/deadreckon-watchkeeper.XXXXXX")
+WK_SOURCE_WORKTREE="$WK_PROOF_ROOT/source"
+WK_PROOF_RESULT="$WK_PROOF_ROOT/credential-free-results.json"
+
+git worktree add --detach "$WK_SOURCE_WORKTREE" "$WK_SOURCE_REV"
+env PYTHONDONTWRITEBYTECODE=1 CARGO_TARGET_DIR="$WK_PROOF_ROOT/target" \
+  python3 "$WK_SOURCE_WORKTREE/examples/watchkeeper-dogfood/adversarial.py" \
+    --repo "$WK_SOURCE_WORKTREE" \
+    --output "$WK_PROOF_RESULT"
+test -z "$(git -C "$WK_SOURCE_WORKTREE" status --porcelain --untracked-files=all)"
 ```
+
+The result must name `WK_SOURCE_REV` and record `repository.dirty` as `false`.
+Only after checking those fields should the operator copy the result into the
+detached worktree and commit it on an evidence branch:
+
+```sh
+WK_EVIDENCE_BRANCH="watchkeeper-evidence-$(git rev-parse --short "$WK_SOURCE_REV")"
+git -C "$WK_SOURCE_WORKTREE" switch -c "$WK_EVIDENCE_BRANCH"
+cp "$WK_PROOF_RESULT" \
+  "$WK_SOURCE_WORKTREE/examples/watchkeeper-dogfood/credential-free-results.json"
+git -C "$WK_SOURCE_WORKTREE" add \
+  examples/watchkeeper-dogfood/credential-free-results.json
+git -C "$WK_SOURCE_WORKTREE" commit \
+  -m "test(watchkeeper): record clean adversarial evidence"
+test "$(git -C "$WK_SOURCE_WORKTREE" rev-parse HEAD^)" = "$WK_SOURCE_REV"
+```
+
+This produces a clean tested source commit `S` and a separate evidence commit
+`E`. The JSON in `E` continues to name `S`; later descendant commits do not
+invalidate that source binding. `E` cannot name its own commit hash because
+adding that hash to the JSON changes `E` and therefore changes the hash again.
+Git parentage, or a later signed attestation, identifies `E`.
 
 The checked-in result currently records 12 passing credential-free proof
 groups and no failures. The added proof groups directly cover supported
