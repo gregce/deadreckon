@@ -7140,7 +7140,8 @@ fn command_table_contains_only_existing_verbs() {
 
 #[test]
 fn colon_steer_appends_to_inbox_from_attach() {
-    let (_temp, mut state) = doc_preview_state();
+    let (temp, mut state) = doc_preview_state();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     state.status = RunStatus::Executing;
     state.provider = Some("cli:codex-server".to_string());
     let mut tui_state = AttachTuiState::default();
@@ -7166,7 +7167,7 @@ fn colon_steer_appends_to_inbox_from_attach() {
         .handle_run_command_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         .expect("steer action");
 
-    dispatch_run_command_mode(&state, action).expect("dispatch :steer");
+    dispatch_run_command_mode(&paths, &state, action).expect("dispatch :steer");
 
     let inbox = deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root).expect("inbox");
     assert_eq!(inbox.len(), 1);

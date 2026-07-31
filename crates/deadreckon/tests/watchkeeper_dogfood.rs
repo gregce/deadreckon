@@ -56,6 +56,7 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "supervisor_restart",
         "network_denial",
         "gate_key_search_and_forgery",
+        "docker_control_boundary",
         "receipt_mutation",
         "result_delivery",
         "unified_job_journey",
@@ -84,6 +85,219 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
     assert!(source.contains("\"status\": \"unproven\""));
     assert!(source.contains("\"matrix_status\": matrix_status(repo)"));
     assert!(source.contains("\"seatbelt_preflight\": seatbelt"));
+    assert!(source.contains("\"docker_preflight\": docker"));
+}
+
+#[test]
+fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
+    let expected = [
+        "live_provider_worker_kill",
+        "live_provider_supervisor_restart",
+        "live_provider_network_loss",
+        "machine_reboot",
+        "cross_provider_gate_attack",
+        "live_provider_parent_repair",
+        "live_campaign_interruption_recovery",
+        "linux_bubblewrap_gate_boundary",
+        "docker_gate_boundary",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(dogfood_dir().join("live-trials.json")).expect("live trial manifest"),
+    )
+    .expect("live trial manifest JSON");
+    let claims = manifest["claim_ids"]
+        .as_array()
+        .expect("live claim ids")
+        .iter()
+        .map(|id| id.as_str().expect("live claim id"))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(claims, expected);
+
+    let trials = manifest["trials"].as_array().expect("live trials");
+    assert_eq!(trials.len(), expected.len());
+    let supported_oracles = [
+        "json_equals",
+        "json_not_equals",
+        "json_values_equal",
+        "json_values_not_equal",
+        "number_increased",
+        "event_count",
+        "event_before",
+        "event_after",
+        "event_suffix_count",
+        "event_suffix_order",
+        "event_boundary_transition",
+        "job_event_history_bound",
+        "job_report_integrity",
+        "job_report_within_policy",
+        "worker_target_stopped",
+        "lease_reclaim_bound",
+        "child_adoption_bound",
+        "text_values_not_equal",
+        "text_contains_any",
+        "doctor_backend_available",
+        "supervisor_service_active",
+        "parent_work_preserved",
+        "parent_only_repair",
+        "parent_repair_bound",
+        "campaign_recovery_bound",
+        "structurally_inconclusive",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let supported_sources = [
+        "job-view",
+        "job-events",
+        "job-intervention",
+        "job-cleanup",
+        "job",
+        "authority",
+        "launch-plan",
+        "lease",
+        "job-report",
+        "receipt",
+        "supervised-child",
+        "host-boot-id",
+        "semantic-judgment",
+        "parent-repair-manifest",
+        "parent-repair-candidate",
+        "doctor",
+        "supervisor-service-status",
+        "parent-artifact",
+        "parent-events",
+        "campaign",
+        "campaign-events",
+        "active-plan",
+        "active-plan-events",
+        "unavailable-objective",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    for trial in trials {
+        let id = trial["id"].as_str().expect("live trial id");
+        assert!(expected.contains(id), "unexpected live trial {id}");
+        assert_eq!(
+            trial["intervention"]["operator_only"], true,
+            "{id} may only be initiated by an operator"
+        );
+        assert!(
+            !trial["prerequisites"]
+                .as_array()
+                .expect("prerequisites")
+                .is_empty(),
+            "{id} has no prerequisites"
+        );
+        assert!(
+            !trial["evidence"].as_array().expect("evidence").is_empty(),
+            "{id} has no objective evidence"
+        );
+        for evidence in trial["evidence"].as_array().expect("evidence") {
+            let source = evidence["source"]
+                .as_str()
+                .expect("trusted evidence source");
+            assert!(
+                supported_sources.contains(source),
+                "{id} uses unsupported trusted source {source}"
+            );
+        }
+        assert!(
+            !trial["cleanup"].as_array().expect("cleanup").is_empty(),
+            "{id} has no cleanup instructions"
+        );
+        for oracle in trial["oracles"].as_array().expect("oracles") {
+            let kind = oracle["type"].as_str().expect("oracle type");
+            assert!(
+                supported_oracles.contains(kind),
+                "{id} uses unsupported oracle {kind}"
+            );
+        }
+    }
+    for id in [
+        "cross_provider_gate_attack",
+        "linux_bubblewrap_gate_boundary",
+        "docker_gate_boundary",
+    ] {
+        let trial = trials
+            .iter()
+            .find(|trial| trial["id"] == id)
+            .expect("hostile gate trial");
+        assert!(
+            trial["oracles"]
+                .as_array()
+                .expect("oracles")
+                .iter()
+                .any(|oracle| oracle["id"] == "receipt_valid"
+                    && oracle["evidence"] == "job-report"
+                    && oracle["expected"] == "valid"),
+            "{id} trusts worker observation without a valid public receipt"
+        );
+    }
+    let reboot = trials
+        .iter()
+        .find(|trial| trial["id"] == "machine_reboot")
+        .expect("reboot trial");
+    assert!(
+        reboot["oracles"]
+            .as_array()
+            .expect("reboot oracles")
+            .iter()
+            .any(|oracle| oracle["type"] == "event_suffix_order"
+                && oracle["before"] == "lease_reclaimed"
+                && oracle["after"] == "attempt_started"),
+        "reboot evidence must prove execution resumed after reclaim"
+    );
+
+    let schema: Value = serde_json::from_slice(
+        &fs::read(dogfood_dir().join("live-trial-results.schema.json"))
+            .expect("live trial result schema"),
+    )
+    .expect("live trial result schema JSON");
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["sanitized"]["const"], true);
+    assert_eq!(
+        schema["properties"]["status"]["enum"],
+        json!(["not_run", "passed", "failed", "inconclusive"])
+    );
+    assert_eq!(
+        schema["allOf"][0]["then"]["properties"]["intervention"]["properties"]["status"]["const"],
+        "performed"
+    );
+    assert_eq!(
+        schema["allOf"][0]["then"]["properties"]["cleanup"]["properties"]["status"]["const"],
+        "completed"
+    );
+
+    let recorder =
+        fs::read_to_string(dogfood_dir().join("live-trial.py")).expect("live trial recorder");
+    for forbidden in [
+        "import signal",
+        "import socket",
+        "import requests",
+        "import urllib",
+    ] {
+        assert!(
+            !recorder.contains(forbidden),
+            "passive recorder contains {forbidden}"
+        );
+    }
+    assert!(recorder.contains("import subprocess"));
+    assert_eq!(
+        recorder.matches("subprocess.run(").count(),
+        1,
+        "the passive recorder may execute only its pinned capture-helper seam"
+    );
+    assert!(recorder.contains("[str(helper), *command]"));
+    assert!(
+        recorder.contains(
+            "stable_regular_path(Path(str(capture.get(\"helper\"))), \"capture helper\")"
+        )
+    );
+    assert!(recorder.contains("cleanup != \"completed\""));
+    assert!(recorder.contains("captured evidence must remain a regular non-symlink file"));
+    assert!(!recorder.contains("attack-observation"));
+    assert!(!recorder.contains("campaign-recovery-summary"));
 }
 
 #[test]
@@ -132,6 +346,7 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         "supervisor_restart",
         "network_denial",
         "gate_key_search_and_forgery",
+        "docker_control_boundary",
         "receipt_mutation",
         "result_delivery",
         "unified_job_journey",

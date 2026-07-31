@@ -1,0 +1,284 @@
+//! Persisted wire vocabulary for trusted operator capture sessions.
+
+use std::{collections::BTreeMap, num::NonZeroU64};
+
+use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
+use schemars::schema::{InstanceType, Schema, SchemaObject};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
+
+use crate::{JobId, JobShape};
+
+/// The only operator-capture wire version understood by this release.
+pub const OPERATOR_CAPTURE_SCHEMA_VERSION: u32 = 1;
+
+/// Checked discriminator for every persisted operator-capture artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct OperatorCaptureSchemaVersion(u32);
+
+impl OperatorCaptureSchemaVersion {
+    pub const CURRENT: Self = Self(OPERATOR_CAPTURE_SCHEMA_VERSION);
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for OperatorCaptureSchemaVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let version = u32::deserialize(deserializer)?;
+        if version == OPERATOR_CAPTURE_SCHEMA_VERSION {
+            Ok(Self::CURRENT)
+        } else {
+            Err(D::Error::custom(format!(
+                "unsupported operator capture schema version {version}; expected \
+                 {OPERATOR_CAPTURE_SCHEMA_VERSION}"
+            )))
+        }
+    }
+}
+
+impl JsonSchema for OperatorCaptureSchemaVersion {
+    fn schema_name() -> String {
+        "OperatorCaptureSchemaVersion".to_string()
+    }
+
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> Schema {
+        Schema::Object(SchemaObject {
+            instance_type: Some(InstanceType::Integer.into()),
+            enum_values: Some(vec![Value::from(OPERATOR_CAPTURE_SCHEMA_VERSION)]),
+            ..SchemaObject::default()
+        })
+    }
+
+    fn is_referenceable() -> bool {
+        false
+    }
+}
+
+/// Immutable identity approved before the first capture event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureBinding {
+    pub schema_version: OperatorCaptureSchemaVersion,
+    pub job_id: JobId,
+    pub session_id: String,
+    pub trial_id: String,
+    pub created_at: DateTime<Utc>,
+    pub source_revision: String,
+    pub source_tree_sha256: String,
+    pub deadreckon_source_revision: String,
+    pub manifest_sha256: String,
+    pub result_schema_sha256: String,
+    pub recorder_sha256: String,
+    /// Absolute interpreter route approved for deterministic recorder replay.
+    pub recorder_interpreter: String,
+    pub recorder_interpreter_sha256: String,
+    pub capture_binary: String,
+    pub capture_binary_sha256: String,
+    pub deadreckon_binary: String,
+    pub deadreckon_binary_sha256: String,
+    pub deadreckon_version: String,
+    pub declared_shape: JobShape,
+    pub declared_backend: String,
+    /// Approved provider routes keyed by manifest-declared execution role.
+    pub provider_routes: BTreeMap<String, Vec<String>>,
+    pub replay_sha256: String,
+    pub pass_capable: bool,
+    pub required_captures: Vec<OperatorCaptureRequirement>,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureRequirement {
+    pub subject: String,
+    pub phase: OperatorCapturePhase,
+    pub source: OperatorCaptureSource,
+    pub media_type: String,
+}
+
+/// A non-zero position in an append-only capture history.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct OperatorCaptureEventSequence(NonZeroU64);
+
+impl OperatorCaptureEventSequence {
+    pub const fn new(value: u64) -> Option<Self> {
+        match NonZeroU64::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl From<OperatorCaptureEventSequence> for u64 {
+    fn from(value: OperatorCaptureEventSequence) -> Self {
+        value.get()
+    }
+}
+
+/// Operator-capture phase, kept separate from Job lifecycle state.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCapturePhase {
+    Prepared,
+    Before,
+    Intervention,
+    After,
+    Cleanup,
+    Finalized,
+}
+
+/// Factual kind of a trusted capture event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureEventKind {
+    SessionPrepared,
+    EvidenceCaptured,
+    OperatorAttestation,
+    InterventionRecorded,
+    CleanupRecorded,
+    ResultFinalized,
+}
+
+/// Strength and origin of the captured fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureProvenance {
+    TrustedSupervisor,
+    PublicDeadreckon,
+    AuthoritativeHost,
+    OperatorAttested,
+}
+
+/// Closed source vocabulary. Only `ManualFile` accepts a caller-provided path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureSource {
+    Binding,
+    JobView,
+    JobEvents,
+    JobIntervention,
+    JobCleanup,
+    Job,
+    Authority,
+    LaunchPlan,
+    Lease,
+    JobReport,
+    Receipt,
+    SupervisedChild,
+    HostBootId,
+    SemanticJudgment,
+    ParentRepairManifest,
+    ParentRepairCandidate,
+    Doctor,
+    SupervisorServiceStatus,
+    ParentArtifact,
+    ParentEvents,
+    Campaign,
+    CampaignEvents,
+    ActivePlan,
+    ActivePlanEvents,
+    SandboxBoundaryObservation,
+    CampaignIntervention,
+    ResultEnvelope,
+    ManualFile,
+    UnavailableObjective,
+}
+
+/// One authenticated append-only capture fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureEvent {
+    pub schema_version: OperatorCaptureSchemaVersion,
+    pub job_id: JobId,
+    pub session_id: String,
+    pub binding_sha256: String,
+    pub sequence: OperatorCaptureEventSequence,
+    pub event_id: String,
+    pub causation_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub phase: OperatorCapturePhase,
+    pub kind: OperatorCaptureEventKind,
+    pub provenance: OperatorCaptureProvenance,
+    pub source: OperatorCaptureSource,
+    pub subject: String,
+    pub content_sha256: String,
+    pub content_bytes: u64,
+    pub previous_event_sha256: Option<String>,
+    pub signature: String,
+}
+
+/// Final authenticated summary of a complete capture history and result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureReceipt {
+    pub schema_version: OperatorCaptureSchemaVersion,
+    pub job_id: JobId,
+    pub session_id: String,
+    pub binding_sha256: String,
+    pub issued_at: DateTime<Utc>,
+    pub event_count: u64,
+    pub final_event_sha256: String,
+    pub result_sha256: String,
+    pub result_bytes: u64,
+    pub completion_lineage: Option<OperatorCaptureCompletionLineage>,
+    pub status: OperatorCaptureStatus,
+    pub signature: String,
+}
+
+/// Exact validated completion identity sealed into a passed capture receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureCompletionLineage {
+    pub completion_receipt_sha256: String,
+    pub authority_sha256: String,
+    pub contract_sha256: String,
+    pub effective_policy_sha256: String,
+    pub launch_plan_sha256: String,
+    pub source_tree_sha256: String,
+    pub source_revision: Option<String>,
+    pub result_tree_sha256: String,
+    pub result_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureStatus {
+    Passed,
+    Failed,
+    Inconclusive,
+    NotRun,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OperatorCaptureEventSequence, OperatorCaptureSchemaVersion};
+
+    #[test]
+    fn capture_wire_discriminators_reject_unsupported_values() {
+        assert!(serde_json::from_str::<OperatorCaptureSchemaVersion>("2").is_err());
+        assert!(serde_json::from_str::<OperatorCaptureEventSequence>("0").is_err());
+        assert_eq!(
+            serde_json::from_str::<OperatorCaptureEventSequence>("1")
+                .expect("non-zero sequence")
+                .get(),
+            1
+        );
+    }
+}

@@ -64,10 +64,20 @@ without duplicating its backing run, plan or campaign.
 ### Ordinary execution shares the Job scheduler
 
 Ordinary direct `run` and `orchestrate`, new supported chains, stored-plan
-`fork`, and direct campaigns now create durable Jobs and detach through the
-same supervisor. Preview, explicit in-place/uncontained execution, historical
-`chain run|resume`, unsupported conductor-only chain policies, and `extend`
-remain labelled compatibility paths and cannot produce a trusted Job receipt.
+`fork`, direct campaigns, and public or guided follow-ups now create durable
+Jobs and detach through the same supervisor. Preview, explicit
+in-place/uncontained execution, historical `chain run|resume`, unsupported
+conductor-only chain policies, and chain extension remain labelled
+compatibility paths and cannot produce a trusted Job receipt.
+
+### Continuation is parent-bound and durable
+
+Public `deadreckon extend` and the follow-up selected by guided `start` queue a
+Single Job from the promoted parent artifact. Approval freezes the completed
+parent identity, state digest, promoted deliverable-tree digest and, for a
+verified parent, its receipt digest. The child revalidates those facts before
+writing continuation history. A launch-time destination is refused; the
+operator uses `finish` only after the follow-up earns its own two-key receipt.
 
 ### Durable Jobs have 2 completion keys
 
@@ -161,6 +171,12 @@ are discarded before DeadReckon creates its own hook-free result commit through
 trusted Git control paths. Documentation providers run read-only and their
 parsed output crosses the same trusted commit boundary.
 
+Sandbox wrappers resolve to canonical trusted system executables rather than
+ambient `PATH`. Before any reset, restore or staging operation can refresh the
+worktree, DeadReckon inventories the current workspace and approved base tree
+and refuses external clean, smudge or process filters. A no-refresh reset is a
+second guard against racy timestamp-triggered filters.
+
 Strict receipt fields bind the approved policy digest, optional source and
 result revisions, deliverable source and result tree digests, and the resolved
 backend and containment result. Worktree sealing and validation separately
@@ -182,18 +198,27 @@ definitions and state classification. They do not prove an active service or a
 live reboot.
 
 The operator dogfood kit contains 24 tasks across 2 repository and provider
-slots. It also includes a metrics collector, human-review schema and
-credential-free adversarial runner. The committed credential-free result is 11
+slots. It also includes a metrics collector, human-review schema,
+credential-free adversarial runner, and a passive operator-gated recorder for
+the 9 remaining live fault claims. The committed credential-free result is 12
 passed, 0 failed, and 9 explicitly unproven live/host claims. The sanitized
 live result records 2 attempted tasks, 22 not run, and 0 verified. This release
 does not claim live task rates, cross-provider results, machine-restart
 results, or false-accept and false-reject rates.
 
+Pass-capable live recording now uses a protected `dr-capture` helper outside
+the Job workspace. It authenticates an immutable Job/trial binding, an
+append-only exact-evidence history, the deterministic evaluation, and an HMAC
+publication receipt. Manual operator-selected files remain useful
+documentation but can only produce an inconclusive result.
+
 A real macOS public-command end-to-end test proves the contained two-phase
 Seatbelt gate. It checks protected-path denial, inherited gate-input scrubbing,
-residual process-group cleanup and the signed observed backend. Equivalent live
-Linux/bubblewrap and Docker evidence, and a real service-backed reboot, remain
-outstanding.
+residual process-group cleanup and the signed observed backend. A separate
+opt-in real Docker test proves the common key, environment, network and
+control-path boundary without pulling an image. A public strict Docker Job
+with a platform-compatible `dr-gate`, live Linux/bubblewrap evidence, and a
+real service-backed reboot remain outstanding.
 
 The collector no longer treats raw receipt fields as verified evidence. Its
 verified count requires a valid public `report --json` receipt assessment and a

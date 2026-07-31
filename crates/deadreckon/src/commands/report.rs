@@ -1169,6 +1169,7 @@ mod tests {
             result_revision: Some("result-revision".to_string()),
             deterministic_marker_sha256: "marker".to_string(),
             semantic_judgment_sha256: "semantic".to_string(),
+            sandbox_boundary_observation_sha256: "sandbox-observation".to_string(),
             contained: true,
             sandbox_backend: "sandbox-exec".to_string(),
             signature: "signature".to_string(),

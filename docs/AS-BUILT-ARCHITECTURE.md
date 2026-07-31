@@ -2,9 +2,9 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-07-30 (Watchkeeper durable Jobs, contained two-phase
-gate, external HMAC signing, read-only semantic judge, result-bound receipts,
-trusted promotion and explicit live-evidence limits)
+**Last updated:** 2026-07-31 (Watchkeeper durable continuation, protected
+operator capture, observed sandbox boundaries, trusted executable/filter
+hardening and regenerated adversarial evidence)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -4072,12 +4072,12 @@ namespacing, and a durable id index.
 
 Watchkeeper adds a durable local Job above the existing run state. Guided
 `start`, ordinary direct `run` and `orchestrate`, new chains, stored-plan
-`fork`, and direct campaigns have one approved, queued, leased and supervised
-parent Job ID. Every durable shape verifies a same-ID parent result with a
-native deterministic gate and a fresh read-only semantic judge. The supervisor
-validates the combined receipt before promotion. Explicit preview,
-in-place/uncontained, historical chain, and continuation paths remain callable
-process-owned compatibility paths.
+`fork`, direct campaigns, and public or guided run follow-ups have one
+approved, queued, leased and supervised parent Job ID. Every durable shape
+verifies a same-ID parent result with a native deterministic gate and a fresh
+read-only semantic judge. The supervisor validates the combined receipt before
+promotion. Explicit preview, in-place/uncontained, historical chain, and chain
+extension paths remain callable process-owned compatibility paths.
 
 ### 58.1 Current execution boundary
 
@@ -4091,7 +4091,7 @@ process-owned compatibility paths.
 | New `chain` | Compiles supported chain policy into a linear `Graph` Job | Verifies the composed parent once at the end with both completion keys | Durable by default; explicit `--sandbox none`, historical `chain run|resume`, and unsupported conductor-only policies remain labelled untrusted |
 | Direct `campaign` | Writes a `LegacyCampaign` Job before the conductor starts | Rebuilds the worst-of roll-up, then uses the same parent two-key sequence | Durable by default; preview remains foreground and live recovery drills remain outstanding |
 | Installed `deadreckon supervisor` user service | launchd or systemd starts `supervisor serve`, which scans supported nonterminal Jobs | Uses the same shape-specific classifiers and receipt validators as detached one-shot supervision | Conditional restart-at-login posture; live active-service and reboot acceptance remain |
-| Guided automatic continuation | Refuses before creating a Job, run or worker | Prints the exact legacy `deadreckon extend <run-id> "<goal>"` command | Honest boundary until continuation shares the Job lifecycle |
+| Public `extend` or a follow-up selected by guided `start` | Freezes the completed parent state, promoted-artifact tree and verified receipt, then writes a Single Job before child work | Revalidates the frozen parent inputs before continuation evidence, then uses the normal two-key child receipt | Durable parent-bound continuation; launch-time `--dest` is refused and delivery remains a later `finish` |
 
 Persisted durability and supervised durability are different claims. Every run
 continues to write state, ledgers, snapshots, and evidence. A Watchkeeper Job
@@ -4162,6 +4162,14 @@ For a Single shape, the Job ID is also the root run ID from launch. For Graph
 and Campaign shapes, the plan or campaign keeps that parent ID while child runs
 keep their own IDs. After merge, the supervisor creates the same-ID parent
 result run.
+
+For a follow-up, public `extend` and guided `start` use the same Single-Job
+scheduler. The launch plan carries a continuation signal with the completed
+parent run and scope, parent-state SHA-256, promoted-library deliverable-tree
+SHA-256, optional verified parent-receipt SHA-256, and the bounded context
+selection. Before the child writes its parent marker, history, or first trace,
+it reloads the parent and revalidates all frozen identities. Changed state,
+artifact bytes, receipt, completion status, or Job ownership fail closed.
 
 `ResolvedRef::Job` is part of the shared Shakedown resolver. Job-aware verbs use
 the same `latest`, scope and wrong-kind rules as their siblings. `list`
@@ -4264,6 +4272,16 @@ canonical-path cases are covered. A strict durable Job refuses
 `sandbox_backend = none` before signing and cannot produce a receipt with
 `contained = false`.
 
+Trusted sandbox wrappers are resolved to canonical absolute system
+executables before provider configuration is built; ambient `PATH` cannot
+substitute a different `sandbox-exec`, `bwrap`, or Docker entry point. The
+controller also seals an HMAC-authenticated sandbox-boundary observation for
+the exact Job attempt, authority, contract, result tree, probe and resolved
+backend. It records denial of gate-key reads, proof/control writes,
+operator-capture reads and writes, and inherited signing inputs. The completion
+receipt binds the observation digest, and later validation recomputes both the
+observation signature and its current Job/result identities.
+
 Provider output crosses a separate artifact boundary before it can become a
 trusted result. Workspace paths are classified as deliverable,
 evidence-only, lifecycle metadata, or disposable runtime output. Trusted
@@ -4281,13 +4299,20 @@ workspace; only DeadReckon parses, writes, and commits the approved
 documentation result. Merge-aware history scans preserve raw Unix path bytes
 and reject private paths even when they appear only in a merge or are added
 and later deleted. Platforms that cannot represent a path fail closed. Strict
-result paths with active Git filters or `160000` gitlinks are currently
-refused rather than incompletely modeled.
+result paths with active Git filters or `160000` gitlinks are refused rather
+than incompletely modeled. Filter refusal happens before any reset, restore or
+staging operation can refresh the worktree and inventories both current
+workspace-guard paths and every path in the approved base tree. The mixed reset
+also uses `--no-refresh`, so a racy timestamp cannot invoke an external clean,
+smudge or process filter before the refusal.
 
 The real macOS public-command end-to-end test runs the approved shell check
 under Seatbelt. It proves protected-path denial, inherited `GATE_*` scrubbing,
 residual process-group cleanup and signing of the observed `sandbox-exec`
-backend. Equivalent live Linux/bubblewrap and Docker trials remain
+backend. An opt-in real Docker test separately proves the common key,
+environment, network and control-path boundary while preserving ordinary
+deliverable writes. It never pulls the required image. A public strict Docker
+Job with a platform-compatible `dr-gate` and live Linux/bubblewrap remain
 outstanding. Host sandbox availability still matters: an `auto` request that
 resolves to no real backend cannot produce a verified strict Job.
 
@@ -4432,22 +4457,39 @@ and promotion enforcement.
 
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
-human-review template, and a credential-free adversarial runner. The committed
-credential-free result records 11 passes, 0 failures, and 9 explicitly
-unproven live/host claims. The sanitized live result records 2 attempted tasks,
-22 not run, and 0 verified.
+human-review template, a credential-free adversarial runner, and a passive
+operator-gated recorder for the 9 remaining live fault claims. The recorder
+declares prerequisites, interventions, objective oracles, sanitized evidence
+and cleanup, but never starts providers, signals processes, controls services,
+changes networking, reboots, or calls `finish`.
 
-The macOS public-command end-to-end gate trial is real host evidence, not a
-hermetic backend simulation. The repository still does not report verified
-completion rates from the planned live tasks, prove false-acceptance or
-false-rejection rates, demonstrate live Linux/bubblewrap or Docker gate
-containment, demonstrate a real machine restart, or demonstrate live Campaign
-interruption recovery. Direct run, orchestration, stored-plan fork, supported
-new chain, and campaign launches now share the Job scheduler; historical and
-explicitly untrusted compatibility paths do not. The operator script in
+Pass-capable recording uses a canonical `dr-capture` and sibling
+`deadreckon` pair outside every Job-controlled source, working, run, merge and
+repair root. The helper HMAC-authenticates an immutable Job/trial/provider
+binding, every append-only exact-evidence event and history head, and the final
+receipt. Preparation is idempotent for identical inputs and refuses conflicting
+replacement. Finalization deterministically reconstructs the evaluation from
+protected evidence, then publishes only a sanitized envelope containing the
+evaluation digest, protected receipt digest and HMAC publication proof.
+Operator-selected manual files remain a compatibility documentation path and
+can never produce `passed`.
+
+The committed credential-free result records 12 passes, 0 failures, and 9
+explicitly unproven live/host claims. The sanitized live result records 2
+attempted tasks, 22 not run, and 0 verified.
+
+The macOS public-command end-to-end gate trial and the common Docker
+control-boundary trial are real host evidence, not hermetic backend
+simulations. The repository still does not report verified completion rates
+from the planned live tasks, prove false-acceptance or false-rejection rates,
+demonstrate live Linux/bubblewrap or a public strict Docker Job, demonstrate a
+real machine restart, or demonstrate live Campaign interruption recovery.
+Direct run, orchestration, stored-plan fork, supported new chain, campaign, and
+run-follow-up launches now share the Job scheduler; historical and explicitly
+untrusted compatibility paths do not. The operator script in
 `docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available now from
 open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-31 for Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

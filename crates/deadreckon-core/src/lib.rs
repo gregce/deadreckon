@@ -25,11 +25,13 @@ pub mod job_lease;
 pub mod learning;
 pub mod ledger_io;
 pub mod lock;
+pub mod operator_capture;
 pub mod paths;
 pub mod plan;
 pub mod polish_subcalls;
 pub mod promotion;
 pub mod run_view;
+pub mod sandbox_observation;
 pub mod state;
 pub mod steer_inbox;
 pub mod tamper;
@@ -106,8 +108,9 @@ pub use gate::{
     marker_path_for_run_root, parent_repair_candidate_path_for_run_root,
     parent_repair_manifest_path_for_run_root, read_gate_key, read_gate_key_for_run_root,
     sign_gate_evaluation_with_key, validate_acceptance_marker, validate_gate_evaluation,
-    verify_v2_marker_signature, write_acceptance_marker, write_acceptance_marker_with_results,
-    write_gate_key, write_native_acceptance_marker_with_results_and_key,
+    validate_gate_evaluation_integrity, verify_v2_marker_signature, write_acceptance_marker,
+    write_acceptance_marker_with_results, write_gate_key,
+    write_native_acceptance_marker_with_results_and_key,
 };
 pub use glossary::{
     NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,
@@ -124,10 +127,18 @@ pub use job::{
 pub use job_lease::{
     LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, LeaseToken,
     append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease,
+    replace_fenced_job_json_and_append_event,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
     terminate_pid,
+};
+pub use operator_capture::{
+    OPERATOR_CAPTURE_BINDING_JSON, OPERATOR_CAPTURE_EVENTS_JSONL, OPERATOR_CAPTURE_RECEIPT_JSON,
+    OperatorCaptureEventDraft, OperatorCaptureHistory, append_operator_capture_event,
+    load_operator_capture_binding, operator_capture_binding_sha256, read_operator_capture_history,
+    seal_operator_capture_receipt, validate_operator_capture_history,
+    validate_operator_capture_receipt, write_operator_capture_binding,
 };
 pub use paths::{DeadreckonPaths, default_deadreckon_home, source_root};
 pub use plan::{
@@ -149,6 +160,11 @@ pub use run_view::{
     Artifact, CheckOutcome, ExchangeRef, Money, ProofBand, RunIdentity, RunView, RunViewDocKind,
     SandboxEvent, SandboxFact, SignatureFact, SignatureStatus, SpendBand, TurnView, VerdictBand,
     WhyBand,
+};
+pub use sandbox_observation::{
+    SANDBOX_BOUNDARY_OBSERVATION_JSON, sandbox_boundary_observation_sha256,
+    sandbox_boundary_result_tree_sha256, seal_sandbox_boundary_observation,
+    validate_sandbox_boundary_observation,
 };
 pub use state::{
     CurrentRunPointer, PhaseId, PhaseState, PhaseStatus, PipelineState, ProviderFailureDisposition,

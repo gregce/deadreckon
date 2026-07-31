@@ -352,6 +352,26 @@ fn accepts_narrows_which_kinds_a_verb_will_take() {
     assert_eq!(resolved_id(&resolved), plan.plan_id);
 }
 
+#[test]
+fn export_resolves_a_durable_job_before_its_backing_run() {
+    let fx = fixture();
+    let job = fx.job("56565656565656565656565656565656", Utc::now());
+    fx.run(job.job.job_id.as_ref(), "verified backing result");
+
+    let resolved = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some(job.job.job_id.as_ref()),
+            all_scopes: true,
+            verb: "export",
+        },
+    )
+    .expect("export accepts the durable Job identity");
+
+    assert_eq!(resolved.kind(), RefKind::Job);
+    assert_eq!(resolved_id(&resolved), job.job.job_id.as_ref());
+}
+
 /// One verb, both kinds. `undo` on a run restores a turn snapshot; on a chain
 /// it unwinds an applied step. Those were two commands with two id spaces
 /// (`undo --run` and `chain undo <id> --step`) for one intent.

@@ -4,11 +4,31 @@ pub(crate) const TRUSTED_SUPERVISOR_JOB_ID_ENV: &str = "DEADRECKON_SUPERVISOR_JO
 pub(crate) const TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_PLAN";
 pub(crate) const LEGACY_CHAIN_FOREGROUND_ENV: &str = "DEADRECKON_LEGACY_CHAIN_STEP_FOREGROUND";
 const DURABLE_LEAF_SIGNAL: &str = "watchkeeper_leaf";
+const UNTRUSTED_FOREGROUND_SIGNAL: &str = "untrusted_foreground";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRunRoute {
+    DurableJob,
+    Foreground,
+}
 
 /// Direct-run options that affect the worker's result, frozen before the
 /// detached supervisor starts. Source, budget, provider and model already live
 /// in first-class launch-plan/authority fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DurableContinuationSpec {
+    pub(crate) parent_run_id: String,
+    pub(crate) parent_scope: String,
+    pub(crate) parent_state_sha256: String,
+    pub(crate) parent_library_tree_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_receipt_sha256: Option<String>,
+    pub(crate) context_turns: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DurableLeafSpec {
     pub(crate) base: Option<String>,
     pub(crate) branch: Option<String>,
@@ -20,6 +40,8 @@ pub(crate) struct DurableLeafSpec {
     pub(crate) narrate: bool,
     pub(crate) no_narrate: bool,
     pub(crate) narrator_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) continuation: Option<DurableContinuationSpec>,
 }
 
 pub(crate) fn durable_leaf_spec(
@@ -58,6 +80,37 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
 /// Direct `deadreckon run`: a trivial operator plan records the decision so
 /// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
+    run_command_with_job_id(args).await.map(|_| ())
+}
+
+/// Dispatch a run and return the durable Job identity when this invocation
+/// queued one. Foreground compatibility and trusted-child paths return
+/// `None`.
+pub(crate) async fn run_command_with_job_id(
+    args: RunCommandArgs,
+) -> Result<Option<deadreckon_protocol::JobId>> {
+    let explicitly_uncontained = args.sandbox.as_deref() == Some("none");
+    let delegated_job_child = commands::graph_job::delegated_plan_child_authorized();
+    let private_characterization = commands::plan::internal_characterization_requested();
+    let private_legacy_chain_foreground =
+        private_characterization && std::env::var_os(LEGACY_CHAIN_FOREGROUND_ENV).is_some();
+    let route = direct_run_route(
+        args.preview,
+        args.in_place,
+        explicitly_uncontained,
+        args.untrusted,
+        args.run_id.is_some(),
+        delegated_job_child,
+        private_characterization,
+        private_legacy_chain_foreground,
+    )?;
+    if (args.durable_source_cwd.is_some() || args.continuation.is_some())
+        && route != DirectRunRoute::DurableJob
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "internal continuation inputs are valid only when scheduling a durable Job".to_string(),
+        )));
+    }
     if let Some(run_id) = args.run_id.as_deref() {
         let paths = DeadreckonPaths::discover();
         let _authority = commands::supervisor::require_guarded_driver_launch(&paths, run_id)?;
@@ -80,32 +133,109 @@ pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
             "run",
         )
     };
-    // The trusted child is already owned by a Job. Preview is read-only.
-    // Explicit in-place execution and an explicit uncontained sandbox cannot
-    // honestly promise isolation, restart recovery, or a trusted Job receipt,
-    // so those named compatibility modes keep the existing foreground path.
-    // A persisted legacy Chain also needs its child to complete synchronously;
-    // this private signal selects that untrusted compatibility path without
-    // weakening the sandbox requested by the historical Chain artifact.
-    let explicitly_uncontained = args.sandbox.as_deref() == Some("none");
-    let legacy_chain_foreground = std::env::var_os(LEGACY_CHAIN_FOREGROUND_ENV).is_some();
-    let durable_job_child = commands::graph_job::delegated_plan_child_authorized();
-    if args.run_id.is_none()
-        && !args.preview
-        && !args.in_place
-        && !explicitly_uncontained
-        && !legacy_chain_foreground
-        && !durable_job_child
-    {
-        return schedule_direct_run(args, &mut plan).await;
+    if args.untrusted {
+        mark_untrusted_foreground(&mut plan);
     }
-    run_command_with_launch_plan(args, plan).await
+    match route {
+        DirectRunRoute::DurableJob => schedule_direct_run(args, &mut plan).await,
+        DirectRunRoute::Foreground => run_command_with_launch_plan(args, plan).await.map(|_| None),
+    }
+}
+
+/// Queue a durable Single Job using an already approved launch plan.
+///
+/// Guided continuation uses this rather than rebuilding a second planning
+/// decision after the operator has approved `start`.
+pub(crate) async fn schedule_durable_run_with_launch_plan(
+    args: RunCommandArgs,
+    mut launch_plan: commands::course::LaunchPlan,
+) -> Result<Option<deadreckon_protocol::JobId>> {
+    let explicitly_uncontained = args.sandbox.as_deref() == Some("none");
+    let route = direct_run_route(
+        args.preview,
+        args.in_place,
+        explicitly_uncontained,
+        args.untrusted,
+        args.run_id.is_some(),
+        commands::graph_job::delegated_plan_child_authorized(),
+        commands::plan::internal_characterization_requested(),
+        false,
+    )?;
+    if route != DirectRunRoute::DurableJob {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "an approved guided launch plan can only schedule a durable Job".to_string(),
+        )));
+    }
+    if args.durable_source_cwd.is_none() || args.continuation.is_none() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "guided continuation is missing its frozen durable parent inputs".to_string(),
+        )));
+    }
+    schedule_direct_run(args, &mut launch_plan).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn direct_run_route(
+    preview: bool,
+    in_place: bool,
+    explicitly_uncontained: bool,
+    untrusted: bool,
+    trusted_supervisor_child: bool,
+    delegated_job_child: bool,
+    private_characterization: bool,
+    private_legacy_chain_foreground: bool,
+) -> Result<DirectRunRoute> {
+    if untrusted && (trusted_supervisor_child || delegated_job_child) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--untrusted cannot be used by a trusted supervisor or delegated Job child",
+            "remove --untrusted; the owning Job controls containment and receipt authority",
+        )));
+    }
+    if untrusted && !in_place && !explicitly_uncontained {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--untrusted is valid only with --in-place or explicit --sandbox none",
+            "remove --untrusted to create a durable isolated Job",
+        )));
+    }
+    if preview {
+        return Ok(DirectRunRoute::Foreground);
+    }
+    if private_characterization
+        && (in_place || explicitly_uncontained || private_legacy_chain_foreground)
+    {
+        return Ok(DirectRunRoute::Foreground);
+    }
+    if (in_place || explicitly_uncontained) && !untrusted {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--in-place and --sandbox none are untrusted foreground compatibility modes",
+            "add --untrusted only if you accept that this Run cannot issue a trusted Job receipt",
+        )));
+    }
+    if untrusted || trusted_supervisor_child || delegated_job_child {
+        return Ok(DirectRunRoute::Foreground);
+    }
+    Ok(DirectRunRoute::DurableJob)
+}
+
+fn mark_untrusted_foreground(plan: &mut commands::course::LaunchPlan) {
+    let mut signals = plan.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(
+        UNTRUSTED_FOREGROUND_SIGNAL.to_string(),
+        json!({
+            "capability": "--untrusted",
+            "execution": "foreground",
+            "durable_job": false,
+            "trusted_job_receipt": false,
+            "reason": "in-place or uncontained foreground compatibility execution"
+        }),
+    );
+    plan.signals = serde_json::Value::Object(signals);
 }
 
 async fn schedule_direct_run(
     mut args: RunCommandArgs,
     launch_plan: &mut commands::course::LaunchPlan,
-) -> Result<()> {
+) -> Result<Option<deadreckon_protocol::JobId>> {
     if args.infer_contract {
         return Err(CliError::Core(deadreckon_core::user_error(
             "--infer-contract requires an interactive foreground review before work starts",
@@ -154,7 +284,10 @@ async fn schedule_direct_run(
             crate::narrator::narrator_model_refusal(model),
         )));
     }
-    let cwd = std::env::current_dir()?;
+    let cwd = args
+        .durable_source_cwd
+        .clone()
+        .unwrap_or(std::env::current_dir()?);
     if args.init_git {
         init_git_repo(&cwd)?;
     }
@@ -184,12 +317,17 @@ async fn schedule_direct_run(
                     "{}",
                     cancelled_run_surface().render_plain(!completion_hints_enabled(args.no_hints))
                 );
-                return Ok(());
+                return Ok(None);
             }
         }
     }
     let source = direct_run_source(&cwd, &args)?;
     let authority_source_cwd = source.from.clone().unwrap_or_else(|| cwd.clone());
+    let durable_job_cwd = if args.durable_source_cwd.is_some() {
+        cwd.clone()
+    } else {
+        authority_source_cwd.clone()
+    };
     if matches!(source.mode, commands::job::DurableSourceMode::Worktree) {
         prepare_worktree_record(
             &paths,
@@ -261,6 +399,7 @@ async fn schedule_direct_run(
         narrate: args.narrate,
         no_narrate: args.no_narrate,
         narrator_model: args.narrator_model.clone(),
+        continuation: args.continuation.clone(),
     };
     let mut signals = launch_plan.signals.as_object().cloned().unwrap_or_default();
     signals.insert(DURABLE_LEAF_SIGNAL.to_string(), serde_json::to_value(leaf)?);
@@ -271,13 +410,13 @@ async fn schedule_direct_run(
     } else {
         if !prompt::confirm("queue this durable job?", true)? {
             eprintln!("cancelled before job creation");
-            return Ok(());
+            return Ok(None);
         }
         deadreckon_protocol::AuthorityAcceptedBy::Operator
     };
     let job = persist_direct_run_job(
         &paths,
-        &authority_source_cwd,
+        &durable_job_cwd,
         launch_plan.clone(),
         contract.as_ref().map(|source| source.path.as_path()),
         source,
@@ -291,7 +430,7 @@ async fn schedule_direct_run(
         let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref())?;
         commands::job::print_job_status(&view, false)?;
     }
-    Ok(())
+    Ok(Some(job.job_id))
 }
 
 fn direct_run_approval_policy(
@@ -381,6 +520,8 @@ pub(crate) async fn run_command_with_launch_plan(
     let RunCommandArgs {
         goal,
         run_id: requested_run_id,
+        durable_source_cwd: _,
+        continuation: _,
         tamper_baseline,
         fresh,
         worktree,
@@ -400,6 +541,7 @@ pub(crate) async fn run_command_with_launch_plan(
         max_spend,
         max_wall_seconds,
         sandbox,
+        untrusted,
         provider,
         model,
         doc_provider,
@@ -417,6 +559,11 @@ pub(crate) async fn run_command_with_launch_plan(
         infer_contract,
     } = args;
     let requested_run_id = trusted_supervisor_run_id(requested_run_id)?;
+    if untrusted {
+        eprintln!(
+            "UNTRUSTED FOREGROUND RUN: no durable Job is created and this Run cannot issue a trusted Job receipt."
+        );
+    }
     if let Err(message) = crate::narrator::validate_narration_flags(narrate, no_narrate) {
         return Err(CliError::Core(DeadreckonError::InvalidInput(message)));
     }
@@ -561,7 +708,9 @@ pub(crate) async fn run_command_with_launch_plan(
     if init_git {
         init_git_repo(&cwd)?;
     }
-    let run_id = requested_run_id.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let run_id = requested_run_id
+        .or_else(commands::graph_job::delegated_plan_child_run_id)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let mut mode_flags = ModeFlags {
         fresh,
         worktree,
@@ -701,7 +850,15 @@ pub(crate) async fn run_command_with_launch_plan(
     } else {
         create_run(&paths, run_options)?
     };
-    commands::course::save_launch_plan_best_effort(&state.run_root, &launch_plan);
+    commands::graph_job::link_delegated_repair_run(&state)?;
+    if untrusted {
+        commands::course::save_launch_plan(
+            &commands::course::launch_plan_path(&state.run_root),
+            &launch_plan,
+        )?;
+    } else {
+        commands::course::save_launch_plan_best_effort(&state.run_root, &launch_plan);
+    }
     if let Some(baseline) = tamper_baseline.as_deref() {
         deadreckon_core::tamper::write_tamper_baseline(&state.run_root, baseline)
             .map_err(CliError::Core)?;
@@ -715,6 +872,10 @@ pub(crate) async fn run_command_with_launch_plan(
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
     commands::acceptance::copy_acceptance_into_run(&state, &acceptance_source)?;
+    if let Some(continuation) = durable_leaf_spec(&launch_plan)?.and_then(|leaf| leaf.continuation)
+    {
+        commands::lifecycle::prepare_durable_continuation(&paths, &state, &continuation)?;
+    }
     maybe_infer_contract(
         &paths,
         &state,
@@ -1040,7 +1201,7 @@ fn run_codebase_refusal_primary(message: &str, goal: &str) -> Option<(String, &'
     }
     if message.contains("--in-place requires --i-know-its-a-lot") {
         return Some((
-            format!("deadreckon run {quoted_goal} --in-place --i-know-its-a-lot --yes"),
+            format!("deadreckon run {quoted_goal} --in-place --i-know-its-a-lot --untrusted --yes"),
             "In-place runs can mutate the current checkout, so DeadReckon requires the stronger acknowledgement before launching.",
         ));
     }
@@ -1240,6 +1401,7 @@ mod durable_direct_tests {
             narrate: false,
             no_narrate: true,
             narrator_model: None,
+            continuation: None,
         };
         plan.signals = json!({ DURABLE_LEAF_SIGNAL: leaf });
 
@@ -1291,6 +1453,7 @@ mod durable_direct_tests {
                 narrate: false,
                 no_narrate: true,
                 narrator_model: None,
+                continuation: None,
             }
         );
     }
@@ -1323,5 +1486,121 @@ mod durable_direct_tests {
     fn quiet_does_not_approve_foreground_execution_but_trusted_child_does() {
         assert!(!foreground_run_auto_confirm(false, false, true, false));
         assert!(foreground_run_auto_confirm(false, false, true, true));
+    }
+
+    #[test]
+    fn ordinary_non_preview_run_routes_to_a_durable_job() {
+        assert_eq!(
+            direct_run_route(false, false, false, false, false, false, false, false)
+                .expect("ordinary route"),
+            DirectRunRoute::DurableJob
+        );
+    }
+
+    #[test]
+    fn untrusted_capability_is_narrow_and_never_valid_for_job_children() {
+        assert_eq!(
+            direct_run_route(false, true, false, true, false, false, false, false)
+                .expect("explicit in-place capability"),
+            DirectRunRoute::Foreground
+        );
+        assert_eq!(
+            direct_run_route(false, false, true, true, false, false, false, false)
+                .expect("explicit uncontained capability"),
+            DirectRunRoute::Foreground
+        );
+        let irrelevant = direct_run_route(false, false, false, true, false, false, false, false)
+            .expect_err("capability without unsafe mode");
+        assert!(irrelevant.to_string().contains("valid only"));
+        for (supervisor, delegated) in [(true, false), (false, true)] {
+            let error = direct_run_route(
+                false, true, false, true, supervisor, delegated, false, false,
+            )
+            .expect_err("Job children cannot become untrusted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("trusted supervisor or delegated Job child")
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_public_runs_refuse_but_read_only_preview_and_private_harness_survive() {
+        for (in_place, uncontained) in [(true, false), (false, true), (true, true)] {
+            let error = direct_run_route(
+                false,
+                in_place,
+                uncontained,
+                false,
+                false,
+                false,
+                false,
+                false,
+            )
+            .expect_err("unsafe public execution needs the capability");
+            assert!(error.to_string().contains("untrusted foreground"));
+            assert_eq!(
+                direct_run_route(
+                    true,
+                    in_place,
+                    uncontained,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .expect("preview is read-only"),
+                DirectRunRoute::Foreground
+            );
+            assert_eq!(
+                direct_run_route(
+                    false,
+                    in_place,
+                    uncontained,
+                    false,
+                    false,
+                    false,
+                    true,
+                    false,
+                )
+                .expect("private characterization route"),
+                DirectRunRoute::Foreground
+            );
+        }
+        assert_eq!(
+            direct_run_route(false, false, false, false, false, false, true, true)
+                .expect("private legacy chain step"),
+            DirectRunRoute::Foreground
+        );
+        assert_eq!(
+            direct_run_route(false, false, false, false, false, false, false, true)
+                .expect("public binary ignores forged legacy signal"),
+            DirectRunRoute::DurableJob
+        );
+    }
+
+    #[test]
+    fn untrusted_plan_signal_denies_durable_job_and_receipt_claims() {
+        let mut plan = commands::course::trivial_operator_plan(
+            "unsafe compatibility work",
+            commands::course::CourseShape::Single,
+            "run",
+        );
+        mark_untrusted_foreground(&mut plan);
+
+        assert_eq!(
+            plan.signals[UNTRUSTED_FOREGROUND_SIGNAL]["execution"],
+            "foreground"
+        );
+        assert_eq!(
+            plan.signals[UNTRUSTED_FOREGROUND_SIGNAL]["durable_job"],
+            false
+        );
+        assert_eq!(
+            plan.signals[UNTRUSTED_FOREGROUND_SIGNAL]["trusted_job_receipt"],
+            false
+        );
     }
 }

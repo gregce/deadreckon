@@ -242,6 +242,75 @@ pub fn append_fenced_job_event(
     append_job_event_locked(paths, event)
 }
 
+/// Replace one controller-owned JSON projection and append the event that
+/// authorizes that exact replacement while holding the Job control lock.
+///
+/// The projection is written first. A crash before the event therefore leaves
+/// an uncommitted projection that consumers must refuse as authority. Once the
+/// event is durable, lease reclamation cannot interleave with either write.
+pub fn replace_fenced_job_json_and_append_event<T: serde::Serialize>(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    now: DateTime<Utc>,
+    artifact_path: &std::path::Path,
+    kind: JobEventKind,
+    causation_id: String,
+    detail: Value,
+    value: &T,
+) -> Result<JobProjection> {
+    let job_dir = paths.job_dir(token.job_id.as_ref());
+    let relative_artifact = artifact_path.strip_prefix(&job_dir).map_err(|_| {
+        lease_error(
+            &token.job_id,
+            "fenced artifact path is outside the protected Job directory",
+        )
+    })?;
+    if relative_artifact.as_os_str().is_empty()
+        || relative_artifact
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(lease_error(
+            &token.job_id,
+            "fenced artifact path is not a normalized protected Job child",
+        ));
+    }
+    let lock_path = job_dir.join(JOB_CONTROL_LOCK);
+    let lock = open_job_control_lock(&lock_path)?;
+    FileExt::lock_exclusive(&lock).with_path(&lock_path)?;
+
+    let lease = load_job_lease(paths, &token.job_id)?;
+    validate_token(&lease, token, now)?;
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let projection = reduce_job_history(&token.job_id, &history)?;
+    if projection.is_terminal()
+        || projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested)
+    {
+        return Err(lease_error(
+            &token.job_id,
+            "cannot replace a fenced artifact after the Job stopped",
+        ));
+    }
+    let sequence = projection
+        .last_sequence
+        .checked_add(1)
+        .and_then(JobEventSequence::new)
+        .ok_or_else(|| lease_error(&token.job_id, "job event sequence exhausted"))?;
+    let event = JobEvent {
+        schema_version: JobSchemaVersion::CURRENT,
+        job_id: token.job_id.clone(),
+        sequence,
+        event_id: Uuid::new_v4().to_string(),
+        causation_id,
+        timestamp: now,
+        lease_epoch: token.epoch,
+        kind,
+        detail,
+    };
+    atomic_write_json(artifact_path, value)?;
+    append_job_event_locked(paths, &event)
+}
+
 pub fn load_job_lease(paths: &DeadreckonPaths, job_id: &JobId) -> Result<JobLease> {
     let path = paths.job_lease(job_id.as_ref());
     let raw = fs::read(&path).with_path(&path)?;
@@ -387,7 +456,7 @@ mod tests {
 
     use super::{
         LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason, append_fenced_job_event,
-        claim_job_lease, heartbeat_job_lease,
+        claim_job_lease, heartbeat_job_lease, replace_fenced_job_json_and_append_event,
     };
     use crate::job::{load_job_projection, read_job_history};
     use crate::paths::DeadreckonPaths;
@@ -518,6 +587,82 @@ mod tests {
         assert!(error.to_string().contains("stale lease token"));
         let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
         assert_eq!(history.events().len(), 2);
+    }
+
+    #[test]
+    fn stale_worker_cannot_replace_a_fenced_json_projection() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-artifact-fence".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let stale = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", "boot-a", 4350),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("first claim")
+        .token();
+        claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-b", "boot-a", 4450),
+            now + TimeDelta::seconds(16),
+            Duration::from_secs(15),
+        )
+        .expect("reclaim");
+        let artifact = paths.job_dir(job_id.as_ref()).join("authority.json");
+
+        let error = replace_fenced_job_json_and_append_event(
+            &paths,
+            &stale,
+            now + TimeDelta::seconds(17),
+            &artifact,
+            JobEventKind::CampaignSubAuthorityChanged,
+            "stale-artifact".to_string(),
+            json!({"transition": "prepared"}),
+            &json!({"authority": "stale"}),
+        )
+        .expect_err("stale worker must not replace the projection");
+
+        assert!(error.to_string().contains("stale lease token"));
+        assert!(!artifact.exists(), "stale projection must not be written");
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(history.events().len(), 2);
+    }
+
+    #[test]
+    fn fenced_json_projection_cannot_escape_the_job_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-artifact-path".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let token = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", "boot-a", 4360),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("claim")
+        .token();
+        let outside = temp.path().join("outside.json");
+
+        let error = replace_fenced_job_json_and_append_event(
+            &paths,
+            &token,
+            now + TimeDelta::seconds(1),
+            &outside,
+            JobEventKind::CampaignSubAuthorityChanged,
+            "escaped-artifact".to_string(),
+            json!({"transition": "prepared"}),
+            &json!({"authority": "escaped"}),
+        )
+        .expect_err("fenced projection must remain under its Job directory");
+
+        assert!(error.to_string().contains("outside"), "{error}");
+        assert!(!outside.exists(), "escaped projection must not be written");
     }
 
     #[test]

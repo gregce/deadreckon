@@ -13,8 +13,9 @@ use deadreckon_core::{DeadreckonPaths, GATE_CONTAINED_ENV, GATE_SANDBOX_BACKEND_
 use deadreckon_core::{
     SupervisedProcessPhase, gate_key_path, load_run, read_supervised_process,
     read_supervised_process_record, validate_acceptance_marker,
+    validate_sandbox_boundary_observation,
 };
-use deadreckon_protocol::{JobEventKind, JobOutcome};
+use deadreckon_protocol::{JobAuthority, JobEventKind, JobOutcome};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -137,8 +138,31 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let host_home = temp.path().join("host-home");
+    let host_secret = host_home.join(".aws/credentials");
+    let outside_write = temp.path().join("gate-host-write");
+    let shim_bin = temp.path().join("shim-bin");
+    let shim_sentinel = temp.path().join("path-shim-ran");
     fs::create_dir_all(workspace.join(".deadreckon")).expect("acceptance dir");
     fs::create_dir_all(paths.home()).expect("home");
+    fs::create_dir_all(host_secret.parent().expect("secret parent")).expect("host secret parent");
+    fs::create_dir_all(&shim_bin).expect("shim bin");
+    fs::write(&host_secret, "WATCHKEEPER_HOST_SECRET_MUST_NOT_LEAK\n").expect("host secret");
+    let shim = shim_bin.join("sandbox-exec");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nprintf shim-ran >{}\nexec /usr/bin/sandbox-exec \"$@\"\n",
+            shell_quote(&shim_sentinel)
+        ),
+    )
+    .expect("sandbox-exec shim");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = fs::metadata(&shim).expect("shim metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&shim, permissions).expect("shim permissions");
+    }
     fs::write(
         paths.config_path(),
         "default_provider = \"smoke\"\n\n[defaults]\nsandbox = \"sandbox-exec\"\n",
@@ -146,7 +170,7 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     .expect("config");
     fs::write(
         workspace.join(".deadreckon/acceptance.yaml"),
-        gate_boundary_acceptance(paths.home()),
+        gate_boundary_acceptance(paths.home(), &host_secret, &outside_write),
     )
     .expect("acceptance");
     fs::write(workspace.join("README.md"), "gate boundary fixture\n").expect("readme");
@@ -162,6 +186,19 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     let launch = public_deadreckon()
         .current_dir(&workspace)
         .env("DEADRECKON_HOME", paths.home())
+        .env("HOME", &host_home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                shim_bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env(
+            "DEADRECKON_FAKE_SECRET",
+            "WATCHKEEPER_AMBIENT_SECRET_MUST_NOT_LEAK",
+        )
         .env(GATE_CONTAINED_ENV, "poisoned")
         .env(GATE_SANDBOX_BACKEND_ENV, "none")
         .args([
@@ -195,12 +232,15 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     assert_eq!(
         view.projection.outcome,
         Some(JobOutcome::NeedsReview),
-        "the deterministic gate should pass before the scripted semantic judge fails closed"
+        "the deterministic gate should pass before the scripted semantic judge fails closed\n\
+         view: {view:#?}\n\
+         supervisor stderr:\n{}",
+        fs::read_to_string(paths.job_dir(job_id).join("supervisor.err")).unwrap_or_default()
     );
     let state = load_run(&paths, job_id).expect("Job result run");
     assert!(
         gate_key_path(&paths, job_id).is_file(),
-        "the exact key-read probe must target real signing material"
+        "strict signing material must exist outside the evaluator-visible workspace"
     );
     let marker = validate_acceptance_marker(&state).expect("trusted gate marker");
     assert!(marker.is_native_gate_proof(), "{marker:#?}");
@@ -213,6 +253,35 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     assert!(
         marker.checks.iter().all(|check| check.passed),
         "{marker:#?}"
+    );
+    let authority_path = paths.job_authority(job_id);
+    let authority: JobAuthority =
+        serde_json::from_slice(&fs::read(&authority_path).expect("Job authority"))
+            .expect("Job authority JSON");
+    let observation =
+        validate_sandbox_boundary_observation(&paths, &state, &authority, "sandbox-exec")
+            .expect("controller-signed sandbox observation");
+    assert!(observation.contained);
+    assert!(observation.gate_key_read_denied);
+    assert!(observation.proof_write_denied);
+    assert!(observation.control_write_denied);
+    assert!(observation.operator_capture_write_denied);
+    assert!(observation.operator_capture_read_denied);
+    assert!(observation.signing_env_scrubbed);
+    assert_eq!(observation.sandbox_backend, marker.sandbox_backend);
+    let marker_json = serde_json::to_string(&marker).expect("marker JSON");
+    assert!(
+        !marker_json.contains("WATCHKEEPER_HOST_SECRET_MUST_NOT_LEAK")
+            && !marker_json.contains("WATCHKEEPER_AMBIENT_SECRET_MUST_NOT_LEAK"),
+        "host credentials or ambient secrets crossed into captured gate evidence: {marker_json}"
+    );
+    assert!(
+        !outside_write.exists(),
+        "the strict gate wrote outside the isolated workspace"
+    );
+    assert!(
+        !shim_sentinel.exists(),
+        "the sandbox backend was selected through ambient PATH"
     );
     assert!(
         !paths.job_receipt(job_id).exists(),
@@ -751,15 +820,21 @@ fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) {
 
 #[cfg(target_os = "macos")]
 fn sandbox_exec_available() -> bool {
-    Command::new("sandbox-exec")
+    Command::new("/usr/bin/sandbox-exec")
         .args(["-p", "(version 1)\n(allow default)", "--", "/usr/bin/true"])
         .status()
         .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "macos")]
-fn gate_boundary_acceptance(deadreckon_home: &Path) -> String {
+fn gate_boundary_acceptance(
+    deadreckon_home: &Path,
+    host_secret: &Path,
+    outside_write: &Path,
+) -> String {
     let deadreckon_home = shell_quote(deadreckon_home);
+    let host_secret = shell_quote(host_secret);
+    let outside_write = shell_quote(outside_write);
     format!(
         r#"name: sandbox gate boundary shell test
 checks:
@@ -768,31 +843,26 @@ checks:
       set -eu
       test -z "${{{contained}+present}}"
       test -z "${{{backend}+present}}"
+      test -z "${{DEADRECKON_FAKE_SECRET+present}}"
       deadreckon_home={deadreckon_home}
-      job_control=$(find "$deadreckon_home/jobs" -mindepth 2 -maxdepth 2 -name job.json -print)
-      test "$(printf '%s\n' "$job_control" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
-      job_dir=$(dirname "$job_control")
-      run_id=$(basename "$job_dir")
-      run_root=$(find "$deadreckon_home/runstate" -type d -path "*/runs/$run_id" -print -quit)
-      test -n "$run_root"
-      gate_key="$deadreckon_home/gate-keys/$run_id.key"
-      gate_control="$run_root/gate/forged"
-      proof_control="$run_root/proofs/turn-acceptance.json"
+      host_secret={host_secret}
+      outside_write={outside_write}
       git_control="$PWD/.git"
-      test -f "$job_control"
-      test -d "$run_root/gate"
       test -f "$git_control"
-      if cat "$gate_key" >/dev/null 2>&1; then exit 31; fi
-      if printf tampered >>"$job_control"; then exit 32; fi
-      if printf tampered >>"$gate_control"; then exit 33; fi
-      if printf forged >"$proof_control"; then exit 34; fi
-      if printf tampered >>"$git_control"; then exit 35; fi
+      if find "$deadreckon_home/gate-keys" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 31; fi
+      if find "$deadreckon_home/jobs" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 32; fi
+      if find "$deadreckon_home/runstate" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 33; fi
+      if printf tampered >>"$git_control"; then exit 34; fi
+      if cat "$host_secret" >/dev/null 2>&1; then exit 35; fi
+      if printf escaped >"$outside_write"; then exit 36; fi
       (sleep 1; printf escaped >"$PWD/delayed-gate-sentinel") </dev/null >/dev/null 2>&1 &
     cwd: "{{working_dir}}"
 "#,
         contained = GATE_CONTAINED_ENV,
         backend = GATE_SANDBOX_BACKEND_ENV,
         deadreckon_home = deadreckon_home,
+        host_secret = host_secret,
+        outside_write = outside_write,
     )
 }
 

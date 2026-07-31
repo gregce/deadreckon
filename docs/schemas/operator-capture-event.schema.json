@@ -1,0 +1,160 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OperatorCaptureEvent",
+  "description": "One authenticated append-only capture fact.",
+  "type": "object",
+  "required": [
+    "binding_sha256",
+    "causation_id",
+    "content_bytes",
+    "content_sha256",
+    "event_id",
+    "job_id",
+    "kind",
+    "phase",
+    "provenance",
+    "schema_version",
+    "sequence",
+    "session_id",
+    "signature",
+    "source",
+    "subject",
+    "timestamp"
+  ],
+  "properties": {
+    "binding_sha256": {
+      "type": "string"
+    },
+    "causation_id": {
+      "type": "string"
+    },
+    "content_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "content_sha256": {
+      "type": "string"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/definitions/OperatorCaptureEventKind"
+    },
+    "phase": {
+      "$ref": "#/definitions/OperatorCapturePhase"
+    },
+    "previous_event_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "provenance": {
+      "$ref": "#/definitions/OperatorCaptureProvenance"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "sequence": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 1.0
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    },
+    "source": {
+      "$ref": "#/definitions/OperatorCaptureSource"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "OperatorCaptureEventKind": {
+      "description": "Factual kind of a trusted capture event.",
+      "type": "string",
+      "enum": [
+        "session_prepared",
+        "evidence_captured",
+        "operator_attestation",
+        "intervention_recorded",
+        "cleanup_recorded",
+        "result_finalized"
+      ]
+    },
+    "OperatorCapturePhase": {
+      "description": "Operator-capture phase, kept separate from Job lifecycle state.",
+      "type": "string",
+      "enum": [
+        "prepared",
+        "before",
+        "intervention",
+        "after",
+        "cleanup",
+        "finalized"
+      ]
+    },
+    "OperatorCaptureProvenance": {
+      "description": "Strength and origin of the captured fact.",
+      "type": "string",
+      "enum": [
+        "trusted_supervisor",
+        "public_deadreckon",
+        "authoritative_host",
+        "operator_attested"
+      ]
+    },
+    "OperatorCaptureSource": {
+      "description": "Closed source vocabulary. Only `ManualFile` accepts a caller-provided path.",
+      "type": "string",
+      "enum": [
+        "binding",
+        "job_view",
+        "job_events",
+        "job_intervention",
+        "job_cleanup",
+        "job",
+        "authority",
+        "launch_plan",
+        "lease",
+        "job_report",
+        "receipt",
+        "supervised_child",
+        "host_boot_id",
+        "semantic_judgment",
+        "parent_repair_manifest",
+        "parent_repair_candidate",
+        "doctor",
+        "supervisor_service_status",
+        "parent_artifact",
+        "parent_events",
+        "campaign",
+        "campaign_events",
+        "active_plan",
+        "active_plan_events",
+        "sandbox_boundary_observation",
+        "campaign_intervention",
+        "result_envelope",
+        "manual_file",
+        "unavailable_objective"
+      ]
+    }
+  }
+}

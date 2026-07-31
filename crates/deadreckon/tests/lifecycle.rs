@@ -558,6 +558,84 @@ async fn extend_creates_new_run_with_parent_artifacts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_extend_queues_one_parent_bound_durable_job() {
+    let temp = repo_tempdir();
+    let (paths, parent) = completed_parent(&temp, "durable extend parent");
+    let server = MockServer::start(extend_script()).await;
+    write_config(paths.home(), &server.base_url());
+
+    let output = deadreckon(&paths)
+        .current_dir(&parent.cwd)
+        .arg("extend")
+        .arg(&parent.run_id)
+        .arg("durable follow-up")
+        .arg("--provider")
+        .arg("mock")
+        .arg("--sandbox")
+        .arg("auto")
+        .arg("--max-spend")
+        .arg("1")
+        .arg("--no-docs")
+        .arg("--yes")
+        .output()
+        .expect("durable extend");
+
+    assert_success(&output);
+    let mut job_ids = fs::read_dir(paths.jobs_dir())
+        .expect("jobs")
+        .map(|entry| {
+            entry
+                .expect("job entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    job_ids.sort();
+    assert_eq!(job_ids.len(), 1, "{}", stdout(&output));
+    let job_id = &job_ids[0];
+    let job = deadreckon_core::load_job(&paths, job_id).expect("durable continuation Job");
+    assert_eq!(job.shape, deadreckon_protocol::JobShape::Single);
+    assert_eq!(job.goal, "durable follow-up");
+    let launch: serde_json::Value = serde_json::from_slice(
+        &fs::read(paths.job_launch_plan(job_id)).expect("launch plan bytes"),
+    )
+    .expect("launch plan");
+    let continuation = &launch["signals"]["watchkeeper_leaf"]["continuation"];
+    let tagged_sha256 = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .and_then(|digest| digest.strip_prefix("sha256:"))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    };
+    assert_eq!(job.scope.as_str(), parent.scope.as_str());
+    assert_eq!(
+        continuation["parent_run_id"],
+        serde_json::Value::String(parent.run_id.clone())
+    );
+    assert_eq!(
+        continuation["parent_scope"],
+        serde_json::Value::String(parent.scope.clone())
+    );
+    assert!(
+        tagged_sha256(&continuation["parent_state_sha256"]),
+        "{launch:#}"
+    );
+    assert!(
+        tagged_sha256(&continuation["parent_library_tree_sha256"]),
+        "{launch:#}"
+    );
+
+    let _ = deadreckon(&paths)
+        .arg("kill")
+        .arg(job_id)
+        .arg("--force")
+        .output();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extend_pre_populates_history_with_parent_summary() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "extend history parent");
@@ -650,7 +728,8 @@ async fn extend_locks_correctly_against_concurrent_extension() {
     )
     .expect("lock");
 
-    let output = deadreckon(&paths)
+    let output = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"))
+        .env("DEADRECKON_HOME", paths.home())
         .arg("extend")
         .arg(&parent.run_id)
         .arg("blocked by lock")
@@ -727,6 +806,7 @@ async fn extend_in_worktree_chains_branches() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -795,6 +875,7 @@ async fn extend_worktree_after_apply_cleanup_recovers_from_library_record() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -856,6 +937,7 @@ async fn extend_in_copy_unchanged_from_today() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -904,6 +986,7 @@ async fn extend_in_in_place_refuses_with_run_hint() {
         .arg("--smoke")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--yes")
@@ -927,7 +1010,7 @@ async fn extend_in_in_place_refuses_with_run_hint() {
     assert_eq!(stderr.matches("\nRecommended\n").count(), 1, "{stderr}");
     assert!(
         stderr.contains(
-            "Recommended\ndeadreckon run --in-place --i-know-its-a-lot \"in-place child\""
+            "Recommended\ndeadreckon run --in-place --i-know-its-a-lot --untrusted \"in-place child\""
         ),
         "{stderr}"
     );
@@ -1406,6 +1489,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -1451,6 +1535,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-hints")
@@ -1485,6 +1570,7 @@ async fn run_completion_prints_lifecycle_hints_and_no_hints_suppresses() {
         .arg("mock")
         .arg("--sandbox")
         .arg("none")
+        .arg("--untrusted")
         .arg("--max-spend")
         .arg("1")
         .arg("--no-docs")
@@ -2220,6 +2306,7 @@ fn run_copies_project_acceptance_spec_into_run_root() {
             "--smoke",
             "--sandbox",
             "none",
+            "--untrusted",
             "--max-spend",
             "1",
             "--yes",
@@ -2385,9 +2472,19 @@ fn finish_in_place_run_has_one_primary_action_and_demoted_secondary_actions() {
 }
 
 #[test]
-fn resume_completed_run_surface_has_one_noop_recommendation() {
+fn public_resume_of_unowned_legacy_run_refuses_without_state_mutation() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "resume completed parent");
+    let state_before = fs::read(parent.state_path()).expect("state before refused resume");
+    let mut run_root_before = fs::read_dir(&parent.run_root)
+        .expect("run root before refused resume")
+        .map(|entry| {
+            entry
+                .expect("run root entry before refused resume")
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    run_root_before.sort();
 
     let output = deadreckon(&paths)
         .arg("resume")
@@ -2395,19 +2492,29 @@ fn resume_completed_run_surface_has_one_noop_recommendation() {
         .output()
         .expect("resume completed");
 
-    assert_success(&output);
-    let stdout = stdout(&output);
-    assert!(stdout.starts_with("no-op run "), "{stdout}");
-    assert!(stdout.contains("Explanation"), "{stdout}");
-    assert!(stdout.contains("Evidence"), "{stdout}");
-    assert_eq!(stdout.matches("\nRecommended\n").count(), 1, "{stdout}");
+    assert!(!output.status.success());
+    let stderr = stderr(&output);
     assert_eq!(
-        stdout
-            .matches(&format!("deadreckon show {}", &parent.run_id[..8]))
-            .count(),
-        1,
-        "{stdout}"
+        fs::read(parent.state_path()).expect("state after refused resume"),
+        state_before
     );
+    let mut run_root_after = fs::read_dir(&parent.run_root)
+        .expect("run root after refused resume")
+        .map(|entry| {
+            entry
+                .expect("run root entry after refused resume")
+                .file_name()
+        })
+        .collect::<Vec<_>>();
+    run_root_after.sort();
+    assert_eq!(run_root_after, run_root_before);
+    assert!(stderr.contains("public resume is retired"), "{stderr}");
+    assert!(stderr.contains("no Run state was changed"), "{stderr}");
+    assert!(stderr.contains("no provider was started"), "{stderr}");
+    assert!(stderr.contains("deadreckon start"), "{stderr}");
+    assert!(stderr.contains("--mode run"), "{stderr}");
+    assert!(stderr.contains("--from"), "{stderr}");
+    assert!(stderr.contains("--yes"), "{stderr}");
 }
 
 #[test]
@@ -3162,7 +3269,8 @@ fn git_ref_exists(cwd: &std::path::Path, reference: &str) -> bool {
 }
 
 fn extend_command(paths: &DeadreckonPaths, parent: &PipelineState, goal: &str) -> Command {
-    let mut command = deadreckon(paths);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"));
+    command.env("DEADRECKON_HOME", paths.home());
     command
         .arg("extend")
         .arg(&parent.run_id)

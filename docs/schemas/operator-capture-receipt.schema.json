@@ -1,0 +1,133 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OperatorCaptureReceipt",
+  "description": "Final authenticated summary of a complete capture history and result.",
+  "type": "object",
+  "required": [
+    "binding_sha256",
+    "event_count",
+    "final_event_sha256",
+    "issued_at",
+    "job_id",
+    "result_bytes",
+    "result_sha256",
+    "schema_version",
+    "session_id",
+    "signature",
+    "status"
+  ],
+  "properties": {
+    "binding_sha256": {
+      "type": "string"
+    },
+    "completion_lineage": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OperatorCaptureCompletionLineage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "event_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "final_event_sha256": {
+      "type": "string"
+    },
+    "issued_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "result_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "result_sha256": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/definitions/OperatorCaptureStatus"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "OperatorCaptureCompletionLineage": {
+      "description": "Exact validated completion identity sealed into a passed capture receipt.",
+      "type": "object",
+      "required": [
+        "authority_sha256",
+        "completion_receipt_sha256",
+        "contract_sha256",
+        "effective_policy_sha256",
+        "launch_plan_sha256",
+        "result_tree_sha256",
+        "source_tree_sha256"
+      ],
+      "properties": {
+        "authority_sha256": {
+          "type": "string"
+        },
+        "completion_receipt_sha256": {
+          "type": "string"
+        },
+        "contract_sha256": {
+          "type": "string"
+        },
+        "effective_policy_sha256": {
+          "type": "string"
+        },
+        "launch_plan_sha256": {
+          "type": "string"
+        },
+        "result_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result_tree_sha256": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_tree_sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperatorCaptureStatus": {
+      "type": "string",
+      "enum": [
+        "passed",
+        "failed",
+        "inconclusive",
+        "not_run"
+      ]
+    }
+  }
+}

@@ -1,6 +1,6 @@
 use chrono::Utc;
 use deadreckon_core::{
-    DeadreckonPaths, PhaseId, PhaseStatus, RunOptions, create_run, load_run, promote_completed_run,
+    DeadreckonPaths, PhaseId, PhaseStatus, RunOptions, create_run, promote_completed_run,
     save_state, write_acceptance_marker,
 };
 use std::process::Command;
@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{assert_success, deadreckon, stderr, stdout};
+use common::{deadreckon, stderr, stdout};
 
 fn workdir(temp: &TempDir) -> std::path::PathBuf {
     let work = temp.path().join("work");
@@ -336,10 +336,11 @@ fn promoted_run_with_file(
 }
 
 #[test]
-fn campaign_repair_promotes_failed_campaign_without_conflicts() {
+fn campaign_repair_refuses_an_unowned_legacy_campaign_without_mutation() {
     use deadreckon_core::campaign::{
-        Campaign, CampaignStatus, SubGoalStatus, build_rollup, build_sub_goals, read_campaign,
-        write_campaign, write_campaign_rollup,
+        Campaign, CampaignStatus, SubGoalStatus, build_rollup, build_sub_goals,
+        campaign_path_for_plan_dir, rollup_path_for_plan_dir, write_campaign,
+        write_campaign_rollup,
     };
     use deadreckon_core::plan::PlanProviders;
 
@@ -381,6 +382,10 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
         )
     });
     write_campaign_rollup(&campaign_dir, &rollup).expect("write rollup");
+    let campaign_before =
+        std::fs::read(campaign_path_for_plan_dir(&campaign_dir)).expect("campaign before");
+    let rollup_before =
+        std::fs::read(rollup_path_for_plan_dir(&campaign_dir)).expect("rollup before");
 
     let output = deadreckon(&paths)
         .current_dir(&work)
@@ -388,67 +393,23 @@ fn campaign_repair_promotes_failed_campaign_without_conflicts() {
         .output()
         .expect("repair campaign");
     assert!(
-        output.status.success(),
-        "{}{}",
-        stdout(&output),
-        stderr(&output)
-    );
-
-    let repaired = read_campaign(&campaign_dir).expect("read repaired campaign");
-    assert_eq!(repaired.status, CampaignStatus::Merged);
-    let result_run_id = repaired.merged_run_id.expect("merged run id");
-    let result = load_run(&paths, &result_run_id).expect("load result");
-    let library = paths.library_dir(&result.scope, &result.run_id);
-    assert_eq!(
-        std::fs::read_to_string(library.join("src/billing.rs")).expect("billing"),
-        "billing"
-    );
-    assert_eq!(
-        std::fs::read_to_string(library.join("src/notify.rs")).expect("notify"),
-        "notify"
-    );
-    assert!(
-        library.join(".deadreckon/codebase.json").is_file(),
-        "campaign promotion must retain lifecycle metadata for verified apply and cleanup"
-    );
-
-    let output = deadreckon(&paths)
-        .current_dir(&work)
-        .args(["apply", &result_run_id[..8], "--no-confirm", "--cleanup"])
-        .output()
-        .expect("apply campaign result");
-    assert_success(&output);
-    assert_eq!(
-        std::fs::read_to_string(work.join("src/billing.rs")).expect("applied billing"),
-        "billing"
-    );
-    assert_eq!(
-        std::fs::read_to_string(work.join("src/notify.rs")).expect("applied notify"),
-        "notify"
-    );
-
-    let output = deadreckon(&paths)
-        .current_dir(&work)
-        .args(["campaign", "repair", &campaign.campaign_id, "--plain"])
-        .output()
-        .expect("repair merged campaign");
-    assert!(
         !output.status.success(),
-        "merged campaign repair should refuse: {}{}",
+        "legacy campaign repair should refuse: {}{}",
         stdout(&output),
         stderr(&output)
     );
     let err = stderr(&output);
-    assert!(err.starts_with("no-op campaign"), "{err}");
-    assert!(err.contains("Explanation\n"), "{err}");
-    assert!(err.contains("Evidence\n"), "{err}");
-    assert_eq!(err.matches("\nRecommended\n").count(), 1, "{err}");
-    assert!(
-        err.contains(&format!(
-            "Recommended\ndeadreckon apply {}",
-            &result_run_id[..8]
-        )),
-        "{err}"
+    assert_eq!(
+        std::fs::read(campaign_path_for_plan_dir(&campaign_dir)).expect("campaign after"),
+        campaign_before
     );
-    assert!(!err.contains("try:"), "{err}");
+    assert_eq!(
+        std::fs::read(rollup_path_for_plan_dir(&campaign_dir)).expect("rollup after"),
+        rollup_before
+    );
+    assert!(err.contains("has no durable Job owner"), "{err}");
+    assert!(
+        !paths.job_json(&campaign.campaign_id).exists(),
+        "the refusal must not synthesize durable ownership"
+    );
 }

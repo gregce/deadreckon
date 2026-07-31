@@ -1239,7 +1239,7 @@ fn app_server_launch_command(spec: &CodexAppServerSpec) -> Result<AppServerLaunc
 
 fn app_server_sandbox_mode(workspace_access: WorkspaceAccess) -> &'static str {
     match workspace_access {
-        WorkspaceAccess::ReadWrite => "workspace-write",
+        WorkspaceAccess::ReadWrite | WorkspaceAccess::Disposable => "workspace-write",
         WorkspaceAccess::ReadOnly => "read-only",
     }
 }
@@ -1621,7 +1621,12 @@ mod tests {
         })
         .expect("launch");
 
-        assert_eq!(launch.program, PathBuf::from("sandbox-exec"));
+        assert_eq!(
+            launch.program,
+            PathBuf::from("/usr/bin/sandbox-exec")
+                .canonicalize()
+                .expect("system sandbox-exec")
+        );
         let profile = launch
             .args
             .windows(2)

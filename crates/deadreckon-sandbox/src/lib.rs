@@ -37,9 +37,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    #[cfg(target_os = "macos")]
     use super::ProtectedPathPolicy;
-    #[cfg(target_os = "macos")]
     use deadreckon_core::DeadreckonPaths;
 
     use super::{
@@ -227,6 +225,117 @@ mod tests {
             assert!(command.args.iter().any(|arg| arg == "--network"));
             assert!(command.args.iter().any(|arg| arg == "none"));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DEADRECKON_LIVE_DOCKER_TEST=1 and an operational Docker daemon"]
+    async fn live_docker_denies_control_tampering_and_gate_inputs() {
+        assert_eq!(
+            std::env::var("DEADRECKON_LIVE_DOCKER_TEST").as_deref(),
+            Ok("1"),
+            "set DEADRECKON_LIVE_DOCKER_TEST=1 to acknowledge the live Docker trial"
+        );
+        let target = std::env::current_dir().expect("cwd").join("target");
+        std::fs::create_dir_all(&target).expect("target");
+        let temp = tempfile::Builder::new()
+            .prefix("watchkeeper-live-docker-")
+            .tempdir_in(target)
+            .expect("docker trial tempdir");
+        let workspace = temp.path().join("workspace");
+        let paths = DeadreckonPaths::from_home(workspace.join(".deadreckon"));
+        let run_root = paths.run_root("project", "run-1");
+        let key = paths.home().join("gate-keys/run-1.key");
+        let job = paths.job_json("run-1");
+        let proof = run_root.join("proofs/turn-acceptance.json");
+        let gate = run_root.join("gate/forged-marker.json");
+        let git_control = workspace.join(".git/config");
+        let deliverable = workspace.join("deliverable.txt");
+        for directory in [
+            key.parent().expect("key parent"),
+            job.parent().expect("job parent"),
+            proof.parent().expect("proof parent"),
+            gate.parent().expect("gate parent"),
+            git_control.parent().expect("git parent"),
+        ] {
+            std::fs::create_dir_all(directory).expect("control directory");
+        }
+        for (path, value) in [
+            (&key, "real-key"),
+            (&job, "real-job"),
+            (&proof, "real-proof"),
+            (&gate, "real-gate"),
+            (&git_control, "real-git"),
+            (&deliverable, "before"),
+        ] {
+            std::fs::write(path, value).expect("control fixture");
+        }
+
+        let boundary = ProtectedPathPolicy::for_paths(&paths);
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::Docker;
+        spec.cwd = workspace;
+        spec.allow_network = false;
+        spec.read_denylist = boundary.read_denylist;
+        spec.write_denylist = boundary.write_denylist;
+        for (name, path) in [
+            ("DR_DOCKER_KEY", &key),
+            ("DR_DOCKER_JOB", &job),
+            ("DR_DOCKER_PROOF", &proof),
+            ("DR_DOCKER_GATE", &gate),
+            ("DR_DOCKER_GIT", &git_control),
+            ("DR_DOCKER_DELIVERABLE", &deliverable),
+        ] {
+            spec.env
+                .insert(name.to_string(), path.to_string_lossy().into_owned());
+        }
+        for (name, value) in [
+            (deadreckon_core::GATE_KEY_ENV, "must-not-cross"),
+            (deadreckon_core::GATE_CONTAINED_ENV, "true"),
+            (deadreckon_core::GATE_SANDBOX_BACKEND_ENV, "docker"),
+        ] {
+            spec.env.insert(name.to_string(), value.to_string());
+        }
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(
+                r#"set -eu
+test ! -e "$DR_DOCKER_KEY"
+if printf tampered >"$DR_DOCKER_JOB" 2>/dev/null; then exit 31; fi
+if printf forged >"$DR_DOCKER_PROOF" 2>/dev/null; then exit 32; fi
+if printf forged >"$DR_DOCKER_GATE" 2>/dev/null; then exit 33; fi
+if printf tampered >"$DR_DOCKER_GIT" 2>/dev/null; then exit 34; fi
+test -z "${DEADRECKON_GATE_KEY-}"
+test -z "${DEADRECKON_GATE_CONTAINED-}"
+test -z "${DEADRECKON_GATE_SANDBOX_BACKEND-}"
+test "$(wc -l </proc/net/route | tr -d ' ')" = "1"
+printf changed >"$DR_DOCKER_DELIVERABLE"
+printf docker-boundary-ok"#,
+            ),
+        ];
+
+        let output = run(spec).await.expect("live Docker boundary");
+        assert_eq!(output.backend, SandboxBackend::Docker, "{output:?}");
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+        assert_eq!(output.stdout, "docker-boundary-ok", "{output:?}");
+        for (path, expected) in [
+            (&key, "real-key"),
+            (&job, "real-job"),
+            (&proof, "real-proof"),
+            (&gate, "real-gate"),
+            (&git_control, "real-git"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(path).expect("control fixture after Docker"),
+                expected,
+                "{} was changed by the Docker worker",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&deliverable).expect("deliverable"),
+            "changed",
+            "the Docker boundary denied the ordinary workspace write as well as control writes"
+        );
     }
 
     #[test]

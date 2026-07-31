@@ -25,6 +25,9 @@ use crate::gate::{
 };
 use crate::job::{JobHistory, load_job, read_job_history, reduce_job_history};
 use crate::paths::DeadreckonPaths;
+use crate::sandbox_observation::{
+    sandbox_boundary_observation_sha256, validate_sandbox_boundary_observation,
+};
 use crate::state::{PipelineState, atomic_write_json};
 use crate::{
     CodebaseMode, WorkspacePathClass, classify_workspace_path, read_trusted_codebase_record,
@@ -178,6 +181,7 @@ pub fn seal_completion_receipt(
     verify_authority_inputs(&job, authority, &authority_path, &launch_path, state)?;
     let result_revision = validate_worktree_result_boundary(state, authority, None)?;
     let result_tree_sha256 = result_tree_hash(state)?;
+    validate_sandbox_boundary_observation(paths, state, authority, &marker.sandbox_backend)?;
     let mut receipt = CompletionReceipt {
         schema_version: JobSchemaVersion::CURRENT,
         job_id: authority.job_id.clone(),
@@ -198,6 +202,10 @@ pub fn seal_completion_receipt(
         result_revision: result_revision.or_else(|| current_git_revision(&state.working_dir)),
         deterministic_marker_sha256: sha256_file(&marker_path)?,
         semantic_judgment_sha256: sha256_file(&semantic_path)?,
+        sandbox_boundary_observation_sha256: sandbox_boundary_observation_sha256(
+            paths,
+            authority.job_id.as_ref(),
+        )?,
         contained: marker.contained,
         sandbox_backend: marker.sandbox_backend.clone(),
         signature: String::new(),
@@ -243,6 +251,13 @@ pub fn validate_completion_receipt(
     let job = load_job(paths, &state.run_id)?;
     verify_authority_inputs(&job, &authority, &authority_path, &launch_path, state)?;
     validate_worktree_result_boundary(state, &authority, Some(&receipt))?;
+    validate_sandbox_boundary_observation(paths, state, &authority, &receipt.sandbox_backend)?;
+    require_digest(
+        &receipt.sandbox_boundary_observation_sha256,
+        &sandbox_boundary_observation_sha256(paths, &state.run_id)?,
+        "sandbox boundary observation",
+        &state.run_id,
+    )?;
     require_digest(
         &receipt.authority_sha256,
         &sha256_file(&authority_path)?,
@@ -1715,7 +1730,8 @@ mod tests {
     use deadreckon_protocol::{
         AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent,
         JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId,
-        SemanticDecision, SemanticJudgeMode, SemanticJudgment,
+        SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
+        SemanticJudgeMode, SemanticJudgment,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1859,18 +1875,60 @@ mod tests {
             &judgment,
         )
         .expect("judgment");
-        Fixture {
+        let fixture = Fixture {
             _temp: temp,
             paths,
             state,
             authority,
             marker,
             judgment,
-        }
+        };
+        seal_boundary_observation(&fixture);
+        fixture
     }
 
     fn fixture() -> Fixture {
         fixture_with_contract("name: result\nchecks:\n  - file_exists: result.txt\n")
+    }
+
+    fn seal_boundary_observation(fixture: &Fixture) {
+        let observation = SandboxBoundaryObservation {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: fixture.authority.job_id.clone(),
+            run_id: fixture.authority.run_id.clone(),
+            observed_at: Utc::now(),
+            issuer: SandboxBoundaryObservationIssuer::DeadreckonController,
+            probe_id: Uuid::new_v4().to_string(),
+            attempt: 1,
+            outer_launch_id: Uuid::new_v4().to_string(),
+            authority_sha256: sha256_file(
+                &fixture
+                    .paths
+                    .job_authority(fixture.authority.job_id.as_ref()),
+            )
+            .expect("authority digest"),
+            contract_sha256: fixture.authority.contract_sha256.clone(),
+            result_tree_sha256: crate::sandbox_boundary_result_tree_sha256(&fixture.state)
+                .expect("result tree"),
+            sandbox_requested: fixture.authority.sandbox_requested.clone(),
+            sandbox_backend: "sandbox-exec".to_string(),
+            contained: true,
+            gate_key_read_denied: true,
+            proof_write_denied: true,
+            control_write_denied: true,
+            operator_capture_read_denied: true,
+            operator_capture_write_denied: true,
+            signing_env_scrubbed: true,
+            probe_sha256: sha256_text("fixed controller probe"),
+            signature: String::new(),
+        };
+        crate::seal_sandbox_boundary_observation(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &observation,
+        )
+        .expect("sandbox boundary observation");
     }
 
     struct RepairFixture {
@@ -2146,6 +2204,7 @@ mod tests {
             AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("repair-aware marker");
+        seal_boundary_observation(fixture);
     }
 
     #[test]
@@ -2466,6 +2525,7 @@ mod tests {
         job.authority_sha256 =
             sha256_file(&fixture.paths.job_authority("job-1")).expect("authority digest");
         atomic_write_json(&fixture.paths.job_json("job-1"), &job).expect("updated job");
+        seal_boundary_observation(&fixture);
         fixture
     }
 
@@ -2505,6 +2565,55 @@ mod tests {
             validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
             receipt
         );
+    }
+
+    #[test]
+    fn receipt_revalidates_missing_mutated_and_symlinked_sandbox_observation() {
+        let fixture = fixture();
+        seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect("seal");
+        let path = fixture
+            .paths
+            .job_sandbox_boundary_observation(fixture.authority.job_id.as_ref());
+        let original = fs::read(&path).expect("observation bytes");
+
+        fs::remove_file(&path).expect("remove observation");
+        validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("missing observation must invalidate receipt");
+        fs::write(&path, &original).expect("restore observation");
+        validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect("restored observation validates");
+
+        let mut changed = original.clone();
+        changed.push(b'\n');
+        fs::write(&path, changed).expect("mutate observation bytes");
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("byte mutation must invalidate receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox boundary observation digest changed")
+        );
+        fs::write(&path, &original).expect("restore observation");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = path.with_extension("copy.json");
+            fs::write(&target, &original).expect("observation copy");
+            fs::remove_file(&path).expect("remove observation");
+            symlink(&target, &path).expect("observation symlink");
+            let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+                .expect_err("symlink observation must invalidate receipt");
+            assert!(error.to_string().contains("non-symlink"));
+        }
     }
 
     #[test]

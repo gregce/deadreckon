@@ -519,6 +519,8 @@ fn cross_sub_file_conflict_accepts_synthesized_repair() {
             preserve: Vec::new(),
         }],
         repair_goal: None,
+        planner_spend_usd: 0.0,
+        planner_wall_seconds: 0.0,
     };
 
     validate_merge_repair_plan(

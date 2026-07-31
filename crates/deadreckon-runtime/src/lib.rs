@@ -36,6 +36,6 @@ pub use semantic_judge::{
 };
 pub use turn_loop::{
     GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
-    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_deterministic_completion_gate,
-    run_parent_repair_turn_loop, run_turn_loop,
+    RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, run_contained_verdict_evaluation,
+    run_deterministic_completion_gate, run_parent_repair_turn_loop, run_turn_loop,
 };

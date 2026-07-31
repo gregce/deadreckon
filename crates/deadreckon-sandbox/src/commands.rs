@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::backend::{Result, SandboxBackend, resolve_backend};
+use crate::backend::{Result, SandboxBackend, backend_executable, resolve_backend};
 use crate::policy::ProtectedPathPolicy;
 use crate::spec::{SandboxSpec, WorkspaceAccess};
 
@@ -25,15 +25,17 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
     // REPORT.md: Disposable Sandboxes are selected per run and degrade to an
     // explicit unsafe warning only when requested or unsupported.
     let (backend, warning) = resolve_backend(spec.backend)?;
-    if spec.workspace_access == WorkspaceAccess::ReadOnly && backend == SandboxBackend::None {
+    if spec.workspace_access != WorkspaceAccess::ReadWrite && backend == SandboxBackend::None {
         return Err(crate::SandboxError::ReadOnlyUnavailable(
             spec.backend.to_string(),
         ));
     }
     match backend {
-        SandboxBackend::SandboxExec => sandbox_exec_command(spec, warning),
-        SandboxBackend::Bwrap => bwrap_command(spec, warning),
-        SandboxBackend::Docker => Ok(docker_command(spec, warning)),
+        SandboxBackend::SandboxExec => {
+            sandbox_exec_command(spec, backend_executable(backend)?, warning)
+        }
+        SandboxBackend::Bwrap => bwrap_command(spec, backend_executable(backend)?, warning),
+        SandboxBackend::Docker => Ok(docker_command(spec, backend_executable(backend)?, warning)),
         SandboxBackend::None => Ok(SandboxCommand {
             backend,
             program: spec.program.clone(),
@@ -53,13 +55,24 @@ pub fn build_command(spec: &SandboxSpec) -> Result<SandboxCommand> {
 
 fn with_protected_boundary(spec: &SandboxSpec) -> SandboxSpec {
     let mut effective = spec.clone();
+    for forbidden in [
+        deadreckon_core::GATE_KEY_ENV,
+        deadreckon_core::GATE_CONTAINED_ENV,
+        deadreckon_core::GATE_SANDBOX_BACKEND_ENV,
+    ] {
+        effective.env.remove(forbidden);
+    }
     let mut boundary = ProtectedPathPolicy::discover();
     boundary.protect_workspace_git_control(&spec.cwd);
     boundary.merge_into(&mut effective.read_denylist, &mut effective.write_denylist);
     effective
 }
 
-fn sandbox_exec_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxCommand> {
+fn sandbox_exec_command(
+    spec: &SandboxSpec,
+    wrapper: PathBuf,
+    warning: Option<String>,
+) -> Result<SandboxCommand> {
     let profile = sandbox_exec_profile(spec)?;
     let mut args = vec![
         OsString::from("-p"),
@@ -70,7 +83,7 @@ fn sandbox_exec_command(spec: &SandboxSpec, warning: Option<String>) -> Result<S
     args.extend(spec.args.clone());
     Ok(SandboxCommand {
         backend: SandboxBackend::SandboxExec,
-        program: OsString::from("sandbox-exec"),
+        program: wrapper.into_os_string(),
         args,
         env: spec.env.clone(),
         cwd: spec.cwd.clone(),
@@ -78,7 +91,11 @@ fn sandbox_exec_command(spec: &SandboxSpec, warning: Option<String>) -> Result<S
     })
 }
 
-fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxCommand> {
+fn bwrap_command(
+    spec: &SandboxSpec,
+    wrapper: PathBuf,
+    warning: Option<String>,
+) -> Result<SandboxCommand> {
     let cwd = spec.cwd.to_string_lossy().to_string();
     let read_mounts = system_read_allowlist(&spec.cwd, &spec.read_allowlist);
     let sandbox_home = match spec.workspace_access {
@@ -87,6 +104,17 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
             std::fs::create_dir_all(&path)?;
             path
         }
+        WorkspaceAccess::Disposable => spec
+            .env
+            .get("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .ok_or_else(|| {
+                crate::SandboxError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "disposable bubblewrap evaluation requires an existing absolute HOME",
+                ))
+            })?,
         WorkspaceAccess::ReadOnly => PathBuf::from("/tmp/.deadreckon-home"),
     };
     let mut args = vec![
@@ -146,7 +174,7 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
     args.extend(spec.args.clone());
     Ok(SandboxCommand {
         backend: SandboxBackend::Bwrap,
-        program: OsString::from("bwrap"),
+        program: wrapper.into_os_string(),
         args,
         env: spec.env.clone(),
         cwd: spec.cwd.clone(),
@@ -154,7 +182,7 @@ fn bwrap_command(spec: &SandboxSpec, warning: Option<String>) -> Result<SandboxC
     })
 }
 
-fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> SandboxCommand {
+fn docker_command(spec: &SandboxSpec, wrapper: PathBuf, warning: Option<String>) -> SandboxCommand {
     let cwd = spec.cwd.to_string_lossy().to_string();
     let mut args = vec![
         "run".into(),
@@ -168,6 +196,41 @@ fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> SandboxCommand
         "-w".into(),
         cwd.into(),
     ];
+    let mut mounted = vec![spec.cwd.clone()];
+    for path in spec
+        .read_allowlist
+        .iter()
+        .filter(|path| path.is_absolute() && path.exists() && !path.starts_with(&spec.cwd))
+    {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if mounted
+            .iter()
+            .any(|root| canonical == *root || canonical.starts_with(root))
+        {
+            continue;
+        }
+        let rendered = canonical.to_string_lossy();
+        args.push("--mount".into());
+        args.push(format!("type=bind,source={rendered},destination={rendered},readonly").into());
+        mounted.push(canonical);
+    }
+    for path in spec
+        .write_allowlist
+        .iter()
+        .filter(|path| path.is_absolute() && path.exists() && !path.starts_with(&spec.cwd))
+    {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if mounted
+            .iter()
+            .any(|root| canonical == *root || canonical.starts_with(root))
+        {
+            continue;
+        }
+        let rendered = canonical.to_string_lossy();
+        args.push("--mount".into());
+        args.push(format!("type=bind,source={rendered},destination={rendered}").into());
+        mounted.push(canonical);
+    }
     if !spec.allow_network {
         args.push("--network".into());
         args.push("none".into());
@@ -176,13 +239,13 @@ fn docker_command(spec: &SandboxSpec, warning: Option<String>) -> SandboxCommand
         args.push("-e".into());
         args.push(format!("{key}={value}").into());
     }
-    append_docker_protected_mounts(&mut args, spec);
+    append_docker_protected_mounts(&mut args, spec, &mounted);
     args.push("rust:1".into());
     args.push(spec.program.clone());
     args.extend(spec.args.clone());
     SandboxCommand {
         backend: SandboxBackend::Docker,
-        program: OsString::from("docker"),
+        program: wrapper.into_os_string(),
         args,
         env: BTreeMap::new(),
         cwd: spec.cwd.clone(),
@@ -217,15 +280,26 @@ fn append_bwrap_protected_mounts(
     }
 }
 
-fn append_docker_protected_mounts(args: &mut Vec<OsString>, spec: &SandboxSpec) {
+fn append_docker_protected_mounts(
+    args: &mut Vec<OsString>,
+    spec: &SandboxSpec,
+    exposed: &[PathBuf],
+) {
     for path in &spec.read_denylist {
-        if path.starts_with(&spec.cwd) {
+        if path.exists() && path_is_exposed(path, exposed) {
             args.push("--mount".into());
-            args.push(format!("type=tmpfs,destination={}", path.to_string_lossy()).into());
+            let rendered = path.to_string_lossy();
+            if path.is_dir() {
+                args.push(format!("type=tmpfs,destination={rendered}").into());
+            } else {
+                args.push(
+                    format!("type=bind,source=/dev/null,destination={rendered},readonly").into(),
+                );
+            }
         }
     }
     for path in &spec.write_denylist {
-        if spec.read_denylist.contains(path) || !path.exists() || !path.starts_with(&spec.cwd) {
+        if spec.read_denylist.contains(path) || !path.exists() || !path_is_exposed(path, exposed) {
             continue;
         }
         let path = path.to_string_lossy();
@@ -250,15 +324,19 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     } else {
         "(deny network*)".to_string()
     };
-    let mut read_rules = String::new();
-    for path in system_read_allowlist(&spec.cwd, &spec.read_allowlist) {
-        read_rules.push_str(&format!(
-            "    (subpath \"{}\")\n",
-            escape_seatbelt_path(&path)
-        ));
-    }
+    let read_rules = seatbelt_read_rules(&system_read_allowlist(&spec.cwd, &spec.read_allowlist));
+    let mut writable_paths = vec![spec.cwd.clone()];
+    writable_paths.extend(spec.write_allowlist.iter().cloned());
+    writable_paths.extend(
+        writable_paths
+            .clone()
+            .into_iter()
+            .filter_map(|path| path.canonicalize().ok()),
+    );
+    writable_paths.sort();
+    writable_paths.dedup();
     let mut write_rules = String::new();
-    for path in &spec.write_allowlist {
+    for path in &writable_paths {
         write_rules.push_str(&format!(
             "    (subpath \"{}\")\n",
             escape_seatbelt_path(path)
@@ -293,21 +371,28 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
             ));
         }
     }
+    let default_posture = if spec.workspace_access == WorkspaceAccess::Disposable {
+        "(deny default)\n(allow process*)\n(allow mach-lookup)\n(allow sysctl-read)"
+    } else {
+        "(allow default)"
+    };
+    let file_read_policy = format!("(allow file-read*\n{read_rules})");
+    let host_temp_writes = if spec.workspace_access == WorkspaceAccess::Disposable {
+        String::new()
+    } else {
+        "    (subpath \"/private/tmp\")\n    (subpath \"/tmp\")\n".to_string()
+    };
     let profile = format!(
         "(version 1)
-(allow default)
+{default_posture}
 {network}
-(allow file-read*
-{read_rules})
+{file_read_policy}
 (allow file-write*
-    (subpath \"{}\")
-    (subpath \"/private/tmp\")
-    (subpath \"/tmp\")
+{host_temp_writes}
 {write_rules})
 {ssh_deny}
 {read_deny_rules}{write_deny_rules}
-",
-        escape_seatbelt_path(&spec.cwd)
+"
     );
     if let Some(profile_dir) = spec.profile_dir.as_ref() {
         std::fs::create_dir_all(profile_dir)?;
@@ -316,17 +401,44 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     Ok(profile)
 }
 
+fn seatbelt_read_rules(paths: &[PathBuf]) -> String {
+    let mut literal_paths = std::collections::BTreeSet::new();
+    for path in paths {
+        literal_paths.extend(path.ancestors().map(Path::to_path_buf));
+    }
+    let mut rules = String::new();
+    for path in literal_paths {
+        rules.push_str(&format!(
+            "    (literal \"{}\")\n",
+            escape_seatbelt_path(&path)
+        ));
+    }
+    for path in paths {
+        rules.push_str(&format!(
+            "    (subpath \"{}\")\n",
+            escape_seatbelt_path(path)
+        ));
+    }
+    rules
+}
+
 fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = vec![
         PathBuf::from("/bin"),
         PathBuf::from("/sbin"),
         PathBuf::from("/usr"),
         PathBuf::from("/System"),
+        PathBuf::from("/System/Volumes/Preboot/Cryptexes"),
         PathBuf::from("/Library"),
         PathBuf::from("/Applications"),
         PathBuf::from("/opt/homebrew"),
         PathBuf::from("/opt/local"),
         PathBuf::from("/dev"),
+        PathBuf::from("/etc"),
+        PathBuf::from("/private/etc"),
+        PathBuf::from("/private/var/db/dyld"),
+        PathBuf::from("/var/db/dyld"),
+        PathBuf::from("/private/var/select"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/tmp"),
         cwd.to_path_buf(),
@@ -336,6 +448,9 @@ fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     }
     paths.extend(extra.iter().cloned());
     paths.extend(extra.iter().filter_map(|path| path.canonicalize().ok()));
+    paths.retain(|path| path.exists());
+    paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -364,7 +479,10 @@ mod tests {
 
     use deadreckon_core::DeadreckonPaths;
 
-    use super::{bwrap_command, docker_command, sandbox_exec_profile, with_protected_boundary};
+    use super::{
+        bwrap_command, docker_command, sandbox_exec_profile, system_read_allowlist,
+        with_protected_boundary,
+    };
     use crate::{ProtectedPathPolicy, SandboxBackend, SandboxSpec, WorkspaceAccess};
     use tempfile::TempDir;
 
@@ -399,13 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn disposable_seatbelt_is_deny_by_default_with_one_writable_workspace() {
+        let mut spec = read_only_spec(SandboxBackend::SandboxExec);
+        spec.workspace_access = WorkspaceAccess::Disposable;
+        spec.write_allowlist.push(spec.cwd.clone());
+        let profile = sandbox_exec_profile(&spec).expect("profile");
+
+        assert!(profile.contains("(deny default)"), "{profile}");
+        assert!(!profile.contains("(allow default)"), "{profile}");
+        assert!(profile.contains("(subpath \"/work/project\")"), "{profile}");
+        let write_policy = profile
+            .split_once("(allow file-write*")
+            .expect("write policy")
+            .1
+            .split_once("(deny file-read*")
+            .map_or(profile.as_str(), |(policy, _)| policy);
+        assert!(!write_policy.contains("(subpath \"/tmp\")"), "{profile}");
+        assert!(
+            !write_policy.contains("(subpath \"/private/tmp\")"),
+            "{profile}"
+        );
+    }
+
+    #[test]
     fn read_only_bwrap_mounts_workspace_ro() {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("project");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let mut spec = read_only_spec(SandboxBackend::Bwrap);
         spec.cwd = workspace.clone();
-        let command = bwrap_command(&spec, None).expect("command");
+        let command = bwrap_command(&spec, PathBuf::from("/usr/bin/bwrap"), None).expect("command");
         assert!(!workspace.join(".deadreckon-home").exists());
         let args = command
             .args
@@ -427,7 +568,7 @@ mod tests {
     #[test]
     fn read_only_docker_mounts_workspace_ro() {
         let spec = read_only_spec(SandboxBackend::Docker);
-        let command = docker_command(&spec, None);
+        let command = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
         let args = command
             .args
             .iter()
@@ -436,6 +577,74 @@ mod tests {
         assert!(
             args.windows(2)
                 .any(|parts| parts == ["-v", "/work/project:/work/project:ro"])
+        );
+    }
+
+    #[test]
+    fn docker_mounts_gate_inputs_read_only_and_runtime_scratch_writable() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let run_root = temp.path().join("run-root");
+        let gate_bin = temp.path().join("gate-bin");
+        let runtime = temp.path().join("runtime");
+        for directory in [&workspace, &run_root, &gate_bin, &runtime] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let mut spec = read_only_spec(SandboxBackend::Docker);
+        spec.cwd = workspace;
+        spec.workspace_access = WorkspaceAccess::Disposable;
+        spec.read_allowlist = vec![run_root.clone(), gate_bin.clone()];
+        spec.write_allowlist = vec![runtime.clone()];
+
+        let command = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for path in [&run_root, &gate_bin] {
+            let path = path.canonicalize().expect("canonical read mount");
+            let rendered = path.to_string_lossy();
+            assert!(
+                args.iter().any(|arg| {
+                    arg == &format!("type=bind,source={rendered},destination={rendered},readonly")
+                }),
+                "missing read-only Docker mount for {rendered}: {args:?}"
+            );
+        }
+        let runtime = runtime.canonicalize().expect("canonical runtime");
+        let rendered = runtime.to_string_lossy();
+        assert!(
+            args.iter().any(|arg| {
+                arg == &format!("type=bind,source={rendered},destination={rendered}")
+            }),
+            "missing writable Docker runtime mount for {rendered}: {args:?}"
+        );
+    }
+
+    #[test]
+    fn native_mount_inventory_omits_nonexistent_host_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("not-present");
+        let mounts = system_read_allowlist(temp.path(), std::slice::from_ref(&missing));
+        assert!(!mounts.contains(&missing), "{mounts:?}");
+        assert!(mounts.iter().all(|path| path.exists()), "{mounts:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn production_wrapper_is_an_absolute_trusted_system_executable() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut spec = read_only_spec(SandboxBackend::SandboxExec);
+        spec.cwd = temp.path().to_path_buf();
+        let command = super::build_command(&spec).expect("sandbox command");
+        assert!(PathBuf::from(&command.program).is_absolute(), "{command:?}");
+        assert_eq!(
+            PathBuf::from(&command.program),
+            PathBuf::from("/usr/bin/sandbox-exec")
+                .canonicalize()
+                .expect("system sandbox-exec"),
+            "{command:?}"
         );
     }
 
@@ -451,11 +660,46 @@ mod tests {
         let spec = with_protected_boundary(&read_only_spec(SandboxBackend::SandboxExec));
         let paths = DeadreckonPaths::discover();
         assert!(spec.read_denylist.contains(&paths.home().join("gate-keys")));
+        assert!(spec.read_denylist.contains(&paths.operator_captures_dir()));
         assert!(spec.write_denylist.contains(&paths.jobs_dir()));
+        assert!(spec.write_denylist.contains(&paths.operator_captures_dir()));
         assert!(
             spec.write_denylist
                 .contains(&PathBuf::from("/work/project/.git"))
         );
+    }
+
+    #[test]
+    fn docker_serialization_cannot_reintroduce_gate_signing_inputs() {
+        let mut spec = read_only_spec(SandboxBackend::Docker);
+        for (name, value) in [
+            (deadreckon_core::GATE_KEY_ENV, "must-not-cross"),
+            (deadreckon_core::GATE_CONTAINED_ENV, "true"),
+            (deadreckon_core::GATE_SANDBOX_BACKEND_ENV, "sandbox-exec"),
+        ] {
+            spec.env.insert(name.to_string(), value.to_string());
+        }
+
+        let protected = with_protected_boundary(&spec);
+        let command = docker_command(&protected, PathBuf::from("/usr/bin/docker"), None);
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for forbidden in [
+            deadreckon_core::GATE_KEY_ENV,
+            deadreckon_core::GATE_CONTAINED_ENV,
+            deadreckon_core::GATE_SANDBOX_BACKEND_ENV,
+            "must-not-cross",
+        ] {
+            assert!(
+                !command.env.keys().any(|name| name == forbidden)
+                    && args.iter().all(|arg| !arg.contains(forbidden)),
+                "{forbidden} crossed the Docker command boundary: {command:?}"
+            );
+        }
     }
 
     #[test]
@@ -498,9 +742,16 @@ mod tests {
 
         let profile = sandbox_exec_profile(&spec).expect("profile");
         let key_store = paths.home().join("gate-keys").display().to_string();
+        let operator_captures = paths.operator_captures_dir().display().to_string();
         let proofs = run_root.join("proofs").display().to_string();
         assert!(profile.contains(&format!("(deny file-read* (literal \"{key_store}\"))")));
         assert!(profile.contains(&format!("(deny file-write* (literal \"{key_store}\"))")));
+        assert!(profile.contains(&format!(
+            "(deny file-read* (literal \"{operator_captures}\"))"
+        )));
+        assert!(profile.contains(&format!(
+            "(deny file-write* (literal \"{operator_captures}\"))"
+        )));
         assert!(profile.contains(&format!("(deny file-write* (literal \"{proofs}\"))")));
         assert!(!profile.contains(&format!("(deny file-read* (literal \"{proofs}\"))")));
     }
@@ -513,6 +764,7 @@ mod tests {
         let run_root = paths.run_root("project", "run-1");
         std::fs::create_dir_all(paths.home().join("gate-keys")).expect("keys");
         std::fs::create_dir_all(paths.jobs_dir()).expect("jobs");
+        std::fs::create_dir_all(paths.operator_captures_dir()).expect("operator captures");
         std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
         let policy = ProtectedPathPolicy::for_paths(&paths);
         let mut spec = read_only_spec(SandboxBackend::Bwrap);
@@ -521,7 +773,7 @@ mod tests {
         spec.read_denylist = policy.read_denylist;
         spec.write_denylist = policy.write_denylist;
 
-        let bwrap = bwrap_command(&spec, None).expect("bwrap");
+        let bwrap = bwrap_command(&spec, PathBuf::from("/usr/bin/bwrap"), None).expect("bwrap");
         let bwrap_args = bwrap
             .args
             .iter()
@@ -529,6 +781,7 @@ mod tests {
             .collect::<Vec<_>>();
         let key_store = paths.home().join("gate-keys").display().to_string();
         let jobs = paths.jobs_dir().display().to_string();
+        let operator_captures = paths.operator_captures_dir().display().to_string();
         assert!(
             bwrap_args
                 .windows(2)
@@ -539,9 +792,14 @@ mod tests {
                 .windows(3)
                 .any(|parts| parts == ["--ro-bind", &jobs, &jobs])
         );
+        assert!(
+            bwrap_args
+                .windows(2)
+                .any(|parts| parts == ["--tmpfs", &operator_captures])
+        );
 
         spec.backend = SandboxBackend::Docker;
-        let docker = docker_command(&spec, None);
+        let docker = docker_command(&spec, PathBuf::from("/usr/bin/docker"), None);
         let docker_args = docker
             .args
             .iter()
@@ -556,6 +814,11 @@ mod tests {
             docker_args.iter().any(|arg| {
                 arg == &format!("type=bind,source={jobs},destination={jobs},readonly")
             })
+        );
+        assert!(
+            docker_args
+                .iter()
+                .any(|arg| { arg == &format!("type=tmpfs,destination={operator_captures}") })
         );
     }
 }

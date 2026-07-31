@@ -19,6 +19,7 @@
     "result_tree_sha256",
     "run_id",
     "sandbox_backend",
+    "sandbox_boundary_observation_sha256",
     "schema_version",
     "semantic_judgment_sha256",
     "signature",
@@ -76,6 +77,9 @@
       "type": "string"
     },
     "sandbox_backend": {
+      "type": "string"
+    },
+    "sandbox_boundary_observation_sha256": {
       "type": "string"
     },
     "schema_version": {

@@ -62,6 +62,8 @@
         "child_launch_prepared",
         "attempt_started",
         "child_linked",
+        "campaign_sub_authority_changed",
+        "repair_child_authority_changed",
         "attempt_stopped",
         "retry_scheduled",
         "deterministic_gate_passed",

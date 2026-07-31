@@ -85,7 +85,7 @@ verify-timed:
 
 smoke: build
 	rm -rf $(DEADRECKON_HOME)
-	DEADRECKON_HOME=$(DEADRECKON_HOME) $(BIN) run "tiny hello rust" --smoke --sandbox none --max-spend 1 --yes --fresh
+	DEADRECKON_HOME=$(DEADRECKON_HOME) $(BIN) run "tiny hello rust" --smoke --sandbox none --untrusted --max-spend 1 --yes --fresh
 	DEADRECKON_HOME=$(DEADRECKON_HOME) $(BIN) list
 
 doctor: build

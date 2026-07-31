@@ -5,14 +5,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use deadreckon_protocol::{JobAuthority, RunEvent, RunEventKind, SpendRecord, TraceRecord};
+use deadreckon_protocol::{
+    JobAuthority, JobSchemaVersion, RunEvent, RunEventKind, SandboxBoundaryObservation,
+    SandboxBoundaryObservationIssuer, SpendRecord, TraceRecord,
+};
 use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::{
     GuardedLaunchSpec, ProtectedPathPolicy, SandboxBackend, SandboxSpec, ToolSandboxPolicy,
-    WorkspaceAccess, run as run_sandbox,
+    WorkspaceAccess, resolve_backend, run as run_sandbox,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -2693,15 +2697,54 @@ pub async fn run_deterministic_completion_gate(
             "deterministic completion gate cancelled before evaluation".to_string(),
         ));
     }
-    let gate = gate_binary_path()?;
     let paths = paths_for_state(state)?;
     let strict_job = paths.job_json(&state.run_id).is_file();
-    let (pid_file, guarded_launch) = if strict_job {
-        let launch_owner = launch_owner.ok_or_else(|| {
+    let resolved_backend = if strict_job {
+        let (resolved, _) = resolve_backend(requested_backend).map_err(|error| {
+            DeadreckonError::InvalidInput(format!(
+                "strict gate requires an available sandbox backend ({error})"
+            ))
+        })?;
+        if resolved == SandboxBackend::None {
+            return Err(DeadreckonError::InvalidInput(
+                "strict gate requires an available containment backend".to_string(),
+            ));
+        }
+        resolved
+    } else {
+        requested_backend
+    };
+    let launch_owner = if strict_job {
+        Some(launch_owner.ok_or_else(|| {
             DeadreckonError::InvalidInput(
                 "strict gate is missing its durable outer launch identity".to_string(),
             )
-        })?;
+        })?)
+    } else {
+        None
+    };
+
+    // Default detection and contract persistence are trusted-controller work.
+    // The keyless evaluator is deliberately read-only outside `working_dir`
+    // and refuses to create or replace this approved input.
+    deadreckon_core::gate::compiled_acceptance_checks(&state.run_root, &state.working_dir)?;
+
+    let boundary_observation = if let Some(launch_owner) = launch_owner {
+        Some(
+            run_strict_sandbox_boundary_probe(
+                state,
+                &paths,
+                resolved_backend,
+                launch_owner,
+                cancellation_token,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let (pid_file, guarded_launch) = if let Some(launch_owner) = launch_owner {
+        let gate = gate_binary_path()?;
         let launch_id = Uuid::new_v4().to_string();
         (
             state.run_root.join("child-pids").join(format!(
@@ -2709,7 +2752,7 @@ pub async fn run_deterministic_completion_gate(
                 launch_owner.attempt
             )),
             Some(GuardedLaunchSpec {
-                program: gate.clone().into_os_string(),
+                program: gate.into_os_string(),
                 launch_id,
                 attempt: launch_owner.attempt,
                 owner_launch_id: Some(launch_owner.outer_launch_id.clone()),
@@ -2724,62 +2767,18 @@ pub async fn run_deterministic_completion_gate(
             None,
         )
     };
-    // Default detection and contract persistence are trusted-controller work.
-    // The keyless evaluator is deliberately read-only outside `working_dir`
-    // and refuses to create or replace this approved input.
-    deadreckon_core::gate::compiled_acceptance_checks(&state.run_root, &state.working_dir)?;
 
-    let mut boundary = ProtectedPathPolicy::for_paths(&paths);
-    boundary.protect_workspace_git_control(&state.working_dir);
-    let mut read_allowlist = vec![state.run_root.clone()];
-    if let Some(parent) = gate.parent() {
-        read_allowlist.push(parent.to_path_buf());
-    }
-    extend_gate_toolchain_reads(&mut read_allowlist);
-    read_allowlist.sort();
-    read_allowlist.dedup();
-    let evaluation = run_sandbox(SandboxSpec {
-        backend: requested_backend,
-        cwd: state.working_dir.clone(),
-        program: gate.clone().into_os_string(),
-        args: vec![
-            "evaluate".into(),
-            "--run".into(),
-            state.run_id.clone().into(),
-            "--run-root".into(),
-            state.run_root.clone().into_os_string(),
-            "--working-dir".into(),
-            state.working_dir.clone().into_os_string(),
-        ],
-        stdin: None,
-        env: BTreeMap::new(),
-        allow_network: false,
-        pid_file: Some(pid_file),
-        cancellation_token: cancellation_token.cloned(),
-        profile_dir: None,
-        read_allowlist,
-        write_allowlist: vec![state.working_dir.clone()],
-        read_denylist: boundary.read_denylist,
-        write_denylist: boundary.write_denylist,
-        network_allowlist: Vec::new(),
-        workspace_access: WorkspaceAccess::ReadWrite,
-        cleanup_process_group: strict_job,
+    let evaluation = run_keyless_gate_evaluation(
+        state,
+        &state.working_dir,
+        resolved_backend,
+        pid_file,
         guarded_launch,
-    })
-    .await
-    .map_err(|err| sandbox_error(&err))?;
-    if evaluation.status_code != Some(0) {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "sandboxed dr-gate evaluation failed: {}{}",
-            evaluation.stdout, evaluation.stderr
-        )));
-    }
-    let contained = evaluation.backend != SandboxBackend::None;
-    if !contained && strict_job {
-        return Err(DeadreckonError::InvalidInput(
-            "deterministic completion gate was not contained; strict Job proof refused".to_string(),
-        ));
-    }
+        strict_job,
+        strict_job,
+        cancellation_token,
+    )
+    .await?;
     if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
         return Err(DeadreckonError::InvalidInput(
             "deterministic completion gate cancelled before signing".to_string(),
@@ -2787,8 +2786,19 @@ pub async fn run_deterministic_completion_gate(
     }
 
     // Read the key only after the sandbox runner has reaped the evaluator and
-    // terminated residual descendants. The signing phase executes no
+    // terminated residual descendants. Both signing phases execute no
     // repository-controlled checks.
+    if let Some(observation) = boundary_observation.as_ref() {
+        let authority_path = paths.job_authority(&state.run_id);
+        let authority_raw = std::fs::read(&authority_path).with_path(&authority_path)?;
+        let authority: JobAuthority =
+            serde_json::from_slice(&authority_raw).map_err(|source| DeadreckonError::Json {
+                path: authority_path,
+                source,
+            })?;
+        deadreckon_core::seal_sandbox_boundary_observation(&paths, state, &authority, observation)?;
+    }
+    let gate = gate_binary_path()?;
     let gate_key = deadreckon_core::read_gate_key(&paths, &state.run_id)?;
     let encoded_key = deadreckon_core::encode_gate_key(&gate_key)?;
     let mut signer = std::process::Command::new(&gate);
@@ -2803,7 +2813,11 @@ pub async fn run_deterministic_completion_gate(
         .arg("--evaluation")
         .arg("-")
         .arg("--contained")
-        .arg(if contained { "true" } else { "false" })
+        .arg(if evaluation.contained {
+            "true"
+        } else {
+            "false"
+        })
         .arg("--sandbox-backend")
         .arg(evaluation.backend.to_string())
         .env(deadreckon_core::GATE_KEY_ENV, encoded_key)
@@ -2822,7 +2836,7 @@ pub async fn run_deterministic_completion_gate(
         .ok_or_else(|| {
             DeadreckonError::InvalidInput("dr-gate signer stdin is unavailable".to_string())
         })?
-        .write_all(evaluation.stdout.as_bytes())
+        .write_all(evaluation.raw_json.as_bytes())
         .with_path(&gate)?;
     let output = signer
         .wait_with_output()
@@ -2840,6 +2854,453 @@ pub async fn run_deterministic_completion_gate(
     Ok(())
 }
 
+const STRICT_SANDBOX_BOUNDARY_PROBE: &str = r#"set -eu
+if cat "$DR_BOUNDARY_GATE_KEY" >/dev/null 2>&1; then exit 31; fi
+if printf forged >"$DR_BOUNDARY_PROOF" 2>/dev/null; then exit 32; fi
+if printf tampered >"$DR_BOUNDARY_CONTROL" 2>/dev/null; then exit 33; fi
+if printf forged >"$DR_BOUNDARY_OPERATOR_CAPTURE" 2>/dev/null; then exit 34; fi
+if cat "$DR_BOUNDARY_OPERATOR_CAPTURE" >/dev/null 2>&1; then exit 35; fi
+test -z "${DEADRECKON_GATE_KEY+x}"
+test -z "${DEADRECKON_GATE_CONTAINED+x}"
+test -z "${DEADRECKON_GATE_SANDBOX_BACKEND+x}"
+printf deadreckon-sandbox-boundary-v1"#;
+const STRICT_SANDBOX_BOUNDARY_SUCCESS: &str = "deadreckon-sandbox-boundary-v1";
+
+async fn run_strict_sandbox_boundary_probe(
+    state: &PipelineState,
+    paths: &DeadreckonPaths,
+    resolved_backend: SandboxBackend,
+    launch_owner: &GateLaunchOwner,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<SandboxBoundaryObservation> {
+    if resolved_backend == SandboxBackend::None || resolved_backend == SandboxBackend::Auto {
+        return Err(DeadreckonError::InvalidInput(
+            "strict sandbox boundary probe requires one resolved containment backend".to_string(),
+        ));
+    }
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DeadreckonError::InvalidInput(
+            "strict sandbox boundary probe cancelled before launch".to_string(),
+        ));
+    }
+
+    let probe_id = Uuid::new_v4().to_string();
+    let proof_sentinel = state
+        .run_root
+        .join("proofs")
+        .join("sandbox-boundary-probes")
+        .join(format!("{probe_id}.proof"));
+    let control_sentinel = paths
+        .job_dir(&state.run_id)
+        .join("sandbox-boundary-probes")
+        .join(format!("{probe_id}.control"));
+    let operator_capture_sentinel = paths
+        .operator_captures_dir()
+        .join("sandbox-boundary-probes")
+        .join(&state.run_id)
+        .join(format!("{probe_id}.capture"));
+    let sentinel = format!("deadreckon-controller-probe:{probe_id}\n");
+    create_probe_sentinel(&proof_sentinel, sentinel.as_bytes())?;
+    create_probe_sentinel(&control_sentinel, sentinel.as_bytes())?;
+    create_probe_sentinel(&operator_capture_sentinel, sentinel.as_bytes())?;
+
+    let runtime = TempDir::new().with_path(PathBuf::from("sandbox-boundary-runtime"))?;
+    let mut env = BTreeMap::new();
+    let mut read_allowlist = vec![
+        state.run_root.clone(),
+        paths.job_dir(&state.run_id),
+        paths.home().join("gate-keys"),
+        paths.operator_captures_dir(),
+    ];
+    let mut write_allowlist = vec![state.working_dir.clone(), runtime.path().to_path_buf()];
+    prepare_strict_gate_environment(
+        &state.working_dir,
+        runtime.path(),
+        &mut env,
+        &mut read_allowlist,
+    )?;
+    for (name, path) in [
+        (
+            "DR_BOUNDARY_GATE_KEY",
+            deadreckon_core::gate_key_path(paths, &state.run_id),
+        ),
+        ("DR_BOUNDARY_PROOF", proof_sentinel.clone()),
+        ("DR_BOUNDARY_CONTROL", control_sentinel.clone()),
+        (
+            "DR_BOUNDARY_OPERATOR_CAPTURE",
+            operator_capture_sentinel.clone(),
+        ),
+    ] {
+        env.insert(name.to_string(), path.to_string_lossy().into_owned());
+    }
+    for (name, value) in [
+        (deadreckon_core::GATE_KEY_ENV, "must-not-cross"),
+        (deadreckon_core::GATE_CONTAINED_ENV, "must-not-cross"),
+        (deadreckon_core::GATE_SANDBOX_BACKEND_ENV, "must-not-cross"),
+    ] {
+        env.insert(name.to_string(), value.to_string());
+    }
+    read_allowlist.sort();
+    read_allowlist.dedup();
+    write_allowlist.sort();
+    write_allowlist.dedup();
+
+    let mut boundary = ProtectedPathPolicy::for_paths(paths);
+    boundary.protect_workspace_git_control(&state.working_dir);
+    let guard = gate_binary_path()?;
+    let probe_launch_id = Uuid::new_v4().to_string();
+    let pid_file = state.run_root.join("child-pids").join(format!(
+        "sandbox-boundary-probe-{}-{probe_launch_id}.json",
+        launch_owner.attempt
+    ));
+    let output = run_sandbox(SandboxSpec {
+        backend: resolved_backend,
+        cwd: state.working_dir.clone(),
+        program: OsString::from("/bin/sh"),
+        args: vec![
+            OsString::from("-c"),
+            OsString::from(STRICT_SANDBOX_BOUNDARY_PROBE),
+        ],
+        stdin: None,
+        env,
+        allow_network: false,
+        pid_file: Some(pid_file),
+        cancellation_token: cancellation_token.cloned(),
+        profile_dir: None,
+        read_allowlist,
+        write_allowlist,
+        read_denylist: boundary.read_denylist,
+        write_denylist: boundary.write_denylist,
+        network_allowlist: Vec::new(),
+        workspace_access: WorkspaceAccess::Disposable,
+        cleanup_process_group: true,
+        guarded_launch: Some(GuardedLaunchSpec {
+            program: guard.into_os_string(),
+            launch_id: probe_launch_id,
+            attempt: launch_owner.attempt,
+            owner_launch_id: Some(launch_owner.outer_launch_id.clone()),
+        }),
+    })
+    .await
+    .map_err(|error| sandbox_error(&error))?;
+
+    let proof_unchanged = read_probe_sentinel(&proof_sentinel)? == sentinel.as_bytes();
+    let control_unchanged = read_probe_sentinel(&control_sentinel)? == sentinel.as_bytes();
+    let operator_capture_unchanged =
+        read_probe_sentinel(&operator_capture_sentinel)? == sentinel.as_bytes();
+    if output.backend != resolved_backend
+        || output.status_code != Some(0)
+        || output.stdout != STRICT_SANDBOX_BOUNDARY_SUCCESS
+        || !proof_unchanged
+        || !control_unchanged
+        || !operator_capture_unchanged
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "strict sandbox boundary probe failed under {} with status {:?}: stdout: {} stderr: {}",
+            output.backend, output.status_code, output.stdout, output.stderr
+        )));
+    }
+
+    let authority_path = paths.job_authority(&state.run_id);
+    let authority_raw = std::fs::read(&authority_path).with_path(&authority_path)?;
+    let authority: JobAuthority =
+        serde_json::from_slice(&authority_raw).map_err(|source| DeadreckonError::Json {
+            path: authority_path.clone(),
+            source,
+        })?;
+    Ok(SandboxBoundaryObservation {
+        schema_version: JobSchemaVersion::CURRENT,
+        job_id: authority.job_id.clone(),
+        run_id: authority.run_id.clone(),
+        observed_at: Utc::now(),
+        issuer: SandboxBoundaryObservationIssuer::DeadreckonController,
+        probe_id,
+        attempt: launch_owner.attempt,
+        outer_launch_id: launch_owner.outer_launch_id.clone(),
+        authority_sha256: deadreckon_core::flight::sha256_file(&authority_path)?,
+        contract_sha256: deadreckon_core::flight::sha256_file(&acceptance_spec_path_for_run_root(
+            &state.run_root,
+        ))?,
+        result_tree_sha256: deadreckon_core::sandbox_boundary_result_tree_sha256(state)?,
+        sandbox_requested: authority.sandbox_requested,
+        sandbox_backend: output.backend.to_string(),
+        contained: true,
+        gate_key_read_denied: true,
+        proof_write_denied: proof_unchanged,
+        control_write_denied: control_unchanged,
+        operator_capture_read_denied: true,
+        operator_capture_write_denied: operator_capture_unchanged,
+        signing_env_scrubbed: true,
+        probe_sha256: deadreckon_core::flight::sha256_text(STRICT_SANDBOX_BOUNDARY_PROBE),
+        signature: String::new(),
+    })
+}
+
+fn create_probe_sentinel(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "sandbox boundary sentinel has no parent: {}",
+            path.display()
+        ))
+    })?;
+    std::fs::create_dir_all(parent).with_path(parent)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_path(path)?;
+    file.write_all(bytes).with_path(path)?;
+    file.sync_all().with_path(path)
+}
+
+fn read_probe_sentinel(path: &Path) -> Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path).with_path(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "sandbox boundary sentinel is not a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    std::fs::read(path).with_path(path)
+}
+
+#[derive(Debug)]
+struct KeylessGateEvaluation {
+    evaluation: deadreckon_core::GateEvaluation,
+    raw_json: String,
+    backend: SandboxBackend,
+    contained: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_keyless_gate_evaluation(
+    state: &PipelineState,
+    working_dir: &Path,
+    requested_backend: SandboxBackend,
+    pid_file: PathBuf,
+    guarded_launch: Option<GuardedLaunchSpec>,
+    cleanup_process_group: bool,
+    require_contained: bool,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<KeylessGateEvaluation> {
+    let gate = gate_binary_path()?;
+    let paths = paths_for_state(state)?;
+    let disposable_copy = require_contained && working_dir != state.working_dir;
+    let evaluation_runtime = if require_contained {
+        Some(
+            tempfile::Builder::new()
+                .prefix("deadreckon-gate-")
+                .tempdir()
+                .with_path(PathBuf::from("gate-runtime"))?,
+        )
+    } else {
+        None
+    };
+    let mut env = BTreeMap::new();
+    let mut boundary = ProtectedPathPolicy::for_paths(&paths);
+    boundary.protect_workspace_git_control(working_dir);
+    if disposable_copy {
+        protect_recorded_workspaces(&paths, state, working_dir, &mut boundary)?;
+    }
+    let mut read_allowlist = vec![state.run_root.clone()];
+    let mut write_allowlist = vec![working_dir.to_path_buf()];
+    if let Some(parent) = gate.parent() {
+        read_allowlist.push(parent.to_path_buf());
+    }
+    if let Some(runtime) = evaluation_runtime.as_ref() {
+        prepare_strict_gate_environment(
+            working_dir,
+            runtime.path(),
+            &mut env,
+            &mut read_allowlist,
+        )?;
+        read_allowlist.push(runtime.path().to_path_buf());
+        write_allowlist.push(runtime.path().to_path_buf());
+    } else {
+        extend_gate_toolchain_reads(&mut read_allowlist);
+    }
+    read_allowlist.sort();
+    read_allowlist.dedup();
+    write_allowlist.sort();
+    write_allowlist.dedup();
+    let output = run_sandbox(SandboxSpec {
+        backend: requested_backend,
+        cwd: working_dir.to_path_buf(),
+        program: gate.clone().into_os_string(),
+        args: vec![
+            "evaluate".into(),
+            "--run".into(),
+            state.run_id.clone().into(),
+            "--run-root".into(),
+            state.run_root.clone().into_os_string(),
+            "--working-dir".into(),
+            working_dir.to_path_buf().into_os_string(),
+        ],
+        stdin: None,
+        env,
+        allow_network: false,
+        pid_file: Some(pid_file),
+        cancellation_token: cancellation_token.cloned(),
+        profile_dir: None,
+        read_allowlist,
+        write_allowlist,
+        read_denylist: boundary.read_denylist,
+        write_denylist: boundary.write_denylist,
+        network_allowlist: Vec::new(),
+        workspace_access: if require_contained {
+            WorkspaceAccess::Disposable
+        } else {
+            WorkspaceAccess::ReadWrite
+        },
+        cleanup_process_group,
+        guarded_launch,
+    })
+    .await
+    .map_err(|err| sandbox_error(&err))?;
+    if output.status_code != Some(0) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "sandboxed dr-gate evaluation failed with status {:?} under {}: stdout: {} stderr: {}",
+            output.status_code, output.backend, output.stdout, output.stderr
+        )));
+    }
+    let contained = output.backend != SandboxBackend::None;
+    if !contained && require_contained {
+        return Err(DeadreckonError::InvalidInput(
+            "dr-gate evaluation was not contained; independent verification refused".to_string(),
+        ));
+    }
+    let evaluation: deadreckon_core::GateEvaluation = serde_json::from_str(&output.stdout)
+        .map_err(|source| DeadreckonError::Json {
+            path: PathBuf::from("dr-gate-evaluation-stdout"),
+            source,
+        })?;
+    deadreckon_core::validate_gate_evaluation_integrity(
+        &state.run_id,
+        &state.run_root,
+        working_dir,
+        &evaluation,
+    )?;
+    Ok(KeylessGateEvaluation {
+        evaluation,
+        raw_json: output.stdout,
+        backend: output.backend,
+        contained,
+    })
+}
+
+fn protect_recorded_workspaces(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    evaluated_working_dir: &Path,
+    boundary: &mut ProtectedPathPolicy,
+) -> Result<()> {
+    let evaluated = evaluated_working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| evaluated_working_dir.to_path_buf());
+    protect_workspace_except(&state.working_dir, &evaluated, boundary);
+    for entry in deadreckon_core::list_runs(paths, None)? {
+        let state = deadreckon_core::load_run(paths, &entry.run_id)?;
+        protect_workspace_except(&state.working_dir, &evaluated, boundary);
+    }
+    boundary.write_denylist.sort();
+    boundary.write_denylist.dedup();
+    Ok(())
+}
+
+fn protect_workspace_except(
+    workspace: &Path,
+    evaluated_working_dir: &Path,
+    boundary: &mut ProtectedPathPolicy,
+) {
+    let canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    if canonical != evaluated_working_dir {
+        boundary.write_denylist.push(workspace.to_path_buf());
+        boundary.write_denylist.push(canonical);
+    }
+}
+
+/// Re-run an ordinary Run's acceptance contract inside a disposable workspace.
+///
+/// Verdict evaluation is keyless and non-authoritative. It requires a real
+/// containment backend, protects every recorded Run workspace and control
+/// path, reaps descendants, and discards all repository-controlled writes.
+pub async fn run_contained_verdict_evaluation(
+    state: &PipelineState,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<deadreckon_core::GateEvaluation> {
+    if !state.working_dir.is_dir() {
+        return Err(DeadreckonError::NotFound(format!(
+            "working directory {}",
+            state.working_dir.display()
+        )));
+    }
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(DeadreckonError::InvalidInput(
+            "verdict evaluation cancelled before launch".to_string(),
+        ));
+    }
+    let contract = acceptance_spec_path_for_run_root(&state.run_root);
+    let metadata = std::fs::symlink_metadata(&contract).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            DeadreckonError::InvalidInput(format!(
+                "verdict requires an approved acceptance contract at {}; no check was run",
+                contract.display()
+            ))
+        } else {
+            DeadreckonError::Io {
+                path: contract.clone(),
+                source,
+            }
+        }
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "verdict requires a regular, non-symlink approved acceptance contract at {}; no check was run",
+            contract.display()
+        )));
+    }
+
+    let configured = state
+        .sandbox
+        .parse::<SandboxBackend>()
+        .map_err(|error| sandbox_error(&error))?;
+    let requested = if configured == SandboxBackend::None {
+        SandboxBackend::Auto
+    } else {
+        configured
+    };
+    let (resolved, _) = resolve_backend(requested).map_err(|error| {
+        DeadreckonError::InvalidInput(format!(
+            "verdict requires an available sandbox backend ({error}); no repository-controlled check was run"
+        ))
+    })?;
+    if resolved == SandboxBackend::None {
+        return Err(DeadreckonError::InvalidInput(
+            "verdict requires an available sandbox backend; no repository-controlled check was run"
+                .to_string(),
+        ));
+    }
+
+    let scratch = TempDir::new().with_path(PathBuf::from("verdict-scratch"))?;
+    let scratch_working_dir = scratch.path().join("workspace");
+    copy_tree(&state.working_dir, &scratch_working_dir)?;
+    let pid_file = scratch.path().join("dr-gate-evaluate.pid");
+    let result = run_keyless_gate_evaluation(
+        state,
+        &scratch_working_dir,
+        resolved,
+        pid_file,
+        None,
+        true,
+        true,
+        cancellation_token,
+    )
+    .await?;
+    Ok(result.evaluation)
+}
+
 fn extend_gate_toolchain_reads(read_allowlist: &mut Vec<PathBuf>) {
     for variable in ["CARGO_HOME", "RUSTUP_HOME"] {
         if let Some(path) = std::env::var_os(variable).map(PathBuf::from) {
@@ -2855,6 +3316,178 @@ fn extend_gate_toolchain_reads(read_allowlist: &mut Vec<PathBuf>) {
             read_allowlist.push(path);
         }
     }
+}
+
+fn prepare_strict_gate_environment(
+    working_dir: &Path,
+    runtime_root: &Path,
+    env: &mut BTreeMap<String, String>,
+    read_allowlist: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let isolated_home = runtime_root.join("home");
+    let isolated_tmp = runtime_root.join("tmp");
+    let isolated_cargo = runtime_root.join("cargo");
+    for directory in [&isolated_home, &isolated_tmp, &isolated_cargo] {
+        std::fs::create_dir_all(directory).with_path(directory)?;
+    }
+
+    for variable in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+        let value = if variable == "HOME" {
+            &isolated_home
+        } else {
+            &isolated_tmp
+        };
+        env.insert(variable.to_string(), value.to_string_lossy().into_owned());
+    }
+    env.insert(
+        "CARGO_HOME".to_string(),
+        isolated_cargo.to_string_lossy().into_owned(),
+    );
+    env.insert("LC_ALL".to_string(), "C".to_string());
+    env.insert("LANG".to_string(), "C".to_string());
+
+    let host_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let host_cargo = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| host_home.as_ref().map(|home| home.join(".cargo")));
+    let host_rustup = std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| host_home.as_ref().map(|home| home.join(".rustup")));
+
+    let mut path_entries = Vec::new();
+    for path in [
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/Library/Apple/usr/bin"),
+    ] {
+        push_existing_unique(&mut path_entries, path);
+    }
+    if let Some(cargo) = host_cargo.as_ref().filter(|path| path.is_dir()) {
+        let bin = cargo.join("bin");
+        push_existing_unique(&mut path_entries, bin.clone());
+        push_existing_unique(read_allowlist, bin);
+        for cache in ["registry", "git"] {
+            let source = cargo.join(cache);
+            if source.is_dir() {
+                link_gate_cache(&source, &isolated_cargo.join(cache))?;
+                push_existing_unique(read_allowlist, source);
+            }
+        }
+    }
+    if let Some(rustup) = host_rustup.as_ref().filter(|path| path.is_dir()) {
+        env.insert(
+            "RUSTUP_HOME".to_string(),
+            rustup.to_string_lossy().into_owned(),
+        );
+        push_existing_unique(read_allowlist, rustup.clone());
+    }
+    push_existing_unique(
+        &mut path_entries,
+        working_dir.join("node_modules").join(".bin"),
+    );
+    let path = std::env::join_paths(&path_entries).map_err(|error| {
+        DeadreckonError::InvalidInput(format!(
+            "strict gate could not construct a safe executable PATH: {error}"
+        ))
+    })?;
+    env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
+    configure_macos_strict_toolchain(env, read_allowlist);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_strict_toolchain(
+    env: &mut BTreeMap<String, String>,
+    read_allowlist: &mut Vec<PathBuf>,
+) {
+    // `/usr/bin/cc` and `/usr/bin/clang` are xcrun shims. Inside the strict
+    // Seatbelt profile they try to update a host-global cache below the Darwin
+    // user temp directory, which is intentionally not writable. Resolve the
+    // selected developer toolchain in the trusted controller and pass only
+    // stable, canonical paths into the disposable evaluator.
+    let Some(clang) = xcrun_path(&["--find", "clang"], false) else {
+        return;
+    };
+    let clang_value = clang.to_string_lossy().into_owned();
+    env.insert("CC".to_string(), clang_value.clone());
+    let cargo_linker = match std::env::consts::ARCH {
+        "aarch64" => Some("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"),
+        "x86_64" => Some("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER"),
+        _ => None,
+    };
+    if let Some(key) = cargo_linker {
+        env.insert(key.to_string(), clang_value);
+    }
+    push_existing_unique(read_allowlist, clang);
+
+    if let Some(clangxx) = xcrun_path(&["--find", "clang++"], false) {
+        env.insert("CXX".to_string(), clangxx.to_string_lossy().into_owned());
+        push_existing_unique(read_allowlist, clangxx);
+    }
+    if let Some(sdk_root) = xcrun_path(&["--show-sdk-path"], true) {
+        env.insert(
+            "SDKROOT".to_string(),
+            sdk_root.to_string_lossy().into_owned(),
+        );
+        push_existing_unique(read_allowlist, sdk_root);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_macos_strict_toolchain(
+    _env: &mut BTreeMap<String, String>,
+    _read_allowlist: &mut Vec<PathBuf>,
+) {
+}
+
+#[cfg(target_os = "macos")]
+fn xcrun_path(args: &[&str], directory: bool) -> Option<PathBuf> {
+    let output = std::process::Command::new("/usr/bin/xcrun")
+        .args(args)
+        .env_clear()
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 4096 {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let mut lines = text.lines();
+    let path = PathBuf::from(lines.next()?.trim());
+    if path.as_os_str().is_empty() || !path.is_absolute() || lines.next().is_some() {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    let metadata = std::fs::symlink_metadata(&canonical).ok()?;
+    if (directory && !metadata.file_type().is_dir())
+        || (!directory && !metadata.file_type().is_file())
+    {
+        return None;
+    }
+    Some(canonical)
+}
+
+fn push_existing_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.exists() && !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+#[cfg(unix)]
+fn link_gate_cache(source: &Path, destination: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(source, destination).with_path(destination)
+}
+
+#[cfg(not(unix))]
+fn link_gate_cache(_source: &Path, _destination: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3770,13 +4403,19 @@ fn commit_worktree_turn_inner(
                 .to_string(),
         )
     })?;
+    refuse_external_git_filters(state, base_sha, &control)?;
     let trusted_head = trusted_head_for_turn(state, turn, base_sha, &control)?;
     // Provider-created commits and index entries are not accepted
     // capabilities. Always rebuild the index from the trusted pre-provider
     // head, while retaining filesystem edits as untrusted input for
     // DeadReckon's own filtered commit. Resetting the whole index also avoids
     // addressing provider-chosen paths through a lossy string conversion.
-    trusted_git_status(&control, &["reset", "--mixed", &trusted_head])?;
+    // `--no-refresh` is a defense in depth: the default refresh can execute a
+    // clean filter while comparing racy worktree timestamps.
+    trusted_git_status(
+        &control,
+        &["reset", "--mixed", "--no-refresh", &trusted_head],
+    )?;
     let branch = record.branch_name.as_deref().ok_or_else(|| {
         DeadreckonError::InvalidInput(
             "worktree codebase record is missing branch_name; refusing detached delivery"
@@ -3787,7 +4426,6 @@ fn commit_worktree_turn_inner(
     trusted_git_status(&control, &["update-ref", &branch_ref, &trusted_head])?;
     trusted_git_status(&control, &["symbolic-ref", "HEAD", &branch_ref])?;
     sanitize_evidence_only_paths(state, turn, base_sha, &control)?;
-    refuse_filtered_deliverables(state, &control)?;
     let mut add_args = vec!["add", "-A", "--", "."];
     add_args.extend_from_slice(delivery_git_exclude_pathspecs());
     trusted_git_status(&control, &add_args)?;
@@ -4042,9 +4680,29 @@ fn refuse_gitlinks(control: &TrustedGitControl) -> Result<()> {
     )))
 }
 
-fn refuse_filtered_deliverables(state: &PipelineState, control: &TrustedGitControl) -> Result<()> {
-    let index = deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)?;
-    let input = git_path_input(index.files.keys())?;
+fn refuse_external_git_filters(
+    state: &PipelineState,
+    base_sha: &str,
+    control: &TrustedGitControl,
+) -> Result<()> {
+    // This check must precede reset, restore, add, or any other Git command
+    // which can convert worktree content. `check-attr` only resolves metadata;
+    // it does not execute the configured clean, smudge, or process command.
+    let current = deadreckon_core::flight::build_workspace_guard_file_index(&state.working_dir)?;
+    let mut paths = current.files.into_keys().collect::<BTreeSet<_>>();
+    let base_tree = trusted_git_output(
+        control,
+        &["ls-tree", "-r", "--name-only", "-z", base_sha, "--"],
+    )?;
+    if !base_tree.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved-base Git attribute inventory failed: {}{}",
+            String::from_utf8_lossy(&base_tree.stdout),
+            String::from_utf8_lossy(&base_tree.stderr)
+        )));
+    }
+    paths.extend(nul_separated_paths(&base_tree.stdout)?);
+    let input = git_path_input(paths.iter())?;
     if input.is_empty() {
         return Ok(());
     }
@@ -4076,7 +4734,7 @@ fn refuse_filtered_deliverables(state: &PipelineState, control: &TrustedGitContr
         return Ok(());
     }
     Err(DeadreckonError::InvalidInput(format!(
-        "strict result applies external Git filter attributes to deliverables: {}; refusing to execute mutable clean or smudge commands",
+        "strict result applies external Git filter attributes to workspace or approved-base paths: {}; refusing to execute mutable clean, smudge, or process commands",
         display_git_paths(&filtered)
     )))
 }
@@ -4350,6 +5008,34 @@ mod tests {
         assert!(GateLaunchOwner::new(0, uuid::Uuid::new_v4().to_string()).is_err());
         assert!(GateLaunchOwner::new(1, "not-a-launch-id").is_err());
         assert!(GateLaunchOwner::new(1, uuid::Uuid::new_v4().to_string()).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_macos_gate_uses_controller_resolved_toolchain_paths() {
+        let mut env = std::collections::BTreeMap::new();
+        let mut read_allowlist = Vec::new();
+
+        super::configure_macos_strict_toolchain(&mut env, &mut read_allowlist);
+
+        let clang = PathBuf::from(env.get("CC").expect("controller resolves clang"));
+        assert!(clang.is_absolute());
+        assert!(clang.is_file());
+        assert_ne!(clang, PathBuf::from("/usr/bin/cc"));
+        assert_ne!(clang, PathBuf::from("/usr/bin/clang"));
+        assert!(read_allowlist.contains(&clang));
+
+        let linker_key = match std::env::consts::ARCH {
+            "aarch64" => "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER",
+            "x86_64" => "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER",
+            other => panic!("unexpected macOS architecture {other}"),
+        };
+        assert_eq!(env.get(linker_key), env.get("CC"));
+
+        let sdk_root = PathBuf::from(env.get("SDKROOT").expect("controller resolves SDK"));
+        assert!(sdk_root.is_absolute());
+        assert!(sdk_root.is_dir());
+        assert!(read_allowlist.contains(&sdk_root));
     }
 
     fn base_run_loop_config() -> RunLoopConfig {

@@ -13,7 +13,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use deadreckon_core::{DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock};
+use deadreckon_core::{DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock, boot_identity};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -28,6 +28,7 @@ const SERVICE_LOCK_TASK: &str = "supervisor-service";
 const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
 const SERVICE_INSTANCE_DIR: &str = "supervisor";
 const SERVICE_INSTANCE_FILE: &str = "instance.json";
+const SERVICE_STATUS_SCHEMA: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Both variants are rendered and tested on each supported host.
@@ -65,6 +66,7 @@ pub(crate) enum MachineRestartPosture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServiceInstanceCheckpoint {
     schema_version: u32,
     generation: u64,
@@ -74,6 +76,89 @@ struct ServiceInstanceCheckpoint {
     started_at: DateTime<Utc>,
     binary: PathBuf,
     deadreckon_home: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceManager {
+    Launchd,
+    Systemd,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceInstallationState {
+    Unsupported,
+    NotInstalled,
+    Stale,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BootIdentitySource {
+    TestOverride,
+    LinuxProcfs,
+    MacosSysctl,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootIdentityObservation {
+    current_boot_id: String,
+    source: BootIdentitySource,
+    test_override: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ServiceManagerRuntime {
+    loaded: Option<bool>,
+    enabled: Option<String>,
+    active: Option<String>,
+}
+
+impl ServiceManagerRuntime {
+    fn is_running(&self) -> bool {
+        self.loaded == Some(true) || self.active.as_deref() == Some("active")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SupervisorServiceStatusReport {
+    schema_version: u32,
+    manager: ServiceManager,
+    installed: ServiceInstallationState,
+    loaded: Option<bool>,
+    enabled: Option<String>,
+    active: Option<String>,
+    checkpoint: Option<ServiceInstanceCheckpoint>,
+    current_boot_id: String,
+    boot_identity_source: BootIdentitySource,
+    /// Live evidence consumers must refuse reports produced with the test-only
+    /// `DEADRECKON_BOOT_ID` override.
+    test_override: bool,
+}
+
+/// Fail-closed admission rule for any consumer turning status JSON into a
+/// live machine-reboot claim. Status itself still renders these fields so an
+/// operator can diagnose the environment without accidentally accepting it.
+#[allow(dead_code)] // The live-trial consumer is intentionally wired separately.
+pub(crate) fn validate_supervisor_service_live_evidence(
+    report: &SupervisorServiceStatusReport,
+) -> Result<()> {
+    if report.test_override || report.boot_identity_source == BootIdentitySource::TestOverride {
+        return Err(invalid_input(
+            "supervisor status used the test-only boot identity override and cannot prove a live reboot",
+        ));
+    }
+    if report.boot_identity_source == BootIdentitySource::Unknown {
+        return Err(invalid_input(
+            "supervisor status has no authoritative boot identity source and cannot prove a live reboot",
+        ));
+    }
+    validate_service_value("current supervisor boot id", &report.current_boot_id)
 }
 
 /// A process-held singleton paired with a durable, replaceable checkpoint.
@@ -265,9 +350,14 @@ pub(crate) fn supervisor_service_start_command() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn supervisor_service_status_command() -> Result<()> {
+pub(crate) fn supervisor_service_status_command(json: bool) -> Result<()> {
     let posture = supervisor_machine_restart_posture()?;
     if posture == MachineRestartPosture::Unsupported {
+        if json {
+            let report = unsupported_service_status_report(current_boot_identity());
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
         println!(
             "supervisor service: unsupported\nmachine-restart durability is available only on macOS launchd and Linux systemd"
         );
@@ -277,6 +367,19 @@ pub(crate) fn supervisor_service_status_command() -> Result<()> {
     let unit_path = context.unit_path();
     let installed = match posture {
         MachineRestartPosture::NotInstalled => {
+            if json {
+                let report = build_service_status_report(
+                    &context,
+                    posture,
+                    ServiceManagerRuntime::default(),
+                    read_service_instance_checkpoint(&service_instance_checkpoint_path(
+                        &DeadreckonPaths::from_home(context.deadreckon_home.clone()),
+                    ))?,
+                    current_boot_identity(),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
             println!("supervisor service: not installed\nnext: deadreckon supervisor install");
             return Ok(());
         }
@@ -288,15 +391,35 @@ pub(crate) fn supervisor_service_status_command() -> Result<()> {
         MachineRestartPosture::Unsupported => unreachable!("handled above"),
     };
 
-    let runtime = match context.platform {
+    let runtime = query_service_manager_runtime(&context)?;
+    if json {
+        let paths = DeadreckonPaths::from_home(context.deadreckon_home.clone());
+        let report = build_service_status_report(
+            &context,
+            posture,
+            runtime,
+            read_service_instance_checkpoint(&service_instance_checkpoint_path(&paths))?,
+            current_boot_identity(),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "{}",
+        render_human_service_status(&context, installed, &runtime)
+    );
+    Ok(())
+}
+
+fn query_service_manager_runtime(context: &ServiceContext) -> Result<ServiceManagerRuntime> {
+    match context.platform {
         ServicePlatform::Launchd => {
             let domain = launchd_domain()?;
             let target = format!("{domain}/{LAUNCHD_LABEL}");
-            if command_succeeds("launchctl", ["print", target.as_str()])? {
-                "loaded"
-            } else {
-                "stopped"
-            }
+            Ok(ServiceManagerRuntime {
+                loaded: Some(command_succeeds("launchctl", ["print", target.as_str()])?),
+                ..ServiceManagerRuntime::default()
+            })
         }
         ServicePlatform::Systemd => {
             let active = run_observational(
@@ -309,27 +432,209 @@ pub(crate) fn supervisor_service_status_command() -> Result<()> {
                 ["--user", "is-enabled", SYSTEMD_UNIT],
                 "read the per-user systemd enablement state",
             )?;
-            refuse_unavailable_manager("read the per-user systemd service state", &active)?;
-            refuse_unavailable_manager("read the per-user systemd enablement state", &enabled)?;
-            let active = output_label(&active, "inactive");
-            let enabled = output_label(&enabled, "disabled");
-            return {
-                println!(
-                    "supervisor service: {active}, {enabled}\nunit: {installed}\npath: {}\nstate: {}\nbinary: {}",
-                    unit_path.display(),
-                    context.deadreckon_home.display(),
-                    context.binary.display()
-                );
-                Ok(())
-            };
+            systemd_manager_runtime(&active, &enabled)
         }
+    }
+}
+
+fn systemd_manager_runtime(active: &Output, enabled: &Output) -> Result<ServiceManagerRuntime> {
+    refuse_unavailable_manager("read the per-user systemd service state", active)?;
+    refuse_unavailable_manager("read the per-user systemd enablement state", enabled)?;
+    Ok(ServiceManagerRuntime {
+        loaded: None,
+        enabled: Some(output_label(enabled, "disabled")),
+        active: Some(output_label(active, "inactive")),
+    })
+}
+
+fn render_human_service_status(
+    context: &ServiceContext,
+    installed: &str,
+    runtime: &ServiceManagerRuntime,
+) -> String {
+    let manager_state = match context.platform {
+        ServicePlatform::Launchd => {
+            if runtime.loaded == Some(true) {
+                "loaded".to_string()
+            } else {
+                "stopped".to_string()
+            }
+        }
+        ServicePlatform::Systemd => format!(
+            "{}, {}",
+            runtime.active.as_deref().unwrap_or("inactive"),
+            runtime.enabled.as_deref().unwrap_or("disabled")
+        ),
     };
-    println!(
-        "supervisor service: {runtime}\nunit: {installed}\npath: {}\nstate: {}\nbinary: {}",
-        unit_path.display(),
+    format!(
+        "supervisor service: {manager_state}\nunit: {installed}\npath: {}\nstate: {}\nbinary: {}",
+        context.unit_path().display(),
         context.deadreckon_home.display(),
         context.binary.display()
-    );
+    )
+}
+
+fn build_service_status_report(
+    context: &ServiceContext,
+    posture: MachineRestartPosture,
+    runtime: ServiceManagerRuntime,
+    checkpoint: Option<ServiceInstanceCheckpoint>,
+    boot: BootIdentityObservation,
+) -> Result<SupervisorServiceStatusReport> {
+    validate_manager_runtime(context.platform, posture, &runtime)?;
+    if let Some(checkpoint) = checkpoint.as_ref() {
+        validate_checkpoint_identity(context, &runtime, checkpoint, &boot.current_boot_id)?;
+    } else if runtime.is_running() {
+        return Err(invalid_input(
+            "service manager reports the supervisor running, but its instance checkpoint is absent",
+        ));
+    }
+    Ok(SupervisorServiceStatusReport {
+        schema_version: SERVICE_STATUS_SCHEMA,
+        manager: match context.platform {
+            ServicePlatform::Launchd => ServiceManager::Launchd,
+            ServicePlatform::Systemd => ServiceManager::Systemd,
+        },
+        installed: service_installation_state(posture),
+        loaded: runtime.loaded,
+        enabled: runtime.enabled,
+        active: runtime.active,
+        checkpoint,
+        current_boot_id: boot.current_boot_id,
+        boot_identity_source: boot.source,
+        test_override: boot.test_override,
+    })
+}
+
+fn validate_manager_runtime(
+    platform: ServicePlatform,
+    posture: MachineRestartPosture,
+    runtime: &ServiceManagerRuntime,
+) -> Result<()> {
+    if posture == MachineRestartPosture::NotInstalled {
+        if runtime != &ServiceManagerRuntime::default() {
+            return Err(invalid_input(
+                "an uninstalled supervisor cannot carry service-manager runtime state",
+            ));
+        }
+        return Ok(());
+    }
+    match platform {
+        ServicePlatform::Launchd
+            if runtime.loaded.is_none()
+                || runtime.enabled.is_some()
+                || runtime.active.is_some() =>
+        {
+            Err(invalid_input(
+                "launchd status must contain only a loaded state",
+            ))
+        }
+        ServicePlatform::Systemd
+            if runtime.loaded.is_some()
+                || runtime.enabled.is_none()
+                || runtime.active.is_none() =>
+        {
+            Err(invalid_input(
+                "systemd status must contain enabled and active states",
+            ))
+        }
+        ServicePlatform::Systemd => {
+            validate_service_value(
+                "systemd enabled state",
+                runtime.enabled.as_deref().unwrap_or_default(),
+            )?;
+            validate_service_value(
+                "systemd active state",
+                runtime.active.as_deref().unwrap_or_default(),
+            )
+        }
+        ServicePlatform::Launchd => Ok(()),
+    }
+}
+
+fn unsupported_service_status_report(
+    boot: BootIdentityObservation,
+) -> SupervisorServiceStatusReport {
+    SupervisorServiceStatusReport {
+        schema_version: SERVICE_STATUS_SCHEMA,
+        manager: ServiceManager::Unsupported,
+        installed: ServiceInstallationState::Unsupported,
+        loaded: None,
+        enabled: None,
+        active: None,
+        checkpoint: None,
+        current_boot_id: boot.current_boot_id,
+        boot_identity_source: boot.source,
+        test_override: boot.test_override,
+    }
+}
+
+fn service_installation_state(posture: MachineRestartPosture) -> ServiceInstallationState {
+    match posture {
+        MachineRestartPosture::Unsupported => ServiceInstallationState::Unsupported,
+        MachineRestartPosture::NotInstalled => ServiceInstallationState::NotInstalled,
+        MachineRestartPosture::StaleManagedUnit => ServiceInstallationState::Stale,
+        MachineRestartPosture::InstalledCurrent => ServiceInstallationState::Current,
+        MachineRestartPosture::UnmanagedUnit => {
+            unreachable!("unmanaged units are refused before status serialization")
+        }
+    }
+}
+
+fn current_boot_identity() -> BootIdentityObservation {
+    let test_override =
+        std::env::var_os("DEADRECKON_BOOT_ID").is_some_and(|value| !value.is_empty());
+    let current_boot_id = boot_identity();
+    let source =
+        classify_boot_identity_source(std::env::consts::OS, &current_boot_id, test_override);
+    BootIdentityObservation {
+        current_boot_id,
+        source,
+        test_override,
+    }
+}
+
+fn classify_boot_identity_source(
+    target_os: &str,
+    current_boot_id: &str,
+    test_override: bool,
+) -> BootIdentitySource {
+    if test_override {
+        return BootIdentitySource::TestOverride;
+    }
+    match target_os {
+        "linux" if current_boot_id != "unknown-boot" => BootIdentitySource::LinuxProcfs,
+        "macos" if current_boot_id.starts_with("macos:") => BootIdentitySource::MacosSysctl,
+        _ => BootIdentitySource::Unknown,
+    }
+}
+
+fn validate_checkpoint_identity(
+    context: &ServiceContext,
+    runtime: &ServiceManagerRuntime,
+    checkpoint: &ServiceInstanceCheckpoint,
+    current_boot_id: &str,
+) -> Result<()> {
+    if checkpoint.binary != context.binary {
+        return Err(invalid_input(format!(
+            "supervisor checkpoint binary {} does not match the current service binary {}",
+            checkpoint.binary.display(),
+            context.binary.display()
+        )));
+    }
+    if checkpoint.deadreckon_home != context.deadreckon_home {
+        return Err(invalid_input(format!(
+            "supervisor checkpoint state {} does not match the current DEADRECKON_HOME {}",
+            checkpoint.deadreckon_home.display(),
+            context.deadreckon_home.display()
+        )));
+    }
+    if runtime.is_running() && checkpoint.boot_id != current_boot_id {
+        return Err(invalid_input(format!(
+            "service manager reports the supervisor running, but checkpoint boot {} does not match current boot {}",
+            checkpoint.boot_id, current_boot_id
+        )));
+    }
     Ok(())
 }
 
@@ -471,16 +776,62 @@ fn service_instance_checkpoint_path(paths: &DeadreckonPaths) -> PathBuf {
 }
 
 fn read_service_instance_checkpoint(path: &Path) -> Result<Option<ServiceInstanceCheckpoint>> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|source| {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(source.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(invalid_input(format!(
+            "supervisor checkpoint must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    let bytes = fs::read(path)?;
+    let checkpoint: ServiceInstanceCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|source| {
             CliError::Core(DeadreckonError::Json {
                 path: path.to_path_buf(),
                 source,
             })
-        }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(source.into()),
+        })?;
+    validate_service_instance_checkpoint(&checkpoint)?;
+    Ok(Some(checkpoint))
+}
+
+fn validate_service_instance_checkpoint(checkpoint: &ServiceInstanceCheckpoint) -> Result<()> {
+    if checkpoint.schema_version != SERVICE_INSTANCE_SCHEMA {
+        return Err(invalid_input(format!(
+            "unsupported supervisor checkpoint schema {}; expected {}",
+            checkpoint.schema_version, SERVICE_INSTANCE_SCHEMA
+        )));
     }
+    if checkpoint.generation == 0 {
+        return Err(invalid_input(
+            "supervisor checkpoint generation must be positive",
+        ));
+    }
+    validate_service_value("supervisor checkpoint instance id", &checkpoint.instance_id)?;
+    validate_service_value("supervisor checkpoint boot id", &checkpoint.boot_id)?;
+    if checkpoint.pid == 0 {
+        return Err(invalid_input("supervisor checkpoint pid must be positive"));
+    }
+    for (name, path) in [
+        ("supervisor checkpoint binary", &checkpoint.binary),
+        (
+            "supervisor checkpoint DEADRECKON_HOME",
+            &checkpoint.deadreckon_home,
+        ),
+    ] {
+        if !path.is_absolute() {
+            return Err(invalid_input(format!(
+                "{name} must be absolute: {}",
+                path.display()
+            )));
+        }
+        validate_service_value(name, path_to_utf8(name, path)?)?;
+    }
+    Ok(())
 }
 
 fn absolute_path(path: PathBuf) -> Result<PathBuf> {
@@ -914,6 +1265,43 @@ mod tests {
         }
     }
 
+    fn checkpoint(
+        context: &ServiceContext,
+        generation: u64,
+        instance_id: &str,
+        boot_id: &str,
+    ) -> ServiceInstanceCheckpoint {
+        ServiceInstanceCheckpoint {
+            schema_version: SERVICE_INSTANCE_SCHEMA,
+            generation,
+            instance_id: instance_id.to_string(),
+            boot_id: boot_id.to_string(),
+            pid: 4242,
+            started_at: Utc::now(),
+            binary: context.binary.clone(),
+            deadreckon_home: context.deadreckon_home.clone(),
+        }
+    }
+
+    fn boot(current_boot_id: &str) -> BootIdentityObservation {
+        BootIdentityObservation {
+            current_boot_id: current_boot_id.to_string(),
+            source: BootIdentitySource::LinuxProcfs,
+            test_override: false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn command_output(stdout: &str, stderr: &str, success: bool) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
     #[test]
     fn macos_launch_agent_is_restart_capable_and_path_safe() {
         let rendered =
@@ -953,6 +1341,251 @@ mod tests {
                 "missing {operation} from:\n{help}"
             );
         }
+        let status = supervisor
+            .find_subcommand_mut("status")
+            .expect("supervisor status subcommand");
+        assert!(status.render_long_help().to_string().contains("--json"));
+    }
+
+    #[test]
+    fn launchd_status_reports_loaded_state_and_preserves_human_output() {
+        let context = context(ServicePlatform::Launchd);
+        let runtime = ServiceManagerRuntime {
+            loaded: Some(true),
+            ..ServiceManagerRuntime::default()
+        };
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime.clone(),
+            Some(checkpoint(&context, 3, "launchd-instance", "boot-a")),
+            boot("boot-a"),
+        )
+        .expect("launchd status report");
+
+        assert_eq!(report.manager, ServiceManager::Launchd);
+        assert_eq!(report.installed, ServiceInstallationState::Current);
+        assert_eq!(report.loaded, Some(true));
+        assert_eq!(report.enabled, None);
+        assert_eq!(report.active, None);
+        assert_eq!(
+            render_human_service_status(&context, "current", &runtime),
+            "supervisor service: loaded\nunit: current\npath: /Users/test/Library/LaunchAgents/com.deadreckon.supervisor.plist\nstate: /Users/test/Dead Reckon State\nbinary: /opt/Dead Reckon/bin/deadreckon"
+        );
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime,
+            None,
+            boot("boot-a"),
+        )
+        .expect_err("a running manager requires a checkpoint");
+        assert!(error.to_string().contains("checkpoint is absent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemd_status_reports_active_and_enabled_manager_labels() {
+        let context = context(ServicePlatform::Systemd);
+        let active = command_output("active\n", "", true);
+        let enabled = command_output("enabled\n", "", true);
+        let runtime = systemd_manager_runtime(&active, &enabled).expect("systemd state");
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime.clone(),
+            Some(checkpoint(&context, 4, "systemd-instance", "boot-a")),
+            boot("boot-a"),
+        )
+        .expect("systemd status report");
+
+        assert_eq!(report.manager, ServiceManager::Systemd);
+        assert_eq!(report.loaded, None);
+        assert_eq!(report.active.as_deref(), Some("active"));
+        assert_eq!(report.enabled.as_deref(), Some("enabled"));
+        assert_eq!(
+            render_human_service_status(&context, "current", &runtime),
+            format!(
+                "supervisor service: active, enabled\nunit: current\npath: {}\nstate: /Users/test/Dead Reckon State\nbinary: /opt/Dead Reckon/bin/deadreckon",
+                context.unit_path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn stopped_service_status_preserves_a_checkpoint_from_the_prior_boot() {
+        let context = context(ServicePlatform::Launchd);
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            ServiceManagerRuntime {
+                loaded: Some(false),
+                ..ServiceManagerRuntime::default()
+            },
+            Some(checkpoint(&context, 8, "prior-instance", "boot-before")),
+            boot("boot-after"),
+        )
+        .expect("boot-change evidence");
+
+        let checkpoint = report.checkpoint.expect("checkpoint");
+        assert_eq!(checkpoint.boot_id, "boot-before");
+        assert_eq!(report.current_boot_id, "boot-after");
+
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            ServiceManagerRuntime {
+                loaded: Some(true),
+                ..ServiceManagerRuntime::default()
+            },
+            Some(checkpoint),
+            boot("boot-after"),
+        )
+        .expect_err("a running manager cannot use a prior-boot checkpoint");
+        assert!(error.to_string().contains("does not match current boot"));
+    }
+
+    #[test]
+    fn service_status_json_is_closed_and_marks_test_boot_overrides() {
+        let context = context(ServicePlatform::Systemd);
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            ServiceManagerRuntime {
+                loaded: None,
+                enabled: Some("disabled".to_string()),
+                active: Some("inactive".to_string()),
+            },
+            Some(checkpoint(&context, 5, "instance-json", "override-boot")),
+            BootIdentityObservation {
+                current_boot_id: "override-boot".to_string(),
+                source: BootIdentitySource::TestOverride,
+                test_override: true,
+            },
+        )
+        .expect("closed status report");
+        let mut value = serde_json::to_value(&report).expect("status JSON");
+        let keys = value
+            .as_object()
+            .expect("status object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "active",
+                "boot_identity_source",
+                "checkpoint",
+                "current_boot_id",
+                "enabled",
+                "installed",
+                "loaded",
+                "manager",
+                "schema_version",
+                "test_override",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(value["boot_identity_source"], "test_override");
+        assert_eq!(value["test_override"], true);
+        assert!(
+            validate_supervisor_service_live_evidence(&report)
+                .expect_err("test override cannot become live evidence")
+                .to_string()
+                .contains("cannot prove a live reboot")
+        );
+        let mut unknown_source = report.clone();
+        unknown_source.boot_identity_source = BootIdentitySource::Unknown;
+        unknown_source.test_override = false;
+        assert!(
+            validate_supervisor_service_live_evidence(&unknown_source)
+                .expect_err("unknown boot identity cannot become live evidence")
+                .to_string()
+                .contains("no authoritative boot identity source")
+        );
+        let mut live_source = report.clone();
+        live_source.boot_identity_source = BootIdentitySource::LinuxProcfs;
+        live_source.test_override = false;
+        validate_supervisor_service_live_evidence(&live_source)
+            .expect("authoritative boot identity");
+        let checkpoint_keys = value["checkpoint"]
+            .as_object()
+            .expect("checkpoint object")
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            checkpoint_keys,
+            [
+                "binary",
+                "boot_id",
+                "deadreckon_home",
+                "generation",
+                "instance_id",
+                "pid",
+                "schema_version",
+                "started_at",
+            ]
+            .into_iter()
+            .collect()
+        );
+        value
+            .as_object_mut()
+            .expect("status object")
+            .insert("untrusted_note".to_string(), json!("forged"));
+        assert!(
+            serde_json::from_value::<SupervisorServiceStatusReport>(value).is_err(),
+            "unknown status fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn malformed_service_checkpoint_is_rejected() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("instance.json");
+        fs::write(&path, b"{not-json\n").expect("malformed checkpoint");
+        assert!(
+            read_service_instance_checkpoint(&path)
+                .expect_err("malformed checkpoint must fail")
+                .to_string()
+                .contains("JSON")
+        );
+
+        let context = context(ServicePlatform::Systemd);
+        let mut invalid = checkpoint(&context, 0, "instance", "boot-a");
+        invalid.pid = 0;
+        fs::write(
+            &path,
+            serde_json::to_vec(&invalid).expect("invalid checkpoint JSON"),
+        )
+        .expect("invalid checkpoint");
+        let error = read_service_instance_checkpoint(&path)
+            .expect_err("invalid checkpoint identity must fail");
+        assert!(error.to_string().contains("generation must be positive"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_service_checkpoint_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("real-instance.json");
+        let link = temp.path().join("instance.json");
+        let context = context(ServicePlatform::Launchd);
+        fs::write(
+            &target,
+            serde_json::to_vec(&checkpoint(&context, 1, "instance", "boot-a"))
+                .expect("checkpoint JSON"),
+        )
+        .expect("checkpoint");
+        symlink(&target, &link).expect("checkpoint symlink");
+
+        let error =
+            read_service_instance_checkpoint(&link).expect_err("symlink checkpoint must fail");
+        assert!(error.to_string().contains("regular non-symlink"));
     }
 
     #[test]

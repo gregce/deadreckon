@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::backend::{Result, SandboxBackend, SandboxError};
 use crate::commands::build_command;
-use crate::spec::{GuardedLaunchSpec, SandboxSpec};
+use crate::spec::{GuardedLaunchSpec, SandboxSpec, WorkspaceAccess};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRunOutput {
@@ -58,8 +58,14 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             process.args(&command.args);
             process
         };
+    process.current_dir(&command.cwd);
+    if spec.workspace_access == WorkspaceAccess::Disposable {
+        // Strict independent evaluation receives an explicit environment.
+        // Repository-controlled checks must not inherit provider credentials,
+        // signing material, or host-specific command routing.
+        process.env_clear();
+    }
     process
-        .current_dir(&command.cwd)
         .envs(&command.env)
         // Signing inputs belong only to the trusted gate-signing phase. The
         // common sandbox boundary must scrub inherited copies even when the

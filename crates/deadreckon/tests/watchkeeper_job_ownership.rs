@@ -156,6 +156,167 @@ fn public_fork_and_merge_cannot_mutate_a_job_owned_plan() {
 }
 
 #[test]
+fn public_apply_refuses_an_owned_nested_plan_before_preparing_or_landing_work() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(&workspace).expect("workspace");
+    git(&workspace, &["init", "-q", "-b", "main"]);
+    git(
+        &workspace,
+        &["config", "user.email", "fixture@example.invalid"],
+    );
+    git(&workspace, &["config", "user.name", "Fixture"]);
+    fs::write(workspace.join("base.txt"), "operator source\n").expect("base source");
+    git(&workspace, &["add", "base.txt"]);
+    git(&workspace, &["commit", "-m", "base"]);
+
+    let job_id = "11212121212121212121212121212121";
+    write_job_fixture(&paths, &workspace, job_id, JobShape::Graph);
+    let mut root = Plan::new(
+        "complete the owned graph",
+        PlanMode::FullPlan,
+        vec![
+            PlanTask::new(0, "nested", "complete nested work", PlanRole::Child, None),
+            PlanTask::new(1, "later", "complete later work", PlanRole::Child, None),
+        ],
+        PlanProviders::default(),
+        Some("watchkeeper-test".to_string()),
+        "test",
+    )
+    .expect("root Plan");
+    root.plan_id = job_id.to_string();
+    root.owner_job_id = Some(job_id.to_string());
+    root.parent_cwd = Some(workspace.clone());
+
+    let mut nested = Plan::new(
+        "complete the owned nested result",
+        PlanMode::FullPlan,
+        vec![
+            PlanTask::new(0, "first", "complete first", PlanRole::Child, None),
+            PlanTask::new(1, "second", "complete second", PlanRole::Child, None),
+        ],
+        PlanProviders::default(),
+        Some("watchkeeper-test".to_string()),
+        "test",
+    )
+    .expect("nested Plan");
+    nested.plan_id = "11212121212121212121212121212122".to_string();
+    nested.owner_job_id = Some(job_id.to_string());
+    nested.parent_plan_id = Some(job_id.to_string());
+    nested.parent_cwd = Some(workspace.clone());
+    root.tasks[0].subplan = Some(nested.plan_id.clone());
+
+    let mut nested_result = create_owned_run(
+        &paths,
+        RunOptions {
+            goal: nested.root_goal.clone(),
+            cwd: workspace.clone(),
+            sandbox: "auto".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            run_id: None,
+            codebase: None,
+        },
+        RunOwnership::plan_result(job_id, &nested.plan_id),
+    )
+    .expect("owned nested result");
+    nested_result.status = RunStatus::Completed;
+    save_state(&nested_result).expect("save nested result");
+    let nested_library = paths.library_dir(&nested_result.scope, &nested_result.run_id);
+    fs::create_dir_all(&nested_library).expect("nested result library");
+    fs::write(
+        nested_library.join("result.txt"),
+        "unverified nested result must not land\n",
+    )
+    .expect("nested result");
+    nested.merged_run_id = Some(nested_result.run_id.clone());
+    nested.status = PlanStatus::Merged;
+    save_plan(&paths, &nested).expect("save nested Plan");
+    save_plan(&paths, &root).expect("save root Plan");
+
+    let root_before = fs::read(paths.plan_json(job_id)).expect("root Plan before");
+    let nested_before = fs::read(paths.plan_json(&nested.plan_id)).expect("nested Plan before");
+    let runs_before = deadreckon_core::list_runs(&paths, None)
+        .expect("runs before")
+        .into_iter()
+        .map(|run| run.run_id)
+        .collect::<Vec<_>>();
+    let worktrees_root = paths.home().join("worktrees");
+    let worktrees_before = if worktrees_root.is_dir() {
+        directory_names(&worktrees_root)
+    } else {
+        Vec::new()
+    };
+    let head_before = git_stdout(&workspace, &["rev-parse", "HEAD"]);
+    let status_before = git_stdout(&workspace, &["status", "--porcelain"]);
+    let branches_before = git_stdout(&workspace, &["branch", "--format=%(refname:short)"]);
+    let nested_docs = paths
+        .plan_dir(&nested.plan_id)
+        .join(deadreckon_core::plan::PLAN_DOCS_DIR);
+    assert!(
+        !nested_docs.exists(),
+        "fixture unexpectedly has nested docs"
+    );
+    assert!(
+        !workspace.join("result.txt").exists(),
+        "fixture target already contains the nested result"
+    );
+
+    let output = deadreckon(&paths, &workspace)
+        .args(["apply", &nested.plan_id, "--no-confirm", "--plain"])
+        .output()
+        .expect("public nested Plan apply");
+
+    assert_job_owned_refusal(&output);
+    assert_eq!(
+        fs::read(paths.plan_json(job_id)).expect("root Plan after"),
+        root_before
+    );
+    assert_eq!(
+        fs::read(paths.plan_json(&nested.plan_id)).expect("nested Plan after"),
+        nested_before
+    );
+    assert!(
+        !nested_docs.exists(),
+        "refused apply generated nested Plan docs"
+    );
+    assert_eq!(
+        deadreckon_core::list_runs(&paths, None)
+            .expect("runs after")
+            .into_iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>(),
+        runs_before,
+        "refused apply created a wrapper Run"
+    );
+    assert_eq!(
+        if worktrees_root.is_dir() {
+            directory_names(&worktrees_root)
+        } else {
+            Vec::new()
+        },
+        worktrees_before,
+        "refused apply created a preparation worktree"
+    );
+    assert_eq!(git_stdout(&workspace, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        git_stdout(&workspace, &["status", "--porcelain"]),
+        status_before
+    );
+    assert_eq!(
+        git_stdout(&workspace, &["branch", "--format=%(refname:short)"]),
+        branches_before
+    );
+    assert!(
+        !workspace.join("result.txt").exists(),
+        "refused apply landed the nested result"
+    );
+}
+
+#[test]
 fn public_resume_and_extend_cannot_mutate_a_job_owned_child() {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
@@ -253,6 +414,7 @@ fn public_resume_and_extend_cannot_mutate_a_job_owned_child() {
 
     let plan_before = fs::read(paths.plan_json(job_id)).expect("Plan before");
     let current_before = fs::read(current.state_path()).expect("current state before");
+    let current_files_before = directory_names(&current.run_root);
     for arguments in [
         vec!["resume".to_string(), format!("{job_id}:task-0")],
         vec![
@@ -262,6 +424,7 @@ fn public_resume_and_extend_cannot_mutate_a_job_owned_child() {
         ],
         vec!["resume".to_string(), first.run_id.clone()],
         vec!["finish".to_string(), current.run_id.clone()],
+        vec!["verdict".to_string(), current.run_id.clone()],
         vec!["apply".to_string(), current.run_id.clone()],
         vec!["abandon".to_string(), current.run_id.clone()],
         vec!["cleanup".to_string(), current.run_id.clone()],
@@ -300,6 +463,11 @@ fn public_resume_and_extend_cannot_mutate_a_job_owned_child() {
         assert_eq!(
             fs::read(current.state_path()).expect("current state after"),
             current_before
+        );
+        assert_eq!(
+            directory_names(&current.run_root),
+            current_files_before,
+            "public command wrote child Run artifacts before refusing"
         );
     }
 
@@ -449,6 +617,18 @@ fn public_campaign_result_cannot_bypass_its_job_lifecycle() {
     assert_eq!(
         fs::read(result.state_path()).expect("Campaign result after doc polish"),
         state_before
+    );
+
+    let files_before = directory_names(&result.run_root);
+    let output = deadreckon(&paths, &workspace)
+        .args(["verdict", &result.run_id])
+        .output()
+        .expect("public Campaign result verdict");
+    assert_job_owned_refusal(&output);
+    assert_eq!(
+        directory_names(&result.run_root),
+        files_before,
+        "public verdict wrote a Campaign result sidecar before refusing"
     );
 }
 
@@ -685,6 +865,10 @@ fn nested_plan_recovers_after_merge_before_parent_result_is_recorded() {
 fn campaign_reserved_plan_identity_survives_all_crash_windows() {
     for (failpoint, minimum_job_attempts) in [
         ("after_sub_launch_intent_before_spawn", 3),
+        ("after_sub_process_prepare_before_release", 2),
+        ("after_sub_process_release_before_link", 2),
+        ("after_sub_process_claim_before_link", 2),
+        ("after_sub_process_link_before_dispatch", 2),
         ("after_sub_plan_saved_before_ownership_freeze", 1),
         ("after_sub_plan_created_before_execution", 1),
         ("after_sub_merge_before_result", 1),
@@ -906,6 +1090,7 @@ fn assert_root_mapping_recovery(shape: JobShape) {
 fn assert_campaign_recovery_case(failpoint: &str, minimum_job_attempts: u32) {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
+    let dispatch_side_effects = temp.path().join("campaign-dispatch-side-effects");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(workspace.join(".deadreckon")).expect("acceptance dir");
     fs::create_dir_all(paths.home()).expect("home");
@@ -937,6 +1122,10 @@ fn assert_campaign_recovery_case(failpoint: &str, minimum_job_attempts: u32) {
     let output = deadreckon(&paths, &workspace)
         .env("DEADRECKON_TEST_CAMPAIGN_FAILPOINTS", "1")
         .env("DEADRECKON_TEST_CAMPAIGN_FAILPOINT", failpoint)
+        .env(
+            "DEADRECKON_TEST_CAMPAIGN_DISPATCH_DIR",
+            &dispatch_side_effects,
+        )
         .args([
             "campaign",
             "Exercise two independent durable Campaign branches.",
@@ -999,7 +1188,10 @@ fn assert_campaign_recovery_case(failpoint: &str, minimum_job_attempts: u32) {
             deadreckon_core::campaign::CampaignStatus::Merged
                 | deadreckon_core::campaign::CampaignStatus::Failed
         ),
-        "{failpoint}: Campaign did not reach a bounded post-child state\n{campaign:#?}\n{view:#?}"
+        "{failpoint}: Campaign did not reach a bounded post-child state\n{campaign:#?}\n{view:#?}\nDriver stderr:\n{}\nCampaign events:\n{:#?}",
+        fs::read_to_string(paths.job_dir(&job_id).join("supervisor.err")).unwrap_or_default(),
+        deadreckon_core::campaign::read_campaign_events(&paths.plan_dir(&job_id))
+            .unwrap_or_default(),
     );
     let plan_ids = campaign
         .sub_goals
@@ -1021,6 +1213,21 @@ fn assert_campaign_recovery_case(failpoint: &str, minimum_job_attempts: u32) {
         assert_eq!(plan.owner_job_id.as_deref(), Some(job_id.as_str()));
         assert_eq!(plan.status, deadreckon_core::PlanStatus::Merged);
     }
+    let dispatches = fs::read_dir(&dispatch_side_effects)
+        .expect("Campaign dispatch side effects")
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "dispatch")
+        })
+        .count();
+    assert_eq!(
+        dispatches,
+        campaign.sub_goals.len(),
+        "{failpoint}: every logical Campaign sub must produce exactly one observable dispatch side effect"
+    );
     assert_eq!(
         fs::read_dir(paths.jobs_dir())
             .expect("jobs")
@@ -1288,4 +1495,22 @@ fn git(cwd: &std::path::Path, args: &[&str]) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("git stdout utf8")
+        .trim()
+        .to_string()
 }

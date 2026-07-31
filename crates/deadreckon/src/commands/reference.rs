@@ -167,7 +167,7 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     // export/apply accept a plan because they map it onto its merged result run.
     VerbRefSpec {
         verb: "export",
-        accepts: RUN_LIKE.union(RefKinds::PLAN),
+        accepts: RefKinds::JOB.union(RUN_LIKE).union(RefKinds::PLAN),
     },
     VerbRefSpec {
         verb: "apply",

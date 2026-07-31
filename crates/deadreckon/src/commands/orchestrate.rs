@@ -510,12 +510,18 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     let max_spend = args.plan.max_spend;
     let max_wall_seconds = args.plan.max_wall_seconds;
     let sandbox = args.plan.sandbox.clone();
-    if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
-        return Ok(());
-    }
-    let plan = commands::plan::create_orchestration_plan(args.plan, &args.seed_pieces).await?;
+    let plan = if args.preview {
+        commands::plan::preview_orchestration_plan(args.plan, &args.seed_pieces).await?
+    } else {
+        if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
+            return Ok(());
+        }
+        commands::plan::create_orchestration_plan(args.plan, &args.seed_pieces).await?
+    };
     let plan_id = plan.plan_id.clone();
-    if let Ok(launch_dir) = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT) {
+    if !args.preview
+        && let Ok(launch_dir) = std::env::var(deadreckon_core::campaign::ENV_SUB_RESULT)
+    {
         commands::campaign::publish_sub_plan_id(std::path::Path::new(&launch_dir), &plan_id)?;
         commands::campaign::campaign_test_failpoint("after_sub_plan_created_before_execution");
     }

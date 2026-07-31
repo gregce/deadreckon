@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 
 use chrono::Utc;
 use deadreckon_protocol::{
-    CompletionReceipt, JobId, JobShape, SemanticDecision, SpendRecord, StopReason, TraceRecord,
+    CompletionReceipt, JobEventKind, JobId, JobShape, SemanticDecision, SpendRecord, StopReason,
+    TraceRecord,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,6 +32,10 @@ const DELEGATION_JOB_ENV: &str = "DEADRECKON_DELEGATION_JOB";
 const DELEGATION_ID_ENV: &str = "DEADRECKON_DELEGATION_ID";
 const MAX_DELEGATION_TOKEN_BYTES: u64 = 512;
 const MAX_DELEGATION_RECORD_BYTES: u64 = 128 * 1024;
+const CAMPAIGN_SUB_LAUNCH_PROTOCOL: &str = "delegated_campaign_sub_v1";
+const CAMPAIGN_SUB_LAUNCH_DIR: &str = "campaign-sub-launches";
+const CAMPAIGN_SUB_RELEASE_ACK_DIR: &str = "release-acks";
+const MERGE_REPAIR_AUTHORITY_DIR: &str = "merge-repair-authorities";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,9 +79,12 @@ struct DriverContext {
 
 static DRIVER_CONTEXT: OnceLock<DriverContext> = OnceLock::new();
 static DELEGATED_PLAN_CHILD: OnceLock<deadreckon_core::RunOwnership> = OnceLock::new();
+static DELEGATED_CHILD_RUN_ID: OnceLock<String> = OnceLock::new();
+static DELEGATED_REPAIR_AUTHORITY: OnceLock<commands::supervisor::GuardedDriverAuthority> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum DelegatedAction {
     PlanChild {
         plan_id: String,
@@ -95,9 +103,19 @@ pub(crate) enum DelegatedAction {
         sub_id: String,
         plan_id: String,
     },
+    MergeRepair {
+        root_artifact_id: String,
+        repair_id: String,
+        repair_round: u32,
+        run_id: String,
+        proof_dir: PathBuf,
+        repair_request_sha256: String,
+        repair_plan_sha256: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DelegatedInvocation {
     schema_version: u32,
     capability_id: String,
@@ -112,6 +130,8 @@ struct DelegatedInvocation {
     cwd: PathBuf,
     scope_root: PathBuf,
     token_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    campaign_sub_launch_id: Option<String>,
     issued_at: chrono::DateTime<Utc>,
 }
 
@@ -119,6 +139,172 @@ pub(crate) struct PreparedDelegation {
     capability_id: String,
     job_id: String,
     token: String,
+    campaign_sub: Option<PreparedCampaignSubLaunch>,
+}
+
+impl PreparedDelegation {
+    pub(crate) fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedCampaignSubLaunch {
+    campaign_id: String,
+    sub_id: String,
+    plan_id: String,
+    launch_id: String,
+}
+
+/// Protected process authority for one durable Campaign sub-plan launch.
+///
+/// `released` records receipt of the private token. `linked` is the execution
+/// boundary: the child cannot return to CLI dispatch until its one-time
+/// delegation is consumed and this flag is durable. An unlinked launch is
+/// therefore provably nonexecuted and may be replaced after its exact process
+/// identity has exited. A linked launch may only be adopted or recovered from
+/// its durable Plan artifacts; it is never launched a second time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignSubLaunchAuthority {
+    schema_version: u32,
+    launch_protocol: String,
+    parent_job_id: String,
+    campaign_id: String,
+    sub_id: String,
+    plan_id: String,
+    attempt: u32,
+    lease_epoch: u64,
+    outer_launch_id: String,
+    launch_id: String,
+    capability_id: String,
+    release_token_sha256: String,
+    #[serde(with = "strict_supervised_process_record")]
+    process: deadreckon_core::SupervisedProcessRecord,
+    released: bool,
+    linked: bool,
+    adopted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adopted_by_attempt: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adopted_by_lease_epoch: Option<u64>,
+    prepared_at: chrono::DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    released_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    linked_at: Option<chrono::DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adopted_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CampaignSubReleaseAck {
+    schema_version: u32,
+    launch_protocol: String,
+    parent_job_id: String,
+    campaign_id: String,
+    sub_id: String,
+    plan_id: String,
+    attempt: u32,
+    lease_epoch: u64,
+    launch_id: String,
+    capability_id: String,
+    release_token_sha256: String,
+    pid: u32,
+    process_group: Option<u32>,
+    boot_id: String,
+    process_start_identity: String,
+    acknowledged_at: chrono::DateTime<Utc>,
+}
+
+mod strict_supervised_process_record {
+    use deadreckon_core::{SupervisedProcess, SupervisedProcessPhase, SupervisedProcessRecord};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StrictRecord {
+        schema_version: u32,
+        pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pgid: Option<u32>,
+        launch_id: String,
+        attempt: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_launch_id: Option<String>,
+        release_token_sha256: String,
+        boot_id: String,
+        process_start_identity: String,
+        phase: SupervisedProcessPhase,
+    }
+
+    pub(super) fn serialize<S>(
+        record: &SupervisedProcessRecord,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        StrictRecord {
+            schema_version: record.schema_version,
+            pid: record.process.pid,
+            pgid: record.process.pgid,
+            launch_id: record.launch_id.clone(),
+            attempt: record.attempt,
+            owner_launch_id: record.owner_launch_id.clone(),
+            release_token_sha256: record.release_token_sha256.clone(),
+            boot_id: record.boot_id.clone(),
+            process_start_identity: record.process_start_identity.clone(),
+            phase: record.phase,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<SupervisedProcessRecord, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let record = StrictRecord::deserialize(deserializer)?;
+        Ok(SupervisedProcessRecord {
+            schema_version: record.schema_version,
+            process: SupervisedProcess {
+                pid: record.pid,
+                pgid: record.pgid,
+            },
+            launch_id: record.launch_id,
+            attempt: record.attempt,
+            owner_launch_id: record.owner_launch_id,
+            release_token_sha256: record.release_token_sha256,
+            boot_id: record.boot_id,
+            process_start_identity: record.process_start_identity,
+            phase: record.phase,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignSubRecoveryDisposition {
+    RelaunchNonexecuted,
+    AdoptLinked,
+    RecoverLinkedArtifacts,
+}
+
+pub(crate) enum CampaignSubProcessPoll {
+    Running,
+    Exited { success: Option<bool> },
+}
+
+pub(crate) struct CampaignSubProcess {
+    launch: CampaignSubLaunchAuthority,
+    child: Option<Child>,
+    prepared: Option<PreparedDelegation>,
+}
+
+pub(crate) enum CampaignSubLaunchRecovery {
+    Relaunch,
+    Adopted(CampaignSubProcess),
+    RecoverLinkedArtifacts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -582,6 +768,92 @@ pub(crate) fn delegated_plan_child_ownership() -> Option<deadreckon_core::RunOwn
     DELEGATED_PLAN_CHILD.get().cloned()
 }
 
+pub(crate) fn delegated_plan_child_run_id() -> Option<String> {
+    DELEGATED_CHILD_RUN_ID.get().cloned()
+}
+
+pub(crate) fn link_delegated_repair_run(state: &deadreckon_core::PipelineState) -> Result<()> {
+    let Some(deadreckon_core::RunOwnership {
+        job_id,
+        artifact:
+            deadreckon_core::RunOwnershipArtifact::MergeRepair {
+                root_artifact_id,
+                repair_id,
+                repair_round,
+                run_id,
+                proof_dir,
+                repair_request_sha256,
+                repair_plan_sha256,
+            },
+        ..
+    }) = state.ownership.as_ref()
+    else {
+        return Ok(());
+    };
+    let path = proof_dir.join("repair-run.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path)?).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: path.clone(),
+                source,
+            })
+        })?;
+    let object = record.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair launch authority is not an object".to_string(),
+        ))
+    })?;
+    let existing_run_id = object.get("run_id").and_then(serde_json::Value::as_str);
+    if job_id != root_artifact_id
+        || object
+            .get("root_artifact_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(root_artifact_id.as_str())
+        || object.get("repair_id").and_then(serde_json::Value::as_str) != Some(repair_id.as_str())
+        || object
+            .get("repair_round")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(*repair_round))
+        || object
+            .get("repair_request_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(repair_request_sha256.as_str())
+        || object
+            .get("repair_plan_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(repair_plan_sha256.as_str())
+        || existing_run_id.is_some_and(|existing| existing != state.run_id)
+        || state.run_id != *run_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair Run cannot link across its immutable launch authority".to_string(),
+        )));
+    }
+    object.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(state.run_id.clone()),
+    );
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String("child_linked".to_string()),
+    );
+    object.insert("linked_at".to_string(), serde_json::to_value(Utc::now())?);
+    if let Some(authority) = DELEGATED_REPAIR_AUTHORITY.get() {
+        replace_merge_repair_authority_fenced(
+            &DeadreckonPaths::discover(),
+            authority,
+            repair_id,
+            "run_linked",
+            &record,
+        )?;
+    } else if !cfg!(test) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair Run has no consumed fenced driver authority".to_string(),
+        )));
+    }
+    commands::job::replace_json_synced(&path, &record)
+}
+
 fn install_driver_context(
     paths: &DeadreckonPaths,
     authority: commands::supervisor::GuardedDriverAuthority,
@@ -1004,6 +1276,488 @@ fn delegation_consumed_path(paths: &DeadreckonPaths, job_id: &str, capability_id
         .join(format!("{capability_id}.json"))
 }
 
+fn merge_repair_authority_path(paths: &DeadreckonPaths, job_id: &str, repair_id: &str) -> PathBuf {
+    let key = repair_id.strip_prefix("sha256:").unwrap_or(repair_id);
+    paths
+        .job_dir(job_id)
+        .join(MERGE_REPAIR_AUTHORITY_DIR)
+        .join(format!("{key}.json"))
+}
+
+fn replace_merge_repair_authority_fenced(
+    paths: &DeadreckonPaths,
+    authority: &commands::supervisor::GuardedDriverAuthority,
+    repair_id: &str,
+    transition: &str,
+    value: &serde_json::Value,
+) -> Result<()> {
+    let token = guarded_authority_lease_token(paths, authority)?;
+    let path = merge_repair_authority_path(paths, &authority.job_id, repair_id);
+    deadreckon_core::replace_fenced_job_json_and_append_event(
+        paths,
+        &token,
+        Utc::now(),
+        &path,
+        JobEventKind::RepairChildAuthorityChanged,
+        format!("merge-repair-authority:{repair_id}:{transition}"),
+        json!({
+            "repair_id": repair_id,
+            "transition": transition,
+            "run_id": value.get("run_id"),
+            "authority": value,
+        }),
+        value,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn restore_merge_repair_projection_if_needed(
+    paths: &DeadreckonPaths,
+    repair_id: &str,
+    projection_path: &Path,
+) -> Result<()> {
+    if projection_path.is_file() {
+        return Ok(());
+    }
+    let context = DRIVER_CONTEXT.get().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "only a current Job driver can restore merge repair authority".to_string(),
+        ))
+    })?;
+    if !commands::supervisor::guarded_driver_authority_is_live(paths, &context.authority)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair authority cannot be restored without the current fenced lease"
+                .to_string(),
+        )));
+    }
+    let authority_path = merge_repair_authority_path(paths, &context.job_id, repair_id);
+    let raw = match fs::read(&authority_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let authority: serde_json::Value = serde_json::from_slice(&raw).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: authority_path.clone(),
+            source,
+        })
+    })?;
+    let history = deadreckon_core::read_job_history(&paths.job_events(&context.job_id))?;
+    let committed = history.events().iter().rev().any(|event| {
+        event.kind == JobEventKind::RepairChildAuthorityChanged
+            && event
+                .detail
+                .get("repair_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(repair_id)
+            && event.detail.get("authority") == Some(&authority)
+    });
+    if !committed {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair projection has no committed fenced authority event".to_string(),
+        )));
+    }
+    commands::job::write_json_synced(projection_path, &authority)
+}
+
+fn campaign_sub_launch_key(sub_id: &str, plan_id: &str) -> String {
+    deadreckon_core::flight::sha256_text(&format!("{sub_id}\0{plan_id}"))
+        .trim_start_matches("sha256:")
+        .to_string()
+}
+
+fn campaign_sub_launch_path(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    sub_id: &str,
+    plan_id: &str,
+) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(CAMPAIGN_SUB_LAUNCH_DIR)
+        .join(format!("{}.json", campaign_sub_launch_key(sub_id, plan_id)))
+}
+
+fn campaign_sub_release_ack_path(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    launch_id: &str,
+) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(CAMPAIGN_SUB_LAUNCH_DIR)
+        .join(CAMPAIGN_SUB_RELEASE_ACK_DIR)
+        .join(format!("{launch_id}.json"))
+}
+
+fn read_bounded_regular_control_file(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
+    let before = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CliError::Core(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            }));
+        }
+    };
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} must be a regular non-symlink file"
+        ))));
+    }
+    if before.len() > MAX_DELEGATION_RECORD_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} exceeded its bounded size"
+        ))));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    let opened = file.metadata().map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if !same_control_file_identity(&before, &opened) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} changed identity while it was opened"
+        ))));
+    }
+    let mut raw = Vec::new();
+    (&mut file)
+        .take(MAX_DELEGATION_RECORD_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|source| {
+            CliError::Core(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+        })?;
+    if raw.len() as u64 > MAX_DELEGATION_RECORD_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} exceeded its bounded size"
+        ))));
+    }
+    let after = file.metadata().map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    let post_path = fs::symlink_metadata(path).map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if !same_control_file_identity(&opened, &after)
+        || !same_control_file_identity(&after, &post_path)
+        || raw.len() as u64 != after.len()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{label} changed while it was being read"
+        ))));
+    }
+    Ok(Some(raw))
+}
+
+#[cfg(unix)]
+fn same_control_file_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_control_file_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.file_type().is_file()
+        && after.file_type().is_file()
+        && before.len() == after.len()
+        && before.modified().ok() == after.modified().ok()
+        && before.created().ok() == after.created().ok()
+}
+
+fn load_campaign_sub_launch(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    sub_id: &str,
+    plan_id: &str,
+) -> Result<Option<CampaignSubLaunchAuthority>> {
+    let path = campaign_sub_launch_path(paths, job_id, sub_id, plan_id);
+    let Some(raw) = read_bounded_regular_control_file(&path, "Campaign sub-process authority")?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|source| CliError::Core(DeadreckonError::Json { path, source }))
+}
+
+#[cfg(test)]
+fn write_campaign_sub_launch(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+) -> Result<()> {
+    validate_campaign_sub_launch_identity(launch)?;
+    commands::job::replace_json_synced(
+        &campaign_sub_launch_path(
+            paths,
+            &launch.parent_job_id,
+            &launch.sub_id,
+            &launch.plan_id,
+        ),
+        launch,
+    )
+}
+
+fn guarded_authority_lease_token(
+    paths: &DeadreckonPaths,
+    authority: &commands::supervisor::GuardedDriverAuthority,
+) -> Result<deadreckon_core::LeaseToken> {
+    if !commands::supervisor::guarded_driver_authority_is_live(paths, authority)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process transition requires the current fenced parent Job".to_string(),
+        )));
+    }
+    let lease = deadreckon_core::load_job_lease(paths, &JobId(authority.job_id.clone()))?;
+    if lease.epoch != authority.lease_epoch {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process transition crossed parent lease epochs".to_string(),
+        )));
+    }
+    Ok(deadreckon_core::LeaseToken::from(&lease))
+}
+
+fn campaign_sub_authority_sha256(launch: &CampaignSubLaunchAuthority) -> Result<String> {
+    Ok(deadreckon_core::flight::sha256_text(
+        &serde_json::to_string(launch)?,
+    ))
+}
+
+fn write_campaign_sub_launch_fenced(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+    token: &deadreckon_core::LeaseToken,
+    transition: &str,
+) -> Result<()> {
+    validate_campaign_sub_launch_identity(launch)?;
+    if token.job_id.as_ref() != launch.parent_job_id
+        || (transition == "adopted" && launch.adopted_by_lease_epoch != Some(token.epoch))
+        || (transition != "adopted" && launch.lease_epoch != token.epoch)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process transition does not match its fenced lease".to_string(),
+        )));
+    }
+    let path = campaign_sub_launch_path(
+        paths,
+        &launch.parent_job_id,
+        &launch.sub_id,
+        &launch.plan_id,
+    );
+    let mut detail = campaign_sub_launch_detail(launch);
+    let object = detail.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process event detail is not an object".to_string(),
+        ))
+    })?;
+    object.insert(
+        "transition".to_string(),
+        serde_json::Value::String(transition.to_string()),
+    );
+    object.insert(
+        "authority_sha256".to_string(),
+        serde_json::Value::String(campaign_sub_authority_sha256(launch)?),
+    );
+    object.insert("authority".to_string(), serde_json::to_value(launch)?);
+    deadreckon_core::replace_fenced_job_json_and_append_event(
+        paths,
+        token,
+        Utc::now(),
+        &path,
+        JobEventKind::CampaignSubAuthorityChanged,
+        format!(
+            "campaign-sub-authority:{}:{}:{transition}",
+            launch.sub_id, launch.launch_id
+        ),
+        detail,
+        launch,
+    )?;
+    Ok(())
+}
+
+fn campaign_sub_transition_is_durable(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+    transition: &str,
+) -> Result<bool> {
+    let history = deadreckon_core::read_job_history(&paths.job_events(&launch.parent_job_id))?;
+    for event in history.events() {
+        if event.kind != JobEventKind::CampaignSubAuthorityChanged
+            || event
+                .detail
+                .get("transition")
+                .and_then(serde_json::Value::as_str)
+                != Some(transition)
+        {
+            continue;
+        }
+        let Some(authority_value) = event.detail.get("authority").cloned() else {
+            continue;
+        };
+        let Ok(authority) = serde_json::from_value::<CampaignSubLaunchAuthority>(authority_value)
+        else {
+            continue;
+        };
+        let authority_sha256 = campaign_sub_authority_sha256(&authority)?;
+        if validate_campaign_sub_launch_identity(&authority).is_err()
+            || !campaign_sub_authority_is_successor(launch, &authority)
+            || event
+                .detail
+                .get("authority_sha256")
+                .and_then(serde_json::Value::as_str)
+                != Some(authority_sha256.as_str())
+            || !campaign_sub_authority_has_transition(&authority, transition)
+        {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn campaign_sub_authority_is_successor(
+    current: &CampaignSubLaunchAuthority,
+    prior: &CampaignSubLaunchAuthority,
+) -> bool {
+    current.schema_version == prior.schema_version
+        && current.launch_protocol == prior.launch_protocol
+        && current.parent_job_id == prior.parent_job_id
+        && current.campaign_id == prior.campaign_id
+        && current.sub_id == prior.sub_id
+        && current.plan_id == prior.plan_id
+        && current.attempt == prior.attempt
+        && current.lease_epoch == prior.lease_epoch
+        && current.outer_launch_id == prior.outer_launch_id
+        && current.launch_id == prior.launch_id
+        && current.capability_id == prior.capability_id
+        && current.release_token_sha256 == prior.release_token_sha256
+        && current.process == prior.process
+        && current.prepared_at == prior.prepared_at
+        && (!prior.released || current.released)
+        && (!prior.linked || current.linked)
+        && (!prior.adopted || current.adopted)
+        && prior
+            .released_at
+            .is_none_or(|timestamp| current.released_at == Some(timestamp))
+        && prior
+            .linked_at
+            .is_none_or(|timestamp| current.linked_at == Some(timestamp))
+        && prior
+            .adopted_at
+            .is_none_or(|timestamp| current.adopted_at == Some(timestamp))
+        && prior
+            .adopted_by_attempt
+            .is_none_or(|attempt| current.adopted_by_attempt == Some(attempt))
+        && prior
+            .adopted_by_lease_epoch
+            .is_none_or(|epoch| current.adopted_by_lease_epoch == Some(epoch))
+}
+
+fn campaign_sub_authority_has_transition(
+    authority: &CampaignSubLaunchAuthority,
+    transition: &str,
+) -> bool {
+    match transition {
+        "prepared" => !authority.released && !authority.linked && !authority.adopted,
+        "released" => authority.released && !authority.linked && !authority.adopted,
+        "linked" => authority.released && authority.linked && !authority.adopted,
+        "adopted" => authority.released && authority.linked && authority.adopted,
+        _ => false,
+    }
+}
+
+fn remove_campaign_sub_launch_projection_if_matches(
+    paths: &DeadreckonPaths,
+    expected: &CampaignSubLaunchAuthority,
+) -> Result<()> {
+    let path = campaign_sub_launch_path(
+        paths,
+        &expected.parent_job_id,
+        &expected.sub_id,
+        &expected.plan_id,
+    );
+    let Some(current) = load_campaign_sub_launch(
+        paths,
+        &expected.parent_job_id,
+        &expected.sub_id,
+        &expected.plan_id,
+    )?
+    else {
+        return Ok(());
+    };
+    if current != *expected {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "refusing to remove a Campaign sub-process authority that advanced or was replaced"
+                .to_string(),
+        )));
+    }
+    fs::remove_file(&path).map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: path.clone(),
+            source,
+        })
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_delegation_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn load_campaign_sub_release_ack(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+) -> Result<Option<CampaignSubReleaseAck>> {
+    let path = campaign_sub_release_ack_path(paths, &launch.parent_job_id, &launch.launch_id);
+    let Some(raw) =
+        read_bounded_regular_control_file(&path, "Campaign sub-process release acknowledgement")?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|source| CliError::Core(DeadreckonError::Json { path, source }))
+}
+
+fn write_campaign_sub_release_ack(
+    paths: &DeadreckonPaths,
+    ack: &CampaignSubReleaseAck,
+) -> Result<()> {
+    commands::job::write_json_synced(
+        &campaign_sub_release_ack_path(paths, &ack.parent_job_id, &ack.launch_id),
+        ack,
+    )
+}
+
 fn sync_delegation_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
@@ -1102,7 +1856,24 @@ pub(crate) fn prepare_delegated_invocation<S: AsRef<OsStr>>(
         }
         DelegatedAction::PlanChild { .. }
         | DelegatedAction::PlanFork { .. }
-        | DelegatedAction::PlanMerge { .. } => None,
+        | DelegatedAction::PlanMerge { .. }
+        | DelegatedAction::MergeRepair { .. } => None,
+    };
+    let prepared_campaign_sub = match &action {
+        DelegatedAction::CampaignSub {
+            campaign_id,
+            sub_id,
+            plan_id,
+        } => Some(PreparedCampaignSubLaunch {
+            campaign_id: campaign_id.clone(),
+            sub_id: sub_id.clone(),
+            plan_id: plan_id.clone(),
+            launch_id: Uuid::new_v4().to_string(),
+        }),
+        DelegatedAction::PlanChild { .. }
+        | DelegatedAction::PlanFork { .. }
+        | DelegatedAction::PlanMerge { .. }
+        | DelegatedAction::MergeRepair { .. } => None,
     };
     let capability_id = Uuid::new_v4().to_string();
     let token = format!("{capability_id}:{}", Uuid::new_v4());
@@ -1118,6 +1889,9 @@ pub(crate) fn prepare_delegated_invocation<S: AsRef<OsStr>>(
         cwd: canonical_invocation_path(cwd, "working directory")?,
         scope_root: canonical_invocation_path(scope_root, "scope root")?,
         token_sha256: deadreckon_core::flight::sha256_text(&token),
+        campaign_sub_launch_id: prepared_campaign_sub
+            .as_ref()
+            .map(|launch| launch.launch_id.clone()),
         issued_at: Utc::now(),
     };
     commands::job::write_json_synced(
@@ -1128,6 +1902,7 @@ pub(crate) fn prepare_delegated_invocation<S: AsRef<OsStr>>(
         capability_id,
         job_id: context.job_id.clone(),
         token,
+        campaign_sub: prepared_campaign_sub,
     })
 }
 
@@ -1196,6 +1971,1001 @@ pub(crate) fn spawn_delegated(
         return Err(error);
     }
     Ok(child)
+}
+
+pub(crate) fn spawn_merge_repair_delegated(
+    paths: &DeadreckonPaths,
+    mut command: Command,
+    prepared: &PreparedDelegation,
+    authority_path: &Path,
+    mut authority: serde_json::Value,
+) -> Result<Child> {
+    let context = DRIVER_CONTEXT.get().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable merge repair launch requires the current parent Job driver".to_string(),
+        ))
+    })?;
+    if context.job_id != prepared.job_id
+        || !commands::supervisor::guarded_driver_authority_is_live(paths, &context.authority)?
+    {
+        revoke_pending_delegation(paths, prepared)?;
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable merge repair launch lost its fenced parent authority".to_string(),
+        )));
+    }
+    apply_delegation(&mut command, prepared);
+    let (mut child, terminator) = match deadreckon_core::spawn_grouped(command) {
+        Ok(spawned) => spawned,
+        Err(source) => {
+            revoke_pending_delegation(paths, prepared)?;
+            return Err(source.into());
+        }
+    };
+    let mut process = match deadreckon_core::SupervisedProcessRecord::prepared(
+        deadreckon_core::SupervisedProcess {
+            pid: child.id(),
+            pgid: None,
+        },
+        prepared.capability_id.clone(),
+        context.authority.attempt,
+        Some(context.authority.launch_id.clone()),
+        deadreckon_core::flight::sha256_text(&prepared.token),
+    ) {
+        Ok(process) => process,
+        Err(source) => {
+            let _ = terminator.terminate(std::time::Duration::from_secs(2));
+            revoke_pending_delegation(paths, prepared)?;
+            return Err(source.into());
+        }
+    };
+    #[cfg(unix)]
+    {
+        process.process.pgid = Some(child.id());
+    }
+    process.phase = deadreckon_core::SupervisedProcessPhase::Running;
+    let object = authority.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair launch authority is not an object".to_string(),
+        ))
+    })?;
+    object.insert("process".to_string(), serde_json::to_value(&process)?);
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String("process_prepared".to_string()),
+    );
+    object.insert(
+        "process_prepared_at".to_string(),
+        serde_json::to_value(Utc::now())?,
+    );
+    let repair_id = authority
+        .get("repair_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "merge repair authority is missing its repair identity".to_string(),
+            ))
+        })?;
+    if let Err(error) = replace_merge_repair_authority_fenced(
+        paths,
+        &context.authority,
+        repair_id,
+        "process_prepared",
+        &authority,
+    )
+    .and_then(|()| commands::job::write_json_synced(authority_path, &authority))
+    {
+        let _ = terminator.terminate(std::time::Duration::from_secs(2));
+        revoke_pending_delegation(paths, prepared)?;
+        return Err(error);
+    }
+    if let Err(error) = release_delegation(&mut child, prepared) {
+        let termination = terminator.terminate(std::time::Duration::from_secs(2));
+        let revocation = revoke_pending_delegation(paths, prepared);
+        if matches!(termination, deadreckon_core::TerminationOutcome::Failed(_)) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge repair capability release failed ({error}); its exact process group could not be stopped ({termination:?}); capability revocation: {}",
+                revocation
+                    .as_ref()
+                    .map(|()| "ok".to_string())
+                    .unwrap_or_else(|revoke_error| revoke_error.to_string())
+            ))));
+        }
+        revocation?;
+        return Err(error);
+    }
+    Ok(child)
+}
+
+fn validate_campaign_sub_launch_identity(launch: &CampaignSubLaunchAuthority) -> Result<()> {
+    let process = &launch.process;
+    if launch.schema_version != 1
+        || launch.launch_protocol != CAMPAIGN_SUB_LAUNCH_PROTOCOL
+        || launch.parent_job_id != launch.campaign_id
+        || launch.attempt == 0
+        || launch.lease_epoch == 0
+        || Uuid::parse_str(&launch.outer_launch_id).is_err()
+        || Uuid::parse_str(&launch.launch_id).is_err()
+        || Uuid::parse_str(&launch.capability_id).is_err()
+        || launch.release_token_sha256.trim().is_empty()
+        || process.launch_id != launch.launch_id
+        || process.attempt != launch.attempt
+        || process.owner_launch_id.as_deref() != Some(launch.outer_launch_id.as_str())
+        || process.release_token_sha256 != launch.release_token_sha256
+        || process.schema_version != deadreckon_core::SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
+        || process.process.pid == 0
+        || process.boot_id.trim().is_empty()
+        || process.process_start_identity.trim().is_empty()
+        || process.phase != deadreckon_core::SupervisedProcessPhase::Running
+        || launch.adopted && !launch.linked
+        || launch.linked && !launch.released
+        || launch.released_at.is_some() != launch.released
+        || launch.linked_at.is_some() != launch.linked
+        || launch.adopted_at.is_some() != launch.adopted
+        || launch.adopted_by_attempt.is_some() != launch.adopted
+        || launch.adopted_by_lease_epoch.is_some() != launch.adopted
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process authority is malformed or crosses launch identities".to_string(),
+        )));
+    }
+    #[cfg(unix)]
+    if process.process.pgid != Some(process.process.pid) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process authority has a mismatched process group".to_string(),
+        )));
+    }
+    #[cfg(not(unix))]
+    if process.process.pgid.is_some() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process authority unexpectedly names a process group".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn campaign_sub_ack_matches(
+    launch: &CampaignSubLaunchAuthority,
+    ack: &CampaignSubReleaseAck,
+) -> bool {
+    ack.schema_version == 1
+        && ack.launch_protocol == CAMPAIGN_SUB_LAUNCH_PROTOCOL
+        && ack.parent_job_id == launch.parent_job_id
+        && ack.campaign_id == launch.campaign_id
+        && ack.sub_id == launch.sub_id
+        && ack.plan_id == launch.plan_id
+        && ack.attempt == launch.attempt
+        && ack.lease_epoch == launch.lease_epoch
+        && ack.launch_id == launch.launch_id
+        && ack.capability_id == launch.capability_id
+        && ack.release_token_sha256 == launch.release_token_sha256
+        && ack.pid == launch.process.process.pid
+        && ack.process_group == launch.process.process.pgid
+        && ack.boot_id == launch.process.boot_id
+        && ack.process_start_identity == launch.process.process_start_identity
+}
+
+fn delegated_record_matches_campaign_launch(
+    record: &DelegatedInvocation,
+    launch: &CampaignSubLaunchAuthority,
+) -> bool {
+    record.schema_version == 1
+        && record.capability_id == launch.capability_id
+        && record.job_id == launch.parent_job_id
+        && record.authority.job_id == launch.parent_job_id
+        && record.authority.attempt == launch.attempt
+        && record.authority.launch_id == launch.outer_launch_id
+        && record.authority.lease_epoch == launch.lease_epoch
+        && record.token_sha256 == launch.release_token_sha256
+        && record.campaign_sub_launch_id.as_deref() == Some(launch.launch_id.as_str())
+        && matches!(
+            &record.action,
+            DelegatedAction::CampaignSub {
+                campaign_id,
+                sub_id,
+                plan_id,
+            } if campaign_id == &launch.campaign_id
+                && sub_id == &launch.sub_id
+                && plan_id == &launch.plan_id
+        )
+}
+
+fn read_matching_delegated_record(
+    path: &Path,
+    launch: &CampaignSubLaunchAuthority,
+) -> Result<Option<DelegatedInvocation>> {
+    let Some(raw) =
+        read_bounded_regular_control_file(path, "Campaign sub-process capability record")?
+    else {
+        return Ok(None);
+    };
+    let record: DelegatedInvocation = serde_json::from_slice(&raw).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if !delegated_record_matches_campaign_launch(&record, launch) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process capability conflicts with its launch authority".to_string(),
+        )));
+    }
+    Ok(Some(record))
+}
+
+fn classify_campaign_sub_recovery(
+    launch: &CampaignSubLaunchAuthority,
+    identity: deadreckon_core::SupervisedProcessIdentity,
+    ack_present: bool,
+    pending_present: bool,
+    consumed_present: bool,
+    linked_transition_durable: bool,
+) -> Result<CampaignSubRecoveryDisposition> {
+    validate_campaign_sub_launch_identity(launch)?;
+    if launch.released && !ack_present {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process says it was released without a matching acknowledgement"
+                .to_string(),
+        )));
+    }
+    if linked_transition_durable && !launch.linked {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process durable link conflicts with its authority projection".to_string(),
+        )));
+    }
+    if launch.linked
+        && linked_transition_durable
+        && (!ack_present || !consumed_present || pending_present)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process linked state is not backed by its release and one-time capability"
+                .to_string(),
+        )));
+    }
+    if !pending_present && !consumed_present {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process lost both its pending and consumed capability evidence"
+                .to_string(),
+        )));
+    }
+    if matches!(
+        identity,
+        deadreckon_core::SupervisedProcessIdentity::Reused
+            | deadreckon_core::SupervisedProcessIdentity::Unverifiable
+    ) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process identity is conflicting or unverifiable".to_string(),
+        )));
+    }
+    if !launch.linked || !linked_transition_durable {
+        return Ok(CampaignSubRecoveryDisposition::RelaunchNonexecuted);
+    }
+    match identity {
+        deadreckon_core::SupervisedProcessIdentity::Current => {
+            Ok(CampaignSubRecoveryDisposition::AdoptLinked)
+        }
+        deadreckon_core::SupervisedProcessIdentity::Exited
+        | deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {
+            Ok(CampaignSubRecoveryDisposition::RecoverLinkedArtifacts)
+        }
+        deadreckon_core::SupervisedProcessIdentity::Reused
+        | deadreckon_core::SupervisedProcessIdentity::Unverifiable => unreachable!(),
+    }
+}
+
+fn campaign_sub_launch_evidence(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+) -> Result<(
+    deadreckon_core::SupervisedProcessIdentity,
+    bool,
+    bool,
+    bool,
+    bool,
+)> {
+    validate_campaign_sub_launch_identity(launch)?;
+    let ack = load_campaign_sub_release_ack(paths, launch)?;
+    if ack
+        .as_ref()
+        .is_some_and(|ack| !campaign_sub_ack_matches(launch, ack))
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process release acknowledgement conflicts with its launch authority"
+                .to_string(),
+        )));
+    }
+    let pending = read_matching_delegated_record(
+        &delegation_pending_path(paths, &launch.parent_job_id, &launch.capability_id),
+        launch,
+    )?
+    .is_some();
+    let consumed = read_matching_delegated_record(
+        &delegation_consumed_path(paths, &launch.parent_job_id, &launch.capability_id),
+        launch,
+    )?
+    .is_some();
+    Ok((
+        launch.process.identity(),
+        ack.is_some(),
+        pending,
+        consumed,
+        campaign_sub_transition_is_durable(paths, launch, "linked")?,
+    ))
+}
+
+fn recover_linked_campaign_sub_artifacts(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+    identity: deadreckon_core::SupervisedProcessIdentity,
+) -> Result<CampaignSubLaunchRecovery> {
+    match identity {
+        deadreckon_core::SupervisedProcessIdentity::Exited => {
+            terminate_campaign_sub_process(
+                launch,
+                std::time::Duration::from_secs(2),
+                "linked residual",
+            )?;
+        }
+        deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {}
+        deadreckon_core::SupervisedProcessIdentity::Current
+        | deadreckon_core::SupervisedProcessIdentity::Reused
+        | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "linked Campaign artifact recovery requires an exited process or changed boot"
+                    .to_string(),
+            )));
+        }
+    }
+    // The durable link authorizes dispatch, but the reserved Plan is the
+    // first durable artifact proving dispatch actually started. A crash in
+    // the narrow link-before-dispatch window is therefore safe to relaunch.
+    if paths.plan_json(&launch.plan_id).is_file() {
+        Ok(CampaignSubLaunchRecovery::RecoverLinkedArtifacts)
+    } else {
+        append_campaign_sub_launch_event(
+            paths,
+            launch,
+            "sub_process_empty_dispatch_relaunch_safe",
+        )?;
+        Ok(CampaignSubLaunchRecovery::Relaunch)
+    }
+}
+
+fn campaign_sub_launch_detail(launch: &CampaignSubLaunchAuthority) -> serde_json::Value {
+    json!({
+        "parent_job_id": launch.parent_job_id,
+        "sub_id": launch.sub_id,
+        "plan_id": launch.plan_id,
+        "attempt": launch.attempt,
+        "lease_epoch": launch.lease_epoch,
+        "outer_launch_id": launch.outer_launch_id,
+        "launch_id": launch.launch_id,
+        "release_token_sha256": launch.release_token_sha256,
+        "pid": launch.process.process.pid,
+        "process_group": launch.process.process.pgid,
+        "boot_id": launch.process.boot_id,
+        "process_start_identity": launch.process.process_start_identity,
+        "released": launch.released,
+        "linked": launch.linked,
+        "adopted": launch.adopted,
+    })
+}
+
+fn append_campaign_sub_launch_event(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+    kind: &str,
+) -> Result<()> {
+    deadreckon_core::campaign::append_campaign_event(
+        &paths.plan_dir(&launch.campaign_id),
+        kind,
+        campaign_sub_launch_detail(launch),
+    )?;
+    Ok(())
+}
+
+fn campaign_sub_launch_test_failpoint_once(
+    paths: &DeadreckonPaths,
+    launch: &CampaignSubLaunchAuthority,
+    name: &str,
+) -> Result<()> {
+    if std::env::var("DEADRECKON_TEST_CAMPAIGN_FAILPOINTS").as_deref() != Ok("1")
+        || std::env::var("DEADRECKON_TEST_CAMPAIGN_FAILPOINT").as_deref() != Ok(name)
+    {
+        return Ok(());
+    }
+    let marker = paths
+        .job_dir(&launch.parent_job_id)
+        .join(CAMPAIGN_SUB_LAUNCH_DIR)
+        .join(format!(".test-failpoint-{name}"));
+    let Some(parent) = marker.parent() else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process failpoint marker has no parent".to_string(),
+        )));
+    };
+    fs::create_dir_all(parent)?;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            #[cfg(unix)]
+            fs::File::open(parent)?.sync_all()?;
+            std::process::exit(86);
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(CliError::Core(DeadreckonError::Io {
+            path: marker,
+            source,
+        })),
+    }
+}
+
+fn record_campaign_sub_dispatch_test_side_effect(
+    launch: &CampaignSubLaunchAuthority,
+) -> Result<()> {
+    let Some(directory) =
+        std::env::var_os("DEADRECKON_TEST_CAMPAIGN_DISPATCH_DIR").filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let directory = PathBuf::from(directory);
+    fs::create_dir_all(&directory)?;
+    let marker = directory.join(format!(
+        "{}.dispatch",
+        campaign_sub_launch_key(&launch.sub_id, &launch.plan_id)
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Campaign sub {} attempted its observable dispatch side effect more than once",
+                    launch.sub_id
+                )))
+            } else {
+                CliError::Core(DeadreckonError::Io {
+                    path: marker.clone(),
+                    source,
+                })
+            }
+        })?;
+    file.write_all(launch.launch_id.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    fs::File::open(&directory)?.sync_all()?;
+    Ok(())
+}
+
+fn terminate_campaign_sub_process(
+    launch: &CampaignSubLaunchAuthority,
+    grace: std::time::Duration,
+    label: &str,
+) -> Result<()> {
+    use deadreckon_core::ChildTerminator as _;
+
+    match launch.process.identity() {
+        deadreckon_core::SupervisedProcessIdentity::DifferentBoot => return Ok(()),
+        deadreckon_core::SupervisedProcessIdentity::Current => {}
+        deadreckon_core::SupervisedProcessIdentity::Exited => {
+            #[cfg(not(unix))]
+            return Ok(());
+        }
+        deadreckon_core::SupervisedProcessIdentity::Reused
+        | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "refusing to signal a Campaign sub-process with conflicting or unknown identity"
+                    .to_string(),
+            )));
+        }
+    }
+    let outcome = {
+        #[cfg(unix)]
+        {
+            let pgid = launch.process.process.pgid.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "Campaign sub-process has no recoverable process group".to_string(),
+                ))
+            })?;
+            let pgid = i32::try_from(pgid).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "Campaign sub-process group identity is invalid".to_string(),
+                ))
+            })?;
+            deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace)
+        }
+        #[cfg(not(unix))]
+        {
+            deadreckon_core::RawPidTerminator::new(launch.process.process.pid).terminate(grace)
+        }
+    };
+    if matches!(outcome, deadreckon_core::TerminationOutcome::Failed(_)) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "could not stop {label} Campaign sub-process: {outcome:?}"
+        ))));
+    }
+    Ok(())
+}
+
+pub(crate) struct ValidatedCampaignSubInventory {
+    launches: Vec<CampaignSubLaunchAuthority>,
+}
+
+pub(crate) fn validate_campaign_sub_process_inventory_for_job(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<ValidatedCampaignSubInventory> {
+    let directory = paths.job_dir(job_id).join(CAMPAIGN_SUB_LAUNCH_DIR);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidatedCampaignSubInventory {
+                launches: Vec::new(),
+            });
+        }
+        Err(source) => {
+            return Err(CliError::Core(DeadreckonError::Io {
+                path: directory,
+                source,
+            }));
+        }
+    };
+    let mut authority_paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    authority_paths.sort();
+    let mut launches = Vec::new();
+    for path in authority_paths {
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Some(raw) = read_bounded_regular_control_file(&path, "Campaign sub-process authority")?
+        else {
+            continue;
+        };
+        let launch: CampaignSubLaunchAuthority =
+            serde_json::from_slice(&raw).map_err(|source| {
+                CliError::Core(DeadreckonError::Json {
+                    path: path.clone(),
+                    source,
+                })
+            })?;
+        validate_campaign_sub_launch_identity(&launch)?;
+        if launch.parent_job_id != job_id || launch.campaign_id != job_id {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Campaign sub-process authority {} changed its parent Job",
+                path.display()
+            ))));
+        }
+        if matches!(
+            launch.process.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Reused
+                | deadreckon_core::SupervisedProcessIdentity::Unverifiable
+        ) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "refusing Campaign cancellation because authority {} has a conflicting or unverifiable process identity",
+                path.display()
+            ))));
+        }
+        launches.push(launch);
+    }
+    Ok(ValidatedCampaignSubInventory { launches })
+}
+
+pub(crate) fn terminate_validated_campaign_sub_processes(
+    paths: &DeadreckonPaths,
+    inventory: ValidatedCampaignSubInventory,
+    grace: std::time::Duration,
+) -> Result<()> {
+    for launch in inventory.launches {
+        terminate_campaign_sub_process(&launch, grace, "cancelled")?;
+        let pending = delegation_pending_path(paths, &launch.parent_job_id, &launch.capability_id);
+        match fs::remove_file(&pending) {
+            Ok(()) => {
+                if let Some(parent) = pending.parent() {
+                    sync_delegation_directory(parent)?;
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CliError::Core(DeadreckonError::Io {
+                    path: pending,
+                    source,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_campaign_sub_processes_for_job(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    grace: std::time::Duration,
+) -> Result<()> {
+    let inventory = validate_campaign_sub_process_inventory_for_job(paths, job_id)?;
+    terminate_validated_campaign_sub_processes(paths, inventory, grace)
+}
+
+pub(crate) fn campaign_sub_launch_process_is_live(
+    paths: &DeadreckonPaths,
+    campaign_id: &str,
+    sub_id: &str,
+    plan_id: &str,
+) -> Result<bool> {
+    let Some(launch) = load_campaign_sub_launch(paths, campaign_id, sub_id, plan_id)? else {
+        return Ok(false);
+    };
+    if launch.parent_job_id != campaign_id
+        || launch.campaign_id != campaign_id
+        || launch.sub_id != sub_id
+        || launch.plan_id != plan_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process authority changed its parent or reserved Plan identity"
+                .to_string(),
+        )));
+    }
+    let (identity, ack, pending, consumed, linked_transition_durable) =
+        campaign_sub_launch_evidence(paths, &launch)?;
+    if matches!(
+        identity,
+        deadreckon_core::SupervisedProcessIdentity::Reused
+            | deadreckon_core::SupervisedProcessIdentity::Unverifiable
+    ) && paths.plan_json(plan_id).is_file()
+    {
+        // Once the exact reserved Plan exists, its protected ownership and
+        // lifecycle are better recovery evidence than a numeric PID that may
+        // have been reused. Validate every non-process invariant, then let
+        // Plan recovery take precedence.
+        let disposition = classify_campaign_sub_recovery(
+            &launch,
+            deadreckon_core::SupervisedProcessIdentity::DifferentBoot,
+            ack,
+            pending,
+            consumed,
+            linked_transition_durable,
+        )?;
+        if disposition == CampaignSubRecoveryDisposition::RecoverLinkedArtifacts {
+            return Ok(false);
+        }
+    }
+    classify_campaign_sub_recovery(
+        &launch,
+        identity,
+        ack,
+        pending,
+        consumed,
+        linked_transition_durable,
+    )?;
+    Ok(identity == deadreckon_core::SupervisedProcessIdentity::Current)
+}
+
+pub(crate) fn recover_campaign_sub_launch(
+    paths: &DeadreckonPaths,
+    campaign_id: &str,
+    sub_id: &str,
+    plan_id: &str,
+) -> Result<CampaignSubLaunchRecovery> {
+    let Some(mut launch) = load_campaign_sub_launch(paths, campaign_id, sub_id, plan_id)? else {
+        return Ok(CampaignSubLaunchRecovery::Relaunch);
+    };
+    if launch.parent_job_id != campaign_id
+        || launch.campaign_id != campaign_id
+        || launch.sub_id != sub_id
+        || launch.plan_id != plan_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process authority changed its parent or reserved Plan identity"
+                .to_string(),
+        )));
+    }
+    let (identity, ack, pending, consumed, linked_transition_durable) =
+        campaign_sub_launch_evidence(paths, &launch)?;
+    match classify_campaign_sub_recovery(
+        &launch,
+        identity,
+        ack,
+        pending,
+        consumed,
+        linked_transition_durable,
+    )? {
+        CampaignSubRecoveryDisposition::RelaunchNonexecuted => {
+            if paths.plan_json(plan_id).is_file() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "unlinked Campaign sub-process has a reserved Plan artifact; refusing to assume it never executed"
+                        .to_string(),
+                )));
+            }
+            if identity == deadreckon_core::SupervisedProcessIdentity::Current {
+                terminate_campaign_sub_process(
+                    &launch,
+                    std::time::Duration::from_secs(2),
+                    "nonexecuted",
+                )?;
+                if launch.process.identity() == deadreckon_core::SupervisedProcessIdentity::Current
+                {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "nonexecuted Campaign sub-process remained alive after bounded termination"
+                            .to_string(),
+                    )));
+                }
+                // The child and recovering driver can race at the link
+                // boundary. Re-read after the exact process is dead. If the
+                // child durably linked before termination, it may have begun
+                // work and must not be launched again.
+                let refreshed = load_campaign_sub_launch(paths, campaign_id, sub_id, plan_id)?
+                    .ok_or_else(|| {
+                        CliError::Core(DeadreckonError::InvalidInput(
+                            "Campaign sub-process authority disappeared during recovery"
+                                .to_string(),
+                        ))
+                    })?;
+                if refreshed.launch_id != launch.launch_id {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "Campaign sub-process launch identity changed during recovery".to_string(),
+                    )));
+                }
+                let (identity, ack, pending, consumed, linked_transition_durable) =
+                    campaign_sub_launch_evidence(paths, &refreshed)?;
+                match classify_campaign_sub_recovery(
+                    &refreshed,
+                    identity,
+                    ack,
+                    pending,
+                    consumed,
+                    linked_transition_durable,
+                )? {
+                    CampaignSubRecoveryDisposition::RecoverLinkedArtifacts => {
+                        return recover_linked_campaign_sub_artifacts(paths, &refreshed, identity);
+                    }
+                    CampaignSubRecoveryDisposition::AdoptLinked => {
+                        return Err(CliError::Core(DeadreckonError::InvalidInput(
+                            "Campaign sub-process remained live after recovery terminated its exact process group"
+                                .to_string(),
+                        )));
+                    }
+                    CampaignSubRecoveryDisposition::RelaunchNonexecuted => {
+                        launch = refreshed;
+                    }
+                }
+            }
+            let pending_path =
+                delegation_pending_path(paths, &launch.parent_job_id, &launch.capability_id);
+            match fs::remove_file(&pending_path) {
+                Ok(()) => {
+                    if let Some(parent) = pending_path.parent() {
+                        sync_delegation_directory(parent)?;
+                    }
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CliError::Core(DeadreckonError::Io {
+                        path: pending_path,
+                        source,
+                    }));
+                }
+            }
+            append_campaign_sub_launch_event(paths, &launch, "sub_process_relaunch_safe")?;
+            Ok(CampaignSubLaunchRecovery::Relaunch)
+        }
+        CampaignSubRecoveryDisposition::AdoptLinked => {
+            let context = DRIVER_CONTEXT.get().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "only a current Job driver can adopt a Campaign sub-process".to_string(),
+                ))
+            })?;
+            if context.job_id != campaign_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "Campaign sub-process adoption requires the current fenced parent Job"
+                        .to_string(),
+                )));
+            }
+            let token = guarded_authority_lease_token(paths, &context.authority)?;
+            launch.adopted = true;
+            launch.adopted_by_attempt = Some(context.authority.attempt);
+            launch.adopted_by_lease_epoch = Some(context.authority.lease_epoch);
+            launch.adopted_at = Some(Utc::now());
+            write_campaign_sub_launch_fenced(paths, &launch, &token, "adopted")?;
+            append_campaign_sub_launch_event(paths, &launch, "sub_process_adopted")?;
+            Ok(CampaignSubLaunchRecovery::Adopted(CampaignSubProcess {
+                launch,
+                child: None,
+                prepared: None,
+            }))
+        }
+        CampaignSubRecoveryDisposition::RecoverLinkedArtifacts => {
+            recover_linked_campaign_sub_artifacts(paths, &launch, identity)
+        }
+    }
+}
+
+pub(crate) fn spawn_campaign_sub_delegated(
+    paths: &DeadreckonPaths,
+    mut command: Command,
+    prepared: PreparedDelegation,
+) -> Result<CampaignSubProcess> {
+    let campaign = match prepared.campaign_sub.clone() {
+        Some(campaign) => campaign,
+        None => {
+            revoke_pending_delegation(paths, &prepared)?;
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "Campaign sub-process launch requires a Campaign delegation".to_string(),
+            )));
+        }
+    };
+    let context = match DRIVER_CONTEXT.get() {
+        Some(context) => context,
+        None => {
+            revoke_pending_delegation(paths, &prepared)?;
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "only an authenticated Job driver can launch a Campaign sub-process".to_string(),
+            )));
+        }
+    };
+    if context.job_id != campaign.campaign_id {
+        revoke_pending_delegation(paths, &prepared)?;
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Campaign sub-process launch requires the current fenced parent Job".to_string(),
+        )));
+    }
+    let token = match guarded_authority_lease_token(paths, &context.authority) {
+        Ok(token) => token,
+        Err(error) => {
+            revoke_pending_delegation(paths, &prepared)?;
+            return Err(error);
+        }
+    };
+    apply_delegation(&mut command, &prepared);
+    let (mut child, terminator) = match deadreckon_core::spawn_grouped(command) {
+        Ok(spawned) => spawned,
+        Err(source) => {
+            revoke_pending_delegation(paths, &prepared)?;
+            return Err(source.into());
+        }
+    };
+    let process = deadreckon_core::SupervisedProcess {
+        pid: child.id(),
+        pgid: None,
+    };
+    let mut supervised = match deadreckon_core::SupervisedProcessRecord::prepared(
+        process,
+        campaign.launch_id.clone(),
+        context.authority.attempt,
+        Some(context.authority.launch_id.clone()),
+        deadreckon_core::flight::sha256_text(&prepared.token),
+    ) {
+        Ok(supervised) => supervised,
+        Err(source) => {
+            let _ = terminator.terminate(std::time::Duration::from_secs(2));
+            revoke_pending_delegation(paths, &prepared)?;
+            return Err(source.into());
+        }
+    };
+    #[cfg(unix)]
+    {
+        supervised.process.pgid = Some(child.id());
+    }
+    supervised.phase = deadreckon_core::SupervisedProcessPhase::Running;
+    let launch = CampaignSubLaunchAuthority {
+        schema_version: 1,
+        launch_protocol: CAMPAIGN_SUB_LAUNCH_PROTOCOL.to_string(),
+        parent_job_id: context.job_id.clone(),
+        campaign_id: campaign.campaign_id,
+        sub_id: campaign.sub_id,
+        plan_id: campaign.plan_id,
+        attempt: context.authority.attempt,
+        lease_epoch: context.authority.lease_epoch,
+        outer_launch_id: context.authority.launch_id.clone(),
+        launch_id: campaign.launch_id,
+        capability_id: prepared.capability_id.clone(),
+        release_token_sha256: deadreckon_core::flight::sha256_text(&prepared.token),
+        process: supervised,
+        released: false,
+        linked: false,
+        adopted: false,
+        adopted_by_attempt: None,
+        adopted_by_lease_epoch: None,
+        prepared_at: Utc::now(),
+        released_at: None,
+        linked_at: None,
+        adopted_at: None,
+    };
+    if let Err(error) = write_campaign_sub_launch_fenced(paths, &launch, &token, "prepared")
+        .and_then(|()| {
+            append_campaign_sub_launch_event(paths, &launch, "sub_process_launch_prepared")
+        })
+    {
+        let _ = terminator.terminate(std::time::Duration::from_secs(2));
+        if !campaign_sub_transition_is_durable(paths, &launch, "prepared").unwrap_or(false) {
+            let _ = remove_campaign_sub_launch_projection_if_matches(paths, &launch);
+            let _ = revoke_pending_delegation(paths, &prepared);
+        }
+        return Err(error);
+    }
+    campaign_sub_launch_test_failpoint_once(
+        paths,
+        &launch,
+        "after_sub_process_prepare_before_release",
+    )?;
+    if let Err(error) = release_delegation(&mut child, &prepared) {
+        let termination = terminator.terminate(std::time::Duration::from_secs(2));
+        if matches!(termination, deadreckon_core::TerminationOutcome::Failed(_)) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Campaign sub-process release failed ({error}) and its exact process group could not be stopped: {termination:?}"
+            ))));
+        }
+        // If the protected authority never advanced, the child cannot have
+        // crossed dispatch. Remove both pieces of abandoned pre-authority so
+        // the next attempt does not inherit an orphaned capability.
+        if remove_campaign_sub_launch_projection_if_matches(paths, &launch).is_ok() {
+            revoke_pending_delegation(paths, &prepared)?;
+        }
+        return Err(error);
+    }
+    Ok(CampaignSubProcess {
+        launch,
+        child: Some(child),
+        prepared: Some(prepared),
+    })
+}
+
+impl CampaignSubProcess {
+    pub(crate) fn try_wait(&mut self) -> Result<CampaignSubProcessPoll> {
+        if let Some(child) = self.child.as_mut() {
+            let Some(status) = child.try_wait()? else {
+                return Ok(CampaignSubProcessPoll::Running);
+            };
+            terminate_campaign_sub_process(
+                &self.launch,
+                std::time::Duration::from_secs(2),
+                "exited residual",
+            )?;
+            return Ok(CampaignSubProcessPoll::Exited {
+                success: Some(status.success()),
+            });
+        }
+        match self.launch.process.identity() {
+            deadreckon_core::SupervisedProcessIdentity::Current => {
+                Ok(CampaignSubProcessPoll::Running)
+            }
+            deadreckon_core::SupervisedProcessIdentity::Exited
+            | deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {
+                terminate_campaign_sub_process(
+                    &self.launch,
+                    std::time::Duration::from_secs(2),
+                    "adopted residual",
+                )?;
+                Ok(CampaignSubProcessPoll::Exited { success: None })
+            }
+            deadreckon_core::SupervisedProcessIdentity::Reused
+            | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+                Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "adopted Campaign sub-process identity became conflicting or unverifiable"
+                        .to_string(),
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn revoke_pending(&self, paths: &DeadreckonPaths) -> Result<()> {
+        if let Some(prepared) = self.prepared.as_ref() {
+            let current = load_campaign_sub_launch(
+                paths,
+                &self.launch.parent_job_id,
+                &self.launch.sub_id,
+                &self.launch.plan_id,
+            )?;
+            if current.as_ref().is_some_and(|launch| launch.linked) {
+                revoke_pending_delegation(paths, prepared)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn validate_delegated_action(paths: &DeadreckonPaths, record: &DelegatedInvocation) -> Result<()> {
@@ -1305,6 +3075,44 @@ fn validate_delegated_action(paths: &DeadreckonPaths, record: &DelegatedInvocati
                 )));
             }
         }
+        DelegatedAction::MergeRepair {
+            root_artifact_id,
+            repair_id,
+            repair_round,
+            run_id,
+            proof_dir,
+            repair_request_sha256,
+            repair_plan_sha256,
+        } => {
+            if root_artifact_id != &record.job_id
+                || repair_id.trim().is_empty()
+                || *repair_round == 0
+                || Uuid::parse_str(run_id).is_err()
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "delegated merge repair changed its durable parent identity".to_string(),
+                )));
+            }
+            let canonical_proof = canonical_invocation_path(proof_dir, "repair proof")?;
+            if canonical_proof != *proof_dir
+                || canonical_invocation_path(&proof_dir.join("repair-child"), "repair child scope")?
+                    != record.scope_root
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "delegated merge repair changed its protected proof scope".to_string(),
+                )));
+            }
+            if deadreckon_core::flight::sha256_file(&proof_dir.join("repair-request.json"))?
+                != *repair_request_sha256
+                || deadreckon_core::flight::sha256_file(&proof_dir.join("repair-plan.json"))?
+                    != *repair_plan_sha256
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "delegated merge repair request or plan changed after authorization"
+                        .to_string(),
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -1320,6 +3128,20 @@ fn claim_delegation_record(pending: &Path, consumed: &Path, raw: &[u8]) -> Resul
             "delegation consumed path has no parent".to_string(),
         ))
     })?;
+    let current = read_bounded_regular_control_file(
+        pending,
+        "delegated invocation pending capability record",
+    )?
+    .ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "delegated invocation pending capability disappeared before claim".to_string(),
+        ))
+    })?;
+    if current != raw {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "delegated invocation pending capability changed before claim".to_string(),
+        )));
+    }
     fs::create_dir_all(consumed_parent)?;
     let mut tombstone = match fs::OpenOptions::new()
         .write(true)
@@ -1347,6 +3169,103 @@ fn claim_delegation_record(pending: &Path, consumed: &Path, raw: &[u8]) -> Resul
     Ok(())
 }
 
+fn release_campaign_sub_invocation(
+    paths: &DeadreckonPaths,
+    record: &DelegatedInvocation,
+    token: &deadreckon_core::LeaseToken,
+) -> Result<Option<CampaignSubLaunchAuthority>> {
+    let DelegatedAction::CampaignSub {
+        campaign_id,
+        sub_id,
+        plan_id,
+    } = &record.action
+    else {
+        return Ok(None);
+    };
+    let launch_id = record.campaign_sub_launch_id.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable Campaign delegation is missing its process launch identity".to_string(),
+        ))
+    })?;
+    let mut launch =
+        load_campaign_sub_launch(paths, campaign_id, sub_id, plan_id)?.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "durable Campaign delegation has no protected process authority".to_string(),
+            ))
+        })?;
+    if launch.launch_id != launch_id
+        || !delegated_record_matches_campaign_launch(record, &launch)
+        || launch.released
+        || launch.linked
+        || launch.adopted
+        || launch.process.process.pid != std::process::id()
+        || launch.process.identity() != deadreckon_core::SupervisedProcessIdentity::Current
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Campaign delegation does not match its exact prepared process".to_string(),
+        )));
+    }
+    let ack = CampaignSubReleaseAck {
+        schema_version: 1,
+        launch_protocol: CAMPAIGN_SUB_LAUNCH_PROTOCOL.to_string(),
+        parent_job_id: launch.parent_job_id.clone(),
+        campaign_id: launch.campaign_id.clone(),
+        sub_id: launch.sub_id.clone(),
+        plan_id: launch.plan_id.clone(),
+        attempt: launch.attempt,
+        lease_epoch: launch.lease_epoch,
+        launch_id: launch.launch_id.clone(),
+        capability_id: launch.capability_id.clone(),
+        release_token_sha256: launch.release_token_sha256.clone(),
+        pid: launch.process.process.pid,
+        process_group: launch.process.process.pgid,
+        boot_id: launch.process.boot_id.clone(),
+        process_start_identity: launch.process.process_start_identity.clone(),
+        acknowledged_at: Utc::now(),
+    };
+    if let Some(existing) = load_campaign_sub_release_ack(paths, &launch)?
+        && existing != ack
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Campaign process release conflicts with an existing acknowledgement"
+                .to_string(),
+        )));
+    }
+    write_campaign_sub_release_ack(paths, &ack)?;
+    launch.released = true;
+    launch.released_at = Some(Utc::now());
+    write_campaign_sub_launch_fenced(paths, &launch, token, "released")?;
+    append_campaign_sub_launch_event(paths, &launch, "sub_process_released")?;
+    campaign_sub_launch_test_failpoint_once(
+        paths,
+        &launch,
+        "after_sub_process_release_before_link",
+    )?;
+    Ok(Some(launch))
+}
+
+fn link_campaign_sub_invocation(
+    paths: &DeadreckonPaths,
+    mut launch: CampaignSubLaunchAuthority,
+    token: &deadreckon_core::LeaseToken,
+) -> Result<()> {
+    if !launch.released || launch.linked {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Campaign process crossed an invalid execution boundary".to_string(),
+        )));
+    }
+    launch.linked = true;
+    launch.linked_at = Some(Utc::now());
+    write_campaign_sub_launch_fenced(paths, &launch, token, "linked")?;
+    append_campaign_sub_launch_event(paths, &launch, "sub_process_linked")?;
+    campaign_sub_launch_test_failpoint_once(
+        paths,
+        &launch,
+        "after_sub_process_link_before_dispatch",
+    )?;
+    record_campaign_sub_dispatch_test_side_effect(&launch)
+}
+
 pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
     let Some(job_id) = std::env::var_os(DELEGATION_JOB_ENV).filter(|value| !value.is_empty())
     else {
@@ -1369,21 +3288,15 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
     })?;
     let paths = DeadreckonPaths::discover();
     let pending = delegation_pending_path(&paths, job_id, &capability_id);
-    let metadata = fs::metadata(&pending).map_err(|source| {
-        if source.kind() == std::io::ErrorKind::NotFound {
-            CliError::Core(DeadreckonError::InvalidInput(
-                "delegated invocation has no pending protected capability record".to_string(),
-            ))
-        } else {
-            CliError::from(source)
-        }
+    let raw = read_bounded_regular_control_file(
+        &pending,
+        "delegated invocation protected capability record",
+    )?
+    .ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "delegated invocation has no pending protected capability record".to_string(),
+        ))
     })?;
-    if metadata.len() > MAX_DELEGATION_RECORD_BYTES {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "delegated invocation record exceeded its bounded size".to_string(),
-        )));
-    }
-    let raw = fs::read(&pending)?;
     let record: DelegatedInvocation = serde_json::from_slice(&raw)?;
     if record.schema_version != 1
         || record.job_id != job_id
@@ -1439,15 +3352,20 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
             "delegated invocation scope changed after authorization".to_string(),
         )));
     }
-    if !commands::supervisor::guarded_driver_authority_is_live(&paths, &record.authority)? {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "delegated invocation is not bound to the current live Job driver".to_string(),
-        )));
-    }
+    let lease_token = guarded_authority_lease_token(&paths, &record.authority)?;
     validate_delegated_action(&paths, &record)?;
 
+    let campaign_launch = release_campaign_sub_invocation(&paths, &record, &lease_token)?;
     let consumed = delegation_consumed_path(&paths, job_id, &capability_id);
     claim_delegation_record(&pending, &consumed, &raw)?;
+    if let Some(launch) = campaign_launch {
+        campaign_sub_launch_test_failpoint_once(
+            &paths,
+            &launch,
+            "after_sub_process_claim_before_link",
+        )?;
+        link_campaign_sub_invocation(&paths, launch, &lease_token)?;
+    }
     match &record.action {
         DelegatedAction::PlanChild {
             plan_id,
@@ -1474,6 +3392,44 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
         | DelegatedAction::CampaignSub { .. } => {
             install_driver_context(&paths, record.authority, false)?;
         }
+        DelegatedAction::MergeRepair {
+            root_artifact_id,
+            repair_id,
+            repair_round,
+            run_id,
+            proof_dir,
+            repair_request_sha256,
+            repair_plan_sha256,
+        } => {
+            DELEGATED_REPAIR_AUTHORITY
+                .set(record.authority.clone())
+                .map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "this process already consumed another repair driver authority".to_string(),
+                    ))
+                })?;
+            DELEGATED_PLAN_CHILD
+                .set(deadreckon_core::RunOwnership::merge_repair(
+                    record.job_id,
+                    root_artifact_id.clone(),
+                    repair_id.clone(),
+                    *repair_round,
+                    run_id.clone(),
+                    proof_dir.clone(),
+                    repair_request_sha256.clone(),
+                    repair_plan_sha256.clone(),
+                ))
+                .map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "this process already consumed another merge repair capability".to_string(),
+                    ))
+                })?;
+            DELEGATED_CHILD_RUN_ID.set(run_id.clone()).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "this process already consumed another delegated Run identity".to_string(),
+                ))
+            })?;
+        }
     }
     Ok(true)
 }
@@ -1483,7 +3439,7 @@ pub(crate) fn require_current_driver_for_job_artifact(
     artifact_id: &str,
     expected_shape: JobShape,
     operation: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let owner = if expected_shape == JobShape::Graph {
         let plan = deadreckon_core::load_plan(paths, artifact_id)?;
         resolve_plan_owner(paths, &plan)?
@@ -1504,7 +3460,7 @@ pub(crate) fn require_current_driver_for_job_artifact(
         None
     };
     let Some(owner) = owner else {
-        return Ok(());
+        return Ok(false);
     };
     if owner.root_plan_id.trim().is_empty() || owner.lineage.is_empty() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -1524,7 +3480,7 @@ pub(crate) fn require_current_driver_for_job_artifact(
             ))));
         }
         validate_owned_plan_lineage(paths, &owner)?;
-        return Ok(());
+        return Ok(true);
     }
     Err(CliError::Core(deadreckon_core::user_error(
         &format!(
@@ -1712,6 +3668,50 @@ fn stamped_run_owner(
             {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                     "Run {} does not match its durable Campaign result authority",
+                    state.run_id
+                ))));
+            }
+        }
+        deadreckon_core::RunOwnershipArtifact::MergeRepair {
+            root_artifact_id,
+            repair_id,
+            repair_round,
+            run_id,
+            proof_dir,
+            repair_request_sha256,
+            repair_plan_sha256,
+        } => {
+            let repair_record_path = proof_dir.join("repair-run.json");
+            let repair_record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&repair_record_path)?).map_err(|source| {
+                    CliError::Core(DeadreckonError::Json {
+                        path: repair_record_path.clone(),
+                        source,
+                    })
+                })?;
+            if root_artifact_id != job.job_id.as_ref()
+                || repair_id.trim().is_empty()
+                || *repair_round == 0
+                || run_id != &state.run_id
+                || repair_record
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(state.run_id.as_str())
+                || repair_record
+                    .get("repair_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(repair_id.as_str())
+                || repair_record
+                    .get("repair_round")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(*repair_round))
+                || deadreckon_core::flight::sha256_file(&proof_dir.join("repair-request.json"))?
+                    != *repair_request_sha256
+                || deadreckon_core::flight::sha256_file(&proof_dir.join("repair-plan.json"))?
+                    != *repair_plan_sha256
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Run {} does not match its immutable merge repair authority",
                     state.run_id
                 ))));
             }
@@ -4127,8 +6127,105 @@ fn plan_execution_usage(
     let mut seen_runs = std::collections::BTreeSet::new();
     let mut seen_plans = std::collections::BTreeSet::new();
     let mut usage = ParentExecutionUsage::default();
-    add_plan_execution_usage(paths, plan, &mut seen_runs, &mut seen_plans, &mut usage)?;
+    add_plan_execution_usage(
+        paths,
+        plan,
+        &mut seen_runs,
+        &mut seen_plans,
+        &mut usage,
+        true,
+    )?;
     Ok(usage)
+}
+
+fn validate_merge_repair_evidence(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<()> {
+    let ownership = state.ownership.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair Run {} has no durable parent ownership",
+            state.run_id
+        )))
+    })?;
+    let deadreckon_core::RunOwnershipArtifact::MergeRepair {
+        root_artifact_id,
+        repair_id,
+        repair_round,
+        run_id,
+        proof_dir,
+        repair_request_sha256,
+        repair_plan_sha256,
+    } = &ownership.artifact
+    else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair Run {} is stamped as another artifact kind",
+            state.run_id
+        ))));
+    };
+    let record_path = proof_dir.join("repair-run.json");
+    let record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record_path)?).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: record_path.clone(),
+                source,
+            })
+        })?;
+    let marker = deadreckon_core::validate_acceptance_marker(state)?;
+    let library = paths.library_dir(&state.scope, &state.run_id);
+    let result_tree_sha256 =
+        deadreckon_core::flight::build_deliverable_file_index(&library)?.tree_hash();
+    let marker_sha256 = deadreckon_core::flight::sha256_file(
+        &deadreckon_core::marker_path_for_run_root(&state.run_root),
+    )?;
+    if ownership.job_id != *root_artifact_id
+        || run_id != &state.run_id
+        || record
+            .get("root_artifact_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(root_artifact_id.as_str())
+        || record.get("repair_id").and_then(serde_json::Value::as_str) != Some(repair_id.as_str())
+        || record
+            .get("repair_round")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(*repair_round))
+        || record.get("run_id").and_then(serde_json::Value::as_str) != Some(state.run_id.as_str())
+        || record
+            .get("repair_request_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(repair_request_sha256.as_str())
+        || record
+            .get("repair_plan_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(repair_plan_sha256.as_str())
+        || record.get("trusted").and_then(serde_json::Value::as_bool) != Some(true)
+        || record
+            .get("acceptance_marker_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(marker_sha256.as_str())
+        || record
+            .get("result_tree_sha256")
+            .and_then(serde_json::Value::as_str)
+            != Some(result_tree_sha256.as_str())
+        || deadreckon_core::flight::sha256_file(&proof_dir.join("repair-request.json"))?
+            != *repair_request_sha256
+        || deadreckon_core::flight::sha256_file(&proof_dir.join("repair-plan.json"))?
+            != *repair_plan_sha256
+        || state.sandbox == "none"
+        || record
+            .get("sandbox_requested")
+            .and_then(serde_json::Value::as_str)
+            != Some(state.sandbox.as_str())
+        || !marker.is_native_gate_proof()
+        || !marker.contained
+        || marker.sandbox_backend == "none"
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair Run {} has missing, stale, or tampered trusted evidence",
+            state.run_id
+        ))));
+    }
+    Ok(())
 }
 
 fn add_plan_execution_usage(
@@ -4137,6 +6234,7 @@ fn add_plan_execution_usage(
     seen_runs: &mut std::collections::BTreeSet<String>,
     seen_plans: &mut std::collections::BTreeSet<String>,
     usage: &mut ParentExecutionUsage,
+    require_complete: bool,
 ) -> Result<()> {
     if !seen_plans.insert(plan.plan_id.clone()) {
         return Ok(());
@@ -4157,7 +6255,14 @@ fn add_plan_execution_usage(
                     "cannot verify parent budget because nested sub-plan {subplan_id} is unreadable: {error}"
                 )))
             })?;
-            add_plan_execution_usage(paths, &subplan, seen_runs, seen_plans, usage)?;
+            add_plan_execution_usage(
+                paths,
+                &subplan,
+                seen_runs,
+                seen_plans,
+                usage,
+                require_complete,
+            )?;
         }
         for run_id in task
             .attempts
@@ -4182,13 +6287,13 @@ fn add_plan_execution_usage(
                 usage,
             )?;
         }
-        if task.attempts.iter().any(|attempt| attempt.run_id.is_none()) {
+        if require_complete && task.attempts.iter().any(|attempt| attempt.run_id.is_none()) {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                 "cannot verify parent budget because graph task {} has an attempt without a run ID",
                 task.task_id
             ))));
         }
-        if task.child_run_id.is_none() {
+        if require_complete && task.child_run_id.is_none() {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
                 "cannot verify parent budget because graph task {} has no result run",
                 task.task_id
@@ -4215,6 +6320,7 @@ fn add_plan_execution_usage(
                 "cannot verify parent budget because merge-repair run {run_id} is unreadable: {error}"
             )))
         })?;
+        validate_merge_repair_evidence(paths, &state)?;
         add_usage(
             &format!("merge-repair run {run_id}"),
             ParentExecutionUsage {
@@ -4225,6 +6331,78 @@ fn add_plan_execution_usage(
         )?;
     }
     Ok(())
+}
+
+pub(crate) fn current_driver_remaining_repair_budget(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    repair_planner_spend_usd: f64,
+    repair_planner_wall_seconds: f64,
+) -> Result<Option<(f64, f64)>> {
+    let Some(context) = DRIVER_CONTEXT.get() else {
+        return Ok(None);
+    };
+    let job = deadreckon_core::load_job(paths, &context.job_id)?;
+    let mut usage = match job.shape {
+        JobShape::Graph => {
+            let mut seen_runs = std::collections::BTreeSet::new();
+            let mut seen_plans = std::collections::BTreeSet::new();
+            let mut usage = ParentExecutionUsage::default();
+            add_plan_execution_usage(
+                paths,
+                plan,
+                &mut seen_runs,
+                &mut seen_plans,
+                &mut usage,
+                false,
+            )?;
+            usage
+        }
+        JobShape::LegacyCampaign => {
+            let campaign =
+                deadreckon_core::campaign::read_campaign(&paths.plan_dir(&context.job_id))?;
+            campaign_execution_usage(paths, &campaign)?
+        }
+        shape => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge repair cannot inherit a budget from incompatible Job shape {shape:?}"
+            ))));
+        }
+    };
+    add_usage(
+        "merge-repair planner",
+        ParentExecutionUsage {
+            spend_usd: repair_planner_spend_usd,
+            wall_seconds: repair_planner_wall_seconds,
+        },
+        &mut usage,
+    )?;
+    remaining_repair_budget(
+        job.policy.max_spend_usd,
+        job.policy.max_wall_seconds as f64,
+        usage,
+    )
+    .map(Some)
+}
+
+fn remaining_repair_budget(
+    max_spend_usd: f64,
+    max_wall_seconds: f64,
+    usage: ParentExecutionUsage,
+) -> Result<(f64, f64)> {
+    let remaining_spend = max_spend_usd - usage.spend_usd;
+    let remaining_wall = max_wall_seconds - usage.wall_seconds;
+    if remaining_spend <= 0.0 || remaining_wall <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge repair child refused because the parent Job has no remaining {} budget",
+            if remaining_spend <= 0.0 {
+                "spend"
+            } else {
+                "wall-time"
+            }
+        ))));
+    }
+    Ok((remaining_spend, remaining_wall))
 }
 
 fn campaign_execution_usage(
@@ -4287,7 +6465,44 @@ fn campaign_execution_usage(
                 "cannot verify campaign budget because sub-plan {plan_id} is unreadable: {error}"
             )))
         })?;
-        add_plan_execution_usage(paths, &plan, &mut seen_runs, &mut seen_plans, &mut usage)?;
+        add_plan_execution_usage(
+            paths,
+            &plan,
+            &mut seen_runs,
+            &mut seen_plans,
+            &mut usage,
+            true,
+        )?;
+    }
+    for event in deadreckon_core::read_plan_events(paths, &campaign.campaign_id)? {
+        let run_id = match event.event {
+            deadreckon_core::PlanEventKind::MergeRepairRunDiscovered { run_id, .. } => Some(run_id),
+            deadreckon_core::PlanEventKind::MergeRepaired {
+                repair_run_id: Some(run_id),
+                ..
+            } => Some(run_id),
+            _ => None,
+        };
+        let Some(run_id) = run_id else {
+            continue;
+        };
+        if !seen_runs.insert(run_id.clone()) {
+            continue;
+        }
+        let state = deadreckon_core::load_run(paths, &run_id).map_err(|error| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot verify campaign budget because merge-repair run {run_id} is unreadable: {error}"
+            )))
+        })?;
+        validate_merge_repair_evidence(paths, &state)?;
+        add_usage(
+            &format!("campaign merge-repair run {run_id}"),
+            ParentExecutionUsage {
+                spend_usd: state.total_spend_usd,
+                wall_seconds: state.total_wall_seconds,
+            },
+            &mut usage,
+        )?;
     }
     validate_parent_usage(usage)?;
     Ok(usage)
@@ -5709,6 +7924,530 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn delegation_claim_rejects_a_symlinked_pending_capability() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let target = temp.path().join("attacker.json");
+        let pending = temp.path().join("pending").join("capability.json");
+        let consumed = temp.path().join("consumed").join("capability.json");
+        fs::write(&target, b"attacker controlled").expect("target");
+        fs::create_dir_all(pending.parent().expect("pending parent")).expect("pending directory");
+        symlink(&target, &pending).expect("pending symlink");
+
+        let error = claim_delegation_record(&pending, &consumed, b"attacker controlled")
+            .expect_err("symlinked pending record must fail closed");
+        assert!(error.to_string().contains("non-symlink"), "{error}");
+        assert!(!consumed.exists(), "no consumed authority may be minted");
+        assert_eq!(
+            fs::read(&target).expect("target remains"),
+            b"attacker controlled"
+        );
+    }
+
+    fn campaign_sub_launch_fixture(released: bool, linked: bool) -> CampaignSubLaunchAuthority {
+        let launch_id = Uuid::new_v4().to_string();
+        let outer_launch_id = Uuid::new_v4().to_string();
+        let mut process = deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess {
+                pid: std::process::id(),
+                pgid: None,
+            },
+            launch_id.clone(),
+            2,
+            Some(outer_launch_id.clone()),
+            "sha256:release".to_string(),
+        )
+        .expect("process identity");
+        #[cfg(unix)]
+        {
+            process.process.pgid = Some(process.process.pid);
+        }
+        process.phase = deadreckon_core::SupervisedProcessPhase::Running;
+        CampaignSubLaunchAuthority {
+            schema_version: 1,
+            launch_protocol: CAMPAIGN_SUB_LAUNCH_PROTOCOL.to_string(),
+            parent_job_id: "campaign-job".to_string(),
+            campaign_id: "campaign-job".to_string(),
+            sub_id: "sub-1".to_string(),
+            plan_id: "reserved-plan".to_string(),
+            attempt: 2,
+            lease_epoch: 7,
+            outer_launch_id,
+            launch_id,
+            capability_id: Uuid::new_v4().to_string(),
+            release_token_sha256: "sha256:release".to_string(),
+            process,
+            released,
+            linked,
+            adopted: false,
+            adopted_by_attempt: None,
+            adopted_by_lease_epoch: None,
+            prepared_at: Utc::now(),
+            released_at: released.then(Utc::now),
+            linked_at: linked.then(Utc::now),
+            adopted_at: None,
+        }
+    }
+
+    #[test]
+    fn campaign_sub_crash_before_release_is_provably_safe_to_relaunch() {
+        let launch = campaign_sub_launch_fixture(false, false);
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Exited,
+                false,
+                true,
+                false,
+                false,
+            )
+            .expect("classify pre-release crash"),
+            CampaignSubRecoveryDisposition::RelaunchNonexecuted
+        );
+    }
+
+    #[test]
+    fn campaign_sub_crash_after_release_before_link_is_still_nonexecuted() {
+        let launch = campaign_sub_launch_fixture(true, false);
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Exited,
+                true,
+                true,
+                false,
+                false,
+            )
+            .expect("classify release-before-link crash"),
+            CampaignSubRecoveryDisposition::RelaunchNonexecuted
+        );
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Exited,
+                true,
+                false,
+                true,
+                false,
+            )
+            .expect("classify capability-consumed-before-link crash"),
+            CampaignSubRecoveryDisposition::RelaunchNonexecuted,
+            "consuming the capability is not execution: only the durable link releases CLI dispatch"
+        );
+    }
+
+    #[test]
+    fn campaign_sub_link_projection_without_its_fenced_event_is_not_execution() {
+        let launch = campaign_sub_launch_fixture(true, true);
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Exited,
+                true,
+                false,
+                true,
+                false,
+            )
+            .expect("classify uncommitted link projection"),
+            CampaignSubRecoveryDisposition::RelaunchNonexecuted
+        );
+    }
+
+    #[test]
+    fn campaign_sub_link_before_dispatch_relaunches_after_a_simulated_boot_change() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch = campaign_sub_launch_fixture(true, true);
+        fs::create_dir_all(paths.plan_dir(&launch.campaign_id)).expect("Campaign directory");
+
+        let disposition = classify_campaign_sub_recovery(
+            &launch,
+            deadreckon_core::SupervisedProcessIdentity::DifferentBoot,
+            true,
+            false,
+            true,
+            true,
+        )
+        .expect("classify rebooted linked launch");
+        assert_eq!(
+            disposition,
+            CampaignSubRecoveryDisposition::RecoverLinkedArtifacts
+        );
+        assert!(matches!(
+            recover_linked_campaign_sub_artifacts(
+                &paths,
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::DifferentBoot,
+            )
+            .expect("recover empty dispatch after boot change"),
+            CampaignSubLaunchRecovery::Relaunch
+        ));
+    }
+
+    #[test]
+    fn campaign_sub_authority_rejects_unknown_outer_and_process_fields() {
+        let launch = campaign_sub_launch_fixture(false, false);
+        let mut outer = serde_json::to_value(&launch).expect("serialize authority");
+        outer
+            .as_object_mut()
+            .expect("authority object")
+            .insert("forged".to_string(), json!(true));
+        assert!(
+            serde_json::from_value::<CampaignSubLaunchAuthority>(outer).is_err(),
+            "unknown outer authority fields must fail closed"
+        );
+
+        let mut nested = serde_json::to_value(&launch).expect("serialize authority");
+        nested
+            .get_mut("process")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("process object")
+            .insert("forged".to_string(), json!(true));
+        assert!(
+            serde_json::from_value::<CampaignSubLaunchAuthority>(nested).is_err(),
+            "unknown embedded process fields must fail closed"
+        );
+
+        let action = json!({
+            "kind": "campaign_sub",
+            "campaign_id": "campaign-job",
+            "sub_id": "sub-1",
+            "plan_id": "reserved-plan",
+            "forged": true,
+        });
+        assert!(
+            serde_json::from_value::<DelegatedAction>(action).is_err(),
+            "unknown delegated action fields must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_sub_authority_rejects_a_mismatched_process_group() {
+        let mut launch = campaign_sub_launch_fixture(false, false);
+        launch.process.process.pgid = Some(launch.process.process.pid.saturating_add(1));
+        let error = validate_campaign_sub_launch_identity(&launch)
+            .expect_err("mismatched Campaign process group must fail closed");
+        assert!(
+            error.to_string().contains("mismatched process group"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn campaign_sub_control_reads_are_bounded() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let path = temp.path().join("oversized.json");
+        fs::write(&path, vec![b'x'; MAX_DELEGATION_RECORD_BYTES as usize + 1])
+            .expect("oversized fixture");
+        let error = read_bounded_regular_control_file(&path, "test control record")
+            .expect_err("oversized control record must fail closed");
+        assert!(error.to_string().contains("bounded size"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_sub_authority_read_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch = campaign_sub_launch_fixture(false, false);
+        let target = temp.path().join("attacker-authority.json");
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&launch).expect("authority JSON"),
+        )
+        .expect("authority target");
+        let link = campaign_sub_launch_path(
+            &paths,
+            &launch.parent_job_id,
+            &launch.sub_id,
+            &launch.plan_id,
+        );
+        fs::create_dir_all(link.parent().expect("authority parent")).expect("authority directory");
+        symlink(&target, &link).expect("authority symlink");
+        let error = load_campaign_sub_launch(
+            &paths,
+            &launch.parent_job_id,
+            &launch.sub_id,
+            &launch.plan_id,
+        )
+        .expect_err("symlinked authority must fail closed");
+        assert!(error.to_string().contains("non-symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn spawned_campaign_sub_fixture(
+        paths: &DeadreckonPaths,
+        job_id: &str,
+        suffix: &str,
+    ) -> (
+        std::process::Child,
+        Box<dyn deadreckon_core::ChildTerminator>,
+        CampaignSubLaunchAuthority,
+    ) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' HUP; sleep 30 & wait"]);
+        let (child, terminator) = deadreckon_core::spawn_grouped(command).expect("grouped child");
+        let launch_id = Uuid::new_v4().to_string();
+        let outer_launch_id = Uuid::new_v4().to_string();
+        let mut process = deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess {
+                pid: child.id(),
+                pgid: None,
+            },
+            launch_id.clone(),
+            1,
+            Some(outer_launch_id.clone()),
+            format!("sha256:release-{suffix}"),
+        )
+        .expect("process identity");
+        process.process.pgid = Some(child.id());
+        process.phase = deadreckon_core::SupervisedProcessPhase::Running;
+        let launch = CampaignSubLaunchAuthority {
+            schema_version: 1,
+            launch_protocol: CAMPAIGN_SUB_LAUNCH_PROTOCOL.to_string(),
+            parent_job_id: job_id.to_string(),
+            campaign_id: job_id.to_string(),
+            sub_id: format!("sub-{suffix}"),
+            plan_id: format!("plan-{suffix}"),
+            attempt: 1,
+            lease_epoch: 1,
+            outer_launch_id,
+            launch_id,
+            capability_id: Uuid::new_v4().to_string(),
+            release_token_sha256: format!("sha256:release-{suffix}"),
+            process,
+            released: false,
+            linked: false,
+            adopted: false,
+            adopted_by_attempt: None,
+            adopted_by_lease_epoch: None,
+            prepared_at: Utc::now(),
+            released_at: None,
+            linked_at: None,
+            adopted_at: None,
+        };
+        write_campaign_sub_launch(paths, &launch).expect("launch authority");
+        let pending = delegation_pending_path(paths, &launch.parent_job_id, &launch.capability_id);
+        fs::create_dir_all(pending.parent().expect("pending parent")).expect("pending directory");
+        fs::write(&pending, b"pending").expect("pending capability");
+        (child, terminator, launch)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_cancellation_terminates_the_nested_process_group_and_revokes_pending() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "campaign-cancel";
+        let (mut child, _terminator, launch) =
+            spawned_campaign_sub_fixture(&paths, job_id, "cancel");
+
+        reconcile_campaign_sub_processes_for_job(&paths, job_id, std::time::Duration::ZERO)
+            .expect("reconcile Campaign sub-processes");
+
+        child.wait().expect("reap Campaign sub-process");
+        assert!(
+            !delegation_pending_path(&paths, job_id, &launch.capability_id).exists(),
+            "cancellation must revoke the unconsumed child capability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_cancellation_validates_the_whole_inventory_before_signalling() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "campaign-cancel-closed";
+        let (mut child, terminator, _launch) =
+            spawned_campaign_sub_fixture(&paths, job_id, "closed");
+        let malformed = paths
+            .job_dir(job_id)
+            .join(CAMPAIGN_SUB_LAUNCH_DIR)
+            .join("zz-malformed.json");
+        fs::write(&malformed, b"{}").expect("malformed authority");
+
+        reconcile_campaign_sub_processes_for_job(&paths, job_id, std::time::Duration::ZERO)
+            .expect_err("malformed sibling authority must fail closed");
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "no nested process may be signalled before the complete inventory validates"
+        );
+
+        let _ = terminator.terminate(std::time::Duration::ZERO);
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn campaign_linked_recovery_terminates_residual_process_group_before_relaunch() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "campaign-linked-residual";
+        let (mut child, terminator, mut launch) =
+            spawned_campaign_sub_fixture(&paths, job_id, "linked-residual");
+        launch.released = true;
+        launch.released_at = Some(Utc::now());
+        launch.linked = true;
+        launch.linked_at = Some(Utc::now());
+        write_campaign_sub_launch(&paths, &launch).expect("linked authority");
+        fs::create_dir_all(paths.plan_dir(&launch.campaign_id)).expect("Campaign directory");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("kill group leader only");
+        child.wait().expect("reap group leader");
+
+        let recovery = recover_linked_campaign_sub_artifacts(
+            &paths,
+            &launch,
+            deadreckon_core::SupervisedProcessIdentity::Exited,
+        )
+        .expect("terminate residual group before relaunch");
+        assert!(matches!(recovery, CampaignSubLaunchRecovery::Relaunch));
+
+        let _ = terminator.terminate(std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn campaign_sub_recovery_adopts_linked_live_process_without_duplicate_execution() {
+        let launch = campaign_sub_launch_fixture(true, true);
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Current,
+                true,
+                false,
+                true,
+                true,
+            )
+            .expect("classify live linked launch"),
+            CampaignSubRecoveryDisposition::AdoptLinked
+        );
+        assert_eq!(
+            classify_campaign_sub_recovery(
+                &launch,
+                deadreckon_core::SupervisedProcessIdentity::Exited,
+                true,
+                false,
+                true,
+                true,
+            )
+            .expect("classify exited linked launch"),
+            CampaignSubRecoveryDisposition::RecoverLinkedArtifacts,
+            "an executed launch must never be classified for relaunch"
+        );
+        let error = classify_campaign_sub_recovery(
+            &launch,
+            deadreckon_core::SupervisedProcessIdentity::Reused,
+            true,
+            false,
+            true,
+            true,
+        )
+        .expect_err("PID reuse must fail closed");
+        assert!(
+            error.to_string().contains("conflicting or unverifiable"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn campaign_sub_recovery_rejects_inconsistent_release_link_and_unknown_identity() {
+        let released = campaign_sub_launch_fixture(true, false);
+        let missing_ack = classify_campaign_sub_recovery(
+            &released,
+            deadreckon_core::SupervisedProcessIdentity::Exited,
+            false,
+            true,
+            false,
+            false,
+        )
+        .expect_err("released state without ack must fail closed");
+        assert!(
+            missing_ack
+                .to_string()
+                .contains("without a matching acknowledgement"),
+            "{missing_ack}"
+        );
+
+        let linked = campaign_sub_launch_fixture(true, true);
+        let still_pending = classify_campaign_sub_recovery(
+            &linked,
+            deadreckon_core::SupervisedProcessIdentity::Current,
+            true,
+            true,
+            true,
+            true,
+        )
+        .expect_err("linked state cannot retain pending capability");
+        assert!(
+            still_pending.to_string().contains("one-time capability"),
+            "{still_pending}"
+        );
+        let missing_consumed = classify_campaign_sub_recovery(
+            &linked,
+            deadreckon_core::SupervisedProcessIdentity::Exited,
+            true,
+            false,
+            false,
+            true,
+        )
+        .expect_err("linked state needs consumed capability");
+        assert!(
+            missing_consumed.to_string().contains("one-time capability"),
+            "{missing_consumed}"
+        );
+        for identity in [
+            deadreckon_core::SupervisedProcessIdentity::Reused,
+            deadreckon_core::SupervisedProcessIdentity::Unverifiable,
+        ] {
+            let unknown =
+                classify_campaign_sub_recovery(&linked, identity, true, false, true, true)
+                    .expect_err("unknown identity must fail closed");
+            assert!(
+                unknown.to_string().contains("conflicting or unverifiable"),
+                "{unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn campaign_sub_launch_projection_advances_without_replacing_its_identity() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut launch = campaign_sub_launch_fixture(false, false);
+        write_campaign_sub_launch(&paths, &launch).expect("write prepared launch");
+
+        launch.released = true;
+        launch.released_at = Some(Utc::now());
+        write_campaign_sub_launch(&paths, &launch).expect("advance released launch");
+        launch.linked = true;
+        launch.linked_at = Some(Utc::now());
+        write_campaign_sub_launch(&paths, &launch).expect("advance linked launch");
+
+        let persisted = load_campaign_sub_launch(
+            &paths,
+            &launch.parent_job_id,
+            &launch.sub_id,
+            &launch.plan_id,
+        )
+        .expect("load launch")
+        .expect("persisted launch");
+        assert_eq!(persisted.launch_id, launch.launch_id);
+        assert!(persisted.released);
+        assert!(persisted.linked);
+        assert!(!persisted.adopted);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn delegated_argv_hash_accepts_non_utf8_arguments_without_loss() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -6089,5 +8828,145 @@ mod tests {
             driver_spec(&plan).expect("frozen driver").apply,
             deadreckon_core::plan::ApplyWhen::AtEnd
         );
+    }
+
+    fn dependency_repair_link_fixture(
+        tamper_plan_digest: bool,
+    ) -> (
+        tempfile::TempDir,
+        DeadreckonPaths,
+        deadreckon_core::PipelineState,
+        PathBuf,
+    ) {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let working = temp.path().join("dependency-working");
+        let proof_dir = temp.path().join("task-launch").join("merge-proofs");
+        fs::create_dir_all(&working).expect("working");
+        fs::create_dir_all(&proof_dir).expect("proofs");
+        let proof_dir = fs::canonicalize(&proof_dir).expect("canonical proofs");
+        let request_sha = deadreckon_core::flight::sha256_text("request");
+        let plan_sha = deadreckon_core::flight::sha256_text("plan");
+        let ownership = deadreckon_core::RunOwnership::merge_repair(
+            "parent-job",
+            "parent-job",
+            "repair-id",
+            1,
+            "dependency-repair-run",
+            proof_dir.clone(),
+            request_sha.clone(),
+            plan_sha.clone(),
+        );
+        let state = deadreckon_core::create_owned_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "dependency repair".to_string(),
+                cwd: working,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some("dependency-repair-run".to_string()),
+                codebase: None,
+            },
+            ownership,
+        )
+        .expect("owned repair Run");
+        commands::job::write_json_synced(
+            &proof_dir.join("repair-run.json"),
+            &json!({
+                "schema_version": 2,
+                "root_artifact_id": "parent-job",
+                "repair_id": "repair-id",
+                "repair_round": 1,
+                "repair_request_sha256": request_sha,
+                "repair_plan_sha256": if tamper_plan_digest {
+                    deadreckon_core::flight::sha256_text("tampered")
+                } else {
+                    plan_sha
+                },
+                "run_id": "dependency-repair-run",
+                "status": "launch_prepared",
+            }),
+        )
+        .expect("launch record");
+        (temp, paths, state, proof_dir)
+    }
+
+    #[test]
+    fn dependency_repair_links_exact_run_before_output_and_refuses_duplicate() {
+        let (_temp, _paths, state, proof_dir) = dependency_repair_link_fixture(false);
+        link_delegated_repair_run(&state).expect("link exact repair Run");
+        let linked: Value = serde_json::from_slice(
+            &fs::read(proof_dir.join("repair-run.json")).expect("linked record"),
+        )
+        .expect("linked JSON");
+        assert_eq!(linked["run_id"], state.run_id);
+        assert_eq!(linked["status"], "child_linked");
+
+        let mut duplicate = state.clone();
+        duplicate.run_id = "duplicate-repair-run".to_string();
+        link_delegated_repair_run(&duplicate)
+            .expect_err("durable authority must not link a second repair Run");
+        let unchanged: Value = serde_json::from_slice(
+            &fs::read(proof_dir.join("repair-run.json")).expect("unchanged record"),
+        )
+        .expect("unchanged JSON");
+        assert_eq!(unchanged["run_id"], state.run_id);
+    }
+
+    #[test]
+    fn dependency_repair_digest_tamper_fails_before_run_link() {
+        let (_temp, _paths, state, proof_dir) = dependency_repair_link_fixture(true);
+        link_delegated_repair_run(&state)
+            .expect_err("tampered immutable repair plan must not link");
+        let record: Value = serde_json::from_slice(
+            &fs::read(proof_dir.join("repair-run.json")).expect("launch record"),
+        )
+        .expect("launch JSON");
+        assert_eq!(record["run_id"], "dependency-repair-run");
+    }
+
+    #[test]
+    fn preassigned_repair_run_survives_crash_before_link_without_duplicate_identity() {
+        let (_temp, paths, state, proof_dir) = dependency_repair_link_fixture(false);
+        let authority: Value = serde_json::from_slice(
+            &fs::read(proof_dir.join("repair-run.json")).expect("launch authority"),
+        )
+        .expect("launch authority JSON");
+        assert_eq!(authority["run_id"], state.run_id);
+        let recovered =
+            deadreckon_core::load_run(&paths, &state.run_id).expect("preassigned owned Run");
+        assert_eq!(recovered.ownership, state.ownership);
+        assert_eq!(
+            recovered
+                .ownership
+                .as_ref()
+                .and_then(|ownership| match &ownership.artifact {
+                    deadreckon_core::RunOwnershipArtifact::MergeRepair { run_id, .. } => {
+                        Some(run_id.as_str())
+                    }
+                    _ => None,
+                }),
+            Some(state.run_id.as_str())
+        );
+    }
+
+    #[test]
+    fn exhausted_parent_budget_refuses_repair_child() {
+        for usage in [
+            ParentExecutionUsage {
+                spend_usd: 4.0,
+                wall_seconds: 1.0,
+            },
+            ParentExecutionUsage {
+                spend_usd: 1.0,
+                wall_seconds: 90.0,
+            },
+        ] {
+            remaining_repair_budget(4.0, 90.0, usage)
+                .expect_err("repair child must fail closed at either parent cap");
+        }
     }
 }

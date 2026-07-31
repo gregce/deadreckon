@@ -504,6 +504,13 @@ pub(crate) fn cancel_job(
     if let Some(state) = state.as_ref() {
         write_cancel_marker(state, "operator cancelled durable job")?;
     }
+    // Cancellation freezes new Job-owned writes. Validate the complete nested
+    // Campaign process inventory before the first signal so corrupt authority
+    // cannot leave an outer driver stopped while an untrusted child survives.
+    let campaign_inventory = commands::graph_job::validate_campaign_sub_process_inventory_for_job(
+        paths,
+        view.job.job_id.as_ref(),
+    )?;
     let metadata_path = paths
         .job_dir(view.job.job_id.as_ref())
         .join("supervised-child.json");
@@ -526,6 +533,11 @@ pub(crate) fn cancel_job(
             ))));
         }
     }
+    commands::graph_job::terminate_validated_campaign_sub_processes(
+        paths,
+        campaign_inventory,
+        grace,
+    )?;
     if let Some(state) = state.as_ref() {
         reconcile_run_supervised_processes(state, grace, false)?;
     }
@@ -1619,6 +1631,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn malformed_campaign_inventory_signals_neither_outer_nor_nested_process() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job = create_job(request(&paths, &source, None)).expect("job");
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        let mut outer = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("outer process");
+        deadreckon_core::write_supervised_process(
+            &paths
+                .job_dir(job.job_id.as_ref())
+                .join("supervised-child.json"),
+            deadreckon_core::SupervisedProcess {
+                pid: outer.id(),
+                pgid: None,
+            },
+        )
+        .expect("outer authority");
+        let nested_dir = paths
+            .job_dir(job.job_id.as_ref())
+            .join("campaign-sub-launches");
+        fs::create_dir_all(&nested_dir).expect("nested authority directory");
+        fs::write(nested_dir.join("malformed.json"), b"{}").expect("malformed authority");
+
+        cancel_job(&paths, &view, true)
+            .expect_err("malformed nested inventory must fail before signalling");
+        assert!(
+            outer.try_wait().expect("poll outer").is_none(),
+            "outer process must remain alive when nested authority is malformed"
+        );
+
+        let _ = outer.kill();
+        let _ = outer.wait();
     }
 
     fn supervised_state(temp: &TempDir) -> deadreckon_core::PipelineState {

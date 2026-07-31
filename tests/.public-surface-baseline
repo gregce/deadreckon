@@ -197,6 +197,7 @@ crate: deadreckon-core
   gate::sign_gate_evaluation_with_key
   gate::validate_acceptance_marker
   gate::validate_gate_evaluation
+  gate::validate_gate_evaluation_integrity
   gate::verify_v2_marker_signature
   gate::write_acceptance_marker
   gate::write_acceptance_marker_with_results
@@ -245,6 +246,7 @@ crate: deadreckon-core
   job_lease::LeaseReclaimReason
   job_lease::LeaseToken
   job_lease::load_job_lease
+  job_lease::replace_fenced_job_json_and_append_event
   lock::acquire_lock
   lock::lock_status
   lock::LockGuard
@@ -253,6 +255,19 @@ crate: deadreckon-core
   lock::pid_is_alive
   lock::release_lock_file
   lock::terminate_pid
+  operator_capture::append_operator_capture_event
+  operator_capture::load_operator_capture_binding
+  operator_capture::OPERATOR_CAPTURE_BINDING_JSON
+  operator_capture::OPERATOR_CAPTURE_EVENTS_JSONL
+  operator_capture::OPERATOR_CAPTURE_RECEIPT_JSON
+  operator_capture::operator_capture_binding_sha256
+  operator_capture::OperatorCaptureEventDraft
+  operator_capture::OperatorCaptureHistory
+  operator_capture::read_operator_capture_history
+  operator_capture::seal_operator_capture_receipt
+  operator_capture::validate_operator_capture_history
+  operator_capture::validate_operator_capture_receipt
+  operator_capture::write_operator_capture_binding
   paths::DeadreckonPaths
   paths::default_deadreckon_home
   paths::source_root
@@ -319,6 +334,11 @@ crate: deadreckon-core
   run_view::TurnView
   run_view::VerdictBand
   run_view::WhyBand
+  sandbox_observation::SANDBOX_BOUNDARY_OBSERVATION_JSON
+  sandbox_observation::sandbox_boundary_observation_sha256
+  sandbox_observation::sandbox_boundary_result_tree_sha256
+  sandbox_observation::seal_sandbox_boundary_observation
+  sandbox_observation::validate_sandbox_boundary_observation
   state::create_owned_run
   state::create_run
   state::CurrentRunPointer
@@ -388,6 +408,8 @@ crate: deadreckon-protocol
   job::JobSchemaVersion
   job::JobShape
   job::JobToolPolicy
+  job::SandboxBoundaryObservation
+  job::SandboxBoundaryObservationIssuer
   job::SemanticDecision
   job::SemanticJudgment
   job::SemanticJudgeMode
@@ -408,6 +430,19 @@ crate: deadreckon-protocol
   ledger::TraceLine
   ledger::TraceRecord
   ledger::spend_kind_loop
+  operator_capture::OPERATOR_CAPTURE_SCHEMA_VERSION
+  operator_capture::OperatorCaptureBinding
+  operator_capture::OperatorCaptureCompletionLineage
+  operator_capture::OperatorCaptureEvent
+  operator_capture::OperatorCaptureEventKind
+  operator_capture::OperatorCaptureEventSequence
+  operator_capture::OperatorCapturePhase
+  operator_capture::OperatorCaptureProvenance
+  operator_capture::OperatorCaptureReceipt
+  operator_capture::OperatorCaptureRequirement
+  operator_capture::OperatorCaptureSchemaVersion
+  operator_capture::OperatorCaptureSource
+  operator_capture::OperatorCaptureStatus
   policy::is_persisted
   policy::ledger_file_for
   policy::redact_for_persistence
@@ -465,6 +500,7 @@ crate: deadreckon-runtime
   turn_loop::NarratorConfig
   turn_loop::ParentRepairCandidate
   turn_loop::ParentRepairCandidateContext
+  turn_loop::run_contained_verdict_evaluation
   turn_loop::run_deterministic_completion_gate
   turn_loop::run_parent_repair_turn_loop
   turn_loop::run_turn_loop

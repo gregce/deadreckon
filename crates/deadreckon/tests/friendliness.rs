@@ -18,7 +18,7 @@ use friendliness_contract::FRIENDLINESS_CONTRACT;
 
 mod common;
 
-use common::{assert_success, deadreckon, stdout, workspace_tempdir as repo_tempdir};
+use common::{assert_success, deadreckon, stderr, stdout, workspace_tempdir as repo_tempdir};
 
 #[test]
 fn friendliness_contract_table_covers_every_top_level_verb() {
@@ -64,7 +64,7 @@ fn audit_doc_lists_a_row_per_verb_and_clause() {
 }
 
 #[test]
-fn try_runs_keyless_and_signs_a_gate() {
+fn try_runs_keyless_as_an_untrusted_local_smoke_diagnostic() {
     let _gate = env!("CARGO_BIN_EXE_dr-gate");
     let temp = repo_tempdir();
     let workspace = temp.path().join("caller-checkout");
@@ -79,6 +79,11 @@ fn try_runs_keyless_and_signs_a_gate() {
         .expect("try");
 
     assert_success(&output);
+    assert!(
+        stderr(&output).contains("cannot issue a trusted Job receipt"),
+        "{}",
+        stderr(&output)
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("untouched.txt")).expect("sentinel"),
         "do not touch"
@@ -93,6 +98,14 @@ fn try_runs_keyless_and_signs_a_gate() {
     assert_eq!(state.provider.as_deref(), Some("smoke"));
     assert!(state.run_root.join("proofs/turn-acceptance.json").is_file());
     assert!(state.cwd.starts_with(paths.home().join("try")));
+    let launch_plan: serde_json::Value = serde_json::from_slice(
+        &fs::read(state.run_root.join("launch-plan.json")).expect("untrusted launch plan"),
+    )
+    .expect("launch plan json");
+    assert_eq!(
+        launch_plan["signals"]["untrusted_foreground"]["trusted_job_receipt"],
+        false
+    );
 }
 
 #[test]
@@ -109,6 +122,14 @@ fn try_prints_proof_block_with_narrative_and_lineage() {
 
     assert_success(&output);
     let stdout = stdout(&output);
+    assert!(
+        stdout.contains("UNTRUSTED LOCAL SMOKE DIAGNOSTIC"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("cannot issue a trusted Job receipt"),
+        "{stdout}"
+    );
     assert!(stdout.contains("gate: SIGNED by dr-gate"), "{stdout}");
     assert!(stdout.contains("proof:  "), "{stdout}");
     assert!(stdout.contains("/proofs/turn-acceptance.json"), "{stdout}");

@@ -22,12 +22,21 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     let resolved_id = resolve_plan_id(&paths, &plan_id)
         .map_err(|_| super::reference::refusal_for_reference(&paths, &plan_id, "merge"))?;
     let mut plan = load_plan(&paths, &resolved_id)?;
-    commands::graph_job::require_current_driver_for_job_artifact(
+    let job_owned = commands::graph_job::require_current_driver_for_job_artifact(
         &paths,
         &plan.plan_id,
         deadreckon_protocol::JobShape::Graph,
         "merge",
     )?;
+    if !job_owned && !commands::plan::internal_characterization_requested() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "merge cannot mutate legacy Plan {} because it has no durable Job owner",
+                run_prefix(&plan.plan_id)
+            ),
+            "start a new durable Job with `deadreckon start`",
+        )));
+    }
     if !matches!(plan.status, PlanStatus::Forked | PlanStatus::Failed) {
         return Err(CliError::Surface {
             code: 1,

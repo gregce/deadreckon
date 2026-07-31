@@ -21,11 +21,11 @@ The current acceptance boundary is:
   revalidates its worst-of roll-up before parent verification;
 - ordinary direct `run` and `orchestrate`, new supported chains, stored-plan
   `fork`, and direct campaigns share the durable Job scheduler;
+- public `extend` and a follow-up selected by guided `start` create a durable
+  parent-bound Single Job;
 - previews, explicit in-place/uncontained execution, historical `chain
   run|resume`, unsupported conductor policies, and chain extension remain
   process-owned compatibility paths;
-- guided automatic continuation refuses before work and prints the exact
-  legacy `extend` command;
 - launchd/systemd definitions and commands exist, but machine recovery becomes
   an accepted claim only after the live drill below.
 
@@ -45,8 +45,11 @@ export WK_REPO_B="/path/to/disposable/fixture-app"
 export WK_PROVIDER_A="cli:codex"
 export WK_PROVIDER_B="cli:claude-code"
 export WK_ARTIFACTS="$WK_STATE/operator-captures/dogfood"
+export DR_CAPTURE_BIN="$PWD/target/release/dr-capture"
+export DEADRECKON_BIN="$WK_BIN"
 
 test -x "$WK_BIN"
+test -x "$DR_CAPTURE_BIN"
 test -d "$WK_REPO_A/.git"
 test -d "$WK_REPO_B/.git"
 mkdir -p "$WK_STATE"
@@ -74,6 +77,113 @@ with `available: true`, and the preview's requested sandbox is `auto` or that
 explicit backend, not `none`. Preview records the request; the supervisor
 records the resolved backend when it runs. A strict Job that resolves to
 `none` is expected to stop for review, not verify.
+
+## Record every live fault claim
+
+Prepare the passive recorder after creating the disposable Job for each fault
+drill and before the intervention. It records evidence but never starts a
+provider, signals a process, changes networking, controls the service, reboots,
+or calls `finish`. The operator remains responsible for the reviewed fault and
+cleanup.
+
+Pass-capable recording requires the protected `dr-capture` and sibling
+`deadreckon` binaries to remain outside every Job source, working, run, merge
+and repair root. For example, before section 3:
+
+```bash
+export WK_TRIAL_ID=live_provider_supervisor_restart
+export WK_LIVE_TRIAL="$WK_ARTIFACTS/live/$WK_TRIAL_ID-01"
+export WK_JOB_ID=the-full-approved-job-id
+
+python3 examples/watchkeeper-dogfood/live-trial.py prepare \
+  "$WK_TRIAL_ID" \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --revision "$(git rev-parse HEAD)" \
+  --capture-helper "$DR_CAPTURE_BIN" \
+  --deadreckon-binary "$DEADRECKON_BIN" \
+  --job-id "$WK_JOB_ID" \
+  --backend sandbox-exec \
+  --provider-route worker="$WK_PROVIDER_A" \
+  --provider-route independent_judge="$WK_PROVIDER_B"
+python3 -m json.tool "$WK_LIVE_TRIAL/replay.json"
+```
+
+Use the backend that the strict Job actually resolved. The provider roles must
+match the manifest and the worker and independent judge must be different.
+Preparation is retry-safe for identical inputs and refuses a conflicting
+binding.
+
+`replay.json` lists the exact canonical subjects, reviewed intervention and
+cleanup. Record the supervisor trial's `before` evidence first:
+
+```bash
+python3 examples/watchkeeper-dogfood/live-trial.py observe \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --canonical job-view-before \
+  --canonical events-before \
+  --canonical lease-before \
+  --canonical supervised-child-before
+```
+
+Perform the reviewed intervention, then record its boundary separately. The
+detail file is operator context; `dr-capture` independently reads the
+trial-specific Job, Campaign or sandbox observation:
+
+```bash
+python3 examples/watchkeeper-dogfood/live-trial.py observe \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --intervention-status performed \
+  --intervention-detail-file /path/to/operator-intervention-evidence
+```
+
+Record the declared `after` evidence:
+
+```bash
+python3 examples/watchkeeper-dogfood/live-trial.py observe \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --canonical job-view-after \
+  --canonical events-after \
+  --canonical lease-after \
+  --canonical supervised-child-after \
+  --canonical job-report
+```
+
+After the manifest's cleanup steps, finalize the deterministic evaluation and
+the minimal publication envelope:
+
+```bash
+python3 examples/watchkeeper-dogfood/live-trial.py cleanup \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --status completed \
+  --detail-file /path/to/cleanup-evidence
+python3 examples/watchkeeper-dogfood/live-trial.py finalize \
+  --trial-dir "$WK_LIVE_TRIAL" \
+  --evaluation-output "$WK_LIVE_TRIAL/result.evaluation.json" \
+  --output "$WK_LIVE_TRIAL/result.json"
+python3 -m json.tool "$WK_LIVE_TRIAL/result.json"
+```
+
+The envelope's HMAC publication proof authenticates the exact protected
+binding, append-only evidence history, deterministic evaluation and capture
+receipt. JSON schema validation alone is not verification. Omitting the
+trusted prepare arguments retains the manual compatibility path: it accepts
+operator-selected `--capture NAME=PATH` files but can never produce
+`status: passed`. A missing capture, unperformed intervention or missing
+cleanup is never rounded up to a pass.
+
+Use these manifest IDs:
+
+- section 3: `live_provider_supervisor_restart`;
+- section 4: `live_provider_worker_kill`;
+- section 5 and section 7 natural parent repair:
+  `live_provider_parent_repair`;
+- section 6 cross-provider attack: `cross_provider_gate_attack`;
+- section 7 Campaign interruption:
+  `live_campaign_interruption_recovery`;
+- section 9: `machine_reboot`;
+- section 10: `live_provider_network_loss`;
+- explicit Linux and Docker strict-Job trials:
+  `linux_bubblewrap_gate_boundary` and `docker_gate_boundary`.
 
 ## 1. Run the public single-Job journey
 
@@ -278,6 +388,25 @@ not substitutes for live rates.
 
 ## 6. Tamper with a verified disposable Job
 
+Before spending provider tokens, the cached-image Docker control-boundary test
+can be run independently:
+
+```bash
+cd /path/to/deadreckon
+docker image inspect rust:1 >/dev/null
+DEADRECKON_LIVE_DOCKER_TEST=1 \
+  cargo test -p deadreckon-sandbox --lib \
+  tests::live_docker_denies_control_tampering_and_gate_inputs \
+  -- --ignored --exact --nocapture
+```
+
+Accept when the exact test reports `ok`. This command does not pull an image.
+It proves the real container denies key visibility, signing inputs, network
+routes, Job/proof/gate/Git control writes and still permits an ordinary
+deliverable write. It does not prove that a host-built macOS `dr-gate` can
+execute inside Linux; that remains the separate public strict Docker Job
+trial.
+
 Do this before `finish`. First preserve the receipt:
 
 ```bash
@@ -379,17 +508,39 @@ Run a separate guided Campaign selected by `start`. Accept when:
 - [ ] direct `campaign` creates a durable Campaign Job with the same roll-up
   and parent verification boundary.
 
-## 8. Confirm guided continuation refuses before work
+## 8. Confirm continuation is a parent-bound Job
 
-Use a repository where `start` offers a follow-up to an existing run. Select
-that follow-up and record the refusal.
+Use a disposable repository with a completed parent that has been promoted to
+the library. Run both entry paths on separate parents:
+
+```bash
+"$WK_BIN" extend "$WK_PARENT_RUN_ID" \
+  "Add one bounded follow-up change." \
+  --provider "$WK_PROVIDER_A" \
+  --max-spend 2 \
+  --yes
+
+"$WK_BIN" start "Add another bounded follow-up change."
+```
+
+For the second command, select the offered follow-up from completed history.
+Record the returned child Job ID and inspect its launch plan, authority, status
+and events.
 
 Accept when:
 
-- [ ] no Job, run or child process is created;
-- [ ] the refusal says that guided continuation is not durable yet;
-- [ ] the `try:` line contains the exact
-  `deadreckon extend <run-id> "<goal>"` compatibility command.
+- [ ] both public `extend` and guided `start` return one new Single Job ID and
+  detach through the normal supervisor;
+- [ ] the child source is the promoted parent artifact, not the operator's
+  mutable checkout;
+- [ ] the launch plan freezes the full parent run and scope, parent-state
+  SHA-256, parent-library-tree SHA-256 and verified parent-receipt SHA-256 when
+  the parent has one;
+- [ ] the child records `durable_continuation_bound` before provider evidence;
+- [ ] changing the frozen parent state, promoted artifact or receipt before
+  child preparation is refused rather than silently continuing;
+- [ ] `--dest` is refused at launch and the result can reach an operator
+  destination only through `finish` after its own two-key receipt.
 
 ## 9. Exercise the user service and a real restart
 
