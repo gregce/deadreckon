@@ -682,13 +682,31 @@ def run_command(repo: Path, proof: ProofCommand) -> dict[str, Any]:
     elapsed = round(time.monotonic() - started, 3)
     stdout = completed.stdout.decode("utf-8", errors="replace")
     stderr = completed.stderr.decode("utf-8", errors="replace")
+    lines = [line.strip() for line in (stdout + "\n" + stderr).splitlines()]
     matching = [
         line.strip()
-        for line in (stdout + "\n" + stderr).splitlines()
-        if proof.expected_test in line
+        for line in lines
+        if proof.expected_test in line or line.startswith("test result:")
     ]
-    observed_pass = completed.returncode == 0 and any(
-        "ok" in line or "test result: ok" in line for line in matching
+    named_test_started = any(proof.expected_test in line for line in matching)
+    named_test_passed_inline = any(
+        proof.expected_test in line and "ok" in line for line in matching
+    )
+    successful_exact_summary = any(
+        line.startswith("test result: ok.")
+        and "1 passed" in line
+        and "0 failed" in line
+        for line in matching
+    )
+    # Some live subprocesses inherit the libtest output descriptor and can
+    # print while libtest is holding `test <name> ... ` on the same line. In
+    # that case the final `ok` appears separately. The command selects exactly
+    # one named test, so the named start plus Cargo's one-pass/zero-fail summary
+    # is the same proof without depending on line-buffering behavior.
+    observed_pass = (
+        completed.returncode == 0
+        and named_test_started
+        and (named_test_passed_inline or successful_exact_summary)
     )
     return {
         "argv": list(proof.argv),
