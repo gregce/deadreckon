@@ -55,6 +55,8 @@ migration step runs.
 ## Watchkeeper one durable Job and two-key completion 2026-07-28
 
 Initial implementation and clean-evidence commit span: `fdf7601..761b001`.
+The later claim-complete dogfood harness is bound to clean source `e87c70f` by
+evidence commit `e7b9bb2`.
 
 Watchkeeper makes guided `start` durable before the first agent turn. It
 freezes the approved goal, definition of done, requested sandbox and tool
