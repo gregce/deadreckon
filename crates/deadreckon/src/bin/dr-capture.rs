@@ -11,18 +11,26 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use deadreckon_core::git::run_git;
 use deadreckon_core::{
-    DeadreckonPaths, JobView, OperatorCaptureEventDraft, RUN_EVENTS_JSONL,
-    append_operator_capture_event, boot_identity, load_job, load_job_lease,
+    DeadreckonPaths, JobView, OperatorCaptureEventDraft, OperatorCapturePassLineage,
+    RUN_EVENTS_JSONL, append_operator_capture_event, boot_identity, load_job, load_job_lease,
     load_operator_capture_binding, load_plan, load_run, operator_capture_binding_sha256,
-    pid_is_alive, read_job_history, read_operator_capture_history, read_plan_events,
-    reduce_job_history, seal_operator_capture_receipt, validate_completion_receipt,
-    validate_operator_capture_receipt, write_operator_capture_binding,
+    pid_is_alive, process_start_identity, read_job_history, read_operator_capture_history,
+    read_plan_events, reduce_job_history, seal_operator_capture_receipt,
+    validate_completion_receipt, validate_operator_capture_receipt, write_operator_capture_binding,
 };
 use deadreckon_protocol::{
-    CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobLease, OperatorCaptureBinding,
-    OperatorCaptureCompletionLineage, OperatorCaptureEventKind, OperatorCapturePhase,
-    OperatorCaptureProvenance, OperatorCaptureRequirement, OperatorCaptureSchemaVersion,
-    OperatorCaptureSource, OperatorCaptureStatus, SandboxBoundaryObservation, SemanticJudgment,
+    CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobLease, JobOutcome, JobShape,
+    OperatorCaptureBinding, OperatorCaptureCompletionLineage, OperatorCaptureConnectivity,
+    OperatorCaptureEventKind, OperatorCaptureExpectedJobResult, OperatorCaptureNetworkAttempt,
+    OperatorCaptureNetworkErrorKind, OperatorCaptureNetworkObservation,
+    OperatorCaptureNetworkProbe, OperatorCapturePhase, OperatorCaptureProvenance,
+    OperatorCaptureRequirement, OperatorCaptureSchemaVersion, OperatorCaptureSource,
+    OperatorCaptureStatus, OperatorCaptureTerminalLineage, SandboxBoundaryObservation,
+    SemanticJudgment, StopReason,
+};
+use deadreckon_providers::registry::{
+    DescriptorKind, ProbeErrorKind, ProbeStatus, ProviderProbe, ProviderProbeOptions,
+    ProviderRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -206,6 +214,7 @@ enum CanonicalSource {
     CampaignEvents,
     ActivePlan,
     ActivePlanEvents,
+    NetworkConnectivityObservation,
     SandboxBoundaryObservation,
     CampaignIntervention,
 }
@@ -236,6 +245,9 @@ impl CanonicalSource {
             Self::CampaignEvents => OperatorCaptureSource::CampaignEvents,
             Self::ActivePlan => OperatorCaptureSource::ActivePlan,
             Self::ActivePlanEvents => OperatorCaptureSource::ActivePlanEvents,
+            Self::NetworkConnectivityObservation => {
+                OperatorCaptureSource::NetworkConnectivityObservation
+            }
             Self::SandboxBoundaryObservation => OperatorCaptureSource::SandboxBoundaryObservation,
             Self::CampaignIntervention => OperatorCaptureSource::CampaignIntervention,
         }
@@ -404,12 +416,14 @@ fn prepare_binding(
         .into());
     }
     let manifest = stable_regular_bytes(&args.manifest, "manifest")?;
+    validate_manifest_job_shape(&manifest, &args.trial_id, job.shape)?;
     let provider_routes = provider_route_map(
         &manifest,
         &args.trial_id,
         &args.provider_routes,
         pass_capable,
     )?;
+    let network_probe = network_probe_binding(context, &args.trial_id, &provider_routes)?;
     let result_schema = stable_regular_bytes(&args.result_schema, "result schema")?;
     let recorder = stable_regular_bytes(&args.recorder, "recorder")?;
     let recorder_interpreter =
@@ -429,6 +443,7 @@ fn prepare_binding(
         validate_pass_capture_locations(context, &job, args)?;
     }
     let required_captures = manifest_requirements(&manifest, &args.trial_id)?;
+    let allowed_terminal_results = manifest_allowed_terminal_results(&manifest, &args.trial_id)?;
     if pass_capable && manifest_trial_is_structurally_inconclusive(&manifest, &args.trial_id)? {
         return Err(refused(
             "a trial with a structurally_inconclusive oracle cannot be prepared as pass-capable",
@@ -473,8 +488,10 @@ fn prepare_binding(
         declared_shape: job.shape,
         declared_backend: required_text(&args.backend, "backend")?,
         provider_routes,
+        network_probe,
         replay_sha256: sha256_bytes(&replay),
         pass_capable,
+        allowed_terminal_results,
         required_captures,
         signature: String::new(),
     };
@@ -678,7 +695,7 @@ fn observe(
         causation_id: required_text(&args.causation_id, "causation ID")?,
         timestamp: Utc::now(),
         phase,
-        kind: objective_kind(observed.source),
+        kind: objective_kind(observed.source, phase),
         provenance: observed.provenance,
         source: observed.source,
         subject,
@@ -754,12 +771,11 @@ fn seal(
         &result,
         "protected sealed evaluation",
     )?;
-    let completion_lineage =
-        if OperatorCaptureStatus::from(args.status) == OperatorCaptureStatus::Passed {
-            Some(validated_completion_lineage(context, &binding)?)
-        } else {
-            None
-        };
+    let lineage = if OperatorCaptureStatus::from(args.status) == OperatorCaptureStatus::Passed {
+        Some(validated_pass_lineage(context, &binding)?)
+    } else {
+        None
+    };
     Ok(seal_operator_capture_receipt(
         &context.paths,
         &binding,
@@ -767,7 +783,7 @@ fn seal(
         &sha256_bytes(&result),
         u64::try_from(result.len()).map_err(|_| refused("capture result is too large"))?,
         OperatorCaptureStatus::from(args.status),
-        completion_lineage,
+        lineage,
     )?)
 }
 
@@ -802,15 +818,19 @@ fn verify(context: &HelperContext, args: &VerifyArgs) -> AnyResult<VerifyVerdict
     validate_runtime_binding(context, &binding)?;
     validate_bound_inputs(context, &binding)?;
     let receipt = validate_operator_capture_receipt(&context.paths, &binding)?;
-    let expected_lineage = if receipt.status == OperatorCaptureStatus::Passed {
-        Some(validated_completion_lineage(context, &binding)?)
-    } else {
-        None
-    };
-    if receipt.completion_lineage != expected_lineage {
-        return Err(
-            refused("validated CompletionReceipt lineage changed after capture sealing").into(),
-        );
+    let (expected_completion, expected_terminal) =
+        if receipt.status == OperatorCaptureStatus::Passed {
+            match validated_pass_lineage(context, &binding)? {
+                OperatorCapturePassLineage::Completion(lineage) => (Some(lineage), None),
+                OperatorCapturePassLineage::Terminal(lineage) => (None, Some(lineage)),
+            }
+        } else {
+            (None, None)
+        };
+    if receipt.completion_lineage != expected_completion
+        || receipt.terminal_lineage != expected_terminal
+    {
+        return Err(refused("validated pass lineage changed after capture sealing").into());
     }
     let result = stable_regular_bytes(&args.result, "published capture result")?;
     let protected_result = stable_regular_bytes(
@@ -995,13 +1015,13 @@ fn expected_operator_intervention_source(trial_id: &str) -> Option<OperatorCaptu
     match trial_id {
         "live_provider_worker_kill"
         | "live_provider_supervisor_restart"
-        | "live_provider_network_loss"
         | "machine_reboot"
         | "live_provider_parent_repair" => Some(OperatorCaptureSource::JobIntervention),
+        "live_provider_network_loss" => Some(OperatorCaptureSource::NetworkConnectivityObservation),
         "live_campaign_interruption_recovery" => Some(OperatorCaptureSource::CampaignIntervention),
         "cross_provider_gate_attack"
         | "linux_bubblewrap_gate_boundary"
-        | "docker_gate_boundary" => Some(OperatorCaptureSource::SandboxBoundaryObservation),
+        | "live_docker_gate_attack" => Some(OperatorCaptureSource::SandboxBoundaryObservation),
         _ => None,
     }
 }
@@ -1094,6 +1114,9 @@ fn validate_result_evaluation(
         );
     }
     validate_final_intervention_freshness(context, binding, history)?;
+    if binding.trial_id == "live_provider_network_loss" {
+        validate_network_fault_lineage(context, binding)?;
+    }
     if object.get("sanitized").and_then(Value::as_bool) != Some(true) {
         return Err(refused("passed evaluation must be explicitly sanitized").into());
     }
@@ -1101,27 +1124,59 @@ fn validate_result_evaluation(
     if !coverage.pass_ready {
         return Err(refused("passed evaluation lacks authenticated capture coverage").into());
     }
-    let completion_bytes = canonical_completion_receipt(context, binding)?;
-    let completion: CompletionReceipt = serde_json::from_slice(&completion_bytes)?;
     let backend = object
         .get("backend")
         .and_then(Value::as_str)
         .ok_or_else(|| refused("passed evaluation has no backend"))?;
-    if !completion.contained
-        || backend != binding.declared_backend
-        || backend != completion.sandbox_backend
+    let pass_lineage = validated_pass_lineage(context, binding)?;
+    let (actual_outcome, actual_stop_reason) = match &pass_lineage {
+        OperatorCapturePassLineage::Completion(_) => (JobOutcome::Verified, StopReason::Verified),
+        OperatorCapturePassLineage::Terminal(lineage) => (lineage.outcome, lineage.stop_reason),
+    };
+    if value.pointer("/job_result/outcome") != Some(&serde_json::to_value(actual_outcome)?)
+        || value.pointer("/job_result/stop_reason")
+            != Some(&serde_json::to_value(actual_stop_reason)?)
+        || value
+            .pointer("/job_result/allowed")
+            .and_then(Value::as_bool)
+            != Some(true)
     {
         return Err(refused(
-            "passed evaluation backend is not bound to the validated contained completion receipt",
+            "passed evaluation Job result does not match the authenticated pass lineage",
         )
         .into());
     }
-    let actual_routes = validated_actual_provider_routes(context, binding)?;
-    if actual_routes != binding.provider_routes {
-        return Err(refused(
-            "role-bound provider routes do not match persisted attempt, planner, and semantic evidence",
-        )
-        .into());
+    match pass_lineage {
+        OperatorCapturePassLineage::Completion(_) => {
+            let completion_bytes = canonical_completion_receipt(context, binding)?;
+            let completion: CompletionReceipt = serde_json::from_slice(&completion_bytes)?;
+            if !completion.contained
+                || backend != binding.declared_backend
+                || backend != completion.sandbox_backend
+            {
+                return Err(refused(
+                    "passed evaluation backend is not bound to the validated contained completion receipt",
+                )
+                .into());
+            }
+            let actual_routes = validated_actual_provider_routes(context, binding)?;
+            if actual_routes != binding.provider_routes {
+                return Err(refused(
+                    "role-bound provider routes do not match persisted attempt, planner, and semantic evidence",
+                )
+                .into());
+            }
+        }
+        OperatorCapturePassLineage::Terminal(_) => {
+            let view = JobView::load(&context.paths, binding.job_id.as_ref())?;
+            validate_terminal_execution(binding, &view)?;
+            if backend != binding.declared_backend {
+                return Err(refused(
+                    "passed evaluation backend is not bound to the authenticated terminal Job",
+                )
+                .into());
+            }
+        }
     }
     let evidence = object
         .get("evidence")
@@ -1437,6 +1492,9 @@ fn validate_final_intervention_freshness(
             }
             job_event.timestamp
         }
+        OperatorCaptureSource::NetworkConnectivityObservation => {
+            serde_json::from_slice::<OperatorCaptureNetworkObservation>(&bytes)?.observed_at
+        }
         OperatorCaptureSource::SandboxBoundaryObservation => {
             serde_json::from_slice::<SandboxBoundaryObservation>(&bytes)?.observed_at
         }
@@ -1509,6 +1567,7 @@ fn capture_source_name(source: OperatorCaptureSource) -> &'static str {
         OperatorCaptureSource::CampaignEvents => "campaign-events",
         OperatorCaptureSource::ActivePlan => "active-plan",
         OperatorCaptureSource::ActivePlanEvents => "active-plan-events",
+        OperatorCaptureSource::NetworkConnectivityObservation => "network-connectivity-observation",
         OperatorCaptureSource::SandboxBoundaryObservation => "sandbox-boundary-observation",
         OperatorCaptureSource::CampaignIntervention => "campaign-intervention",
         OperatorCaptureSource::ResultEnvelope => "result-envelope",
@@ -1716,6 +1775,9 @@ fn canonical_observation(
         CanonicalSource::ActivePlanEvents => {
             canonical_active_plan_events(&context.paths, binding, phase)?
         }
+        CanonicalSource::NetworkConnectivityObservation => {
+            canonical_network_connectivity_observation(context, binding, phase)?
+        }
         CanonicalSource::SandboxBoundaryObservation => {
             canonical_sandbox_boundary_observation(context, binding)?
         }
@@ -1778,11 +1840,347 @@ fn canonical_job_intervention(
     Ok(serde_json::to_vec(event)?)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NetworkAttemptSnapshot {
+    identity: OperatorCaptureNetworkAttempt,
+    child_bytes: Vec<u8>,
+}
+
+fn canonical_network_connectivity_observation(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+    phase: OperatorCapturePhase,
+) -> AnyResult<Vec<u8>> {
+    if binding.trial_id != "live_provider_network_loss" {
+        return Err(refused(
+            "network connectivity observations are valid only for the network-loss trial",
+        )
+        .into());
+    }
+    let probe = binding
+        .network_probe
+        .as_ref()
+        .ok_or_else(|| refused("signed capture binding has no network probe authority"))?;
+    let affected = match phase {
+        OperatorCapturePhase::Before => None,
+        OperatorCapturePhase::Intervention => Some(load_protected_network_observation(
+            context,
+            binding,
+            "network-reachable-before",
+        )?),
+        OperatorCapturePhase::After => Some(load_protected_network_observation(
+            context,
+            binding,
+            "intervention",
+        )?),
+        _ => {
+            return Err(refused(
+                "network connectivity observation requires before, intervention, or after phase",
+            )
+            .into());
+        }
+    };
+    if let Some(previous) = affected.as_ref() {
+        let expected_phase = match phase {
+            OperatorCapturePhase::Intervention => OperatorCapturePhase::Before,
+            OperatorCapturePhase::After => OperatorCapturePhase::Intervention,
+            _ => unreachable!("affected observations are only loaded after before"),
+        };
+        let expected_connectivity = match phase {
+            OperatorCapturePhase::Intervention => OperatorCaptureConnectivity::Reachable,
+            OperatorCapturePhase::After => OperatorCaptureConnectivity::Unreachable,
+            _ => unreachable!("affected observations are only loaded after before"),
+        };
+        validate_network_observation_identity(binding, probe, previous)?;
+        if previous.phase != expected_phase || previous.connectivity != expected_connectivity {
+            return Err(refused(
+                "protected prior network observation has the wrong phase or result",
+            )
+            .into());
+        }
+    }
+
+    let before_attempt = if matches!(
+        phase,
+        OperatorCapturePhase::Before | OperatorCapturePhase::Intervention
+    ) {
+        Some(current_network_attempt(context, binding, probe)?)
+    } else {
+        None
+    };
+    if phase == OperatorCapturePhase::Intervention
+        && before_attempt.as_ref().map(|snapshot| &snapshot.identity)
+            != affected.as_ref().map(|observation| &observation.attempt)
+    {
+        return Err(refused(
+            "offline probe no longer targets the live attempt captured before intervention",
+        )
+        .into());
+    }
+
+    let (connectivity, error_kind) = probe_bound_provider(context, probe)?;
+
+    let attempt = if let Some(before_attempt) = before_attempt {
+        let after_attempt = current_network_attempt(context, binding, probe)?;
+        if after_attempt != before_attempt {
+            return Err(refused(
+                "supervised attempt changed or exited while the provider endpoint was probed",
+            )
+            .into());
+        }
+        before_attempt.identity
+    } else {
+        affected
+            .as_ref()
+            .ok_or_else(|| refused("restored probe has no affected attempt identity"))?
+            .attempt
+            .clone()
+    };
+    let expected = match phase {
+        OperatorCapturePhase::Before | OperatorCapturePhase::After => {
+            OperatorCaptureConnectivity::Reachable
+        }
+        OperatorCapturePhase::Intervention => OperatorCaptureConnectivity::Unreachable,
+        _ => unreachable!("phase was checked above"),
+    };
+    if connectivity != expected {
+        return Err(refused(match phase {
+            OperatorCapturePhase::Intervention => {
+                "provider endpoint remained reachable after the operator intervention"
+            }
+            _ => "provider endpoint was not reachable at the required capture boundary",
+        })
+        .into());
+    }
+    let history = read_job_history(&context.paths.job_events(binding.job_id.as_ref()))?;
+    let job = load_job(&context.paths, binding.job_id.as_ref())?;
+    let projection = reduce_job_history(&job.job_id, &history)?;
+    let observation = OperatorCaptureNetworkObservation {
+        schema_version: OperatorCaptureSchemaVersion::CURRENT,
+        job_id: binding.job_id.clone(),
+        session_id: binding.session_id.clone(),
+        trial_id: binding.trial_id.clone(),
+        phase,
+        observed_at: Utc::now(),
+        provider_role: probe.provider_role.clone(),
+        provider_route: probe.provider_route.clone(),
+        endpoint: probe.endpoint.clone(),
+        connectivity,
+        error_kind,
+        job_last_sequence: projection.last_sequence,
+        attempt,
+    };
+    validate_network_observation_identity(binding, probe, &observation)?;
+    Ok(serde_json::to_vec(&observation)?)
+}
+
+fn load_protected_network_observation(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+    subject: &str,
+) -> AnyResult<OperatorCaptureNetworkObservation> {
+    let bytes = stable_regular_bytes(
+        &protected_evidence_path(&context.paths, binding, subject),
+        "protected network observation",
+    )?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn validate_network_observation_identity(
+    binding: &OperatorCaptureBinding,
+    probe: &OperatorCaptureNetworkProbe,
+    observation: &OperatorCaptureNetworkObservation,
+) -> AnyResult<()> {
+    if observation.job_id != binding.job_id
+        || observation.session_id != binding.session_id
+        || observation.trial_id != binding.trial_id
+        || observation.provider_role != probe.provider_role
+        || observation.provider_route != probe.provider_route
+        || observation.endpoint != probe.endpoint
+        || observation.job_last_sequence == 0
+        || observation.attempt.run_id.trim().is_empty()
+        || observation.attempt.attempt == 0
+        || observation.attempt.lease_epoch == 0
+        || observation.attempt.launch_id.trim().is_empty()
+        || observation.attempt.pid == 0
+        || observation.attempt.boot_id.trim().is_empty()
+        || observation.attempt.process_start_identity.trim().is_empty()
+        || (observation.connectivity == OperatorCaptureConnectivity::Reachable
+            && observation.error_kind.is_some())
+        || (observation.connectivity == OperatorCaptureConnectivity::Unreachable
+            && observation.error_kind != Some(OperatorCaptureNetworkErrorKind::EndpointUnreachable))
+    {
+        return Err(
+            refused("network observation is malformed or outside its signed authority").into(),
+        );
+    }
+    Ok(())
+}
+
+fn current_network_attempt(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+    probe: &OperatorCaptureNetworkProbe,
+) -> AnyResult<NetworkAttemptSnapshot> {
+    let child_path = context
+        .paths
+        .job_dir(binding.job_id.as_ref())
+        .join("supervised-child.json");
+    let child_bytes = stable_regular_bytes(&child_path, "supervised-child.json")?;
+    let child: Value = serde_json::from_slice(&child_bytes)?;
+    let pid_u64 = child
+        .get("pid")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("supervised child has no PID"))?;
+    let pid = u32::try_from(pid_u64).map_err(|_| refused("supervised child PID overflowed"))?;
+    let attempt_u64 = child
+        .get("attempt")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| refused("supervised child has no attempt"))?;
+    let attempt =
+        u32::try_from(attempt_u64).map_err(|_| refused("supervised child attempt overflowed"))?;
+    let launch_id = required_json_string(&child, "launch_id", "supervised child")?;
+    let boot_id = required_json_string(&child, "boot_id", "supervised child")?;
+    let start_identity =
+        required_json_string(&child, "process_start_identity", "supervised child")?;
+    if attempt == 0 || !network_process_is_current(pid, &boot_id, &start_identity) {
+        return Err(refused(
+            "network probe requires a current supervised child with stable boot and process identity",
+        )
+        .into());
+    }
+    let lease = load_job_lease(&context.paths, &binding.job_id)?;
+    if lease.epoch == 0 || lease.expires_at <= Utc::now() {
+        return Err(refused("network probe requires a live fenced Job lease").into());
+    }
+    let job = load_job(&context.paths, binding.job_id.as_ref())?;
+    let history = read_job_history(&context.paths.job_events(binding.job_id.as_ref()))?;
+    let projection = reduce_job_history(&job.job_id, &history)?;
+    if projection.is_terminal() || projection.attempt_count != attempt {
+        return Err(refused("network probe no longer targets the active Job attempt").into());
+    }
+    let matching_links = history
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind == JobEventKind::ChildLinked
+                && event.lease_epoch == lease.epoch
+                && event.detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
+                && event.detail.get("launch_id").and_then(Value::as_str) == Some(launch_id.as_str())
+                && event.detail.get("pid").and_then(Value::as_u64) == Some(u64::from(pid))
+                && event.detail.get("boot_id").and_then(Value::as_str) == Some(boot_id.as_str())
+                && event
+                    .detail
+                    .get("process_start_identity")
+                    .and_then(Value::as_str)
+                    == Some(start_identity.as_str())
+        })
+        .collect::<Vec<_>>();
+    let linked = match matching_links.as_slice() {
+        [linked] => *linked,
+        _ => {
+            return Err(refused(
+                "current supervised child does not have one exact durable ChildLinked event",
+            )
+            .into());
+        }
+    };
+    let run_id = linked
+        .detail
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.is_empty())
+        .ok_or_else(|| refused("network attempt ChildLinked event has no run identity"))?
+        .to_string();
+    let view = JobView::load(&context.paths, binding.job_id.as_ref())?;
+    let run = view
+        .attempts
+        .iter()
+        .find(|run| run.id.run_id == run_id)
+        .ok_or_else(|| refused("network attempt is absent from the Job read model"))?;
+    if run.provider != probe.provider_route {
+        return Err(
+            refused("live attempt provider does not match the signed network route").into(),
+        );
+    }
+    Ok(NetworkAttemptSnapshot {
+        identity: OperatorCaptureNetworkAttempt {
+            run_id,
+            attempt,
+            lease_epoch: lease.epoch,
+            launch_id,
+            pid,
+            boot_id,
+            process_start_identity: start_identity,
+        },
+        child_bytes,
+    })
+}
+
+fn network_process_is_current(
+    pid: u32,
+    expected_boot_id: &str,
+    expected_start_identity: &str,
+) -> bool {
+    pid != 0
+        && expected_boot_id == boot_identity()
+        && pid_is_alive(pid)
+        && process_start_identity(pid).as_deref() == Some(expected_start_identity)
+}
+
+fn required_json_string(value: &Value, field: &str, label: &str) -> AnyResult<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| refused(&format!("{label} has no {field}")).into())
+}
+
+fn probe_bound_provider(
+    context: &HelperContext,
+    probe: &OperatorCaptureNetworkProbe,
+) -> AnyResult<(
+    OperatorCaptureConnectivity,
+    Option<OperatorCaptureNetworkErrorKind>,
+)> {
+    let registry = ProviderRegistry::with_overrides(context.paths.home())?;
+    let descriptor = registry
+        .get(&probe.provider_route)
+        .ok_or_else(|| refused("signed network route disappeared from the provider registry"))?;
+    if descriptor.kind != DescriptorKind::Http
+        || descriptor.default_endpoint.as_deref() != Some(probe.endpoint.as_str())
+        || !valid_non_loopback_http_endpoint(&probe.endpoint)
+    {
+        return Err(
+            refused("provider registry route or endpoint changed after capture prepare").into(),
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(descriptor.probe(ProviderProbeOptions { ping: true }));
+    if result.id != probe.provider_route || result.location.as_deref() != Some(&probe.endpoint) {
+        return Err(
+            refused("provider probe result is not bound to the signed route and endpoint").into(),
+        );
+    }
+    match (result.status, result.error_kind) {
+        (ProbeStatus::Ok, None) => Ok((OperatorCaptureConnectivity::Reachable, None)),
+        (ProbeStatus::Failed, Some(ProbeErrorKind::EndpointUnreachable)) => Ok((
+            OperatorCaptureConnectivity::Unreachable,
+            Some(OperatorCaptureNetworkErrorKind::EndpointUnreachable),
+        )),
+        _ => Err(refused(
+            "provider probe did not establish endpoint reachability or endpoint_unreachable",
+        )
+        .into()),
+    }
+}
+
 fn expected_job_intervention_kind(trial_id: &str) -> AnyResult<JobEventKind> {
     match trial_id {
-        "live_provider_worker_kill" | "live_provider_network_loss" => {
-            Ok(JobEventKind::AttemptStopped)
-        }
+        "live_provider_worker_kill" => Ok(JobEventKind::AttemptStopped),
         "live_provider_supervisor_restart" | "machine_reboot" => Ok(JobEventKind::LeaseReclaimed),
         "live_provider_parent_repair" => Ok(JobEventKind::SemanticJudgeRevise),
         _ => {
@@ -1806,7 +2204,7 @@ fn canonical_sandbox_boundary_observation(
 ) -> AnyResult<Vec<u8>> {
     if !matches!(
         binding.trial_id.as_str(),
-        "cross_provider_gate_attack" | "linux_bubblewrap_gate_boundary" | "docker_gate_boundary"
+        "cross_provider_gate_attack" | "linux_bubblewrap_gate_boundary" | "live_docker_gate_attack"
     ) {
         return Err(refused(
             "sandbox boundary observations are not an intervention source for this trial",
@@ -1867,27 +2265,296 @@ fn canonical_campaign_intervention(
     let events =
         deadreckon_core::campaign::read_campaign_events(&paths.plan_dir(binding.job_id.as_ref()))?;
     let plan_id = resolve_active_plan_id(paths, binding, OperatorCapturePhase::After)?;
-    let event = events
+    let matching = events
         .iter()
-        .rev()
-        .find(|event| {
+        .filter(|event| {
             event.ts > before_boundary
-                && matches!(
-                    event.kind.as_str(),
-                    "sub_process_relaunch_safe" | "sub_process_adopted" | "sub_recovered"
-                )
+                && event.kind == "sub_process_adopted"
                 && event.detail.get("plan_id").and_then(Value::as_str) == Some(plan_id.as_str())
         })
-        .ok_or_else(|| {
-            refused("Campaign has no guarded interruption recovery event after the before boundary")
-        })?;
+        .collect::<Vec<_>>();
+    let [event] = matching.as_slice() else {
+        return Err(refused(
+            "Campaign must have exactly one guarded process adoption for the protected Plan after the before boundary",
+        )
+        .into());
+    };
+    let original_attempt = event
+        .detail
+        .get("attempt")
+        .and_then(Value::as_u64)
+        .filter(|attempt| *attempt > 0)
+        .ok_or_else(|| refused("Campaign adoption has no original attempt identity"))?;
+    let original_epoch = event
+        .detail
+        .get("lease_epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > 0)
+        .ok_or_else(|| refused("Campaign adoption has no original lease identity"))?;
+    let adopted_attempt = event
+        .detail
+        .get("adopted_by_attempt")
+        .and_then(Value::as_u64)
+        .filter(|attempt| *attempt > 0)
+        .ok_or_else(|| refused("Campaign adoption has no adopting attempt identity"))?;
+    let adopted_epoch = event
+        .detail
+        .get("adopted_by_lease_epoch")
+        .and_then(Value::as_u64)
+        .filter(|epoch| *epoch > original_epoch)
+        .ok_or_else(|| refused("Campaign adoption is not fenced by a newer lease"))?;
+    for field in [
+        "sub_id",
+        "outer_launch_id",
+        "launch_id",
+        "release_token_sha256",
+        "boot_id",
+        "process_start_identity",
+        "adopted_at",
+    ] {
+        required_json_string(&event.detail, field, "Campaign adoption")?;
+    }
+    if event.detail.get("parent_job_id").and_then(Value::as_str) != Some(binding.job_id.as_ref())
+        || event.detail.get("pid").and_then(Value::as_u64).unwrap_or(0) == 0
+        || event.detail.get("released").and_then(Value::as_bool) != Some(true)
+        || event.detail.get("linked").and_then(Value::as_bool) != Some(true)
+        || event.detail.get("adopted").and_then(Value::as_bool) != Some(true)
+        || adopted_attempt < original_attempt
+        || adopted_epoch <= original_epoch
+    {
+        return Err(refused(
+            "Campaign adoption does not preserve one released and linked launch under a newer fenced owner",
+        )
+        .into());
+    }
     Ok(serde_json::to_vec(event)?)
+}
+
+fn validate_network_restored_before_cleanup(
+    paths: &DeadreckonPaths,
+    binding: &OperatorCaptureBinding,
+) -> AnyResult<()> {
+    let probe = binding
+        .network_probe
+        .as_ref()
+        .ok_or_else(|| refused("network cleanup has no signed probe authority"))?;
+    let load = |subject: &str| -> AnyResult<(OperatorCaptureNetworkObservation, Vec<u8>)> {
+        let bytes = stable_regular_bytes(
+            &protected_evidence_path(paths, binding, subject),
+            "protected network observation",
+        )?;
+        let observation = serde_json::from_slice(&bytes)?;
+        Ok((observation, bytes))
+    };
+    let (before, before_bytes) = load("network-reachable-before")?;
+    let (offline, offline_bytes) = load("intervention")?;
+    let (after, after_bytes) = load("network-reachable-after")?;
+    for observation in [&before, &offline, &after] {
+        validate_network_observation_identity(binding, probe, observation)?;
+    }
+    if before.phase != OperatorCapturePhase::Before
+        || before.connectivity != OperatorCaptureConnectivity::Reachable
+        || offline.phase != OperatorCapturePhase::Intervention
+        || offline.connectivity != OperatorCaptureConnectivity::Unreachable
+        || after.phase != OperatorCapturePhase::After
+        || after.connectivity != OperatorCaptureConnectivity::Reachable
+        || before.attempt != offline.attempt
+        || offline.attempt != after.attempt
+        || !(before.observed_at < offline.observed_at && offline.observed_at < after.observed_at)
+        || before.job_last_sequence > offline.job_last_sequence
+        || offline.job_last_sequence > after.job_last_sequence
+    {
+        return Err(refused(
+            "network cleanup requires one signed reachable -> unreachable -> reachable sequence for the same attempt",
+        )
+        .into());
+    }
+    let capture_history =
+        read_operator_capture_history(paths, binding.job_id.as_ref(), &binding.session_id)?;
+    let expected = [
+        (
+            "network-reachable-before",
+            OperatorCapturePhase::Before,
+            &before_bytes,
+        ),
+        (
+            "intervention",
+            OperatorCapturePhase::Intervention,
+            &offline_bytes,
+        ),
+        (
+            "network-reachable-after",
+            OperatorCapturePhase::After,
+            &after_bytes,
+        ),
+    ];
+    let mut sequences = Vec::new();
+    for (subject, phase, bytes) in expected {
+        let matches = capture_history
+            .events()
+            .iter()
+            .filter(|event| {
+                event.subject == subject
+                    && event.phase == phase
+                    && event.source == OperatorCaptureSource::NetworkConnectivityObservation
+                    && event.provenance == OperatorCaptureProvenance::TrustedSupervisor
+                    && event.content_sha256 == sha256_bytes(bytes)
+                    && u64::try_from(bytes.len()).ok() == Some(event.content_bytes)
+            })
+            .collect::<Vec<_>>();
+        let [event] = matches.as_slice() else {
+            return Err(refused(
+                "network transition is not covered by one exact authenticated capture event",
+            )
+            .into());
+        };
+        sequences.push(event.sequence.get());
+    }
+    if !(sequences[0] < sequences[1] && sequences[1] < sequences[2]) {
+        return Err(refused("authenticated network transition events are out of order").into());
+    }
+    Ok(())
+}
+
+fn validate_network_fault_lineage(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+) -> AnyResult<()> {
+    validate_network_restored_before_cleanup(&context.paths, binding)?;
+    let offline = load_protected_network_observation(context, binding, "intervention")?;
+    let after = load_protected_network_observation(context, binding, "network-reachable-after")?;
+    let before_history_bytes = stable_regular_bytes(
+        &protected_evidence_path(&context.paths, binding, "events-before"),
+        "protected pre-fault Job history",
+    )?;
+    let after_history_bytes = stable_regular_bytes(
+        &protected_evidence_path(&context.paths, binding, "events-after"),
+        "protected post-fault Job history",
+    )?;
+    let before_events = parse_exact_job_events(&before_history_bytes, binding)?;
+    let after_events = parse_exact_job_events(&after_history_bytes, binding)?;
+    if before_events.len() > after_events.len()
+        || after_events[..before_events.len()] != before_events
+        || before_events.last().map(|event| event.sequence.get())
+            != Some(
+                load_protected_network_observation(context, binding, "network-reachable-before")?
+                    .job_last_sequence,
+            )
+    {
+        return Err(refused(
+            "network trial before-history is not an exact prefix at the reachable boundary",
+        )
+        .into());
+    }
+    let current_history_bytes = canonical_job_events(&context.paths, binding.job_id.as_ref())?;
+    if after_history_bytes != current_history_bytes
+        || after_events.last().map(|event| event.sequence.get()) != Some(after.job_last_sequence)
+    {
+        return Err(refused(
+            "network trial after-history does not exactly match the restored terminal Job boundary",
+        )
+        .into());
+    }
+    let matching_stops = after_events
+        .iter()
+        .filter(|event| {
+            event.kind == JobEventKind::AttemptStopped
+                && event.sequence.get() > offline.job_last_sequence
+                && event.timestamp > offline.observed_at
+                && event.lease_epoch == offline.attempt.lease_epoch
+                && event.detail.get("attempt").and_then(Value::as_u64)
+                    == Some(u64::from(offline.attempt.attempt))
+        })
+        .collect::<Vec<_>>();
+    let [stopped] = matching_stops.as_slice() else {
+        return Err(refused(
+            "network trial requires one exact post-outage stop for the captured attempt and lease",
+        )
+        .into());
+    };
+    let retries = after_events
+        .iter()
+        .filter(|event| {
+            event.kind == JobEventKind::RetryScheduled
+                && event.sequence.get() > stopped.sequence.get()
+                && event.detail.get("after_attempt").and_then(Value::as_u64)
+                    == Some(u64::from(offline.attempt.attempt))
+        })
+        .collect::<Vec<_>>();
+    if retries.len() > 1 {
+        return Err(refused(
+            "captured network attempt has duplicate retry facts after its exact stop",
+        )
+        .into());
+    }
+    if retries.is_empty() {
+        let view = JobView::load(&context.paths, binding.job_id.as_ref())?;
+        let outcome = view
+            .projection
+            .outcome
+            .ok_or_else(|| refused("network trial stopped without retry or terminal outcome"))?;
+        let stop_reason = view
+            .projection
+            .stop_reason
+            .ok_or_else(|| refused("network trial terminal outcome has no stop reason"))?;
+        let expected = OperatorCaptureExpectedJobResult {
+            outcome,
+            stop_reason,
+        };
+        let terminal = after_events.last().filter(|event| {
+            event.sequence.get() > stopped.sequence.get()
+                && terminal_event_matches(event.kind, outcome)
+        });
+        if terminal.is_none() || !binding.allowed_terminal_results.contains(&expected) {
+            return Err(refused(
+                "captured attempt stop is followed by neither its retry nor an approved terminal result",
+            )
+            .into());
+        }
+    }
+    let protected_report = stable_regular_bytes(
+        &protected_evidence_path(&context.paths, binding, "job-report"),
+        "protected network Job report",
+    )?;
+    if protected_report != canonical_job_report(context, binding)? {
+        return Err(refused("network trial report changed after its authenticated capture").into());
+    }
+    Ok(())
+}
+
+fn parse_exact_job_events(
+    bytes: &[u8],
+    binding: &OperatorCaptureBinding,
+) -> AnyResult<Vec<JobEvent>> {
+    let text = std::str::from_utf8(bytes)?;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: JobEvent = serde_json::from_str(line)?;
+        let expected_sequence = u64::try_from(events.len())? + 1;
+        if event.job_id != binding.job_id || event.sequence.get() != expected_sequence {
+            return Err(refused(
+                "protected network Job history is foreign, gapped, or out of order",
+            )
+            .into());
+        }
+        events.push(event);
+    }
+    if events.is_empty() {
+        return Err(refused("protected network Job history is empty").into());
+    }
+    Ok(events)
 }
 
 fn canonical_job_cleanup(
     paths: &DeadreckonPaths,
     binding: &OperatorCaptureBinding,
 ) -> AnyResult<Vec<u8>> {
+    if binding.trial_id == "live_provider_network_loss" {
+        validate_network_restored_before_cleanup(paths, binding)?;
+    }
     let view = JobView::load(paths, binding.job_id.as_ref())?;
     if !view.projection.is_terminal() {
         return Err(refused("cleanup capture requires a terminal Job projection").into());
@@ -1958,6 +2625,211 @@ fn process_group_is_alive(pgid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_group_is_alive(_pgid: u32) -> bool {
     false
+}
+
+fn validated_pass_lineage(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+) -> AnyResult<OperatorCapturePassLineage> {
+    let view = JobView::load(&context.paths, binding.job_id.as_ref())?;
+    if !view.projection.is_terminal() {
+        return Err(refused("passed trial requires a terminal Job projection").into());
+    }
+    let outcome = view
+        .projection
+        .outcome
+        .ok_or_else(|| refused("terminal Job projection has no outcome"))?;
+    let stop_reason = view
+        .projection
+        .stop_reason
+        .ok_or_else(|| refused("terminal Job projection has no stop reason"))?;
+    let actual = OperatorCaptureExpectedJobResult {
+        outcome,
+        stop_reason,
+    };
+    if !actual.is_valid() || !binding.allowed_terminal_results.contains(&actual) {
+        return Err(refused(
+            "actual Job terminal outcome/reason pair was not approved by the signed capture binding",
+        )
+        .into());
+    }
+    if outcome == JobOutcome::Verified {
+        return Ok(OperatorCapturePassLineage::Completion(
+            validated_completion_lineage(context, binding)?,
+        ));
+    }
+    Ok(OperatorCapturePassLineage::Terminal(
+        validated_terminal_lineage(context, binding, &view)?,
+    ))
+}
+
+fn validated_terminal_lineage(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+    initial_view: &JobView,
+) -> AnyResult<OperatorCaptureTerminalLineage> {
+    let job_id = binding.job_id.as_ref();
+    match fs::symlink_metadata(context.paths.job_receipt(job_id)) {
+        Ok(_) => {
+            return Err(
+                refused("a non-Verified terminal Job unexpectedly has receipt.json").into(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_terminal_execution(binding, initial_view)?;
+    let history_path = context.paths.job_events(job_id);
+    let history_bytes = canonical_job_events(&context.paths, job_id)?;
+    let history = read_job_history(&history_path)?;
+    if !history.caveats.is_empty() {
+        return Err(refused("terminal Job history contains a torn or recoverable caveat").into());
+    }
+    let job = load_job(&context.paths, job_id)?;
+    let projection = reduce_job_history(&job.job_id, &history)?;
+    let current_view = JobView::load(&context.paths, job_id)?;
+    let repeated_history = canonical_job_events(&context.paths, job_id)?;
+    if repeated_history != history_bytes
+        || current_view.projection != projection
+        || current_view.projection != initial_view.projection
+    {
+        return Err(refused("terminal Job changed while its pass lineage was captured").into());
+    }
+    let outcome = projection
+        .outcome
+        .ok_or_else(|| refused("terminal Job history has no outcome"))?;
+    let stop_reason = projection
+        .stop_reason
+        .ok_or_else(|| refused("terminal Job history has no stop reason"))?;
+    let terminal_event = history
+        .events()
+        .last()
+        .ok_or_else(|| refused("terminal Job history is empty"))?;
+    if !projection.is_terminal()
+        || terminal_event.sequence.get() != projection.last_sequence
+        || !terminal_event_matches(terminal_event.kind, outcome)
+    {
+        return Err(refused(
+            "the final Job history event is not the event that produced the terminal result",
+        )
+        .into());
+    }
+
+    require_protected_terminal_subject(context, binding, "events-after", &history_bytes)?;
+    require_protected_terminal_subject(
+        context,
+        binding,
+        "job-view-after",
+        &serde_json::to_vec(&current_view)?,
+    )?;
+    require_protected_terminal_subject(
+        context,
+        binding,
+        "job-report",
+        &canonical_job_report(context, binding)?,
+    )?;
+
+    let authority_path = context.paths.job_authority(job_id);
+    let authority_bytes = stable_regular_bytes(&authority_path, "authority.json")?;
+    let authority: JobAuthority = serde_json::from_slice(&authority_bytes)?;
+    if authority.job_id != binding.job_id
+        || authority.source_tree_sha256 != binding.source_tree_sha256
+        || authority.source_revision.as_deref() != Some(binding.source_revision.as_str())
+    {
+        return Err(refused("terminal authority does not match the signed capture binding").into());
+    }
+    Ok(OperatorCaptureTerminalLineage {
+        authority_sha256: sha256_bytes(&authority_bytes),
+        goal_sha256: authority.goal_sha256,
+        contract_sha256: authority.contract_sha256,
+        effective_policy_sha256: authority.effective_policy_sha256,
+        launch_plan_sha256: authority.launch_plan_sha256,
+        source_tree_sha256: authority.source_tree_sha256,
+        source_revision: authority.source_revision,
+        job_history_sha256: sha256_bytes(&history_bytes),
+        job_history_bytes: u64::try_from(history_bytes.len())
+            .map_err(|_| refused("terminal Job history is too large"))?,
+        terminal_event_sha256: sha256_bytes(&serde_json::to_vec(terminal_event)?),
+        terminal_sequence: terminal_event.sequence.get(),
+        outcome,
+        stop_reason,
+    })
+}
+
+fn require_protected_terminal_subject(
+    context: &HelperContext,
+    binding: &OperatorCaptureBinding,
+    subject: &str,
+    expected: &[u8],
+) -> AnyResult<()> {
+    let requirement = binding
+        .required_captures
+        .iter()
+        .find(|requirement| requirement.subject == subject)
+        .ok_or_else(|| refused("terminal pass policy lacks a required canonical subject"))?;
+    if requirement.phase != OperatorCapturePhase::After {
+        return Err(refused("terminal pass subject is not declared in the after phase").into());
+    }
+    let observed = stable_regular_bytes(
+        &protected_evidence_path(&context.paths, binding, subject),
+        "protected terminal evidence",
+    )?;
+    if observed != expected {
+        return Err(refused(
+            "protected terminal evidence does not match the current authenticated Job state",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_terminal_execution(binding: &OperatorCaptureBinding, view: &JobView) -> AnyResult<()> {
+    if view.attempts.is_empty()
+        || view
+            .attempts
+            .iter()
+            .any(|attempt| attempt.sandbox.backend != binding.declared_backend)
+    {
+        return Err(refused(
+            "terminal Job attempts are absent or do not use the signed contained backend",
+        )
+        .into());
+    }
+    let worker_role = if binding.provider_routes.contains_key("hostile_worker") {
+        "hostile_worker"
+    } else {
+        "worker"
+    };
+    let allowed = binding
+        .provider_routes
+        .get(worker_role)
+        .ok_or_else(|| refused("terminal binding has no worker provider route"))?;
+    if view
+        .attempts
+        .iter()
+        .any(|attempt| !allowed.contains(&attempt.provider))
+    {
+        return Err(refused(
+            "terminal Job used a worker provider outside the signed route declaration",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn terminal_event_matches(kind: JobEventKind, outcome: JobOutcome) -> bool {
+    matches!(
+        (kind, outcome),
+        (JobEventKind::NeedsReview, JobOutcome::NeedsReview)
+            | (JobEventKind::Blocked, JobOutcome::Blocked)
+            | (JobEventKind::BudgetExhausted, JobOutcome::BudgetExhausted)
+            | (JobEventKind::DeadlineReached, JobOutcome::DeadlineReached)
+            | (
+                JobEventKind::Failed,
+                JobOutcome::RetryExhausted | JobOutcome::Failed
+            )
+            | (JobEventKind::Cancelled, JobOutcome::Cancelled)
+    )
 }
 
 fn canonical_completion_receipt(
@@ -2442,6 +3314,99 @@ fn manifest_trial_is_structurally_inconclusive(manifest: &[u8], trial_id: &str) 
     }))
 }
 
+fn manifest_allowed_terminal_results(
+    manifest: &[u8],
+    trial_id: &str,
+) -> AnyResult<Vec<OperatorCaptureExpectedJobResult>> {
+    let value: Value = serde_json::from_slice(manifest)?;
+    let declarations = value
+        .get("trials")
+        .and_then(Value::as_array)
+        .and_then(|trials| {
+            trials
+                .iter()
+                .find(|trial| trial.get("id").and_then(Value::as_str) == Some(trial_id))
+        })
+        .and_then(|trial| trial.pointer("/job/allowed_terminal_results"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| refused("trial has no allowed terminal-result declarations"))?;
+    if declarations.is_empty() {
+        return Err(refused("trial allowed terminal-result declarations are empty").into());
+    }
+    let mut results = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let object = declaration
+            .as_object()
+            .filter(|object| {
+                object.len() == 2
+                    && object.contains_key("outcome")
+                    && object.contains_key("stop_reason")
+            })
+            .ok_or_else(|| refused("terminal result must contain exact outcome and stop_reason"))?;
+        let result = OperatorCaptureExpectedJobResult {
+            outcome: serde_json::from_value(
+                object
+                    .get("outcome")
+                    .cloned()
+                    .ok_or_else(|| refused("terminal result has no outcome"))?,
+            )?,
+            stop_reason: serde_json::from_value(
+                object
+                    .get("stop_reason")
+                    .cloned()
+                    .ok_or_else(|| refused("terminal result has no stop_reason"))?,
+            )?,
+        };
+        if !result.is_valid() || results.contains(&result) {
+            return Err(
+                refused("terminal results must be unique valid outcome/stop_reason pairs").into(),
+            );
+        }
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn validate_manifest_job_shape(manifest: &[u8], trial_id: &str, actual: JobShape) -> AnyResult<()> {
+    let value: Value = serde_json::from_slice(manifest)?;
+    let trial = value
+        .get("trials")
+        .and_then(Value::as_array)
+        .and_then(|trials| {
+            trials
+                .iter()
+                .find(|trial| trial.get("id").and_then(Value::as_str) == Some(trial_id))
+        })
+        .ok_or_else(|| refused("manifest does not contain the requested trial ID"))?;
+    let declared = trial
+        .pointer("/job/shape")
+        .and_then(Value::as_str)
+        .ok_or_else(|| refused("trial has no Job shape declaration"))?;
+    let allowed = match declared {
+        "single" => actual == JobShape::Single,
+        "graph" => actual == JobShape::Graph,
+        "campaign" => actual == JobShape::LegacyCampaign,
+        "graph_or_campaign" => matches!(actual, JobShape::Graph | JobShape::LegacyCampaign),
+        "single_or_graph_or_campaign" => matches!(
+            actual,
+            JobShape::Single | JobShape::Graph | JobShape::LegacyCampaign
+        ),
+        _ => {
+            return Err(refused(&format!(
+                "trial has an unsupported Job shape declaration: {declared}"
+            ))
+            .into());
+        }
+    };
+    if !allowed {
+        return Err(refused(&format!(
+            "Job shape {actual:?} is not allowed by trial declaration {declared}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 fn provider_route_map(
     manifest: &[u8],
     trial_id: &str,
@@ -2505,6 +3470,90 @@ fn provider_route_map(
     Ok(routes)
 }
 
+fn network_probe_binding(
+    context: &HelperContext,
+    trial_id: &str,
+    routes: &BTreeMap<String, Vec<String>>,
+) -> AnyResult<Option<OperatorCaptureNetworkProbe>> {
+    if trial_id != "live_provider_network_loss" {
+        return Ok(None);
+    }
+    let worker_routes = routes
+        .get("worker")
+        .filter(|routes| routes.len() == 1)
+        .ok_or_else(|| {
+            refused("network-loss capture requires exactly one declared worker provider route")
+        })?;
+    let provider_route = worker_routes[0].clone();
+    let registry = ProviderRegistry::with_overrides(context.paths.home())?;
+    let descriptor = registry
+        .get(&provider_route)
+        .ok_or_else(|| refused("network-loss worker route is absent from the provider registry"))?;
+    if descriptor.kind != DescriptorKind::Http {
+        return Err(
+            refused("network-loss capture requires a registry-backed HTTP provider route").into(),
+        );
+    }
+    let endpoint = descriptor
+        .default_endpoint
+        .clone()
+        .filter(|endpoint| valid_non_loopback_http_endpoint(endpoint))
+        .ok_or_else(|| refused("network-loss provider route has no non-loopback HTTP endpoint"))?;
+    Ok(Some(OperatorCaptureNetworkProbe {
+        provider_role: "worker".to_string(),
+        provider_route,
+        endpoint,
+    }))
+}
+
+fn valid_non_loopback_http_endpoint(endpoint: &str) -> bool {
+    let Some(rest) = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty()
+            && (!suffix.starts_with(':')
+                || suffix[1..].is_empty()
+                || !suffix[1..].bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        host
+    } else {
+        if authority.matches(':').count() > 1 {
+            return false;
+        }
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        host
+    };
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+    {
+        return false;
+    }
+    host.parse::<std::net::IpAddr>().map_or(true, |address| {
+        !address.is_loopback() && !address.is_unspecified()
+    })
+}
+
 fn parse_manifest_source(value: &str) -> AnyResult<OperatorCaptureSource> {
     let source = match value {
         "job-view" => OperatorCaptureSource::JobView,
@@ -2530,6 +3579,7 @@ fn parse_manifest_source(value: &str) -> AnyResult<OperatorCaptureSource> {
         "campaign-events" => OperatorCaptureSource::CampaignEvents,
         "active-plan" => OperatorCaptureSource::ActivePlan,
         "active-plan-events" => OperatorCaptureSource::ActivePlanEvents,
+        "network-connectivity-observation" => OperatorCaptureSource::NetworkConnectivityObservation,
         "unavailable-objective" => OperatorCaptureSource::UnavailableObjective,
         _ => {
             return Err(refused(&format!("unknown canonical evidence source {value}")).into());
@@ -2539,7 +3589,9 @@ fn parse_manifest_source(value: &str) -> AnyResult<OperatorCaptureSource> {
 }
 
 fn expected_source_for_subject(subject: &str) -> OperatorCaptureSource {
-    if subject.starts_with("job-view") {
+    if subject.starts_with("network-") {
+        OperatorCaptureSource::NetworkConnectivityObservation
+    } else if subject.starts_with("job-view") {
         OperatorCaptureSource::JobView
     } else if subject == "job-report" || subject.starts_with("job-report-") {
         OperatorCaptureSource::JobReport
@@ -2875,11 +3927,19 @@ fn required_text(value: &str, label: &str) -> AnyResult<String> {
     }
 }
 
-fn objective_kind(source: OperatorCaptureSource) -> OperatorCaptureEventKind {
+fn objective_kind(
+    source: OperatorCaptureSource,
+    phase: OperatorCapturePhase,
+) -> OperatorCaptureEventKind {
     match source {
         OperatorCaptureSource::JobIntervention
         | OperatorCaptureSource::SandboxBoundaryObservation
         | OperatorCaptureSource::CampaignIntervention => {
+            OperatorCaptureEventKind::InterventionRecorded
+        }
+        OperatorCaptureSource::NetworkConnectivityObservation
+            if phase == OperatorCapturePhase::Intervention =>
+        {
             OperatorCaptureEventKind::InterventionRecorded
         }
         OperatorCaptureSource::JobCleanup => OperatorCaptureEventKind::CleanupRecorded,
@@ -2914,15 +3974,18 @@ mod tests {
     use tempfile::TempDir;
 
     use deadreckon_protocol::{
-        JobEventKind, JobId, OperatorCaptureReceipt, OperatorCaptureSchemaVersion,
-        OperatorCaptureStatus,
+        JobEventKind, JobId, JobOutcome, JobShape, OperatorCaptureEventKind, OperatorCapturePhase,
+        OperatorCaptureReceipt, OperatorCaptureSchemaVersion, OperatorCaptureSource,
+        OperatorCaptureStatus, StopReason,
     };
 
     use super::{
-        Cli, expected_job_intervention_kind, job_intervention_is_fresh, manifest_requirements,
-        persist_bound_bytes, persist_observation_no_clobber, provider_route_map, sha256_bytes,
-        stable_regular_bytes, trusted_recorder_command, validate_published_envelope,
-        validate_root_schema_contract,
+        Cli, boot_identity, expected_job_intervention_kind, job_intervention_is_fresh,
+        manifest_allowed_terminal_results, manifest_requirements, network_process_is_current,
+        objective_kind, persist_bound_bytes, persist_observation_no_clobber,
+        process_start_identity, provider_route_map, sha256_bytes, stable_regular_bytes,
+        trusted_recorder_command, valid_non_loopback_http_endpoint, validate_manifest_job_shape,
+        validate_published_envelope, validate_root_schema_contract,
     };
 
     #[test]
@@ -2973,6 +4036,95 @@ mod tests {
         assert_eq!(requirements.len(), 2);
         assert_eq!(requirements[0].subject, "job-view-before");
         assert_eq!(requirements[1].subject, "job-view-after");
+    }
+
+    #[test]
+    fn manifest_job_shape_is_closed_and_matches_the_bound_job() {
+        let manifest = |shape: &str| {
+            format!(r#"{{"trials":[{{"id":"trial-1","job":{{"shape":"{shape}"}}}}]}}"#)
+        };
+        for (declared, allowed) in [
+            ("single", vec![JobShape::Single]),
+            ("graph", vec![JobShape::Graph]),
+            ("campaign", vec![JobShape::LegacyCampaign]),
+            (
+                "graph_or_campaign",
+                vec![JobShape::Graph, JobShape::LegacyCampaign],
+            ),
+            (
+                "single_or_graph_or_campaign",
+                vec![JobShape::Single, JobShape::Graph, JobShape::LegacyCampaign],
+            ),
+        ] {
+            let bytes = manifest(declared);
+            for actual in [
+                JobShape::Single,
+                JobShape::Graph,
+                JobShape::LegacyChain,
+                JobShape::LegacyCampaign,
+            ] {
+                let result = validate_manifest_job_shape(bytes.as_bytes(), "trial-1", actual);
+                assert_eq!(
+                    result.is_ok(),
+                    allowed.contains(&actual),
+                    "declaration {declared} and actual shape {actual:?}"
+                );
+            }
+        }
+
+        let unknown = manifest("anything");
+        assert!(
+            validate_manifest_job_shape(unknown.as_bytes(), "trial-1", JobShape::Single)
+                .expect_err("unknown declaration must fail closed")
+                .to_string()
+                .contains("unsupported Job shape declaration")
+        );
+    }
+
+    #[test]
+    fn manifest_terminal_results_are_exact_valid_unique_pairs() {
+        let valid = br#"{
+          "trials": [{
+            "id": "trial-1",
+            "job": {
+              "allowed_terminal_results": [
+                {"outcome":"verified","stop_reason":"verified"},
+                {"outcome":"needs_review","stop_reason":"semantic_unavailable"}
+              ]
+            }
+          }]
+        }"#;
+        let results =
+            manifest_allowed_terminal_results(valid, "trial-1").expect("valid exact pairs");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].outcome, JobOutcome::Verified);
+        assert_eq!(results[0].stop_reason, StopReason::Verified);
+        assert_eq!(results[1].outcome, JobOutcome::NeedsReview);
+        assert_eq!(results[1].stop_reason, StopReason::SemanticUnavailable);
+
+        for (label, manifest) in [
+            (
+                "empty",
+                r#"{"trials":[{"id":"trial-1","job":{"allowed_terminal_results":[]}}]}"#,
+            ),
+            (
+                "cross-paired",
+                r#"{"trials":[{"id":"trial-1","job":{"allowed_terminal_results":[{"outcome":"verified","stop_reason":"fatal_gate"}]}}]}"#,
+            ),
+            (
+                "duplicate",
+                r#"{"trials":[{"id":"trial-1","job":{"allowed_terminal_results":[{"outcome":"verified","stop_reason":"verified"},{"outcome":"verified","stop_reason":"verified"}]}}]}"#,
+            ),
+            (
+                "extra-field",
+                r#"{"trials":[{"id":"trial-1","job":{"allowed_terminal_results":[{"outcome":"verified","stop_reason":"verified","wildcard":true}]}}]}"#,
+            ),
+        ] {
+            assert!(
+                manifest_allowed_terminal_results(manifest.as_bytes(), "trial-1").is_err(),
+                "{label} declaration unexpectedly passed"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3098,6 +4250,7 @@ mod tests {
             result_sha256: sha256_bytes(&result),
             result_bytes: u64::try_from(result.len()).expect("length"),
             completion_lineage: None,
+            terminal_lineage: None,
             status: OperatorCaptureStatus::Inconclusive,
             signature: "c".repeat(64),
         };
@@ -3223,6 +4376,67 @@ mod tests {
             .to_string()
             .contains("unknown role")
         );
+    }
+
+    #[test]
+    fn network_endpoint_authority_refuses_non_http_loopback_and_userinfo() {
+        for endpoint in [
+            "ftp://api.openai.com",
+            "http://localhost:8080",
+            "http://service.localhost",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+            "https://credential@example.com",
+        ] {
+            assert!(
+                !valid_non_loopback_http_endpoint(endpoint),
+                "unsafe endpoint accepted: {endpoint}"
+            );
+        }
+        assert!(valid_non_loopback_http_endpoint(
+            "https://api.openai.com/v1"
+        ));
+    }
+
+    #[test]
+    fn network_observation_kind_tracks_its_exact_capture_phase() {
+        let source = OperatorCaptureSource::NetworkConnectivityObservation;
+        assert_eq!(
+            objective_kind(source, OperatorCapturePhase::Before),
+            OperatorCaptureEventKind::EvidenceCaptured
+        );
+        assert_eq!(
+            objective_kind(source, OperatorCapturePhase::Intervention),
+            OperatorCaptureEventKind::InterventionRecorded
+        );
+        assert_eq!(
+            objective_kind(source, OperatorCapturePhase::After),
+            OperatorCaptureEventKind::EvidenceCaptured
+        );
+    }
+
+    #[test]
+    fn network_attempt_process_identity_must_be_current_and_exact() {
+        let pid = std::process::id();
+        let boot_id = boot_identity();
+        let start_identity = process_start_identity(pid).expect("current process identity");
+
+        assert!(network_process_is_current(pid, &boot_id, &start_identity));
+        assert!(!network_process_is_current(
+            pid,
+            "different-boot",
+            &start_identity
+        ));
+        assert!(!network_process_is_current(
+            pid,
+            &boot_id,
+            "different-process-start"
+        ));
+        assert!(!network_process_is_current(
+            u32::MAX,
+            &boot_id,
+            &start_identity
+        ));
     }
 
     #[test]

@@ -236,6 +236,12 @@ enum MonitoredChild {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum ChildMonitorOutcome {
+    Exited(ChildExit),
+    PolicyTerminal,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ChildExit {
     status: Option<ExitStatus>,
     adopted: bool,
@@ -671,19 +677,7 @@ async fn supervise_one_job(
     {
         return Ok(());
     }
-    if initial
-        .job
-        .policy
-        .deadline
-        .is_some_and(|deadline| deadline <= Utc::now())
-    {
-        append_terminal_event(
-            paths,
-            &token,
-            JobEventKind::DeadlineReached,
-            StopReason::Deadline,
-            json!({ "reason": "approved job deadline elapsed before the next attempt" }),
-        )?;
+    if finish_deadline_reached(paths, &token, &initial.job, None)? {
         return Ok(());
     }
     match super::graph_job::recover_pending_driver_state(paths, &initial.job) {
@@ -812,8 +806,17 @@ async fn supervise_one_job(
                 child_link_detail(&initial.job, &child, true, None),
             )?;
             let launch_id = child.launch_id.clone();
-            let exit =
-                monitor_child(paths, &token, MonitoredChild::Adopted(child.process.pid)).await?;
+            let exit = match monitor_child(
+                paths,
+                &token,
+                &initial.job,
+                MonitoredChild::Adopted(child.process.pid),
+            )
+            .await?
+            {
+                ChildMonitorOutcome::Exited(exit) => exit,
+                ChildMonitorOutcome::PolicyTerminal => return Ok(()),
+            };
             if let Err(error) = reconcile_attempt_processes(
                 paths,
                 job_id,
@@ -979,6 +982,9 @@ async fn supervise_one_job(
         if finish_cancel_requested(paths, &token, None)? {
             return Ok(());
         }
+        if finish_deadline_reached(paths, &token, &initial.job, None)? {
+            return Ok(());
+        }
         let attempt_already_started = guarded_recovery
             .as_ref()
             .is_some_and(|recovery| recovery.attempt == attempt && recovery.attempt_started);
@@ -1009,6 +1015,9 @@ async fn supervise_one_job(
         if finish_cancel_requested(paths, &token, None)? {
             return Ok(());
         }
+        if finish_deadline_reached(paths, &token, &initial.job, None)? {
+            return Ok(());
+        }
         match spawn_job_driver(paths, &initial.job, &instance.executable, &prepared) {
             Ok(mut guarded) => {
                 append_control_event(
@@ -1024,8 +1033,17 @@ async fn supervise_one_job(
                     supervisor_test_failpoint("after_child_released");
                 }
                 let launch_id = guarded.metadata.launch_id.clone();
-                let exit =
-                    monitor_child(paths, &token, MonitoredChild::Owned(guarded.child)).await?;
+                let exit = match monitor_child(
+                    paths,
+                    &token,
+                    &initial.job,
+                    MonitoredChild::Owned(guarded.child),
+                )
+                .await?
+                {
+                    ChildMonitorOutcome::Exited(exit) => exit,
+                    ChildMonitorOutcome::PolicyTerminal => return Ok(()),
+                };
                 if let Err(error) = reconcile_attempt_processes(
                     paths,
                     job_id,
@@ -2166,26 +2184,69 @@ fn prepare_unlinked_launch_recovery(
 async fn monitor_child(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
+    job: &Job,
     mut child: MonitoredChild,
-) -> Result<ChildExit> {
+) -> Result<ChildMonitorOutcome> {
     loop {
+        if job
+            .policy
+            .deadline
+            .is_some_and(|deadline| deadline <= Utc::now())
+        {
+            let terminalized = match &mut child {
+                MonitoredChild::Owned(child) => {
+                    // Process-group termination waits for the group to
+                    // disappear. Reap the directly owned leader in parallel
+                    // so its zombie cannot make that proof time out.
+                    let cleanup_paths = paths.clone();
+                    let cleanup_token = token.clone();
+                    let cleanup_job = job.clone();
+                    let cleanup = std::thread::spawn(move || {
+                        finish_deadline_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
+                    });
+                    let _ = child.wait();
+                    cleanup.join().map_err(|_| {
+                        CliError::Core(DeadreckonError::InvalidInput(
+                            "deadline cleanup thread panicked".to_string(),
+                        ))
+                    })??
+                }
+                MonitoredChild::Adopted(_) => finish_deadline_reached(paths, token, job, None)?,
+            };
+            if terminalized {
+                return Ok(ChildMonitorOutcome::PolicyTerminal);
+            }
+        }
+        if JobView::load(paths, token.job_id.as_ref())?
+            .projection
+            .is_terminal()
+        {
+            return Ok(ChildMonitorOutcome::PolicyTerminal);
+        }
         let status = match &mut child {
             MonitoredChild::Owned(child) => child.try_wait()?,
             MonitoredChild::Adopted(pid) if !pid_is_alive(*pid) => {
-                return Ok(ChildExit {
+                return Ok(ChildMonitorOutcome::Exited(ChildExit {
                     status: None,
                     adopted: true,
-                });
+                }));
             }
             MonitoredChild::Adopted(_) => None,
         };
         if let Some(status) = status {
-            return Ok(ChildExit {
+            return Ok(ChildMonitorOutcome::Exited(ChildExit {
                 status: Some(status),
                 adopted: false,
-            });
+            }));
         }
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
+        let sleep_for = job.policy.deadline.map_or(HEARTBEAT_INTERVAL, |deadline| {
+            deadline
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                .min(HEARTBEAT_INTERVAL)
+        });
+        tokio::time::sleep(sleep_for).await;
         heartbeat_job_lease(paths, token, Utc::now(), LEASE_TTL)?;
     }
 }
@@ -2230,6 +2291,9 @@ async fn reconcile_child_exit(
     max_attempts: u32,
 ) -> Result<ChildReconciliation> {
     if finish_cancel_requested(paths, token, Some(&exit))? {
+        return Ok(ChildReconciliation::Finished);
+    }
+    if finish_deadline_reached(paths, token, job, Some(&exit))? {
         return Ok(ChildReconciliation::Finished);
     }
     if matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign) {
@@ -3876,6 +3940,13 @@ fn finish_cancel_requested(
                     Duration::from_secs(2),
                 )
             })
+            .and_then(|()| {
+                super::graph_job::reconcile_merge_repair_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
             .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
     {
         block_for_lost_containment(
@@ -3910,6 +3981,85 @@ fn finish_cancel_requested(
             } else {
                 "operator cancelled before another attempt was launched"
             },
+        }),
+    )?;
+    Ok(true)
+}
+
+/// Enforce the approved absolute deadline as a live execution boundary.
+///
+/// A deadline becomes terminal only after every process identity owned by the
+/// controller has been reconciled. Applying the same rule before adoption
+/// prevents a restarted supervisor from declaring a timed-out Job finished
+/// while its old child continues mutating the isolated workspace.
+fn finish_deadline_reached(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    let Some(deadline) = job.policy.deadline else {
+        return Ok(false);
+    };
+    if deadline > Utc::now() {
+        return Ok(false);
+    }
+    if let Err(error) =
+        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
+            .and_then(|()| {
+                super::graph_job::reconcile_campaign_sub_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| {
+                super::graph_job::reconcile_merge_repair_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+    {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "approved deadline elapsed, but not every supervised process could be proven stopped: {error}"
+            ),
+        )?;
+        return Ok(true);
+    }
+    let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
+    if attempt_active {
+        append_attempt_stopped(
+            paths,
+            token,
+            StopReason::Deadline,
+            json!({
+                "reason": "approved absolute deadline elapsed during the active durable attempt",
+                "deadline": deadline,
+                "exit": exit.map(exit_detail),
+            }),
+        )?;
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::DeadlineReached,
+        StopReason::Deadline,
+        json!({
+            "reason": if attempt_active {
+                "approved absolute deadline elapsed during the active durable attempt"
+            } else {
+                "approved absolute deadline elapsed before the next attempt"
+            },
+            "deadline": deadline,
         }),
     )?;
     Ok(true)
@@ -4174,6 +4324,7 @@ mod tests {
                 ceiling_usd: Some(2.0),
                 split: Vec::new(),
                 wall_seconds: Some(30),
+                deadline: None,
             },
             contract: CourseContract::default(),
             signals: json!({
@@ -4776,15 +4927,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elapsed_deadline_stops_before_launch_with_distinct_outcome() {
+    async fn elapsed_public_approved_deadline_stops_before_launch_with_distinct_outcome() {
         let temp = TempDir::new().expect("tempdir");
-        let (paths, mut job) = fixture(&temp, 1);
-        job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::seconds(1));
-        fs::write(
-            paths.job_json(job.job_id.as_ref()),
-            serde_json::to_vec_pretty(&job).expect("job json"),
-        )
-        .expect("expired job fixture");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
+        let deadline = Utc::now() - chrono::TimeDelta::seconds(1);
+        let job = super::super::job::create_job(super::super::job::CreateJob {
+            paths: &paths,
+            source_cwd: &source,
+            scope: deadreckon_core::paths::workspace_scope(&source).expect("scope"),
+            launch_plan: super::super::course::trivial_operator_plan(
+                "finish before the approved deadline",
+                CourseShape::Single,
+                "run",
+            ),
+            shape: deadreckon_protocol::JobShape::Single,
+            driver: None,
+            contract_source: None,
+            source: super::super::job::DurableSource {
+                mode: super::super::job::DurableSourceMode::Copy,
+                from: Some(source.clone()),
+                allow_dirty: false,
+            },
+            max_spend_usd: 3.0,
+            max_wall_seconds: 60,
+            max_attempts: 1,
+            deadline: Some(deadline),
+            sandbox_requested: "auto".to_string(),
+            accepted_by: AuthorityAcceptedBy::YesFlagGuardrail,
+        })
+        .expect("public-approved Job creation");
+
+        let frozen =
+            super::super::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+                .expect("frozen launch plan");
+        assert_eq!(job.policy.deadline, Some(deadline));
+        assert_eq!(frozen.budget.deadline, Some(deadline));
 
         supervise_one_job(
             &paths,
@@ -4796,6 +4976,154 @@ mod tests {
 
         let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
         assert_eq!(view.projection.attempt_count, 0);
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::DeadlineReached)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::Deadline));
+    }
+
+    #[tokio::test]
+    async fn elapsed_deadline_fails_closed_when_merge_repair_authority_is_malformed() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 1);
+        job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::seconds(1));
+        fs::write(
+            paths.job_json(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&job).expect("job JSON"),
+        )
+        .expect("expired Job fixture");
+        let authority_dir = paths
+            .job_dir(job.job_id.as_ref())
+            .join("merge-repair-authorities");
+        fs::create_dir_all(&authority_dir).expect("merge-repair authority directory");
+        fs::write(authority_dir.join("malformed.json"), b"{}").expect("malformed authority");
+
+        supervise_one_job(
+            &paths,
+            &instance(temp.path().join("must-not-launch")),
+            job.job_id.as_ref(),
+        )
+        .await
+        .expect("deadline must fail closed");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Blocked)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::LostContainment)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_deadline_stops_an_active_child_before_terminalizing() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
+        let deadline = Utc::now() + chrono::TimeDelta::milliseconds(300);
+        let job = super::super::job::create_job(super::super::job::CreateJob {
+            paths: &paths,
+            source_cwd: &source,
+            scope: deadreckon_core::paths::workspace_scope(&source).expect("scope"),
+            launch_plan: super::super::course::trivial_operator_plan(
+                "stop the active child at the approved deadline",
+                CourseShape::Single,
+                "run",
+            ),
+            shape: deadreckon_protocol::JobShape::Single,
+            driver: None,
+            contract_source: None,
+            source: super::super::job::DurableSource {
+                mode: super::super::job::DurableSourceMode::Copy,
+                from: Some(source.clone()),
+                allow_dirty: false,
+            },
+            max_spend_usd: 3.0,
+            max_wall_seconds: 60,
+            max_attempts: 2,
+            deadline: Some(deadline),
+            sandbox_requested: "auto".to_string(),
+            accepted_by: AuthorityAcceptedBy::YesFlagGuardrail,
+        })
+        .expect("public-approved Job creation");
+
+        let (child, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 30");
+            command
+        })
+        .expect("long-running child");
+        let child_pid = child.id();
+        let launch_id = Uuid::new_v4().to_string();
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: child_pid,
+                pgid: Some(child_pid),
+            },
+            launch_id: Some(launch_id),
+            attempt: Some(1),
+            release_token_sha256: Some(deadreckon_core::flight::sha256_text("deadline-test")),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start_identity(child_pid),
+        };
+        write_child_metadata(&child_metadata_path(&paths, job.job_id.as_ref()), &metadata)
+            .expect("child metadata");
+        for (sequence, kind, detail) in [
+            (4, JobEventKind::AttemptStarted, attempt_detail(&job, 1)),
+            (
+                5,
+                JobEventKind::ChildLinked,
+                child_link_detail(&job, &metadata, false, Some(1)),
+            ),
+        ] {
+            append_job_event(
+                &paths,
+                &JobEvent {
+                    schema_version: JobSchemaVersion::CURRENT,
+                    job_id: job.job_id.clone(),
+                    sequence: JobEventSequence::new(sequence).expect("sequence"),
+                    event_id: format!("active-deadline-{sequence}"),
+                    causation_id: format!("active-deadline-{sequence}"),
+                    timestamp: Utc::now(),
+                    lease_epoch: 0,
+                    kind,
+                    detail,
+                },
+            )
+            .expect("active attempt event");
+        }
+
+        let owner = instance(temp.path().join("must-not-launch")).owner;
+        let token = claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL)
+            .expect("claim")
+            .token();
+        let outcome = monitor_child(&paths, &token, &job, MonitoredChild::Owned(child))
+            .await
+            .expect("deadline stops active child");
+
+        assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
+        assert!(!pid_is_alive(child_pid));
+        assert!(!child_metadata_path(&paths, job.job_id.as_ref()).exists());
+        let history =
+            read_job_history(&paths.job_events(job.job_id.as_ref())).expect("deadline history");
+        assert!(history.events().iter().any(|event| {
+            event.kind == JobEventKind::AttemptStopped
+                && event.detail.get("stop_reason")
+                    == Some(&serde_json::to_value(StopReason::Deadline).expect("stop reason"))
+        }));
+        assert!(
+            !history
+                .events()
+                .iter()
+                .any(|event| event.kind == JobEventKind::RetryScheduled)
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("deadline view");
         assert_eq!(
             view.projection.outcome,
             Some(deadreckon_protocol::JobOutcome::DeadlineReached)

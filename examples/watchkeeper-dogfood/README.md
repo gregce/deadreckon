@@ -225,8 +225,10 @@ proves a local server is reachable without containment and unreachable through
 DeadReckon's Seatbelt profile. The common Docker control-boundary pass and the
 public strict Docker group are distinct: the latter requires the static Linux
 evaluator sidecar and verifies Job-level completion, cancellation and recovery.
-Neither host-backed pass claims a live provider, an active user service or a
-reboot.
+Neither host-backed pass claims the stronger `live_docker_gate_attack`, a live
+provider, an active user service or a reboot. The credential-free
+`docker_gate_boundary` ID is intentionally separate from that hostile-worker,
+independent-judge and valid-receipt claim.
 
 The following remain standing live claims until an operator performs them:
 
@@ -237,9 +239,12 @@ The following remain standing live claims until an operator performs them:
 - a cross-provider hostile gate trial from the 24-task matrix;
 - a naturally occurring live semantic `revise` followed by Graph or Campaign
   parent repair;
-- live Campaign interruption and recovery without duplicate sub-plan or repair
-  work;
+- live Campaign interruption in which a replacement owner adopts the same
+  authenticated sub-Plan process launch and recovers it without a second
+  persisted launch fact;
 - the equivalent protected gate boundary on Linux/bubblewrap.
+- a hostile live Docker worker paired with a distinct independent judge and a
+  valid Docker-bound completion receipt (`live_docker_gate_attack`).
 
 ## Record an operator-run live fault trial
 
@@ -254,17 +259,53 @@ source, working, run, merge and repair roots. Pass-capable prepare fails closed
 for in-place or uncontained Jobs. Name every provider by its manifest role;
 worker and independent-judge routes must be different.
 
+`live_provider_network_loss` is narrower: its worker must be exactly one
+registry-backed HTTP route. Prepare derives and signs that route's non-loopback
+endpoint from the provider registry; there is no caller-provided probe URL.
+Capture `network-reachable-before`, apply the reviewed host change, record the
+intervention while the same supervised attempt is still current, restore the
+change, then capture `network-reachable-after`. The helper accepts only the
+official probe's `endpoint_unreachable` result for the middle observation and
+does not retain its free-form error text or credentials. The evidence proves
+an observed route outage and ordered Job response, not causal attribution to
+the host command.
+
+`live_campaign_interruption_recovery` binds the one active sub-Plan's complete
+prepared, released and linked process authority before interruption. After the
+parent lease is reclaimed, its canonical intervention is exactly one
+`sub_process_adopted` event for the same parent, sub, Plan, attempt, launch,
+PID, boot and process-start identities under the newer lease. The oracle then
+requires `sub_recovered`, exact append-only Campaign and Plan histories, no
+second launch fact and no reopened completed Plan task. This is an objective
+persisted-adoption claim, not a promise that arbitrary external side effects
+are globally exactly-once.
+
+Every trial declares the exact terminal outcome/reason pairs that count as an
+acceptable product response before the intervention. Verified work still has
+to carry the normal valid completion receipt. A declared non-Verified response,
+such as `needs_review/semantic_unavailable`, is accepted only when the protected
+helper signs the matching final Job history and confirms that no completion
+receipt exists. Similar-looking but undeclared pairs fail closed.
+
 ```sh
 export WK_TRIAL_ID=live_provider_supervisor_restart
 export WK_LIVE_TRIAL="$DEADRECKON_DOGFOOD_ARTIFACTS/live/$WK_TRIAL_ID-01"
 export WK_JOB_ID=the-full-approved-job-id
 export DR_CAPTURE_BIN=/protected/deadreckon/bin/dr-capture
 export DEADRECKON_BIN=/protected/deadreckon/bin/deadreckon
+export WK_JOB_AUTHORITY="$DEADRECKON_HOME/jobs/$WK_JOB_ID/authority.json"
+test -f "$WK_JOB_AUTHORITY"
+test ! -L "$WK_JOB_AUTHORITY"
+export WK_JOB_SOURCE_REV="$(
+  python3 -c \
+    'import json,re,sys; value=json.load(open(sys.argv[1], encoding="utf-8"))["source_revision"]; assert isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value); print(value)' \
+    "$WK_JOB_AUTHORITY"
+)"
 
 python3 examples/watchkeeper-dogfood/live-trial.py prepare \
   "$WK_TRIAL_ID" \
   --trial-dir "$WK_LIVE_TRIAL" \
-  --revision "$(git rev-parse HEAD)" \
+  --revision "$WK_JOB_SOURCE_REV" \
   --capture-helper "$DR_CAPTURE_BIN" \
   --deadreckon-binary "$DEADRECKON_BIN" \
   --job-id "$WK_JOB_ID" \
@@ -275,7 +316,11 @@ python3 -m json.tool "$WK_LIVE_TRIAL/replay.json"
 ```
 
 Prepare is retry-safe: the same inputs reuse the same capture session and
-protected binding after an interruption. Conflicting inputs are refused.
+protected binding after an interruption. `WK_JOB_SOURCE_REV` is the approved
+target Job source revision, not the revision of the checkout containing the
+recorder. The protected helper independently binds and revalidates the Job
+authority, so a missing or different revision is refused. Conflicting inputs
+are refused.
 `replay.json` records the exact canonical subjects, trial-specific
 intervention source and cleanup source. Capture the declared `before`
 subjects:

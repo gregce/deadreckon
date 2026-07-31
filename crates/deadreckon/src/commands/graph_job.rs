@@ -2351,6 +2351,9 @@ fn campaign_sub_launch_detail(launch: &CampaignSubLaunchAuthority) -> serde_json
         "released": launch.released,
         "linked": launch.linked,
         "adopted": launch.adopted,
+        "adopted_by_attempt": launch.adopted_by_attempt,
+        "adopted_by_lease_epoch": launch.adopted_by_lease_epoch,
+        "adopted_at": launch.adopted_at,
     })
 }
 
@@ -2593,6 +2596,374 @@ pub(crate) fn reconcile_campaign_sub_processes_for_job(
 ) -> Result<()> {
     let inventory = validate_campaign_sub_process_inventory_for_job(paths, job_id)?;
     terminate_validated_campaign_sub_processes(paths, inventory, grace)
+}
+
+#[derive(Debug, Clone)]
+struct MergeRepairProcessAuthority {
+    path: PathBuf,
+    raw: Vec<u8>,
+    job_id: String,
+    repair_id: String,
+    capability_id: String,
+    process: deadreckon_core::SupervisedProcessRecord,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedMergeRepairProcessInventory {
+    authorities: Vec<MergeRepairProcessAuthority>,
+}
+
+/// Validate every separately-grouped merge-repair process before signalling
+/// any of them. The authority projection alone is not enough: it must be the
+/// exact value committed by the Job event history, name the current Job and
+/// outer launch, and match its one-time delegated capability.
+pub(crate) fn validate_merge_repair_process_inventory_for_job(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<ValidatedMergeRepairProcessInventory> {
+    let directory = paths.job_dir(job_id).join(MERGE_REPAIR_AUTHORITY_DIR);
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidatedMergeRepairProcessInventory {
+                authorities: Vec::new(),
+            });
+        }
+        Err(source) => {
+            return Err(CliError::Core(DeadreckonError::Io {
+                path: directory,
+                source,
+            }));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair authorities for Job {job_id} are not a trusted directory"
+        ))));
+    }
+    let mut authority_paths = fs::read_dir(&directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    authority_paths.sort();
+    let history = deadreckon_core::read_job_history(&paths.job_events(job_id))?;
+    let mut authorities = Vec::new();
+    for path in authority_paths {
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let Some(raw) = read_bounded_regular_control_file(&path, "merge-repair process authority")?
+        else {
+            continue;
+        };
+        let authority: serde_json::Value = serde_json::from_slice(&raw).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: path.clone(),
+                source,
+            })
+        })?;
+        let object = authority.as_object().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} is not an object",
+                path.display()
+            )))
+        })?;
+        let repair_id = required_merge_repair_string(object, "repair_id", &path)?;
+        let capability_id = required_merge_repair_string(object, "capability_id", &path)?;
+        let run_id = required_merge_repair_string(object, "run_id", &path)?;
+        if object
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(2)
+            || object
+                .get("root_artifact_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(job_id)
+            || merge_repair_authority_path(paths, job_id, &repair_id) != path
+            || Uuid::parse_str(&capability_id).is_err()
+            || Uuid::parse_str(&run_id).is_err()
+            || !matches!(
+                object.get("status").and_then(serde_json::Value::as_str),
+                Some("process_prepared" | "child_linked")
+            )
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} changed its exact Job, repair, capability, run, or lifecycle identity",
+                path.display()
+            ))));
+        }
+        let process: deadreckon_core::SupervisedProcessRecord =
+            serde_json::from_value(object.get("process").cloned().ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "merge-repair authority {} has no supervised process",
+                    path.display()
+                )))
+            })?)?;
+        validate_merge_repair_process_identity(&path, &capability_id, &process)?;
+
+        let (authority_index, authority_event) = history
+            .events()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, event)| {
+                event.kind == JobEventKind::RepairChildAuthorityChanged
+                    && event
+                        .detail
+                        .get("repair_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(repair_id.as_str())
+            })
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "merge-repair authority {} has no committed Job event",
+                    path.display()
+                )))
+            })?;
+        if authority_event.detail.get("authority") != Some(&authority) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} differs from its latest committed Job event",
+                path.display()
+            ))));
+        }
+        let owner_launch_id = process.owner_launch_id.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} has no outer launch identity",
+                path.display()
+            )))
+        })?;
+        let outer_launch_committed = history.events()[..=authority_index].iter().any(|event| {
+            event.kind == JobEventKind::ChildLinked
+                && event
+                    .detail
+                    .get("attempt")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(process.attempt))
+                && event
+                    .detail
+                    .get("launch_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(owner_launch_id)
+                && event
+                    .detail
+                    .get("root_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(job_id)
+        });
+        if !outer_launch_committed {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} is not bound to its exact outer Job launch",
+                path.display()
+            ))));
+        }
+        validate_merge_repair_delegation(
+            paths,
+            job_id,
+            &repair_id,
+            &run_id,
+            &capability_id,
+            authority_event.lease_epoch,
+            &process,
+        )?;
+        if matches!(
+            process.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Reused
+                | deadreckon_core::SupervisedProcessIdentity::Unverifiable
+        ) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "refusing Job cleanup because merge-repair authority {} has a conflicting or unverifiable process identity",
+                path.display()
+            ))));
+        }
+        authorities.push(MergeRepairProcessAuthority {
+            path,
+            raw,
+            job_id: job_id.to_string(),
+            repair_id,
+            capability_id,
+            process,
+        });
+    }
+    Ok(ValidatedMergeRepairProcessInventory { authorities })
+}
+
+fn required_merge_repair_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+) -> Result<String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} has no valid {field}",
+                path.display()
+            )))
+        })
+}
+
+fn validate_merge_repair_process_identity(
+    path: &Path,
+    capability_id: &str,
+    process: &deadreckon_core::SupervisedProcessRecord,
+) -> Result<()> {
+    let process_group_valid = {
+        #[cfg(unix)]
+        {
+            process.process.pgid == Some(process.process.pid)
+        }
+        #[cfg(not(unix))]
+        {
+            process.process.pgid.is_none()
+        }
+    };
+    if process.schema_version != deadreckon_core::SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
+        || process.process.pid == 0
+        || process.attempt == 0
+        || process.launch_id != capability_id
+        || process
+            .owner_launch_id
+            .as_deref()
+            .is_none_or(|launch_id| Uuid::parse_str(launch_id).is_err())
+        || process.release_token_sha256.trim().is_empty()
+        || process.boot_id.trim().is_empty()
+        || process.process_start_identity.trim().is_empty()
+        || process.phase != deadreckon_core::SupervisedProcessPhase::Running
+        || !process_group_valid
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair authority {} has an invalid exact process or launch identity",
+            path.display()
+        ))));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_merge_repair_delegation(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    repair_id: &str,
+    run_id: &str,
+    capability_id: &str,
+    authority_lease_epoch: u64,
+    process: &deadreckon_core::SupervisedProcessRecord,
+) -> Result<()> {
+    let pending = delegation_pending_path(paths, job_id, capability_id);
+    let consumed = delegation_consumed_path(paths, job_id, capability_id);
+    let pending_raw =
+        read_bounded_regular_control_file(&pending, "merge-repair pending delegated capability")?;
+    let consumed_raw =
+        read_bounded_regular_control_file(&consumed, "merge-repair consumed delegated capability")?;
+    if pending_raw.is_some() && consumed_raw.is_some() && pending_raw != consumed_raw {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair capability {capability_id} has conflicting pending and consumed authority"
+        ))));
+    }
+    let raw = consumed_raw.or(pending_raw).ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair capability {capability_id} has no protected delegation record"
+        )))
+    })?;
+    let record: DelegatedInvocation = serde_json::from_slice(&raw)?;
+    let action_matches = matches!(
+        &record.action,
+        DelegatedAction::MergeRepair {
+            root_artifact_id,
+            repair_id: delegated_repair_id,
+            run_id: delegated_run_id,
+            ..
+        } if root_artifact_id == job_id
+            && delegated_repair_id == repair_id
+            && delegated_run_id == run_id
+    );
+    if record.schema_version != 1
+        || record.job_id != job_id
+        || record.capability_id != capability_id
+        || record.authority.job_id != job_id
+        || record.authority.attempt != process.attempt
+        || record.authority.launch_id.as_str() != process.owner_launch_id.as_deref().unwrap_or("")
+        || record.authority.lease_epoch != authority_lease_epoch
+        || record.token_sha256 != process.release_token_sha256
+        || record.campaign_sub_launch_id.is_some()
+        || !action_matches
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair capability {capability_id} does not match its exact Job, launch, process, and repair authority"
+        ))));
+    }
+    Ok(())
+}
+
+pub(crate) fn terminate_validated_merge_repair_processes(
+    paths: &DeadreckonPaths,
+    inventory: ValidatedMergeRepairProcessInventory,
+    grace: std::time::Duration,
+) -> Result<()> {
+    for authority in inventory.authorities {
+        let current =
+            read_bounded_regular_control_file(&authority.path, "merge-repair process authority")?
+                .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "merge-repair authority {} disappeared before cleanup",
+                    authority.path.display()
+                )))
+            })?;
+        if current != authority.raw {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge-repair authority {} changed before cleanup",
+                authority.path.display()
+            ))));
+        }
+        match authority.process.identity() {
+            deadreckon_core::SupervisedProcessIdentity::Current
+            | deadreckon_core::SupervisedProcessIdentity::Exited => {
+                let outcome =
+                    commands::job::terminate_supervised_process(authority.process.process, grace);
+                if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "could not stop merge-repair process {} for {}: {reason}",
+                        authority.process.process.pid, authority.repair_id
+                    ))));
+                }
+            }
+            deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {}
+            deadreckon_core::SupervisedProcessIdentity::Reused
+            | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "merge-repair process identity {} became conflicting before cleanup",
+                    authority.process.process.pid
+                ))));
+            }
+        }
+        let pending = delegation_pending_path(paths, &authority.job_id, &authority.capability_id);
+        match fs::remove_file(&pending) {
+            Ok(()) => {
+                if let Some(parent) = pending.parent() {
+                    sync_delegation_directory(parent)?;
+                }
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CliError::Core(DeadreckonError::Io {
+                    path: pending,
+                    source,
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_merge_repair_processes_for_job(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    grace: std::time::Duration,
+) -> Result<()> {
+    let inventory = validate_merge_repair_process_inventory_for_job(paths, job_id)?;
+    terminate_validated_merge_repair_processes(paths, inventory, grace)
 }
 
 pub(crate) fn campaign_sub_launch_process_is_live(
@@ -4284,6 +4655,7 @@ async fn drive_plan(
     commands::orchestrate::orchestrate_command(commands::orchestrate::OrchestrateRunArgs {
         seed_pieces: plan.pieces,
         accepted_launch_plan: None,
+        deadline: job.policy.deadline,
         plan: PlanCommandArgs {
             goal: job.goal.clone(),
             n,
@@ -4352,6 +4724,7 @@ async fn resume_plan(
             plan_id: job.job_id.as_ref().to_string(),
             max_spend: Some(job.policy.max_spend_usd),
             max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
+            deadline: job.policy.deadline,
             sandbox: Some(authority.sandbox_requested.clone()),
             provider: driver.child_provider,
             child_provider: driver.child_provider_overrides,
@@ -4403,6 +4776,7 @@ async fn drive_campaign(
         model: driver.model,
         max_spend: Some(job.policy.max_spend_usd),
         max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
+        deadline: job.policy.deadline,
         sandbox: Some(authority.sandbox_requested),
         acceptance: Some(commands::job::job_acceptance_path(
             paths,
@@ -8285,6 +8659,223 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn spawned_merge_repair_fixture(
+        paths: &DeadreckonPaths,
+        job_id: &str,
+    ) -> (
+        std::process::Child,
+        Box<dyn deadreckon_core::ChildTerminator>,
+        serde_json::Value,
+        String,
+    ) {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "trap '' HUP; sleep 30 & wait"]);
+        let (child, terminator) = deadreckon_core::spawn_grouped(command).expect("grouped child");
+        let capability_id = Uuid::new_v4().to_string();
+        let outer_launch_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().simple().to_string();
+        let repair_id = deadreckon_core::flight::sha256_text("merge repair fixture");
+        let delegated_token_sha256 = "sha256:delegated-release".to_string();
+        let mut process = deadreckon_core::SupervisedProcessRecord::prepared(
+            deadreckon_core::SupervisedProcess {
+                pid: child.id(),
+                pgid: None,
+            },
+            capability_id.clone(),
+            2,
+            Some(outer_launch_id.clone()),
+            delegated_token_sha256.clone(),
+        )
+        .expect("process identity");
+        process.process.pgid = Some(child.id());
+        process.phase = deadreckon_core::SupervisedProcessPhase::Running;
+        let source = paths.home().join("merge-repair-source");
+        let proof_dir = paths.home().join("merge-repair-proof");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&proof_dir).expect("proof");
+        let delegation = DelegatedInvocation {
+            schema_version: 1,
+            capability_id: capability_id.clone(),
+            job_id: job_id.to_string(),
+            authority: commands::supervisor::GuardedDriverAuthority {
+                job_id: job_id.to_string(),
+                attempt: 2,
+                launch_id: outer_launch_id.clone(),
+                lease_epoch: 7,
+                release_token_sha256: "sha256:outer-release".to_string(),
+            },
+            action: DelegatedAction::MergeRepair {
+                root_artifact_id: job_id.to_string(),
+                repair_id: repair_id.clone(),
+                repair_round: 1,
+                run_id: run_id.clone(),
+                proof_dir: proof_dir.clone(),
+                repair_request_sha256: "sha256:request".to_string(),
+                repair_plan_sha256: "sha256:plan".to_string(),
+            },
+            immutable_plan_sha256: None,
+            immutable_campaign_sha256: None,
+            argv_sha256: "sha256:argv".to_string(),
+            cwd: source.clone(),
+            scope_root: proof_dir,
+            token_sha256: delegated_token_sha256,
+            campaign_sub_launch_id: None,
+            issued_at: Utc::now(),
+        };
+        let pending = delegation_pending_path(paths, job_id, &capability_id);
+        commands::job::write_json_synced(&pending, &delegation).expect("delegation authority");
+        let authority = json!({
+            "schema_version": 2,
+            "plan_id": job_id,
+            "root_artifact_id": job_id,
+            "repair_id": repair_id,
+            "repair_round": 1,
+            "repair_request_sha256": "sha256:request",
+            "repair_plan_sha256": "sha256:plan",
+            "capability_id": capability_id,
+            "run_id": run_id,
+            "status": "process_prepared",
+            "sandbox_requested": "auto",
+            "planner_spend_usd": 0.1,
+            "planner_wall_seconds": 1.0,
+            "source": source,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+            "process": process,
+            "process_prepared_at": Utc::now(),
+        });
+        let authority_path = merge_repair_authority_path(paths, job_id, &repair_id);
+        commands::job::write_json_synced(&authority_path, &authority)
+            .expect("merge repair authority");
+        let now = Utc::now();
+        let events = [
+            deadreckon_protocol::JobEvent {
+                schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                sequence: deadreckon_protocol::JobEventSequence::new(1).expect("sequence"),
+                event_id: Uuid::new_v4().to_string(),
+                causation_id: "merge-repair-test:outer".to_string(),
+                timestamp: now,
+                lease_epoch: 7,
+                kind: JobEventKind::ChildLinked,
+                detail: json!({
+                    "root_id": job_id,
+                    "attempt": 2,
+                    "launch_id": outer_launch_id,
+                }),
+            },
+            deadreckon_protocol::JobEvent {
+                schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                sequence: deadreckon_protocol::JobEventSequence::new(2).expect("sequence"),
+                event_id: Uuid::new_v4().to_string(),
+                causation_id: "merge-repair-test:authority".to_string(),
+                timestamp: now,
+                lease_epoch: 7,
+                kind: JobEventKind::RepairChildAuthorityChanged,
+                detail: json!({
+                    "repair_id": repair_id,
+                    "transition": "process_prepared",
+                    "run_id": run_id,
+                    "authority": authority,
+                }),
+            },
+        ];
+        let mut history = Vec::new();
+        for event in events {
+            history.extend(serde_json::to_vec(&event).expect("event JSON"));
+            history.push(b'\n');
+        }
+        fs::write(paths.job_events(job_id), history).expect("Job history");
+        (child, terminator, authority, capability_id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_cleanup_terminates_the_exact_event_and_delegation_bound_process() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-cleanup";
+        let (mut child, _terminator, _authority, capability_id) =
+            spawned_merge_repair_fixture(&paths, job_id);
+
+        reconcile_merge_repair_processes_for_job(&paths, job_id, std::time::Duration::ZERO)
+            .expect("reconcile merge-repair process");
+
+        child.wait().expect("reap merge-repair child");
+        assert!(
+            !delegation_pending_path(&paths, job_id, &capability_id).exists(),
+            "cleanup must revoke an unconsumed merge-repair capability"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_cleanup_fails_closed_for_foreign_or_malformed_authority() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-closed";
+        let (mut child, terminator, authority, _capability_id) =
+            spawned_merge_repair_fixture(&paths, job_id);
+        let directory = paths.job_dir(job_id).join(MERGE_REPAIR_AUTHORITY_DIR);
+        let foreign_path = directory.join("zz-foreign.json");
+        let mut foreign = authority.clone();
+        foreign["root_artifact_id"] = json!("another-job");
+        commands::job::write_json_synced(&foreign_path, &foreign).expect("foreign authority");
+
+        validate_merge_repair_process_inventory_for_job(&paths, job_id)
+            .expect_err("foreign authority must fail closed");
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "the complete inventory must validate before any process is signalled"
+        );
+
+        fs::remove_file(&foreign_path).expect("remove foreign fixture");
+        let malformed_path = directory.join("zz-malformed.json");
+        fs::write(&malformed_path, b"{}").expect("malformed authority");
+        validate_merge_repair_process_inventory_for_job(&paths, job_id)
+            .expect_err("malformed authority must fail closed");
+        assert!(
+            child.try_wait().expect("poll child").is_none(),
+            "malformed authority must not weaken containment"
+        );
+
+        let _ = terminator.terminate(std::time::Duration::ZERO);
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_cleanup_rejects_a_crossed_outer_launch_identity() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-crossed-launch";
+        let (mut child, terminator, authority, capability_id) =
+            spawned_merge_repair_fixture(&paths, job_id);
+        let pending = delegation_pending_path(&paths, job_id, &capability_id);
+        let mut delegation: DelegatedInvocation =
+            serde_json::from_slice(&fs::read(&pending).expect("delegation bytes"))
+                .expect("delegation");
+        delegation.authority.launch_id = Uuid::new_v4().to_string();
+        commands::job::replace_json_synced(&pending, &delegation).expect("crossed delegation");
+
+        let error = validate_merge_repair_process_inventory_for_job(&paths, job_id)
+            .expect_err("crossed launch must fail closed");
+        assert!(
+            error.to_string().contains("exact Job, launch, process"),
+            "{error}"
+        );
+        assert!(child.try_wait().expect("poll child").is_none());
+        assert_eq!(
+            authority["root_artifact_id"], job_id,
+            "the failure is the crossed launch, not a foreign Job fixture"
+        );
+
+        let _ = terminator.terminate(std::time::Duration::ZERO);
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn campaign_linked_recovery_terminates_residual_process_group_before_relaunch() {
         let temp = tempfile::TempDir::new().expect("temp");
@@ -8359,6 +8950,26 @@ mod tests {
             error.to_string().contains("conflicting or unverifiable"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn campaign_adoption_event_names_the_original_launch_and_fenced_new_owner() {
+        let mut launch = campaign_sub_launch_fixture(true, true);
+        launch.adopted = true;
+        launch.adopted_by_attempt = Some(3);
+        launch.adopted_by_lease_epoch = Some(8);
+        launch.adopted_at = Some(Utc::now());
+
+        let detail = campaign_sub_launch_detail(&launch);
+        assert_eq!(detail["attempt"], 2);
+        assert_eq!(detail["lease_epoch"], 7);
+        assert_eq!(detail["adopted"], true);
+        assert_eq!(detail["adopted_by_attempt"], 3);
+        assert_eq!(detail["adopted_by_lease_epoch"], 8);
+        assert!(detail["adopted_at"].as_str().is_some());
+        assert!(detail["launch_id"].as_str().is_some());
+        assert!(detail["outer_launch_id"].as_str().is_some());
+        assert!(detail["process_start_identity"].as_str().is_some());
     }
 
     #[test]

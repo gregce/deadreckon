@@ -659,6 +659,11 @@ UNPROVEN = (
         "status": "unproven",
         "reason": "requires a Linux host with an operational bubblewrap backend",
     },
+    {
+        "id": "live_docker_gate_attack",
+        "status": "unproven",
+        "reason": "requires distinct approved live hostile-worker and independent-judge routes plus a valid Docker-bound completion receipt",
+    },
 )
 
 

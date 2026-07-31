@@ -442,6 +442,7 @@ pub(crate) struct CampaignArgs {
     pub(crate) model: Option<String>,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) sandbox: Option<String>,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) preview: bool,
@@ -2111,12 +2112,7 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
             "durable campaign max spend must be a positive finite value".to_string(),
         )));
     }
-    if !max_wall_seconds.is_finite() || max_wall_seconds <= 0.0 {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "durable campaign wall cap must be a positive finite value".to_string(),
-        )));
-    }
-    let max_wall_seconds = max_wall_seconds as u64;
+    let max_wall_seconds = commands::job::checked_job_wall_seconds(max_wall_seconds)?;
     if !args.yes {
         if !io::stdin().is_terminal() {
             return Err(CliError::Core(deadreckon_core::user_error(
@@ -2125,10 +2121,14 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
             )));
         }
         println!(
-            "durable campaign\n  goal: {}\n  children: {}\n  spend cap: ${max_spend_usd:.2}\n  wall cap: {max_wall_seconds}s",
+            "durable campaign\n  goal: {}\n  children: {}\n  spend cap: ${max_spend_usd:.2}\n  wall cap: {max_wall_seconds}s\n  deadline: {}",
             goal,
             args.n
-                .map_or_else(|| "planner-selected".to_string(), |n| n.to_string())
+                .map_or_else(|| "planner-selected".to_string(), |n| n.to_string()),
+            args.deadline
+                .as_ref()
+                .map(DateTime::to_rfc3339)
+                .unwrap_or_else(|| "none".to_string())
         );
         print_campaign_contract_preview(&contract_preview);
         if !prompt::confirm("create and start this durable campaign Job?", true)? {
@@ -2144,6 +2144,7 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
     launch.n = args.n;
     launch.budget.ceiling_usd = Some(max_spend_usd);
     launch.budget.wall_seconds = Some(max_wall_seconds);
+    launch.budget.deadline = args.deadline;
     let mut signals = launch.signals.as_object().cloned().unwrap_or_default();
     signals.insert(
         "watchkeeper_campaign_budget".to_string(),
@@ -2196,6 +2197,7 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
         max_spend_usd,
         max_wall_seconds,
         max_attempts: 3,
+        deadline: args.deadline,
         sandbox_requested: sandbox,
         accepted_by,
     })?;
@@ -3862,6 +3864,7 @@ mod durable_campaign_launch_tests {
             model: None,
             max_spend: Some(2.0),
             max_wall_seconds: Some(120.0),
+            deadline: None,
             sandbox: Some("auto".to_string()),
             acceptance: None,
             preview: false,

@@ -2387,6 +2387,7 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         mode: CliStartMode::Auto,
         plan: None,
         max_spend: None,
+        deadline: None,
         provider: None,
         model: None,
         children: None,

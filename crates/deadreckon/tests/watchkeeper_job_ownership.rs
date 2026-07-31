@@ -27,6 +27,12 @@ use deadreckon_protocol::{Job, JobId, JobPolicy, JobSchemaVersion, JobShape, Sem
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
+use common::SupervisorServiceFixture;
+
 #[test]
 fn public_fork_and_merge_cannot_mutate_a_job_owned_plan() {
     let temp = TempDir::new().expect("tempdir");
@@ -750,8 +756,11 @@ fn trusted_supervisor_can_mutate_and_merge_its_job_owned_plan() {
     git(&workspace, &["config", "user.name", "Watchkeeper Test"]);
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let output = deadreckon(&paths, &workspace)
+    let output = service
+        .deadreckon()
+        .current_dir(&workspace)
         .args([
             "start",
             "Exercise the durable graph driver with two isolated smoke tasks.",
@@ -916,9 +925,22 @@ fn assert_root_mapping_recovery(shape: JobShape) {
     git(&workspace, &["config", "user.name", "Watchkeeper Test"]);
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
+    let graph_service = matches!(shape, JobShape::Graph).then(|| {
+        SupervisorServiceFixture::configured_with_env(
+            &paths,
+            &[(
+                "DEADRECKON_TEST_PLAN_FAILPOINT",
+                "after_root_plan_saved_before_driver_state",
+            )],
+        )
+    });
 
     let output = match shape {
-        JobShape::Graph => deadreckon(&paths, &workspace)
+        JobShape::Graph => graph_service
+            .as_ref()
+            .expect("Graph service fixture")
+            .deadreckon()
+            .current_dir(&workspace)
             .env(
                 "DEADRECKON_TEST_PLAN_FAILPOINT",
                 "after_root_plan_saved_before_driver_state",
@@ -1329,7 +1351,16 @@ fn assert_nested_plan_case(failpoint: Option<&str>, expect_recovery: bool) {
     )
     .expect("saved plan");
 
-    let mut start = deadreckon(&paths, &workspace);
+    let service = match failpoint {
+        Some(failpoint) => SupervisorServiceFixture::configured_with_env(
+            &paths,
+            &[("DEADRECKON_TEST_PLAN_FAILPOINT", failpoint)],
+        ),
+        None => SupervisorServiceFixture::configured(&paths),
+    };
+
+    let mut start = service.deadreckon();
+    start.current_dir(&workspace);
     start.args([
         "start",
         "--plan",

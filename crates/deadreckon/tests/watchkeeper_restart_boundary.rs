@@ -10,10 +10,15 @@ use deadreckon_protocol::{JobEventKind, JobId, JobOutcome};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod common;
+
+use common::SupervisorServiceFixture;
+
 const FAILPOINT_ENABLE_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINTS";
 const FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn every_pre_release_crash_relaunches_the_same_attempt_without_mutating_early() {
     for failpoint in [
         "after_launch_prepared",
@@ -27,18 +32,24 @@ fn every_pre_release_crash_relaunches_the_same_attempt_without_mutating_early() 
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn crash_after_private_release_adopts_or_recovers_without_duplicating_the_attempt() {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    let service = SupervisorServiceFixture::configured_with_env(
+        &paths,
+        &[
+            ("DEADRECKON_BOOT_ID", "watchkeeper-before-release-crash"),
+            (FAILPOINT_ENABLE_ENV, "1"),
+            (FAILPOINT_ENV, "after_child_released"),
+        ],
+    );
 
-    let launch = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
-        .env("DEADRECKON_BOOT_ID", "watchkeeper-before-release-crash")
-        .env(FAILPOINT_ENABLE_ENV, "1")
-        .env(FAILPOINT_ENV, "after_child_released")
         .args([
             "start",
             "Create the deterministic smoke project and satisfy its checks.",
@@ -125,13 +136,18 @@ fn assert_pre_release_crash_recovers(failpoint: &str) {
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    let service = SupervisorServiceFixture::configured_with_env(
+        &paths,
+        &[
+            ("DEADRECKON_BOOT_ID", "watchkeeper-before-crash"),
+            (FAILPOINT_ENABLE_ENV, "1"),
+            (FAILPOINT_ENV, failpoint),
+        ],
+    );
 
-    let launch = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
-        .env("DEADRECKON_BOOT_ID", "watchkeeper-before-crash")
-        .env(FAILPOINT_ENABLE_ENV, "1")
-        .env(FAILPOINT_ENV, failpoint)
         .args([
             "start",
             "Create the deterministic smoke project and satisfy its checks.",

@@ -135,10 +135,11 @@ pub use lock::{
 };
 pub use operator_capture::{
     OPERATOR_CAPTURE_BINDING_JSON, OPERATOR_CAPTURE_EVENTS_JSONL, OPERATOR_CAPTURE_RECEIPT_JSON,
-    OperatorCaptureEventDraft, OperatorCaptureHistory, append_operator_capture_event,
-    load_operator_capture_binding, operator_capture_binding_sha256, read_operator_capture_history,
-    seal_operator_capture_receipt, validate_operator_capture_history,
-    validate_operator_capture_receipt, write_operator_capture_binding,
+    OperatorCaptureEventDraft, OperatorCaptureHistory, OperatorCapturePassLineage,
+    append_operator_capture_event, load_operator_capture_binding, operator_capture_binding_sha256,
+    read_operator_capture_history, seal_operator_capture_receipt,
+    validate_operator_capture_history, validate_operator_capture_receipt,
+    write_operator_capture_binding,
 };
 pub use paths::{DeadreckonPaths, default_deadreckon_home, source_root};
 pub use plan::{

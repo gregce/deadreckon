@@ -109,7 +109,17 @@
         "required": ["id", "status", "reason"],
         "properties": {
           "id": {
-            "type": "string"
+            "enum": [
+              "live_provider_worker_kill",
+              "live_provider_supervisor_restart",
+              "live_provider_network_loss",
+              "machine_reboot",
+              "cross_provider_gate_attack",
+              "live_provider_parent_repair",
+              "live_campaign_interruption_recovery",
+              "linux_bubblewrap_gate_boundary",
+              "live_docker_gate_attack"
+            ]
           },
           "status": {
             "const": "unproven"

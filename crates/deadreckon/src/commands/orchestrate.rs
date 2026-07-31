@@ -32,6 +32,7 @@ pub(crate) struct OrchestrateRunArgs {
     /// An already accepted launch decision, used by reshape/replay callers
     /// that must preserve lineage and decision provenance in the durable Job.
     pub(crate) accepted_launch_plan: Option<commands::course::LaunchPlan>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) preview: bool,
     pub(crate) yes: bool,
     pub(crate) no_repair: bool,
@@ -45,6 +46,7 @@ pub(crate) struct BareOrchestrateArgs {
     pub(crate) goal_file: Option<PathBuf>,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) sandbox: Option<String>,
     pub(crate) preview: bool,
     pub(crate) init_git: bool,
@@ -67,6 +69,7 @@ pub(crate) fn orchestrate_request_from_cli(
         Some(OrchestrateCommand::Review(args)) => Ok(OrchestrateRunArgs {
             seed_pieces: Vec::new(),
             accepted_launch_plan: None,
+            deadline: args.deadline.or(bare.deadline),
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate review",
@@ -112,6 +115,7 @@ pub(crate) fn orchestrate_request_from_cli(
         Some(OrchestrateCommand::FullPlan(args)) => Ok(OrchestrateRunArgs {
             seed_pieces: Vec::new(),
             accepted_launch_plan: None,
+            deadline: args.deadline.or(bare.deadline),
             plan: PlanCommandArgs {
                 goal: resolve_required_goal_input(
                     "orchestrate full-plan",
@@ -164,6 +168,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
         goal_file,
         max_spend,
         max_wall_seconds,
+        deadline,
         sandbox,
         preview,
         init_git,
@@ -258,6 +263,7 @@ fn interactive_orchestrate_request(bare: BareOrchestrateArgs) -> Result<Orchestr
     Ok(OrchestrateRunArgs {
         seed_pieces: Vec::new(),
         accepted_launch_plan: None,
+        deadline,
         plan,
         preview,
         yes,
@@ -509,6 +515,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     let no_hints = args.plan.no_hints;
     let max_spend = args.plan.max_spend;
     let max_wall_seconds = args.plan.max_wall_seconds;
+    let deadline = args.deadline;
     let sandbox = args.plan.sandbox.clone();
     let plan = if args.preview {
         commands::plan::preview_orchestration_plan(args.plan, &args.seed_pieces).await?
@@ -530,6 +537,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
             &plan,
             max_spend,
             max_wall_seconds,
+            deadline.as_ref(),
             sandbox.as_deref(),
             args.no_repair,
         );
@@ -551,6 +559,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
         plan_id: plan_id.clone(),
         max_spend,
         max_wall_seconds,
+        deadline,
         sandbox,
         provider: None,
         child_provider: Vec::new(),
@@ -600,6 +609,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
 
 pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> Result<()> {
     let quiet = args.plan.quiet;
+    let deadline = args.deadline;
     let explicitly_approved = orchestration_approval_policy(args.yes, quiet, prompt::is_tty())?;
     if !commands::plan::prepare_orchestration_source(args.plan.init_git, quiet)? {
         return Ok(());
@@ -619,12 +629,12 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
     let defaults = config_defaults(&paths)?;
     let cwd = std::env::current_dir()?;
     let max_spend_usd = args.plan.max_spend.or(defaults.max_spend).unwrap_or(10.0);
-    let max_wall_seconds = args
-        .plan
-        .max_wall_seconds
-        .or(defaults.cli_max_wall_seconds)
-        .unwrap_or(36_000.0)
-        .max(1.0) as u64;
+    let max_wall_seconds = commands::job::checked_job_wall_seconds(
+        args.plan
+            .max_wall_seconds
+            .or(defaults.cli_max_wall_seconds)
+            .unwrap_or(36_000.0),
+    )?;
     let sandbox_requested = args
         .plan
         .sandbox
@@ -697,6 +707,7 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
     };
     launch_plan.budget.ceiling_usd = Some(max_spend_usd);
     launch_plan.budget.wall_seconds = Some(max_wall_seconds);
+    launch_plan.budget.deadline = deadline;
     if accepted_launch_plan.is_none() {
         launch_plan.accepted_by = Some(if explicitly_approved {
             "yes-flag-guardrail".to_string()
@@ -747,6 +758,7 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
         source,
         max_spend_usd,
         max_wall_seconds,
+        deadline,
         sandbox_requested,
         accepted_by,
     )?;
@@ -781,6 +793,7 @@ fn persist_direct_orchestration_job(
     source: commands::job::DurableSource,
     max_spend_usd: f64,
     max_wall_seconds: u64,
+    deadline: Option<DateTime<Utc>>,
     sandbox_requested: String,
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
 ) -> Result<deadreckon_protocol::Job> {
@@ -796,6 +809,7 @@ fn persist_direct_orchestration_job(
         max_spend_usd,
         max_wall_seconds,
         max_attempts: 3,
+        deadline,
         sandbox_requested,
         accepted_by,
     })
@@ -873,6 +887,7 @@ mod tests {
             model: None,
             source_init_git: false,
         };
+        let deadline = Utc::now() + chrono::TimeDelta::hours(2);
 
         let job = persist_direct_orchestration_job(
             &paths,
@@ -887,6 +902,7 @@ mod tests {
             },
             12.0,
             600,
+            Some(deadline),
             "auto".to_string(),
             deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
         )
@@ -902,6 +918,8 @@ mod tests {
         assert_eq!(job.shape, deadreckon_protocol::JobShape::Graph);
         assert_eq!(job.job_id.as_ref(), authority.run_id.as_ref());
         assert_eq!(job.policy.max_attempts, 3);
+        assert_eq!(job.policy.deadline, Some(deadline));
+        assert_eq!(frozen.budget.deadline, Some(deadline));
         assert_eq!(
             commands::graph_job::driver_spec(&frozen).expect("driver"),
             driver

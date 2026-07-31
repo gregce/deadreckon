@@ -17,7 +17,7 @@ pub use docker::{
     DOCKER_EXECUTION_RECORD_SCHEMA_VERSION, DOCKER_SIDECAR_CONTAINER_PROGRAM, DockerExecution,
     DockerExecutionRecord, DockerImage, DockerPlatform, inspect_docker_image,
     read_docker_execution_record, reconcile_docker_execution, reconcile_docker_execution_record,
-    write_docker_execution_record,
+    reconcile_docker_execution_record_for_job, write_docker_execution_record,
 };
 pub use doctor::{BackendAvailability, doctor};
 pub use policy::{ProtectedPathPolicy, ToolSandboxPolicy};

@@ -44,7 +44,35 @@ EXPECTED_CLAIM_IDS = {
     "live_provider_parent_repair",
     "live_campaign_interruption_recovery",
     "linux_bubblewrap_gate_boundary",
-    "docker_gate_boundary",
+    "live_docker_gate_attack",
+}
+ALLOWED_JOB_SHAPE_DECLARATIONS = {
+    "single",
+    "graph",
+    "campaign",
+    "graph_or_campaign",
+    "single_or_graph_or_campaign",
+}
+VALID_TERMINAL_RESULTS = {
+    "verified": {"verified"},
+    "needs_review": {
+        "semantic_revise",
+        "semantic_uncertain",
+        "semantic_unavailable",
+    },
+    "blocked": {"operator_input_required", "lost_containment"},
+    "budget_exhausted": {"spend_cap", "wall_cap"},
+    "deadline_reached": {"deadline"},
+    "retry_exhausted": {"attempt_limit"},
+    "cancelled": {"cancel_requested"},
+    "failed": {
+        "transient_provider",
+        "fatal_provider",
+        "fatal_gate",
+        "lost_containment",
+        "corrupt_history",
+        "legacy_unknown",
+    },
 }
 FORMAT_SUFFIX = {"json": ".json", "jsonl": ".jsonl", "text": ".txt"}
 MEDIA_TYPE = {
@@ -76,11 +104,13 @@ ALLOWED_EVIDENCE_SOURCES = {
     "campaign-events",
     "active-plan",
     "active-plan-events",
+    "network-connectivity-observation",
     "unavailable-objective",
 }
 TRUSTED_INTERVENTION_SOURCES = {
     "job-intervention",
     "campaign-intervention",
+    "network-connectivity-observation",
     "sandbox-boundary-observation",
 }
 RECORDER_COMMAND = "python3 examples/watchkeeper-dogfood/live-trial.py"
@@ -345,6 +375,39 @@ def normalized_helper_name(value: Any) -> str:
     return str(value).replace("_", "-").lower()
 
 
+def validate_trial_job_declaration(trial: dict[str, Any]) -> None:
+    job = trial.get("job")
+    if not isinstance(job, dict):
+        raise TrialError(f"trial {trial['id']} has no Job declaration")
+    shape = job.get("shape")
+    if shape not in ALLOWED_JOB_SHAPE_DECLARATIONS:
+        raise TrialError(f"trial {trial['id']} has an unsupported Job shape declaration")
+    allowed = job.get("allowed_terminal_results")
+    if not isinstance(allowed, list) or not allowed:
+        raise TrialError(f"trial {trial['id']} has no allowed terminal results")
+    pairs: set[tuple[str, str]] = set()
+    for declaration in allowed:
+        if not isinstance(declaration, dict) or set(declaration) != {
+            "outcome",
+            "stop_reason",
+        }:
+            raise TrialError(
+                f"trial {trial['id']} terminal result must contain exact outcome and stop_reason"
+            )
+        outcome = declaration.get("outcome")
+        stop_reason = declaration.get("stop_reason")
+        if (
+            not isinstance(outcome, str)
+            or not isinstance(stop_reason, str)
+            or stop_reason not in VALID_TERMINAL_RESULTS.get(outcome, set())
+            or (outcome, stop_reason) in pairs
+        ):
+            raise TrialError(
+                f"trial {trial['id']} has an invalid or duplicate terminal result"
+            )
+        pairs.add((outcome, stop_reason))
+
+
 def load_manifest(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
     manifest = load_json(path)
     trials = manifest.get("trials")
@@ -358,6 +421,7 @@ def load_manifest(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]
         trial_id = trial["id"]
         if trial_id in indexed:
             raise TrialError(f"duplicate live trial id: {trial_id}")
+        validate_trial_job_declaration(trial)
         indexed[trial_id] = trial
     if set(claim_ids) != EXPECTED_CLAIM_IDS or set(indexed) != EXPECTED_CLAIM_IDS:
         raise TrialError("manifest must cover exactly the nine current live claim ids")
@@ -615,11 +679,12 @@ def command_prepare(
         ).rstrip()
 
     replay = {
-        "schema_version": 2,
+        "schema_version": 3,
         "trial_id": trial_id,
         "source_revision": revision,
         "capture_mode": state["capture_mode"],
         "operator_intervention_only": True,
+        "allowed_terminal_results": list(trial["job"]["allowed_terminal_results"]),
         "required_evidence": [
             declaration["name"]
             for declaration in declarations.values()
@@ -1397,6 +1462,13 @@ def required_nonnegative_number(value: Any, pointer: str) -> float:
     return float(observed)
 
 
+def required_positive_integer(value: Any, pointer: str) -> int:
+    observed = json_pointer(value, pointer)
+    if not isinstance(observed, int) or isinstance(observed, bool) or observed <= 0:
+        raise TrialError(f"{pointer} must be a positive integer")
+    return observed
+
+
 def event_detail_matches(event: dict[str, Any], expected: dict[str, Any]) -> bool:
     detail = event.get("detail")
     return isinstance(detail, dict) and all(detail.get(key) == value for key, value in expected.items())
@@ -1421,6 +1493,242 @@ def supervised_identity(value: Any) -> dict[str, Any]:
         raise TrialError("supervised child owner_launch_id must be null or non-empty")
     identity["owner_launch_id"] = owner_launch_id
     return identity
+
+
+def parsed_timestamp(value: Any, label: str) -> datetime.datetime:
+    if not isinstance(value, str):
+        raise TrialError(f"{label} timestamp must be a string")
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise TrialError(f"{label} timestamp is malformed") from error
+    if parsed.tzinfo is None:
+        raise TrialError(f"{label} timestamp must include an offset")
+    return parsed
+
+
+def network_observation_identity(
+    value: Any,
+    state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(value, dict):
+        raise TrialError("network observation must be one JSON object")
+    if (
+        value.get("schema_version") != 2
+        or value.get("job_id") != state.get("trusted_capture", {}).get("job_id")
+        or value.get("session_id") != state.get("session_id")
+        or value.get("trial_id") != "live_provider_network_loss"
+        or value.get("provider_role") != "worker"
+        or not isinstance(value.get("provider_route"), str)
+        or not value["provider_route"]
+        or not isinstance(value.get("endpoint"), str)
+        or not value["endpoint"].startswith(("http://", "https://"))
+        or not isinstance(value.get("job_last_sequence"), int)
+        or isinstance(value.get("job_last_sequence"), bool)
+        or value["job_last_sequence"] <= 0
+    ):
+        raise TrialError("network observation is malformed or foreign")
+    declared = state.get("trusted_capture", {}).get("provider_routes", [])
+    if declared.count(f"worker={value['provider_route']}") != 1:
+        raise TrialError("network observation route is not the one declared worker route")
+    attempt = value.get("attempt")
+    expected_attempt_fields = {
+        "run_id",
+        "attempt",
+        "lease_epoch",
+        "launch_id",
+        "pid",
+        "boot_id",
+        "process_start_identity",
+    }
+    if not isinstance(attempt, dict) or set(attempt) != expected_attempt_fields:
+        raise TrialError("network observation attempt identity is malformed")
+    for field in ("attempt", "lease_epoch", "pid"):
+        if (
+            not isinstance(attempt[field], int)
+            or isinstance(attempt[field], bool)
+            or attempt[field] <= 0
+        ):
+            raise TrialError(f"network attempt {field} must be positive")
+    for field in ("run_id", "launch_id", "boot_id", "process_start_identity"):
+        if not isinstance(attempt[field], str) or not attempt[field].strip():
+            raise TrialError(f"network attempt {field} must be non-empty")
+    parsed_timestamp(value.get("observed_at"), "network observation")
+    return value, attempt
+
+
+def network_connectivity_transition_facts(
+    trial_dir: Path,
+    state: dict[str, Any],
+    declaration: dict[str, Any],
+    allowed_terminal_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    before, before_attempt = network_observation_identity(
+        load_captured_value(trial_dir, state, str(declaration["before_evidence"])),
+        state,
+    )
+    after, after_attempt = network_observation_identity(
+        load_captured_value(trial_dir, state, str(declaration["after_evidence"])),
+        state,
+    )
+    intervention_path = trial_dir / RAW_DIR / "intervention.json"
+    intervention_bytes = stable_regular_bytes(
+        intervention_path, "trusted network intervention"
+    )
+    if state.get("intervention", {}).get("detail_sha256") != digest_bytes(
+        intervention_bytes
+    ):
+        raise TrialError("network intervention digest is not bound to protected bytes")
+    offline, offline_attempt = network_observation_identity(
+        json.loads(intervention_bytes), state
+    )
+    if (
+        before.get("phase") != "before"
+        or before.get("connectivity") != "reachable"
+        or before.get("error_kind") is not None
+        or offline.get("phase") != "intervention"
+        or offline.get("connectivity") != "unreachable"
+        or offline.get("error_kind") != "endpoint_unreachable"
+        or after.get("phase") != "after"
+        or after.get("connectivity") != "reachable"
+        or after.get("error_kind") is not None
+        or before_attempt != offline_attempt
+        or offline_attempt != after_attempt
+        or (
+            before.get("provider_role"),
+            before.get("provider_route"),
+            before.get("endpoint"),
+        )
+        != (
+            offline.get("provider_role"),
+            offline.get("provider_route"),
+            offline.get("endpoint"),
+        )
+        or (
+            offline.get("provider_role"),
+            offline.get("provider_route"),
+            offline.get("endpoint"),
+        )
+        != (
+            after.get("provider_role"),
+            after.get("provider_route"),
+            after.get("endpoint"),
+        )
+        or not (
+            parsed_timestamp(before["observed_at"], "reachable-before")
+            < parsed_timestamp(offline["observed_at"], "unreachable")
+            < parsed_timestamp(after["observed_at"], "reachable-after")
+        )
+        or not (
+            before["job_last_sequence"]
+            <= offline["job_last_sequence"]
+            <= after["job_last_sequence"]
+        )
+    ):
+        raise TrialError("network observations do not form one bound transition")
+    full, suffix = event_suffix(
+        trial_dir,
+        state,
+        str(declaration["events_before"]),
+        str(declaration["events_after"]),
+    )
+    before_events = full[: len(full) - len(suffix)]
+    if (
+        not before_events
+        or before_events[-1].get("sequence") != before["job_last_sequence"]
+        or not full
+        or full[-1].get("sequence") != after["job_last_sequence"]
+    ):
+        raise TrialError("network event histories do not match observation boundaries")
+    matching_links = [
+        event
+        for event in before_events
+        if event.get("kind") == "child_linked"
+        and event.get("lease_epoch") == before_attempt["lease_epoch"]
+        and event_detail_matches(
+            event,
+            {
+                "run_id": before_attempt["run_id"],
+                "attempt": before_attempt["attempt"],
+                "launch_id": before_attempt["launch_id"],
+                "pid": before_attempt["pid"],
+                "boot_id": before_attempt["boot_id"],
+                "process_start_identity": before_attempt["process_start_identity"],
+            },
+        )
+    ]
+    offline_at = parsed_timestamp(offline["observed_at"], "unreachable")
+    matching_stops = [
+        event
+        for event in suffix
+        if event.get("kind") == "attempt_stopped"
+        and event.get("lease_epoch") == offline_attempt["lease_epoch"]
+        and isinstance(event.get("sequence"), int)
+        and event["sequence"] > offline["job_last_sequence"]
+        and parsed_timestamp(event.get("timestamp"), "attempt_stopped") > offline_at
+        and event_detail_matches(
+            event, {"attempt": offline_attempt["attempt"]}
+        )
+    ]
+    if len(matching_links) != 1 or len(matching_stops) != 1:
+        raise TrialError("network stop is not bound to the exact captured ChildLinked attempt")
+    stopped_sequence = matching_stops[0]["sequence"]
+    retries = [
+        event
+        for event in suffix
+        if event.get("kind") == "retry_scheduled"
+        and isinstance(event.get("sequence"), int)
+        and event["sequence"] > stopped_sequence
+        and event_detail_matches(
+            event, {"after_attempt": offline_attempt["attempt"]}
+        )
+    ]
+    terminal_allowed = False
+    if not retries:
+        view = load_captured_value(
+            trial_dir, state, str(declaration["job_evidence"])
+        )
+        outcome = json_pointer(view, "/job/projection/outcome")
+        stop_reason = json_pointer(view, "/job/projection/stop_reason")
+        phase = json_pointer(view, "/job/projection/phase")
+        allowed = {
+            (item.get("outcome"), item.get("stop_reason"))
+            for item in allowed_terminal_results
+            if isinstance(item, dict)
+        }
+        terminal_kind = {
+            "verified": "verified",
+            "needs_review": "needs_review",
+            "blocked": "blocked",
+            "budget_exhausted": "budget_exhausted",
+            "deadline_reached": "deadline_reached",
+            "retry_exhausted": "failed",
+            "cancelled": "cancelled",
+            "failed": "failed",
+        }.get(outcome)
+        terminal_allowed = (
+            phase == "terminal"
+            and (outcome, stop_reason) in allowed
+            and full[-1].get("kind") == terminal_kind
+            and isinstance(full[-1].get("sequence"), int)
+            and full[-1]["sequence"] > stopped_sequence
+        )
+    if len(retries) > 1:
+        raise TrialError("captured network attempt has duplicate retry facts")
+    if not retries and not terminal_allowed:
+        raise TrialError("captured network stop has no exact retry or approved terminal result")
+    return {
+        "provider_role": before["provider_role"],
+        "provider_route": before["provider_route"],
+        "endpoint": before["endpoint"],
+        "attempt": before_attempt["attempt"],
+        "lease_epoch": before_attempt["lease_epoch"],
+        "launch_id": before_attempt["launch_id"],
+        "matching_child_links": len(matching_links),
+        "matching_attempt_stops": len(matching_stops),
+        "matching_retries": len(retries),
+        "approved_terminal": terminal_allowed,
+    }
 
 
 def job_id_from_view(value: Any) -> str:
@@ -1579,6 +1887,291 @@ def preserved_parent_work(before: Any, after: Any) -> dict[str, Any]:
     }
 
 
+def campaign_recovery_facts(
+    trial_dir: Path,
+    state: dict[str, Any],
+    declaration: dict[str, Any],
+) -> dict[str, Any]:
+    campaign_before = load_captured_value(
+        trial_dir, state, str(declaration["campaign_before"])
+    )
+    campaign_after = load_captured_value(
+        trial_dir, state, str(declaration["campaign_after"])
+    )
+    plan_before = load_captured_value(
+        trial_dir, state, str(declaration["plan_before"])
+    )
+    plan_after = load_captured_value(
+        trial_dir, state, str(declaration["plan_after"])
+    )
+    view = load_captured_value(
+        trial_dir, state, str(declaration["job_evidence"])
+    )
+    lease_before = load_captured_value(
+        trial_dir, state, str(declaration["lease_before"])
+    )
+    lease_after = load_captured_value(
+        trial_dir, state, str(declaration["lease_after"])
+    )
+    campaign_events, suffix = event_suffix(
+        trial_dir,
+        state,
+        str(declaration["events_before"]),
+        str(declaration["events_after"]),
+    )
+    before_events = campaign_events[: len(campaign_events) - len(suffix)]
+    plan_events, plan_suffix = event_suffix(
+        trial_dir,
+        state,
+        str(declaration["plan_events_before"]),
+        str(declaration["plan_events_after"]),
+    )
+
+    campaign_observed = preserved_parent_work(campaign_before, campaign_after)
+    plan_observed = preserved_parent_work(plan_before, plan_after)
+    job_id = job_id_from_view(view)
+    plan_id = required_string(plan_before, "/plan_id")
+    if (
+        required_string(campaign_before, "/campaign_id") != job_id
+        or required_string(campaign_after, "/campaign_id") != job_id
+        or required_string(plan_after, "/plan_id") != plan_id
+        or required_string(plan_before, "/owner_job_id") != job_id
+        or required_string(plan_after, "/owner_job_id") != job_id
+    ):
+        raise TrialError("Campaign or active Plan is not owned by the protected Job")
+    if any(
+        not isinstance(item, dict) or item.get("plan_id") != plan_id
+        for item in plan_events
+    ):
+        raise TrialError("active Plan history contains a foreign Plan event")
+
+    sub_goals = campaign_before.get("sub_goals")
+    if not isinstance(sub_goals, list):
+        raise TrialError("Campaign sub_goals must be an array")
+    active_subs = [
+        item
+        for item in sub_goals
+        if isinstance(item, dict)
+        and item.get("status") == "running"
+        and item.get("sub_plan_id") == plan_id
+        and isinstance(item.get("sub_id"), str)
+        and item["sub_id"]
+    ]
+    if len(active_subs) != 1:
+        raise TrialError("Campaign must have one protected running sub-Plan")
+    sub_id = active_subs[0]["sub_id"]
+
+    def target(event: Any, kind: str) -> bool:
+        return bool(
+            isinstance(event, dict)
+            and event.get("kind") == kind
+            and isinstance(event.get("detail"), dict)
+            and event["detail"].get("sub_id") == sub_id
+            and event["detail"].get("plan_id") == plan_id
+        )
+
+    logical_prepared = [
+        index
+        for index, item in enumerate(before_events)
+        if target(item, "sub_launch_prepared")
+    ]
+    logical_launched = [
+        index
+        for index, item in enumerate(before_events)
+        if target(item, "sub_launched")
+    ]
+    process_kinds = (
+        "sub_process_launch_prepared",
+        "sub_process_released",
+        "sub_process_linked",
+    )
+    process_matches = {
+        kind: [
+            (index, item)
+            for index, item in enumerate(before_events)
+            if target(item, kind)
+        ]
+        for kind in process_kinds
+    }
+    if (
+        len(logical_prepared) != 1
+        or len(logical_launched) != 1
+        or any(len(items) != 1 for items in process_matches.values())
+    ):
+        raise TrialError("protected sub-Plan has no single durable launch authority chain")
+    prepared_index, prepared_event = process_matches["sub_process_launch_prepared"][0]
+    released_index, released_event = process_matches["sub_process_released"][0]
+    linked_index, linked_event = process_matches["sub_process_linked"][0]
+    if not (
+        logical_prepared[0]
+        < logical_launched[0]
+        < prepared_index
+        < released_index
+        < linked_index
+    ):
+        raise TrialError("protected sub-Plan launch authority is out of order")
+
+    prepared_detail = prepared_event["detail"]
+    string_fields = (
+        "parent_job_id",
+        "sub_id",
+        "plan_id",
+        "outer_launch_id",
+        "launch_id",
+        "release_token_sha256",
+        "boot_id",
+        "process_start_identity",
+    )
+    identity = {
+        field: required_string(prepared_detail, f"/{field}")
+        for field in string_fields
+    }
+    identity.update(
+        {
+            "attempt": required_positive_integer(prepared_detail, "/attempt"),
+            "lease_epoch": required_positive_integer(prepared_detail, "/lease_epoch"),
+            "pid": required_positive_integer(prepared_detail, "/pid"),
+            "process_group": prepared_detail.get("process_group"),
+        }
+    )
+    if identity["process_group"] is not None and (
+        not isinstance(identity["process_group"], int)
+        or isinstance(identity["process_group"], bool)
+        or identity["process_group"] <= 0
+    ):
+        raise TrialError("Campaign launch process_group must be null or positive")
+    if identity["parent_job_id"] != job_id:
+        raise TrialError("Campaign launch authority belongs to a foreign parent Job")
+    for event_item, released, linked in (
+        (prepared_event, False, False),
+        (released_event, True, False),
+        (linked_event, True, True),
+    ):
+        detail = event_item["detail"]
+        if (
+            not event_detail_matches(event_item, identity)
+            or detail.get("released") is not released
+            or detail.get("linked") is not linked
+            or detail.get("adopted") is not False
+            or detail.get("adopted_by_attempt") is not None
+            or detail.get("adopted_by_lease_epoch") is not None
+            or detail.get("adopted_at") is not None
+        ):
+            raise TrialError("Campaign launch authority identity changed before adoption")
+
+    before_epoch = required_positive_integer(lease_before, "/epoch")
+    after_epoch = required_positive_integer(lease_after, "/epoch")
+    before_owner = required_string(lease_before, "/owner_id")
+    after_owner = required_string(lease_after, "/owner_id")
+    if (
+        required_string(lease_before, "/job_id") != job_id
+        or required_string(lease_after, "/job_id") != job_id
+        or before_owner == after_owner
+        or after_epoch <= before_epoch
+        or identity["lease_epoch"] != before_epoch
+    ):
+        raise TrialError("Campaign recovery is not fenced by one newer Job lease")
+
+    adoptions = [item for item in suffix if target(item, "sub_process_adopted")]
+    if len(adoptions) != 1:
+        raise TrialError("Campaign recovery must append exactly one process adoption")
+    adoption = adoptions[0]
+    adoption_detail = adoption["detail"]
+    if (
+        not event_detail_matches(adoption, identity)
+        or adoption_detail.get("released") is not True
+        or adoption_detail.get("linked") is not True
+        or adoption_detail.get("adopted") is not True
+        or required_positive_integer(adoption_detail, "/adopted_by_attempt")
+        < identity["attempt"]
+        or required_positive_integer(adoption_detail, "/adopted_by_lease_epoch")
+        != after_epoch
+        or after_epoch <= identity["lease_epoch"]
+        or not isinstance(adoption_detail.get("adopted_at"), str)
+        or not adoption_detail["adopted_at"]
+    ):
+        raise TrialError("Campaign adoption is not the same launch under the new fenced owner")
+
+    forbidden_relaunch_kinds = {
+        "sub_launch_prepared",
+        "sub_launched",
+        "sub_process_launch_prepared",
+        "sub_process_relaunch_safe",
+        "sub_process_empty_dispatch_relaunch_safe",
+    }
+    relaunched = [
+        item
+        for item in suffix
+        if isinstance(item, dict)
+        and item.get("kind") in forbidden_relaunch_kinds
+        and isinstance(item.get("detail"), dict)
+        and item["detail"].get("sub_id") == sub_id
+        and item["detail"].get("plan_id") == plan_id
+    ]
+    if relaunched:
+        raise TrialError("Campaign recovery appended a second launch fact")
+
+    adoption_index = suffix.index(adoption)
+    recoveries = [
+        (index, item)
+        for index, item in enumerate(suffix)
+        if target(item, "sub_recovered")
+    ]
+    if len(recoveries) != 1 or recoveries[0][0] <= adoption_index:
+        raise TrialError("Campaign adoption has no later recovery of the same sub-Plan")
+
+    intervention_path = trial_dir / RAW_DIR / "intervention.json"
+    intervention_bytes = stable_regular_bytes(
+        intervention_path, "trusted Campaign intervention"
+    )
+    if state.get("intervention", {}).get("detail_sha256") != digest_bytes(
+        intervention_bytes
+    ):
+        raise TrialError("Campaign intervention digest is not bound to protected bytes")
+    if json.loads(intervention_bytes) != adoption:
+        raise TrialError("Campaign intervention is not the exact adoption event")
+
+    completed_task_ids = {
+        item.get("task_id")
+        for item in plan_before.get("tasks", [])
+        if isinstance(item, dict)
+        and item.get("status") in {"done", "completed", "merged"}
+        and isinstance(item.get("task_id"), str)
+    }
+    reopened_completed = 0
+    for item in plan_suffix:
+        nested = item.get("event") if isinstance(item, dict) else None
+        if not isinstance(nested, dict):
+            raise TrialError("Plan event history has a malformed nested event")
+        if (
+            nested.get("kind")
+            in {"task_started", "task_retrying", "task_run_discovered"}
+            and nested.get("task_id") in completed_task_ids
+        ):
+            reopened_completed += 1
+    if reopened_completed:
+        raise TrialError("Campaign recovery reopened completed Plan work")
+
+    return {
+        "campaign": campaign_observed,
+        "plan": plan_observed,
+        "job_id": job_id,
+        "sub_id": sub_id,
+        "plan_id": plan_id,
+        "original_attempt": identity["attempt"],
+        "original_lease_epoch": identity["lease_epoch"],
+        "adopting_attempt": adoption_detail["adopted_by_attempt"],
+        "adopting_lease_epoch": adoption_detail["adopted_by_lease_epoch"],
+        "outer_launch_id": identity["outer_launch_id"],
+        "launch_id": identity["launch_id"],
+        "pid": identity["pid"],
+        "matching_adoptions": len(adoptions),
+        "matching_recoveries": len(recoveries),
+        "new_launch_facts": len(relaunched),
+        "completed_plan_tasks_reopened": reopened_completed,
+    }
+
+
 def terminal_projection(trial_dir: Path, state: dict[str, Any], name: str) -> bool:
     value = load_captured_value(trial_dir, state, name)
     try:
@@ -1609,6 +2202,7 @@ def evaluate_oracle(
     declaration: dict[str, Any],
     *,
     sandbox_boundary_probe_sha256: str | None = None,
+    allowed_terminal_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     oracle_type = declaration.get("type")
     try:
@@ -2057,7 +2651,7 @@ def evaluate_oracle(
             checkpoint = service.get("checkpoint")
             current_boot = service.get("current_boot_id")
             authoritative = (
-                service.get("schema_version") == 1
+                service.get("schema_version") == 2
                 and service.get("installed") == "current"
                 and service.get("test_override") is False
                 and service.get("boot_identity_source")
@@ -2065,6 +2659,7 @@ def evaluate_oracle(
                 and isinstance(current_boot, str)
                 and bool(current_boot)
                 and isinstance(checkpoint, dict)
+                and checkpoint.get("schema_version") == 2
                 and checkpoint.get("boot_id") == current_boot
                 and isinstance(checkpoint.get("generation"), int)
                 and not isinstance(checkpoint.get("generation"), bool)
@@ -2074,12 +2669,14 @@ def evaluate_oracle(
                 and checkpoint.get("pid", 0) > 0
                 and isinstance(checkpoint.get("instance_id"), str)
                 and bool(checkpoint.get("instance_id"))
+                and isinstance(checkpoint.get("process_start_identity"), str)
+                and bool(checkpoint.get("process_start_identity"))
             )
             active = (
                 manager == "launchd"
                 and service.get("loaded") is True
                 and service.get("active") is None
-                and service.get("enabled") is None
+                and service.get("enabled") == "enabled"
             ) or (
                 manager == "systemd"
                 and service.get("loaded") is None
@@ -2219,118 +2816,12 @@ def evaluate_oracle(
                 },
             )
         if oracle_type == "campaign_recovery_bound":
-            campaign_before = load_captured_value(
-                trial_dir, state, str(declaration["campaign_before"])
-            )
-            campaign_after = load_captured_value(
-                trial_dir, state, str(declaration["campaign_after"])
-            )
-            plan_before = load_captured_value(
-                trial_dir, state, str(declaration["plan_before"])
-            )
-            plan_after = load_captured_value(
-                trial_dir, state, str(declaration["plan_after"])
-            )
-            _, suffix = event_suffix(
-                trial_dir,
-                state,
-                str(declaration["events_before"]),
-                str(declaration["events_after"]),
-            )
-            plan_events, plan_suffix = event_suffix(
-                trial_dir,
-                state,
-                str(declaration["plan_events_before"]),
-                str(declaration["plan_events_after"]),
-            )
-            campaign_observed = preserved_parent_work(campaign_before, campaign_after)
-            plan_observed = preserved_parent_work(plan_before, plan_after)
-            plan_id = plan_before.get("plan_id")
-            campaign_plan_ids = {
-                item.get("sub_plan_id")
-                for item in campaign_before.get("sub_goals", [])
-                if isinstance(item, dict)
-            }
-            if not isinstance(plan_id, str) or plan_id not in campaign_plan_ids:
-                raise TrialError("active Plan is not linked by the Campaign artifact")
-            if any(
-                not isinstance(item, dict) or item.get("plan_id") != plan_id
-                for item in plan_events
-            ):
-                raise TrialError("active Plan history contains a foreign Plan event")
-            active_subs = [
-                item
-                for item in campaign_before.get("sub_goals", [])
-                if isinstance(item, dict)
-                and item.get("status") == "running"
-                and item.get("sub_plan_id") == plan_id
-            ]
-            recovered = [
-                item
-                for item in suffix
-                if item.get("kind") == "sub_recovered"
-                and isinstance(item.get("detail"), dict)
-                and any(
-                    item["detail"].get("sub_id") == sub.get("sub_id")
-                    and item["detail"].get("plan_id") == plan_id
-                    for sub in active_subs
-                )
-            ]
-            after_events = load_captured_value(
-                trial_dir, state, str(declaration["events_after"])
-            )
-            seen: set[tuple[str, Any, Any]] = set()
-            duplicates = 0
-            for event in after_events:
-                if event.get("kind") not in {"sub_launch_prepared", "sub_launched"}:
-                    continue
-                detail = event.get("detail")
-                if not isinstance(detail, dict):
-                    raise TrialError("Campaign launch event has malformed detail")
-                key = (event["kind"], detail.get("sub_id"), detail.get("plan_id"))
-                if None in key or key in seen:
-                    duplicates += 1
-                seen.add(key)
-            completed_task_ids = {
-                item.get("task_id")
-                for item in plan_before.get("tasks", [])
-                if isinstance(item, dict)
-                and item.get("status") in {"done", "completed", "merged"}
-                and isinstance(item.get("task_id"), str)
-            }
-            reopened_completed = 0
-            for item in plan_suffix:
-                nested = item.get("event") if isinstance(item, dict) else None
-                if not isinstance(nested, dict):
-                    raise TrialError("Plan event history has a malformed nested event")
-                if (
-                    nested.get("kind")
-                    in {"task_started", "task_retrying", "task_run_discovered"}
-                    and nested.get("task_id") in completed_task_ids
-                ):
-                    reopened_completed += 1
-            passed = bool(
-                duplicates == 0
-                and reopened_completed == 0
-                and active_subs
-                and recovered
-            )
+            facts = campaign_recovery_facts(trial_dir, state, declaration)
             return oracle_result(
                 declaration,
-                "passed" if passed else "failed",
-                "real Campaign and Plan artifacts retain identities without duplicate launch facts"
-                if passed
-                else "Campaign artifacts or events contain duplicate persisted launch facts",
-                {
-                    "campaign": campaign_observed,
-                    "plan": plan_observed,
-                    "suffix_events": len(suffix),
-                    "duplicate_launch_facts": duplicates,
-                    "plan_suffix_events": len(plan_suffix),
-                    "completed_plan_tasks_reopened": reopened_completed,
-                    "active_subplans": len(active_subs),
-                    "matching_recoveries": len(recovered),
-                },
+                "passed",
+                "the replacement owner adopted one exact persisted Campaign launch and recovered its Plan without relaunching completed work",
+                facts,
             )
         if oracle_type == "sandbox_boundary_observation_bound":
             try:
@@ -2353,6 +2844,29 @@ def evaluate_oracle(
                 "the authenticated controller probe is bound to the exact Job, attempt, backend, evaluator, receipt, and denial facts"
                 if passed
                 else "the sandbox boundary observation contradicted at least one required binding or denial fact",
+                facts,
+            )
+        if oracle_type == "network_connectivity_transition_bound":
+            if allowed_terminal_results is None:
+                raise TrialError("network oracle has no manifest-approved terminal results")
+            try:
+                facts = network_connectivity_transition_facts(
+                    trial_dir,
+                    state,
+                    declaration,
+                    allowed_terminal_results,
+                )
+            except (KeyError, TypeError, TrialError, ValueError):
+                return oracle_result(
+                    declaration,
+                    "failed",
+                    "the signed connectivity transition or exact attempt response was absent, malformed, or unbound",
+                    None,
+                )
+            return oracle_result(
+                declaration,
+                "passed",
+                "the declared endpoint was observed reachable, unreachable for one exact live attempt, and restored before its bounded response was accepted",
                 facts,
             )
         if oracle_type == "structurally_inconclusive":
@@ -2595,6 +3109,7 @@ EVALUATION_FIELDS = {
     "backend",
     "provider_slots",
     "job_id_prefix",
+    "job_result",
     "capture_provenance",
     "intervention",
     "oracle_assertions",
@@ -2627,8 +3142,23 @@ def validate_lifecycle_payload(payload: dict[str, Any]) -> tuple[
 def validate_evaluation_payload(payload: dict[str, Any]) -> None:
     if set(payload) != EVALUATION_FIELDS:
         raise TrialError("evaluation does not match the closed pre-seal contract")
-    if payload["schema_version"] != 1 or payload["sanitized"] is not True:
+    if payload["schema_version"] != 2 or payload["sanitized"] is not True:
         raise TrialError("evaluation has an invalid schema or sanitization marker")
+    job_result = payload.get("job_result")
+    if (
+        not isinstance(job_result, dict)
+        or set(job_result) != {"outcome", "stop_reason", "allowed"}
+        or (
+            job_result.get("outcome") is not None
+            and not isinstance(job_result.get("outcome"), str)
+        )
+        or (
+            job_result.get("stop_reason") is not None
+            and not isinstance(job_result.get("stop_reason"), str)
+        )
+        or not isinstance(job_result.get("allowed"), bool)
+    ):
+        raise TrialError("evaluation has a malformed Job result")
     provenance = payload.get("capture_provenance")
     if (
         not isinstance(provenance, dict)
@@ -2643,6 +3173,9 @@ def validate_evaluation_payload(payload: dict[str, Any]) -> None:
         if (
             provenance.get("status") != "trusted_preseal"
             or payload["backend"] in {"none", "unknown"}
+            or job_result.get("allowed") is not True
+            or job_result.get("outcome") is None
+            or job_result.get("stop_reason") is None
             or intervention.get("status") != "performed"
             or not valid_digest(intervention.get("detail_sha256"))
             or cleanup.get("status") != "completed"
@@ -2804,6 +3337,7 @@ def build_evaluation(
             sandbox_boundary_probe_sha256=manifest["trusted_capture"].get(
                 "sandbox_boundary_probe_sha256"
             ),
+            allowed_terminal_results=trial["job"]["allowed_terminal_results"],
         )
         for declaration in trial["oracles"]
     ]
@@ -2833,8 +3367,9 @@ def build_evaluation(
         "cleanup",
         {"not_run", "completed", "failed"},
     )
+    job_result = observed_job_result(trial_dir, state, trial)
     evaluation = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": generated_at or now(),
         "sanitized": True,
         "trial_id": trial["id"],
@@ -2853,6 +3388,7 @@ def build_evaluation(
         "backend": captured_backend(trial_dir, state),
         "provider_slots": list(trial["job"]["provider_slots"]),
         "job_id_prefix": job_prefix(trial_dir, state),
+        "job_result": job_result,
         "capture_provenance": {
             "status": (
                 "trusted_preseal"
@@ -2875,6 +3411,30 @@ def build_evaluation(
     }
     validate_evaluation_payload(evaluation)
     return evaluation
+
+
+def observed_job_result(
+    trial_dir: Path,
+    state: dict[str, Any],
+    trial: dict[str, Any],
+) -> dict[str, Any]:
+    if "job-view-after" not in state.get("captures", {}):
+        return {"outcome": None, "stop_reason": None, "allowed": False}
+    try:
+        view = load_captured_value(trial_dir, state, "job-view-after")
+        phase = json_pointer(view, "/job/projection/phase")
+        outcome = json_pointer(view, "/job/projection/outcome")
+        stop_reason = json_pointer(view, "/job/projection/stop_reason")
+    except TrialError:
+        return {"outcome": None, "stop_reason": None, "allowed": False}
+    pair = {"outcome": outcome, "stop_reason": stop_reason}
+    allowed = (
+        phase == "terminal"
+        and isinstance(outcome, str)
+        and isinstance(stop_reason, str)
+        and pair in trial["job"]["allowed_terminal_results"]
+    )
+    return {**pair, "allowed": allowed}
 
 
 def command_evaluate_bundle(

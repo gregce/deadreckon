@@ -152,6 +152,8 @@ pub(crate) struct CourseBudget {
     pub(crate) split: Vec<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) wall_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deadline: Option<DateTime<Utc>>,
 }
 
 /// The done contract as the launch saw it (summary, not the spec itself —
@@ -1441,6 +1443,9 @@ pub(crate) fn course_card(plan: &LaunchPlan) -> Card {
         None => "no explicit ceiling (defaults apply)".to_string(),
     };
     rows.push(("cost".to_string(), cost));
+    if let Some(deadline) = plan.budget.deadline.as_ref() {
+        rows.push(("deadline".to_string(), deadline.to_rfc3339()));
+    }
     let done = match (&plan.contract.summary, &plan.contract.caveat) {
         (Some(summary), None) => format!("{summary} [{}]", plan.contract.source.label()),
         (Some(summary), Some(caveat)) => format!("{summary} - caveat: {caveat}"),
@@ -1603,6 +1608,7 @@ pub(crate) fn launch_plan_from_decision(
         ceiling_usd,
         split: Vec::new(),
         wall_seconds: None,
+        deadline: None,
     };
     plan.contract = CourseContract {
         source: match decision.done_criteria_source {
@@ -1672,6 +1678,9 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
         )));
     }
     let mut plan = load_launch_plan(&proposal_path)?;
+    if let Some(deadline) = args.deadline {
+        plan.budget.deadline = Some(deadline);
+    }
     plan.parent.get_or_insert_with(|| state.run_id.clone());
 
     if !args.quiet && !args.json {
@@ -1732,6 +1741,7 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
         // plan creation instead of re-planning the same goal.
         seed_pieces: plan.pieces.clone(),
         accepted_launch_plan: Some(plan.clone()),
+        deadline: plan.budget.deadline,
         plan: crate::cli::PlanCommandArgs {
             goal: goal.clone(),
             n,
@@ -1803,6 +1813,7 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
 /// Parsed `deadreckon reshape` arguments.
 pub(crate) struct ReshapeArgs {
     pub(crate) run_id: String,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) yes: bool,
     pub(crate) json: bool,
     pub(crate) plain: bool,
@@ -1922,6 +1933,7 @@ mod tests {
             ceiling_usd: Some(12.0),
             split: vec![5.0, 3.0, 4.0],
             wall_seconds: None,
+            deadline: None,
         };
         plan.contract = CourseContract {
             source: ContractOrigin::Detected,
