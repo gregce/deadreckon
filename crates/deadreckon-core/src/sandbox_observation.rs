@@ -6,7 +6,9 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use deadreckon_protocol::{
-    JobAuthority, JobSchemaVersion, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer,
+    DOCKER_GATE_GUEST_PATH, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, JobAuthority,
+    JobSchemaVersion, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -20,6 +22,15 @@ use crate::{acceptance_spec_path_for_run_root, read_gate_key};
 
 pub const SANDBOX_BOUNDARY_OBSERVATION_JSON: &str = "sandbox-boundary-observation.json";
 const OBSERVATION_MAGIC: &[u8] = b"deadreckon.sandbox-boundary-observation.v1\0";
+
+/// Digest the canonical wire representation frozen into strict Job policy.
+pub fn gate_evaluator_identity_sha256(identity: &GateEvaluatorIdentity) -> Result<String> {
+    let encoded = serde_json::to_vec(identity).map_err(|source| DeadreckonError::Json {
+        path: PathBuf::from("gate evaluator identity"),
+        source,
+    })?;
+    Ok(sha256_bytes(&encoded))
+}
 
 /// Authenticate and atomically persist the latest controller-produced
 /// observation for one strict Job result.
@@ -140,6 +151,7 @@ fn validate_observation_fields(
             "observed sandbox backend does not match the deterministic gate",
         ));
     }
+    validate_gate_evaluator_binding(paths, authority, observation)?;
     require_digest(
         &observation.authority_sha256,
         &sha256_file(&authority_path)?,
@@ -167,6 +179,152 @@ fn validate_observation_fields(
         require_sha256(digest, job_id, label)?;
     }
     Ok(())
+}
+
+fn validate_gate_evaluator_binding(
+    paths: &DeadreckonPaths,
+    authority: &JobAuthority,
+    observation: &SandboxBoundaryObservation,
+) -> Result<()> {
+    let job_id = authority.job_id.as_ref();
+    let job = crate::load_job(paths, job_id)?;
+    let policy_identity = job
+        .policy
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.gate_evaluator.as_ref());
+    match (
+        policy_identity,
+        authority.gate_evaluator_sha256.as_deref(),
+        observation.gate_evaluator_sha256.as_deref(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(identity), Some(authority_digest), Some(observation_digest)) => {
+            validate_gate_evaluator_identity(
+                identity,
+                &authority.sandbox_requested,
+                &observation.sandbox_backend,
+                job_id,
+            )?;
+            let actual = gate_evaluator_identity_sha256(identity)?;
+            require_digest(
+                authority_digest,
+                &actual,
+                job_id,
+                "approved gate evaluator identity",
+            )?;
+            require_digest(
+                observation_digest,
+                &actual,
+                job_id,
+                "observed gate evaluator identity",
+            )?;
+            Ok(())
+        }
+        _ => Err(observation_error(
+            job_id,
+            "gate evaluator identity is partial across policy, authority, and observation",
+        )),
+    }
+}
+
+fn validate_gate_evaluator_identity(
+    identity: &GateEvaluatorIdentity,
+    sandbox_requested: &str,
+    sandbox_backend: &str,
+    job_id: &str,
+) -> Result<()> {
+    if identity.schema_version != GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION
+        || identity.protocol_version != GATE_EVALUATOR_PROTOCOL_VERSION
+        || !valid_binary_identity(&identity.controller)
+        || !valid_binary_identity(&identity.evaluator)
+    {
+        return Err(observation_error(
+            job_id,
+            "gate evaluator identity version, protocol, or binary identity is invalid",
+        ));
+    }
+
+    if sandbox_requested != "auto" && sandbox_requested != sandbox_backend {
+        return Err(observation_error(
+            job_id,
+            "gate evaluator backend does not match the approved sandbox request",
+        ));
+    }
+    let requested_docker = sandbox_requested == "docker";
+    let observed_docker = sandbox_backend == "docker";
+    if requested_docker != observed_docker {
+        return Err(observation_error(
+            job_id,
+            "Docker evaluator identity does not match the requested and observed backend",
+        ));
+    }
+    match identity.docker.as_ref() {
+        None if observed_docker => Err(observation_error(
+            job_id,
+            "Docker verification is missing its immutable image identity",
+        )),
+        Some(_) if !observed_docker => Err(observation_error(
+            job_id,
+            "native verification unexpectedly carries a Docker evaluator identity",
+        )),
+        None => {
+            if identity.controller != identity.evaluator {
+                return Err(observation_error(
+                    job_id,
+                    "native verification controller and evaluator identities differ",
+                ));
+            }
+            Ok(())
+        }
+        Some(docker) => {
+            if identity.evaluator.os != "linux"
+                || !valid_sha256(&docker.image_id)
+                || docker.guest_path != Path::new(DOCKER_GATE_GUEST_PATH)
+                || !docker_platform_matches_binary(
+                    &docker.platform,
+                    &identity.evaluator.os,
+                    &identity.evaluator.arch,
+                )
+            {
+                return Err(observation_error(
+                    job_id,
+                    "Docker image ID, platform, evaluator target, or fixed guest path is invalid",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn valid_binary_identity(identity: &GateBinaryIdentity) -> bool {
+    valid_sha256(&identity.sha256)
+        && valid_platform_component(&identity.os)
+        && valid_platform_component(&identity.arch)
+}
+
+fn valid_platform_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+}
+
+fn docker_platform_matches_binary(platform: &str, os: &str, arch: &str) -> bool {
+    let Some((platform_os, platform_arch)) = platform.split_once('/') else {
+        return false;
+    };
+    !platform_arch.contains('/')
+        && platform_os == os
+        && normalized_arch(platform_arch) == normalized_arch(arch)
+}
+
+fn normalized_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
 }
 
 fn refuse_non_regular_existing_target(path: &Path, job_id: &str) -> Result<()> {
@@ -303,13 +461,7 @@ fn require_digest(expected: &str, actual: &str, job_id: &str, label: &str) -> Re
 }
 
 fn require_sha256(value: &str, job_id: &str, label: &str) -> Result<()> {
-    let digest = value.strip_prefix("sha256:").filter(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    });
-    if digest.is_some() {
+    if valid_sha256(value) {
         Ok(())
     } else {
         Err(observation_error(
@@ -317,6 +469,15 @@ fn require_sha256(value: &str, job_id: &str, label: &str) -> Result<()> {
             &format!("{label} digest is not sha256:<64 lowercase hex characters>"),
         ))
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
@@ -370,14 +531,16 @@ mod tests {
 
     use chrono::Utc;
     use deadreckon_protocol::{
-        AuthorityAcceptedBy, JobAuthority, JobId, JobSchemaVersion, RunId,
-        SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticJudgeMode,
+        AuthorityAcceptedBy, DOCKER_GATE_GUEST_PATH, DockerGateIdentity, GateBinaryIdentity,
+        GateEvaluatorIdentity, Job, JobAuthority, JobId, JobPolicy, JobSchemaVersion, JobShape,
+        RunId, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticJudgeMode,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::{
-        sandbox_boundary_result_tree_sha256, seal_sandbox_boundary_observation,
+        gate_evaluator_identity_sha256, sandbox_boundary_result_tree_sha256,
+        seal_sandbox_boundary_observation, validate_gate_evaluator_identity,
         validate_sandbox_boundary_observation,
     };
     use crate::flight::{sha256_file, sha256_text};
@@ -391,7 +554,26 @@ mod tests {
         authority: JobAuthority,
     }
 
+    fn native_identity() -> GateEvaluatorIdentity {
+        let binary = GateBinaryIdentity {
+            sha256: format!("sha256:{}", "a".repeat(64)),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+        };
+        GateEvaluatorIdentity {
+            schema_version: deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            protocol_version: deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+            controller: binary.clone(),
+            evaluator: binary,
+            docker: None,
+        }
+    }
+
     fn fixture() -> Fixture {
+        fixture_with_identity(None)
+    }
+
+    fn fixture_with_identity(gate_evaluator: Option<&GateEvaluatorIdentity>) -> Fixture {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let source = temp.path().join("source");
@@ -419,6 +601,16 @@ mod tests {
         )
         .expect("contract");
         fs::create_dir_all(paths.job_dir(&state.run_id)).expect("job dir");
+        let mut execution = deadreckon_protocol::JobExecutionPolicy::workspace_only("sandbox-exec");
+        execution.gate_evaluator = gate_evaluator.cloned();
+        let policy = JobPolicy {
+            max_spend_usd: 1.0,
+            max_wall_seconds: 30,
+            max_attempts: 1,
+            deadline: None,
+            semantic_judge: SemanticJudgeMode::Required,
+            execution: Some(execution),
+        };
         let authority = JobAuthority {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: JobId(state.run_id.clone()),
@@ -427,20 +619,85 @@ mod tests {
             accepted_by: AuthorityAcceptedBy::Operator,
             goal_sha256: sha256_text(&state.goal),
             contract_sha256: sha256_file(&contract).expect("contract digest"),
-            effective_policy_sha256: sha256_text("policy"),
+            effective_policy_sha256: sha256_text(
+                &serde_json::to_string(&policy).expect("policy JSON"),
+            ),
             launch_plan_sha256: sha256_text("launch"),
             source_tree_sha256: sha256_text("source"),
             source_revision: None,
             sandbox_requested: "sandbox-exec".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: gate_evaluator
+                .map(gate_evaluator_identity_sha256)
+                .transpose()
+                .expect("gate evaluator digest"),
         };
         atomic_write_json(&paths.job_authority(&state.run_id), &authority).expect("authority");
+        crate::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: authority.job_id.clone(),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: state.cwd.clone(),
+                launch_plan_sha256: authority.launch_plan_sha256.clone(),
+                authority_sha256: sha256_file(&paths.job_authority(&state.run_id))
+                    .expect("authority digest"),
+                policy,
+            },
+        )
+        .expect("job");
         Fixture {
             _temp: temp,
             paths,
             state,
             authority,
         }
+    }
+
+    fn identity_presence_fixture(
+        policy_present: bool,
+        authority_present: bool,
+    ) -> (Fixture, String) {
+        let identity = native_identity();
+        let identity_sha256 =
+            gate_evaluator_identity_sha256(&identity).expect("gate evaluator digest");
+        let mut fixture = fixture_with_identity(Some(&identity));
+        let mut job = crate::load_job(&fixture.paths, fixture.authority.job_id.as_ref())
+            .expect("identity-bound job");
+        if !policy_present {
+            job.policy
+                .execution
+                .as_mut()
+                .expect("execution")
+                .gate_evaluator = None;
+        }
+        fixture.authority.gate_evaluator_sha256 =
+            authority_present.then(|| identity_sha256.clone());
+        fixture.authority.effective_policy_sha256 =
+            sha256_text(&serde_json::to_string(&job.policy).expect("policy JSON"));
+        atomic_write_json(
+            &fixture
+                .paths
+                .job_authority(fixture.authority.job_id.as_ref()),
+            &fixture.authority,
+        )
+        .expect("updated authority");
+        job.authority_sha256 = sha256_file(
+            &fixture
+                .paths
+                .job_authority(fixture.authority.job_id.as_ref()),
+        )
+        .expect("authority digest");
+        atomic_write_json(
+            &fixture.paths.job_json(fixture.authority.job_id.as_ref()),
+            &job,
+        )
+        .expect("updated job");
+        (fixture, identity_sha256)
     }
 
     fn observation(fixture: &Fixture) -> SandboxBoundaryObservation {
@@ -472,6 +729,7 @@ mod tests {
             operator_capture_write_denied: true,
             signing_env_scrubbed: true,
             probe_sha256: sha256_text("fixed controller probe"),
+            gate_evaluator_sha256: fixture.authority.gate_evaluator_sha256.clone(),
             signature: String::new(),
         }
     }
@@ -486,6 +744,10 @@ mod tests {
             &observation(&fixture),
         )
         .expect("seal observation");
+        assert!(
+            sealed.gate_evaluator_sha256.is_none(),
+            "legacy all-absent identity remains verifiable"
+        );
         assert_eq!(
             validate_sandbox_boundary_observation(
                 &fixture.paths,
@@ -506,6 +768,141 @@ mod tests {
         )
         .expect_err("result mutation must invalidate observation");
         assert!(error.to_string().contains("result tree digest changed"));
+    }
+
+    #[test]
+    fn every_partial_evaluator_identity_presence_combination_fails_closed() {
+        for (policy_present, authority_present, observation_present) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            let (fixture, identity_sha256) =
+                identity_presence_fixture(policy_present, authority_present);
+            let mut candidate = observation(&fixture);
+            candidate.gate_evaluator_sha256 = observation_present.then(|| identity_sha256.clone());
+            let error = seal_sandbox_boundary_observation(
+                &fixture.paths,
+                &fixture.state,
+                &fixture.authority,
+                &candidate,
+            )
+            .expect_err("partial evaluator identity must fail closed");
+            assert!(
+                error.to_string().contains("partial"),
+                "presence policy={policy_present} authority={authority_present} observation={observation_present}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn evaluator_identity_round_trips_and_partial_or_tampered_bindings_fail_closed() {
+        let identity = native_identity();
+        let fixture = fixture_with_identity(Some(&identity));
+        let sealed = seal_sandbox_boundary_observation(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &observation(&fixture),
+        )
+        .expect("identity-bound observation");
+        assert_eq!(
+            sealed.gate_evaluator_sha256,
+            fixture.authority.gate_evaluator_sha256
+        );
+
+        let mut missing_observation_identity = observation(&fixture);
+        missing_observation_identity.gate_evaluator_sha256 = None;
+        let error = seal_sandbox_boundary_observation(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &missing_observation_identity,
+        )
+        .expect_err("partial observation identity");
+        assert!(error.to_string().contains("partial"));
+
+        let mut wrong_observation_identity = observation(&fixture);
+        wrong_observation_identity.gate_evaluator_sha256 =
+            Some(format!("sha256:{}", "b".repeat(64)));
+        let error = seal_sandbox_boundary_observation(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &wrong_observation_identity,
+        )
+        .expect_err("wrong observation identity");
+        assert!(
+            error
+                .to_string()
+                .contains("observed gate evaluator identity digest changed")
+        );
+
+        let mut job = crate::load_job(&fixture.paths, fixture.authority.job_id.as_ref())
+            .expect("identity-bound job");
+        let identity = job
+            .policy
+            .execution
+            .as_mut()
+            .expect("execution")
+            .gate_evaluator
+            .as_mut()
+            .expect("identity");
+        identity.controller.sha256 = format!("sha256:{}", "c".repeat(64));
+        identity.evaluator.sha256 = identity.controller.sha256.clone();
+        atomic_write_json(
+            &fixture.paths.job_json(fixture.authority.job_id.as_ref()),
+            &job,
+        )
+        .expect("tampered job identity");
+        let error = seal_sandbox_boundary_observation(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &observation(&fixture),
+        )
+        .expect_err("tampered policy identity");
+        assert!(
+            error
+                .to_string()
+                .contains("approved gate evaluator identity digest changed")
+        );
+    }
+
+    #[test]
+    fn evaluator_identity_rejects_native_substitution_and_mutable_docker_coordinates() {
+        let mut native = native_identity();
+        native.evaluator.sha256 = format!("sha256:{}", "b".repeat(64));
+        let error =
+            validate_gate_evaluator_identity(&native, "sandbox-exec", "sandbox-exec", "job-1")
+                .expect_err("native evaluator substitution");
+        assert!(error.to_string().contains("identities differ"));
+
+        let mut docker = GateEvaluatorIdentity {
+            schema_version: deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            protocol_version: deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+            controller: native_identity().controller,
+            evaluator: GateBinaryIdentity {
+                sha256: format!("sha256:{}", "c".repeat(64)),
+                os: "linux".to_string(),
+                arch: "aarch64".to_string(),
+            },
+            docker: Some(DockerGateIdentity {
+                image_id: format!("sha256:{}", "d".repeat(64)),
+                platform: "linux/arm64".to_string(),
+                guest_path: DOCKER_GATE_GUEST_PATH.into(),
+            }),
+        };
+        validate_gate_evaluator_identity(&docker, "docker", "docker", "job-1")
+            .expect("immutable Docker identity");
+
+        docker.docker.as_mut().expect("Docker identity").image_id = "rust:1".to_string();
+        let error = validate_gate_evaluator_identity(&docker, "docker", "docker", "job-1")
+            .expect_err("mutable Docker image tag");
+        assert!(error.to_string().contains("Docker image ID"));
     }
 
     #[test]

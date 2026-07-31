@@ -134,6 +134,7 @@ fn completion_fixture() -> CompletionFixture {
         source_revision: None,
         sandbox_requested: "sandbox-exec".to_string(),
         semantic_judge_mode: SemanticJudgeMode::Required,
+        gate_evaluator_sha256: None,
     };
     write_json(&paths.job_authority("fault-receipt"), &authority);
     let job = Job {
@@ -220,6 +221,7 @@ fn completion_fixture() -> CompletionFixture {
             operator_capture_write_denied: true,
             signing_env_scrubbed: true,
             probe_sha256: sha256_text("fixed controller probe"),
+            gate_evaluator_sha256: authority.gate_evaluator_sha256.clone(),
             signature: String::new(),
         },
     )

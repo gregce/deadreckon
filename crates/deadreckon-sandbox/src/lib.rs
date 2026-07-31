@@ -5,6 +5,7 @@
 
 mod backend;
 mod commands;
+mod docker;
 mod doctor;
 mod policy;
 mod process;
@@ -12,6 +13,12 @@ mod spec;
 
 pub use backend::{Result, SandboxBackend, SandboxError, resolve_backend};
 pub use commands::{SandboxCommand, build_command};
+pub use docker::{
+    DOCKER_EXECUTION_RECORD_SCHEMA_VERSION, DOCKER_SIDECAR_CONTAINER_PROGRAM, DockerExecution,
+    DockerExecutionRecord, DockerImage, DockerPlatform, inspect_docker_image,
+    read_docker_execution_record, reconcile_docker_execution, reconcile_docker_execution_record,
+    write_docker_execution_record,
+};
 pub use doctor::{BackendAvailability, doctor};
 pub use policy::{ProtectedPathPolicy, ToolSandboxPolicy};
 pub use process::{SandboxRunOutput, run};
@@ -48,6 +55,7 @@ mod tests {
     fn shell_spec() -> SandboxSpec {
         SandboxSpec {
             backend: SandboxBackend::None,
+            docker: None,
             cwd: std::env::current_dir().expect("cwd"),
             program: OsString::from("sh"),
             args: vec![OsString::from("-c"), OsString::from("printf ok")],
@@ -406,6 +414,7 @@ printf docker-boundary-ok"#,
         std::fs::create_dir_all(&work).expect("work");
         let output = run(SandboxSpec {
             backend: SandboxBackend::SandboxExec,
+            docker: None,
             cwd: work,
             program: OsString::from("sh"),
             args: vec![
@@ -453,6 +462,7 @@ printf docker-boundary-ok"#,
         std::fs::create_dir_all(&work).expect("work");
         let output = run(SandboxSpec {
             backend: SandboxBackend::SandboxExec,
+            docker: None,
             cwd: work,
             program: OsString::from("curl"),
             args: vec![

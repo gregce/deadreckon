@@ -13,6 +13,13 @@ const TARGETS = [
   "x86_64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
 ];
+const REQUIRED_HOMEBREW_BINARIES = [
+  "deadreckon",
+  "dr-gate",
+  "dr-capture",
+  "dr-gate-evaluator-aarch64-unknown-linux-musl",
+  "dr-gate-evaluator-x86_64-unknown-linux-musl",
+];
 
 const command = process.argv[2];
 const args = parseArgs(process.argv.slice(3));
@@ -401,6 +408,16 @@ function verifyHomebrew(localArgs = args) {
   let verifiedUrls = 0;
   for (const formula of formulae) {
     const text = fs.readFileSync(path.join(dir, formula), "utf8");
+    const installedBinaries = new Set(
+      [...text.matchAll(/^\s*bin\.install\s+(.+)$/gm)].flatMap((match) =>
+        [...match[1].matchAll(/"([^"]+)"/g)].map((name) => name[1]),
+      ),
+    );
+    for (const binary of REQUIRED_HOMEBREW_BINARIES) {
+      if (!installedBinaries.has(binary)) {
+        throw new Error(`${formula} does not install required binary ${binary}`);
+      }
+    }
     // Multi-platform formulae carry one url per target inside on_macos/on_linux
     // blocks, and cargo-dist only embeds sha256 lines at publish/host time. So
     // at the build+trust stage verify every referenced artifact is present in
@@ -497,6 +514,7 @@ function isReleaseAsset(name, relative) {
     name.endsWith(".rb") ||
     name === "SHA256SUMS" ||
     name === "release-manifest.json" ||
+    name === "release-archive-members.json" ||
     name === "release.spdx.json"
   );
 }

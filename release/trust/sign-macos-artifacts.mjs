@@ -9,6 +9,7 @@ const args = parseArgs(process.argv.slice(2));
 const dir = required(args.dir, "--dir");
 const target = required(args.target, "--target");
 const identity = args.identity ?? "Developer ID Application";
+const NATIVE_BINARIES = ["deadreckon", "dr-gate", "dr-capture"];
 
 const archives = findArchives(dir, target);
 if (archives.length === 0) {
@@ -32,6 +33,7 @@ fs.writeFileSync(
       signature_kind: "Developer ID Application",
       notarized: true,
       artifacts: signedArtifacts,
+      signed_binaries: NATIVE_BINARIES,
       verified_at: new Date().toISOString(),
     },
     null,
@@ -44,12 +46,16 @@ function signArchive(archive) {
   const extractDir = path.join(temp, "extract");
   fs.mkdirSync(extractDir);
   extractArchive(archive, extractDir);
-  const binary = findBinary(extractDir);
-  run("codesign", ["--sign", identity, "--options", "runtime", "--timestamp", binary]);
-  run("codesign", ["--verify", "--verbose", binary]);
+  const binaries = findBinaries(extractDir);
+  for (const binary of binaries) {
+    run("codesign", ["--sign", identity, "--options", "runtime", "--timestamp", binary]);
+    run("codesign", ["--verify", "--strict", "--verbose=2", binary]);
+  }
 
   const notarizationZip = path.join(temp, `${target}-notarization.zip`);
-  run("ditto", ["-c", "-k", "--keepParent", binary, notarizationZip]);
+  // Submit the complete final payload. The Linux evaluator sidecars are not
+  // codesigned, but they are part of the notarized archive and its checksum.
+  run("ditto", ["-c", "-k", "--keepParent", payloadRoot(extractDir), notarizationZip]);
   run("xcrun", [
     "notarytool",
     "submit",
@@ -112,17 +118,33 @@ function repackArchive(archive, sourceDir) {
   }
 }
 
-function findBinary(root) {
-  const candidates = [];
-  walk(root, (file) => {
-    if (path.basename(file) === "deadreckon") {
-      candidates.push(file);
+function findBinaries(root) {
+  return NATIVE_BINARIES.map((name) => {
+    const candidates = [];
+    walk(root, (file) => {
+      if (path.basename(file) === name) {
+        candidates.push(file);
+      }
+    });
+    if (candidates.length !== 1) {
+      throw new Error(
+        `expected exactly one ${name} in extracted ${target} archive; found ${candidates.length}`,
+      );
     }
+    return candidates[0];
   });
-  if (candidates.length === 0) {
-    throw new Error(`no deadreckon binary found in extracted ${target} archive`);
+}
+
+function payloadRoot(root) {
+  const entries = fs.readdirSync(root).filter((name) => name !== ".DS_Store");
+  if (entries.length !== 1) {
+    throw new Error(`expected one top-level payload in extracted ${target} archive`);
   }
-  return candidates[0];
+  const payload = path.join(root, entries[0]);
+  if (!fs.statSync(payload).isDirectory()) {
+    throw new Error(`expected ${payload} to be a directory`);
+  }
+  return payload;
 }
 
 function walk(dir, visitor) {

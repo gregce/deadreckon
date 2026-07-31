@@ -16,8 +16,10 @@ pub mod schema;
 pub use ids::{JobId, PlanId, RunId, TurnId};
 pub use job::{
     AuthorityAcceptedBy, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
-    GoalCoverage, GoalCoverageStatus, JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent,
-    JobEventKind, JobEventSequence, JobExecutionPolicy, JobLease, JobOutcome, JobPhase, JobPolicy,
+    DOCKER_GATE_GUEST_PATH, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, GoalCoverage,
+    GoalCoverageStatus, JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent, JobEventKind,
+    JobEventSequence, JobExecutionPolicy, JobLease, JobOutcome, JobPhase, JobPolicy,
     JobSchemaVersion, JobShape, JobToolPolicy, SandboxBoundaryObservation,
     SandboxBoundaryObservationIssuer, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
     StopReason,

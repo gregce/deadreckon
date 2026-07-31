@@ -1202,6 +1202,7 @@ fn app_server_launch_command(spec: &CodexAppServerSpec) -> Result<AppServerLaunc
     }
     let command = build_command(&SandboxSpec {
         backend,
+        docker: None,
         cwd: spec.cwd.clone(),
         program: program.into_os_string(),
         args,

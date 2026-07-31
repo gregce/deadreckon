@@ -6,15 +6,19 @@
 
 use super::super::*;
 
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use deadreckon_protocol::{
-    AuthorityAcceptedBy, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
-    JobExecutionPolicy, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
-    StopReason,
+    AuthorityAcceptedBy, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, Job, JobAuthority,
+    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobId, JobPolicy,
+    JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
 };
+use sha2::Sha256;
 
 const JOB_ACCEPTANCE_FILE: &str = "acceptance.yaml";
 const SUPERVISOR_LAUNCH_STDOUT: &str = "supervisor.out";
@@ -55,6 +59,47 @@ pub(crate) struct CreateJob<'a> {
     pub(crate) accepted_by: AuthorityAcceptedBy,
 }
 
+struct PendingJobDirectory {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PendingJobDirectory {
+    fn create(path: &Path) -> Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Job directory has no parent: {}",
+                path.display()
+            )))
+        })?;
+        fs::create_dir_all(parent)?;
+        fs::create_dir(path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            armed: true,
+        })
+    }
+
+    fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingJobDirectory {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = fs::remove_dir_all(&self.path);
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
+        }
+    }
+}
+
 pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     if request.sandbox_requested.trim() == "none" {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -86,7 +131,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     }
     let job_id = JobId(Uuid::new_v4().simple().to_string());
     let job_dir = request.paths.job_dir(job_id.as_ref());
-    fs::create_dir_all(&job_dir)?;
+    let pending_job_directory = PendingJobDirectory::create(&job_dir)?;
     let authority_source_cwd = authority_source_cwd(&request.source, request.source_cwd, &job_dir)?;
     let scope_root = effective_scope_root(request.source_cwd)?;
     if matches!(request.source.mode, DurableSourceMode::Copy) {
@@ -122,15 +167,18 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     )?;
     let contract_sha256 = deadreckon_core::flight::sha256_file(&contract_path)?;
 
+    let gate_evaluator =
+        freeze_gate_evaluator_identity(request.paths, job_id.as_ref(), &request.sandbox_requested)?;
+    let gate_evaluator_sha256 = gate_evaluator_identity_sha256(&gate_evaluator)?;
+    let mut execution = JobExecutionPolicy::workspace_only(request.sandbox_requested.clone());
+    execution.gate_evaluator = Some(gate_evaluator);
     let policy = JobPolicy {
         max_spend_usd: request.max_spend_usd,
         max_wall_seconds: request.max_wall_seconds,
         max_attempts: request.max_attempts.max(1),
         deadline: None,
         semantic_judge: SemanticJudgeMode::Required,
-        execution: Some(JobExecutionPolicy::workspace_only(
-            request.sandbox_requested.clone(),
-        )),
+        execution: Some(execution),
     };
     let effective_policy_sha256 = deadreckon_core::flight::sha256_text(
         &serde_json::to_string(&policy).map_err(|source| DeadreckonError::Json {
@@ -158,6 +206,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         },
         sandbox_requested: request.sandbox_requested,
         semantic_judge_mode: SemanticJudgeMode::Required,
+        gate_evaluator_sha256: Some(gate_evaluator_sha256.clone()),
     };
     let authority_path = request.paths.job_authority(job_id.as_ref());
     write_json_synced(&authority_path, &authority)?;
@@ -188,6 +237,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
             json!({
                 "contract_sha256": authority.contract_sha256,
                 "accepted_by": authority.accepted_by,
+                "gate_evaluator_sha256": gate_evaluator_sha256,
             }),
         ),
         (
@@ -216,6 +266,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
             },
         )?;
     }
+    pending_job_directory.commit();
     Ok(job)
 }
 
@@ -541,6 +592,7 @@ pub(crate) fn cancel_job(
     if let Some(state) = state.as_ref() {
         reconcile_run_supervised_processes(state, grace, false)?;
     }
+    reconcile_job_docker_executions(paths, &view.job)?;
     let updated = deadreckon_core::JobView::load(paths, view.job.job_id.as_ref())?;
     print_job_status(&updated, false)
 }
@@ -561,6 +613,9 @@ pub(crate) fn reconcile_run_supervised_processes(
         .collect::<std::io::Result<Vec<_>>>()?;
     paths.sort();
     for path in paths {
+        if is_docker_cid_sidecar(&path) {
+            continue;
+        }
         match deadreckon_core::read_supervised_process_record(&path) {
             Ok(record) => reconcile_guarded_process_record(&path, &record, grace)?,
             Err(record_error) => {
@@ -584,6 +639,48 @@ pub(crate) fn reconcile_run_supervised_processes(
                 remove_supervised_file(&path)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn is_docker_cid_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    path.extension() == Some(std::ffi::OsStr::new("cid"))
+        && (name.starts_with("docker-gate-probe-") || name.starts_with("docker-gate-evaluate-"))
+}
+
+pub(crate) fn reconcile_job_docker_executions(paths: &DeadreckonPaths, job: &Job) -> Result<()> {
+    let directory = paths.job_dir(job.job_id.as_ref()).join("docker-executions");
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(source.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Docker execution records for job {} are not a trusted directory",
+            job.job_id
+        ))));
+    }
+    let mut records = fs::read_dir(&directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    records.sort_by_key(fs::DirEntry::file_name);
+    for entry in records {
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("json")) {
+            continue;
+        }
+        let record = deadreckon_sandbox::read_docker_execution_record(&path)
+            .map_err(|error| CliError::Core(DeadreckonError::InvalidInput(error.to_string())))?;
+        if record.job_id() != job.job_id.as_ref() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Docker execution record {} belongs to a different Job",
+                path.display()
+            ))));
+        }
+        deadreckon_sandbox::reconcile_docker_execution_record(&path)
+            .map_err(|error| CliError::Core(DeadreckonError::InvalidInput(error.to_string())))?;
     }
     Ok(())
 }
@@ -831,6 +928,348 @@ fn freeze_contract(source: Option<&Path>, source_cwd: &Path, target: &Path) -> R
     Ok(())
 }
 
+fn freeze_gate_evaluator_identity(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    sandbox_requested: &str,
+) -> Result<GateEvaluatorIdentity> {
+    let controller_source = locate_installed_gate("dr-gate")?;
+    let controller_bytes = read_stable_executable(&controller_source)?;
+    let controller_os = host_gate_os()?;
+    let controller_arch = host_gate_arch()?;
+    validate_gate_binary(
+        &controller_bytes,
+        controller_os,
+        controller_arch,
+        false,
+        &controller_source,
+    )?;
+    let controller_target = paths.job_frozen_controller_gate(job_id);
+    let controller_sha256 = freeze_executable(&controller_target, &controller_bytes)?;
+    let controller = GateBinaryIdentity {
+        sha256: controller_sha256,
+        os: controller_os.to_string(),
+        arch: controller_arch.to_string(),
+    };
+
+    let (evaluator, docker) = if sandbox_requested == "docker" {
+        let image = deadreckon_sandbox::inspect_docker_image(OsStr::new("rust:1"))
+            .map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Docker containment requires the cached rust:1 image before approval ({error}); run `docker pull rust:1` explicitly, then retry"
+                )))
+            })?;
+        let (arch, sidecar_name) = match image.platform() {
+            deadreckon_sandbox::DockerPlatform::LinuxArm64 => {
+                ("aarch64", "dr-gate-evaluator-aarch64-unknown-linux-musl")
+            }
+            deadreckon_sandbox::DockerPlatform::LinuxAmd64 => {
+                ("x86_64", "dr-gate-evaluator-x86_64-unknown-linux-musl")
+            }
+        };
+        let evaluator_source = locate_installed_gate(sidecar_name)?;
+        let evaluator_bytes = read_stable_executable(&evaluator_source)?;
+        validate_gate_binary(&evaluator_bytes, "linux", arch, true, &evaluator_source)?;
+        let evaluator_target = paths.job_frozen_evaluator_gate(job_id);
+        let evaluator_sha256 = freeze_executable(&evaluator_target, &evaluator_bytes)?;
+        (
+            GateBinaryIdentity {
+                sha256: evaluator_sha256,
+                os: "linux".to_string(),
+                arch: arch.to_string(),
+            },
+            Some(DockerGateIdentity {
+                image_id: image.id().to_string(),
+                platform: image.platform().as_str().to_string(),
+                guest_path: PathBuf::from(deadreckon_protocol::DOCKER_GATE_GUEST_PATH),
+            }),
+        )
+    } else {
+        let evaluator_target = paths.job_frozen_evaluator_gate(job_id);
+        let evaluator_sha256 = freeze_executable(&evaluator_target, &controller_bytes)?;
+        (
+            GateBinaryIdentity {
+                sha256: evaluator_sha256,
+                os: controller_os.to_string(),
+                arch: controller_arch.to_string(),
+            },
+            None,
+        )
+    };
+
+    Ok(GateEvaluatorIdentity {
+        schema_version: GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+        protocol_version: GATE_EVALUATOR_PROTOCOL_VERSION,
+        controller,
+        evaluator,
+        docker,
+    })
+}
+
+fn gate_evaluator_identity_sha256(identity: &GateEvaluatorIdentity) -> Result<String> {
+    let raw = serde_json::to_string(identity).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: PathBuf::from("gate-evaluator-identity"),
+            source,
+        })
+    })?;
+    Ok(deadreckon_core::flight::sha256_text(&raw))
+}
+
+fn locate_installed_gate(name: &str) -> Result<PathBuf> {
+    let current = std::env::current_exe().map_err(|source| {
+        CliError::Core(DeadreckonError::Io {
+            path: PathBuf::from("current-exe"),
+            source,
+        })
+    })?;
+    let mut roots = Vec::new();
+    for executable in [current.clone(), current.canonicalize().unwrap_or(current)] {
+        let Some(parent) = executable.parent() else {
+            continue;
+        };
+        roots.push(parent.to_path_buf());
+        if parent.file_name() == Some(OsStr::new("deps"))
+            && let Some(target_dir) = parent.parent()
+        {
+            roots.push(target_dir.to_path_buf());
+        }
+        if let Some(prefix) = parent.parent() {
+            roots.push(prefix.join("libexec"));
+            roots.push(prefix.join("libexec").join("deadreckon"));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+
+    let native_name = if name == "dr-gate" {
+        format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    } else {
+        name.to_string()
+    };
+    for root in roots {
+        let candidate = root.join(&native_name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(CliError::Core(DeadreckonError::NotFound(format!(
+        "trusted release helper {native_name} next to the DeadReckon installation"
+    ))))
+}
+
+fn read_stable_executable(path: &Path) -> Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable must be a regular non-symlink file: {}",
+            path.display()
+        ))));
+    }
+    const MAX_GATE_BYTES: u64 = 256 * 1024 * 1024;
+    if before.len() == 0 || before.len() > MAX_GATE_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable has an invalid bounded size: {}",
+            path.display()
+        ))));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    let post_path = fs::symlink_metadata(path)?;
+    if !stable_gate_metadata(&before, &opened)
+        || !stable_gate_metadata(&opened, &after)
+        || !stable_gate_metadata(&after, &post_path)
+        || u64::try_from(bytes.len()).ok() != Some(after.len())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable changed while its trusted bytes were read: {}",
+            path.display()
+        ))));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn stable_gate_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.file_type().is_file()
+        && right.file_type().is_file()
+}
+
+#[cfg(not(unix))]
+fn stable_gate_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.file_type().is_file()
+        && right.file_type().is_file()
+}
+
+fn freeze_executable(path: &Path, bytes: &[u8]) -> Result<String> {
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen gate path has no parent: {}",
+            path.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o500))?;
+        fs::File::open(parent)?.sync_all()?;
+    }
+    let expected = format!("sha256:{:x}", <Sha256 as sha2::Digest>::digest(bytes));
+    let actual = deadreckon_core::flight::sha256_file(path)?;
+    if actual != expected {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen gate digest mismatch at {}",
+            path.display()
+        ))));
+    }
+    Ok(actual)
+}
+
+fn host_gate_os() -> Result<&'static str> {
+    match std::env::consts::OS {
+        "macos" => Ok("macos"),
+        "linux" => Ok("linux"),
+        "windows" => Ok("windows"),
+        other => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "unsupported gate controller operating system {other}"
+        )))),
+    }
+}
+
+fn host_gate_arch() -> Result<&'static str> {
+    match std::env::consts::ARCH {
+        "aarch64" => Ok("aarch64"),
+        "x86_64" => Ok("x86_64"),
+        other => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "unsupported gate controller architecture {other}"
+        )))),
+    }
+}
+
+fn validate_gate_binary(
+    bytes: &[u8],
+    os: &str,
+    arch: &str,
+    require_static_elf: bool,
+    path: &Path,
+) -> Result<()> {
+    let valid = match os {
+        "macos" => {
+            bytes.get(0..4) == Some(&[0xcf, 0xfa, 0xed, 0xfe])
+                && read_u32_le(bytes, 4)
+                    == Some(match arch {
+                        "aarch64" => 0x0100_000c,
+                        "x86_64" => 0x0100_0007,
+                        _ => 0,
+                    })
+        }
+        "linux" => {
+            let expected_machine = match arch {
+                "aarch64" => 183,
+                "x86_64" => 62,
+                _ => 0,
+            };
+            bytes.get(0..6) == Some(&[0x7f, b'E', b'L', b'F', 2, 1])
+                && read_u16_le(bytes, 18) == Some(expected_machine)
+                && (!require_static_elf || !elf_has_interpreter(bytes))
+        }
+        "windows" => {
+            pe_machine(bytes)
+                == Some(match arch {
+                    "x86_64" => 0x8664,
+                    _ => 0,
+                })
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable {} is not a compatible {} {}{} binary",
+            path.display(),
+            os,
+            arch,
+            if require_static_elf { " static" } else { "" }
+        ))));
+    }
+    Ok(())
+}
+
+fn elf_has_interpreter(bytes: &[u8]) -> bool {
+    if bytes.get(0..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+        return false;
+    }
+    let Some(offset) = read_u64_le(bytes, 32).and_then(|value| usize::try_from(value).ok()) else {
+        return true;
+    };
+    let Some(entry_size) = read_u16_le(bytes, 54).map(usize::from) else {
+        return true;
+    };
+    let Some(count) = read_u16_le(bytes, 56).map(usize::from) else {
+        return true;
+    };
+    if entry_size < 4 {
+        return true;
+    }
+    (0..count).any(|index| {
+        offset
+            .checked_add(index.saturating_mul(entry_size))
+            .and_then(|start| read_u32_le(bytes, start))
+            == Some(3)
+    })
+}
+
+fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.get(0..2) != Some(b"MZ") {
+        return None;
+    }
+    let offset = read_u32_le(bytes, 0x3c).and_then(|value| usize::try_from(value).ok())?;
+    if bytes.get(offset..offset.checked_add(4)?)? != b"PE\0\0" {
+        return None;
+    }
+    read_u16_le(bytes, offset.checked_add(4)?)
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?,
+    ))
+}
+
 fn portable_default_check(
     check: deadreckon_core::AcceptanceCheck,
 ) -> deadreckon_core::AcceptanceCheck {
@@ -991,6 +1430,50 @@ mod tests {
         assert!(execution.tools.values().all(|tool| {
             tool.workspace_read && tool.workspace_write && tool.network_allowlist.is_empty()
         }));
+        let gate_evaluator = execution
+            .gate_evaluator
+            .as_ref()
+            .expect("immutable gate evaluator identity");
+        assert!(
+            gate_evaluator.docker.is_none(),
+            "an auto-contained Job freezes the host-native evaluator"
+        );
+        let gate_evaluator_sha256 = deadreckon_core::gate_evaluator_identity_sha256(gate_evaluator)
+            .expect("gate evaluator identity digest");
+        assert_eq!(
+            authority.gate_evaluator_sha256.as_deref(),
+            Some(gate_evaluator_sha256.as_str())
+        );
+        let controller_path = paths.job_frozen_controller_gate(job.job_id.as_ref());
+        let evaluator_path = paths.job_frozen_evaluator_gate(job.job_id.as_ref());
+        assert_eq!(
+            deadreckon_core::flight::sha256_file(&controller_path)
+                .expect("frozen controller digest"),
+            gate_evaluator.controller.sha256
+        );
+        assert_eq!(
+            deadreckon_core::flight::sha256_file(&evaluator_path).expect("frozen evaluator digest"),
+            gate_evaluator.evaluator.sha256
+        );
+        assert_eq!(
+            fs::read(&controller_path).expect("frozen controller"),
+            fs::read(&evaluator_path).expect("frozen evaluator"),
+            "non-Docker Jobs use two independently frozen copies of the approved native helper"
+        );
+        #[cfg(unix)]
+        for path in [&controller_path, &evaluator_path] {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("gate metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o500,
+                "frozen gate helpers are executable but not writable"
+            );
+        }
         assert_eq!(
             authority.effective_policy_sha256,
             deadreckon_core::flight::sha256_text(
@@ -1016,6 +1499,39 @@ mod tests {
             ]
         );
         assert!(history.events().iter().all(|event| event.lease_epoch == 0));
+    }
+
+    #[test]
+    fn frozen_gate_tamper_is_rejected_before_unattended_launch() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), "durable").expect("source file");
+
+        let job = create_job(request(&paths, &source, None)).expect("create job");
+        let evaluator_path = paths.job_frozen_evaluator_gate(job.job_id.as_ref());
+        let mut tampered = fs::read(&evaluator_path).expect("approved evaluator");
+        tampered.push(0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&evaluator_path, fs::Permissions::from_mode(0o700))
+                .expect("make fixture writable");
+        }
+        fs::write(&evaluator_path, tampered).expect("tamper evaluator");
+
+        let error = super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect_err("tampered evaluator must be rejected before launch");
+        assert!(
+            error.to_string().contains("gate evaluator changed"),
+            "{error}"
+        );
+        assert!(
+            !paths.job_lease(job.job_id.as_ref()).exists(),
+            "input validation must fail before an unattended lease is written"
+        );
     }
 
     #[test]
@@ -1063,6 +1579,29 @@ mod tests {
                     .next()
                     .is_none(),
             "refusal must happen before a durable identity is written"
+        );
+    }
+
+    #[test]
+    fn pending_job_directory_is_removed_unless_creation_commits() {
+        let temp = TempDir::new().expect("tempdir");
+        let abandoned = temp.path().join("jobs").join("abandoned");
+        {
+            let _pending = PendingJobDirectory::create(&abandoned).expect("pending directory");
+            fs::write(abandoned.join("partial.json"), "{}").expect("partial artifact");
+        }
+        assert!(
+            !abandoned.exists(),
+            "failed creation must not leave a partial Job identity"
+        );
+
+        let committed = temp.path().join("jobs").join("committed");
+        let pending = PendingJobDirectory::create(&committed).expect("pending directory");
+        fs::write(committed.join("job.json"), "{}").expect("Job artifact");
+        pending.commit();
+        assert!(
+            committed.join("job.json").is_file(),
+            "committed Job state must survive the creation guard"
         );
     }
 
@@ -1770,6 +2309,26 @@ mod tests {
 
         assert!(error.to_string().contains("cannot reconcile"), "{error}");
         assert!(path.exists(), "corrupt evidence must remain inspectable");
+    }
+
+    #[test]
+    fn guarded_process_reconciliation_leaves_trusted_docker_cid_sidecars_to_docker_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("docker-gate-evaluate-1-launch.cid");
+        fs::create_dir_all(path.parent().expect("parent")).expect("child-pids");
+        fs::write(&path, "a".repeat(64)).expect("Docker cidfile");
+
+        reconcile_run_supervised_processes(&state, Duration::ZERO, false)
+            .expect("Docker cid sidecar is not a process record");
+
+        assert!(
+            path.exists(),
+            "the Docker lifecycle owns validation and removal of its cidfile"
+        );
     }
 
     #[cfg(unix)]

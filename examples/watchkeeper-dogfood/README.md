@@ -98,6 +98,37 @@ env PYTHONDONTWRITEBYTECODE=1 CARGO_TARGET_DIR="$WK_PROOF_ROOT/target" \
 test -z "$(git -C "$WK_SOURCE_WORKTREE" status --porcelain --untracked-files=all)"
 ```
 
+The public strict Docker group runs automatically only when preflight finds a
+running daemon, an already-cached `rust:1` image for `arm64/linux`, and a static
+Linux arm64 evaluator beside Cargo's debug `deadreckon` binary. The runner
+never pulls or builds either prerequisite. To make that group pass, install
+`cargo-zigbuild` 0.23.0 and Zig 0.14.1, then prepare the evaluator outside the
+clean source worktree before running the command above:
+
+```sh
+rustup target add aarch64-unknown-linux-musl
+(
+  cd "$WK_SOURCE_WORKTREE"
+  CARGO_TARGET_DIR="$WK_PROOF_ROOT/target" cargo zigbuild \
+    --release --locked --no-default-features \
+    -p deadreckon --bin dr-gate \
+    --target aarch64-unknown-linux-musl
+)
+mkdir -p "$WK_PROOF_ROOT/target/debug"
+install -m 0755 \
+  "$WK_PROOF_ROOT/target/aarch64-unknown-linux-musl/release/dr-gate" \
+  "$WK_PROOF_ROOT/target/debug/dr-gate-evaluator-aarch64-unknown-linux-musl"
+node "$WK_SOURCE_WORKTREE/release/evaluator-sidecars.mjs" verify-sidecars \
+  --sidecars-dir "$WK_PROOF_ROOT/target/debug" \
+  --target aarch64-unknown-linux-musl
+docker image inspect rust:1 --format '{{.Id}} {{.Architecture}}/{{.Os}}'
+```
+
+If any public Docker prerequisite is absent or incompatible, the runner records
+`docker_gate_boundary` as `unproven` with no commands executed. It still runs
+the other credential-free groups. The three public commands set
+`DEADRECKON_LIVE_DOCKER_TEST=1` themselves and never invoke a paid provider.
+
 The result must name `WK_SOURCE_REV` and record `repository.dirty` as `false`.
 Only after checking those fields should the operator copy the result into the
 detached worktree and commit it on an evidence branch:
@@ -120,8 +151,14 @@ invalidate that source binding. `E` cannot name its own commit hash because
 adding that hash to the JSON changes `E` and therefore changes the hash again.
 Git parentage, or a later signed attestation, identifies `E`.
 
-The checked-in result currently records 12 passing credential-free proof
-groups and no failures. The added proof groups directly cover supported
+The checked-in historical result records 12 passing credential-free proof
+groups, no failures and nine unproven claims against its named clean source.
+It predates the expanded runner and remains evidence for that source rather
+than for later changes. The current runner defines 13 proof groups and eight
+standing live claims. On the same capable macOS arm64 host, a fresh complete
+recording is expected to report 13 passed, no failures and eight unproven.
+
+The proof groups directly cover supported
 creation routes entering one Job journey, one- and two-round Graph semantic
 parent repair, one-round Campaign semantic parent repair, candidate-ready
 recovery, and all seven repair-receipt lineage attacks. They also prove that
@@ -130,19 +167,24 @@ read-only planning cannot write to the operator workspace while a benign
 planner remains usable under an operational sandbox. An opt-in live Docker
 trial additionally proves the real container's key, environment, network and
 control-path boundary when `rust:1` is already cached; it never pulls an image
-implicitly. Nine public live or host-specific claims remain explicitly
-unproven.
+implicitly. A second Docker group now runs three public strict Jobs: normal
+deterministic completion, operator cancellation, and worker `SIGKILL` followed
+by stale-container cleanup and exactly one retry. Rerun and bind the expanded
+matrix to a clean source revision before treating that public Docker row as
+checked dogfood evidence.
 
 The JSON output records each command, duration, exit status, matched test line,
 and stdout/stderr digest. It labels proof by scope. The runner first proves
 that `sandbox-exec` can apply a profile; nested environments that deny that
 operation report the host-sandbox trials as `unproven`. The network test
 proves a local server is reachable without containment and unreachable through
-DeadReckon's Seatbelt profile. The Docker control-boundary pass does not claim
-that a macOS Mach-O `dr-gate` can execute inside a Linux container. Neither
-host-backed pass claims a live provider, an active user service or a reboot.
+DeadReckon's Seatbelt profile. The common Docker control-boundary pass and the
+public strict Docker group are distinct: the latter requires the static Linux
+evaluator sidecar and verifies Job-level completion, cancellation and recovery.
+Neither host-backed pass claims a live provider, an active user service or a
+reboot.
 
-The following remain `unproven` in that file until an operator performs them:
+The following remain standing live claims until an operator performs them:
 
 - worker death during an approved live provider run;
 - supervisor death during an approved live provider run;
@@ -153,9 +195,7 @@ The following remain `unproven` in that file until an operator performs them:
   parent repair;
 - live Campaign interruption and recovery without duplicate sub-plan or repair
   work;
-- the equivalent protected gate boundary on Linux/bubblewrap;
-- a public strict Docker Job running a platform-compatible `dr-gate`; the
-  common live Docker control boundary is covered separately.
+- the equivalent protected gate boundary on Linux/bubblewrap.
 
 ## Record an operator-run live fault trial
 

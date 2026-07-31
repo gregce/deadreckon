@@ -1229,6 +1229,7 @@ fn schedule_advanced_recovery(
 }
 
 fn load_launch_inputs(paths: &DeadreckonPaths, job: &Job) -> Result<LaunchInputs> {
+    super::job::reconcile_job_docker_executions(paths, job)?;
     let plan_path = paths.job_launch_plan(job.job_id.as_ref());
     let plan_digest = deadreckon_core::flight::sha256_file(&plan_path)?;
     if plan_digest != job.launch_plan_sha256 {
@@ -1324,6 +1325,42 @@ fn load_launch_inputs(paths: &DeadreckonPaths, job: &Job) -> Result<LaunchInputs
             "effective execution policy does not match authority for job {}",
             job.job_id
         ))));
+    }
+    let gate_evaluator = execution.gate_evaluator.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "job {} predates immutable gate evaluator identity; refusing unattended execution",
+            job.job_id
+        )))
+    })?;
+    let gate_evaluator_sha256 = deadreckon_core::gate_evaluator_identity_sha256(gate_evaluator)?;
+    if authority.gate_evaluator_sha256.as_deref() != Some(gate_evaluator_sha256.as_str()) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate evaluator identity changed after job {} was approved",
+            job.job_id
+        ))));
+    }
+    for (label, path, expected) in [
+        (
+            "gate controller",
+            paths.job_frozen_controller_gate(job.job_id.as_ref()),
+            gate_evaluator.controller.sha256.as_str(),
+        ),
+        (
+            "gate evaluator",
+            paths.job_frozen_evaluator_gate(job.job_id.as_ref()),
+            gate_evaluator.evaluator.sha256.as_str(),
+        ),
+    ] {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_file()
+            || deadreckon_core::flight::sha256_file(&path)? != expected
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{label} changed after job {} was approved",
+                job.job_id
+            ))));
+        }
     }
     if let Some(expected) = authority.source_revision.as_deref()
         && current_source_revision(&job.source_cwd).as_deref() != Some(expected)
@@ -3734,9 +3771,8 @@ fn append_attempt_stopped(
             "cannot stop a Job attempt before an attempt has started".to_string(),
         )));
     }
-    let mut detail = match merge_stop_reason(reason, extra) {
-        Value::Object(detail) => detail,
-        _ => unreachable!("merge_stop_reason always returns an object"),
+    let Value::Object(mut detail) = merge_stop_reason(reason, extra) else {
+        unreachable!("merge_stop_reason always returns an object")
     };
     match detail.get("attempt").and_then(Value::as_u64) {
         Some(recorded) if recorded != u64::from(attempt) => {
@@ -3840,6 +3876,7 @@ fn finish_cancel_requested(
                     Duration::from_secs(2),
                 )
             })
+            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
     {
         block_for_lost_containment(
             paths,
@@ -4162,15 +4199,36 @@ mod tests {
             "name: fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/fixture-proof.txt\"\n",
         )
         .expect("contract");
+        let gate_bytes = b"current supervisor fixture gate";
+        let controller_path = paths.job_frozen_controller_gate(job_id.as_ref());
+        fs::create_dir_all(controller_path.parent().expect("controller parent"))
+            .expect("controller parent");
+        fs::write(&controller_path, gate_bytes).expect("frozen controller");
+        let evaluator_path = paths.job_frozen_evaluator_gate(job_id.as_ref());
+        fs::create_dir_all(evaluator_path.parent().expect("evaluator parent"))
+            .expect("evaluator parent");
+        fs::write(&evaluator_path, gate_bytes).expect("frozen evaluator");
+        let binary_identity = deadreckon_protocol::GateBinaryIdentity {
+            sha256: deadreckon_core::flight::sha256_file(&controller_path).expect("gate digest"),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        };
+        let gate_evaluator = deadreckon_protocol::GateEvaluatorIdentity {
+            schema_version: deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            protocol_version: deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+            controller: binary_identity.clone(),
+            evaluator: binary_identity,
+            docker: None,
+        };
+        let mut execution = deadreckon_protocol::JobExecutionPolicy::workspace_only("auto");
+        execution.gate_evaluator = Some(gate_evaluator.clone());
         let policy = JobPolicy {
             max_spend_usd: 3.0,
             max_wall_seconds: 60,
             max_attempts,
             deadline: None,
             semantic_judge: SemanticJudgeMode::Required,
-            execution: Some(deadreckon_protocol::JobExecutionPolicy::workspace_only(
-                "none",
-            )),
+            execution: Some(execution),
         };
 
         let authority = JobAuthority {
@@ -4190,8 +4248,12 @@ mod tests {
                 .expect("source index")
                 .tree_hash(),
             source_revision: None,
-            sandbox_requested: "none".to_string(),
+            sandbox_requested: "auto".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: Some(
+                deadreckon_core::gate_evaluator_identity_sha256(&gate_evaluator)
+                    .expect("gate evaluator identity digest"),
+            ),
         };
         let authority_path = paths.job_authority(job_id.as_ref());
         fs::create_dir_all(authority_path.parent().expect("parent")).expect("job dir");
@@ -4423,6 +4485,7 @@ mod tests {
                 .expect("result tree"),
             sandbox_requested: authority.sandbox_requested.clone(),
             sandbox_backend: backend.to_string(),
+            gate_evaluator_sha256: authority.gate_evaluator_sha256.clone(),
             contained: true,
             gate_key_read_denied: true,
             proof_write_denied: true,

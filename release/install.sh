@@ -165,10 +165,22 @@ installed="${DEADRECKON_BIN:-${HOME}/.local/share/deadreckon/bin/deadreckon}"
 if [ -x "$installed" ]; then
   bin="$installed"
 elif command -v deadreckon >/dev/null 2>&1; then
-  bin="deadreckon"
+  bin="$(command -v deadreckon)"
 else
   bin="$installed"
 fi
+
+install_dir="$(dirname "$bin")"
+for helper in \
+  dr-gate \
+  dr-capture \
+  dr-gate-evaluator-aarch64-unknown-linux-musl \
+  dr-gate-evaluator-x86_64-unknown-linux-musl
+do
+  [ -x "${install_dir}/${helper}" ] \
+    || die "release installer did not install required helper ${helper} next to deadreckon"
+done
+ok "helpers " "native gate/capture and both offline evaluator sidecars are installed"
 
 version="$($bin --version 2>/dev/null || printf '%s' "deadreckon ${tag}")"
 

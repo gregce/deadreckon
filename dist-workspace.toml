@@ -4,10 +4,9 @@ members = ["cargo:."]
 [dist]
 cargo-dist-version = "0.31.0"
 ci = ["github"]
-# Let dist create and manage the GitHub release: `dist host --steps=create`
-# (dist-plan job) opens the draft that the publish job then uploads to and
-# announces. Without this, hosting is None and `dist host` errors with
-# "release not found".
+# Keep GitHub release coordinates in cargo-dist's generated installers and
+# package metadata. The hand-maintained workflow uses `dist plan` and `dist
+# build` only; its final write-scoped `gh release` job is the sole publisher.
 hosting = ["github"]
 # release.yml is hand-maintained for the Release Trust pipeline (signing,
 # provenance, fail-closed lanes) and intentionally diverges from the dist
@@ -23,6 +22,11 @@ targets = [
   "x86_64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
 ]
+# cargo-dist builds every application binary for the selected host target, but
+# cannot add Linux-target executables to macOS/Windows archives. Release CI
+# therefore builds the two static musl dr-gate evaluators separately and uses
+# release/evaluator-sidecars.mjs to assemble them into every host archive and
+# generated installer before signing, checksums, and attestations.
 # Explicit checksum algorithm for the *.sha256 siblings and SHA256SUMS the
 # release lane aggregates; the wrapper installer dies on mismatch. The inner
 # cargo-dist installer does not yet verify embedded sums for tar.xz — that

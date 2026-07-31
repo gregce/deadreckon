@@ -239,6 +239,7 @@ crate: deadreckon-core
   job::write_job
   job_lease::append_fenced_job_event
   job_lease::claim_job_lease
+  job_lease::FencedJobJsonEvent
   job_lease::heartbeat_job_lease
   job_lease::LeaseClaim
   job_lease::LeaseClaimDisposition
@@ -335,6 +336,7 @@ crate: deadreckon-core
   run_view::VerdictBand
   run_view::WhyBand
   sandbox_observation::SANDBOX_BOUNDARY_OBSERVATION_JSON
+  sandbox_observation::gate_evaluator_identity_sha256
   sandbox_observation::sandbox_boundary_observation_sha256
   sandbox_observation::sandbox_boundary_result_tree_sha256
   sandbox_observation::seal_sandbox_boundary_observation
@@ -344,6 +346,7 @@ crate: deadreckon-core
   state::CurrentRunPointer
   state::list_runs
   state::load_run
+  state::MergeRepairOwnership
   state::PhaseId
   state::PhaseState
   state::PhaseStatus
@@ -392,6 +395,12 @@ crate: deadreckon-protocol
   job::CompletionProofKind
   job::CompletionReceipt
   job::CompletionReceiptIssuer
+  job::DOCKER_GATE_GUEST_PATH
+  job::DockerGateIdentity
+  job::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION
+  job::GATE_EVALUATOR_PROTOCOL_VERSION
+  job::GateBinaryIdentity
+  job::GateEvaluatorIdentity
   job::GoalCoverage
   job::GoalCoverageStatus
   job::Job
@@ -514,6 +523,17 @@ crate: deadreckon-sandbox
   backend::SandboxError
   commands::build_command
   commands::SandboxCommand
+  docker::DOCKER_EXECUTION_RECORD_SCHEMA_VERSION
+  docker::DOCKER_SIDECAR_CONTAINER_PROGRAM
+  docker::DockerExecution
+  docker::DockerExecutionRecord
+  docker::DockerImage
+  docker::DockerPlatform
+  docker::inspect_docker_image
+  docker::read_docker_execution_record
+  docker::reconcile_docker_execution
+  docker::reconcile_docker_execution_record
+  docker::write_docker_execution_record
   doctor::BackendAvailability
   doctor::doctor
   policy::ProtectedPathPolicy

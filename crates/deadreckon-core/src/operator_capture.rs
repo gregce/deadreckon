@@ -2393,6 +2393,7 @@ mod tests {
             source_revision: Some("0123456789abcdef".to_string()),
             sandbox_requested: "strict".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         atomic_write_json(&paths.job_authority("job-1"), &authority).expect("authority");
         write_gate_key(&paths, "job-1", &[7_u8; 32]).expect("gate key");
@@ -2687,7 +2688,7 @@ mod tests {
         assert!(path.starts_with(paths.operator_captures_dir()));
         assert!(!path.starts_with(paths.job_dir("job-1")));
 
-        let mut replacement = binding.clone();
+        let mut replacement = binding;
         replacement.manifest_sha256 = digest('e');
         replacement.signature.clear();
         let error = write_operator_capture_binding(&paths, &replacement)

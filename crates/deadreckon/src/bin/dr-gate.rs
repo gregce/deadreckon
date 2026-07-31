@@ -7,7 +7,7 @@ use std::str::FromStr as _;
 
 use deadreckon_core::gate::{
     AcceptanceContainment, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
-    GateEvaluation, decode_gate_key, evaluate_gate, sign_gate_evaluation_with_key,
+    GateEvaluation, decode_gate_key, evaluate_gate_with_identity, sign_gate_evaluation_with_key,
 };
 use deadreckon_core::{
     SupervisedProcessIdentity, SupervisedProcessPhase, read_supervised_process_record,
@@ -23,6 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == OsStr::new("guarded-exec") {
         let args = parse_guarded_exec(raw)?;
         return guarded_exec(&args);
+    }
+    if mode == OsStr::new("probe-boundary") {
+        if raw.next().is_some() {
+            return Err("probe-boundary accepts no arguments".into());
+        }
+        return probe_boundary();
     }
     let mode = mode
         .into_string()
@@ -41,11 +47,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn probe_boundary() -> Result<(), Box<dyn std::error::Error>> {
+    const SUCCESS: &str = "deadreckon-sandbox-boundary-v1";
+    reject_evaluator_gate_environment(|name| std::env::var_os(name).is_some()).map_err(
+        |message| format!("dr-gate probe-boundary refused unsafe environment: {message}"),
+    )?;
+    let gate_key = required_boundary_path("DR_BOUNDARY_GATE_KEY")?;
+    let proof = required_boundary_path("DR_BOUNDARY_PROOF")?;
+    let control = required_boundary_path("DR_BOUNDARY_CONTROL")?;
+    let operator_capture = required_boundary_path("DR_BOUNDARY_OPERATOR_CAPTURE")?;
+    if fs::File::open(&gate_key).is_ok() {
+        return Err("probe-boundary could read the protected gate key".into());
+    }
+    for (label, path) in [
+        ("proof", &proof),
+        ("control", &control),
+        ("operator capture", &operator_capture),
+    ] {
+        if fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .is_ok()
+        {
+            return Err(format!("probe-boundary could write protected {label}").into());
+        }
+    }
+    if fs::File::open(&operator_capture).is_ok() {
+        return Err("probe-boundary could read protected operator capture".into());
+    }
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(SUCCESS.as_bytes())?;
+    Ok(())
+}
+
+fn required_boundary_path(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let value = std::env::var_os(name).ok_or_else(|| format!("{name} is required"))?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be absolute").into());
+    }
+    Ok(path)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommonArgs {
     run_id: String,
     run_root: PathBuf,
     working_dir: PathBuf,
+    gate_evaluator_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +124,12 @@ struct GuardedExecArgs {
 fn evaluate(args: &CommonArgs) -> Result<(), Box<dyn std::error::Error>> {
     reject_evaluator_gate_environment(|name| std::env::var_os(name).is_some())
         .map_err(|message| format!("dr-gate evaluate refused unsafe environment: {message}"))?;
-    let evaluation = evaluate_gate(&args.run_id, &args.run_root, &args.working_dir)?;
+    let evaluation = evaluate_gate_with_identity(
+        &args.run_id,
+        &args.run_root,
+        &args.working_dir,
+        args.gate_evaluator_sha256.clone(),
+    )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     serde_json::to_writer(&mut stdout, &evaluation)?;
@@ -83,14 +138,21 @@ fn evaluate(args: &CommonArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn sign(args: SignArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = read_evaluation(&args.evaluation)?;
+    let evaluation: GateEvaluation = serde_json::from_str(&raw)
+        .map_err(|error| format!("invalid gate evaluation JSON: {error}"))?;
+    if evaluation.gate_evaluator_sha256 != args.common.gate_evaluator_sha256 {
+        return Err(format!(
+            "gate evaluation identity {:?} does not match approved identity {:?}",
+            evaluation.gate_evaluator_sha256, args.common.gate_evaluator_sha256
+        )
+        .into());
+    }
     let environment = SigningEnvironment::from_lookup(
         |name| std::env::var(name).ok(),
         |name| std::env::var_os(name).is_some(),
     )
     .map_err(|message| format!("dr-gate sign refused unsafe supervisor inputs: {message}"))?;
-    let raw = read_evaluation(&args.evaluation)?;
-    let evaluation: GateEvaluation = serde_json::from_str(&raw)
-        .map_err(|error| format!("invalid gate evaluation JSON: {error}"))?;
     sign_gate_evaluation_with_key(
         &args.common.run_root,
         &args.common.run_id,
@@ -204,14 +266,28 @@ fn guarded_exec(args: &GuardedExecArgs) -> Result<(), Box<dyn std::error::Error>
     }
 
     let mut record = read_supervised_process_record(&args.metadata)?;
-    if record.process.pid != std::process::id()
-        || record.launch_id != args.launch_id
-        || record.attempt != args.attempt
-        || record.release_token_sha256 != args.release_token_sha256
-        || record.phase != SupervisedProcessPhase::Prepared
-        || record.identity() != SupervisedProcessIdentity::Current
+    let current_pid = std::process::id();
+    let observed_identity = record.identity();
+    let pid_matches = record.process.pid == current_pid;
+    let launch_matches = record.launch_id == args.launch_id;
+    let attempt_matches = record.attempt == args.attempt;
+    let release_matches = record.release_token_sha256 == args.release_token_sha256;
+    let phase_matches = record.phase == SupervisedProcessPhase::Prepared;
+    let process_identity_matches = observed_identity == SupervisedProcessIdentity::Current;
+    if !pid_matches
+        || !launch_matches
+        || !attempt_matches
+        || !release_matches
+        || !phase_matches
+        || !process_identity_matches
     {
-        return Err("guarded-exec identity did not match its durable prepared record".into());
+        return Err(format!(
+            "guarded-exec identity did not match its durable prepared record \
+             (pid={pid_matches}, launch={launch_matches}, attempt={attempt_matches}, \
+             release={release_matches}, phase={phase_matches}, \
+             process_identity={process_identity_matches}, observed={observed_identity:?})"
+        )
+        .into());
     }
 
     #[cfg(unix)]
@@ -255,6 +331,7 @@ fn parse_command(
     let mut evaluation = None;
     let mut contained = None;
     let mut sandbox_backend = None;
+    let mut gate_evaluator_sha256 = None;
     while let Some(arg) = args.next() {
         let value = args
             .next()
@@ -270,6 +347,10 @@ fn parse_command(
             "--sandbox-backend" => {
                 set_once(&mut sandbox_backend, value, "--sandbox-backend")?;
             }
+            "--gate-evaluator-sha256" => {
+                validate_sha256(&value, "--gate-evaluator-sha256")?;
+                set_once(&mut gate_evaluator_sha256, value, "--gate-evaluator-sha256")?;
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -277,6 +358,7 @@ fn parse_command(
         run_id: run_id.ok_or("--run is required")?,
         run_root: run_root.ok_or("--run-root is required")?,
         working_dir: working_dir.ok_or("--working-dir is required")?,
+        gate_evaluator_sha256,
     };
     match mode.as_str() {
         "evaluate" => {
@@ -293,6 +375,20 @@ fn parse_command(
         })),
         other => Err(format!("unknown dr-gate command {other}; expected evaluate or sign").into()),
     }
+}
+
+fn validate_sha256(value: &str, argument: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(format!("{argument} must use sha256:<64 lowercase hex>").into());
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{argument} must use sha256:<64 lowercase hex>").into());
+    }
+    Ok(())
 }
 
 fn set_once<T>(
@@ -401,8 +497,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        GateCommand, SigningEnvironment, explicit_containment, parse_command, parse_guarded_exec,
-        read_evaluation, reject_evaluator_gate_environment,
+        CommonArgs, GateCommand, SignArgs, SigningEnvironment, explicit_containment, parse_command,
+        parse_guarded_exec, read_evaluation, reject_evaluator_gate_environment, sign,
     };
 
     fn common_args(command: &str) -> Vec<String> {
@@ -425,12 +521,15 @@ mod tests {
         };
         assert_eq!(args.run_id, "run-1");
         assert_eq!(args.run_root, PathBuf::from("/tmp/run-1"));
+        assert_eq!(args.gate_evaluator_sha256, None);
     }
 
     #[test]
     fn sign_cli_requires_explicit_coherent_containment() {
         let mut args = common_args("sign");
         args.extend([
+            "--gate-evaluator-sha256".to_string(),
+            format!("sha256:{}", "a".repeat(64)),
             "--evaluation".to_string(),
             "-".to_string(),
             "--contained".to_string(),
@@ -444,6 +543,11 @@ mod tests {
         };
         assert!(args.containment.contained);
         assert_eq!(args.containment.sandbox_backend, "sandbox-exec");
+        let expected_identity = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            args.common.gate_evaluator_sha256.as_deref(),
+            Some(expected_identity.as_str())
+        );
 
         let err = explicit_containment(true, "none").expect_err("incoherent containment");
         assert!(err.to_string().contains("inconsistent"), "{err}");
@@ -486,6 +590,59 @@ mod tests {
 
         assert!(err.contains(GATE_KEY_ENV), "{err}");
         assert!(err.contains("required"), "{err}");
+    }
+
+    #[test]
+    fn signer_rejects_evaluator_identity_before_reading_the_gate_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let evaluation_path = temp.path().join("evaluation.json");
+        std::fs::write(
+            &evaluation_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "run_id": "run-1",
+                "working_dir": temp.path(),
+                "contract_sha256": format!("sha256:{}", "c".repeat(64)),
+                "gate_evaluator_sha256": format!("sha256:{}", "a".repeat(64)),
+                "results": [],
+                "tamper": {
+                    "schema_version": 1,
+                    "run_id": "run-1",
+                    "evaluated_at": "2026-07-31T00:00:00Z",
+                    "verdict": "clean",
+                    "spec_modified": false,
+                    "lint_findings": [],
+                    "covered_files_touched": [],
+                    "caveats": [],
+                    "refusal_reasons": []
+                }
+            }))
+            .expect("evaluation JSON"),
+        )
+        .expect("evaluation fixture");
+        let approved_identity = format!("sha256:{}", "b".repeat(64));
+        let error = sign(SignArgs {
+            common: CommonArgs {
+                run_id: "run-1".to_string(),
+                run_root: temp.path().join("run"),
+                working_dir: temp.path().to_path_buf(),
+                gate_evaluator_sha256: Some(approved_identity),
+            },
+            evaluation: evaluation_path.to_string_lossy().into_owned(),
+            containment: deadreckon_core::gate::AcceptanceContainment::contained("sandbox-exec"),
+        })
+        .expect_err("identity mismatch must fail before the signing environment is read");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match approved identity"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains(GATE_KEY_ENV),
+            "the mismatch must be decided before gate-key lookup: {error}"
+        );
     }
 
     #[test]

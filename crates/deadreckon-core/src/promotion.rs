@@ -618,6 +618,7 @@ mod tests {
             source_revision: None,
             sandbox_requested: "sandbox-exec".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         atomic_write_json(&paths.job_authority(&state.run_id), &authority).expect("authority");
         let job = Job {
@@ -784,6 +785,7 @@ mod tests {
             operator_capture_write_denied: true,
             signing_env_scrubbed: true,
             probe_sha256: sha256_text("fixed controller probe"),
+            gate_evaluator_sha256: authority.gate_evaluator_sha256.clone(),
             signature: String::new(),
         };
         crate::seal_sandbox_boundary_observation(paths, state, authority, &observation)

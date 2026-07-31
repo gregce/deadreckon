@@ -22,19 +22,26 @@ stable publication.
 
 Every official RC or stable release must produce:
 
-- cargo-dist archives and shell/PowerShell installers;
+- cargo-dist archives and shell/PowerShell installers. Every host archive must
+  contain the host-native `deadreckon`, `dr-gate`, and `dr-capture` binaries
+  plus both static Linux evaluator sidecars:
+  `dr-gate-evaluator-aarch64-unknown-linux-musl` and
+  `dr-gate-evaluator-x86_64-unknown-linux-musl`;
 - the Homebrew formula artifact;
 - npm wrapper and platform packages when the lane is stable;
 - `SHA256SUMS`;
 - `release-manifest.json`;
+- `release-archive-members.json`, which records every final archive member and
+  the common evaluator-sidecar digests;
 - `release.spdx.json`;
 - GitHub artifact attestations;
 - npm provenance for published npm packages;
 - release notes or runbook commands that show verification steps.
 
-The workflow uploads the trust bundle explicitly after `cargo-dist` creates the
-GitHub Release, then appends the checksum and attestation verification commands
-to the release notes.
+`cargo-dist` plans and builds artifacts but never creates or updates the GitHub
+Release. After the trust bundle and attestations succeed, one final write-scoped
+job publishes the release with `gh` and includes the checksum and attestation
+verification commands in the release notes.
 
 Users should be able to verify a downloaded artifact with:
 
@@ -43,9 +50,20 @@ shasum -a 256 -c SHA256SUMS
 gh attestation verify <artifact> --repo gregce/deadreckon
 ```
 
-For macOS artifacts, CI extracts the cargo-dist archive, signs the packaged
-`deadreckon` binary, verifies it with `codesign`, submits it with `notarytool`,
-then repacks the archive that will be uploaded.
+Release CI builds the two evaluator sidecars as static musl ELF binaries for
+Linux arm64 and x86-64. It validates their architecture and lack of a dynamic
+interpreter, then inserts the identical pair into every host archive before
+signing, checksums, manifests, attestations, package-manager preparation, and
+upload. `release/evaluator-sidecars.mjs` fails closed when a helper is missing,
+duplicated, unsafe to extract, dynamically linked, for the wrong architecture,
+or differs between archives.
+
+For macOS artifacts, CI extracts the complete assembled archive, signs the
+host-native `deadreckon`, `dr-gate`, and `dr-capture` binaries, verifies each
+with `codesign --strict`, submits the complete payload with `notarytool`, then
+repacks the archive that will be checksummed and uploaded. The Linux evaluator
+sidecars are not Apple-signed executables, but they are members of the
+notarized, checksummed and attested payload.
 
 ## Required Apple Secrets
 
@@ -69,9 +87,10 @@ Official stable releases fail if Windows signing material is absent.
 | `WINDOWS_CERT_PFX` | Base64-encoded Authenticode code-signing `.pfx` export. |
 | `WINDOWS_CERT_PWD` | Password for the `.pfx` export. |
 
-The Windows job decodes the `.pfx`, extracts the cargo-dist Windows zip, signs
-`deadreckon.exe` with `signtool sign`, verifies it with `signtool verify`, then
-repacks the zip and records Authenticode status in `release-manifest.json`.
+The Windows job decodes the `.pfx`, extracts the complete assembled cargo-dist
+Windows zip, signs `deadreckon.exe`, `dr-gate.exe`, and `dr-capture.exe` with
+`signtool sign`, verifies each with `signtool verify`, then repacks the zip and
+records Authenticode status in `release-manifest.json`.
 
 ## Apple Developer ID Checklist
 
@@ -173,7 +192,7 @@ Everything the operator does once, in order, before cutting `v0.1.0`:
    ```sh
    cargo test -p deadreckon --test release_plan
    cargo test -p deadreckon --test npm_wrapper
-   cargo fmt --check
+   cargo fmt --all -- --check
    git diff --check
    ```
 
@@ -197,8 +216,10 @@ Everything the operator does once, in order, before cutting `v0.1.0`:
    `release/known-good-providers.json` (schema_version 1); commit that file
    so the release notes can reference known-good CLI versions.
 9. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
-   `SHA256SUMS`, `release-manifest.json`, `release.spdx.json`, macOS signing
-   evidence, and attestations.
+   `SHA256SUMS`, `release-manifest.json`, `release-archive-members.json`,
+   `release.spdx.json`, macOS signing evidence, and attestations. Confirm every
+   archive contains exactly one host-native `deadreckon`, `dr-gate`, and
+   `dr-capture`, plus exactly one copy of each static evaluator sidecar.
 10. After the RC rehearsal is clean, create and push the stable tag.
 
 The first real release remains an operator action.
@@ -230,7 +251,9 @@ deadreckon doctor
 
 Before announcing the command, confirm that the site script's default tag points
 at the published RC and that the release has `deadreckon-installer.sh` plus
-`SHA256SUMS` attached. For a pinned rehearsal:
+`SHA256SUMS` attached. The wrapper refuses a completed installation unless all
+three host-native binaries and both evaluator sidecars are executable beside
+`deadreckon`. For a pinned rehearsal:
 
 ```sh
 curl -fsSL https://deadreckon.sh/install.sh | DEADRECKON_TAG=<tag-under-test> sh

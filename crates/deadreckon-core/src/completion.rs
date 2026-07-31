@@ -1728,10 +1728,10 @@ mod tests {
 
     use chrono::Utc;
     use deadreckon_protocol::{
-        AuthorityAcceptedBy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent,
-        JobEventKind, JobEventSequence, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId,
-        SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
-        SemanticJudgeMode, SemanticJudgment,
+        AuthorityAcceptedBy, GateBinaryIdentity, GateEvaluatorIdentity, GoalCoverage,
+        GoalCoverageStatus, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobId,
+        JobPolicy, JobSchemaVersion, JobShape, RunId, SandboxBoundaryObservation,
+        SandboxBoundaryObservationIssuer, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
     };
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -1817,6 +1817,7 @@ mod tests {
             source_revision: None,
             sandbox_requested: "sandbox-exec".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         atomic_write_json(&paths.job_authority("job-1"), &authority).expect("authority");
         let job = Job {
@@ -1891,6 +1892,52 @@ mod tests {
         fixture_with_contract("name: result\nchecks:\n  - file_exists: result.txt\n")
     }
 
+    fn identity_fixture() -> Fixture {
+        let mut fixture = fixture();
+        let binary = GateBinaryIdentity {
+            sha256: format!("sha256:{}", "a".repeat(64)),
+            os: "macos".to_string(),
+            arch: "aarch64".to_string(),
+        };
+        let identity = GateEvaluatorIdentity {
+            schema_version: deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            protocol_version: deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+            controller: binary.clone(),
+            evaluator: binary,
+            docker: None,
+        };
+        let mut job = load_job(&fixture.paths, fixture.authority.job_id.as_ref()).expect("job");
+        job.policy
+            .execution
+            .as_mut()
+            .expect("execution policy")
+            .gate_evaluator = Some(identity.clone());
+        fixture.authority.gate_evaluator_sha256 =
+            Some(crate::gate_evaluator_identity_sha256(&identity).expect("identity digest"));
+        fixture.authority.effective_policy_sha256 =
+            sha256_text(&serde_json::to_string(&job.policy).expect("policy JSON"));
+        atomic_write_json(
+            &fixture
+                .paths
+                .job_authority(fixture.authority.job_id.as_ref()),
+            &fixture.authority,
+        )
+        .expect("identity-bound authority");
+        job.authority_sha256 = sha256_file(
+            &fixture
+                .paths
+                .job_authority(fixture.authority.job_id.as_ref()),
+        )
+        .expect("authority digest");
+        atomic_write_json(
+            &fixture.paths.job_json(fixture.authority.job_id.as_ref()),
+            &job,
+        )
+        .expect("identity-bound job");
+        seal_boundary_observation(&fixture);
+        fixture
+    }
+
     fn seal_boundary_observation(fixture: &Fixture) {
         let observation = SandboxBoundaryObservation {
             schema_version: JobSchemaVersion::CURRENT,
@@ -1920,6 +1967,7 @@ mod tests {
             operator_capture_write_denied: true,
             signing_env_scrubbed: true,
             probe_sha256: sha256_text("fixed controller probe"),
+            gate_evaluator_sha256: fixture.authority.gate_evaluator_sha256.clone(),
             signature: String::new(),
         };
         crate::seal_sandbox_boundary_observation(
@@ -2564,6 +2612,39 @@ mod tests {
         assert_eq!(
             validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
             receipt
+        );
+    }
+
+    #[test]
+    fn receipt_round_trips_identity_bound_observation_and_rejects_identity_tamper() {
+        let fixture = identity_fixture();
+        let receipt = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect("identity-bound receipt");
+        assert_eq!(
+            validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
+            receipt
+        );
+
+        let path = fixture
+            .paths
+            .job_sandbox_boundary_observation(fixture.authority.job_id.as_ref());
+        let mut observation: SandboxBoundaryObservation =
+            serde_json::from_slice(&fs::read(&path).expect("observation"))
+                .expect("observation JSON");
+        observation.gate_evaluator_sha256 = Some(format!("sha256:{}", "b".repeat(64)));
+        atomic_write_json(&path, &observation).expect("tampered evaluator identity");
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("identity tamper must invalidate receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("observed gate evaluator identity digest changed")
         );
     }
 

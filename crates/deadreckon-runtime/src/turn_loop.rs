@@ -1,18 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_protocol::{
-    JobAuthority, JobSchemaVersion, RunEvent, RunEventKind, SandboxBoundaryObservation,
-    SandboxBoundaryObservationIssuer, SpendRecord, TraceRecord,
+    GateEvaluatorIdentity, JobAuthority, JobSchemaVersion, RunEvent, RunEventKind,
+    SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::{
-    GuardedLaunchSpec, ProtectedPathPolicy, SandboxBackend, SandboxSpec, ToolSandboxPolicy,
-    WorkspaceAccess, resolve_backend, run as run_sandbox,
+    DockerExecution, DockerImage, DockerPlatform, GuardedLaunchSpec, ProtectedPathPolicy,
+    SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, inspect_docker_image,
+    reconcile_docker_execution_record, resolve_backend, run as run_sandbox,
+    write_docker_execution_record,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -944,6 +946,7 @@ async fn run_turn_loop_inner(
                 }
                 let output = match run_sandbox(SandboxSpec {
                     backend: config.sandbox_backend,
+                    docker: None,
                     cwd: state.working_dir.clone(),
                     program: OsString::from("sh"),
                     args: vec![OsString::from("-lc"), OsString::from(command.clone())],
@@ -2723,6 +2726,7 @@ pub async fn run_deterministic_completion_gate(
     } else {
         None
     };
+    let gate_toolchain = resolve_gate_toolchain(state, &paths, strict_job, resolved_backend)?;
 
     // Default detection and contract persistence are trusted-controller work.
     // The keyless evaluator is deliberately read-only outside `working_dir`
@@ -2736,6 +2740,7 @@ pub async fn run_deterministic_completion_gate(
                 &paths,
                 resolved_backend,
                 launch_owner,
+                &gate_toolchain,
                 cancellation_token,
             )
             .await?,
@@ -2744,7 +2749,6 @@ pub async fn run_deterministic_completion_gate(
         None
     };
     let (pid_file, guarded_launch) = if let Some(launch_owner) = launch_owner {
-        let gate = gate_binary_path()?;
         let launch_id = Uuid::new_v4().to_string();
         (
             state.run_root.join("child-pids").join(format!(
@@ -2752,7 +2756,7 @@ pub async fn run_deterministic_completion_gate(
                 launch_owner.attempt
             )),
             Some(GuardedLaunchSpec {
-                program: gate.into_os_string(),
+                program: gate_toolchain.controller.clone().into_os_string(),
                 launch_id,
                 attempt: launch_owner.attempt,
                 owner_launch_id: Some(launch_owner.outer_launch_id.clone()),
@@ -2776,6 +2780,7 @@ pub async fn run_deterministic_completion_gate(
         guarded_launch,
         strict_job,
         strict_job,
+        Some(&gate_toolchain),
         cancellation_token,
     )
     .await?;
@@ -2798,7 +2803,8 @@ pub async fn run_deterministic_completion_gate(
             })?;
         deadreckon_core::seal_sandbox_boundary_observation(&paths, state, &authority, observation)?;
     }
-    let gate = gate_binary_path()?;
+    revalidate_gate_toolchain(&gate_toolchain)?;
+    let gate = gate_toolchain.controller.clone();
     let gate_key = deadreckon_core::read_gate_key(&paths, &state.run_id)?;
     let encoded_key = deadreckon_core::encode_gate_key(&gate_key)?;
     let mut signer = std::process::Command::new(&gate);
@@ -2826,6 +2832,9 @@ pub async fn run_deterministic_completion_gate(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(identity) = gate_toolchain.identity_sha256.as_deref() {
+        signer.arg("--gate-evaluator-sha256").arg(identity);
+    }
     let mut signer = signer.spawn().map_err(|source| DeadreckonError::Io {
         path: gate.clone(),
         source,
@@ -2854,16 +2863,7 @@ pub async fn run_deterministic_completion_gate(
     Ok(())
 }
 
-const STRICT_SANDBOX_BOUNDARY_PROBE: &str = r#"set -eu
-if cat "$DR_BOUNDARY_GATE_KEY" >/dev/null 2>&1; then exit 31; fi
-if printf forged >"$DR_BOUNDARY_PROOF" 2>/dev/null; then exit 32; fi
-if printf tampered >"$DR_BOUNDARY_CONTROL" 2>/dev/null; then exit 33; fi
-if printf forged >"$DR_BOUNDARY_OPERATOR_CAPTURE" 2>/dev/null; then exit 34; fi
-if cat "$DR_BOUNDARY_OPERATOR_CAPTURE" >/dev/null 2>&1; then exit 35; fi
-test -z "${DEADRECKON_GATE_KEY+x}"
-test -z "${DEADRECKON_GATE_CONTAINED+x}"
-test -z "${DEADRECKON_GATE_SANDBOX_BACKEND+x}"
-printf deadreckon-sandbox-boundary-v1"#;
+const STRICT_SANDBOX_BOUNDARY_PROBE: &str = "dr-gate probe-boundary v1";
 const STRICT_SANDBOX_BOUNDARY_SUCCESS: &str = "deadreckon-sandbox-boundary-v1";
 
 async fn run_strict_sandbox_boundary_probe(
@@ -2871,6 +2871,7 @@ async fn run_strict_sandbox_boundary_probe(
     paths: &DeadreckonPaths,
     resolved_backend: SandboxBackend,
     launch_owner: &GateLaunchOwner,
+    gate_toolchain: &ResolvedGateToolchain,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<SandboxBoundaryObservation> {
     if resolved_backend == SandboxBackend::None || resolved_backend == SandboxBackend::Auto {
@@ -2916,6 +2917,7 @@ async fn run_strict_sandbox_boundary_probe(
     prepare_strict_gate_environment(
         &state.working_dir,
         runtime.path(),
+        resolved_backend,
         &mut env,
         &mut read_allowlist,
     )?;
@@ -2947,20 +2949,30 @@ async fn run_strict_sandbox_boundary_probe(
 
     let mut boundary = ProtectedPathPolicy::for_paths(paths);
     boundary.protect_workspace_git_control(&state.working_dir);
-    let guard = gate_binary_path()?;
+    revalidate_gate_toolchain(gate_toolchain)?;
+    let guard = gate_toolchain.controller.clone();
     let probe_launch_id = Uuid::new_v4().to_string();
     let pid_file = state.run_root.join("child-pids").join(format!(
         "sandbox-boundary-probe-{}-{probe_launch_id}.json",
         launch_owner.attempt
     ));
+    let docker = prepare_gate_docker(
+        state,
+        paths,
+        gate_toolchain,
+        resolved_backend,
+        "gate-probe",
+        &probe_launch_id,
+        launch_owner.attempt,
+        Some(launch_owner.outer_launch_id.clone()),
+        &pid_file,
+    )?;
     let output = run_sandbox(SandboxSpec {
         backend: resolved_backend,
+        docker: docker.as_ref().map(|prepared| prepared.execution.clone()),
         cwd: state.working_dir.clone(),
-        program: OsString::from("/bin/sh"),
-        args: vec![
-            OsString::from("-c"),
-            OsString::from(STRICT_SANDBOX_BOUNDARY_PROBE),
-        ],
+        program: gate_toolchain.evaluator.clone().into_os_string(),
+        args: vec![OsString::from("probe-boundary")],
         stdin: None,
         env,
         allow_network: false,
@@ -2982,7 +2994,9 @@ async fn run_strict_sandbox_boundary_probe(
         }),
     })
     .await
-    .map_err(|error| sandbox_error(&error))?;
+    .map_err(|error| sandbox_error(&error));
+    finish_gate_docker(docker.as_ref())?;
+    let output = output?;
 
     let proof_unchanged = read_probe_sentinel(&proof_sentinel)? == sentinel.as_bytes();
     let control_unchanged = read_probe_sentinel(&control_sentinel)? == sentinel.as_bytes();
@@ -3024,6 +3038,7 @@ async fn run_strict_sandbox_boundary_probe(
         result_tree_sha256: deadreckon_core::sandbox_boundary_result_tree_sha256(state)?,
         sandbox_requested: authority.sandbox_requested,
         sandbox_backend: output.backend.to_string(),
+        gate_evaluator_sha256: gate_toolchain.identity_sha256.clone(),
         contained: true,
         gate_key_read_denied: true,
         proof_write_denied: proof_unchanged,
@@ -3081,9 +3096,20 @@ async fn run_keyless_gate_evaluation(
     guarded_launch: Option<GuardedLaunchSpec>,
     cleanup_process_group: bool,
     require_contained: bool,
+    gate_toolchain: Option<&ResolvedGateToolchain>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<KeylessGateEvaluation> {
-    let gate = gate_binary_path()?;
+    let fallback_gate;
+    let (gate, gate_evaluator_sha256) = if let Some(toolchain) = gate_toolchain {
+        revalidate_gate_toolchain(toolchain)?;
+        (
+            toolchain.evaluator.as_path(),
+            toolchain.identity_sha256.as_deref(),
+        )
+    } else {
+        fallback_gate = gate_binary_path()?;
+        (fallback_gate.as_path(), None)
+    };
     let paths = paths_for_state(state)?;
     let disposable_copy = require_contained && working_dir != state.working_dir;
     let evaluation_runtime = if require_contained {
@@ -3111,6 +3137,7 @@ async fn run_keyless_gate_evaluation(
         prepare_strict_gate_environment(
             working_dir,
             runtime.path(),
+            requested_backend,
             &mut env,
             &mut read_allowlist,
         )?;
@@ -3123,19 +3150,51 @@ async fn run_keyless_gate_evaluation(
     read_allowlist.dedup();
     write_allowlist.sort();
     write_allowlist.dedup();
+    let mut gate_args = vec![
+        "evaluate".into(),
+        "--run".into(),
+        state.run_id.clone().into(),
+        "--run-root".into(),
+        state.run_root.clone().into_os_string(),
+        "--working-dir".into(),
+        working_dir.to_path_buf().into_os_string(),
+    ];
+    if let Some(identity) = gate_evaluator_sha256 {
+        gate_args.push("--gate-evaluator-sha256".into());
+        gate_args.push(identity.into());
+    }
+    let docker = if requested_backend == SandboxBackend::Docker {
+        let toolchain = gate_toolchain.ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "Docker verdict evaluation requires a frozen Job evaluator; no check was run"
+                    .to_string(),
+            )
+        })?;
+        let guard = guarded_launch.as_ref().ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "strict Docker evaluation is missing guarded launch identity".to_string(),
+            )
+        })?;
+        prepare_gate_docker(
+            state,
+            &paths,
+            toolchain,
+            requested_backend,
+            "gate-evaluate",
+            &guard.launch_id,
+            guard.attempt,
+            guard.owner_launch_id.clone(),
+            &pid_file,
+        )?
+    } else {
+        None
+    };
     let output = run_sandbox(SandboxSpec {
         backend: requested_backend,
+        docker: docker.as_ref().map(|prepared| prepared.execution.clone()),
         cwd: working_dir.to_path_buf(),
-        program: gate.clone().into_os_string(),
-        args: vec![
-            "evaluate".into(),
-            "--run".into(),
-            state.run_id.clone().into(),
-            "--run-root".into(),
-            state.run_root.clone().into_os_string(),
-            "--working-dir".into(),
-            working_dir.to_path_buf().into_os_string(),
-        ],
+        program: gate.as_os_str().to_os_string(),
+        args: gate_args,
         stdin: None,
         env,
         allow_network: false,
@@ -3156,7 +3215,9 @@ async fn run_keyless_gate_evaluation(
         guarded_launch,
     })
     .await
-    .map_err(|err| sandbox_error(&err))?;
+    .map_err(|err| sandbox_error(&err));
+    finish_gate_docker(docker.as_ref())?;
+    let output = output?;
     if output.status_code != Some(0) {
         return Err(DeadreckonError::InvalidInput(format!(
             "sandboxed dr-gate evaluation failed with status {:?} under {}: stdout: {} stderr: {}",
@@ -3180,6 +3241,12 @@ async fn run_keyless_gate_evaluation(
         working_dir,
         &evaluation,
     )?;
+    if evaluation.gate_evaluator_sha256.as_deref() != gate_evaluator_sha256 {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "sandboxed dr-gate evaluator identity {:?} does not match approved identity {:?}",
+            evaluation.gate_evaluator_sha256, gate_evaluator_sha256
+        )));
+    }
     Ok(KeylessGateEvaluation {
         evaluation,
         raw_json: output.stdout,
@@ -3295,6 +3362,7 @@ pub async fn run_contained_verdict_evaluation(
         None,
         true,
         true,
+        None,
         cancellation_token,
     )
     .await?;
@@ -3321,6 +3389,7 @@ fn extend_gate_toolchain_reads(read_allowlist: &mut Vec<PathBuf>) {
 fn prepare_strict_gate_environment(
     working_dir: &Path,
     runtime_root: &Path,
+    backend: SandboxBackend,
     env: &mut BTreeMap<String, String>,
     read_allowlist: &mut Vec<PathBuf>,
 ) -> Result<()> {
@@ -3358,22 +3427,41 @@ fn prepare_strict_gate_environment(
         .filter(|path| path.is_absolute())
         .or_else(|| host_home.as_ref().map(|home| home.join(".rustup")));
 
-    let mut path_entries = Vec::new();
-    for path in [
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/sbin"),
-        PathBuf::from("/sbin"),
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/Library/Apple/usr/bin"),
-    ] {
-        push_existing_unique(&mut path_entries, path);
-    }
+    let docker = backend == SandboxBackend::Docker;
+    let mut path_entries = if docker {
+        [
+            "/usr/local/cargo/bin",
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>()
+    } else {
+        let mut entries = Vec::new();
+        for path in [
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+            PathBuf::from("/usr/sbin"),
+            PathBuf::from("/sbin"),
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/Library/Apple/usr/bin"),
+        ] {
+            push_existing_unique(&mut entries, path);
+        }
+        entries
+    };
     if let Some(cargo) = host_cargo.as_ref().filter(|path| path.is_dir()) {
         let bin = cargo.join("bin");
-        push_existing_unique(&mut path_entries, bin.clone());
-        push_existing_unique(read_allowlist, bin);
+        if !docker {
+            push_existing_unique(&mut path_entries, bin.clone());
+            push_existing_unique(read_allowlist, bin);
+        }
         for cache in ["registry", "git"] {
             let source = cargo.join(cache);
             if source.is_dir() {
@@ -3382,7 +3470,9 @@ fn prepare_strict_gate_environment(
             }
         }
     }
-    if let Some(rustup) = host_rustup.as_ref().filter(|path| path.is_dir()) {
+    if docker {
+        env.insert("RUSTUP_HOME".to_string(), "/usr/local/rustup".to_string());
+    } else if let Some(rustup) = host_rustup.as_ref().filter(|path| path.is_dir()) {
         env.insert(
             "RUSTUP_HOME".to_string(),
             rustup.to_string_lossy().into_owned(),
@@ -3399,7 +3489,9 @@ fn prepare_strict_gate_environment(
         ))
     })?;
     env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
-    configure_macos_strict_toolchain(env, read_allowlist);
+    if !docker {
+        configure_macos_strict_toolchain(env, read_allowlist);
+    }
     Ok(())
 }
 
@@ -4944,17 +5036,283 @@ fn trusted_git_status(control: &TrustedGitControl, args: &[&str]) -> Result<()> 
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedGateToolchain {
+    controller: PathBuf,
+    evaluator: PathBuf,
+    identity: Option<GateEvaluatorIdentity>,
+    identity_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedGateDocker {
+    execution: DockerExecution,
+    record_path: PathBuf,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_gate_docker(
+    state: &PipelineState,
+    paths: &DeadreckonPaths,
+    toolchain: &ResolvedGateToolchain,
+    resolved_backend: SandboxBackend,
+    purpose: &str,
+    launch_id: &str,
+    attempt: u32,
+    owner_launch_id: Option<String>,
+    guarded_process_record: &Path,
+) -> Result<Option<PreparedGateDocker>> {
+    if resolved_backend != SandboxBackend::Docker {
+        return Ok(None);
+    }
+    let identity = toolchain.identity.as_ref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "strict Docker gate is missing immutable evaluator identity".to_string(),
+        )
+    })?;
+    let docker = identity.docker.as_ref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "strict Docker gate is missing immutable image identity".to_string(),
+        )
+    })?;
+    if docker.guest_path != Path::new(deadreckon_sandbox::DOCKER_SIDECAR_CONTAINER_PROGRAM)
+        || docker.guest_path != Path::new(deadreckon_protocol::DOCKER_GATE_GUEST_PATH)
+    {
+        return Err(DeadreckonError::InvalidInput(
+            "approved Docker evaluator guest path does not match the fixed sandbox boundary"
+                .to_string(),
+        ));
+    }
+    let platform = match docker.platform.as_str() {
+        "linux/amd64" => DockerPlatform::LinuxAmd64,
+        "linux/arm64" => DockerPlatform::LinuxArm64,
+        other => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "unsupported approved Docker evaluator platform {other}"
+            )));
+        }
+    };
+    let image = DockerImage::new(docker.image_id.clone(), platform)
+        .map_err(|error| sandbox_error(&error))?;
+    let observed = inspect_docker_image(OsStr::new(&docker.image_id))
+        .map_err(|error| sandbox_error(&error))?;
+    if observed != image {
+        return Err(DeadreckonError::InvalidInput(
+            "cached Docker image identity changed after Job approval".to_string(),
+        ));
+    }
+    let safe_purpose = purpose
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect::<String>();
+    let launch_slug = launch_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>();
+    let container_name = format!("deadreckon-{safe_purpose}-{attempt}-{launch_slug}");
+    let record_dir = paths.job_dir(&state.run_id).join("docker-executions");
+    std::fs::create_dir_all(&record_dir).with_path(&record_dir)?;
+    let process_record_dir = guarded_process_record.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "guarded process record has no parent: {}",
+            guarded_process_record.display()
+        ))
+    })?;
+    std::fs::create_dir_all(process_record_dir).with_path(process_record_dir)?;
+    let cid_file =
+        process_record_dir.join(format!("docker-{safe_purpose}-{attempt}-{launch_slug}.cid"));
+    let record_path = record_dir.join(format!("{safe_purpose}-{attempt}-{launch_slug}.json"));
+    let execution = DockerExecution::new(
+        image,
+        &toolchain.evaluator,
+        container_name,
+        cid_file,
+        state.run_id.clone(),
+        launch_id.to_string(),
+        attempt,
+        owner_launch_id,
+    )
+    .map_err(|error| sandbox_error(&error))?;
+    write_docker_execution_record(&record_path, &execution)
+        .map_err(|error| sandbox_error(&error))?;
+    Ok(Some(PreparedGateDocker {
+        execution,
+        record_path,
+    }))
+}
+
+fn finish_gate_docker(prepared: Option<&PreparedGateDocker>) -> Result<()> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    reconcile_docker_execution_record(&prepared.record_path).map_err(|error| sandbox_error(&error))
+}
+
+fn resolve_gate_toolchain(
+    state: &PipelineState,
+    paths: &DeadreckonPaths,
+    strict_job: bool,
+    resolved_backend: SandboxBackend,
+) -> Result<ResolvedGateToolchain> {
+    if !strict_job {
+        let gate = gate_binary_path()?;
+        return Ok(ResolvedGateToolchain {
+            controller: gate.clone(),
+            evaluator: gate,
+            identity: None,
+            identity_sha256: None,
+        });
+    }
+    let job = deadreckon_core::load_job(paths, &state.run_id)?;
+    let authority_path = paths.job_authority(&state.run_id);
+    if deadreckon_core::flight::sha256_file(&authority_path)? != job.authority_sha256 {
+        return Err(DeadreckonError::InvalidInput(
+            "Job authority changed before deterministic gate launch".to_string(),
+        ));
+    }
+    let authority_raw = std::fs::read(&authority_path).with_path(&authority_path)?;
+    let authority: JobAuthority =
+        serde_json::from_slice(&authority_raw).map_err(|source| DeadreckonError::Json {
+            path: authority_path,
+            source,
+        })?;
+    let identity = job
+        .policy
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.gate_evaluator.clone())
+        .ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "strict Job is missing its immutable gate evaluator identity".to_string(),
+            )
+        })?;
+    let identity_sha256 = deadreckon_core::gate_evaluator_identity_sha256(&identity)?;
+    if authority.gate_evaluator_sha256.as_deref() != Some(identity_sha256.as_str()) {
+        return Err(DeadreckonError::InvalidInput(
+            "strict Job gate evaluator identity no longer matches approved authority".to_string(),
+        ));
+    }
+    let docker_coherent = if resolved_backend == SandboxBackend::Docker {
+        identity.docker.is_some()
+    } else {
+        identity.docker.is_none()
+    };
+    if !docker_coherent {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved gate evaluator is incompatible with resolved {resolved_backend} containment"
+        )));
+    }
+    if identity.controller.os != current_gate_os()
+        || identity.controller.arch != current_gate_arch()
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved gate controller targets {}/{}, but this supervisor is {}/{}",
+            identity.controller.os,
+            identity.controller.arch,
+            current_gate_os(),
+            current_gate_arch()
+        )));
+    }
+    let toolchain = ResolvedGateToolchain {
+        controller: paths.job_frozen_controller_gate(&state.run_id),
+        evaluator: paths.job_frozen_evaluator_gate(&state.run_id),
+        identity: Some(identity),
+        identity_sha256: Some(identity_sha256),
+    };
+    revalidate_gate_toolchain(&toolchain)?;
+    Ok(toolchain)
+}
+
+fn revalidate_gate_toolchain(toolchain: &ResolvedGateToolchain) -> Result<()> {
+    let Some(identity) = toolchain.identity.as_ref() else {
+        return Ok(());
+    };
+    validate_frozen_gate(&toolchain.controller, &identity.controller.sha256)?;
+    validate_frozen_gate(&toolchain.evaluator, &identity.evaluator.sha256)
+}
+
+fn validate_frozen_gate(path: &Path, expected_sha256: &str) -> Result<()> {
+    let before = std::fs::symlink_metadata(path).with_path(path)?;
+    if !before.file_type().is_file() || before.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "frozen gate artifact is not a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    let actual = deadreckon_core::flight::sha256_file(path)?;
+    let after = std::fs::symlink_metadata(path).with_path(path)?;
+    if !stable_gate_artifact_metadata(&before, &after) || actual != expected_sha256 {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "frozen gate artifact changed after Job approval: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn stable_gate_artifact_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.file_type().is_file()
+        && right.file_type().is_file()
+}
+
+#[cfg(not(unix))]
+fn stable_gate_artifact_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.file_type().is_file()
+        && right.file_type().is_file()
+}
+
+fn current_gate_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        "windows" => "windows",
+        other => other,
+    }
+}
+
+fn current_gate_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "aarch64",
+        "x86_64" => "x86_64",
+        other => other,
+    }
+}
+
 fn gate_binary_path() -> Result<PathBuf> {
     let current = std::env::current_exe().map_err(|source| DeadreckonError::Io {
         path: PathBuf::from("current-exe"),
         source,
     })?;
-    let gate = current.with_file_name("dr-gate");
-    if gate.exists() {
-        return Ok(gate);
+    let name = format!("dr-gate{}", std::env::consts::EXE_SUFFIX);
+    let mut roots = current
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if current.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("deps"))
+        && let Some(root) = current.parent().and_then(Path::parent)
+    {
+        roots.push(root.to_path_buf());
+    }
+    for root in roots {
+        let gate = root.join(&name);
+        if gate.exists() {
+            return Ok(gate);
+        }
     }
     Err(DeadreckonError::NotFound(format!(
-        "dr-gate binary next to {}",
+        "{name} binary next to {}",
         current.display()
     )))
 }
@@ -7990,6 +8348,7 @@ network = []
             source_revision: None,
             sandbox_requested: "sandbox-exec".to_string(),
             semantic_judge_mode: SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
         };
         let authority_path = paths.job_authority(&state.run_id);
         std::fs::create_dir_all(authority_path.parent().expect("authority parent"))
@@ -8409,5 +8768,41 @@ exit 0\n",
             provider_failure_disposition(&fatal),
             deadreckon_core::ProviderFailureDisposition::Fatal
         );
+    }
+
+    #[test]
+    fn frozen_gate_validation_rejects_content_and_symlink_tamper() {
+        let temp = TempDir::new().expect("tempdir");
+        let gate = temp.path().join("dr-gate");
+        std::fs::write(&gate, b"approved gate bytes").expect("gate fixture");
+        let expected = deadreckon_core::flight::sha256_file(&gate).expect("approved gate digest");
+
+        super::validate_frozen_gate(&gate, &expected).expect("approved gate validates");
+
+        std::fs::write(&gate, b"tampered gate bytes").expect("tamper gate");
+        let error = super::validate_frozen_gate(&gate, &expected)
+            .expect_err("content tamper must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("frozen gate artifact changed after Job approval"),
+            "{error}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = temp.path().join("replacement");
+            std::fs::write(&target, b"approved gate bytes").expect("replacement");
+            std::fs::remove_file(&gate).expect("remove gate");
+            symlink(&target, &gate).expect("symlink gate");
+            let error = super::validate_frozen_gate(&gate, &expected)
+                .expect_err("symlink substitution must be rejected");
+            assert!(
+                error.to_string().contains("regular non-symlink file"),
+                "{error}"
+            );
+        }
     }
 }

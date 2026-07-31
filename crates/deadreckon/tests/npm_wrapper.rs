@@ -45,6 +45,10 @@ const PLATFORM_PACKAGES: &[PlatformPackage] = &[
         binary: "deadreckon.exe",
     },
 ];
+const EVALUATOR_SIDECARS: &[&str] = &[
+    "dr-gate-evaluator-aarch64-unknown-linux-musl",
+    "dr-gate-evaluator-x86_64-unknown-linux-musl",
+];
 
 #[derive(Clone, Copy)]
 struct PlatformPackage {
@@ -185,16 +189,42 @@ fn npm_wrapper_bin_resolves_to_platform_package() {
 }
 
 #[test]
-fn npm_platform_package_contains_single_executable() {
+fn npm_platform_package_contains_native_helpers_and_both_evaluators() {
     let prepared = prepare_fake_npm_release();
     for package in PLATFORM_PACKAGES {
         let bin_dir = prepared.path().join("npm").join(package.name).join("bin");
         let entries = fs::read_dir(&bin_dir)
             .expect("read bin dir")
-            .map(|entry| entry.expect("bin entry").file_name())
-            .collect::<Vec<_>>();
-        assert_eq!(1, entries.len(), "{}", bin_dir.display());
-        assert_eq!(package.binary, entries[0].to_string_lossy());
+            .map(|entry| {
+                entry
+                    .expect("bin entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = package_files(*package)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected, entries, "{}", bin_dir.display());
+
+        let package_json = read_json(
+            &prepared
+                .path()
+                .join("npm")
+                .join(package.name)
+                .join("package.json"),
+        );
+        let declared = package_json
+            .get("files")
+            .and_then(Value::as_array)
+            .expect("files array")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|entry| entry.trim_start_matches("bin/").to_string())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected, declared, "{} package files", package.name);
     }
 }
 
@@ -229,6 +259,43 @@ fn npm_platform_package_json_pins_os_and_cpu() {
             "{}",
             package.name
         );
+    }
+}
+
+#[test]
+fn npm_platform_packages_pack_complete_runtime_from_release_archives() {
+    let prepared = prepare_fake_npm_release_from_archives();
+    for package in PLATFORM_PACKAGES {
+        let package_dir = prepared.path().join("npm").join(package.name);
+        let output = Command::new("npm")
+            .args(["pack", "--dry-run", "--json"])
+            .arg(&package_dir)
+            .current_dir(prepared.path())
+            .output()
+            .expect("npm pack dry run");
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let packed: Value = serde_json::from_slice(&output.stdout).expect("npm pack json");
+        let files = packed[0]["files"]
+            .as_array()
+            .expect("packed files")
+            .iter()
+            .filter_map(|entry| entry["path"].as_str())
+            .collect::<BTreeSet<_>>();
+        let mut expected = package_files(*package)
+            .into_iter()
+            .map(|name| format!("bin/{name}"))
+            .collect::<BTreeSet<_>>();
+        expected.insert("package.json".to_string());
+        let actual = files
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(expected, actual, "{} npm tarball", package.name);
     }
 }
 
@@ -303,11 +370,10 @@ fn prepare_fake_npm_release() -> TempDir {
     for package in PLATFORM_PACKAGES {
         let dir = artifacts.join(package.target);
         fs::create_dir_all(&dir).expect("artifact dir");
-        fs::write(
-            dir.join(package.binary),
-            format!("binary for {}\n", package.target),
-        )
-        .expect("artifact binary");
+        for file in package_files(*package) {
+            fs::write(dir.join(file), format!("{file} for {}\n", package.target))
+                .expect("artifact binary");
+        }
     }
     let output = Command::new("node")
         .arg(temp.path().join("npm/scripts/prepare-release.mjs"))
@@ -322,6 +388,78 @@ fn prepare_fake_npm_release() -> TempDir {
         String::from_utf8_lossy(&output.stderr)
     );
     temp
+}
+
+fn prepare_fake_npm_release_from_archives() -> TempDir {
+    let temp = TempDir::new().expect("tempdir");
+    copy_dir(&workspace_root().join("npm"), &temp.path().join("npm"));
+    let artifacts = temp.path().join("artifacts");
+    let payloads = temp.path().join("payloads");
+    fs::create_dir_all(&artifacts).expect("artifacts");
+    fs::create_dir_all(&payloads).expect("payloads");
+    for package in PLATFORM_PACKAGES {
+        let payload_name = format!("deadreckon-{}", package.target);
+        let payload = payloads.join(&payload_name);
+        fs::create_dir_all(&payload).expect("archive payload");
+        for file in package_files(*package) {
+            fs::write(
+                payload.join(file),
+                format!("{file} for {}\n", package.target),
+            )
+            .expect("archive member");
+        }
+        let output = if package.target.ends_with("windows-msvc") {
+            Command::new("zip")
+                .args(["-X", "-q", "-r"])
+                .arg(artifacts.join(format!("{payload_name}.zip")))
+                .arg(&payload_name)
+                .current_dir(&payloads)
+                .output()
+                .expect("create npm Windows archive")
+        } else {
+            Command::new("tar")
+                .args(["-cJf"])
+                .arg(artifacts.join(format!("{payload_name}.tar.xz")))
+                .arg("-C")
+                .arg(&payloads)
+                .arg(&payload_name)
+                .output()
+                .expect("create npm target archive")
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("node")
+        .arg(temp.path().join("npm/scripts/prepare-release.mjs"))
+        .args(["--tag", "v9.8.7", "--artifacts"])
+        .arg(&artifacts)
+        .output()
+        .expect("prepare npm release from archives");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    temp
+}
+
+fn package_files(package: PlatformPackage) -> Vec<&'static str> {
+    let windows = package.target.ends_with("windows-msvc");
+    let mut files = vec![
+        package.binary,
+        if windows { "dr-gate.exe" } else { "dr-gate" },
+        if windows {
+            "dr-capture.exe"
+        } else {
+            "dr-capture"
+        },
+    ];
+    files.extend(EVALUATOR_SIDECARS.iter().copied());
+    files
 }
 
 fn write_fake_platform_package(wrapper_root: &Path, package: PlatformPackage) {

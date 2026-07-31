@@ -45,6 +45,13 @@
     "control_write_denied": {
       "type": "boolean"
     },
+    "gate_evaluator_sha256": {
+      "description": "Evaluator identity digest approved by policy and authority.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "gate_key_read_denied": {
       "type": "boolean"
     },
