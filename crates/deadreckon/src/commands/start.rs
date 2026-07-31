@@ -2368,6 +2368,13 @@ fn start_launch_preview_rows(
     let mut rows = launch_preview_rows(&start_launch_preview_facts(decision));
     let seams = read_seams_config(&paths.config_path(), args.no_seams)?;
     rows.push(("seams".to_string(), seam_preview_label(&seams)));
+    rows.push((
+        "deadline".to_string(),
+        args.deadline
+            .as_ref()
+            .map(DateTime::to_rfc3339)
+            .unwrap_or_else(|| "none".to_string()),
+    ));
     Ok(rows)
 }
 
@@ -2542,6 +2549,177 @@ pub(crate) fn resolve_start_goal(provided: Option<&str>, allows_prompts: bool) -
     }
 }
 
+fn start_service_preflight_error(
+    preflight: &commands::supervisor_service::SupervisorServicePreflight,
+) -> CliError {
+    let reason = preflight
+        .reason()
+        .unwrap_or("machine-restart supervisor readiness could not be proven");
+    let recovery = if preflight.setup_is_supported() {
+        "deadreckon setup --supervisor"
+    } else {
+        "deadreckon supervisor status"
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &format!("durable start requires a restart-capable supervisor service; {reason}"),
+        recovery,
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartSupervisorAdmission {
+    Proceed,
+    OfferSetup,
+    Refuse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartLaunchIntent {
+    Inspect,
+    Launch,
+}
+
+fn start_launch_intent(args: &StartCommandArgs) -> StartLaunchIntent {
+    if args.preview || (args.json && !args.yes) {
+        StartLaunchIntent::Inspect
+    } else {
+        StartLaunchIntent::Launch
+    }
+}
+
+fn emit_start_read_only_result(
+    decision: &StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+) -> Result<bool> {
+    if args.json && !args.yes {
+        let surface = start_preview_surface(decision, args, paths)?;
+        let mut next_actions = vec![surface.primary_action.command.clone()];
+        next_actions.extend(start_preview_secondary_actions(decision));
+        if decision.recovery.is_none()
+            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
+        {
+            for action in &decision.history_next_actions {
+                if !next_actions.iter().any(|existing| existing == action) {
+                    next_actions.push(action.clone());
+                }
+            }
+        }
+        let payload = surface.add_to_json(json!({
+            "kind": "start",
+            "goal": &decision.goal,
+            "selected_mode": decision.selected_mode.label(),
+            "selection_source": decision.selection_source.label(),
+            "reason": &decision.reason,
+            "provider": &decision.provider_label,
+            "provider_source": decision.provider_source.label(),
+            "done_criteria": &decision.done_criteria_label,
+            "done_criteria_source": decision.done_criteria_source.label(),
+            "done_contract": start_done_contract_json(decision),
+            "source_mode": decision.source_mode.label(),
+            "goal_shape": &decision.goal_shape,
+            "requires_confirmation": decision.requires_confirmation,
+            "will_start": false,
+            "history_actions": &decision.history_next_actions,
+            "next_actions": next_actions,
+            "try_lines": &decision.try_lines
+        }));
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(true);
+    }
+    if args.preview {
+        if !args.quiet {
+            print_start_preview_surface(decision, args, paths)?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn start_supervisor_admission(
+    preflight: &commands::supervisor_service::SupervisorServicePreflight,
+    prompts_allowed: bool,
+) -> StartSupervisorAdmission {
+    if preflight.is_ready() {
+        StartSupervisorAdmission::Proceed
+    } else if preflight.setup_is_supported() && prompts_allowed {
+        StartSupervisorAdmission::OfferSetup
+    } else {
+        StartSupervisorAdmission::Refuse
+    }
+}
+
+/// The ordinary `start` promise includes recovery after a machine restart.
+/// Preview remains read-only, while a real TTY launch may perform the explicit
+/// one-time install/start only after operator confirmation. Non-interactive
+/// launches fail closed and point at the same explicit lifecycle commands.
+fn require_start_supervisor_service(mut prompter: Option<&mut dyn StartPrompter>) -> Result<()> {
+    let preflight =
+        commands::supervisor_service::supervisor_service_preflight().map_err(|error| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "durable start could not prove restart-capable supervisor readiness: {error}"
+                ),
+                "deadreckon supervisor status",
+            ))
+        })?;
+    match start_supervisor_admission(&preflight, prompter.is_some()) {
+        StartSupervisorAdmission::Proceed => return Ok(()),
+        StartSupervisorAdmission::Refuse => {
+            return Err(start_service_preflight_error(&preflight));
+        }
+        StartSupervisorAdmission::OfferSetup => {}
+    }
+    let prior_instance = preflight.instance().cloned();
+
+    let reason = preflight.reason().unwrap_or("setup is required");
+    let question =
+        format!("{reason}. Install/update and start the per-user DeadReckon supervisor now?");
+    let Some(prompter) = prompter.as_mut() else {
+        return Err(start_service_preflight_error(&preflight));
+    };
+    if !prompter.confirm(&question, true)? {
+        return Err(start_service_preflight_error(&preflight));
+    }
+
+    commands::supervisor_service::supervisor_service_install_command()?;
+    commands::supervisor_service::supervisor_service_start_command()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match commands::supervisor_service::supervisor_service_preflight() {
+            Ok(ready)
+                if ready.is_ready()
+                    && match (prior_instance.as_ref(), ready.instance()) {
+                        (None, Some(_)) => true,
+                        (Some(prior), Some(current)) => current.is_fresh_successor_of(prior),
+                        _ => false,
+                    } =>
+            {
+                return Ok(());
+            }
+            Ok(ready) if ready.is_ready() && std::time::Instant::now() >= deadline => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "the supervisor service manager became ready, but it did not publish a fresh live instance after restart",
+                    "deadreckon supervisor status",
+                )));
+            }
+            Ok(not_ready) if std::time::Instant::now() >= deadline => {
+                return Err(start_service_preflight_error(&not_ready));
+            }
+            Err(error) if std::time::Instant::now() >= deadline => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!(
+                        "the supervisor service was started, but readiness could not be proven: {error}"
+                    ),
+                    "deadreckon supervisor status",
+                )));
+            }
+            Ok(_) | Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
 fn start_goal_required_error() -> CliError {
     CliError::Core(deadreckon_core::user_error(
         "start goal required",
@@ -2553,7 +2731,7 @@ fn start_goal_required_error() -> CliError {
 /// current budget flag, stamp the resolution as a replay, and dispatch the
 /// identical shape. The plan file is the decision — no classification, no
 /// planning, at most the standard launch confirmation.
-async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Result<()> {
+async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> Result<()> {
     let mut plan = commands::course::load_launch_plan(plan_path)?;
     if plan.shape == commands::course::CourseShape::ChainExtend {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -2574,6 +2752,11 @@ async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Resul
     }
     if args.max_spend.is_some() {
         plan.budget.ceiling_usd = args.max_spend;
+    }
+    if args.deadline.is_some() {
+        plan.budget.deadline = args.deadline;
+    } else {
+        args.deadline = plan.budget.deadline;
     }
     plan.resolution.source = commands::course::ResolutionSource::Replay;
     plan.accepted_by = Some("replay".to_string());
@@ -2617,6 +2800,16 @@ async fn start_replay_command(args: StartCommandArgs, plan_path: &Path) -> Resul
                 .unwrap_or("deadreckon try"),
         )));
     }
+    let paths = DeadreckonPaths::discover();
+    if emit_start_read_only_result(&decision, &replay_args, &paths)? {
+        return Ok(());
+    }
+    let eligibility = StartPromptEligibility::from_args(&replay_args, io::stdin().is_terminal());
+    let mut terminal_prompter = TerminalStartPrompter;
+    let prompter = eligibility
+        .allows_prompts()
+        .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+    require_start_supervisor_service(prompter)?;
     materialize_start_done_criteria(&mut decision, None).await?;
     dispatch_start_command(replay_args, &decision, plan)
         .await
@@ -2639,6 +2832,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     decision.model = args.model.clone();
     add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
+    let mut terminal_prompter = TerminalStartPrompter;
+    if start_launch_intent(&args) == StartLaunchIntent::Launch {
+        let service_prompter = eligibility
+            .allows_prompts()
+            .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+        require_start_supervisor_service(service_prompter)?;
+    }
     if start_goal_shape_should_classify(&args, eligibility) {
         let defaults = config_defaults(&paths)?;
         let provider = start_should_ask_provider_for_shape(&args, eligibility)
@@ -2662,7 +2862,6 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
         apply_goal_shape_recommendation(&mut decision, recommendation);
     }
-    let mut terminal_prompter = TerminalStartPrompter;
     if eligibility.allows_prompts() {
         maybe_prompt_start_mode(
             &mut decision,
@@ -2687,45 +2886,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .and_then(|defaults| defaults.start_confirm_contract)
             .unwrap_or(false);
     apply_forced_contract_review_guard(&mut decision, eligibility, force_contract_review);
-    if args.json && !args.yes {
-        let surface = start_preview_surface(&decision, &args, &paths)?;
-        let mut next_actions = vec![surface.primary_action.command.clone()];
-        next_actions.extend(start_preview_secondary_actions(&decision));
-        if decision.recovery.is_none()
-            && !matches!(decision.selected_mode, StartSelectedMode::Extend)
-        {
-            for action in &decision.history_next_actions {
-                if !next_actions.iter().any(|existing| existing == action) {
-                    next_actions.push(action.clone());
-                }
-            }
-        }
-        let payload = surface.add_to_json(json!({
-            "kind": "start",
-            "goal": decision.goal,
-            "selected_mode": decision.selected_mode.label(),
-            "selection_source": decision.selection_source.label(),
-            "reason": decision.reason,
-            "provider": decision.provider_label,
-            "provider_source": decision.provider_source.label(),
-            "done_criteria": decision.done_criteria_label,
-            "done_criteria_source": decision.done_criteria_source.label(),
-            "done_contract": start_done_contract_json(&decision),
-            "source_mode": decision.source_mode.label(),
-            "goal_shape": &decision.goal_shape,
-            "requires_confirmation": decision.requires_confirmation,
-            "will_start": false,
-            "history_actions": decision.history_next_actions,
-            "next_actions": next_actions,
-            "try_lines": decision.try_lines
-        }));
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
-    if args.preview {
-        if !args.quiet {
-            print_start_preview_surface(&decision, &args, &paths)?;
-        }
+    if emit_start_read_only_result(&decision, &args, &paths)? {
         return Ok(());
     }
     if decision.recovery.is_none() && eligibility.allows_prompts() {
@@ -2744,6 +2905,11 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
                 recommendation.rationale
             )
         });
+        let deadline_label = args
+            .deadline
+            .as_ref()
+            .map(DateTime::to_rfc3339)
+            .unwrap_or_else(|| "none".to_string());
         let mut rows: Vec<(&str, &str)> = vec![
             ("goal", decision.goal.as_str()),
             ("mode", mode),
@@ -2758,6 +2924,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             ("done", decision.done_criteria_label.as_str()),
             ("workspace", decision.source_mode_label.as_str()),
             ("seams", seam_label.as_str()),
+            ("deadline", deadline_label.as_str()),
             (
                 "confirmation",
                 if decision.requires_confirmation {
@@ -2802,7 +2969,9 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let ceiling = args
         .max_spend
         .or_else(|| config_defaults(&paths).ok().and_then(|d| d.max_spend));
-    let launch_plan = commands::course::launch_plan_from_decision(&decision, ceiling, accepted_by);
+    let mut launch_plan =
+        commands::course::launch_plan_from_decision(&decision, ceiling, accepted_by);
+    launch_plan.budget.deadline = args.deadline;
     if args.json && args.yes {
         // C-P10: launch JSON parity — dispatch quietly, then emit one
         // machine envelope carrying the plan and what actually launched.
@@ -2921,8 +3090,9 @@ async fn dispatch_start_command(
             let cwd = std::env::current_dir()?;
             let defaults = config_defaults(&paths)?;
             let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
-            let max_wall_seconds =
-                defaults.cli_max_wall_seconds.unwrap_or(36_000.0).max(1.0) as u64;
+            let max_wall_seconds = commands::job::checked_job_wall_seconds(
+                defaults.cli_max_wall_seconds.unwrap_or(36_000.0),
+            )?;
             let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());
             let source = commands::job::DurableSource {
                 mode: match decision.source_mode {
@@ -2960,6 +3130,7 @@ async fn dispatch_start_command(
                 max_spend_usd,
                 max_wall_seconds,
                 max_attempts: 3,
+                deadline: args.deadline,
                 sandbox_requested,
                 accepted_by,
             })?;
@@ -3048,6 +3219,7 @@ fn guided_extension_args(
         no_context: false,
         max_spend: args.max_spend,
         max_wall_seconds: None,
+        deadline: args.deadline,
         provider: decision
             .provider_route
             .clone()
@@ -3084,7 +3256,8 @@ async fn dispatch_advanced_start_job(
     let cwd = std::env::current_dir()?;
     let defaults = config_defaults(&paths)?;
     let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
-    let max_wall_seconds = defaults.cli_max_wall_seconds.unwrap_or(36_000.0).max(1.0) as u64;
+    let max_wall_seconds =
+        commands::job::checked_job_wall_seconds(defaults.cli_max_wall_seconds.unwrap_or(36_000.0))?;
     let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());
     let provider_route = decision.provider_route.clone();
     let graph = matches!(
@@ -3168,6 +3341,7 @@ async fn dispatch_advanced_start_job(
         max_spend_usd,
         max_wall_seconds,
         max_attempts: 3,
+        deadline: args.deadline,
         sandbox_requested,
         accepted_by,
     })?;
@@ -3302,11 +3476,42 @@ fn print_start_lifecycle_footer(kind: &str, id: &str, launch_state: StartLaunchS
 #[cfg(test)]
 mod start_footer_tests {
     use super::{
-        StartLaunchInput, StartLaunchState, StartSelectedMode, guided_extension_args,
-        plan_launch_state_from, run_launch_state, start_footer_content, start_launch_decision,
+        StartLaunchInput, StartLaunchIntent, StartLaunchState, StartSelectedMode,
+        StartSupervisorAdmission, guided_extension_args, plan_launch_state_from, run_launch_state,
+        start_footer_content, start_launch_decision, start_launch_intent,
+        start_supervisor_admission,
     };
     use crate::cli::{CliStartMode, StartCommandArgs};
+    use crate::commands::supervisor_service::SupervisorServicePreflight;
     use deadreckon_core::{PlanStatus, RunStatus};
+
+    fn start_args() -> StartCommandArgs {
+        StartCommandArgs {
+            goal: "test goal".to_string(),
+            mode: CliStartMode::Auto,
+            plan: None,
+            max_spend: Some(3.0),
+            deadline: None,
+            provider: None,
+            model: None,
+            children: None,
+            planner_provider: None,
+            child_provider: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            preview: false,
+            review_done: false,
+            yes: true,
+            no_seams: false,
+            fresh: false,
+            worktree: false,
+            from: None,
+            allow_dirty: false,
+            plain: true,
+            quiet: true,
+            json: false,
+        }
+    }
 
     #[test]
     fn completed_launch_recommends_finish_not_attach() {
@@ -3324,6 +3529,48 @@ mod start_footer_tests {
     }
 
     #[test]
+    fn ordinary_start_fails_closed_without_restart_capable_service() {
+        assert_eq!(
+            start_supervisor_admission(&SupervisorServicePreflight::ready_for_test(), false),
+            StartSupervisorAdmission::Proceed
+        );
+        let setup = SupervisorServicePreflight::SetupRequired {
+            reason: "service stopped".to_string(),
+            last_instance: None,
+        };
+        assert_eq!(
+            start_supervisor_admission(&setup, true),
+            StartSupervisorAdmission::OfferSetup
+        );
+        assert_eq!(
+            start_supervisor_admission(&setup, false),
+            StartSupervisorAdmission::Refuse
+        );
+        let unsupported = SupervisorServicePreflight::Refused {
+            reason: "unsupported".to_string(),
+        };
+        assert_eq!(
+            start_supervisor_admission(&unsupported, true),
+            StartSupervisorAdmission::Refuse
+        );
+    }
+
+    #[test]
+    fn preview_and_unconfirmed_json_are_read_only_launch_intents() {
+        let mut args = start_args();
+        args.preview = true;
+        assert_eq!(start_launch_intent(&args), StartLaunchIntent::Inspect);
+
+        args.preview = false;
+        args.json = true;
+        args.yes = false;
+        assert_eq!(start_launch_intent(&args), StartLaunchIntent::Inspect);
+
+        args.yes = true;
+        assert_eq!(start_launch_intent(&args), StartLaunchIntent::Launch);
+    }
+
+    #[test]
     fn guided_history_continuation_builds_parent_bound_durable_request() {
         let mut decision = start_launch_decision(StartLaunchInput {
             goal: "add a durable follow-up",
@@ -3333,39 +3580,17 @@ mod start_footer_tests {
         decision.selected_mode = StartSelectedMode::Extend;
         decision.base_run_id = Some("1234567890abcdef".to_string());
         decision.provider_route = Some("cli:codex".to_string());
-        let extension = guided_extension_args(
-            &StartCommandArgs {
-                goal: decision.goal.clone(),
-                mode: CliStartMode::Auto,
-                plan: None,
-                max_spend: Some(3.0),
-                provider: None,
-                model: None,
-                children: None,
-                planner_provider: None,
-                child_provider: Vec::new(),
-                coder_provider: None,
-                reviewer_provider: None,
-                preview: false,
-                review_done: false,
-                yes: true,
-                no_seams: false,
-                fresh: false,
-                worktree: false,
-                from: None,
-                allow_dirty: false,
-                plain: true,
-                quiet: true,
-                json: false,
-            },
-            &decision,
-        )
-        .expect("guided extension request");
+        let mut args = start_args();
+        args.goal = decision.goal.clone();
+        let deadline = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+        args.deadline = Some(deadline);
+        let extension = guided_extension_args(&args, &decision).expect("guided extension request");
 
         assert_eq!(extension.parent_run_id, "1234567890abcdef");
         assert_eq!(extension.new_goal, "add a durable follow-up");
         assert_eq!(extension.provider.as_deref(), Some("cli:codex"));
         assert_eq!(extension.max_spend, Some(3.0));
+        assert_eq!(extension.deadline, Some(deadline));
         assert!(extension.yes);
         assert!(extension.dest.is_none());
     }

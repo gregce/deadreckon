@@ -11,10 +11,11 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
-    JobAuthority, JobId, OperatorCaptureBinding, OperatorCaptureCompletionLineage,
+    JobAuthority, JobId, JobOutcome, OperatorCaptureBinding, OperatorCaptureCompletionLineage,
     OperatorCaptureEvent, OperatorCaptureEventKind, OperatorCaptureEventSequence,
-    OperatorCapturePhase, OperatorCaptureProvenance, OperatorCaptureReceipt,
-    OperatorCaptureSchemaVersion, OperatorCaptureSource, OperatorCaptureStatus,
+    OperatorCaptureExpectedJobResult, OperatorCapturePhase, OperatorCaptureProvenance,
+    OperatorCaptureReceipt, OperatorCaptureSchemaVersion, OperatorCaptureSource,
+    OperatorCaptureStatus, OperatorCaptureTerminalLineage, StopReason,
 };
 use fs2::FileExt as _;
 use hmac::{Hmac, Mac};
@@ -87,6 +88,16 @@ pub struct OperatorCaptureEventDraft {
 pub struct OperatorCaptureHistory {
     events: Vec<OperatorCaptureEvent>,
     raw_lines: Vec<Vec<u8>>,
+}
+
+/// Authenticated product lineage required when a capture evaluation passes.
+///
+/// Keeping the variants mutually exclusive prevents a caller from presenting
+/// a non-Verified terminal result alongside a completion receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorCapturePassLineage {
+    Completion(OperatorCaptureCompletionLineage),
+    Terminal(OperatorCaptureTerminalLineage),
 }
 
 impl OperatorCaptureHistory {
@@ -360,26 +371,31 @@ pub fn seal_operator_capture_receipt(
     result_sha256: &str,
     result_bytes: u64,
     status: OperatorCaptureStatus,
-    completion_lineage: Option<OperatorCaptureCompletionLineage>,
+    lineage: Option<OperatorCapturePassLineage>,
 ) -> Result<OperatorCaptureReceipt> {
+    let (completion_lineage, terminal_lineage) = match lineage {
+        Some(OperatorCapturePassLineage::Completion(lineage)) => (Some(lineage), None),
+        Some(OperatorCapturePassLineage::Terminal(lineage)) => (None, Some(lineage)),
+        None => (None, None),
+    };
     if let Some(lineage) = &completion_lineage {
         validate_completion_lineage(lineage, binding.job_id.as_ref(), &binding.session_id)?;
     }
+    if let Some(lineage) = &terminal_lineage {
+        validate_terminal_lineage(lineage, binding.job_id.as_ref(), &binding.session_id)?;
+    }
+    validate_pass_lineage_policy(
+        binding,
+        status,
+        completion_lineage.as_ref(),
+        terminal_lineage.as_ref(),
+    )?;
     require_sha256(
         result_sha256,
         binding.job_id.as_ref(),
         &binding.session_id,
         "result",
     )?;
-    if status == OperatorCaptureStatus::Passed
-        && (!binding.pass_capable || completion_lineage.is_none())
-    {
-        return Err(capture_error(
-            binding.job_id.as_ref(),
-            &binding.session_id,
-            "a passed receipt requires a pass-capable binding and completion lineage",
-        ));
-    }
     let session_dir = paths.operator_capture_dir(binding.job_id.as_ref(), &binding.session_id);
     fs::create_dir_all(&session_dir).with_path(&session_dir)?;
     let lock_path = session_dir.join(OPERATOR_CAPTURE_LOCK);
@@ -466,6 +482,7 @@ pub fn seal_operator_capture_receipt(
             && existing.result_bytes == result_bytes
             && existing.status == status
             && existing.completion_lineage == completion_lineage
+            && existing.terminal_lineage == terminal_lineage
         {
             Ok(existing)
         } else {
@@ -590,6 +607,7 @@ pub fn seal_operator_capture_receipt(
         result_sha256: result_sha256.to_string(),
         result_bytes,
         completion_lineage,
+        terminal_lineage,
         status,
         signature: String::new(),
     };
@@ -664,8 +682,6 @@ pub fn validate_operator_capture_receipt(
         || finalized.content_sha256 != receipt.result_sha256
         || finalized.content_bytes != receipt.result_bytes
         || finalized.causation_id != format!("{:?}", receipt.status)
-        || (receipt.status == OperatorCaptureStatus::Passed && receipt.completion_lineage.is_none())
-        || (receipt.status != OperatorCaptureStatus::Passed && receipt.completion_lineage.is_some())
     {
         return Err(capture_error(
             binding.job_id.as_ref(),
@@ -682,6 +698,15 @@ pub fn validate_operator_capture_receipt(
     if let Some(lineage) = &receipt.completion_lineage {
         validate_completion_lineage(lineage, binding.job_id.as_ref(), &binding.session_id)?;
     }
+    if let Some(lineage) = &receipt.terminal_lineage {
+        validate_terminal_lineage(lineage, binding.job_id.as_ref(), &binding.session_id)?;
+    }
+    validate_pass_lineage_policy(
+        binding,
+        receipt.status,
+        receipt.completion_lineage.as_ref(),
+        receipt.terminal_lineage.as_ref(),
+    )?;
     let key = read_gate_key(paths, binding.job_id.as_ref())?;
     verify_receipt_signature(&receipt, &key)?;
     Ok(receipt)
@@ -741,6 +766,120 @@ fn validate_completion_lineage(
                 &format!("{label} must be a 7-40 character lowercase Git object ID"),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_terminal_lineage(
+    lineage: &OperatorCaptureTerminalLineage,
+    job_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    for (label, digest) in [
+        ("terminal authority", lineage.authority_sha256.as_str()),
+        ("terminal goal", lineage.goal_sha256.as_str()),
+        ("terminal contract", lineage.contract_sha256.as_str()),
+        (
+            "terminal effective policy",
+            lineage.effective_policy_sha256.as_str(),
+        ),
+        ("terminal launch plan", lineage.launch_plan_sha256.as_str()),
+        ("terminal source tree", lineage.source_tree_sha256.as_str()),
+        ("terminal Job history", lineage.job_history_sha256.as_str()),
+        ("terminal Job event", lineage.terminal_event_sha256.as_str()),
+    ] {
+        require_sha256(digest, job_id, session_id, label)?;
+    }
+    if lineage.job_history_bytes == 0 || lineage.terminal_sequence == 0 {
+        return Err(capture_error(
+            job_id,
+            session_id,
+            "terminal lineage requires non-empty Job history and a non-zero terminal sequence",
+        ));
+    }
+    validate_git_revision(
+        lineage.source_revision.as_deref(),
+        job_id,
+        session_id,
+        "terminal source revision",
+    )?;
+    if lineage.outcome == JobOutcome::Verified
+        || !(OperatorCaptureExpectedJobResult {
+            outcome: lineage.outcome,
+            stop_reason: lineage.stop_reason,
+        })
+        .is_valid()
+    {
+        return Err(capture_error(
+            job_id,
+            session_id,
+            "terminal lineage must contain a valid non-Verified outcome/reason pair",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pass_lineage_policy(
+    binding: &OperatorCaptureBinding,
+    status: OperatorCaptureStatus,
+    completion: Option<&OperatorCaptureCompletionLineage>,
+    terminal: Option<&OperatorCaptureTerminalLineage>,
+) -> Result<()> {
+    let invalid = || {
+        capture_error(
+            binding.job_id.as_ref(),
+            &binding.session_id,
+            "capture receipt lineage does not match its signed pass policy",
+        )
+    };
+    if status != OperatorCaptureStatus::Passed {
+        return if completion.is_none() && terminal.is_none() {
+            Ok(())
+        } else {
+            Err(invalid())
+        };
+    }
+    if !binding.pass_capable {
+        return Err(invalid());
+    }
+    match (completion, terminal) {
+        (Some(_), None)
+            if binding.allowed_terminal_results.iter().any(|expected| {
+                expected.outcome == JobOutcome::Verified
+                    && expected.stop_reason == StopReason::Verified
+            }) =>
+        {
+            Ok(())
+        }
+        (None, Some(lineage))
+            if binding.allowed_terminal_results.iter().any(|expected| {
+                expected.outcome == lineage.outcome && expected.stop_reason == lineage.stop_reason
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn validate_git_revision(
+    revision: Option<&str>,
+    job_id: &str,
+    session_id: &str,
+    label: &str,
+) -> Result<()> {
+    if let Some(revision) = revision
+        && (revision.len() < 7
+            || revision.len() > 40
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(capture_error(
+            job_id,
+            session_id,
+            &format!("{label} must be a 7-40 character lowercase Git object ID"),
+        ));
     }
     Ok(())
 }
@@ -835,6 +974,40 @@ fn validate_binding_fields(
             }
         }
     }
+    match (&binding.network_probe, binding.trial_id.as_str()) {
+        (Some(probe), "live_provider_network_loss") => {
+            let bound_routes = binding
+                .provider_routes
+                .get(&probe.provider_role)
+                .filter(|routes| routes.len() == 1);
+            if probe.provider_role.trim().is_empty()
+                || probe.provider_route.trim().is_empty()
+                || bound_routes.and_then(|routes| routes.first()) != Some(&probe.provider_route)
+                || !valid_non_loopback_http_endpoint(&probe.endpoint)
+            {
+                return Err(capture_error(
+                    job_id,
+                    session_id,
+                    "network probe must name the one signed provider route and a non-loopback HTTP endpoint",
+                ));
+            }
+        }
+        (None, "live_provider_network_loss") => {
+            return Err(capture_error(
+                job_id,
+                session_id,
+                "network-loss capture requires signed provider probe authority",
+            ));
+        }
+        (None, _) => {}
+        (Some(_), _) => {
+            return Err(capture_error(
+                job_id,
+                session_id,
+                "network probe authority is valid only for the network-loss trial",
+            ));
+        }
+    }
     let mut requirements = BTreeSet::new();
     for requirement in &binding.required_captures {
         if requirement.subject.trim().is_empty()
@@ -889,6 +1062,23 @@ fn validate_binding_fields(
             "pass-capable capture requires sandbox-exec, bwrap, or docker and a concrete provider route",
         ));
     }
+    if binding.allowed_terminal_results.is_empty()
+        || binding
+            .allowed_terminal_results
+            .iter()
+            .any(|expected| !expected.is_valid())
+        || binding
+            .allowed_terminal_results
+            .iter()
+            .enumerate()
+            .any(|(index, expected)| binding.allowed_terminal_results[..index].contains(expected))
+    {
+        return Err(capture_error(
+            job_id,
+            session_id,
+            "allowed terminal results must be non-empty, unique, valid outcome/reason pairs",
+        ));
+    }
 
     let job = load_job(paths, job_id)?;
     if job.job_id != binding.job_id || job.shape != binding.declared_shape {
@@ -914,6 +1104,54 @@ fn validate_binding_fields(
         ));
     }
     Ok(())
+}
+
+fn valid_non_loopback_http_endpoint(endpoint: &str) -> bool {
+    let Some(rest) = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, suffix)) = bracketed.split_once(']') else {
+            return false;
+        };
+        if !suffix.is_empty()
+            && (!suffix.starts_with(':')
+                || suffix[1..].is_empty()
+                || !suffix[1..].bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        host
+    } else {
+        if authority.matches(':').count() > 1 {
+            return false;
+        }
+        let (host, port) = authority
+            .split_once(':')
+            .map_or((authority, None), |(host, port)| (host, Some(port)));
+        if port
+            .is_some_and(|port| port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return false;
+        }
+        host
+    };
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host.to_ascii_lowercase().ends_with(".localhost")
+    {
+        return false;
+    }
+    host.parse::<std::net::IpAddr>().map_or(true, |address| {
+        !address.is_loopback() && !address.is_unspecified()
+    })
 }
 
 fn validate_draft(
@@ -1021,9 +1259,9 @@ fn validate_pass_coverage(
     let expected_intervention_source = match binding.trial_id.as_str() {
         "live_provider_worker_kill"
         | "live_provider_supervisor_restart"
-        | "live_provider_network_loss"
         | "machine_reboot"
         | "live_provider_parent_repair" => OperatorCaptureSource::JobIntervention,
+        "live_provider_network_loss" => OperatorCaptureSource::NetworkConnectivityObservation,
         "live_campaign_interruption_recovery" => OperatorCaptureSource::CampaignIntervention,
         "cross_provider_gate_attack"
         | "linux_bubblewrap_gate_boundary"
@@ -1088,6 +1326,15 @@ fn validate_source_claim(
         | OperatorCaptureSource::CampaignIntervention => {
             phase == OperatorCapturePhase::Intervention
                 && kind == OperatorCaptureEventKind::InterventionRecorded
+                && provenance == OperatorCaptureProvenance::TrustedSupervisor
+        }
+        OperatorCaptureSource::NetworkConnectivityObservation => {
+            ((matches!(
+                phase,
+                OperatorCapturePhase::Before | OperatorCapturePhase::After
+            ) && kind == OperatorCaptureEventKind::EvidenceCaptured)
+                || (phase == OperatorCapturePhase::Intervention
+                    && kind == OperatorCaptureEventKind::InterventionRecorded))
                 && provenance == OperatorCaptureProvenance::TrustedSupervisor
         }
         OperatorCaptureSource::JobCleanup => {
@@ -2312,19 +2559,20 @@ mod tests {
 
     use chrono::{TimeZone as _, Utc};
     use deadreckon_protocol::{
-        AuthorityAcceptedBy, Job, JobAuthority, JobExecutionPolicy, JobId, JobPolicy,
-        JobSchemaVersion, JobShape, OperatorCaptureCompletionLineage, OperatorCaptureRequirement,
-        RunId, SemanticJudgeMode,
+        AuthorityAcceptedBy, Job, JobAuthority, JobExecutionPolicy, JobId, JobOutcome, JobPolicy,
+        JobSchemaVersion, JobShape, OperatorCaptureCompletionLineage,
+        OperatorCaptureExpectedJobResult, OperatorCaptureNetworkProbe, OperatorCaptureRequirement,
+        OperatorCaptureTerminalLineage, RunId, SemanticJudgeMode, StopReason,
     };
     use serde_json::Value;
     use tempfile::TempDir;
 
     use super::{
         OperatorCaptureBinding, OperatorCaptureEventDraft, OperatorCaptureEventKind,
-        OperatorCaptureEventSequence, OperatorCapturePhase, OperatorCaptureProvenance,
-        OperatorCaptureSchemaVersion, OperatorCaptureSource, OperatorCaptureStatus,
-        append_operator_capture_event, append_synced_json_line, build_signed_event,
-        load_operator_capture_binding, operator_capture_binding_sha256,
+        OperatorCaptureEventSequence, OperatorCapturePassLineage, OperatorCapturePhase,
+        OperatorCaptureProvenance, OperatorCaptureSchemaVersion, OperatorCaptureSource,
+        OperatorCaptureStatus, append_operator_capture_event, append_synced_json_line,
+        build_signed_event, load_operator_capture_binding, operator_capture_binding_sha256,
         read_operator_capture_history, seal_operator_capture_receipt,
         validate_operator_capture_receipt, write_operator_capture_binding,
     };
@@ -2348,6 +2596,24 @@ mod tests {
             source_revision: Some("0123456789abcdef".to_string()),
             result_tree_sha256: digest('7'),
             result_revision: Some("fedcba9876543210".to_string()),
+        }
+    }
+
+    fn terminal_lineage() -> OperatorCaptureTerminalLineage {
+        OperatorCaptureTerminalLineage {
+            authority_sha256: digest('2'),
+            goal_sha256: digest('3'),
+            contract_sha256: digest('4'),
+            effective_policy_sha256: digest('5'),
+            launch_plan_sha256: digest('1'),
+            source_tree_sha256: digest('6'),
+            source_revision: Some("0123456789abcdef".to_string()),
+            job_history_sha256: digest('7'),
+            job_history_bytes: 128,
+            terminal_event_sha256: digest('8'),
+            terminal_sequence: 9,
+            outcome: JobOutcome::NeedsReview,
+            stop_reason: StopReason::SemanticUnavailable,
         }
     }
 
@@ -2425,8 +2691,13 @@ mod tests {
                     vec!["cli:judge".to_string()],
                 ),
             ]),
+            network_probe: None,
             replay_sha256: digest('c'),
             pass_capable: true,
+            allowed_terminal_results: vec![OperatorCaptureExpectedJobResult {
+                outcome: JobOutcome::Verified,
+                stop_reason: StopReason::Verified,
+            }],
             required_captures: vec![OperatorCaptureRequirement {
                 subject: "before".to_string(),
                 phase: OperatorCapturePhase::Before,
@@ -2617,7 +2888,7 @@ mod tests {
             &digest('d'),
             42,
             OperatorCaptureStatus::Passed,
-            Some(completion_lineage()),
+            Some(OperatorCapturePassLineage::Completion(completion_lineage())),
         )
         .expect("receipt");
         let retried_receipt = seal_operator_capture_receipt(
@@ -2627,7 +2898,7 @@ mod tests {
             &digest('d'),
             42,
             OperatorCaptureStatus::Passed,
-            Some(completion_lineage()),
+            Some(OperatorCapturePassLineage::Completion(completion_lineage())),
         )
         .expect("idempotent receipt retry");
         assert_eq!(retried_receipt, receipt);
@@ -2640,7 +2911,7 @@ mod tests {
             &digest('d'),
             42,
             OperatorCaptureStatus::Passed,
-            Some(invalid_lineage),
+            Some(OperatorCapturePassLineage::Completion(invalid_lineage)),
         )
         .expect_err("invalid completion lineage");
         assert!(invalid.to_string().contains("completion contract digest"));
@@ -2674,10 +2945,80 @@ mod tests {
             &digest('e'),
             42,
             OperatorCaptureStatus::Passed,
-            Some(completion_lineage()),
+            Some(OperatorCapturePassLineage::Completion(completion_lineage())),
         )
         .expect_err("different result cannot reuse receipt");
         assert!(error.to_string().contains("different result or status"));
+    }
+
+    #[test]
+    fn passed_non_verified_trial_requires_exact_allowed_terminal_lineage() {
+        let (_temp, paths, mut unsigned) = fixture("terminal-lineage");
+        unsigned.allowed_terminal_results = vec![OperatorCaptureExpectedJobResult {
+            outcome: JobOutcome::NeedsReview,
+            stop_reason: StopReason::SemanticUnavailable,
+        }];
+        let binding = prepared_binding(&paths, &unsigned);
+        append_operator_capture_event(&paths, &binding, &draft("before", "before", 1))
+            .expect("required capture");
+        append_operator_capture_event(
+            &paths,
+            &binding,
+            &lifecycle_draft(
+                "intervention",
+                OperatorCapturePhase::Intervention,
+                OperatorCaptureEventKind::InterventionRecorded,
+                2,
+            ),
+        )
+        .expect("intervention");
+        append_operator_capture_event(
+            &paths,
+            &binding,
+            &lifecycle_draft(
+                "cleanup",
+                OperatorCapturePhase::Cleanup,
+                OperatorCaptureEventKind::CleanupRecorded,
+                3,
+            ),
+        )
+        .expect("cleanup");
+        let receipt = seal_operator_capture_receipt(
+            &paths,
+            &binding,
+            Utc.with_ymd_and_hms(2026, 7, 30, 12, 1, 0)
+                .single()
+                .expect("timestamp"),
+            &digest('d'),
+            42,
+            OperatorCaptureStatus::Passed,
+            Some(OperatorCapturePassLineage::Terminal(terminal_lineage())),
+        )
+        .expect("allowed terminal lineage");
+        assert!(receipt.completion_lineage.is_none());
+        assert_eq!(receipt.terminal_lineage, Some(terminal_lineage()));
+        validate_operator_capture_receipt(&paths, &binding)
+            .expect("authenticated terminal receipt");
+
+        let (_temp, paths, mut unsigned) = fixture("wrong-terminal-lineage");
+        unsigned.allowed_terminal_results = vec![OperatorCaptureExpectedJobResult {
+            outcome: JobOutcome::Blocked,
+            stop_reason: StopReason::OperatorInputRequired,
+        }];
+        let binding = prepared_binding(&paths, &unsigned);
+        let error = seal_operator_capture_receipt(
+            &paths,
+            &binding,
+            Utc.with_ymd_and_hms(2026, 7, 30, 12, 1, 0)
+                .single()
+                .expect("timestamp"),
+            &digest('d'),
+            42,
+            OperatorCaptureStatus::Passed,
+            Some(OperatorCapturePassLineage::Terminal(terminal_lineage())),
+        )
+        .expect_err("unapproved terminal pair");
+        assert!(error.to_string().contains("signed pass policy"));
     }
 
     #[test]
@@ -3252,6 +3593,77 @@ mod tests {
     }
 
     #[test]
+    fn network_probe_authority_refuses_non_http_loopback_and_unbound_routes() {
+        for (label, route, endpoint) in [
+            ("non-http", "openai", "ssh://api.openai.com"),
+            ("loopback-name", "openai", "http://localhost:8080"),
+            ("loopback-ip", "openai", "http://127.0.0.1:8080"),
+            ("unbound-route", "anthropic", "https://api.anthropic.com"),
+        ] {
+            let (_temp, paths, mut unsigned) = fixture(label);
+            unsigned.trial_id = "live_provider_network_loss".to_string();
+            unsigned
+                .provider_routes
+                .insert("worker".to_string(), vec!["openai".to_string()]);
+            unsigned.network_probe = Some(OperatorCaptureNetworkProbe {
+                provider_role: "worker".to_string(),
+                provider_route: route.to_string(),
+                endpoint: endpoint.to_string(),
+            });
+            let error = write_operator_capture_binding(&paths, &unsigned)
+                .expect_err("unsafe network probe authority");
+            assert!(
+                error.to_string().contains("network probe"),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_probe_authority_is_reserved_for_the_network_trial() {
+        let (_temp, paths, mut unsigned) = fixture("foreign-network-authority");
+        unsigned.network_probe = Some(OperatorCaptureNetworkProbe {
+            provider_role: "worker".to_string(),
+            provider_route: "cli:codex".to_string(),
+            endpoint: "https://api.openai.com/v1".to_string(),
+        });
+        let error = write_operator_capture_binding(&paths, &unsigned)
+            .expect_err("foreign trial network authority");
+        assert!(
+            error
+                .to_string()
+                .contains("only for the network-loss trial")
+        );
+    }
+
+    #[test]
+    fn signed_network_source_can_mint_only_its_three_exact_phases() {
+        let (_temp, paths, mut unsigned) = fixture("network-source");
+        unsigned.trial_id = "live_provider_network_loss".to_string();
+        unsigned
+            .provider_routes
+            .insert("worker".to_string(), vec!["openai".to_string()]);
+        unsigned.network_probe = Some(OperatorCaptureNetworkProbe {
+            provider_role: "worker".to_string(),
+            provider_route: "openai".to_string(),
+            endpoint: "https://api.openai.com/v1".to_string(),
+        });
+        let binding = prepared_binding(&paths, &unsigned);
+        let mut before = draft("network-before", "before", 1);
+        before.source = OperatorCaptureSource::NetworkConnectivityObservation;
+        before.provenance = OperatorCaptureProvenance::TrustedSupervisor;
+        append_operator_capture_event(&paths, &binding, &before).expect("network before");
+
+        let mut forged_cleanup = before.clone();
+        forged_cleanup.event_id = "network-cleanup".to_string();
+        forged_cleanup.phase = OperatorCapturePhase::Cleanup;
+        forged_cleanup.kind = OperatorCaptureEventKind::CleanupRecorded;
+        let error = append_operator_capture_event(&paths, &binding, &forged_cleanup)
+            .expect_err("network source cannot mint cleanup");
+        assert!(error.to_string().contains("source cannot mint"));
+    }
+
+    #[test]
     fn manual_attestation_cannot_satisfy_pass_coverage() {
         let (_temp, paths, unsigned) = fixture("manual-coverage");
         let binding = prepared_binding(&paths, &unsigned);
@@ -3291,7 +3703,7 @@ mod tests {
             &digest('d'),
             42,
             OperatorCaptureStatus::Passed,
-            Some(completion_lineage()),
+            Some(OperatorCapturePassLineage::Completion(completion_lineage())),
         )
         .expect_err("manual evidence cannot pass");
         assert!(

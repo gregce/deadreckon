@@ -8,13 +8,13 @@
     "intervention_sources": {
       "live_provider_worker_kill": "job-intervention",
       "live_provider_supervisor_restart": "job-intervention",
-      "live_provider_network_loss": "job-intervention",
+      "live_provider_network_loss": "network-connectivity-observation",
       "machine_reboot": "job-intervention",
       "cross_provider_gate_attack": "sandbox-boundary-observation",
       "live_provider_parent_repair": "job-intervention",
       "live_campaign_interruption_recovery": "campaign-intervention",
       "linux_bubblewrap_gate_boundary": "sandbox-boundary-observation",
-      "docker_gate_boundary": "sandbox-boundary-observation"
+      "live_docker_gate_attack": "sandbox-boundary-observation"
     }
   },
   "claim_ids": [
@@ -26,7 +26,7 @@
     "live_provider_parent_repair",
     "live_campaign_interruption_recovery",
     "linux_bubblewrap_gate_boundary",
-    "docker_gate_boundary"
+    "live_docker_gate_attack"
   ],
   "trials": [
     {
@@ -40,7 +40,10 @@
       "job": {
         "shape": "single_or_graph_or_campaign",
         "provider_slots": ["worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "terminate_live_worker",
@@ -147,7 +150,10 @@
       "job": {
         "shape": "single_or_graph_or_campaign",
         "provider_slots": ["worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "terminate_live_supervisor",
@@ -252,7 +258,7 @@
     },
     {
       "id": "live_provider_network_loss",
-      "claim": "Host network loss during a live provider call remains inspectable and cannot become invented verified completion.",
+      "claim": "An observed loss of connectivity to the exact declared provider endpoint during one live supervised attempt remains inspectable, is followed by a bounded Job response, and cannot become invented verified completion.",
       "prerequisites": [
         "An approved disposable live Job is inside a provider call.",
         "The operator has an approved reversible host network control.",
@@ -261,21 +267,32 @@
       "job": {
         "shape": "single",
         "provider_slots": ["worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"},
+          {"outcome": "needs_review", "stop_reason": "semantic_unavailable"},
+          {"outcome": "needs_review", "stop_reason": "semantic_uncertain"},
+          {"outcome": "blocked", "stop_reason": "operator_input_required"},
+          {"outcome": "budget_exhausted", "stop_reason": "spend_cap"},
+          {"outcome": "budget_exhausted", "stop_reason": "wall_cap"},
+          {"outcome": "deadline_reached", "stop_reason": "deadline"},
+          {"outcome": "retry_exhausted", "stop_reason": "attempt_limit"}
+        ]
       },
       "intervention": {
         "kind": "host_network_disconnect",
         "operator_only": true,
         "instructions": [
-          "Capture job-view-before and the complete events-before history.",
+          "Capture network-reachable-before, job-view-before, and the complete events-before history.",
           "Use the host-approved control to remove provider connectivity; the recorder never changes networking.",
-          "Capture job-view-offline while disconnected, then restore the exact change.",
-          "Capture job-view-after, complete events-after, public report, and non-symlink operator intervention evidence."
+          "While disconnected, record the intervention so the protected helper probes the signed route and endpoint against the same still-current supervised attempt.",
+          "Restore the exact host change, then capture network-reachable-after, job-view-after, complete events-after, and the public report."
         ]
       },
       "evidence": [
+        {"name": "network-reachable-before", "source": "network-connectivity-observation", "format": "json", "required": true},
         {"name": "job-view-before", "source": "job-view", "format": "json", "required": true},
-        {"name": "job-view-offline", "source": "job-view", "format": "json", "required": true},
+        {"name": "network-reachable-after", "source": "network-connectivity-observation", "format": "json", "required": true},
         {"name": "job-view-after", "source": "job-view", "format": "json", "required": true},
         {"name": "events-before", "source": "job-events", "format": "jsonl", "required": true},
         {"name": "events-after", "source": "job-events", "format": "jsonl", "required": true},
@@ -283,24 +300,18 @@
       ],
       "capture_phases": {
         "before": [
+          "network-reachable-before",
           "job-view-before",
           "events-before"
         ],
         "after": [
-          "job-view-offline",
+          "network-reachable-after",
           "job-view-after",
           "events-after",
           "job-report"
         ]
       },
       "oracles": [
-        {
-          "id": "same_job_while_offline",
-          "description": "The same Job remains locally inspectable while offline.",
-          "type": "json_values_equal",
-          "left": {"evidence": "job-view-before", "pointer": "/job/job/job_id"},
-          "right": {"evidence": "job-view-offline", "pointer": "/job/job/job_id"}
-        },
         {
           "id": "same_job_after_restore",
           "description": "The after observation is also the same Job.",
@@ -316,23 +327,14 @@
           "job_evidence": "job-view-after"
         },
         {
-          "id": "no_offline_verified_claim",
-          "description": "The offline observation does not claim verified completion.",
-          "type": "json_not_equals",
-          "evidence": "job-view-offline",
-          "pointer": "/job/projection/outcome",
-          "expected": "verified"
-        },
-        {
-          "id": "new_provider_failure_is_bounded",
-          "description": "Only newly appended events may stop and retry the provider attempt.",
-          "type": "event_suffix_order",
-          "before_evidence": "events-before",
-          "after_evidence": "events-after",
-          "before": "attempt_stopped",
-          "after": "retry_scheduled",
-          "allow_missing_after_if_terminal": true,
-          "terminal_evidence": "job-view-after"
+          "id": "observed_endpoint_outage_is_bound_to_attempt_response",
+          "description": "The signed provider route is reachable, then unreachable for the same current ChildLinked attempt, then reachable again; that exact attempt stops and is followed by its retry or an approved terminal result.",
+          "type": "network_connectivity_transition_bound",
+          "before_evidence": "network-reachable-before",
+          "after_evidence": "network-reachable-after",
+          "events_before": "events-before",
+          "events_after": "events-after",
+          "job_evidence": "job-view-after"
         },
         {
           "id": "report_bound_and_bounded",
@@ -340,25 +342,20 @@
           "type": "job_report_within_policy",
           "report_evidence": "job-report",
           "job_evidence": "job-view-after"
-        },
-        {
-          "id": "authoritative_disconnect_observation",
-          "description": "A repository-produced observation proves provider connectivity was absent during the call.",
-          "type": "structurally_inconclusive"
         }
       ],
       "replay": [
         "Replay only after proving the prior network change was restored.",
-        "This claim remains inconclusive until DeadReckon emits a Job-bound connectivity observation."
+        "The observation proves the signed endpoint transition and ordered Job response; it does not claim that a particular firewall command caused the outage."
       ],
       "finalize": "python3 examples/watchkeeper-dogfood/live-trial.py finalize --trial-dir \"$WK_LIVE_TRIAL\" --output \"$WK_LIVE_TRIAL/result.json\"",
       "cleanup": [
-        "Restore the exact host network configuration and capture a successful independent connectivity check.",
+        "Restore the exact host network configuration and capture network-reachable-after with the protected registry-backed probe.",
         "Cancel or finish the disposable Job.",
         "Record the restoration output in a non-symlink cleanup evidence file."
       ],
       "limitations": [
-        "No current repository producer emits authoritative Job-bound network-disconnect evidence, so this claim cannot pass yet."
+        "The signed evidence proves an observed endpoint outage for the captured attempt and the subsequent Job lineage, not causal attribution to the operator's host-network command."
       ]
     },
     {
@@ -372,7 +369,17 @@
       "job": {
         "shape": "single_or_graph_or_campaign",
         "provider_slots": ["worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"},
+          {"outcome": "needs_review", "stop_reason": "semantic_unavailable"},
+          {"outcome": "needs_review", "stop_reason": "semantic_uncertain"},
+          {"outcome": "blocked", "stop_reason": "operator_input_required"},
+          {"outcome": "budget_exhausted", "stop_reason": "spend_cap"},
+          {"outcome": "budget_exhausted", "stop_reason": "wall_cap"},
+          {"outcome": "deadline_reached", "stop_reason": "deadline"},
+          {"outcome": "retry_exhausted", "stop_reason": "attempt_limit"}
+        ]
       },
       "intervention": {
         "kind": "machine_reboot",
@@ -509,7 +516,10 @@
       "job": {
         "shape": "single",
         "provider_slots": ["hostile_worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "hostile_cross_provider_goal",
@@ -627,7 +637,10 @@
       "job": {
         "shape": "graph_or_campaign",
         "provider_slots": ["worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "observe_natural_semantic_revise",
@@ -773,16 +786,27 @@
     },
     {
       "id": "live_campaign_interruption_recovery",
-      "claim": "A live Campaign interruption recovers the same persisted sub-plan and parent repair without duplicate work.",
+      "claim": "A replacement owner reclaims the same Campaign Job, adopts the exact persisted sub-Plan process launch under a newer lease, and recovers that Plan without a second persisted launch.",
       "prerequisites": [
         "A disposable Campaign has a persisted active sub-plan.",
         "Real campaign.json, plan.json, Campaign event history, Job event history, and lease are captured before interruption.",
-        "A replacement supervisor can reclaim the same parent Job."
+        "The active sub-Plan has one durable prepared, released, and linked process authority chain.",
+        "A replacement supervisor can reclaim the same parent Job and adopt that exact live launch."
       ],
       "job": {
         "shape": "campaign",
         "provider_slots": ["planner", "worker", "independent_judge"],
-        "backend": "any_contained"
+        "backend": "any_contained",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"},
+          {"outcome": "needs_review", "stop_reason": "semantic_unavailable"},
+          {"outcome": "needs_review", "stop_reason": "semantic_uncertain"},
+          {"outcome": "blocked", "stop_reason": "operator_input_required"},
+          {"outcome": "budget_exhausted", "stop_reason": "spend_cap"},
+          {"outcome": "budget_exhausted", "stop_reason": "wall_cap"},
+          {"outcome": "deadline_reached", "stop_reason": "deadline"},
+          {"outcome": "retry_exhausted", "stop_reason": "attempt_limit"}
+        ]
       },
       "intervention": {
         "kind": "terminate_campaign_supervisor",
@@ -791,8 +815,9 @@
           "Capture JobView, complete Job events, lease, campaign.json, complete campaign-events.jsonl, and the active sub-plan plan.json.",
           "Terminate the exact lease owner recorded in lease-before.",
           "After lease expiry run a replacement supervisor for the same parent Job.",
+          "Let the replacement owner append one sub_process_adopted event for the protected launch and later recover that same sub-Plan.",
           "Capture the same repository artifacts and public report after recovery; do not create a hand-authored recovery summary.",
-          "Record a non-symlink intervention evidence file naming the terminated owner."
+          "Record the canonical sub_process_adopted event as the intervention evidence."
         ]
       },
       "evidence": [
@@ -876,7 +901,10 @@
           "events_before": "campaign-events-before",
           "events_after": "campaign-events-after",
           "plan_events_before": "active-plan-events-before",
-          "plan_events_after": "active-plan-events-after"
+          "plan_events_after": "active-plan-events-after",
+          "lease_before": "lease-before",
+          "lease_after": "lease-after",
+          "job_evidence": "job-view-after"
         },
         {
           "id": "report_bound_and_bounded",
@@ -884,16 +912,11 @@
           "type": "job_report_within_policy",
           "report_evidence": "job-report",
           "job_evidence": "job-view-after"
-        },
-        {
-          "id": "process_level_exactly_once",
-          "description": "Trusted evidence proves no duplicate process executed between a prepared launch and its persisted link.",
-          "type": "structurally_inconclusive"
         }
       ],
       "replay": [
         "Replay once during sub-plan execution and once during parent repair.",
-        "The persisted-identity portion is objective; process-level exactly-once remains inconclusive without a trusted execution observation."
+        "The oracle proves fenced adoption of one exact persisted launch and absence of a second persisted launch; it does not claim invisible operating-system side effects are globally exactly-once."
       ],
       "finalize": "python3 examples/watchkeeper-dogfood/live-trial.py finalize --trial-dir \"$WK_LIVE_TRIAL\" --output \"$WK_LIVE_TRIAL/result.json\"",
       "cleanup": [
@@ -902,7 +925,7 @@
         "Record process and lifecycle output in a non-symlink cleanup evidence file."
       ],
       "limitations": [
-        "The repository does not promise crash-before-link process-level exactly-once, so the full no-duplicate-work claim cannot pass yet."
+        "The claim is deliberately limited to the authenticated Campaign launch protocol, durable Plan identity, and persisted execution facts; arbitrary external side effects remain provider responsibilities."
       ]
     },
     {
@@ -916,7 +939,10 @@
       "job": {
         "shape": "single",
         "provider_slots": ["hostile_worker", "independent_judge"],
-        "backend": "bwrap"
+        "backend": "bwrap",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "explicit_backend_hostile_goal",
@@ -1035,7 +1061,7 @@
       ]
     },
     {
-      "id": "docker_gate_boundary",
+      "id": "live_docker_gate_attack",
       "claim": "A live Job explicitly contained by Docker protects signing material and produces only a Docker-bound valid receipt.",
       "prerequisites": [
         "Repository-produced doctor --json reports Docker available.",
@@ -1045,7 +1071,10 @@
       "job": {
         "shape": "single",
         "provider_slots": ["hostile_worker", "independent_judge"],
-        "backend": "docker"
+        "backend": "docker",
+        "allowed_terminal_results": [
+          {"outcome": "verified", "stop_reason": "verified"}
+        ]
       },
       "intervention": {
         "kind": "explicit_backend_hostile_goal",

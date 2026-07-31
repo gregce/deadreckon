@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 fn dogfood_dir() -> PathBuf {
@@ -20,6 +21,10 @@ fn git_output(repo: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("run git {args:?} in {}: {error}", repo.display()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn validate_credential_free_source(payload: &Value, repo: &Path) -> Result<String, String> {
@@ -131,12 +136,37 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "live_provider_parent_repair",
         "live_campaign_interruption_recovery",
         "linux_bubblewrap_gate_boundary",
+        "live_docker_gate_attack",
     ] {
         assert!(
             source.contains(unproven),
             "missing live boundary {unproven}"
         );
     }
+    let schema: Value = serde_json::from_slice(
+        &fs::read(dogfood_dir().join("adversarial.schema.json")).expect("adversarial schema"),
+    )
+    .expect("adversarial schema JSON");
+    let schema_live_ids = schema["properties"]["live_claims"]["items"]["properties"]["id"]["enum"]
+        .as_array()
+        .expect("live claim ID enum")
+        .iter()
+        .map(|value| value.as_str().expect("live claim ID"))
+        .collect::<BTreeSet<_>>();
+    let expected_live_ids = [
+        "live_provider_worker_kill",
+        "live_provider_supervisor_restart",
+        "live_provider_network_loss",
+        "machine_reboot",
+        "cross_provider_gate_attack",
+        "live_provider_parent_repair",
+        "live_campaign_interruption_recovery",
+        "linux_bubblewrap_gate_boundary",
+        "live_docker_gate_attack",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    assert_eq!(schema_live_ids, expected_live_ids);
     for unified_job_proof in [
         "guided_continuation_preserves_approved_authority_provenance",
         "durable_chain_freezes_one_graph_job_with_at_end_verification",
@@ -246,7 +276,7 @@ esac
     );
     assert_eq!(
         dynamic_or_invalid["live_claims"].as_array().map(Vec::len),
-        Some(8)
+        Some(9)
     );
     assert!(
         dynamic_or_invalid["live_claims"]
@@ -256,6 +286,13 @@ esac
                     .iter()
                     .all(|claim| claim["id"] != "docker_gate_boundary")
             })
+    );
+    assert!(
+        dynamic_or_invalid["live_claims"]
+            .as_array()
+            .is_some_and(|claims| claims
+                .iter()
+                .any(|claim| claim["id"] == "live_docker_gate_attack"))
     );
 
     let cargo = fake_bin.join("cargo");
@@ -308,7 +345,7 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
         "live_provider_parent_repair",
         "live_campaign_interruption_recovery",
         "linux_bubblewrap_gate_boundary",
-        "docker_gate_boundary",
+        "live_docker_gate_attack",
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -352,6 +389,7 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
         "parent_only_repair",
         "parent_repair_bound",
         "campaign_recovery_bound",
+        "network_connectivity_transition_bound",
         "sandbox_boundary_observation_bound",
         "structurally_inconclusive",
     ]
@@ -381,6 +419,7 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
         "campaign-events",
         "active-plan",
         "active-plan-events",
+        "network-connectivity-observation",
         "unavailable-objective",
     ]
     .into_iter()
@@ -427,7 +466,7 @@ fn live_fault_trials_are_operator_gated_objective_and_sanitized() {
     for id in [
         "cross_provider_gate_attack",
         "linux_bubblewrap_gate_boundary",
-        "docker_gate_boundary",
+        "live_docker_gate_attack",
     ] {
         let trial = trials
             .iter()
@@ -547,11 +586,30 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         serde_json::from_slice(&fs::read(&result_path).expect("results")).expect("results JSON");
     assert_eq!(payload["schema_version"], 1);
     assert_eq!(payload["credential_free"], true);
-    validate_credential_free_source(
-        &payload,
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source_revision =
+        validate_credential_free_source(&payload, &repo).unwrap_or_else(|error| panic!("{error}"));
+    let expected_runner_sha = payload["runner_sha256"]
+        .as_str()
+        .expect("credential-free runner digest");
+    let current_runner = fs::read(dogfood_dir().join("adversarial.py")).expect("current runner");
+    let source_runner = if sha256_bytes(&current_runner) == expected_runner_sha {
+        current_runner
+    } else {
+        let runner_object =
+            format!("{source_revision}:examples/watchkeeper-dogfood/adversarial.py");
+        let historical = git_output(&repo, &["show", &runner_object]);
+        assert!(
+            historical.status.success(),
+            "credential-free runner provenance is unprovable: current bytes do not match and the historical source runner is unavailable"
+        );
+        assert_eq!(
+            sha256_bytes(&historical.stdout),
+            expected_runner_sha,
+            "credential-free runner provenance is invalid: neither current nor historical source bytes match the recorded digest"
+        );
+        historical.stdout
+    };
     assert_eq!(payload["matrix_status"]["total_tasks"], tasks.len());
     for (status, count) in expected_counts {
         assert_eq!(
@@ -560,11 +618,7 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         );
     }
     assert_eq!(payload["summary"]["failed"], 0);
-    assert_eq!(
-        payload["runner_sha256"],
-        deadreckon_core::flight::sha256_file(&dogfood_dir().join("adversarial.py"))
-            .expect("runner digest")
-    );
+    assert_eq!(payload["runner_sha256"], sha256_bytes(&source_runner));
     let trials = payload["trials"]
         .as_array()
         .expect("credential-free trials");
@@ -615,7 +669,9 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         true
     );
     let live = payload["live_claims"].as_array().expect("live claims");
-    assert_eq!(live.len(), 8);
+    let source_runner_text = String::from_utf8(source_runner).expect("source runner UTF-8");
+    let split_live_docker_claim = source_runner_text.contains("live_docker_gate_attack");
+    assert_eq!(live.len(), if split_live_docker_claim { 9 } else { 8 });
     assert!(
         live.iter()
             .all(|claim| claim["status"].as_str() == Some("unproven"))
@@ -623,6 +679,11 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
     assert!(
         live.iter()
             .all(|claim| claim["id"].as_str() != Some("docker_gate_boundary"))
+    );
+    assert_eq!(
+        live.iter()
+            .any(|claim| claim["id"].as_str() == Some("live_docker_gate_attack")),
+        split_live_docker_claim
     );
 }
 

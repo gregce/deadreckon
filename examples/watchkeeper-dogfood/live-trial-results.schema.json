@@ -13,6 +13,7 @@
     "backend",
     "provider_slots",
     "job_id_prefix",
+    "job_result",
     "capture_provenance",
     "intervention",
     "oracle_assertions",
@@ -21,7 +22,7 @@
     "limitations"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "generated_at": {"type": "string", "format": "date-time"},
     "sanitized": {"const": true},
     "trial_id": {
@@ -34,7 +35,7 @@
         "live_provider_parent_repair",
         "live_campaign_interruption_recovery",
         "linux_bubblewrap_gate_boundary",
-        "docker_gate_boundary"
+        "live_docker_gate_attack"
       ]
     },
     "status": {
@@ -70,6 +71,29 @@
     "job_id_prefix": {
       "type": ["string", "null"],
       "pattern": "^[A-Za-z0-9_-]{4,12}$"
+    },
+    "job_result": {
+      "type": "object",
+      "required": ["outcome", "stop_reason", "allowed"],
+      "properties": {
+        "outcome": {
+          "type": ["string", "null"],
+          "enum": [
+            "verified",
+            "needs_review",
+            "blocked",
+            "budget_exhausted",
+            "deadline_reached",
+            "retry_exhausted",
+            "cancelled",
+            "failed",
+            null
+          ]
+        },
+        "stop_reason": {"type": ["string", "null"]},
+        "allowed": {"type": "boolean"}
+      },
+      "additionalProperties": false
     },
     "capture_provenance": {
       "type": "object",
@@ -244,6 +268,13 @@
             "properties": {
               "status": {"const": "trusted_preseal"},
               "receipt_sha256": {"const": null}
+            }
+          },
+          "job_result": {
+            "properties": {
+              "outcome": {"type": "string"},
+              "stop_reason": {"type": "string"},
+              "allowed": {"const": true}
             }
           },
           "intervention": {

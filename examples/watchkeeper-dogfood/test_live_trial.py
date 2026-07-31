@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent
 SCRIPT = ROOT / "live-trial.py"
 MANIFEST = ROOT / "live-trials.json"
 SCHEMA = ROOT / "live-trial-results.schema.json"
+OPERATOR_CHECKLIST = ROOT.parents[1] / "docs" / "WATCHKEEPER-OPERATOR-ACCEPTANCE.md"
 EXPECTED_IDS = {
     "live_provider_worker_kill",
     "live_provider_supervisor_restart",
@@ -28,7 +29,7 @@ EXPECTED_IDS = {
     "live_provider_parent_repair",
     "live_campaign_interruption_recovery",
     "linux_bubblewrap_gate_boundary",
-    "docker_gate_boundary",
+    "live_docker_gate_attack",
 }
 REVISION = "defd889cfa7c2b21ea77b3053026157c02612fc4"
 JOB_ID = "01234567-89ab-cdef-0123-456789abcdef"
@@ -242,7 +243,501 @@ def supervisor_histories() -> tuple[list[dict], list[dict]]:
     return before, after
 
 
+class NetworkOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.trial_dir = Path(self.temp.name) / "trial"
+        self.raw = self.trial_dir / "raw"
+        self.raw.mkdir(parents=True)
+        self.attempt = {
+            "run_id": JOB_ID,
+            "attempt": 1,
+            "lease_epoch": 7,
+            "launch_id": "launch-network-a",
+            "pid": 4321,
+            "boot_id": "boot-network-a",
+            "process_start_identity": "start-network-a",
+        }
+        self.before = self.observation(
+            "before", "reachable", None, "2026-07-30T00:00:04Z", 4
+        )
+        self.offline = self.observation(
+            "intervention",
+            "unreachable",
+            "endpoint_unreachable",
+            "2026-07-30T00:00:04.500000Z",
+            4,
+        )
+        self.after = self.observation(
+            "after", "reachable", None, "2026-07-30T00:00:06Z", 6
+        )
+        self.before_events = [
+            event(1, "created", lease_epoch=0),
+            event(2, "lease_acquired", lease_epoch=7),
+            event(3, "attempt_started", lease_epoch=7, detail={"attempt": 1}),
+            event(
+                4,
+                "child_linked",
+                lease_epoch=7,
+                detail={
+                    "run_id": JOB_ID,
+                    "attempt": 1,
+                    "launch_id": self.attempt["launch_id"],
+                    "pid": self.attempt["pid"],
+                    "boot_id": self.attempt["boot_id"],
+                    "process_start_identity": self.attempt[
+                        "process_start_identity"
+                    ],
+                },
+            ),
+        ]
+        self.after_events = self.before_events + [
+            event(
+                5,
+                "attempt_stopped",
+                lease_epoch=7,
+                detail={"attempt": 1, "stop_reason": "transient_provider"},
+            ),
+            event(
+                6,
+                "retry_scheduled",
+                lease_epoch=7,
+                detail={"after_attempt": 1, "reason": "transient_provider"},
+            ),
+        ]
+        self.state = {
+            "session_id": "network-session",
+            "trusted_capture": {
+                "job_id": JOB_ID,
+                "provider_routes": [
+                    "worker=openai",
+                    "independent_judge=anthropic",
+                ],
+            },
+            "captures": {},
+            "intervention": {},
+        }
+        self.declaration = {
+            "before_evidence": "network-reachable-before",
+            "after_evidence": "network-reachable-after",
+            "events_before": "events-before",
+            "events_after": "events-after",
+            "job_evidence": "job-view-after",
+        }
+        self.allowed = [{"outcome": "verified", "stop_reason": "verified"}]
+        self.persist_fixture()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def observation(
+        self,
+        phase: str,
+        connectivity: str,
+        error_kind: str | None,
+        observed_at: str,
+        sequence: int,
+    ) -> dict:
+        return {
+            "schema_version": 2,
+            "job_id": JOB_ID,
+            "session_id": "network-session",
+            "trial_id": "live_provider_network_loss",
+            "phase": phase,
+            "observed_at": observed_at,
+            "provider_role": "worker",
+            "provider_route": "openai",
+            "endpoint": "https://api.openai.com/v1",
+            "connectivity": connectivity,
+            "error_kind": error_kind,
+            "job_last_sequence": sequence,
+            "attempt": copy.deepcopy(self.attempt),
+        }
+
+    def capture(self, name: str, value: object, suffix: str) -> None:
+        path = self.raw / f"{name}.{suffix}"
+        if suffix == "jsonl":
+            assert isinstance(value, list)
+            write_jsonl(path, value)
+        else:
+            write_json(path, value)
+        data = path.read_bytes()
+        self.state["captures"][name] = {
+            "file": path.name,
+            "format": suffix,
+            "bytes": len(data),
+            "sha256": RECORDER.digest_bytes(data),
+        }
+
+    def persist_fixture(self) -> None:
+        self.state["captures"] = {}
+        self.capture("network-reachable-before", self.before, "json")
+        self.capture("network-reachable-after", self.after, "json")
+        self.capture("events-before", self.before_events, "jsonl")
+        self.capture("events-after", self.after_events, "jsonl")
+        intervention_path = self.raw / "intervention.json"
+        write_json(intervention_path, self.offline)
+        self.state["intervention"] = {
+            "detail_sha256": RECORDER.digest_bytes(intervention_path.read_bytes())
+        }
+
+    def evaluate(self) -> dict:
+        return RECORDER.network_connectivity_transition_facts(
+            self.trial_dir,
+            self.state,
+            self.declaration,
+            self.allowed,
+        )
+
+    def test_exact_reachable_unreachable_restored_attempt_lineage_passes(self) -> None:
+        facts = self.evaluate()
+        self.assertEqual(facts["matching_child_links"], 1)
+        self.assertEqual(facts["matching_attempt_stops"], 1)
+        self.assertEqual(facts["matching_retries"], 1)
+
+    def test_route_endpoint_attempt_and_launch_substitutions_are_refused(self) -> None:
+        mutations = (
+            ("route", lambda value: value.__setitem__("provider_route", "anthropic")),
+            (
+                "endpoint",
+                lambda value: value.__setitem__("endpoint", "https://example.invalid"),
+            ),
+            (
+                "attempt",
+                lambda value: value["attempt"].__setitem__("attempt", 2),
+            ),
+            (
+                "launch",
+                lambda value: value["attempt"].__setitem__("launch_id", "other-launch"),
+            ),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                original = copy.deepcopy(self.offline)
+                mutate(self.offline)
+                self.persist_fixture()
+                with self.assertRaises(RECORDER.TrialError):
+                    self.evaluate()
+                self.offline = original
+
+    def test_stop_predating_outage_or_naming_another_attempt_is_refused(self) -> None:
+        cases = (
+            (
+                "predating",
+                lambda stopped: stopped.__setitem__(
+                    "timestamp", "2026-07-30T00:00:04Z"
+                ),
+            ),
+            (
+                "generic-other-attempt",
+                lambda stopped: stopped["detail"].__setitem__("attempt", 9),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                original = copy.deepcopy(self.after_events)
+                mutate(self.after_events[4])
+                self.persist_fixture()
+                with self.assertRaises(RECORDER.TrialError):
+                    self.evaluate()
+                self.after_events = original
+
+    def test_missing_restored_reachability_is_refused(self) -> None:
+        self.after["connectivity"] = "unreachable"
+        self.after["error_kind"] = "endpoint_unreachable"
+        self.persist_fixture()
+        with self.assertRaises(RECORDER.TrialError):
+            self.evaluate()
+
+    def test_duplicate_retry_fact_is_refused(self) -> None:
+        duplicate = event(
+            7,
+            "retry_scheduled",
+            lease_epoch=7,
+            detail={"after_attempt": 1, "reason": "duplicate"},
+        )
+        self.after_events.append(duplicate)
+        self.after["job_last_sequence"] = 7
+        self.persist_fixture()
+        with self.assertRaisesRegex(RECORDER.TrialError, "duplicate retry"):
+            self.evaluate()
+
+
+class CampaignRecoveryOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.trial_dir = Path(self.temp.name) / "trial"
+        self.raw = self.trial_dir / "raw"
+        self.raw.mkdir(parents=True)
+        self.plan_id = "plan-a"
+        self.sub_id = "sub-a"
+        self.campaign_before = {
+            "campaign_id": JOB_ID,
+            "sub_goals": [
+                {
+                    "sub_id": self.sub_id,
+                    "sub_plan_id": self.plan_id,
+                    "status": "running",
+                    "result_run_id": None,
+                }
+            ],
+        }
+        self.campaign_after = copy.deepcopy(self.campaign_before)
+        self.campaign_after["sub_goals"][0]["status"] = "merged"
+        self.campaign_after["sub_goals"][0]["result_run_id"] = "result-a"
+        self.plan_before = {
+            "plan_id": self.plan_id,
+            "owner_job_id": JOB_ID,
+            "tasks": [
+                {"task_id": "done-a", "status": "completed"},
+                {"task_id": "active-a", "status": "running"},
+            ],
+        }
+        self.plan_after = copy.deepcopy(self.plan_before)
+        self.plan_after["tasks"][1]["status"] = "completed"
+        self.plan_events_before = [
+            {
+                "plan_id": self.plan_id,
+                "event": {"kind": "task_completed", "task_id": "done-a"},
+            }
+        ]
+        self.plan_events_after = self.plan_events_before + [
+            {
+                "plan_id": self.plan_id,
+                "event": {"kind": "task_completed", "task_id": "active-a"},
+            }
+        ]
+        self.identity = {
+            "parent_job_id": JOB_ID,
+            "sub_id": self.sub_id,
+            "plan_id": self.plan_id,
+            "attempt": 1,
+            "lease_epoch": 1,
+            "outer_launch_id": "outer-a",
+            "launch_id": "campaign-launch-a",
+            "release_token_sha256": "sha256:campaign-release",
+            "pid": 4100,
+            "process_group": 4100,
+            "boot_id": "boot-a",
+            "process_start_identity": "process-start-a",
+        }
+        prepared = {
+            **self.identity,
+            "released": False,
+            "linked": False,
+            "adopted": False,
+            "adopted_by_attempt": None,
+            "adopted_by_lease_epoch": None,
+            "adopted_at": None,
+        }
+        released = {**prepared, "released": True}
+        linked = {**released, "linked": True}
+        adopted = {
+            **linked,
+            "adopted": True,
+            "adopted_by_attempt": 1,
+            "adopted_by_lease_epoch": 2,
+            "adopted_at": "2026-07-30T00:00:07Z",
+        }
+        self.campaign_events_before = [
+            self.campaign_event(
+                1,
+                "sub_launch_prepared",
+                {"sub_id": self.sub_id, "plan_id": self.plan_id},
+            ),
+            self.campaign_event(
+                2,
+                "sub_launched",
+                {"sub_id": self.sub_id, "plan_id": self.plan_id},
+            ),
+            self.campaign_event(3, "sub_process_launch_prepared", prepared),
+            self.campaign_event(4, "sub_process_released", released),
+            self.campaign_event(5, "sub_process_linked", linked),
+        ]
+        self.adoption = self.campaign_event(7, "sub_process_adopted", adopted)
+        self.recovery = self.campaign_event(
+            8,
+            "sub_recovered",
+            {
+                "sub_id": self.sub_id,
+                "plan_id": self.plan_id,
+                "result_run_id": "result-a",
+                "ok": True,
+            },
+        )
+        self.campaign_events_after = self.campaign_events_before + [
+            self.adoption,
+            self.recovery,
+        ]
+        self.view = job_view(lease_epoch=2, last_sequence=6)
+        self.lease_before = lease(owner="owner-a", epoch=1, pid=100)
+        self.lease_after = lease(owner="owner-b", epoch=2, pid=200)
+        self.state = {
+            "session_id": "campaign-session",
+            "captures": {},
+            "intervention": {},
+        }
+        self.declaration = {
+            "campaign_before": "campaign-before",
+            "campaign_after": "campaign-after",
+            "plan_before": "active-plan-before",
+            "plan_after": "active-plan-after",
+            "events_before": "campaign-events-before",
+            "events_after": "campaign-events-after",
+            "plan_events_before": "active-plan-events-before",
+            "plan_events_after": "active-plan-events-after",
+            "lease_before": "lease-before",
+            "lease_after": "lease-after",
+            "job_evidence": "job-view-after",
+        }
+        self.persist_fixture()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    @staticmethod
+    def campaign_event(sequence: int, kind: str, detail: dict) -> dict:
+        return {
+            "schema_version": 1,
+            "ts": f"2026-07-30T00:00:{sequence:02d}Z",
+            "kind": kind,
+            "detail": detail,
+        }
+
+    def capture(self, name: str, value: object, suffix: str) -> None:
+        path = self.raw / f"{name}.{suffix}"
+        if suffix == "jsonl":
+            assert isinstance(value, list)
+            write_jsonl(path, value)
+        else:
+            write_json(path, value)
+        data = path.read_bytes()
+        self.state["captures"][name] = {
+            "file": path.name,
+            "format": suffix,
+            "bytes": len(data),
+            "sha256": RECORDER.digest_bytes(data),
+        }
+
+    def persist_fixture(self, *, intervention: dict | None = None) -> None:
+        self.state["captures"] = {}
+        for name, value, suffix in (
+            ("campaign-before", self.campaign_before, "json"),
+            ("campaign-after", self.campaign_after, "json"),
+            ("active-plan-before", self.plan_before, "json"),
+            ("active-plan-after", self.plan_after, "json"),
+            ("campaign-events-before", self.campaign_events_before, "jsonl"),
+            ("campaign-events-after", self.campaign_events_after, "jsonl"),
+            ("active-plan-events-before", self.plan_events_before, "jsonl"),
+            ("active-plan-events-after", self.plan_events_after, "jsonl"),
+            ("lease-before", self.lease_before, "json"),
+            ("lease-after", self.lease_after, "json"),
+            ("job-view-after", self.view, "json"),
+        ):
+            self.capture(name, value, suffix)
+        intervention_path = self.raw / "intervention.json"
+        write_json(intervention_path, intervention or self.adoption)
+        self.state["intervention"] = {
+            "detail_sha256": RECORDER.digest_bytes(intervention_path.read_bytes())
+        }
+
+    def evaluate(self) -> dict:
+        return RECORDER.campaign_recovery_facts(
+            self.trial_dir, self.state, self.declaration
+        )
+
+    def test_exact_fenced_adoption_and_recovery_passes(self) -> None:
+        facts = self.evaluate()
+        self.assertEqual(facts["matching_adoptions"], 1)
+        self.assertEqual(facts["matching_recoveries"], 1)
+        self.assertEqual(facts["new_launch_facts"], 0)
+        self.assertEqual(facts["launch_id"], self.identity["launch_id"])
+
+    def test_different_launch_or_duplicate_adoption_is_refused(self) -> None:
+        original = copy.deepcopy(self.campaign_events_after)
+        self.campaign_events_after[-2]["detail"]["launch_id"] = "foreign-launch"
+        self.persist_fixture(intervention=self.campaign_events_after[-2])
+        with self.assertRaisesRegex(RECORDER.TrialError, "same launch"):
+            self.evaluate()
+        self.campaign_events_after = copy.deepcopy(original)
+        self.campaign_events_after.insert(-1, copy.deepcopy(self.adoption))
+        self.persist_fixture()
+        with self.assertRaisesRegex(RECORDER.TrialError, "exactly one process adoption"):
+            self.evaluate()
+
+    def test_foreign_owner_or_stale_plan_is_refused(self) -> None:
+        self.plan_before["owner_job_id"] = "foreign-job"
+        self.plan_after["owner_job_id"] = "foreign-job"
+        self.persist_fixture()
+        with self.assertRaisesRegex(RECORDER.TrialError, "not owned"):
+            self.evaluate()
+        self.plan_before["owner_job_id"] = JOB_ID
+        self.plan_after["owner_job_id"] = JOB_ID
+        self.campaign_after["sub_goals"][0]["sub_plan_id"] = "stale-plan"
+        self.persist_fixture()
+        with self.assertRaisesRegex(RECORDER.TrialError, "field sub_plan_id changed"):
+            self.evaluate()
+
+    def test_relaunch_fact_or_substituted_intervention_is_refused(self) -> None:
+        relaunch = self.campaign_event(
+            6,
+            "sub_process_relaunch_safe",
+            {**self.identity, "released": True, "linked": True},
+        )
+        self.campaign_events_after.insert(-2, relaunch)
+        self.persist_fixture()
+        with self.assertRaisesRegex(RECORDER.TrialError, "second launch fact"):
+            self.evaluate()
+        self.campaign_events_after.remove(relaunch)
+        substituted = copy.deepcopy(self.adoption)
+        substituted["detail"]["pid"] = 9999
+        self.persist_fixture(intervention=substituted)
+        with self.assertRaisesRegex(RECORDER.TrialError, "exact adoption event"):
+            self.evaluate()
+
+    def test_approved_bounded_negative_terminal_result_remains_pass_capable(self) -> None:
+        self.view = job_view(
+            phase="terminal",
+            outcome="deadline_reached",
+            stop_reason="deadline",
+            lease_epoch=2,
+            last_sequence=6,
+        )
+        self.persist_fixture()
+        self.assertEqual(self.evaluate()["matching_adoptions"], 1)
+        _, trials = RECORDER.load_manifest(MANIFEST)
+        observed = RECORDER.observed_job_result(
+            self.trial_dir,
+            self.state,
+            trials["live_campaign_interruption_recovery"],
+        )
+        self.assertEqual(
+            observed,
+            {
+                "outcome": "deadline_reached",
+                "stop_reason": "deadline",
+                "allowed": True,
+            },
+        )
+
+
 class ManifestContractTests(unittest.TestCase):
+    def test_trusted_prepare_uses_the_target_job_authority_revision(self) -> None:
+        for path in (ROOT / "README.md", OPERATOR_CHECKLIST):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn('--revision "$(git rev-parse HEAD)"', text, path)
+            self.assertIn(
+                '$DEADRECKON_HOME/jobs/$WK_JOB_ID/authority.json',
+                text,
+                path,
+            )
+            self.assertIn('--revision "$WK_JOB_SOURCE_REV"', text, path)
+            self.assertIn(
+                "target Job source revision",
+                text,
+                path,
+            )
+
     def test_manifest_covers_exactly_nine_claims_with_authoritative_references(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         ids = [trial["id"] for trial in manifest["trials"]]
@@ -272,6 +767,7 @@ class ManifestContractTests(unittest.TestCase):
             "parent_only_repair",
             "parent_repair_bound",
             "campaign_recovery_bound",
+            "network_connectivity_transition_bound",
             "sandbox_boundary_observation_bound",
             "structurally_inconclusive",
         }
@@ -311,6 +807,26 @@ class ManifestContractTests(unittest.TestCase):
             self.assertEqual(set(phased), set(declarations), trial["id"])
             self.assertTrue(trial["prerequisites"], trial["id"])
             self.assertTrue(trial["job"]["provider_slots"], trial["id"])
+            allowed_results = trial["job"]["allowed_terminal_results"]
+            self.assertTrue(allowed_results, trial["id"])
+            self.assertEqual(
+                len(allowed_results),
+                len(
+                    {
+                        (item["outcome"], item["stop_reason"])
+                        for item in allowed_results
+                    }
+                ),
+                trial["id"],
+            )
+            self.assertTrue(
+                all(
+                    item["stop_reason"]
+                    in RECORDER.VALID_TERMINAL_RESULTS[item["outcome"]]
+                    for item in allowed_results
+                ),
+                trial["id"],
+            )
             self.assertTrue(trial["intervention"]["operator_only"], trial["id"])
             self.assertTrue(trial["intervention"]["instructions"], trial["id"])
             self.assertTrue(trial["oracles"], trial["id"])
@@ -364,6 +880,63 @@ class ManifestContractTests(unittest.TestCase):
                         (trial["id"], oracle["id"]),
                     )
 
+    def test_manifest_job_shape_vocabulary_fails_closed(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual(
+            {trial["job"]["shape"] for trial in manifest["trials"]},
+            {
+                "single",
+                "campaign",
+                "graph_or_campaign",
+                "single_or_graph_or_campaign",
+            },
+        )
+        manifest["trials"][0]["job"]["shape"] = "legacy_chain"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "live-trials.json"
+            write_json(path, manifest)
+            with self.assertRaisesRegex(
+                RECORDER.TrialError,
+                "unsupported Job shape declaration",
+            ):
+                RECORDER.load_manifest(path)
+
+    def test_manifest_terminal_results_are_exact_valid_unique_pairs(self) -> None:
+        original = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        cases = [
+            ([], "no allowed terminal results"),
+            (
+                [{"outcome": "verified", "stop_reason": "fatal_gate"}],
+                "invalid or duplicate terminal result",
+            ),
+            (
+                [
+                    {"outcome": "verified", "stop_reason": "verified"},
+                    {"outcome": "verified", "stop_reason": "verified"},
+                ],
+                "invalid or duplicate terminal result",
+            ),
+            (
+                [
+                    {
+                        "outcome": "verified",
+                        "stop_reason": "verified",
+                        "wildcard": True,
+                    }
+                ],
+                "exact outcome and stop_reason",
+            ),
+        ]
+        for allowed, message in cases:
+            with self.subTest(allowed=allowed):
+                manifest = json.loads(json.dumps(original))
+                manifest["trials"][0]["job"]["allowed_terminal_results"] = allowed
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "live-trials.json"
+                    write_json(path, manifest)
+                    with self.assertRaisesRegex(RECORDER.TrialError, message):
+                        RECORDER.load_manifest(path)
+
     def test_arbitrary_attack_and_recovery_summaries_are_not_declared(self) -> None:
         manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
         evidence = {
@@ -381,13 +954,7 @@ class ManifestContractTests(unittest.TestCase):
                 for oracle in trial["oracles"]
             )
         }
-        self.assertEqual(
-            structurally_inconclusive,
-            {
-                "live_provider_network_loss",
-                "live_campaign_interruption_recovery",
-            },
-        )
+        self.assertEqual(structurally_inconclusive, set())
 
     def test_result_schema_is_closed_and_fail_closed_for_pass(self) -> None:
         schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
@@ -416,6 +983,9 @@ class ManifestContractTests(unittest.TestCase):
         )
         self.assertEqual(
             pass_then["cleanup"]["properties"]["status"]["const"], "completed"
+        )
+        self.assertTrue(
+            pass_then["job_result"]["properties"]["allowed"]["const"]
         )
         self.assertEqual(
             pass_then["oracle_assertions"]["items"]["properties"]["status"]["const"],
@@ -672,6 +1242,8 @@ else:
         stale_after: bool = False,
         report_last_sequence: int | None = None,
         nonverified_receipt: bool = False,
+        terminal_outcome: str = "verified",
+        terminal_stop_reason: str = "verified",
     ) -> tuple[list[str], list[str]]:
         before_events, after_events = supervisor_histories()
         if stale_after:
@@ -710,8 +1282,33 @@ else:
             after_events = before_events + [
                 event(7, "deterministic_gate_passed", lease_epoch=2)
             ]
+        terminal_kind = {
+            "verified": "verified",
+            "needs_review": "needs_review",
+            "blocked": "blocked",
+            "budget_exhausted": "budget_exhausted",
+            "deadline_reached": "deadline_reached",
+            "retry_exhausted": "failed",
+            "cancelled": "cancelled",
+            "failed": "failed",
+        }[terminal_outcome]
+        terminal_detail = (
+            {} if terminal_outcome == "verified" else {"stop_reason": terminal_stop_reason}
+        )
+        after_events = after_events + [
+            event(
+                len(after_events) + 1,
+                terminal_kind,
+                detail=terminal_detail,
+                lease_epoch=2,
+            )
+        ]
         report_value = job_report(
             report_job_id,
+            backend=backend,
+            phase="terminal",
+            outcome=terminal_outcome,
+            stop_reason=terminal_stop_reason,
             lease_epoch=2,
             last_sequence=(
                 len(after_events)
@@ -734,6 +1331,9 @@ else:
             ),
             "job-view-after": job_view(
                 backend=backend,
+                phase="terminal",
+                outcome=terminal_outcome,
+                stop_reason=terminal_stop_reason,
                 lease_epoch=2,
                 last_sequence=len(after_events),
             ),
@@ -839,18 +1439,19 @@ else:
         raw.mkdir(parents=True)
         path = raw / "service-before.json"
         service = {
-            "schema_version": 1,
+            "schema_version": 2,
             "manager": "launchd",
             "installed": "current",
             "loaded": True,
-            "enabled": None,
+            "enabled": "enabled",
             "active": None,
             "checkpoint": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "generation": 2,
                 "instance_id": "service-instance",
                 "boot_id": "boot-a",
                 "pid": 4242,
+                "process_start_identity": "pid-start-service-instance",
             },
             "current_boot_id": "boot-a",
             "boot_identity_source": "macos_sysctl",
@@ -883,6 +1484,24 @@ else:
             self.trial_dir, capture_state(), declaration
         )
         self.assertEqual(assertion["status"], "passed")
+
+        service["enabled"] = "disabled"
+        write_json(path, service)
+        assertion = RECORDER.evaluate_oracle(
+            self.trial_dir, capture_state(), declaration
+        )
+        self.assertEqual(assertion["status"], "failed")
+        service["enabled"] = "enabled"
+
+        process_start_identity = service["checkpoint"].pop(
+            "process_start_identity"
+        )
+        write_json(path, service)
+        assertion = RECORDER.evaluate_oracle(
+            self.trial_dir, capture_state(), declaration
+        )
+        self.assertEqual(assertion["status"], "failed")
+        service["checkpoint"]["process_start_identity"] = process_start_identity
 
         service["test_override"] = True
         service["boot_identity_source"] = "test_override"
@@ -1561,7 +2180,11 @@ module.write_json_no_clobber(target, {"durable": True})
 
     def test_nonverified_lifecycle_cannot_carry_a_valid_receipt(self) -> None:
         self.prepare()
-        self.observe_supervisor(nonverified_receipt=True)
+        self.observe_supervisor(
+            nonverified_receipt=True,
+            terminal_outcome="needs_review",
+            terminal_stop_reason="semantic_unavailable",
+        )
         self.complete_cleanup()
         result = self.finalize()
         evaluation = result["evaluation"]
@@ -1570,6 +2193,64 @@ module.write_json_no_clobber(target, {"durable": True})
         }
         self.assertNotEqual(rejected["report_bound_to_job"], "passed")
         self.assertNotEqual(evaluation["status"], "passed")
+
+    def test_observed_job_result_requires_the_exact_approved_pair(self) -> None:
+        self.prepare()
+        self.observe_supervisor(
+            terminal_outcome="needs_review",
+            terminal_stop_reason="semantic_unavailable",
+        )
+        self.complete_cleanup()
+        state = json.loads(
+            (self.trial_dir / "trial-state.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        trial = next(
+            item
+            for item in manifest["trials"]
+            if item["id"] == "live_provider_supervisor_restart"
+        )
+        trial["job"]["allowed_terminal_results"] = [
+            {
+                "outcome": "needs_review",
+                "stop_reason": "semantic_unavailable",
+            }
+        ]
+        self.assertEqual(
+            RECORDER.observed_job_result(self.trial_dir, state, trial),
+            {
+                "outcome": "needs_review",
+                "stop_reason": "semantic_unavailable",
+                "allowed": True,
+            },
+        )
+        state["capture_mode"] = "trusted"
+        manifest_path = self.root / "negative-terminal-manifest.json"
+        write_json(manifest_path, manifest)
+        evaluation = RECORDER.build_evaluation(
+            manifest_path,
+            self.trial_dir,
+            state,
+            trusted_pass_ready=True,
+        )
+        self.assertEqual(evaluation["status"], "passed")
+        self.assertEqual(
+            evaluation["job_result"],
+            {
+                "outcome": "needs_review",
+                "stop_reason": "semantic_unavailable",
+                "allowed": True,
+            },
+        )
+        trial["job"]["allowed_terminal_results"] = [
+            {
+                "outcome": "needs_review",
+                "stop_reason": "semantic_uncertain",
+            }
+        ]
+        self.assertFalse(
+            RECORDER.observed_job_result(self.trial_dir, state, trial)["allowed"]
+        )
 
     def test_definitive_failure_is_not_hidden_by_an_inconclusive_oracle(self) -> None:
         state = {

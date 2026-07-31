@@ -60,7 +60,7 @@
     "schema_version": {
       "type": "integer",
       "enum": [
-        1
+        2
       ]
     },
     "sequence": {
@@ -149,6 +149,7 @@
         "campaign_events",
         "active_plan",
         "active_plan_events",
+        "network_connectivity_observation",
         "sandbox_boundary_observation",
         "campaign_intervention",
         "result_envelope",

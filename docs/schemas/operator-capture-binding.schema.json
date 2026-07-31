@@ -4,6 +4,7 @@
   "description": "Immutable identity approved before the first capture event.",
   "type": "object",
   "required": [
+    "allowed_terminal_results",
     "capture_binary",
     "capture_binary_sha256",
     "created_at",
@@ -31,6 +32,13 @@
     "trial_id"
   ],
   "properties": {
+    "allowed_terminal_results": {
+      "description": "Exact product terminal results approved before the fault is applied. A `verified/verified` result still requires a valid CompletionReceipt; every other accepted pair requires authenticated terminal-history lineage instead.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/OperatorCaptureExpectedJobResult"
+      }
+    },
     "capture_binary": {
       "type": "string"
     },
@@ -64,6 +72,17 @@
     },
     "manifest_sha256": {
       "type": "string"
+    },
+    "network_probe": {
+      "description": "Exact registry-backed provider endpoint approved for the network-loss trial. Other trials must not carry a network probe authority.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OperatorCaptureNetworkProbe"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "pass_capable": {
       "type": "boolean"
@@ -103,7 +122,7 @@
     "schema_version": {
       "type": "integer",
       "enum": [
-        1
+        2
       ]
     },
     "session_id": {
@@ -124,6 +143,20 @@
   },
   "additionalProperties": false,
   "definitions": {
+    "JobOutcome": {
+      "description": "Terminal classification, separate from both phase and causal stop reason.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "needs_review",
+        "blocked",
+        "budget_exhausted",
+        "deadline_reached",
+        "retry_exhausted",
+        "cancelled",
+        "failed"
+      ]
+    },
     "JobShape": {
       "type": "string",
       "enum": [
@@ -132,6 +165,44 @@
         "legacy_chain",
         "legacy_campaign"
       ]
+    },
+    "OperatorCaptureExpectedJobResult": {
+      "description": "One exact outcome/reason pair that may satisfy a dogfood trial.",
+      "type": "object",
+      "required": [
+        "outcome",
+        "stop_reason"
+      ],
+      "properties": {
+        "outcome": {
+          "$ref": "#/definitions/JobOutcome"
+        },
+        "stop_reason": {
+          "$ref": "#/definitions/StopReason"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OperatorCaptureNetworkProbe": {
+      "description": "Immutable provider route and endpoint selected before a network fault.",
+      "type": "object",
+      "required": [
+        "endpoint",
+        "provider_role",
+        "provider_route"
+      ],
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        },
+        "provider_role": {
+          "type": "string"
+        },
+        "provider_route": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     },
     "OperatorCapturePhase": {
       "description": "Operator-capture phase, kept separate from Job lifecycle state.",
@@ -197,11 +268,34 @@
         "campaign_events",
         "active_plan",
         "active_plan_events",
+        "network_connectivity_observation",
         "sandbox_boundary_observation",
         "campaign_intervention",
         "result_envelope",
         "manual_file",
         "unavailable_objective"
+      ]
+    },
+    "StopReason": {
+      "description": "Why execution stopped. New jobs persist this typed value instead of recovering meaning from free-form failure text.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "semantic_revise",
+        "semantic_uncertain",
+        "semantic_unavailable",
+        "operator_input_required",
+        "spend_cap",
+        "wall_cap",
+        "deadline",
+        "attempt_limit",
+        "cancel_requested",
+        "transient_provider",
+        "fatal_provider",
+        "fatal_gate",
+        "lost_containment",
+        "corrupt_history",
+        "legacy_unknown"
       ]
     }
   }

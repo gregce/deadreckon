@@ -11,7 +11,7 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::process::{Command, Stdio};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
     AuthorityAcceptedBy, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
     GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, Job, JobAuthority,
@@ -55,8 +55,21 @@ pub(crate) struct CreateJob<'a> {
     pub(crate) max_spend_usd: f64,
     pub(crate) max_wall_seconds: u64,
     pub(crate) max_attempts: u32,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) sandbox_requested: String,
     pub(crate) accepted_by: AuthorityAcceptedBy,
+}
+
+/// Convert the CLI/config wall-cap representation without silently widening
+/// an invalid or sub-second approval into a different Job policy.
+pub(crate) fn checked_job_wall_seconds(value: f64) -> Result<u64> {
+    if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 || value >= u64::MAX as f64 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job wall-clock cap must be a positive, finite, whole number of seconds that is representable as u64"
+                .to_string(),
+        )));
+    }
+    Ok(value as u64)
 }
 
 struct PendingJobDirectory {
@@ -101,12 +114,43 @@ impl Drop for PendingJobDirectory {
 }
 
 pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
+    if !request.max_spend_usd.is_finite() || request.max_spend_usd <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job spend cap must be finite and greater than zero".to_string(),
+        )));
+    }
+    if request.max_wall_seconds == 0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job wall-clock cap must be greater than zero".to_string(),
+        )));
+    }
+    if request.max_attempts == 0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job attempt cap must be greater than zero".to_string(),
+        )));
+    }
+    if request
+        .launch_plan
+        .budget
+        .ceiling_usd
+        .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job launch-plan spend cap must be finite and greater than zero".to_string(),
+        )));
+    }
+    if request.launch_plan.budget.wall_seconds == Some(0) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable Job launch-plan wall-clock cap must be greater than zero".to_string(),
+        )));
+    }
     if request.sandbox_requested.trim() == "none" {
         return Err(CliError::Core(deadreckon_core::user_error(
             "durable Jobs require containment; sandbox `none` cannot be frozen as trusted execution policy",
             "use sandbox auto or an available sandbox-exec, bwrap, or docker backend",
         )));
     }
+    request.launch_plan.budget.deadline = request.deadline;
     let expected_shape = match request.launch_plan.shape {
         commands::course::CourseShape::Single => JobShape::Single,
         commands::course::CourseShape::Plan => JobShape::Graph,
@@ -175,8 +219,8 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     let policy = JobPolicy {
         max_spend_usd: request.max_spend_usd,
         max_wall_seconds: request.max_wall_seconds,
-        max_attempts: request.max_attempts.max(1),
-        deadline: None,
+        max_attempts: request.max_attempts,
+        deadline: request.deadline,
         semantic_judge: SemanticJudgeMode::Required,
         execution: Some(execution),
     };
@@ -562,6 +606,11 @@ pub(crate) fn cancel_job(
         paths,
         view.job.job_id.as_ref(),
     )?;
+    let merge_repair_inventory =
+        commands::graph_job::validate_merge_repair_process_inventory_for_job(
+            paths,
+            view.job.job_id.as_ref(),
+        )?;
     let metadata_path = paths
         .job_dir(view.job.job_id.as_ref())
         .join("supervised-child.json");
@@ -587,6 +636,11 @@ pub(crate) fn cancel_job(
     commands::graph_job::terminate_validated_campaign_sub_processes(
         paths,
         campaign_inventory,
+        grace,
+    )?;
+    commands::graph_job::terminate_validated_merge_repair_processes(
+        paths,
+        merge_repair_inventory,
         grace,
     )?;
     if let Some(state) = state.as_ref() {
@@ -616,31 +670,43 @@ pub(crate) fn reconcile_run_supervised_processes(
         if is_docker_cid_sidecar(&path) {
             continue;
         }
-        match deadreckon_core::read_supervised_process_record(&path) {
-            Ok(record) => reconcile_guarded_process_record(&path, &record, grace)?,
-            Err(record_error) => {
-                let process = read_legacy_nested_supervised_process(&path).map_err(|error| {
-                    CliError::Core(DeadreckonError::InvalidInput(format!(
-                        "cannot reconcile supervised process record {}: {record_error}; legacy parse also failed: {error}",
-                        path.display()
-                    )))
-                })?;
-                if boot_changed {
-                    remove_supervised_file(&path)?;
-                    continue;
-                }
-                if deadreckon_core::pid_is_alive(process.pid) {
+        reconcile_run_supervised_process_path(&path, grace, boot_changed)?;
+    }
+    Ok(())
+}
+
+fn reconcile_run_supervised_process_path(
+    path: &Path,
+    grace: Duration,
+    boot_changed: bool,
+) -> Result<()> {
+    match deadreckon_core::read_supervised_process_record(path) {
+        Ok(record) => reconcile_guarded_process_record(path, &record, grace),
+        Err(record_error) => {
+            let process = match read_legacy_nested_supervised_process(path) {
+                Ok(process) => process,
+                Err(_error) if path_is_confirmed_absent(path)? => return Ok(()),
+                Err(error) => {
                     return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                        "cannot prove legacy supervised process {} from {} is dead because it has no boot and process-start identity",
-                        process.pid,
+                        "cannot reconcile supervised process record {}: {record_error}; legacy parse also failed: {error}",
                         path.display()
                     ))));
                 }
-                remove_supervised_file(&path)?;
+            };
+            if boot_changed {
+                remove_supervised_file(path)?;
+                return Ok(());
             }
+            if deadreckon_core::pid_is_alive(process.pid) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "cannot prove legacy supervised process {} from {} is dead because it has no boot and process-start identity",
+                    process.pid,
+                    path.display()
+                ))));
+            }
+            remove_supervised_file(path)
         }
     }
-    Ok(())
 }
 
 fn is_docker_cid_sidecar(path: &Path) -> bool {
@@ -671,18 +737,22 @@ pub(crate) fn reconcile_job_docker_executions(paths: &DeadreckonPaths, job: &Job
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
-        let record = deadreckon_sandbox::read_docker_execution_record(&path)
-            .map_err(|error| CliError::Core(DeadreckonError::InvalidInput(error.to_string())))?;
-        if record.job_id() != job.job_id.as_ref() {
-            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "Docker execution record {} belongs to a different Job",
-                path.display()
-            ))));
-        }
-        deadreckon_sandbox::reconcile_docker_execution_record(&path)
-            .map_err(|error| CliError::Core(DeadreckonError::InvalidInput(error.to_string())))?;
+        reconcile_job_docker_execution_path(&path, job)?;
     }
     Ok(())
+}
+
+fn reconcile_job_docker_execution_path(path: &Path, job: &Job) -> Result<()> {
+    deadreckon_sandbox::reconcile_docker_execution_record_for_job(path, job.job_id.as_ref())
+        .map_err(|error| CliError::Core(DeadreckonError::InvalidInput(error.to_string())))
+}
+
+fn path_is_confirmed_absent(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn read_legacy_nested_supervised_process(
@@ -1388,9 +1458,77 @@ mod tests {
             max_spend_usd: 4.0,
             max_wall_seconds: 90,
             max_attempts: 2,
+            deadline: None,
             sandbox_requested: "auto".to_string(),
             accepted_by: AuthorityAcceptedBy::Operator,
         }
+    }
+
+    #[test]
+    fn wall_cap_conversion_never_rewrites_an_invalid_or_fractional_approval() {
+        assert_eq!(checked_job_wall_seconds(90.0).expect("whole cap"), 90);
+        for invalid in [
+            0.0,
+            -1.0,
+            0.5,
+            1.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            u64::MAX as f64,
+        ] {
+            let error = checked_job_wall_seconds(invalid)
+                .expect_err("invalid wall approval must fail closed");
+            assert!(error.to_string().contains("wall-clock cap"), "{error}");
+        }
+    }
+
+    #[test]
+    fn central_job_creation_rejects_invalid_approved_limits_before_persistence() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+
+        for invalid_spend in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let mut invalid = request(&paths, &source, None);
+            invalid.max_spend_usd = invalid_spend;
+            let error = create_job(invalid).expect_err("invalid spend cap must fail closed");
+            assert!(error.to_string().contains("spend cap"), "{error}");
+        }
+
+        let mut zero_wall = request(&paths, &source, None);
+        zero_wall.max_wall_seconds = 0;
+        let error = create_job(zero_wall).expect_err("zero wall cap must fail closed");
+        assert!(error.to_string().contains("wall-clock cap"), "{error}");
+
+        let mut zero_attempts = request(&paths, &source, None);
+        zero_attempts.max_attempts = 0;
+        let error = create_job(zero_attempts).expect_err("zero attempt cap must fail closed");
+        assert!(error.to_string().contains("attempt cap"), "{error}");
+
+        let mut invalid_plan_spend = request(&paths, &source, None);
+        invalid_plan_spend.launch_plan.budget.ceiling_usd = Some(f64::NAN);
+        let error = create_job(invalid_plan_spend)
+            .expect_err("invalid embedded spend cap must fail closed");
+        assert!(
+            error.to_string().contains("launch-plan spend cap"),
+            "{error}"
+        );
+
+        let mut zero_plan_wall = request(&paths, &source, None);
+        zero_plan_wall.launch_plan.budget.wall_seconds = Some(0);
+        let error =
+            create_job(zero_plan_wall).expect_err("zero embedded wall cap must fail closed");
+        assert!(
+            error.to_string().contains("launch-plan wall-clock cap"),
+            "{error}"
+        );
+
+        assert!(
+            !paths.jobs_dir().exists(),
+            "invalid approved policy must fail before creating durable state"
+        );
     }
 
     #[test]
@@ -2212,6 +2350,46 @@ mod tests {
         let _ = outer.wait();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn malformed_merge_repair_inventory_does_not_signal_the_outer_job_process() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job = create_job(request(&paths, &source, None)).expect("job");
+        let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        let mut outer = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("outer process");
+        deadreckon_core::write_supervised_process(
+            &paths
+                .job_dir(job.job_id.as_ref())
+                .join("supervised-child.json"),
+            deadreckon_core::SupervisedProcess {
+                pid: outer.id(),
+                pgid: None,
+            },
+        )
+        .expect("outer authority");
+        let repair_dir = paths
+            .job_dir(job.job_id.as_ref())
+            .join("merge-repair-authorities");
+        fs::create_dir_all(&repair_dir).expect("merge-repair authority directory");
+        fs::write(repair_dir.join("malformed.json"), b"{}").expect("malformed authority");
+
+        cancel_job(&paths, &view, true)
+            .expect_err("malformed merge-repair inventory must fail before signalling");
+        assert!(
+            outer.try_wait().expect("poll outer").is_none(),
+            "outer process must remain alive when merge-repair authority is malformed"
+        );
+
+        let _ = outer.kill();
+        let _ = outer.wait();
+    }
+
     fn supervised_state(temp: &TempDir) -> deadreckon_core::PipelineState {
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let cwd = temp.path().join("workspace");
@@ -2231,6 +2409,49 @@ mod tests {
             },
         )
         .expect("run state")
+    }
+
+    #[test]
+    fn supervised_process_record_removed_after_directory_snapshot_is_idempotent() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let directory = state.run_root.join("child-pids");
+        fs::create_dir_all(&directory).expect("child-pids");
+        let original = directory.join("disappearing-process.json");
+        fs::write(&original, b"123\n").expect("legacy process record");
+        let snapshot = fs::read_dir(&directory)
+            .expect("directory snapshot")
+            .next()
+            .expect("snapshot entry")
+            .expect("snapshot path")
+            .path();
+        fs::remove_file(&original).expect("concurrent trusted reconciliation");
+
+        reconcile_run_supervised_process_path(&snapshot, Duration::ZERO, false)
+            .expect("an already reconciled snapshot path is success");
+    }
+
+    #[test]
+    fn docker_record_removed_after_directory_snapshot_is_idempotent() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job = create_job(request(&paths, &source, None)).expect("job");
+        let directory = paths.job_dir(job.job_id.as_ref()).join("docker-executions");
+        fs::create_dir_all(&directory).expect("Docker execution directory");
+        let original = directory.join("disappearing-execution.json");
+        fs::write(&original, b"{}\n").expect("execution placeholder");
+        let snapshot = fs::read_dir(&directory)
+            .expect("directory snapshot")
+            .next()
+            .expect("snapshot entry")
+            .expect("snapshot path")
+            .path();
+        fs::remove_file(&original).expect("concurrent trusted reconciliation");
+
+        reconcile_job_docker_execution_path(&snapshot, &job)
+            .expect("an already reconciled Docker snapshot path is success");
     }
 
     #[cfg(unix)]

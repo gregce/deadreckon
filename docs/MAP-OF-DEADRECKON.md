@@ -122,7 +122,7 @@ truthfully by Jobs.
 | Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; real Docker tests prove the common control boundary and the public strict-Job completion, cancellation and worker-recovery paths on macOS arm64. Clean-source recording and live Linux gate proof remain outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
 | Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event and steering parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
 | Structured provider contracts | Replace output scraping with declared event semantics | Pi/Copilot and app-server paths emit/consume typed events; other adapters retain parsing gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
-| Budgets and context | Bound delegated work and reveal consumption | Wall-time, turn and API-spend caps plus spend/context records drive status and stopping | Budget is enforced by the outer harness | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
+| Budgets and context | Bound delegated work and reveal consumption | Exact positive wall caps, one absolute deadline across every durable creation route, turn/API-spend caps and spend/context records drive typed stopping | The outer harness enforces expiry while work is live and reconciles nested process authorities before terminal state | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
 | Evidence ledgers and protocol | Make every important decision reconstructable | Append-only run, trace, spend, flight and narrative records feed a shared projection | Evidence is a first-class artifact, not a log side effect | **Stable**: Keel centralized the wire vocabulary, persistence policy, readers, writers and checked schemas | **Essential; preserve compatibility and route new formats through the protocol** |
 | `RunView` and `JobView` projections | Give surfaces one interpretation of evidence and lifecycle | `RunView` retains rich run facts; `JobView` folds Job events and composes the linked run | Separates control truth from evidence without duplicating either | **Stable / maturing**: legacy adapters are read-only; all surfaces are not yet Job-native | **Essential; complete projection/resolver parity** |
 | Two-key completion and verdict | Separate "agent finished" from "work accepted" | A native contained HMAC gate must pass, then a fresh read-only semantic judge must return `achieved`; the supervisor seals a combined receipt | Natural-language meaning is checked without weakening deterministic failure | **Stable / bounded for durable Jobs**; explicitly legacy objects remain deterministic-only | **Core differentiator; benchmark false acceptance/rejection** |
@@ -139,7 +139,7 @@ truthfully by Jobs.
 | App-server steering | Control a live inner harness through a richer protocol | Codex app-server integration and a provider-neutral inbox support bounded steering/approvals | Moves beyond stdout scraping | **Experimental**, opt-in and Codex-led | **Preserve the neutral pattern; validate before broad surface investment** |
 | Learning and self-improve | Mine prior runs and propose changes to DeadReckon itself | Indexing and learning commands derive observations/proposals from artifacts | A self-hosted improvement loop | **Experimental**; weak connection to the original highest-priority needs | **Strong product-decision/deprecation candidate** unless usage and proposal quality justify it |
 | Notifications and sleep inhibition | Support unattended operation | Optional notifications and platform sleep handling wrap long runs | Useful operational polish | **Stable / peripheral** | **Keep while cheap; not strategic** |
-| Supervisor service operations | Restore local work after the worker shell or supervisor disappears | Explicit managed launchd/systemd definitions pin binary, home and PATH; install/start/status/stop refuse unmanaged conflicts | Machine-level posture is opt-in and inspectable | **Implemented definitions and commands; live cross-platform reboot acceptance outstanding** | **Dogfood before making restart-at-login a default claim** |
+| Supervisor service operations | Restore local work after the worker shell or supervisor disappears | `setup --supervisor` installs and starts an identity-bound launchd/systemd user service; real approved `start` requires a current active definition and live boot/PID/start-identity checkpoint | Machine-level posture is explicit, inspectable and a launch prerequisite | **Implemented and hermetically exercised; live cross-platform reboot acceptance outstanding** | **Dogfood the real reboot path before claiming machine recovery** |
 | Doctor, setup, update and release trust | Make the binary installable and diagnosable | Environment checks, provider setup, update flow, signing/attestation and packaging support operations | Necessary for trusting a local supervisor binary | **Stable / maturing** | **Add service/containment preflight; otherwise maintain as infrastructure** |
 
 ## Durable Job gates are closed; refused legacy routes and foreground escapes remain
@@ -223,6 +223,18 @@ followed by semantic `NEEDS_REVIEW`, operator cancellation without retry or
 receipt, and worker `SIGKILL` cleanup before exactly one bounded retry. Those
 results are bound to clean source `e87c70f` by evidence commit `e7b9bb2`. Live
 Linux/bubblewrap proof and a real service-backed reboot remain outstanding.
+The network-loss recorder is no longer structurally incapable of passing: it
+signs the registry-derived worker route and endpoint, records a strict
+reachable/unreachable/reachable transition for one durably linked attempt, and
+requires that attempt's exact stop and retry-or-approved-terminal lineage.
+That is implementation evidence only; the host/provider drill itself remains
+unrun and therefore unproven.
+The Campaign interruption recorder is also pass-capable for a deliberately
+narrow claim. It binds one prepared/released/linked sub-Plan process authority,
+requires exactly one later adoption of that same launch under a newer fenced
+Job lease, rejects any second launch fact or reopened completed task, and then
+requires recovery of the same Plan. It does not broaden that evidence into a
+global exactly-once claim, and the live provider interruption remains unrun.
 
 ## Original unmet needs: current outcome
 
@@ -335,11 +347,17 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   arm64. The committed
   credential-free adversarial result records 13 passes and 0 failures. The
   24-row live operator kit records 2 attempted tasks, 22 not run, and 0
-  verified. A passive recorder defines evidence and oracles for all 8
-  remaining live claims without initiating their destructive actions. Its
+  verified. A passive recorder defines evidence and oracles for all 9 current
+  live claims without initiating their destructive actions. The ninth keeps
+  the hostile live Docker/provider/receipt claim separate from the narrower
+  credential-free Docker lifecycle proof. Its
   protected `dr-capture` mode authenticates the exact Job, append-only history,
   deterministic evaluation and HMAC publication receipt; operator-supplied
-  compatibility captures remain explicitly inconclusive. The public strict
+  compatibility captures remain explicitly inconclusive. Trials sign exact
+  allowed terminal outcome/reason pairs before the fault. Verified outcomes
+  still require the normal `CompletionReceipt`; an approved non-Verified
+  outcome requires distinct signed terminal-history lineage and the absence of
+  a completion receipt. The public strict
   Docker results are bound to the clean committed source named by that result
   artifact. There is no live Linux/bubblewrap result, reboot result, or
   measured false-accept and false-reject rate.

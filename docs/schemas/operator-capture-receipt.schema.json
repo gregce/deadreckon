@@ -56,7 +56,7 @@
     "schema_version": {
       "type": "integer",
       "enum": [
-        1
+        2
       ]
     },
     "session_id": {
@@ -67,10 +67,34 @@
     },
     "status": {
       "$ref": "#/definitions/OperatorCaptureStatus"
+    },
+    "terminal_lineage": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OperatorCaptureTerminalLineage"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
   "definitions": {
+    "JobOutcome": {
+      "description": "Terminal classification, separate from both phase and causal stop reason.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "needs_review",
+        "blocked",
+        "budget_exhausted",
+        "deadline_reached",
+        "retry_exhausted",
+        "cancelled",
+        "failed"
+      ]
+    },
     "OperatorCaptureCompletionLineage": {
       "description": "Exact validated completion identity sealed into a passed capture receipt.",
       "type": "object",
@@ -127,6 +151,95 @@
         "failed",
         "inconclusive",
         "not_run"
+      ]
+    },
+    "OperatorCaptureTerminalLineage": {
+      "description": "Exact authenticated Job history behind a passed non-Verified trial.",
+      "type": "object",
+      "required": [
+        "authority_sha256",
+        "contract_sha256",
+        "effective_policy_sha256",
+        "goal_sha256",
+        "job_history_bytes",
+        "job_history_sha256",
+        "launch_plan_sha256",
+        "outcome",
+        "source_tree_sha256",
+        "stop_reason",
+        "terminal_event_sha256",
+        "terminal_sequence"
+      ],
+      "properties": {
+        "authority_sha256": {
+          "type": "string"
+        },
+        "contract_sha256": {
+          "type": "string"
+        },
+        "effective_policy_sha256": {
+          "type": "string"
+        },
+        "goal_sha256": {
+          "type": "string"
+        },
+        "job_history_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "job_history_sha256": {
+          "type": "string"
+        },
+        "launch_plan_sha256": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/definitions/JobOutcome"
+        },
+        "source_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_tree_sha256": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "$ref": "#/definitions/StopReason"
+        },
+        "terminal_event_sha256": {
+          "type": "string"
+        },
+        "terminal_sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "StopReason": {
+      "description": "Why execution stopped. New jobs persist this typed value instead of recovering meaning from free-form failure text.",
+      "type": "string",
+      "enum": [
+        "verified",
+        "semantic_revise",
+        "semantic_uncertain",
+        "semantic_unavailable",
+        "operator_input_required",
+        "spend_cap",
+        "wall_cap",
+        "deadline",
+        "attempt_limit",
+        "cancel_requested",
+        "transient_provider",
+        "fatal_provider",
+        "fatal_gate",
+        "lost_containment",
+        "corrupt_history",
+        "legacy_unknown"
       ]
     }
   }

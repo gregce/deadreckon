@@ -1,8 +1,19 @@
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::narrative::{AttachViewMode, NarrativeVisualMode};
+
+pub(crate) fn parse_rfc3339_deadline(value: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|deadline| deadline.with_timezone(&Utc))
+        .map_err(|_| {
+            format!(
+                "invalid deadline {value:?}; expected RFC3339, for example 2026-08-01T04:00:00Z"
+            )
+        })
+}
 
 const TOP_LEVEL_TEMPLATE: &str = "\
 {name} {version}
@@ -34,10 +45,13 @@ Supported shells: bash, elvish, fish, powershell, zsh.";
 const INIT_HELP: &str = "\
 Lifecycle:
   deadreckon init
+  deadreckon setup --supervisor
   deadreckon doctor
   deadreckon start \"build the thing\"
 
-Use `deadreckon config provider` and `deadreckon config model` later to see or change defaults.";
+`setup --supervisor` is the explicit one-time action that installs and starts
+the restart-capable per-user service. Use `deadreckon config provider` and
+`deadreckon config model` later to see or change defaults.";
 
 const CONFIG_HELP: &str = "\
 Subcommands:
@@ -605,6 +619,12 @@ pub(crate) enum Commands {
         no_confirm: bool,
         #[arg(long, help = "Skip shell completion installation")]
         no_completion: bool,
+        #[arg(
+            long,
+            exclusive = true,
+            help = "Install and start the restart-capable per-user supervisor service"
+        )]
+        supervisor: bool,
     },
     #[command(
         next_help_heading = "Setup",
@@ -747,6 +767,13 @@ pub(crate) enum Commands {
             help = "Budget ceiling for this launch (also gates auto-accept)"
         )]
         max_spend: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(long, help = "Confirm the launch preview without prompting")]
         yes: bool,
         #[arg(long, help = "Force built-in governance seams for this launch")]
@@ -857,6 +884,13 @@ pub(crate) enum Commands {
         max_wall_seconds: Option<f64>,
         #[arg(
             long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
+        #[arg(
+            long,
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
@@ -940,6 +974,13 @@ pub(crate) enum Commands {
         max_wall_seconds: Option<f64>,
         #[arg(
             long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
+        #[arg(
+            long,
             help = "Sandbox backend for the interactive chooser: auto, sandbox-exec, bwrap, docker, or none"
         )]
         sandbox: Option<String>,
@@ -1016,6 +1057,13 @@ pub(crate) enum Commands {
         max_spend: Option<f64>,
         #[arg(long, help = "Per-leaf wall-clock cap for CLI-backed turns")]
         max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(
             long,
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
@@ -1105,6 +1153,13 @@ pub(crate) enum Commands {
         max_spend: Option<f64>,
         #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
         max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(
             long,
             help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
@@ -1231,6 +1286,13 @@ pub(crate) enum Commands {
         max_spend: Option<f64>,
         #[arg(long, help = "Aggregate chain wall-clock cap in seconds")]
         max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(long, help = "Provider route override")]
         provider: Option<String>,
         #[arg(long, help = "Model override")]
@@ -1590,6 +1652,13 @@ pub(crate) enum Commands {
         max_spend: Option<f64>,
         #[arg(long, help = "Wall-clock cap for CLI-backed turns")]
         max_wall_seconds: Option<f64>,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for this durable follow-up Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(long, help = "Provider route override")]
         provider: Option<String>,
         #[arg(long, help = "Model override for this extended run")]
@@ -1738,6 +1807,13 @@ pub(crate) enum Commands {
     Reshape {
         #[arg(help = "Run id or prefix carrying a reshape proposal, or `latest`")]
         run_id: String,
+        #[arg(
+            long,
+            value_name = "RFC3339",
+            value_parser = parse_rfc3339_deadline,
+            help = "Absolute deadline for the durable reshaped Job"
+        )]
+        deadline: Option<DateTime<Utc>>,
         #[arg(long, help = "Accept and dispatch without prompting")]
         yes: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
@@ -2064,6 +2140,13 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) max_wall_seconds: Option<f64>,
     #[arg(
         long,
+        value_name = "RFC3339",
+        value_parser = parse_rfc3339_deadline,
+        help = "Absolute deadline for this durable Job"
+    )]
+    pub(crate) deadline: Option<DateTime<Utc>>,
+    #[arg(
+        long,
         help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
     )]
     pub(crate) sandbox: Option<String>,
@@ -2128,6 +2211,13 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) max_spend: Option<f64>,
     #[arg(long, help = "Per-child wall-clock cap for CLI-backed turns")]
     pub(crate) max_wall_seconds: Option<f64>,
+    #[arg(
+        long,
+        value_name = "RFC3339",
+        value_parser = parse_rfc3339_deadline,
+        help = "Absolute deadline for this durable Job"
+    )]
+    pub(crate) deadline: Option<DateTime<Utc>>,
     #[arg(
         long,
         help = "Sandbox backend: auto, sandbox-exec, bwrap, docker, or none"
@@ -2692,6 +2782,7 @@ pub(crate) struct RunCommandArgs {
     pub(crate) quiet: bool,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) sandbox: Option<String>,
     pub(crate) untrusted: bool,
     pub(crate) provider: Option<String>,
@@ -2716,6 +2807,7 @@ pub(crate) struct StartCommandArgs {
     pub(crate) mode: CliStartMode,
     pub(crate) plan: Option<PathBuf>,
     pub(crate) max_spend: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) children: Option<u8>,
@@ -2769,6 +2861,7 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) plan_id: String,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) sandbox: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) child_provider: Vec<String>,
@@ -2816,6 +2909,7 @@ pub(crate) struct ChainCommandArgs {
     pub(crate) circuit_breaker_threshold: u32,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) sandbox: String,
@@ -2851,6 +2945,7 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) no_context: bool,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
+    pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) sandbox: Option<String>,
@@ -2866,7 +2961,131 @@ pub(crate) struct ExtendCommandArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, OrchestrateCommand, parse_rfc3339_deadline};
+
+    #[test]
+    fn deadline_parser_normalizes_offsets_to_utc_and_rejects_non_rfc3339() {
+        let parsed = parse_rfc3339_deadline("2026-08-01T00:00:00-04:00").expect("RFC3339 deadline");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-01T04:00:00+00:00");
+        assert!(parse_rfc3339_deadline("tomorrow morning").is_err());
+    }
+
+    #[test]
+    fn setup_supervisor_is_one_explicit_exclusive_service_action() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from(["deadreckon", "setup", "--supervisor"])
+                    .expect("supervisor setup parses through the public setup alias");
+                let Some(Commands::Init { supervisor, .. }) = cli.command else {
+                    panic!("setup alias must resolve to init");
+                };
+                assert!(supervisor);
+                assert!(
+                    Cli::try_parse_from([
+                        "deadreckon",
+                        "setup",
+                        "--supervisor",
+                        "--provider",
+                        "smoke",
+                    ])
+                    .is_err(),
+                    "service setup must not silently perform provider initialization"
+                );
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
+    }
+
+    #[test]
+    fn every_public_durable_creation_route_accepts_the_same_deadline_input() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let value = "2026-08-01T00:00:00-04:00";
+                let expected = "2026-08-01T04:00:00+00:00";
+                let cases = [
+                    vec!["deadreckon", "start", "goal", "--deadline", value],
+                    vec!["deadreckon", "run", "goal", "--deadline", value],
+                    vec!["deadreckon", "campaign", "goal", "--deadline", value],
+                    vec!["deadreckon", "fork", "plan-123", "--deadline", value],
+                    vec!["deadreckon", "reshape", "latest", "--deadline", value],
+                    vec![
+                        "deadreckon",
+                        "chain",
+                        "step one",
+                        "step two",
+                        "--deadline",
+                        value,
+                    ],
+                    vec![
+                        "deadreckon",
+                        "extend",
+                        "latest",
+                        "follow up",
+                        "--deadline",
+                        value,
+                    ],
+                ];
+                for argv in cases {
+                    let cli = Cli::try_parse_from(argv).expect("durable route parses deadline");
+                    let Some(command) = cli.command else {
+                        panic!("durable creation command")
+                    };
+                    let (Commands::Start { deadline, .. }
+                    | Commands::Run { deadline, .. }
+                    | Commands::Campaign { deadline, .. }
+                    | Commands::Fork { deadline, .. }
+                    | Commands::Reshape { deadline, .. }
+                    | Commands::Chain { deadline, .. }
+                    | Commands::Extend { deadline, .. }) = command
+                    else {
+                        panic!("durable creation route")
+                    };
+                    assert_eq!(deadline.expect("deadline").to_rfc3339(), expected);
+                }
+
+                for argv in [
+                    vec!["deadreckon", "orchestrate", "goal", "--deadline", value],
+                    vec![
+                        "deadreckon",
+                        "orchestrate",
+                        "review",
+                        "goal",
+                        "--deadline",
+                        value,
+                    ],
+                    vec![
+                        "deadreckon",
+                        "orchestrate",
+                        "full-plan",
+                        "goal",
+                        "--deadline",
+                        value,
+                    ],
+                ] {
+                    let cli = Cli::try_parse_from(argv).expect("orchestrate deadline");
+                    let Some(Commands::Orchestrate {
+                        command,
+                        deadline: bare_deadline,
+                        ..
+                    }) = cli.command
+                    else {
+                        panic!("orchestration");
+                    };
+                    let parsed = match command {
+                        None => bare_deadline,
+                        Some(OrchestrateCommand::Review(args)) => args.deadline,
+                        Some(OrchestrateCommand::FullPlan(args)) => args.deadline,
+                    };
+                    assert_eq!(parsed.expect("deadline").to_rfc3339(), expected);
+                }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
+    }
 
     #[test]
     fn fork_yes_is_explicit_and_quiet_does_not_set_it() {

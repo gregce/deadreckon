@@ -9,10 +9,10 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::{JobId, JobShape};
+use crate::{JobId, JobOutcome, JobShape, StopReason};
 
 /// The only operator-capture wire version understood by this release.
-pub const OPERATOR_CAPTURE_SCHEMA_VERSION: u32 = 1;
+pub const OPERATOR_CAPTURE_SCHEMA_VERSION: u32 = 2;
 
 /// Checked discriminator for every persisted operator-capture artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -89,10 +89,118 @@ pub struct OperatorCaptureBinding {
     pub declared_backend: String,
     /// Approved provider routes keyed by manifest-declared execution role.
     pub provider_routes: BTreeMap<String, Vec<String>>,
+    /// Exact registry-backed provider endpoint approved for the network-loss
+    /// trial. Other trials must not carry a network probe authority.
+    pub network_probe: Option<OperatorCaptureNetworkProbe>,
     pub replay_sha256: String,
     pub pass_capable: bool,
+    /// Exact product terminal results approved before the fault is applied.
+    /// A `verified/verified` result still requires a valid CompletionReceipt;
+    /// every other accepted pair requires authenticated terminal-history
+    /// lineage instead.
+    pub allowed_terminal_results: Vec<OperatorCaptureExpectedJobResult>,
     pub required_captures: Vec<OperatorCaptureRequirement>,
     pub signature: String,
+}
+
+/// Immutable provider route and endpoint selected before a network fault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureNetworkProbe {
+    pub provider_role: String,
+    pub provider_route: String,
+    pub endpoint: String,
+}
+
+/// Connectivity result emitted by the official provider registry probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureConnectivity {
+    Reachable,
+    Unreachable,
+}
+
+/// Deliberately narrow network failure vocabulary. Other provider probe
+/// failures (for example missing credentials) cannot masquerade as an outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCaptureNetworkErrorKind {
+    EndpointUnreachable,
+}
+
+/// Exact supervised attempt affected by a network observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureNetworkAttempt {
+    pub run_id: String,
+    pub attempt: u32,
+    pub lease_epoch: u64,
+    pub launch_id: String,
+    pub pid: u32,
+    pub boot_id: String,
+    pub process_start_identity: String,
+}
+
+/// Canonical reachable/unreachable fact for one signed provider route and one
+/// durable supervised attempt. The after observation retains the affected
+/// attempt identity even when that process has already exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureNetworkObservation {
+    pub schema_version: OperatorCaptureSchemaVersion,
+    pub job_id: JobId,
+    pub session_id: String,
+    pub trial_id: String,
+    pub phase: OperatorCapturePhase,
+    pub observed_at: DateTime<Utc>,
+    pub provider_role: String,
+    pub provider_route: String,
+    pub endpoint: String,
+    pub connectivity: OperatorCaptureConnectivity,
+    pub error_kind: Option<OperatorCaptureNetworkErrorKind>,
+    pub job_last_sequence: u64,
+    pub attempt: OperatorCaptureNetworkAttempt,
+}
+
+/// One exact outcome/reason pair that may satisfy a dogfood trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureExpectedJobResult {
+    pub outcome: JobOutcome,
+    pub stop_reason: StopReason,
+}
+
+impl OperatorCaptureExpectedJobResult {
+    pub fn is_valid(self) -> bool {
+        match self.outcome {
+            JobOutcome::Verified => self.stop_reason == StopReason::Verified,
+            JobOutcome::NeedsReview => matches!(
+                self.stop_reason,
+                StopReason::SemanticRevise
+                    | StopReason::SemanticUncertain
+                    | StopReason::SemanticUnavailable
+            ),
+            JobOutcome::Blocked => matches!(
+                self.stop_reason,
+                StopReason::OperatorInputRequired | StopReason::LostContainment
+            ),
+            JobOutcome::BudgetExhausted => {
+                matches!(self.stop_reason, StopReason::SpendCap | StopReason::WallCap)
+            }
+            JobOutcome::DeadlineReached => self.stop_reason == StopReason::Deadline,
+            JobOutcome::RetryExhausted => self.stop_reason == StopReason::AttemptLimit,
+            JobOutcome::Cancelled => self.stop_reason == StopReason::CancelRequested,
+            JobOutcome::Failed => matches!(
+                self.stop_reason,
+                StopReason::TransientProvider
+                    | StopReason::FatalProvider
+                    | StopReason::FatalGate
+                    | StopReason::LostContainment
+                    | StopReason::CorruptHistory
+                    | StopReason::LegacyUnknown
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -194,6 +302,7 @@ pub enum OperatorCaptureSource {
     CampaignEvents,
     ActivePlan,
     ActivePlanEvents,
+    NetworkConnectivityObservation,
     SandboxBoundaryObservation,
     CampaignIntervention,
     ResultEnvelope,
@@ -238,6 +347,7 @@ pub struct OperatorCaptureReceipt {
     pub result_sha256: String,
     pub result_bytes: u64,
     pub completion_lineage: Option<OperatorCaptureCompletionLineage>,
+    pub terminal_lineage: Option<OperatorCaptureTerminalLineage>,
     pub status: OperatorCaptureStatus,
     pub signature: String,
 }
@@ -257,6 +367,25 @@ pub struct OperatorCaptureCompletionLineage {
     pub result_revision: Option<String>,
 }
 
+/// Exact authenticated Job history behind a passed non-Verified trial.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorCaptureTerminalLineage {
+    pub authority_sha256: String,
+    pub goal_sha256: String,
+    pub contract_sha256: String,
+    pub effective_policy_sha256: String,
+    pub launch_plan_sha256: String,
+    pub source_tree_sha256: String,
+    pub source_revision: Option<String>,
+    pub job_history_sha256: String,
+    pub job_history_bytes: u64,
+    pub terminal_event_sha256: String,
+    pub terminal_sequence: u64,
+    pub outcome: JobOutcome,
+    pub stop_reason: StopReason,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatorCaptureStatus {
@@ -272,7 +401,7 @@ mod tests {
 
     #[test]
     fn capture_wire_discriminators_reject_unsupported_values() {
-        assert!(serde_json::from_str::<OperatorCaptureSchemaVersion>("2").is_err());
+        assert!(serde_json::from_str::<OperatorCaptureSchemaVersion>("3").is_err());
         assert!(serde_json::from_str::<OperatorCaptureEventSequence>("0").is_err());
         assert_eq!(
             serde_json::from_str::<OperatorCaptureEventSequence>("1")

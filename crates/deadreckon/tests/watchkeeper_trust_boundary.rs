@@ -19,6 +19,10 @@ use deadreckon_protocol::{JobAuthority, JobEventKind, JobOutcome};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod common;
+
+use common::SupervisorServiceFixture;
+
 #[cfg(unix)]
 #[test]
 fn guarded_exec_does_not_run_when_parent_pipe_closes_before_identity_is_durable() {
@@ -63,6 +67,7 @@ fn guarded_exec_does_not_run_when_parent_pipe_closes_before_identity_is_durable(
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn strict_public_start_refuses_none_despite_poisoned_legacy_gate_environment() {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
@@ -74,10 +79,11 @@ fn strict_public_start_refuses_none_despite_poisoned_legacy_gate_environment() {
         "default_provider = \"smoke\"\n\n[defaults]\nsandbox = \"none\"\n",
     )
     .expect("config");
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let launch = public_deadreckon()
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
         .env(GATE_CONTAINED_ENV, "true")
         .env(GATE_SANDBOX_BACKEND_ENV, "sandbox-exec")
         .args([
@@ -138,7 +144,8 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let host_home = temp.path().join("host-home");
+    let service = SupervisorServiceFixture::configured(&paths);
+    let host_home = service.user_home().to_path_buf();
     let host_secret = host_home.join(".aws/credentials");
     let outside_write = temp.path().join("gate-host-write");
     let shim_bin = temp.path().join("shim-bin");
@@ -183,18 +190,10 @@ fn sandboxed_public_gate_denies_control_tampering_and_reaps_delayed_checks_befor
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
 
-    let launch = public_deadreckon()
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
-        .env("HOME", &host_home)
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                shim_bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
+        .env("PATH", format!("{}:{}", shim_bin.display(), service.path()))
         .env(
             "DEADRECKON_FAKE_SECRET",
             "WATCHKEEPER_AMBIENT_SECRET_MUST_NOT_LEAK",
@@ -340,10 +339,11 @@ checks:
     git(&workspace, &["config", "user.name", "Watchkeeper Test"]);
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let launch = public_deadreckon()
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
         .args([
             "start",
             "Enter the approved cancellable deterministic gate.",
@@ -469,10 +469,11 @@ checks:
     git(&workspace, &["config", "user.name", "Watchkeeper Test"]);
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let launch = public_deadreckon()
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
         .args([
             "start",
             "Recover the approved deterministic gate after one launcher crash.",
@@ -565,15 +566,17 @@ checks:
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn public_smoke_job_can_never_issue_a_trusted_completion_receipt() {
     let temp = TempDir::new().expect("tempdir");
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let launch = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
         .args([
             "start",
             "Create the deterministic smoke project and satisfy its checks.",
@@ -866,6 +869,7 @@ checks:
 
 #[cfg(unix)]
 struct LiveDockerFixture {
+    _service: SupervisorServiceFixture,
     _temp: TempDir,
     workspace: std::path::PathBuf,
     paths: DeadreckonPaths,
@@ -951,10 +955,11 @@ fn launch_live_docker_job(goal: &str, acceptance: &str) -> LiveDockerFixture {
     git(&workspace, &["config", "user.name", "Watchkeeper Test"]);
     git(&workspace, &["add", "-A"]);
     git(&workspace, &["commit", "-m", "fixture"]);
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let launch = public_deadreckon()
+    let launch = service
+        .deadreckon()
         .current_dir(&workspace)
-        .env("DEADRECKON_HOME", paths.home())
         .args([
             "start",
             goal,
@@ -984,6 +989,7 @@ fn launch_live_docker_job(goal: &str, acceptance: &str) -> LiveDockerFixture {
         .to_string();
     let state = wait_for_run(&paths, &job_id, Duration::from_secs(30));
     LiveDockerFixture {
+        _service: service,
         _temp: temp,
         workspace,
         paths,

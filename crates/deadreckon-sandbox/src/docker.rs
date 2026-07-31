@@ -335,12 +335,49 @@ pub fn reconcile_docker_execution_record(path: &Path) -> Result<()> {
     reconcile_docker_execution_record_value_with(&wrapper, path, &record)
 }
 
+pub fn reconcile_docker_execution_record_for_job(path: &Path, expected_job_id: &str) -> Result<()> {
+    let Some(record) = read_docker_execution_record_for_reconciliation(path)? else {
+        return Ok(());
+    };
+    validate_expected_job(path, &record, expected_job_id)?;
+    let wrapper = backend_executable(SandboxBackend::Docker)?;
+    reconcile_docker_execution_record_value_with(&wrapper, path, &record)
+}
+
 #[cfg(test)]
 fn reconcile_docker_execution_record_with(wrapper: &Path, path: &Path) -> Result<()> {
     let Some(record) = read_docker_execution_record_for_reconciliation(path)? else {
         return Ok(());
     };
     reconcile_docker_execution_record_value_with(wrapper, path, &record)
+}
+
+#[cfg(test)]
+fn reconcile_docker_execution_record_for_job_with(
+    wrapper: &Path,
+    path: &Path,
+    expected_job_id: &str,
+) -> Result<()> {
+    let Some(record) = read_docker_execution_record_for_reconciliation(path)? else {
+        return Ok(());
+    };
+    validate_expected_job(path, &record, expected_job_id)?;
+    reconcile_docker_execution_record_value_with(wrapper, path, &record)
+}
+
+fn validate_expected_job(
+    path: &Path,
+    record: &DockerExecutionRecord,
+    expected_job_id: &str,
+) -> Result<()> {
+    if record.job_id() != expected_job_id {
+        return Err(invalid_docker(format!(
+            "Docker execution record {} belongs to Job {}, expected {expected_job_id}",
+            path.display(),
+            record.job_id()
+        )));
+    }
+    Ok(())
 }
 
 fn read_docker_execution_record_for_reconciliation(
@@ -928,8 +965,8 @@ mod tests {
             &temp,
             "docker-inspect",
             &format!(
-                "#!/bin/sh\nprintf '%s\\tlinux\\tarm64\\n' '{}'\n",
-                format!("sha256:{}", "b".repeat(64))
+                "#!/bin/sh\nprintf '%s\\tlinux\\tarm64\\n' 'sha256:{}'\n",
+                "b".repeat(64)
             ),
         );
         let image = inspect_docker_image_with(&docker, OsStr::new("rust:1")).expect("inspect");
@@ -1105,6 +1142,91 @@ mod tests {
         assert!(fixture.state.exists(), "container state was removed");
         assert!(fixture.execution.cid_file().exists(), "cidfile was removed");
         assert!(record_path.exists(), "execution record was removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_bound_reconciliation_refuses_a_foreign_record_before_daemon_action() {
+        let fixture = docker_reconciliation_fixture(false);
+        let record_path = fixture
+            .execution
+            .cid_file()
+            .parent()
+            .expect("cid parent")
+            .join("foreign-job.json");
+        write_docker_execution_record(&record_path, &fixture.execution).expect("write record");
+
+        let error =
+            reconcile_docker_execution_record_for_job_with(&fixture.docker, &record_path, "job-2")
+                .expect_err("foreign record");
+
+        assert!(error.to_string().contains("expected job-2"), "{error}");
+        assert!(fixture.state.exists(), "foreign container was removed");
+        assert!(
+            fixture.execution.cid_file().exists(),
+            "foreign cidfile was removed"
+        );
+        assert!(record_path.exists(), "foreign record was removed");
+        let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+        assert!(!log.contains("container rm -f"), "{log}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_bound_reconciliation_never_acts_on_a_record_swapped_after_validation() {
+        let fixture = docker_reconciliation_fixture(false);
+        let record_path = fixture
+            .execution
+            .cid_file()
+            .parent()
+            .expect("cid parent")
+            .join("swapped-job.json");
+        write_docker_execution_record(&record_path, &fixture.execution).expect("write record");
+        let mut foreign = fixture.execution.record();
+        foreign.job_id = "job-2".to_string();
+        let foreign_path = record_path.with_extension("foreign");
+        foreign.write_to(&foreign_path).expect("foreign record");
+        let swapped = record_path.with_extension("swapped");
+        fs::write(
+            &fixture.docker,
+            format!(
+                "#!/bin/sh\n\
+                 state='{}'\n\
+                 log='{}'\n\
+                 record='{}'\n\
+                 foreign='{}'\n\
+                 swapped='{}'\n\
+                 printf '%s\\n' \"$*\" >>\"$log\"\n\
+                 if test \"$1 $2\" = 'container inspect'; then\n\
+                   if test ! -f \"$swapped\"; then\n\
+                     /bin/cp \"$foreign\" \"$record\"; : >\"$swapped\"\n\
+                   fi\n\
+                   if test -f \"$state\"; then /bin/cat \"$state\"; exit 0; fi\n\
+                   printf 'Error: No such object\\n' >&2; exit 1\n\
+                 fi\n\
+                 if test \"$1 $2 $3\" = 'container rm -f'; then\n\
+                   /bin/rm -f \"$state\"; printf '%s\\n' \"$4\"; exit 0\n\
+                 fi\n\
+                 exit 90\n",
+                fixture.state.display(),
+                fixture.log.display(),
+                record_path.display(),
+                foreign_path.display(),
+                swapped.display(),
+            ),
+        )
+        .expect("swapping Docker script");
+
+        let error =
+            reconcile_docker_execution_record_for_job_with(&fixture.docker, &record_path, "job-1")
+                .expect_err("record swap");
+
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert_eq!(
+            read_docker_execution_record(&record_path).expect("retained foreign record"),
+            foreign
+        );
+        assert!(record_path.exists(), "swapped record was removed");
     }
 
     #[cfg(unix)]
@@ -1325,7 +1447,7 @@ mod tests {
         };
         let container = serde_json::json!([{
             "Id": cid,
-            "Image": image_id.clone(),
+            "Image": image_id,
             "Name": "/deadreckon-gate-launch-1",
             "Config": {
                 "Labels": {

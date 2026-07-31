@@ -140,6 +140,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         circuit_breaker_threshold,
         max_spend,
         max_wall_seconds,
+        deadline,
         provider,
         model,
         sandbox,
@@ -196,6 +197,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 pre_job_spend_usd: 0.0,
                 pre_job_wall_seconds: 0.0,
                 provider,
@@ -247,6 +249,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 pre_job_spend_usd: 0.0,
                 pre_job_wall_seconds: 0.0,
                 provider,
@@ -414,6 +417,7 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 pre_job_spend_usd: 0.0,
                 pre_job_wall_seconds: 0.0,
                 provider,
@@ -449,6 +453,7 @@ struct ChainCreateOptions {
     circuit_breaker_threshold: u32,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
+    deadline: Option<DateTime<Utc>>,
     pre_job_spend_usd: f64,
     pre_job_wall_seconds: f64,
     provider: Option<String>,
@@ -623,6 +628,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         circuit_breaker_threshold,
         max_spend,
         max_wall_seconds,
+        deadline,
         pre_job_spend_usd,
         pre_job_wall_seconds,
         provider,
@@ -756,6 +762,13 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
     };
     if !quiet && (draft || !yes) {
         println!("{}", chain_preview(&chain));
+        println!(
+            "deadline: {}",
+            deadline
+                .as_ref()
+                .map(DateTime::to_rfc3339)
+                .unwrap_or_else(|| "none".to_string())
+        );
         if let Some(contract_preview) = contract_preview.as_ref() {
             print_chain_contract_preview(contract_preview);
         }
@@ -826,6 +839,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         &chain,
         pre_job_spend_usd,
         pre_job_wall_seconds,
+        deadline,
         acceptance.as_deref(),
         chain_accepted_by(yes),
         contract_preview.as_ref().ok_or_else(|| {
@@ -1266,6 +1280,7 @@ fn schedule_linear_chain_job(
     chain: &Chain,
     pre_job_spend_usd: f64,
     pre_job_wall_seconds: f64,
+    deadline: Option<DateTime<Utc>>,
     acceptance: Option<&Path>,
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
     contract_preview: &ChainContractPreview,
@@ -1274,11 +1289,14 @@ fn schedule_linear_chain_job(
     let job = create_linear_chain_job(
         paths,
         chain,
-        pre_job_spend_usd,
-        pre_job_wall_seconds,
-        acceptance,
-        accepted_by,
-        contract_preview,
+        &LinearChainJobRequest {
+            pre_job_spend_usd,
+            pre_job_wall_seconds,
+            deadline,
+            acceptance,
+            accepted_by,
+            contract_preview,
+        },
     )?;
     commands::job::launch_detached_supervisor(paths, &job.job_id)?;
     if quiet {
@@ -1290,15 +1308,26 @@ fn schedule_linear_chain_job(
     Ok(job.job_id.to_string())
 }
 
+struct LinearChainJobRequest<'a> {
+    pre_job_spend_usd: f64,
+    pre_job_wall_seconds: f64,
+    deadline: Option<DateTime<Utc>>,
+    acceptance: Option<&'a Path>,
+    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
+    contract_preview: &'a ChainContractPreview,
+}
+
 fn create_linear_chain_job(
     paths: &DeadreckonPaths,
     chain: &Chain,
-    pre_job_spend_usd: f64,
-    pre_job_wall_seconds: f64,
-    acceptance: Option<&Path>,
-    accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
-    contract_preview: &ChainContractPreview,
+    request: &LinearChainJobRequest<'_>,
 ) -> Result<deadreckon_protocol::Job> {
+    let pre_job_spend_usd = request.pre_job_spend_usd;
+    let pre_job_wall_seconds = request.pre_job_wall_seconds;
+    let deadline = request.deadline;
+    let acceptance = request.acceptance;
+    let accepted_by = request.accepted_by;
+    let contract_preview = request.contract_preview;
     let defaults = config_defaults(paths)?;
     let approved_max_spend_usd = chain.max_spend_usd.or(defaults.max_spend).unwrap_or(10.0);
     let approved_max_wall_seconds = chain
@@ -1310,11 +1339,8 @@ fn create_linear_chain_job(
             "durable chain max spend must be a positive finite value".to_string(),
         )));
     }
-    if !approved_max_wall_seconds.is_finite() || approved_max_wall_seconds <= 0.0 {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "durable chain wall cap must be a positive finite value".to_string(),
-        )));
-    }
+    let approved_max_wall_seconds_u64 =
+        commands::job::checked_job_wall_seconds(approved_max_wall_seconds)?;
     if !pre_job_spend_usd.is_finite() || pre_job_spend_usd < 0.0 {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "chain planner reported invalid pre-Job spend; no Job was created".to_string(),
@@ -1326,7 +1352,7 @@ fn create_linear_chain_job(
         )));
     }
     let execution_max_spend_usd = approved_max_spend_usd - pre_job_spend_usd;
-    let execution_max_wall_seconds = approved_max_wall_seconds - pre_job_wall_seconds;
+    let execution_max_wall_seconds = approved_max_wall_seconds_u64 as f64 - pre_job_wall_seconds;
     if execution_max_spend_usd <= 0.0 || execution_max_wall_seconds <= 0.0 {
         let message = format!(
             "one token-bounded chain planner completion used ${pre_job_spend_usd:.6} and {pre_job_wall_seconds:.3}s of the approved ${approved_max_spend_usd:.6} / {approved_max_wall_seconds:.3}s total; planning exhausted a cap, so no Job was created"
@@ -1336,7 +1362,10 @@ fn create_linear_chain_job(
             "raise --max-spend/--max-wall-seconds or provide ordered goals directly to skip planning",
         )));
     }
-    let execution_max_wall_seconds = execution_max_wall_seconds as u64;
+    // The approved total is whole seconds. Charge fractional planner time by
+    // flooring only the remaining execution allowance, which can make the Job
+    // stricter but can never widen the operator-approved total.
+    let execution_max_wall_seconds = execution_max_wall_seconds.floor() as u64;
     if execution_max_wall_seconds == 0 {
         return Err(CliError::Core(deadreckon_core::user_error(
             "less than one second remains under the approved chain wall cap; no Job was created",
@@ -1346,6 +1375,7 @@ fn create_linear_chain_job(
     let mut launch = linear_chain_launch_plan(chain);
     launch.budget.ceiling_usd = Some(execution_max_spend_usd);
     launch.budget.wall_seconds = Some(execution_max_wall_seconds);
+    launch.budget.deadline = deadline;
     let mut signals = launch.signals.as_object().cloned().unwrap_or_default();
     signals.insert(
         "watchkeeper_pre_job_budget".to_string(),
@@ -1410,6 +1440,7 @@ fn create_linear_chain_job(
         max_spend_usd: execution_max_spend_usd,
         max_wall_seconds: execution_max_wall_seconds,
         max_attempts: 3,
+        deadline,
         sandbox_requested: chain.sandbox.clone(),
         accepted_by,
     })
@@ -3151,6 +3182,7 @@ async fn dispatch_chain_command_mode(
         CommandModeVerb::Reshape => {
             super::course::reshape_command(super::course::ReshapeArgs {
                 run_id: target,
+                deadline: None,
                 yes: true,
                 json: false,
                 plain: false,
@@ -4639,15 +4671,19 @@ mod tests {
         .expect("acceptance");
         let contract_preview =
             chain_contract_preview(Some(&acceptance), &chain.cwd).expect("contract preview");
+        let deadline = Utc::now() + chrono::TimeDelta::hours(2);
 
         let job = create_linear_chain_job(
             &paths,
             &chain,
-            0.5,
-            5.25,
-            Some(&acceptance),
-            deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
-            &contract_preview,
+            &LinearChainJobRequest {
+                pre_job_spend_usd: 0.5,
+                pre_job_wall_seconds: 5.25,
+                deadline: Some(deadline),
+                acceptance: Some(&acceptance),
+                accepted_by: deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
+                contract_preview: &contract_preview,
+            },
         )
         .expect("create graph job");
         let launch =
@@ -4658,6 +4694,8 @@ mod tests {
         assert_eq!(job.shape, deadreckon_protocol::JobShape::Graph);
         assert_eq!(job.policy.max_spend_usd, 2.5);
         assert_eq!(job.policy.max_wall_seconds, 114);
+        assert_eq!(job.policy.deadline, Some(deadline));
+        assert_eq!(launch.budget.deadline, Some(deadline));
         assert_ne!(job.job_id.as_ref(), chain.chain_id);
         assert_eq!(launch.pieces.len(), 3);
         assert_eq!(driver.kind, commands::graph_job::DriverKind::FullPlan);
@@ -4707,11 +4745,14 @@ mod tests {
         let error = create_linear_chain_job(
             &paths,
             &chain,
-            3.0,
-            1.0,
-            None,
-            deadreckon_protocol::AuthorityAcceptedBy::Operator,
-            &contract_preview,
+            &LinearChainJobRequest {
+                pre_job_spend_usd: 3.0,
+                pre_job_wall_seconds: 1.0,
+                deadline: None,
+                acceptance: None,
+                accepted_by: deadreckon_protocol::AuthorityAcceptedBy::Operator,
+                contract_preview: &contract_preview,
+            },
         )
         .expect_err("planner exhausted the approved total");
 

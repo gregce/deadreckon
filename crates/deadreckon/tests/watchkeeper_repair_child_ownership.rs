@@ -22,6 +22,12 @@ use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+mod common;
+
+#[cfg(target_os = "macos")]
+use common::SupervisorServiceFixture;
+
 /// Depth test for the HIGH merge-repair trust-boundary gap.
 ///
 /// Run this ignored test while developing the fix:
@@ -82,6 +88,7 @@ impl RepairShape {
 
 #[cfg(target_os = "macos")]
 struct RepairFixture {
+    _supervisor: SupervisorServiceFixture,
     _temp: TempDir,
     shape: RepairShape,
     paths: DeadreckonPaths,
@@ -112,8 +119,10 @@ impl RepairFixture {
         .expect("acceptance");
         init_git_repo(&workspace);
         write_repair_fixture_provider(&paths, temp.path(), &provider_id);
+        let supervisor = SupervisorServiceFixture::configured(&paths);
 
         Self {
+            _supervisor: supervisor,
             _temp: temp,
             shape,
             paths,
@@ -230,7 +239,9 @@ impl RepairFixture {
         )
         .expect("Graph launch plan");
 
-        deadreckon(&self.paths, &self.workspace)
+        self._supervisor
+            .deadreckon()
+            .current_dir(&self.workspace)
             .args([
                 "start",
                 "--plan",

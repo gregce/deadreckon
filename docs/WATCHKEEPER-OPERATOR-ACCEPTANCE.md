@@ -142,11 +142,19 @@ and repair root. For example, before section 3:
 export WK_TRIAL_ID=live_provider_supervisor_restart
 export WK_LIVE_TRIAL="$WK_ARTIFACTS/live/$WK_TRIAL_ID-01"
 export WK_JOB_ID=the-full-approved-job-id
+export WK_JOB_AUTHORITY="$DEADRECKON_HOME/jobs/$WK_JOB_ID/authority.json"
+test -f "$WK_JOB_AUTHORITY"
+test ! -L "$WK_JOB_AUTHORITY"
+export WK_JOB_SOURCE_REV="$(
+  python3 -c \
+    'import json,re,sys; value=json.load(open(sys.argv[1], encoding="utf-8"))["source_revision"]; assert isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value); print(value)' \
+    "$WK_JOB_AUTHORITY"
+)"
 
 python3 examples/watchkeeper-dogfood/live-trial.py prepare \
   "$WK_TRIAL_ID" \
   --trial-dir "$WK_LIVE_TRIAL" \
-  --revision "$(git rev-parse HEAD)" \
+  --revision "$WK_JOB_SOURCE_REV" \
   --capture-helper "$DR_CAPTURE_BIN" \
   --deadreckon-binary "$DEADRECKON_BIN" \
   --job-id "$WK_JOB_ID" \
@@ -158,8 +166,11 @@ python3 -m json.tool "$WK_LIVE_TRIAL/replay.json"
 
 Use the backend that the strict Job actually resolved. The provider roles must
 match the manifest and the worker and independent judge must be different.
-Preparation is retry-safe for identical inputs and refuses a conflicting
-binding.
+The revision is the approved target Job source revision from `authority.json`,
+not the revision of the checkout containing this recorder. The protected
+helper independently binds and revalidates that authority; a missing or
+different revision is refused. Preparation is retry-safe for identical inputs
+and refuses a conflicting binding.
 
 `replay.json` lists the exact canonical subjects, reviewed intervention and
 cleanup. Record the supervisor trial's `before` evidence first:
@@ -213,7 +224,11 @@ python3 -m json.tool "$WK_LIVE_TRIAL/result.json"
 
 The envelope's HMAC publication proof authenticates the exact protected
 binding, append-only evidence history, deterministic evaluation and capture
-receipt. JSON schema validation alone is not verification. Omitting the
+receipt. The binding approves exact outcome/reason pairs, not independent
+outcome and reason lists. `verified/verified` remains valid only with the
+normal `CompletionReceipt`; an approved non-Verified result requires signed
+terminal-history lineage and no completion receipt. JSON schema validation
+alone is not verification. Omitting the
 trusted prepare arguments retains the manual compatibility path: it accepts
 operator-selected `--capture NAME=PATH` files but can never produce
 `status: passed`. A missing capture, unperformed intervention or missing
@@ -231,7 +246,7 @@ Use these manifest IDs:
 - section 9: `machine_reboot`;
 - section 10: `live_provider_network_loss`;
 - explicit Linux and Docker strict-Job trials:
-  `linux_bubblewrap_gate_boundary` and `docker_gate_boundary`.
+  `linux_bubblewrap_gate_boundary` and `live_docker_gate_attack`.
 
 ## 1. Run the public single-Job journey
 
@@ -594,8 +609,16 @@ Accept when:
 Run a separate guided Campaign selected by `start`. Accept when:
 
 - [ ] the campaign artifact and Job retain the same parent ID;
-- [ ] after interruption, recovery reconciles an exactly linked persisted
-  sub-plan without launching a duplicate;
+- [ ] before interruption, the protected sub-Plan has one ordered
+  `sub_launch_prepared`, `sub_launched`, `sub_process_launch_prepared`,
+  `sub_process_released`, and `sub_process_linked` authority chain;
+- [ ] after lease reclaim, the replacement owner appends exactly one
+  `sub_process_adopted` event with the same Job, sub, Plan, launch, PID, boot
+  and process-start identities and the new lease epoch;
+- [ ] the canonical adoption event is the protected intervention evidence and
+  is followed by `sub_recovered` for the same sub-Plan;
+- [ ] recovery appends no new logical or process launch fact and does not
+  reopen a completed Plan task;
 - [ ] the supervisor rebuilds the worst-of roll-up from current leaf evidence;
 - [ ] a refused or changed roll-up stops before the semantic judge;
 - [ ] semantic `revise` repairs only the merged Campaign parent and retains the
@@ -646,11 +669,13 @@ disposable user profile or only after recording the existing service posture:
 
 ```bash
 "$WK_BIN" supervisor status
-"$WK_BIN" supervisor install
-"$WK_BIN" supervisor status
-"$WK_BIN" supervisor start
+"$WK_BIN" setup --supervisor
 "$WK_BIN" supervisor status
 ```
+
+`setup --supervisor` is the normal one-step install-and-start path. The
+lower-level `supervisor install` and `supervisor start` commands remain useful
+when separately rehearsing those operator transitions.
 
 Start a sufficiently long disposable Job, record its ID, and restart the
 machine. After login:
@@ -668,6 +693,10 @@ Accept when:
 - [ ] the installed definition names the intended binary, state directory, and
   `PATH`;
 - [ ] an unmanaged same-name definition is refused rather than overwritten;
+- [ ] status reports a live schema-version-2 checkpoint whose boot ID, PID,
+  process-start identity and instance belong to the current service;
+- [ ] a real non-interactive `start --yes` refuses before provider work when
+  the service is missing, stale or inactive;
 - [ ] the service starts after login and evaluates the persisted Job;
 - [ ] boot identity/lease changes are explicit in history;
 - [ ] recovery either resumes/adopts supported work or stops with a bounded,
@@ -687,19 +716,37 @@ slice.
 
 ## 10. Network-loss drill
 
-On a live disposable Job, disconnect the host network long enough for the
-provider call to fail, then reconnect it.
+Use a disposable Single Job whose worker route is a registry-backed HTTP
+provider. Trusted prepare signs that exact worker role, provider route and
+registry endpoint. It refuses CLI, local/loopback, caller-supplied and
+unregistered endpoints.
+
+Capture `network-reachable-before` while the protected helper can prove the
+same supervised child before and after its bounded provider-registry ping.
+Apply the reviewed host network change outside the recorder. While the exact
+child is still current, record the intervention; this captures
+`network-connectivity-observation` with `endpoint_unreachable`. Restore the
+host change and capture `network-reachable-after` before cleanup. The recorder
+does not persist the provider probe's free-form error message or credentials.
 
 Accept when:
 
-- [ ] the Job remains inspectable from local state while offline;
-- [ ] provider failure is recorded and bounded by wall/spend/attempt policy;
-- [ ] no network error is converted into a verified receipt;
-- [ ] recovery behavior matches the typed events rather than an optimistic
-  narrative.
+- [ ] the signed route and endpoint are observed reachable, unreachable and
+  reachable again in that strict order;
+- [ ] the before and unreachable probes bracket the same current process,
+  launch, attempt and lease identity with one durable `child_linked` event;
+- [ ] the exact affected attempt stops after the unreachable observation and
+  is followed by its retry or a manifest-approved terminal result;
+- [ ] `events-after`, `job-view-after` and the public report describe the same
+  final append-only Job state;
+- [ ] cleanup and pass both refuse a missing or unsuccessful restored probe;
+- [ ] a verified result still has the independent deterministic and semantic
+  completion receipt.
 
 Network control is host-specific, so this checklist does not prescribe a
-firewall command.
+firewall command. The receipt proves the observed endpoint transition and
+ordered Job response. It does not claim that a particular firewall command
+caused the outage.
 
 ## Not covered until somebody runs it
 

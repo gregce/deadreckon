@@ -204,17 +204,54 @@ live reboot.
 The operator dogfood kit contains 24 tasks across 2 repository and provider
 slots. It also includes a metrics collector, human-review schema,
 credential-free adversarial runner, and a passive operator-gated recorder for
-the 8 remaining live fault claims. The committed credential-free result is 13
-passed, 0 failed, and 8 explicitly unproven live/host claims. The sanitized
-live result records 2 attempted tasks, 22 not run, and 0 verified. This release
-does not claim live task rates, cross-provider results, machine-restart
-results, or false-accept and false-reject rates.
+the 9 current live fault claims. The ninth separates the hostile live Docker
+worker, independent judge and valid-receipt claim from the narrower
+credential-free Docker lifecycle proof. The committed historical
+credential-free result is 13 passed, 0 failed, and 8 explicitly unproven
+live/host claims. The sanitized live result records 2 attempted tasks, 22 not
+run, and 0 verified. This release does not claim live task rates,
+cross-provider results, machine-restart results, or false-accept and
+false-reject rates.
 
 Pass-capable live recording now uses a protected `dr-capture` helper outside
 the Job workspace. It authenticates an immutable Job/trial binding, an
 append-only exact-evidence history, the deterministic evaluation, and an HMAC
 publication receipt. Manual operator-selected files remain useful
 documentation but can only produce an inconclusive result.
+Protected preparation now also refuses a Job whose actual Single, Graph or
+Campaign shape falls outside the selected trial's closed shape declaration.
+Each trial also signs a non-empty list of exact allowed terminal
+outcome/stop-reason pairs before the intervention. A `verified/verified` pass
+still requires the unchanged valid `CompletionReceipt`. An explicitly allowed
+non-Verified result can pass only through separate signed terminal lineage
+that binds the Job authority, complete history, final terminal event and public
+report; it must not have a completion receipt.
+The live network-loss trial now derives and signs one non-loopback HTTP worker
+endpoint from the provider registry. Its protected evidence records an exact
+reachable -> unreachable -> reachable transition for one current, durably
+linked supervised attempt and accepts only that attempt's later stop followed
+by its retry or an approved terminal result. Missing restoration, substituted
+route/endpoint/launch identities, stale stops and arbitrary probe URLs fail
+closed. The evidence deliberately claims an observed outage, not that a
+particular host firewall command caused it.
+
+Real approved guided starts now require the managed per-user supervisor to be
+current, active and represented by a live schema-version-2 boot/PID/process
+identity checkpoint. `deadreckon setup --supervisor` performs the explicit
+install-and-start transition; read-only preview remains side-effect free. All
+public durable Job creation routes also accept one RFC3339 absolute deadline.
+The supervisor enforces it while children are live and reconciles outer,
+evaluator, Campaign and merge-repair process authorities before recording the
+typed terminal result with no retry. Invalid or fractional wall caps are
+refused rather than silently widened.
+
+The Campaign interruption oracle is no longer structurally inconclusive. It
+proves the narrower claim DeadReckon actually persists: one prepared, released
+and linked sub-Plan launch is adopted exactly once by the replacement fenced
+owner, then that same Plan is recovered without a second persisted launch or
+reopened completed task. Foreign, stale, duplicate or substituted identities
+fail closed. This is implementation and recorder evidence; the real live
+Campaign interruption trial remains outstanding.
 
 A real macOS public-command end-to-end test proves the contained two-phase
 Seatbelt gate. It checks protected-path denial, inherited gate-input scrubbing,

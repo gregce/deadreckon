@@ -31,10 +31,12 @@ pub use ledger::{
 };
 pub use operator_capture::{
     OPERATOR_CAPTURE_SCHEMA_VERSION, OperatorCaptureBinding, OperatorCaptureCompletionLineage,
-    OperatorCaptureEvent, OperatorCaptureEventKind, OperatorCaptureEventSequence,
-    OperatorCapturePhase, OperatorCaptureProvenance, OperatorCaptureReceipt,
-    OperatorCaptureRequirement, OperatorCaptureSchemaVersion, OperatorCaptureSource,
-    OperatorCaptureStatus,
+    OperatorCaptureConnectivity, OperatorCaptureEvent, OperatorCaptureEventKind,
+    OperatorCaptureEventSequence, OperatorCaptureExpectedJobResult, OperatorCaptureNetworkAttempt,
+    OperatorCaptureNetworkErrorKind, OperatorCaptureNetworkObservation,
+    OperatorCaptureNetworkProbe, OperatorCapturePhase, OperatorCaptureProvenance,
+    OperatorCaptureReceipt, OperatorCaptureRequirement, OperatorCaptureSchemaVersion,
+    OperatorCaptureSource, OperatorCaptureStatus, OperatorCaptureTerminalLineage,
 };
 pub use policy::{is_persisted, ledger_file_for, redact_for_persistence};
 pub use schema::all_schemas;

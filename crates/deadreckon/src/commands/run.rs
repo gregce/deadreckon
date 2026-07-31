@@ -372,11 +372,11 @@ async fn schedule_direct_run(
     )
     .await?;
     let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
-    let max_wall_seconds = args
-        .max_wall_seconds
-        .or(defaults.cli_max_wall_seconds)
-        .unwrap_or(36_000.0)
-        .max(1.0) as u64;
+    let max_wall_seconds = commands::job::checked_job_wall_seconds(
+        args.max_wall_seconds
+            .or(defaults.cli_max_wall_seconds)
+            .unwrap_or(36_000.0),
+    )?;
     let sandbox_requested = args
         .sandbox
         .clone()
@@ -407,6 +407,7 @@ async fn schedule_direct_run(
     }];
     launch_plan.budget.ceiling_usd = Some(max_spend_usd);
     launch_plan.budget.wall_seconds = Some(max_wall_seconds);
+    launch_plan.budget.deadline = args.deadline;
     let leaf = DurableLeafSpec {
         base: args.base.clone(),
         branch: args.branch.clone(),
@@ -443,6 +444,7 @@ async fn schedule_direct_run(
         source,
         max_spend_usd,
         max_wall_seconds,
+        args.deadline,
         sandbox_requested,
         accepted_by,
     )?;
@@ -511,6 +513,7 @@ fn persist_direct_run_job(
     source: commands::job::DurableSource,
     max_spend_usd: f64,
     max_wall_seconds: u64,
+    deadline: Option<DateTime<Utc>>,
     sandbox_requested: String,
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
 ) -> Result<deadreckon_protocol::Job> {
@@ -526,6 +529,7 @@ fn persist_direct_run_job(
         max_spend_usd,
         max_wall_seconds,
         max_attempts: 3,
+        deadline,
         sandbox_requested,
         accepted_by,
     })
@@ -561,6 +565,7 @@ pub(crate) async fn run_command_with_launch_plan(
         quiet,
         max_spend,
         max_wall_seconds,
+        deadline,
         sandbox,
         untrusted,
         provider,
@@ -792,6 +797,7 @@ pub(crate) async fn run_command_with_launch_plan(
         doc_provider_source: doc_provider_selection.source.as_str(),
         max_spend: effective_max_spend,
         max_wall_seconds: effective_max_wall_seconds,
+        deadline: deadline.as_ref(),
         acceptance: &acceptance_preview,
         sleep: &sleep_preview,
         seams: &seams_label,
@@ -1453,6 +1459,7 @@ mod durable_direct_tests {
             continuation: None,
         };
         plan.signals = json!({ DURABLE_LEAF_SIGNAL: leaf });
+        let deadline = Utc::now() + chrono::TimeDelta::hours(2);
 
         let job = persist_direct_run_job(
             &paths,
@@ -1466,6 +1473,7 @@ mod durable_direct_tests {
             },
             7.5,
             240,
+            Some(deadline),
             "auto".to_string(),
             deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
         )
@@ -1483,6 +1491,8 @@ mod durable_direct_tests {
         assert_eq!(job.policy.max_attempts, 3);
         assert_eq!(job.policy.max_spend_usd, 7.5);
         assert_eq!(job.policy.max_wall_seconds, 240);
+        assert_eq!(job.policy.deadline, Some(deadline));
+        assert_eq!(frozen.budget.deadline, Some(deadline));
         assert_eq!(
             authority.accepted_by,
             deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail

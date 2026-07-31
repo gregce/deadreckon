@@ -1633,6 +1633,7 @@ pub(crate) fn print_orchestrate_preflight(
     plan: &Plan,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
+    deadline: Option<&DateTime<Utc>>,
     sandbox: Option<&str>,
     no_repair: bool,
 ) {
@@ -1694,6 +1695,12 @@ pub(crate) fn print_orchestrate_preflight(
         ("sandbox".to_string(), sandbox),
         ("spend".to_string(), spend),
         ("wall".to_string(), wall),
+        (
+            "deadline".to_string(),
+            deadline
+                .map(DateTime::to_rfc3339)
+                .unwrap_or_else(|| "none".to_string()),
+        ),
         ("capabilities".to_string(), capabilities),
     ];
     items.extend(
@@ -2067,6 +2074,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         plan_id,
         max_spend,
         max_wall_seconds,
+        deadline: _,
         sandbox,
         provider,
         child_provider,
@@ -2673,6 +2681,7 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
         plan_id,
         max_spend,
         max_wall_seconds,
+        deadline,
         sandbox,
         provider,
         child_provider,
@@ -2828,6 +2837,7 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
             },
             seed_pieces,
             accepted_launch_plan: None,
+            deadline,
             preview: false,
             yes,
             no_repair,

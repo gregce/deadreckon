@@ -264,6 +264,7 @@ crate: deadreckon-core
   operator_capture::operator_capture_binding_sha256
   operator_capture::OperatorCaptureEventDraft
   operator_capture::OperatorCaptureHistory
+  operator_capture::OperatorCapturePassLineage
   operator_capture::read_operator_capture_history
   operator_capture::seal_operator_capture_receipt
   operator_capture::validate_operator_capture_history
@@ -445,6 +446,12 @@ crate: deadreckon-protocol
   operator_capture::OperatorCaptureEvent
   operator_capture::OperatorCaptureEventKind
   operator_capture::OperatorCaptureEventSequence
+  operator_capture::OperatorCaptureExpectedJobResult
+  operator_capture::OperatorCaptureConnectivity
+  operator_capture::OperatorCaptureNetworkAttempt
+  operator_capture::OperatorCaptureNetworkErrorKind
+  operator_capture::OperatorCaptureNetworkObservation
+  operator_capture::OperatorCaptureNetworkProbe
   operator_capture::OperatorCapturePhase
   operator_capture::OperatorCaptureProvenance
   operator_capture::OperatorCaptureReceipt
@@ -452,6 +459,7 @@ crate: deadreckon-protocol
   operator_capture::OperatorCaptureSchemaVersion
   operator_capture::OperatorCaptureSource
   operator_capture::OperatorCaptureStatus
+  operator_capture::OperatorCaptureTerminalLineage
   policy::is_persisted
   policy::ledger_file_for
   policy::redact_for_persistence
@@ -533,6 +541,7 @@ crate: deadreckon-sandbox
   docker::read_docker_execution_record
   docker::reconcile_docker_execution
   docker::reconcile_docker_execution_record
+  docker::reconcile_docker_execution_record_for_job
   docker::write_docker_execution_record
   doctor::BackendAvailability
   doctor::doctor

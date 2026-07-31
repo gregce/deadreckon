@@ -22,7 +22,10 @@ use tempfile::TempDir;
 
 mod common;
 
-use common::{assert_success, deadreckon as deadreckon_binary, repo_tempdir, stderr, stdout};
+use common::{
+    SupervisorServiceFixture, assert_success, deadreckon as deadreckon_binary, repo_tempdir,
+    stderr, stdout,
+};
 
 /// This suite characterizes the inner Plan conductor and merge machinery.
 /// Public `fork` and `orchestrate` now queue durable Jobs; debug test binaries
@@ -32,6 +35,13 @@ fn deadreckon(paths: &DeadreckonPaths) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon-characterization"));
     command.env("DEADRECKON_HOME", paths.home());
     command
+}
+
+fn characterization_service(paths: &DeadreckonPaths) -> SupervisorServiceFixture {
+    SupervisorServiceFixture::configured_for_binary(
+        paths,
+        std::path::Path::new(env!("CARGO_BIN_EXE_deadreckon-characterization")),
+    )
 }
 
 fn assert_verdict_surface(text: &str, verdict: &str, recommended: &str) {
@@ -759,16 +769,17 @@ esac
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_with_no_provider_refuses_with_try_line() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    let empty_bin = temp.path().join("empty-bin");
-    fs::create_dir_all(&empty_bin).expect("empty bin");
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
-        .env("PATH", &empty_bin)
+        .env("PATH", service.manager_bin())
         .args(["start", "build the app", "--plain"])
         .output()
         .expect("start missing provider");
@@ -869,6 +880,7 @@ fn start_with_two_detected_providers_still_prompts() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -879,8 +891,10 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
         "default_provider = \"smoke\"\n\n[defaults]\nprovider = \"smoke\"\ndoc_provider = \"smoke\"\n",
     )
     .expect("config");
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args(["start", "build the app", "--plain"])
         .output()
@@ -897,6 +911,7 @@ fn start_missing_done_criteria_suggests_def_done_in_non_tty() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_non_git_non_tty_refuses_with_source_mode_try_lines() {
     let temp = TempDir::new().expect("tempdir");
     let source = temp.path().join("plain");
@@ -904,8 +919,10 @@ fn start_non_git_non_tty_refuses_with_source_mode_try_lines() {
     fs::write(source.join("README.md"), "hello").expect("readme");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &source);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&source)
         .args(["start", "build the app", "--plain"])
         .output()
@@ -955,6 +972,7 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rescue_never_fires_off_tty_refusal_is_byte_identical() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -965,8 +983,10 @@ fn rescue_never_fires_off_tty_refusal_is_byte_identical() {
         "default_provider = \"anthropic\"\n\n[providers.anthropic]\nkind = \"anthropic\"\n",
     )
     .expect("config");
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args(["start", "rescue off tty", "--mode", "run", "--yes"])
         .output()
@@ -1117,14 +1137,17 @@ fn pty_start_single_detected_provider_preview_without_config_write() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_dirty_git_reuses_allow_dirty_guidance() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     fs::write(repo.join("dirty.txt"), "dirty").expect("dirty");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args(["start", "build the app", "--plain"])
         .output()
@@ -1191,13 +1214,16 @@ fn start_review_preview_creates_no_plan_state() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_dispatches_explicit_run_to_single_job() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -1223,13 +1249,16 @@ fn start_dispatches_explicit_run_to_single_job() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_dispatches_explicit_review_to_graph_job() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -1346,13 +1375,16 @@ fn start_preview_in_existing_repo_shows_concise_history_hint() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_quiet_success_obeys_existing_quiet_policy() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -1372,13 +1404,16 @@ fn start_quiet_success_obeys_existing_quiet_policy() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_run_success_prints_job_lifecycle_commands() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -1424,13 +1459,16 @@ fn start_run_success_prints_job_lifecycle_commands() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_review_success_prints_same_job_lifecycle_commands() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -1476,13 +1514,16 @@ fn start_review_success_prints_same_job_lifecycle_commands() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_footer_uses_parent_job_id_for_orchestrated_goal() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -7063,13 +7104,16 @@ fn new_replayed_graph_job_root(
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn accepted_plan_lands_in_job_root_before_work() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args(["start", "plan lands in run root", "--yes", "--plain"])
         .output()
@@ -7085,13 +7129,16 @@ fn accepted_plan_lands_in_job_root_before_work() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn plan_shape_dispatches_graph_job_with_planned_n() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -7330,13 +7377,16 @@ fn accepted_reshape_dispatches_plan_with_parent_lineage() {
 // ---- C-P10: replay + launch JSON parity ----
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_plan_replays_identical_shape_and_pieces() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = SupervisorServiceFixture::configured(&paths);
 
-    let output = deadreckon_binary(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -7362,7 +7412,8 @@ fn start_plan_replays_identical_shape_and_pieces() {
     fs::copy(first.join("launch-plan.json"), &saved).expect("copy plan");
     let before = job_ids(&paths);
 
-    let output = deadreckon_binary(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args([
             "start",
@@ -7395,6 +7446,202 @@ fn start_plan_replays_identical_shape_and_pieces() {
         record["signals"]["watchkeeper_driver"]["child_count"], 3,
         "{record}"
     );
+}
+
+#[test]
+fn public_start_without_supervisor_service_refuses_before_job_creation() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let service = SupervisorServiceFixture::unconfigured(&paths);
+
+    let output = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "refuse an unattended launch without restart recovery",
+            "--mode",
+            "run",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("unconfigured public start");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("durable start requires a restart-capable supervisor service"),
+        "{err}"
+    );
+    assert!(err.contains("deadreckon setup --supervisor"), "{err}");
+    assert!(
+        !paths.jobs_dir().exists(),
+        "service refusal allocated durable Job state"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn configured_supervisor_fixture_allows_public_start_launch() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let service = SupervisorServiceFixture::configured(&paths);
+
+    let output = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "launch with proven machine restart supervision",
+            "--mode",
+            "run",
+            "--yes",
+            "--plain",
+            "--json",
+        ])
+        .output()
+        .expect("configured public start");
+
+    assert_success(&output);
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("launch JSON");
+    let job_id = envelope["dispatched"]["ids"][0]
+        .as_str()
+        .expect("dispatched Job ID");
+    assert!(paths.job_dir(job_id).is_dir(), "{envelope}");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn setup_supervisor_alias_installs_current_unit_without_host_mutation() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let service = SupervisorServiceFixture::unconfigured(&paths);
+
+    let setup = service
+        .deadreckon()
+        .args(["setup", "--supervisor"])
+        .output()
+        .expect("setup isolated supervisor service");
+    assert_success(&setup);
+    assert!(
+        service.managed_unit_path().is_file(),
+        "setup did not install the managed unit at {}",
+        service.managed_unit_path().display()
+    );
+
+    let reinstall = service
+        .deadreckon()
+        .args(["supervisor", "install"])
+        .output()
+        .expect("recheck isolated managed unit");
+    assert_success(&reinstall);
+    assert!(
+        stdout(&reinstall).contains("already installed"),
+        "the setup alias did not install the current binary/unit identity:\n{}",
+        stdout(&reinstall)
+    );
+}
+
+#[test]
+fn replay_inspection_is_read_only_without_supervisor_service() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let saved = temp.path().join("read-only-launch-plan.json");
+    write_minimal_replay_plan(&saved, "read-only replay");
+    let service = SupervisorServiceFixture::unconfigured(&paths);
+
+    for args in [
+        vec![
+            "start",
+            "--plan",
+            saved.to_str().expect("UTF-8 plan path"),
+            "--preview",
+            "--plain",
+        ],
+        vec![
+            "start",
+            "--plan",
+            saved.to_str().expect("UTF-8 plan path"),
+            "--json",
+        ],
+    ] {
+        let output = service
+            .deadreckon()
+            .current_dir(&repo)
+            .args(args)
+            .output()
+            .expect("read-only replay");
+        assert_success(&output);
+        assert!(
+            !paths.jobs_dir().exists(),
+            "read-only replay allocated durable Job state"
+        );
+    }
+}
+
+#[test]
+fn replay_json_yes_without_supervisor_service_refuses_before_job_creation() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let saved = temp.path().join("unconfigured-launch-plan.json");
+    write_minimal_replay_plan(&saved, "unconfigured replay launch");
+    let service = SupervisorServiceFixture::unconfigured(&paths);
+
+    let output = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "--plan",
+            saved.to_str().expect("UTF-8 plan path"),
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("unconfigured replay launch");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("restart-capable supervisor service"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !paths.jobs_dir().exists(),
+        "replay service refusal allocated durable Job state"
+    );
+}
+
+fn write_minimal_replay_plan(path: &std::path::Path, goal: &str) {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": 1,
+            "created_at": "2026-07-31T00:00:00Z",
+            "goal": goal,
+            "shape": "single",
+            "pieces": [],
+            "providers": { "coder": "smoke" },
+            "budget": { "ceiling_usd": 1.0 },
+            "resolution": {
+                "source": "operator",
+                "confidence": 1.0,
+                "rationale": "integration-test replay plan"
+            },
+            "accepted_by": "operator"
+        }))
+        .expect("serialize replay plan"),
+    )
+    .expect("write replay plan");
 }
 
 #[test]
@@ -7446,13 +7693,16 @@ fn replay_with_smaller_budget_refuses_naming_numbers() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_json_emits_launch_envelope_no_card() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
 
-    let output = deadreckon(&paths)
+    let output = service
+        .deadreckon()
         .current_dir(&repo)
         .args(["start", "json launch goal", "--yes", "--json"])
         .output()
@@ -7480,15 +7730,17 @@ fn start_json_emits_launch_envelope_no_card() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn concurrent_same_goal_start_json_returns_each_exact_job_id() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     write_start_ready_setup(&paths, &repo);
     let goal = "concurrent exact job identity";
+    let service = characterization_service(&paths);
 
     let launch = || {
-        let mut command = deadreckon(&paths);
+        let mut command = service.deadreckon();
         command
             .current_dir(&repo)
             .env("DEADRECKON_TEST_START_ENVELOPE_DELAY_MS", "500")

@@ -4167,6 +4167,15 @@ the combined parent completion receipt. Without the user service, the detached
 supervisor can outlive its launching shell but is not a machine-restart
 guarantee.
 
+A real approved `start --yes` is admitted only when the managed per-user
+service definition is current, the platform manager reports it enabled and
+active, and the supervisor has published a live schema-version-2 checkpoint.
+Read-only preview and JSON inspection without `--yes` do not require or mutate
+service state. `deadreckon setup --supervisor` is the one-step setup path; a
+non-interactive launch otherwise refuses before provider classification or Job
+creation. This makes the machine-recovery prerequisite explicit instead of
+quietly falling back to a terminal-owned detached process.
+
 ### 58.2 Job protocol, event history, and projection
 
 `deadreckon-protocol/src/job.rs` owns the checked schema-version-1 wire types:
@@ -4223,6 +4232,16 @@ limits. Authority does not claim which backend will resolve at runtime. The
 runtime reconstructs the approved policy before provider execution. The
 native marker and final receipt separately bind the backend that actually
 resolved and whether it contained the gate.
+
+Every public durable creation route accepts the same absolute `--deadline`,
+including guided and ordinary start, direct run/orchestration/campaign,
+stored-plan fork, reshape, supported chain and continuation. Deadlines are
+checked before launch and while the active child is running. Expiry terminates
+and reconciles the exact outer, gate-evaluator, Campaign-subprocess and
+merge-repair process authorities before recording
+`deadline_reached/deadline`; it never schedules a retry. Public wall caps are
+validated as positive whole seconds instead of being silently rounded or
+widened.
 
 For a Single shape, the Job ID is also the root run ID from launch. For Graph
 and Campaign shapes, the plan or campaign keeps that parent ID while child runs
@@ -4281,6 +4300,10 @@ The recovery policy is intentionally fail-closed:
   cannot start before their unique boot/process/attempt identity is synced, and
   cancellation or retry must reconcile every nested identity plus the outer
   worker group first;
+- cancellation and deadline cleanup also enumerate separately grouped
+  merge-repair children from authenticated authority records. Malformed,
+  foreign or swapped records stop `LostContainment` instead of leaving an
+  untracked repair process or claiming a clean stop;
 - root planner spend and wall time are embedded before child work, restored
   after mapping-creation crashes, subtracted from the Job policy, and divided
   across Plan tasks or Campaign sub-plans rather than granting every child the
@@ -4481,6 +4504,7 @@ semantic evidence remains `NEEDS_REVIEW`.
 The operator namespace is explicit and discoverable:
 
 ```text
+deadreckon setup --supervisor
 deadreckon supervisor install
 deadreckon supervisor start
 deadreckon supervisor status
@@ -4495,6 +4519,15 @@ macOS uses
 `DEADRECKON_HOME`, and `PATH`, use restart-at-login/failure policy, and keep
 service logs under the DeadReckon home. Linux stops the whole service control
 group. Unsupported operating systems refuse installation.
+
+Ordinary setup installs and starts the service as one explicit action. The
+lower-level supervisor commands remain available for inspection and operator
+maintenance. A current service status is not inferred from a PID alone: the
+schema-version-2 checkpoint binds the boot ID, PID process-start identity,
+instance ID and monotonic generation. After an explicit restart, launch
+admission requires a fresh successor instance rather than accepting the old
+checkpoint. Legacy or malformed checkpoints and symlinked/non-regular managed
+units fail closed.
 
 Installation is idempotent and atomic. It may replace an older definition only
 when the DeadReckon ownership marker is present; a same-name unmanaged unit is
@@ -4526,7 +4559,7 @@ and promotion enforcement.
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
 harness, a 24-row/two-provider-slot matrix, a metrics schema/collector, a
 human-review template, a credential-free adversarial runner, and a passive
-operator-gated recorder for the 8 remaining live fault claims. The recorder
+operator-gated recorder for the 9 current live fault claims. The recorder
 declares prerequisites, interventions, objective oracles, sanitized evidence
 and cleanup, but never starts providers, signals processes, controls services,
 changes networking, reboots, or calls `finish`.
@@ -4535,16 +4568,60 @@ Pass-capable recording uses a canonical `dr-capture` and sibling
 `deadreckon` pair outside every Job-controlled source, working, run, merge and
 repair root. The helper HMAC-authenticates an immutable Job/trial/provider
 binding, every append-only exact-evidence event and history head, and the final
-receipt. Preparation is idempotent for identical inputs and refuses conflicting
-replacement. Finalization deterministically reconstructs the evaluation from
-protected evidence, then publishes only a sanitized envelope containing the
-evaluation digest, protected receipt digest and HMAC publication proof.
+receipt. Preparation is idempotent for identical inputs, refuses conflicting
+replacement, and requires the actual Job shape to match the selected trial's
+closed shape declaration. Finalization deterministically reconstructs the
+evaluation from protected evidence, then publishes only a sanitized envelope
+containing the evaluation digest, protected receipt digest and HMAC publication
+proof.
 Operator-selected manual files remain a compatibility documentation path and
 can never produce `passed`.
+
+The binding also freezes a non-empty set of exact terminal
+`JobOutcome`/`StopReason` pairs. It never treats the two fields as independent
+wildcards. `verified/verified` follows the existing completion-lineage path and
+requires the canonical valid `CompletionReceipt`. Any approved non-Verified
+pair follows a separate terminal-lineage path: `dr-capture` requires no
+`receipt.json`, re-reads the stable append-only Job history and projection,
+checks the final event produced that exact result, and binds the authority,
+history, terminal event, `job-view-after`, and public Job report into the HMAC
+capture receipt. Failed deterministic checks can therefore never be relabeled
+as verified completion.
+
+The live provider network-loss claim has a separate signed observation path.
+Prepare resolves the one declared worker route through the provider registry,
+requires a non-loopback HTTP descriptor endpoint, and freezes the exact role,
+route and endpoint in capture authority. The protected helper uses the
+registry's bounded ping before, during and after the operator-controlled fault.
+Before and unreachable observations must bracket the same live process,
+launch, attempt and lease with one durable `ChildLinked` event. The restored
+observation retains that affected identity; cleanup and pass refuse until it is
+reachable. Pass then binds the exact later `AttemptStopped` to that attempt and
+lease and requires its retry or an approved terminal result, plus the exact
+after history and public report. This proves an observed endpoint transition
+and ordered response, not which host command caused the outage.
+
+The Campaign interruption claim is similarly narrow and pass-capable. Before
+the fault it requires one ordered `sub_launch_prepared`, `sub_launched`,
+`sub_process_launch_prepared`, `sub_process_released`, and
+`sub_process_linked` authority chain for the protected sub-Plan. After a Job
+lease reclaim it accepts exactly one `sub_process_adopted` event with the same
+parent, sub, Plan, attempt, launch, PID, boot and process-start identities and
+the newer fenced lease, followed by `sub_recovered`. The canonical adoption
+event is itself the protected intervention evidence. A new launch fact,
+foreign owner, stale Plan, duplicate adoption, changed intervention or reopened
+completed Plan task fails the oracle. This proves persisted fenced adoption;
+it deliberately does not claim that arbitrary external side effects are
+globally exactly-once. The real provider interruption drill remains unrun.
 
 The committed credential-free result records 13 passes, 0 failures, and 8
 explicitly unproven live/host claims. The sanitized live result records 2
 attempted tasks, 22 not run, and 0 verified.
+
+That 8-claim count is historical evidence for source `e87c70f`. The current
+recorder and runner list 9 open live claims because the stronger hostile live
+Docker/provider/valid-receipt claim is now separate from the passing narrower
+credential-free Docker lifecycle proof.
 
 The macOS public-command end-to-end gate trial and the common Docker
 control-boundary trial are real host evidence, not hermetic backend

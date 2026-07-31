@@ -635,17 +635,23 @@ async fn main_inner() -> Result<()> {
             sandbox,
             no_confirm,
             no_completion,
+            supervisor,
         } => {
-            commands::init::init_command(
-                provider,
-                api_key,
-                base_url,
-                max_spend,
-                sandbox,
-                no_confirm,
-                no_completion,
-            )
-            .await
+            if supervisor {
+                commands::supervisor_service::supervisor_service_install_command()?;
+                commands::supervisor_service::supervisor_service_start_command()
+            } else {
+                commands::init::init_command(
+                    provider,
+                    api_key,
+                    base_url,
+                    max_spend,
+                    sandbox,
+                    no_confirm,
+                    no_completion,
+                )
+                .await
+            }
         }
         Commands::Config { command } => config_command(command),
         Commands::HelpAll => {
@@ -672,6 +678,7 @@ async fn main_inner() -> Result<()> {
             mode,
             plan,
             max_spend,
+            deadline,
             provider,
             model,
             children,
@@ -706,6 +713,7 @@ async fn main_inner() -> Result<()> {
                 mode,
                 plan,
                 max_spend,
+                deadline,
                 provider,
                 model,
                 children,
@@ -781,6 +789,7 @@ async fn main_inner() -> Result<()> {
             quiet,
             max_spend,
             max_wall_seconds,
+            deadline,
             sandbox,
             untrusted,
             provider,
@@ -829,6 +838,7 @@ async fn main_inner() -> Result<()> {
                 quiet,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 sandbox,
                 untrusted,
                 provider,
@@ -855,6 +865,7 @@ async fn main_inner() -> Result<()> {
             goal_file,
             max_spend,
             max_wall_seconds,
+            deadline,
             sandbox,
             preview,
             init_git,
@@ -879,6 +890,7 @@ async fn main_inner() -> Result<()> {
                     goal_file,
                     max_spend,
                     max_wall_seconds,
+                    deadline,
                     sandbox,
                     preview,
                     init_git,
@@ -907,6 +919,7 @@ async fn main_inner() -> Result<()> {
             model,
             max_spend,
             max_wall_seconds,
+            deadline,
             sandbox,
             acceptance,
             preview,
@@ -955,6 +968,7 @@ async fn main_inner() -> Result<()> {
                 model,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 sandbox,
                 acceptance,
                 preview,
@@ -1021,6 +1035,7 @@ async fn main_inner() -> Result<()> {
             plan_id,
             max_spend,
             max_wall_seconds,
+            deadline,
             sandbox,
             provider,
             child_provider,
@@ -1038,6 +1053,7 @@ async fn main_inner() -> Result<()> {
                 plan_id,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 sandbox,
                 provider,
                 child_provider,
@@ -1102,6 +1118,7 @@ async fn main_inner() -> Result<()> {
             circuit_breaker_threshold,
             max_spend,
             max_wall_seconds,
+            deadline,
             provider,
             model,
             sandbox,
@@ -1141,6 +1158,7 @@ async fn main_inner() -> Result<()> {
                 circuit_breaker_threshold,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 provider,
                 model,
                 sandbox,
@@ -1279,6 +1297,7 @@ async fn main_inner() -> Result<()> {
             no_context,
             max_spend,
             max_wall_seconds,
+            deadline,
             provider,
             model,
             sandbox,
@@ -1300,6 +1319,7 @@ async fn main_inner() -> Result<()> {
                 no_context,
                 max_spend,
                 max_wall_seconds,
+                deadline,
                 provider,
                 model,
                 sandbox,
@@ -1378,6 +1398,7 @@ async fn main_inner() -> Result<()> {
         }
         Commands::Reshape {
             run_id,
+            deadline,
             yes,
             json,
             plain,
@@ -1386,6 +1407,7 @@ async fn main_inner() -> Result<()> {
             ui::set_plain_output(plain || json);
             commands::course::reshape_command(commands::course::ReshapeArgs {
                 run_id,
+                deadline,
                 yes,
                 json,
                 plain,
@@ -3618,6 +3640,7 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         quiet: true,
         max_spend: Some(1.0),
         max_wall_seconds: Some(60.0),
+        deadline: None,
         sandbox: Some("none".to_string()),
         untrusted: true,
         provider: None,
@@ -4138,6 +4161,7 @@ struct RunPreview<'a> {
     doc_provider_source: &'a str,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
+    deadline: Option<&'a DateTime<Utc>>,
     acceptance: &'a setup::DoneCriteriaSelection,
     sleep: &'a sleep::SleepPreview,
     seams: &'a str,
@@ -4159,6 +4183,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         doc_provider_source,
         max_spend,
         max_wall_seconds,
+        deadline,
         acceptance,
         sleep,
         seams,
@@ -4294,6 +4319,12 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         ("sandbox".to_string(), sandbox.to_string()),
         ("seams".to_string(), seams.to_string()),
         ("caps".to_string(), caps),
+        (
+            "deadline".to_string(),
+            deadline
+                .map(DateTime::to_rfc3339)
+                .unwrap_or_else(|| "none".to_string()),
+        ),
         ("sleep".to_string(), sleep.label()),
         (
             "done".to_string(),
@@ -4401,6 +4432,7 @@ mod seam_surface_tests {
             doc_provider_source: "none",
             max_spend: Some(1.0),
             max_wall_seconds: Some(60.0),
+            deadline: None,
             acceptance: &acceptance,
             sleep: &sleep,
             seams: "external: policy, event_sink",
@@ -13378,6 +13410,7 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         no_context: false,
         max_spend: state.max_spend_usd,
         max_wall_seconds: state.max_wall_seconds,
+        deadline: None,
         provider: state.provider.clone(),
         model: None,
         sandbox: Some(state.sandbox.clone()),
