@@ -1057,16 +1057,12 @@ async fn collect_doctor_provider_findings(
             .unwrap_or_else(|| config_provider_kind_label(kind).to_string());
         let subject = format!("provider {name} kind={kind_label}");
         if kind.contains("cli") || name.starts_with("cli:") {
+            // RESOLUTION CHAIN: config binary → registry default_binary → derive from name
             let binary = entry
                 .get("binary")
                 .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| {
-                    if name.contains("claude") {
-                        "claude"
-                    } else {
-                        "codex"
-                    }
-                });
+                .or_else(|| registry.get(name).and_then(|d| d.default_binary.as_deref()))
+                .unwrap_or_else(|| name.strip_prefix("cli:").unwrap_or(name));
             if command_exists(binary) || PathBuf::from(binary).exists() {
                 // Presence says "installed", the auth probe says "usable":
                 // surface installed-but-logged-out here instead of mid-run.
