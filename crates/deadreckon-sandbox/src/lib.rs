@@ -529,19 +529,27 @@ printf docker-boundary-ok"#,
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn hostile_agent_cannot_find_keys_or_forge_marker_macos() {
-        if which::which("sandbox-exec").is_err() {
-            return;
-        }
+        which::which("sandbox-exec")
+            .expect("sandbox-exec unavailable: the macOS hostile-agent boundary was not exercised");
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("work");
         let paths = DeadreckonPaths::from_home(workspace.join(".deadreckon"));
         let run_root = paths.run_root("project", "run-1");
         let key_store = paths.home().join("gate-keys");
         let marker = run_root.join("proofs/turn-acceptance.json");
+        let sandbox_policy = run_root.join("sandbox.toml");
+        let snapshot = run_root.join("snapshots/turn-0/inventory.json");
+        let provenance = run_root.join("provenance.jsonl");
+        let deliverable = workspace.join("deliverable.txt");
         std::fs::create_dir_all(&key_store).expect("key store");
         std::fs::create_dir_all(marker.parent().expect("proof parent")).expect("proofs");
+        std::fs::create_dir_all(snapshot.parent().expect("snapshot parent")).expect("snapshots");
         std::fs::write(key_store.join("run-1.key"), "super-secret-signing-material").expect("key");
         std::fs::write(&marker, "original-marker").expect("marker");
+        std::fs::write(&sandbox_policy, "original-policy").expect("sandbox policy");
+        std::fs::write(&snapshot, "original-snapshot").expect("snapshot");
+        std::fs::write(&provenance, "original-provenance").expect("provenance");
+        std::fs::write(&deliverable, "before").expect("deliverable");
         let boundary = ProtectedPathPolicy::for_paths(&paths);
 
         let mut spec = shell_spec();
@@ -551,15 +559,28 @@ printf docker-boundary-ok"#,
         spec.write_allowlist = vec![workspace.clone()];
         spec.read_denylist = boundary.read_denylist;
         spec.write_denylist = boundary.write_denylist;
+        for (name, path) in [
+            ("DR_HOSTILE_MARKER", &marker),
+            ("DR_HOSTILE_SANDBOX_POLICY", &sandbox_policy),
+            ("DR_HOSTILE_SNAPSHOT", &snapshot),
+            ("DR_HOSTILE_PROVENANCE", &provenance),
+            ("DR_HOSTILE_DELIVERABLE", &deliverable),
+        ] {
+            spec.env
+                .insert(name.to_string(), path.to_string_lossy().into_owned());
+        }
         spec.args = vec![
             OsString::from("-c"),
             OsString::from(format!(
-                "find '{}' -name '*.key' -exec cat {{}} \\; 2>/dev/null || true; \
-                 if printf forged > '{}'; then exit 41; fi; \
-                 test \"$(cat '{}')\" = original-marker",
-                workspace.display(),
-                marker.display(),
-                marker.display()
+                r#"set -eu
+find '{}' -name '*.key' -exec cat {{}} \; 2>/dev/null || true
+if printf forged > "$DR_HOSTILE_MARKER" 2>/dev/null; then exit 41; fi
+if printf tampered > "$DR_HOSTILE_SANDBOX_POLICY" 2>/dev/null; then exit 42; fi
+if printf tampered > "$DR_HOSTILE_SNAPSHOT" 2>/dev/null; then exit 43; fi
+if printf tampered > "$DR_HOSTILE_PROVENANCE" 2>/dev/null; then exit 44; fi
+printf changed > "$DR_HOSTILE_DELIVERABLE"
+printf hostile-boundary-ok"#,
+                workspace.display()
             )),
         ];
 
@@ -567,9 +588,24 @@ printf docker-boundary-ok"#,
 
         assert_eq!(output.status_code, Some(0), "{}", output.stderr);
         assert!(!output.stdout.contains("super-secret-signing-material"));
+        assert!(output.stdout.ends_with("hostile-boundary-ok"), "{output:?}");
+        for (path, expected) in [
+            (&marker, "original-marker"),
+            (&sandbox_policy, "original-policy"),
+            (&snapshot, "original-snapshot"),
+            (&provenance, "original-provenance"),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(path).expect("protected fixture"),
+                expected,
+                "hostile worker changed {}",
+                path.display()
+            );
+        }
         assert_eq!(
-            std::fs::read_to_string(marker).expect("marker"),
-            "original-marker"
+            std::fs::read_to_string(deliverable).expect("deliverable"),
+            "changed",
+            "the worker lost ordinary workspace write access"
         );
     }
 }

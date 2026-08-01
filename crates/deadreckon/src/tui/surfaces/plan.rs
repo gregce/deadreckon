@@ -667,6 +667,9 @@ pub(crate) fn plan_event_summary(event: &PlanEventKind) -> String {
                 .unwrap_or_else(|| "-".to_string());
             format!("{task_id} completed run {run} status {status}")
         }
+        PlanEventKind::TaskSkipped {
+            task_id, reason, ..
+        } => format!("{task_id} skipped: {reason}"),
         PlanEventKind::TaskBlocked {
             task_id, reason, ..
         } => {

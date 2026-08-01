@@ -4,6 +4,7 @@
   "description": "Cryptographically authenticated two-key completion result persisted in `receipt.json`.",
   "type": "object",
   "required": [
+    "attempt",
     "authority_sha256",
     "contained",
     "contract_sha256",
@@ -15,6 +16,7 @@
     "job_id",
     "launch_plan_sha256",
     "outcome",
+    "outer_launch_id",
     "proof_kind",
     "result_tree_sha256",
     "run_id",
@@ -27,6 +29,12 @@
     "stop_reason"
   ],
   "properties": {
+    "attempt": {
+      "description": "Durable Job attempt whose contained gate produced this result.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0.0
+    },
     "authority_sha256": {
       "type": "string"
     },
@@ -41,6 +49,16 @@
     },
     "effective_policy_sha256": {
       "type": "string"
+    },
+    "execution_evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompletionExecutionEvidence"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "goal_sha256": {
       "type": "string"
@@ -60,6 +78,10 @@
     },
     "outcome": {
       "$ref": "#/definitions/JobOutcome"
+    },
+    "outer_launch_id": {
+      "description": "Exact supervisor child launch that owned the contained gate.",
+      "type": "string"
     },
     "proof_kind": {
       "$ref": "#/definitions/CompletionProofKind"
@@ -108,6 +130,31 @@
     }
   },
   "definitions": {
+    "CompletionExecutionEvidence": {
+      "description": "Exact controller-owned execution ledgers covered by a verified receipt. Present for durable ordered chains, whose final tree alone cannot explain which approved hooks ran or which child result was landed at each step.",
+      "type": "object",
+      "required": [
+        "ordered_candidate_manifest_sha256"
+      ],
+      "properties": {
+        "candidate_application_events_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chain_hook_events_sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordered_candidate_manifest_sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "CompletionProofKind": {
       "type": "string",
       "enum": [

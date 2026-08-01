@@ -81,6 +81,17 @@ crate: deadreckon-core
   completion::seal_completion_receipt
   completion::SEMANTIC_JUDGMENT_JSON
   completion::validate_completion_receipt
+  delivery::acquire_job_operation_lock
+  delivery::GitDeliveryTarget
+  delivery::JobOperationLock
+  delivery::seal_applied_git_delivery_receipt
+  delivery::seal_git_delivery_intent
+  delivery::validate_applied_git_delivery_receipt
+  delivery::validate_applied_git_delivery_receipt_snapshot
+  delivery::ValidatedAppliedGitDeliveryReceipt
+  delivery::validate_git_delivery_intent
+  delivery::validate_git_delivery_intent_snapshot
+  delivery::ValidatedGitDeliveryIntent
   docs::append_parent_narrative_update
   docs::append_turn_doc
   docs::apply_commit_body
@@ -238,7 +249,10 @@ crate: deadreckon-core
   job::reduce_job_history
   job::write_job
   job_lease::append_fenced_job_event
+  job_lease::append_next_fenced_job_event
   job_lease::claim_job_lease
+  job_lease::create_fenced_job_json_and_append_event
+  job_lease::CreateFencedJobJsonDisposition
   job_lease::FencedJobJsonEvent
   job_lease::heartbeat_job_lease
   job_lease::LeaseClaim
@@ -273,6 +287,8 @@ crate: deadreckon-core
   paths::DeadreckonPaths
   paths::default_deadreckon_home
   paths::source_root
+  plan::append_owned_plan_event_fenced
+  plan::append_owned_plan_message_fenced
   plan::append_plan_event
   plan::append_plan_message
   plan::CapabilityPreview
@@ -301,6 +317,7 @@ crate: deadreckon-core
   plan::PlanTaskStatus
   plan::read_plan_events
   plan::read_plan_messages
+  plan::save_owned_plan_fenced
   plan::save_plan
   plan::SUMMARIES_DIR
   plan::validate_task_count
@@ -309,6 +326,7 @@ crate: deadreckon-core
   plan::WORKER_SPECS_DIR
   plan::write_child_summary
   plan::write_coordinator_state
+  plan::write_owned_coordinator_state_fenced
   plan::write_plan_child_marker
   plan::write_worker_spec
   polish_subcalls::DEFAULT_DOC_POLISH_TOKEN_BUDGET
@@ -392,7 +410,9 @@ crate: deadreckon-protocol
   ids::PlanId
   ids::RunId
   ids::TurnId
+  job::AppliedGitDeliveryReceipt
   job::AuthorityAcceptedBy
+  job::CompletionExecutionEvidence
   job::CompletionProofKind
   job::CompletionReceipt
   job::CompletionReceiptIssuer
@@ -402,6 +422,9 @@ crate: deadreckon-protocol
   job::GATE_EVALUATOR_PROTOCOL_VERSION
   job::GateBinaryIdentity
   job::GateEvaluatorIdentity
+  job::GitDeliveryIntent
+  job::GitDeliveryRepositoryIdentity
+  job::GitDeliveryStrategy
   job::GoalCoverage
   job::GoalCoverageStatus
   job::Job

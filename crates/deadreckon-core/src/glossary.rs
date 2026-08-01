@@ -84,6 +84,7 @@ pub fn plan_task_status_label(status: PlanTaskStatus) -> &'static str {
         PlanTaskStatus::Pending => "pending",
         PlanTaskStatus::Running => "running",
         PlanTaskStatus::Completed => "completed",
+        PlanTaskStatus::Skipped => "skipped",
         PlanTaskStatus::Failed => "failed",
         PlanTaskStatus::Killed => "killed",
     }

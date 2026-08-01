@@ -1472,6 +1472,7 @@ pub(crate) fn orchestration_dependency_rows(plan: &Plan) -> Vec<OrchestrationDep
                 PlanTaskStatus::Pending => format!("after {}", blockers.join(",")),
                 PlanTaskStatus::Running => "already running".to_string(),
                 PlanTaskStatus::Completed => "done".to_string(),
+                PlanTaskStatus::Skipped => "skipped".to_string(),
                 PlanTaskStatus::Failed => "failed".to_string(),
                 PlanTaskStatus::Killed => "killed".to_string(),
             };
@@ -2103,15 +2104,17 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
     // fork, and the only recovery used to be none: fork refused re-entry
     // forever. The durable state (task statuses, attempts) is enough to pick
     // the work back up; only the in-memory supervisor was lost.
+    let durable_resume_pending = plan_requires_durable_resume(&paths, &plan)?;
     let resuming = match plan.status {
         PlanStatus::Pending => false,
         PlanStatus::Forked
-            if plan.tasks.iter().any(|task| {
-                matches!(
-                    task.status,
-                    PlanTaskStatus::Pending | PlanTaskStatus::Running
-                )
-            }) =>
+            if durable_resume_pending
+                || plan.tasks.iter().any(|task| {
+                    matches!(
+                        task.status,
+                        PlanTaskStatus::Pending | PlanTaskStatus::Running
+                    )
+                }) =>
         {
             if let Some(pid) = plan.conductor_pid
                 && pid != std::process::id()
@@ -2196,6 +2199,9 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
             quiet,
             plain,
         })?;
+        if halt.is_none() {
+            halt = reconcile_completed_per_node_tasks(&paths, &plan)?;
+        }
         // A breaker that had already tripped stays tripped across the crash.
         if halt.is_none()
             && plan.circuit_breaker_threshold > 0
@@ -2237,7 +2243,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         if !ready.is_empty() {
             made_progress = true;
         }
-        for &task_index in &ready {
+        let mut launch_ready = Vec::new();
+        for task_index in ready {
             let task_id = plan.tasks[task_index].task_id.clone();
             append_plan_event(
                 &paths,
@@ -2247,6 +2254,74 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     task_index,
                 },
             )?;
+            let mut pre_step = None;
+            if commands::graph_job::current_durable_chain_has_hook(
+                &plan,
+                deadreckon_core::chain::ChainHookName::PreStep,
+            )? {
+                let task = &plan.tasks[task_index];
+                let base_ref = plan
+                    .parent_cwd
+                    .as_deref()
+                    .map(|cwd| git_stdout(cwd, &["rev-parse", "HEAD"]))
+                    .transpose()?
+                    .map(|value| value.trim().to_string());
+                pre_step = Some(invoke_durable_chain_hook_or_reason(
+                    &paths,
+                    &plan,
+                    deadreckon_core::chain::ChainHookName::PreStep,
+                    Some(task.index),
+                    task.attempts_used() + 1,
+                    json!({
+                        "step_index": task.index,
+                        "step_goal": task.goal,
+                        "base_ref": base_ref,
+                    }),
+                ));
+            }
+            match pre_step {
+                Some(Ok(Some(1))) => {
+                    mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Skipped)?;
+                    append_plan_event(
+                        &paths,
+                        &plan.plan_id,
+                        PlanEventKind::TaskSkipped {
+                            task_id: task_id.clone(),
+                            task_index,
+                            reason: "skipped_by_pre_step_hook".to_string(),
+                        },
+                    )?;
+                    append_plan_message(
+                        &paths,
+                        &plan.plan_id,
+                        &PlanMessage::new(
+                            "coordinator",
+                            &task_id,
+                            PlanMessageKind::Progress,
+                            format!("{task_id} skipped by approved pre-step hook"),
+                            json!({ "task_index": task_index }),
+                        )?,
+                    )?;
+                    continue;
+                }
+                Some(Ok(Some(code))) => {
+                    if let Some(reason) = durable_chain_hook_block_reason(
+                        deadreckon_core::chain::ChainHookName::PreStep,
+                        code,
+                    ) {
+                        let reason = format!("blocked_by_chain_hook_pre-step: {reason}");
+                        append_chain_hook_task_block_once(&paths, &plan, task_index, &reason)?;
+                        halt = Some(reason);
+                        continue;
+                    }
+                }
+                Some(Ok(None)) | None => {}
+                Some(Err(reason)) => {
+                    append_chain_hook_task_block_once(&paths, &plan, task_index, &reason)?;
+                    halt = Some(reason);
+                    continue;
+                }
+            }
             mark_plan_task_status(&mut plan, task_index, PlanTaskStatus::Running)?;
             append_plan_event(
                 &paths,
@@ -2267,17 +2342,18 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     json!({ "task_index": task_index }),
                 )?,
             )?;
-        }
-        if ready.is_empty() {
-            continue;
+            launch_ready.push(task_index);
         }
         save_plan(&paths, &plan)?;
         write_coordinator_snapshot(&paths, &plan, None)?;
+        if launch_ready.is_empty() {
+            continue;
+        }
 
         let mut outcomes = Vec::new();
         let (signal_tx, signal_rx) = std::sync::mpsc::channel::<PlanChildSignal>();
         let mut handles = Vec::new();
-        for task_index in ready {
+        for task_index in launch_ready {
             let source_dir = match plan_child_source_dir(
                 &paths,
                 &plan,
@@ -2536,63 +2612,70 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode
                         && status == PlanTaskStatus::Completed
                     {
-                        // A landing failure is not a gate failure: the node did
-                        // its work and passed. Retrying it would re-run good
-                        // work against the same conflict, so the plan halts
-                        // with the reason instead, leaving earlier nodes
-                        // applied and the rest unstarted.
-                        // Landing is git work — sync process spawns — and this
-                        // loop runs on the async runtime; landing inline would
-                        // stall progress ticks and signal draining for its
-                        // duration.
-                        let apply_result = {
+                        // Hook execution and landing are blocking process work.
+                        // Their durable reconciliation happens off the async
+                        // runtime and closes with TaskApplied only after both
+                        // boundaries have succeeded.
+                        let reconciliation = {
                             let paths_for_apply = paths.clone();
                             let plan_for_apply = plan.clone();
-                            let run_for_apply = run_id.clone();
+                            let state_for_apply = state.clone();
                             tokio::task::spawn_blocking(move || {
-                                apply_node(
+                                reconcile_completed_per_node_task(
                                     &paths_for_apply,
                                     &plan_for_apply,
                                     task_index,
-                                    &run_for_apply,
+                                    &state_for_apply,
                                 )
                             })
                             .await
                             .map_err(|join| {
                                 CliError::Core(DeadreckonError::InvalidInput(format!(
-                                    "landing task panicked: {join}"
+                                    "chain hook or landing task panicked: {join}"
                                 )))
                             })
                             .and_then(|result| result)
                         };
-                        if let Err(error) = apply_result {
-                            let reason = error.to_string();
-                            append_plan_event(
-                                &paths,
-                                &plan.plan_id,
-                                PlanEventKind::TaskBlocked {
-                                    task_id: task_id.clone(),
-                                    task_index,
-                                    reason: reason.clone(),
-                                },
-                            )?;
-                            halt = Some(reason);
-                        } else {
-                            append_plan_event(
-                                &paths,
-                                &plan.plan_id,
-                                PlanEventKind::TaskApplied {
-                                    task_id: task_id.clone(),
-                                    task_index,
-                                    run_id: run_id.clone(),
-                                },
-                            )?;
-                            if !quiet {
-                                println!(
-                                    "{}",
-                                    ui_status(format!("{task_id} landed on the branch"))
-                                );
+                        match reconciliation {
+                            Ok(Some(reason)) => {
+                                append_chain_hook_task_block_once(
+                                    &paths, &plan, task_index, &reason,
+                                )?;
+                                halt = Some(reason);
                             }
+                            Err(error) => {
+                                let reason = error.to_string();
+                                append_chain_hook_task_block_once(
+                                    &paths, &plan, task_index, &reason,
+                                )?;
+                                halt = Some(reason);
+                            }
+                            Ok(None) if !quiet => println!(
+                                "{}",
+                                ui_status(format!("{task_id} landed on the isolated candidate"))
+                            ),
+                            Ok(None) => {}
+                        }
+                        if halt.is_none()
+                            && !applied_plan_task_ids(&paths, &plan)?.contains(&task_id)
+                        {
+                            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                                "per-node reconciliation returned without TaskApplied evidence"
+                                    .to_string(),
+                            )));
+                        }
+                        if halt.is_some() {
+                            append_plan_message(
+                                &paths,
+                                &plan.plan_id,
+                                &PlanMessage::new(
+                                    "coordinator",
+                                    &task_id,
+                                    PlanMessageKind::Blocker,
+                                    format!("{task_id} stopped at the chain policy boundary"),
+                                    json!({ "task_index": task_index, "reason": halt }),
+                                )?,
+                            )?;
                         }
                         save_plan(&paths, &plan)?;
                     }
@@ -2647,6 +2730,49 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
                     write_coordinator_snapshot(&paths, &plan, None)?;
                 }
             }
+        }
+    }
+
+    if halt.is_none()
+        && plan
+            .tasks
+            .iter()
+            .all(|task| task.status.is_successful_terminal())
+        && commands::graph_job::current_durable_chain_has_hook(
+            &plan,
+            deadreckon_core::chain::ChainHookName::OnChainEnd,
+        )?
+    {
+        let completed = plan
+            .tasks
+            .iter()
+            .filter(|task| task.status == PlanTaskStatus::Completed)
+            .count();
+        let skipped = plan
+            .tasks
+            .iter()
+            .filter(|task| task.status == PlanTaskStatus::Skipped)
+            .count();
+        match invoke_durable_chain_hook_or_reason(
+            &paths,
+            &plan,
+            deadreckon_core::chain::ChainHookName::OnChainEnd,
+            None,
+            1,
+            json!({
+                "status": "completed",
+                "steps_completed": completed,
+                "steps_skipped": skipped,
+                "total_spend_usd": plan.attempts_spend_usd(),
+            }),
+        ) {
+            Ok(Some(code)) if code < 0 => {
+                halt = Some(format!(
+                    "blocked_by_chain_hook_on-chain-end: hook_process_error_{code}"
+                ));
+            }
+            Ok(_) => {}
+            Err(reason) => halt = Some(reason),
         }
     }
 
@@ -2860,9 +2986,27 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
 /// Applying to the parent repo is also what lets the next node see this work:
 /// nodes source from `plan.parent_cwd`, so a node that starts after this
 /// returns copies a tree that already contains it.
-fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &str) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeApplyPreflight {
+    candidate_git_root: PathBuf,
+    candidate_before_revision: String,
+    child_base_was_explicit: bool,
+    child_base_revision: String,
+    child_result_revision: String,
+    validated_marker_sha256: String,
+}
+
+fn preflight_node_apply(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    run_id: &str,
+) -> Result<NodeApplyPreflight> {
     let state = load_run(paths, run_id)?;
     validate_acceptance_marker(&state)?;
+    let validated_marker_sha256 = deadreckon_core::flight::sha256_file(
+        &deadreckon_core::marker_path_for_run_root(&state.run_root),
+    )?;
     let record = read_codebase_record(&state.working_dir)?;
     let git_root = record.source_git_root.as_ref().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
@@ -2883,12 +3027,26 @@ fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &
             ),
         )));
     }
+    let candidate_before_revision = git_stdout(git_root, &["rev-parse", "HEAD^{commit}"])?;
+    let child_base_was_explicit = record.base_sha.is_some();
+    let child_base_revision = git_stdout(
+        git_root,
+        &[
+            "rev-parse",
+            &format!(
+                "{}^{{commit}}",
+                record.base_sha.as_deref().unwrap_or("HEAD")
+            ),
+        ],
+    )?;
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "missing branch_name".to_string(),
+        ))
+    })?;
+    let child_result_revision =
+        git_stdout(git_root, &["rev-parse", &format!("{branch}^{{commit}}")])?;
     if !plan.apply_allowlist.is_empty() {
-        let branch = record.branch_name.as_deref().ok_or_else(|| {
-            CliError::Core(DeadreckonError::InvalidInput(
-                "missing branch_name".to_string(),
-            ))
-        })?;
         let files = git_stdout(
             git_root,
             &["diff", "--name-only", &format!("HEAD..{branch}")],
@@ -2906,6 +3064,348 @@ fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &
             }
         }
     }
+    Ok(NodeApplyPreflight {
+        candidate_git_root: git_root.clone(),
+        candidate_before_revision,
+        child_base_was_explicit,
+        child_base_revision,
+        child_result_revision,
+        validated_marker_sha256,
+    })
+}
+
+fn git_commit_parents(git_root: &Path, revision: &str) -> Result<Vec<String>> {
+    let row = git_stdout(git_root, &["rev-list", "--parents", "-n", "1", revision])?;
+    Ok(row.split_whitespace().skip(1).map(str::to_string).collect())
+}
+
+fn git_revision_tree(git_root: &Path, revision: &str) -> Result<String> {
+    git_stdout(git_root, &["rev-parse", &format!("{revision}^{{tree}}")])
+}
+
+fn git_revisions_in_range(
+    git_root: &Path,
+    before: &str,
+    after: &str,
+    first_parent: bool,
+) -> Result<Vec<String>> {
+    let range = format!("{before}..{after}");
+    let mut args = vec!["rev-list", "--reverse"];
+    if first_parent {
+        args.push("--first-parent");
+    }
+    args.push(&range);
+    Ok(git_stdout(git_root, &args)?
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn verify_ordered_candidate_application_result(
+    paths: &DeadreckonPaths,
+    candidate_git_root: &Path,
+    event: &deadreckon_core::plan::OrderedCandidateApplicationEvent,
+    candidate_after_revision: &str,
+) -> Result<()> {
+    use deadreckon_core::plan::ApplyStrategy;
+
+    event.verify()?;
+    let state = load_run(paths, &event.run_id)?;
+    validate_acceptance_marker(&state)?;
+    let marker_sha256 = deadreckon_core::flight::sha256_file(
+        &deadreckon_core::marker_path_for_run_root(&state.run_root),
+    )?;
+    let record = read_codebase_record(&state.working_dir)?;
+    let child_git_root = record.source_git_root.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate child has no source_git_root".to_string(),
+        ))
+    })?;
+    if fs::canonicalize(child_git_root)? != fs::canonicalize(candidate_git_root)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate child names a different target repository".to_string(),
+        )));
+    }
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate child has no result branch".to_string(),
+        ))
+    })?;
+    let base = record.base_sha.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate child has no exact base revision".to_string(),
+        ))
+    })?;
+    let observed_base = git_stdout(
+        candidate_git_root,
+        &["rev-parse", &format!("{base}^{{commit}}")],
+    )?;
+    let observed_child = git_stdout(
+        candidate_git_root,
+        &["rev-parse", &format!("{branch}^{{commit}}")],
+    )?;
+    let observed_head = git_stdout(candidate_git_root, &["rev-parse", "HEAD^{commit}"])?;
+    let dirty = git_stdout(candidate_git_root, &["status", "--porcelain"])?;
+    if observed_base != event.child_base_revision
+        || observed_base != event.candidate_before_revision
+        || observed_child != event.child_result_revision
+        || marker_sha256 != event.validated_marker_sha256
+        || observed_head != candidate_after_revision
+        || !dirty.trim().is_empty()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate application {} no longer matches its prepared child, marker, or clean HEAD",
+            event.application_id
+        ))));
+    }
+
+    let before_tree = git_revision_tree(candidate_git_root, &event.candidate_before_revision)?;
+    let child_tree = git_revision_tree(candidate_git_root, &event.child_result_revision)?;
+    let after_tree = git_revision_tree(candidate_git_root, candidate_after_revision)?;
+    if candidate_after_revision == event.candidate_before_revision {
+        if child_tree != before_tree {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate application {} did not land its intended child delta",
+                event.application_id
+            ))));
+        }
+        return Ok(());
+    }
+    git_status(
+        candidate_git_root,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &event.candidate_before_revision,
+            candidate_after_revision,
+        ],
+    )
+    .map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate application {} no longer descends from its prepared HEAD",
+            event.application_id
+        )))
+    })?;
+    if after_tree != child_tree {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate application {} produced a tree other than its exact child result",
+            event.application_id
+        ))));
+    }
+
+    match event.apply_strategy {
+        ApplyStrategy::Squash => {
+            if git_commit_parents(candidate_git_root, candidate_after_revision)?
+                != vec![event.candidate_before_revision.clone()]
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate application {} is not one exact squash commit",
+                    event.application_id
+                ))));
+            }
+        }
+        ApplyStrategy::Merge => {
+            if git_commit_parents(candidate_git_root, candidate_after_revision)?
+                != vec![
+                    event.candidate_before_revision.clone(),
+                    event.child_result_revision.clone(),
+                ]
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate application {} is not the exact intended merge",
+                    event.application_id
+                ))));
+            }
+        }
+        ApplyStrategy::CherryPick => {
+            let source = git_revisions_in_range(
+                candidate_git_root,
+                &event.candidate_before_revision,
+                &event.child_result_revision,
+                false,
+            )?;
+            let landed = git_revisions_in_range(
+                candidate_git_root,
+                &event.candidate_before_revision,
+                candidate_after_revision,
+                true,
+            )?;
+            if source.is_empty() || source.len() != landed.len() {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate application {} has a different cherry-pick sequence",
+                    event.application_id
+                ))));
+            }
+            for (source_revision, landed_revision) in source.iter().zip(&landed) {
+                if git_revision_tree(candidate_git_root, source_revision)?
+                    != git_revision_tree(candidate_git_root, landed_revision)?
+                {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application {} changed its cherry-pick sequence",
+                        event.application_id
+                    ))));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn reconcile_prepared_ordered_candidate_application(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    initial_revision: &str,
+    candidate_git_root: &Path,
+) -> Result<()> {
+    let events = deadreckon_core::plan::read_ordered_candidate_application_events(
+        paths,
+        token.job_id.as_ref(),
+    )?;
+    let fold = deadreckon_core::plan::fold_ordered_candidate_application_events(
+        &events,
+        initial_revision,
+    )?;
+    let Some(prepared) = fold.pending else {
+        return Ok(());
+    };
+    let head = git_stdout(candidate_git_root, &["rev-parse", "HEAD^{commit}"])?;
+    if head == prepared.candidate_before_revision {
+        return Ok(());
+    }
+    verify_ordered_candidate_application_result(paths, candidate_git_root, &prepared, &head)?;
+    let completed = deadreckon_core::plan::OrderedCandidateApplicationEvent::completed(
+        &prepared,
+        head,
+        Utc::now(),
+    )?;
+    deadreckon_core::plan::append_owned_ordered_candidate_application_event_fenced(
+        paths,
+        token,
+        &prepared.plan_id,
+        initial_revision,
+        &completed,
+    )?;
+    Ok(())
+}
+
+fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &str) -> Result<()> {
+    // Re-run the read-only preflight immediately before mutation. Durable
+    // Chain on-promote hooks run only after an earlier preflight, but they are
+    // external processes and can change the candidate while they run. The
+    // second check closes that interval instead of trusting the hook.
+    let preflight = preflight_node_apply(paths, plan, task_index, run_id)?;
+    let application_authority = if plan.owner_job_id.is_some() {
+        let token =
+            commands::graph_job::current_plan_mutation_token(paths, plan)?.ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Job-owned Plan {} cannot apply without its fenced driver lease",
+                    plan.plan_id
+                )))
+            })?;
+        let initial_revision =
+            commands::graph_job::current_ordered_candidate_initial_revision(paths, plan)?
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "Job-owned Plan {} has no ordered candidate manifest",
+                        plan.plan_id
+                    )))
+                })?;
+        let completed_hook_invocation_ids =
+            commands::graph_job::completed_current_durable_chain_hook_invocation_ids(
+                paths,
+                plan,
+                plan.tasks[task_index].index,
+                plan.tasks[task_index].attempts_used() + 1,
+            )?;
+        let events = deadreckon_core::plan::read_ordered_candidate_application_events(
+            paths,
+            token.job_id.as_ref(),
+        )?;
+        let fold = deadreckon_core::plan::fold_ordered_candidate_application_events(
+            &events,
+            &initial_revision,
+        )?;
+        if let Some(completed) = fold
+            .completed
+            .iter()
+            .find(|event| event.task_id == plan.tasks[task_index].task_id && event.run_id == run_id)
+        {
+            let after = completed
+                .candidate_after_revision
+                .as_deref()
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate completed application {} has no after revision",
+                        completed.application_id
+                    )))
+                })?;
+            if completed.job_id != token.job_id.as_ref()
+                || completed.plan_id != plan.plan_id
+                || completed.task_index != task_index
+                || !preflight.child_base_was_explicit
+                || completed.child_base_revision != preflight.child_base_revision
+                || completed.child_result_revision != preflight.child_result_revision
+                || completed.validated_marker_sha256 != preflight.validated_marker_sha256
+                || completed.apply_strategy != plan.apply_strategy
+                || completed.completed_hook_invocation_ids != completed_hook_invocation_ids
+                || preflight.candidate_before_revision != after
+            {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate completed application {} no longer matches its task, child, hooks, or HEAD",
+                    completed.application_id
+                ))));
+            }
+            return Ok(());
+        }
+        let prepared = deadreckon_core::plan::OrderedCandidateApplicationEvent::prepared(
+            token.job_id.as_ref(),
+            &plan.plan_id,
+            &plan.tasks[task_index].task_id,
+            task_index,
+            run_id,
+            &preflight.candidate_before_revision,
+            &preflight.child_base_revision,
+            &preflight.child_result_revision,
+            &preflight.validated_marker_sha256,
+            plan.apply_strategy,
+            completed_hook_invocation_ids,
+            Utc::now(),
+        )?;
+        if !preflight.child_base_was_explicit
+            || prepared.child_base_revision != prepared.candidate_before_revision
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate child {} was not based on the exact candidate HEAD",
+                prepared.run_id
+            ))));
+        }
+        if let Some(existing) = fold.pending.as_ref() {
+            if existing.application_id != prepared.application_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate has unfinished application {} before {}",
+                    existing.application_id, prepared.application_id
+                ))));
+            }
+        } else {
+            if preflight.candidate_before_revision != fold.expected_head_revision {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate HEAD {} is not the initial revision or last completed landing {}",
+                    preflight.candidate_before_revision, fold.expected_head_revision
+                ))));
+            }
+            deadreckon_core::plan::append_owned_ordered_candidate_application_event_fenced(
+                paths,
+                &token,
+                &plan.plan_id,
+                &initial_revision,
+                &prepared,
+            )?;
+        }
+        Some((token, initial_revision, prepared))
+    } else {
+        None
+    };
     super::lifecycle::apply_command_quiet(
         run_id.to_string(),
         apply_strategy_label(plan.apply_strategy).to_string(),
@@ -2914,7 +3414,301 @@ fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &
         true,
         false,
         None,
+    )?;
+    if let Some((token, initial_revision, prepared)) = application_authority {
+        let after = git_stdout(
+            &preflight.candidate_git_root,
+            &["rev-parse", "HEAD^{commit}"],
+        )?;
+        verify_ordered_candidate_application_result(
+            paths,
+            &preflight.candidate_git_root,
+            &prepared,
+            &after,
+        )?;
+        let completed = deadreckon_core::plan::OrderedCandidateApplicationEvent::completed(
+            &prepared,
+            after,
+            Utc::now(),
+        )?;
+        deadreckon_core::plan::append_owned_ordered_candidate_application_event_fenced(
+            paths,
+            &token,
+            &plan.plan_id,
+            &initial_revision,
+            &completed,
+        )?;
+    }
+    Ok(())
+}
+
+fn applied_plan_task_ids(paths: &DeadreckonPaths, plan: &Plan) -> Result<BTreeSet<String>> {
+    let applied = deadreckon_core::read_plan_events(paths, &plan.plan_id)?
+        .into_iter()
+        .filter_map(|event| match event.event {
+            PlanEventKind::TaskApplied {
+                task_id, run_id, ..
+            } => Some((task_id, run_id)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let Some(job_id) = plan.owner_job_id.as_deref() else {
+        return Ok(applied.into_iter().map(|(task_id, _)| task_id).collect());
+    };
+    let completed =
+        deadreckon_core::plan::read_ordered_candidate_application_events(paths, job_id)?
+            .into_iter()
+            .filter(|event| {
+                event.kind == deadreckon_core::plan::OrderedCandidateApplicationEventKind::Completed
+            })
+            .map(|event| (event.task_id, event.run_id))
+            .collect::<BTreeSet<_>>();
+    Ok(applied
+        .intersection(&completed)
+        .map(|(task_id, _)| task_id.clone())
+        .collect())
+}
+
+pub(crate) fn plan_requires_durable_resume(paths: &DeadreckonPaths, plan: &Plan) -> Result<bool> {
+    if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        let applied = applied_plan_task_ids(paths, plan)?;
+        if plan.tasks.iter().any(|task| {
+            task.status == PlanTaskStatus::Completed && !applied.contains(&task.task_id)
+        }) {
+            return Ok(true);
+        }
+    }
+    commands::graph_job::durable_chain_end_hook_pending(paths, plan)
+}
+
+pub(crate) fn durable_chain_operator_block_reason(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+) -> Result<Option<String>> {
+    Ok(deadreckon_core::read_plan_events(paths, plan_id)?
+        .into_iter()
+        .rev()
+        .find_map(|event| match event.event {
+            PlanEventKind::PlanFailed { reason }
+                if reason.starts_with("blocked_by_chain_hook_") =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        }))
+}
+
+fn append_chain_hook_task_block_once(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    reason: &str,
+) -> Result<()> {
+    let task_id = plan.tasks[task_index].task_id.clone();
+    let already_recorded = deadreckon_core::read_plan_events(paths, &plan.plan_id)?
+        .iter()
+        .any(|event| {
+            matches!(
+                &event.event,
+                PlanEventKind::TaskBlocked {
+                    task_id: recorded_task,
+                    reason: recorded_reason,
+                    ..
+                } if recorded_task == &task_id && recorded_reason == reason
+            )
+        });
+    if !already_recorded {
+        append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::TaskBlocked {
+                task_id,
+                task_index,
+                reason: reason.to_string(),
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn durable_chain_hook_block_reason(
+    name: deadreckon_core::chain::ChainHookName,
+    exit_code: i32,
+) -> Option<String> {
+    use deadreckon_core::chain::ChainHookName;
+
+    if exit_code < 0 {
+        return Some(format!("hook_process_error_{exit_code}"));
+    }
+    match (name, exit_code) {
+        (ChainHookName::PreStep, 2) => Some("paused_by_pre_step_hook".to_string()),
+        (ChainHookName::PostStep, 1) => Some("paused_by_post_step_hook".to_string()),
+        (ChainHookName::PostStep, 2) => Some("refused_by_post_step_hook".to_string()),
+        (ChainHookName::OnPromote, 1) => Some("paused_by_hook_on_promote".to_string()),
+        (ChainHookName::OnPromote, 2) => Some("refused_by_hook_on_promote".to_string()),
+        _ => None,
+    }
+}
+
+fn invoke_durable_chain_hook_or_reason(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    name: deadreckon_core::chain::ChainHookName,
+    step_index: Option<u32>,
+    attempt: u32,
+    payload: Value,
+) -> std::result::Result<Option<i32>, String> {
+    commands::graph_job::invoke_current_durable_chain_hook(
+        paths, plan, name, step_index, attempt, payload,
     )
+    .map_err(|error| format!("blocked_by_chain_hook_{}: {error}", name.as_str()))
+}
+
+fn durable_chain_promote_payload(
+    plan: &Plan,
+    task_index: usize,
+    state: &deadreckon_core::PipelineState,
+) -> Result<Value> {
+    let record = read_codebase_record(&state.working_dir)?;
+    let git_root = record.source_git_root.as_ref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain child has no source Git root".to_string(),
+        ))
+    })?;
+    let branch = record.branch_name.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain child has no result branch".to_string(),
+        ))
+    })?;
+    let files_changed = git_stdout(
+        git_root,
+        &["diff", "--name-only", &format!("HEAD..{branch}")],
+    )?
+    .lines()
+    .filter(|line| !line.trim().is_empty())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+    let diff_stat =
+        git_stdout(git_root, &["diff", "--stat", &format!("HEAD..{branch}")]).unwrap_or_default();
+    Ok(json!({
+        "chain_id": commands::graph_job::current_parent_job_id(),
+        "step_index": plan.tasks[task_index].index,
+        "run_id": state.run_id,
+        "diff_stat": diff_stat,
+        "files_changed": files_changed,
+    }))
+}
+
+/// Reconcile the external-policy and apply boundary for one completed child.
+/// Hook evidence makes each invocation replay-safe; apply itself is
+/// idempotent when the child revision is already present. Only after both
+/// boundaries close do we append `TaskApplied`.
+fn reconcile_completed_per_node_task(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    task_index: usize,
+    state: &deadreckon_core::PipelineState,
+) -> Result<Option<String>> {
+    use deadreckon_core::chain::ChainHookName;
+
+    let task = &plan.tasks[task_index];
+    let attempt = task.attempts_used() + 1;
+    let step_index = Some(task.index);
+    let post_payload = json!({
+        "chain_id": commands::graph_job::current_parent_job_id(),
+        "step_index": task.index,
+        "run_id": state.run_id,
+        "status": state.status.to_string(),
+        "library_dir": state.promoted_library_dir,
+    });
+    match invoke_durable_chain_hook_or_reason(
+        paths,
+        plan,
+        ChainHookName::PostStep,
+        step_index,
+        attempt,
+        post_payload,
+    ) {
+        Ok(Some(code)) => {
+            if let Some(reason) = durable_chain_hook_block_reason(ChainHookName::PostStep, code) {
+                return Ok(Some(format!("blocked_by_chain_hook_post-step: {reason}")));
+            }
+        }
+        Ok(None) => {}
+        Err(reason) => return Ok(Some(reason)),
+    }
+
+    if commands::graph_job::current_durable_chain_has_hook(plan, ChainHookName::OnPromote)? {
+        // Preserve the legacy Chain boundary: an invalid marker, dirty target,
+        // or out-of-allowlist result must be refused before an on-promote hook
+        // is allowed to create an external effect. `apply_node` repeats this
+        // preflight afterward to guard against hook-time mutation.
+        if let Err(error) = preflight_node_apply(paths, plan, task_index, &state.run_id) {
+            return Ok(Some(error.to_string()));
+        }
+        let payload = durable_chain_promote_payload(plan, task_index, state)?;
+        match invoke_durable_chain_hook_or_reason(
+            paths,
+            plan,
+            ChainHookName::OnPromote,
+            step_index,
+            attempt,
+            payload,
+        ) {
+            Ok(Some(code)) => {
+                if let Some(reason) =
+                    durable_chain_hook_block_reason(ChainHookName::OnPromote, code)
+                {
+                    return Ok(Some(format!("blocked_by_chain_hook_on-promote: {reason}")));
+                }
+            }
+            Ok(None) => {}
+            Err(reason) => return Ok(Some(reason)),
+        }
+    }
+
+    if let Err(error) = apply_node(paths, plan, task_index, &state.run_id) {
+        return Ok(Some(error.to_string()));
+    }
+    if !applied_plan_task_ids(paths, plan)?.contains(&task.task_id) {
+        append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::TaskApplied {
+                task_id: task.task_id.clone(),
+                task_index,
+                run_id: state.run_id.clone(),
+            },
+        )?;
+    }
+    Ok(None)
+}
+
+fn reconcile_completed_per_node_tasks(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+) -> Result<Option<String>> {
+    if plan.apply != deadreckon_core::plan::ApplyWhen::PerNode {
+        return Ok(None);
+    }
+    let applied = applied_plan_task_ids(paths, plan)?;
+    for (task_index, task) in plan.tasks.iter().enumerate() {
+        if task.status != PlanTaskStatus::Completed || applied.contains(&task.task_id) {
+            continue;
+        }
+        let run_id = task.child_run_id.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "completed per-node task {} has no result Run",
+                task.task_id
+            )))
+        })?;
+        let state = load_run(paths, run_id)?;
+        if let Some(reason) = reconcile_completed_per_node_task(paths, plan, task_index, &state)? {
+            append_chain_hook_task_block_once(paths, plan, task_index, &reason)?;
+            return Ok(Some(reason));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn apply_strategy_label(value: ApplyStrategy) -> &'static str {
@@ -3047,24 +3841,14 @@ fn adopt_orphaned_children(context: AdoptOrphans<'_>) -> Result<()> {
                 )?;
                 *consecutive_failures = 0;
                 if plan.apply == deadreckon_core::plan::ApplyWhen::PerNode {
-                    // The run finished but the conductor died before landing
-                    // it. Landing is idempotent-adjacent, not idempotent, so
-                    // check first: if the run's commit is already on the
-                    // branch, apply_node's dirty/allowlist guards handle the
-                    // rest; a landing failure halts with the reason exactly
-                    // as it does live.
-                    if let Err(error) = apply_node(paths, plan, task_index, &run_id) {
-                        *halt = Some(error.to_string());
-                    } else {
-                        append_plan_event(
-                            paths,
-                            &plan.plan_id,
-                            PlanEventKind::TaskApplied {
-                                task_id: task_id.clone(),
-                                task_index,
-                                run_id: run_id.clone(),
-                            },
-                        )?;
+                    // Re-enter the same fenced hook/apply reconciliation as a
+                    // live child. Completed hook evidence is reused; an
+                    // incomplete invocation blocks instead of being replayed.
+                    if let Some(reason) =
+                        reconcile_completed_per_node_task(paths, plan, task_index, &state)?
+                    {
+                        append_chain_hook_task_block_once(paths, plan, task_index, &reason)?;
+                        *halt = Some(reason);
                     }
                 }
             }
@@ -3812,6 +4596,11 @@ fn append_task_terminal_plan_event(
             task_index,
             run_id: Some(run_id.to_string()),
         },
+        PlanTaskStatus::Skipped => PlanEventKind::TaskSkipped {
+            task_id: task.task_id.clone(),
+            task_index,
+            reason: "skipped by approved orchestration policy".to_string(),
+        },
         PlanTaskStatus::Pending | PlanTaskStatus::Running => PlanEventKind::TaskBlocked {
             task_id: task.task_id.clone(),
             task_index,
@@ -3944,6 +4733,9 @@ fn plan_dependency_artifacts(
                 "edit the plan so depends_on references earlier task ids",
             ))
         })?;
+        if dependency_task.status == PlanTaskStatus::Skipped {
+            continue;
+        }
         if dependency_task.status != PlanTaskStatus::Completed {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!(
@@ -4590,13 +5382,26 @@ fn run_plan_child(launch: PlanChildLaunch<'_>) -> Result<String> {
     );
     command.args(&argv);
     let delegation = if commands::graph_job::current_parent_job_id().is_some() {
+        let task_attempt = task.attempts.len() as u32 + 1;
+        let parent_job_id = commands::graph_job::current_parent_job_id().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "Plan child lost its parent Job identity".to_string(),
+            ))
+        })?;
+        let run_id = commands::graph_job::plan_task_run_id(
+            parent_job_id,
+            &plan.plan_id,
+            &task.task_id,
+            task_attempt,
+        );
         let prepared = commands::graph_job::prepare_delegated_invocation(
             paths,
             commands::graph_job::DelegatedAction::PlanChild {
                 plan_id: plan.plan_id.clone(),
                 task_id: task.task_id.clone(),
                 task_index: task.index,
-                task_attempt: task.attempts.len() as u32 + 1,
+                task_attempt,
+                run_id,
             },
             &argv,
             source_dir,
@@ -4853,13 +5658,13 @@ fn mark_blocked_pending_tasks(
     let completed = plan
         .tasks
         .iter()
-        .filter(|task| task.status == PlanTaskStatus::Completed)
+        .filter(|task| task.status.satisfies_dependency())
         .map(|task| task.task_id.clone())
         .collect::<BTreeSet<_>>();
     let blockers = plan
         .tasks
         .iter()
-        .filter(|task| task.status != PlanTaskStatus::Completed)
+        .filter(|task| !task.status.satisfies_dependency())
         .map(|task| task.task_id.clone())
         .collect::<BTreeSet<_>>();
     let pending = plan
@@ -4947,6 +5752,8 @@ fn print_fork_finished(plan: &Plan, no_hints: bool) {
 
 #[cfg(test)]
 mod tests {
+    use deadreckon_protocol::JobId;
+
     use super::*;
 
     #[test]
@@ -5087,6 +5894,226 @@ mod tests {
     fn parse_planner_response_rejects_non_json() {
         assert!(parse_planner_response("I could not produce a plan.").is_err());
     }
+
+    #[test]
+    fn prepared_ordered_candidate_crash_is_reconciled_without_second_apply() {
+        use deadreckon_core::plan::{
+            OrderedCandidateApplicationEvent, OrderedCandidateApplicationEventKind,
+            read_ordered_candidate_application_events,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let candidate = temp.path().join("candidate");
+        fs::create_dir_all(&candidate).expect("candidate");
+        git_status(&candidate, &["init", "--quiet"]).expect("git init");
+        git_status(&candidate, &["checkout", "--quiet", "-b", "ordered"])
+            .expect("candidate branch");
+        fs::write(candidate.join("base.txt"), "base\n").expect("base");
+        git_status(&candidate, &["add", "--all"]).expect("stage base");
+        git_status(
+            &candidate,
+            &[
+                "-c",
+                "user.name=DeadReckon",
+                "-c",
+                "user.email=deadreckon@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        )
+        .expect("commit base");
+        let initial = git_stdout(&candidate, &["rev-parse", "HEAD"]).expect("initial");
+
+        let child = temp.path().join("child");
+        git_status(
+            &candidate,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "child-result",
+                child.to_str().expect("child path"),
+                &initial,
+            ],
+        )
+        .expect("child worktree");
+        fs::write(child.join("result.txt"), "approved child result\n").expect("result");
+        git_status(&child, &["add", "result.txt"]).expect("stage child result");
+        git_status(
+            &child,
+            &[
+                "-c",
+                "user.name=DeadReckon",
+                "-c",
+                "user.email=deadreckon@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "child result",
+            ],
+        )
+        .expect("commit child result");
+        let child_result =
+            git_stdout(&candidate, &["rev-parse", "child-result"]).expect("child revision");
+
+        let run_id = "ordered-child-run";
+        let record = deadreckon_core::CodebaseRecord {
+            schema_version: deadreckon_core::codebase::CODEBASE_RECORD_VERSION,
+            mode: deadreckon_core::CodebaseMode::Worktree,
+            source_path: Some(candidate.clone()),
+            source_git_root: Some(candidate.clone()),
+            branch_name: Some("child-result".to_string()),
+            base_ref: Some(initial.clone()),
+            base_sha: Some(initial.clone()),
+            parent_branch: Some("ordered".to_string()),
+            worktree_path: Some(child.clone()),
+            dirty_files_seeded: false,
+            head_was_detached: false,
+            created_at: Utc::now(),
+            deadreckon_version: "test".to_string(),
+            doc_polish_hash: None,
+        };
+        let state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "land the child".to_string(),
+                cwd: candidate.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "test".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some(run_id.to_string()),
+                codebase: Some(record),
+            },
+        )
+        .expect("child run");
+        deadreckon_core::write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("acceptance marker");
+        let marker_sha256 = deadreckon_core::flight::sha256_file(
+            &deadreckon_core::marker_path_for_run_root(&state.run_root),
+        )
+        .expect("marker digest");
+
+        let job_id = "ordered-crash-job";
+        let mut plan = Plan::new(
+            "ordered crash recovery",
+            PlanMode::FullPlan,
+            vec![
+                PlanTask::new(
+                    0,
+                    "land child",
+                    "land the exact child",
+                    PlanRole::Child,
+                    None,
+                ),
+                PlanTask::new(
+                    1,
+                    "preserve sibling",
+                    "leave the unrelated sibling pending",
+                    PlanRole::Child,
+                    None,
+                ),
+            ],
+            PlanProviders::default(),
+            None,
+            "test",
+        )
+        .expect("plan");
+        plan.plan_id = job_id.to_string();
+        plan.owner_job_id = Some(job_id.to_string());
+        plan.parent_cwd = Some(candidate.clone());
+        plan.apply = deadreckon_core::plan::ApplyWhen::PerNode;
+        plan.apply_strategy = deadreckon_core::plan::ApplyStrategy::Squash;
+        deadreckon_core::save_plan(&paths, &plan).expect("save owned plan");
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &JobId(job_id.to_string()),
+            &deadreckon_core::LeaseOwner {
+                owner_id: "ordered-crash-owner".to_string(),
+                boot_id: "ordered-crash-boot".to_string(),
+                pid: std::process::id(),
+                process_group: std::process::id(),
+            },
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("lease")
+        .token();
+        let prepared = OrderedCandidateApplicationEvent::prepared(
+            job_id,
+            job_id,
+            &plan.tasks[0].task_id,
+            0,
+            run_id,
+            &initial,
+            &initial,
+            &child_result,
+            marker_sha256,
+            deadreckon_core::plan::ApplyStrategy::Squash,
+            Vec::new(),
+            Utc::now(),
+        )
+        .expect("prepared fact");
+        deadreckon_core::plan::append_owned_ordered_candidate_application_event_fenced(
+            &paths, &token, job_id, &initial, &prepared,
+        )
+        .expect("append prepared");
+
+        git_status(&candidate, &["merge", "--squash", "child-result"])
+            .expect("Git mutation before crash");
+        git_status(
+            &candidate,
+            &[
+                "-c",
+                "user.name=DeadReckon",
+                "-c",
+                "user.email=deadreckon@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "land child",
+            ],
+        )
+        .expect("commit before crash");
+        let landed = git_stdout(&candidate, &["rev-parse", "HEAD"]).expect("landed");
+
+        reconcile_prepared_ordered_candidate_application(&paths, &token, &initial, &candidate)
+            .expect("reconcile exact crash landing");
+        reconcile_prepared_ordered_candidate_application(&paths, &token, &initial, &candidate)
+            .expect("reconciliation is idempotent");
+        let events = read_ordered_candidate_application_events(&paths, job_id).expect("ledger");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].kind,
+            OrderedCandidateApplicationEventKind::Prepared
+        );
+        assert_eq!(
+            events[1].kind,
+            OrderedCandidateApplicationEventKind::Completed
+        );
+        assert_eq!(
+            events[1].candidate_after_revision.as_deref(),
+            Some(landed.as_str())
+        );
+        assert_eq!(
+            git_stdout(
+                &candidate,
+                &["rev-list", "--count", &format!("{initial}..HEAD")]
+            )
+            .expect("landing count"),
+            "1"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5097,7 +6124,7 @@ mod retry_gate_tests {
     };
     use chrono::{Duration, Utc};
     use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, TaskAttempt};
-    use deadreckon_core::{DeadreckonPaths, read_plan_events, read_plan_messages};
+    use deadreckon_core::{DeadreckonPaths, read_plan_events, read_plan_messages, save_plan};
 
     fn plan_on_disk(paths: &DeadreckonPaths) -> Plan {
         let plan = Plan::new(
@@ -5112,7 +6139,7 @@ mod retry_gate_tests {
             "test",
         )
         .expect("plan");
-        std::fs::create_dir_all(paths.plan_dir(&plan.plan_id)).expect("plan dir");
+        save_plan(paths, &plan).expect("persist plan fixture");
         plan
     }
 

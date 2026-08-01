@@ -271,7 +271,29 @@ pub fn gate_key_path_for_run_root(run_root: &Path, run_id: &str) -> Result<PathB
     Ok(gate_key_path(&DeadreckonPaths::from_home(home), run_id))
 }
 
+fn ensure_private_gate_key_store(paths: &DeadreckonPaths) -> Result<PathBuf> {
+    let store = paths.home().join("gate-keys");
+    std::fs::create_dir_all(&store).with_path(&store)?;
+    let metadata = std::fs::symlink_metadata(&store).with_path(&store)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "protected gate key store {} is not a real directory",
+            store.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // This is a local, per-user keyring. Tightening an older store is a
+        // safe in-place migration and keeps existing per-run keys usable.
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700))
+            .with_path(&store)?;
+    }
+    Ok(store)
+}
+
 pub fn create_gate_key(paths: &DeadreckonPaths, run_id: &str) -> Result<Vec<u8>> {
+    ensure_private_gate_key_store(paths)?;
     let path = gate_key_path(paths, run_id);
     match std::fs::symlink_metadata(&path) {
         Ok(_) => return read_gate_key_at_path(&path, run_id),
@@ -310,10 +332,7 @@ pub fn write_gate_key(paths: &DeadreckonPaths, run_id: &str, key: &[u8]) -> Resu
         )));
     }
     let path = gate_key_path(paths, run_id);
-    let parent = path.parent().ok_or_else(|| {
-        DeadreckonError::InvalidInput(format!("gate key path {} has no parent", path.display()))
-    })?;
-    std::fs::create_dir_all(parent).with_path(parent)?;
+    ensure_private_gate_key_store(paths)?;
 
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -360,6 +379,39 @@ pub fn encode_gate_key(key: &[u8]) -> Result<String> {
 }
 
 fn read_gate_key_at_path(path: &Path, run_id: &str) -> Result<Vec<u8>> {
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!("gate key path {} has no parent", path.display()))
+    })?;
+    let parent_metadata = match std::fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "protected gate key is missing for run {run_id}; acceptance cannot be verified\ntry: deadreckon verdict {run_id}"
+            )));
+        }
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: parent.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "protected gate key store {} is not a real directory; acceptance cannot be verified",
+            parent.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if parent_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "protected gate key store {} is accessible to other users; acceptance cannot be verified",
+                parent.display()
+            )));
+        }
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
@@ -2305,6 +2357,11 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                key_path.parent().expect("key parent"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .expect("private key-store permissions");
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
                 .expect("private fixture permissions");
         }
@@ -2360,6 +2417,30 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        let directory_mode = std::fs::metadata(paths.home().join("gate-keys"))
+            .expect("key-store metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_gate_key_store_refuses_historical_verification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key = super::create_gate_key(&paths, "permissive-store").expect("key");
+        let store = paths.home().join("gate-keys");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755))
+            .expect("weaken fixture store");
+
+        let error = super::read_gate_key(&paths, "permissive-store")
+            .expect_err("permissive store must fail closed");
+        assert!(error.to_string().contains("accessible to other users"));
+        assert_eq!(key.len(), 32);
     }
 
     #[test]

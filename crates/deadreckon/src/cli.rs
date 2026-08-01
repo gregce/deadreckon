@@ -490,10 +490,13 @@ Resume reconstructs history from traces, skips partial trailing records, and con
 
 const UNDO_HELP: &str = "\
 Lifecycle:
-  deadreckon undo --run latest
+  deadreckon undo <verified-job-id> --no-confirm
+  deadreckon undo <run-id> --turn 2
+  deadreckon undo <chain-id> --no-confirm
   deadreckon show latest
 
-Undo restores a run snapshot. It is mainly for in-place runs or recovery inside a run working directory.";
+For a durable Job, undo reverts only its receipt-bound applied Git revision.
+For a run, it restores a snapshot. For a legacy chain, it unwinds applied steps.";
 
 const SHOW_HELP: &str = "\
 Raw inspection command. `deadreckon status` and `deadreckon list` are the
@@ -1851,7 +1854,7 @@ pub(crate) enum Commands {
     Undo {
         #[arg(
             value_name = "ID",
-            help = "Run id, unique prefix, or latest; defaults to current project's latest"
+            help = "Job, run, or chain id, unique prefix, or latest; defaults to current project's latest"
         )]
         id: Option<String>,
         #[arg(
@@ -1861,6 +1864,11 @@ pub(crate) enum Commands {
         run: Option<String>,
         #[arg(long, help = "Snapshot turn to restore")]
         turn: Option<u32>,
+        #[arg(
+            long,
+            help = "Skip confirmation when reverting a verified applied Job or chain delivery"
+        )]
+        no_confirm: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",

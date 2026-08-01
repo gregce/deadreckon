@@ -2702,7 +2702,7 @@ fn shape_is_derived_from_the_graph_not_a_word() {
              {"id":"n1","goal":"rebuild search"}],
            "confidence":0.9,"rationale":"two sub-projects"}"#,
     );
-    assert_eq!(nested, super::commands::course::CourseShape::Campaign);
+    assert_eq!(nested, super::commands::course::CourseShape::Plan);
     assert!(
         pieces[0].subplan.is_some(),
         "the nested node keeps its graph"
@@ -2725,7 +2725,7 @@ fn a_nested_graph_keeps_its_sub_nodes_and_their_own_apply_mode() {
            "apply":"at-end","confidence":0.9,"rationale":"two sub-projects"}"#,
     );
 
-    assert_eq!(shape, super::commands::course::CourseShape::Campaign);
+    assert_eq!(shape, super::commands::course::CourseShape::Plan);
     assert_eq!(apply, deadreckon_core::plan::ApplyWhen::AtEnd, "parent");
 
     let sub = pieces[0].subplan.as_ref().expect("sub-nodes survive");
@@ -6321,6 +6321,26 @@ fn acceptance_activity_lines_surface_running_and_failed_checks() {
     assert!(lines.contains("acceptance failed"), "{lines}");
     assert!(lines.contains("1 required failures"), "{lines}");
     assert!(lines.contains("npm test"), "{lines}");
+}
+
+#[test]
+fn acceptance_activity_lines_never_describe_invalid_or_missing_markers_as_passed() {
+    for (status, expected) in [
+        (AcceptanceUiStatus::Invalid, "acceptance invalid"),
+        (AcceptanceUiStatus::Missing, "acceptance missing"),
+    ] {
+        let acceptance = AcceptanceLive {
+            status,
+            latest_detail: Some(expected.to_string()),
+            progress_lines: vec![format!("! {expected}")],
+            ..AcceptanceLive::default()
+        };
+
+        let lines = acceptance_activity_lines(&acceptance).join("\n");
+
+        assert!(lines.contains(expected), "{lines}");
+        assert!(!lines.contains("acceptance passed"), "{lines}");
+    }
 }
 
 fn test_log_spec(cwd_match: IngestCwdMatch) -> ProviderJsonlLogSpec {

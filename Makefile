@@ -35,6 +35,7 @@ size-check: build
 	cd $(ROOT) && DEADRECKON_RELEASE_SIZE_CHECK=1 cargo test -p deadreckon --test hygiene_config release_binary_size_within_baseline_slack -- --exact
 
 test:
+	cd $(ROOT) && cargo build -p deadreckon --features internal-characterization --bin deadreckon-characterization
 	cd $(ROOT) && cargo test --workspace
 	cd $(ROOT) && cargo test -p deadreckon --features internal-characterization --test chain --test orchestrate
 

@@ -9,9 +9,9 @@ use std::process::Stdio;
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
-    CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, GoalCoverageStatus, Job,
-    JobAuthority, JobEvent, JobEventKind, JobOutcome, JobSchemaVersion, JobShape, SemanticDecision,
-    SemanticJudgment, StopReason,
+    CompletionExecutionEvidence, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
+    GoalCoverageStatus, Job, JobAuthority, JobEvent, JobEventKind, JobOutcome, JobSchemaVersion,
+    JobShape, SemanticDecision, SemanticJudgment, StopReason,
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -37,6 +37,8 @@ const RECEIPT_MAGIC: &[u8] = b"deadreckon.completion-receipt.v1\0";
 pub const SEMANTIC_JUDGMENT_JSON: &str = "proofs/semantic-judgment.json";
 const PARENT_REPAIR_INTENT_JSON: &str = "parent-repair.json";
 const PARENT_REPAIR_ARCHIVE_DIR: &str = "parent-repairs";
+const DURABLE_CHAIN_ADAPTER_SIGNAL: &str = "watchkeeper_chain_adapter";
+const ORDERED_CANDIDATE_MANIFEST_JSON: &str = "ordered-candidate.json";
 const PARENT_REPAIR_ROUND_FILES: [&str; 5] = [
     "intent.json",
     "final-attempt.json",
@@ -127,6 +129,46 @@ struct ParentRepairRoundSnapshot {
     judgment: TrustedFileSnapshot,
 }
 
+fn completion_execution_evidence(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Option<CompletionExecutionEvidence>> {
+    let launch_path = paths.job_launch_plan(job_id);
+    let launch = read_required_trusted_file_snapshot(&launch_path, "launch plan", job_id)?;
+    let launch: serde_json::Value =
+        serde_json::from_slice(&launch.bytes).with_json_path(&launch_path)?;
+    if launch
+        .get("signals")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|signals| signals.get(DURABLE_CHAIN_ADAPTER_SIGNAL))
+        .is_none()
+    {
+        return Ok(None);
+    }
+
+    let job_dir = paths.job_dir(job_id);
+    let manifest = read_required_trusted_file_snapshot(
+        &job_dir.join(ORDERED_CANDIDATE_MANIFEST_JSON),
+        "ordered candidate manifest",
+        job_id,
+    )?;
+    let applications = read_optional_trusted_file_snapshot(
+        &job_dir.join(crate::plan::ORDERED_CANDIDATE_APPLICATION_EVENTS_JSONL),
+        "ordered candidate application ledger",
+        job_id,
+    )?;
+    let hooks = read_optional_trusted_file_snapshot(
+        &job_dir.join(crate::chain::DURABLE_CHAIN_HOOK_EVENTS_JSONL),
+        "durable chain hook ledger",
+        job_id,
+    )?;
+    Ok(Some(CompletionExecutionEvidence {
+        ordered_candidate_manifest_sha256: manifest.sha256,
+        candidate_application_events_sha256: applications.map(|snapshot| snapshot.sha256),
+        chain_hook_events_sha256: hooks.map(|snapshot| snapshot.sha256),
+    }))
+}
+
 pub fn seal_completion_receipt(
     paths: &DeadreckonPaths,
     state: &PipelineState,
@@ -181,11 +223,15 @@ pub fn seal_completion_receipt(
     verify_authority_inputs(&job, authority, &authority_path, &launch_path, state)?;
     let result_revision = validate_worktree_result_boundary(state, authority, None)?;
     let result_tree_sha256 = result_tree_hash(state)?;
-    validate_sandbox_boundary_observation(paths, state, authority, &marker.sandbox_backend)?;
+    let sandbox_observation =
+        validate_sandbox_boundary_observation(paths, state, authority, &marker.sandbox_backend)?;
+    let execution_evidence = completion_execution_evidence(paths, authority.job_id.as_ref())?;
     let mut receipt = CompletionReceipt {
         schema_version: JobSchemaVersion::CURRENT,
         job_id: authority.job_id.clone(),
         run_id: authority.run_id.clone(),
+        attempt: sandbox_observation.attempt,
+        outer_launch_id: sandbox_observation.outer_launch_id,
         issued_at: chrono::Utc::now(),
         issuer: CompletionReceiptIssuer::DeadreckonSupervisor,
         proof_kind: CompletionProofKind::TwoKeyCompletion,
@@ -206,6 +252,7 @@ pub fn seal_completion_receipt(
             paths,
             authority.job_id.as_ref(),
         )?,
+        execution_evidence,
         contained: marker.contained,
         sandbox_backend: marker.sandbox_backend.clone(),
         signature: String::new(),
@@ -251,13 +298,29 @@ pub fn validate_completion_receipt(
     let job = load_job(paths, &state.run_id)?;
     verify_authority_inputs(&job, &authority, &authority_path, &launch_path, state)?;
     validate_worktree_result_boundary(state, &authority, Some(&receipt))?;
-    validate_sandbox_boundary_observation(paths, state, &authority, &receipt.sandbox_backend)?;
+    let sandbox_observation =
+        validate_sandbox_boundary_observation(paths, state, &authority, &receipt.sandbox_backend)?;
+    if receipt.attempt == 0
+        || receipt.attempt != sandbox_observation.attempt
+        || receipt.outer_launch_id != sandbox_observation.outer_launch_id
+    {
+        return Err(completion_error(
+            &state.run_id,
+            "receipt attempt identity does not match its authenticated sandbox observation",
+        ));
+    }
     require_digest(
         &receipt.sandbox_boundary_observation_sha256,
         &sandbox_boundary_observation_sha256(paths, &state.run_id)?,
         "sandbox boundary observation",
         &state.run_id,
     )?;
+    if receipt.execution_evidence != completion_execution_evidence(paths, &state.run_id)? {
+        return Err(completion_error(
+            &state.run_id,
+            "receipt execution ledgers changed after verified completion",
+        ));
+    }
     require_digest(
         &receipt.authority_sha256,
         &sha256_file(&authority_path)?,
@@ -1758,7 +1821,7 @@ mod tests {
         judgment: SemanticJudgment,
     }
 
-    fn fixture_with_contract(contract: &str) -> Fixture {
+    fn fixture_with_contract_and_launch(contract: &str, launch: &str) -> Fixture {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let source = temp.path().join("source");
@@ -1784,11 +1847,7 @@ mod tests {
         fs::write(&contract_path, contract).expect("contract");
         fs::create_dir_all(paths.job_dir("job-1")).expect("job dir");
         let launch_path = paths.job_launch_plan("job-1");
-        fs::write(
-            &launch_path,
-            "{\"schema\":1,\"goal\":\"ship verified change\"}\n",
-        )
-        .expect("launch");
+        fs::write(&launch_path, launch).expect("launch");
         let policy = JobPolicy {
             max_spend_usd: 2.0,
             max_wall_seconds: 60,
@@ -1888,8 +1947,39 @@ mod tests {
         fixture
     }
 
+    fn fixture_with_contract(contract: &str) -> Fixture {
+        fixture_with_contract_and_launch(
+            contract,
+            "{\"schema\":1,\"goal\":\"ship verified change\"}\n",
+        )
+    }
+
     fn fixture() -> Fixture {
         fixture_with_contract("name: result\nchecks:\n  - file_exists: result.txt\n")
+    }
+
+    fn durable_chain_fixture() -> Fixture {
+        let fixture = fixture_with_contract_and_launch(
+            "name: result\nchecks:\n  - file_exists: result.txt\n",
+            "{\"schema\":1,\"goal\":\"ship verified change\",\"signals\":{\"watchkeeper_chain_adapter\":{}}}\n",
+        );
+        let job_dir = fixture.paths.job_dir(fixture.authority.job_id.as_ref());
+        fs::write(
+            job_dir.join(super::ORDERED_CANDIDATE_MANIFEST_JSON),
+            "{\"schema_version\":1,\"ordered_candidates\":[]}\n",
+        )
+        .expect("ordered candidate manifest");
+        fs::write(
+            job_dir.join(crate::plan::ORDERED_CANDIDATE_APPLICATION_EVENTS_JSONL),
+            "{\"kind\":\"prepared\",\"sequence\":1}\n",
+        )
+        .expect("candidate application ledger");
+        fs::write(
+            job_dir.join(crate::chain::DURABLE_CHAIN_HOOK_EVENTS_JSONL),
+            "{\"kind\":\"started\",\"sequence\":1}\n",
+        )
+        .expect("chain hook ledger");
+        fixture
     }
 
     fn identity_fixture() -> Fixture {
@@ -2613,6 +2703,103 @@ mod tests {
             validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
             receipt
         );
+    }
+
+    #[test]
+    fn receipt_rejects_attempt_and_outer_launch_identity_tamper() {
+        let fixture = fixture();
+        let receipt = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect("seal");
+        let receipt_path = fixture.paths.job_receipt(fixture.authority.job_id.as_ref());
+
+        let mut tampered = receipt.clone();
+        tampered.attempt += 1;
+        atomic_write_json(&receipt_path, &tampered).expect("tampered receipt attempt");
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("a different attempt must invalidate the receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("receipt attempt identity does not match")
+        );
+
+        let mut tampered = receipt.clone();
+        tampered.outer_launch_id = Uuid::new_v4().to_string();
+        atomic_write_json(&receipt_path, &tampered).expect("tampered receipt launch");
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("a different outer launch must invalidate the receipt");
+        assert!(
+            error
+                .to_string()
+                .contains("receipt attempt identity does not match")
+        );
+    }
+
+    #[test]
+    fn receipt_revalidates_every_durable_chain_execution_evidence_file() {
+        let fixture = durable_chain_fixture();
+        let receipt = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect("seal durable chain receipt");
+        let evidence = receipt
+            .execution_evidence
+            .as_ref()
+            .expect("durable chain execution evidence");
+        assert!(evidence.candidate_application_events_sha256.is_some());
+        assert!(evidence.chain_hook_events_sha256.is_some());
+
+        let job_dir = fixture.paths.job_dir(fixture.authority.job_id.as_ref());
+        let evidence_files = [
+            job_dir.join(super::ORDERED_CANDIDATE_MANIFEST_JSON),
+            job_dir.join(crate::plan::ORDERED_CANDIDATE_APPLICATION_EVENTS_JSONL),
+            job_dir.join(crate::chain::DURABLE_CHAIN_HOOK_EVENTS_JSONL),
+        ];
+        for path in &evidence_files {
+            let original = fs::read(path).expect("execution evidence bytes");
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"tampered\n");
+            fs::write(path, changed).expect("mutate execution evidence");
+            let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+                .expect_err("mutated execution evidence must invalidate the receipt");
+            assert!(
+                error
+                    .to_string()
+                    .contains("receipt execution ledgers changed")
+            );
+            fs::write(path, original).expect("restore execution evidence");
+            validate_completion_receipt(&fixture.paths, &fixture.state)
+                .expect("restored execution evidence validates");
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            for path in &evidence_files {
+                let original = fs::read(path).expect("execution evidence bytes");
+                let target = path.with_extension("trusted-copy");
+                fs::write(&target, &original).expect("byte-identical evidence copy");
+                fs::remove_file(path).expect("remove execution evidence");
+                symlink(&target, path).expect("substitute execution evidence symlink");
+                let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+                    .expect_err("symlinked execution evidence must fail closed");
+                assert!(error.to_string().contains("regular non-symlink"));
+                fs::remove_file(path).expect("remove execution evidence symlink");
+                fs::write(path, original).expect("restore execution evidence");
+                fs::remove_file(target).expect("remove evidence copy");
+            }
+        }
     }
 
     #[test]

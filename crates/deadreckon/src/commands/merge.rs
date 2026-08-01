@@ -47,7 +47,7 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
     if let Some(task) = plan
         .tasks
         .iter()
-        .find(|task| task.status != PlanTaskStatus::Completed)
+        .find(|task| !task.status.is_successful_terminal())
     {
         return Err(CliError::Surface {
             code: 1,

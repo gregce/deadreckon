@@ -3487,6 +3487,9 @@ fn plan_event_summary_for_narrative(event: &PlanEventKind) -> String {
         PlanEventKind::TaskCompleted {
             task_id, status, ..
         } => format!("{task_id} completed with {status}"),
+        PlanEventKind::TaskSkipped {
+            task_id, reason, ..
+        } => format!("{task_id} skipped: {reason}"),
         PlanEventKind::TaskBlocked {
             task_id, reason, ..
         } => format!("{task_id} blocked: {reason}"),
@@ -3654,6 +3657,7 @@ fn style_for_plan_status(status: PlanStatus) -> &'static str {
 fn style_for_task_status(status: PlanTaskStatus) -> &'static str {
     match status {
         PlanTaskStatus::Completed => "success",
+        PlanTaskStatus::Skipped => "muted",
         PlanTaskStatus::Failed | PlanTaskStatus::Killed => "danger",
         PlanTaskStatus::Running => "primary",
         PlanTaskStatus::Pending => "muted",

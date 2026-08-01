@@ -16,6 +16,7 @@ pub const PLAN_JSON: &str = "plan.json";
 pub const COORDINATOR_JSON: &str = "coordinator.json";
 pub const PLAN_MESSAGES_JSONL: &str = "messages.jsonl";
 pub const PLAN_EVENTS_JSONL: &str = "plan-events.jsonl";
+pub const ORDERED_CANDIDATE_APPLICATION_EVENTS_JSONL: &str = "ordered-candidate-applications.jsonl";
 pub const PLAN_DOCS_DIR: &str = "docs";
 pub const PLAN_NARRATIVE: &str = "PLAN-NARRATIVE.md";
 pub const WORKER_SPECS_DIR: &str = "worker-specs";
@@ -170,8 +171,21 @@ pub enum PlanTaskStatus {
     Pending,
     Running,
     Completed,
+    /// Deliberately omitted by an approved orchestration policy. A skipped
+    /// node satisfies dependency ordering but contributes no merge artifact.
+    Skipped,
     Failed,
     Killed,
+}
+
+impl PlanTaskStatus {
+    pub const fn satisfies_dependency(self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped)
+    }
+
+    pub const fn is_successful_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,7 +551,7 @@ impl Plan {
             .tasks
             .iter()
             .filter(|task| {
-                task.status == PlanTaskStatus::Completed
+                task.status.satisfies_dependency()
                     || (on_fail == OnFail::Continue
                         && matches!(task.status, PlanTaskStatus::Failed | PlanTaskStatus::Killed))
             })
@@ -619,6 +633,11 @@ pub enum PlanEventKind {
         task_index: usize,
         run_id: Option<String>,
         status: String,
+    },
+    TaskSkipped {
+        task_id: String,
+        task_index: usize,
+        reason: String,
     },
     TaskBlocked {
         task_id: String,
@@ -713,6 +732,184 @@ pub struct PlanEvent {
     pub timestamp: DateTime<Utc>,
     pub plan_id: String,
     pub event: PlanEventKind,
+}
+
+/// The two durable facts around one mutation of a Job-owned ordered
+/// candidate. `Prepared` is appended before Git is invoked; `Completed`
+/// repeats the exact authority binding and adds the observed after revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderedCandidateApplicationEventKind {
+    Prepared,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrderedCandidateApplicationEvent {
+    pub schema_version: u32,
+    pub application_id: String,
+    pub job_id: String,
+    pub plan_id: String,
+    pub task_id: String,
+    pub task_index: usize,
+    pub run_id: String,
+    pub candidate_before_revision: String,
+    pub child_base_revision: String,
+    pub child_result_revision: String,
+    pub validated_marker_sha256: String,
+    pub apply_strategy: ApplyStrategy,
+    pub completed_hook_invocation_ids: Vec<String>,
+    pub kind: OrderedCandidateApplicationEventKind,
+    pub recorded_at: DateTime<Utc>,
+    pub candidate_after_revision: Option<String>,
+}
+
+impl OrderedCandidateApplicationEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepared(
+        job_id: impl Into<String>,
+        plan_id: impl Into<String>,
+        task_id: impl Into<String>,
+        task_index: usize,
+        run_id: impl Into<String>,
+        candidate_before_revision: impl Into<String>,
+        child_base_revision: impl Into<String>,
+        child_result_revision: impl Into<String>,
+        validated_marker_sha256: impl Into<String>,
+        apply_strategy: ApplyStrategy,
+        completed_hook_invocation_ids: Vec<String>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Self> {
+        let mut event = Self {
+            schema_version: 1,
+            application_id: String::new(),
+            job_id: job_id.into(),
+            plan_id: plan_id.into(),
+            task_id: task_id.into(),
+            task_index,
+            run_id: run_id.into(),
+            candidate_before_revision: candidate_before_revision.into(),
+            child_base_revision: child_base_revision.into(),
+            child_result_revision: child_result_revision.into(),
+            validated_marker_sha256: validated_marker_sha256.into(),
+            apply_strategy,
+            completed_hook_invocation_ids,
+            kind: OrderedCandidateApplicationEventKind::Prepared,
+            recorded_at,
+            candidate_after_revision: None,
+        };
+        event.application_id = ordered_candidate_application_id(&event);
+        event.verify()?;
+        Ok(event)
+    }
+
+    pub fn completed(
+        prepared: &Self,
+        candidate_after_revision: impl Into<String>,
+        recorded_at: DateTime<Utc>,
+    ) -> Result<Self> {
+        if prepared.kind != OrderedCandidateApplicationEventKind::Prepared {
+            return Err(DeadreckonError::InvalidInput(
+                "ordered candidate completion requires its prepared fact".to_string(),
+            ));
+        }
+        let mut event = prepared.clone();
+        event.kind = OrderedCandidateApplicationEventKind::Completed;
+        event.recorded_at = recorded_at;
+        event.candidate_after_revision = Some(candidate_after_revision.into());
+        event.verify()?;
+        Ok(event)
+    }
+
+    pub fn verify(&self) -> Result<()> {
+        let identity_fields = [
+            self.job_id.as_str(),
+            self.plan_id.as_str(),
+            self.task_id.as_str(),
+            self.run_id.as_str(),
+            self.candidate_before_revision.as_str(),
+            self.child_base_revision.as_str(),
+            self.child_result_revision.as_str(),
+            self.validated_marker_sha256.as_str(),
+        ];
+        let after_shape_is_valid = match self.kind {
+            OrderedCandidateApplicationEventKind::Prepared => {
+                self.candidate_after_revision.is_none()
+            }
+            OrderedCandidateApplicationEventKind::Completed => self
+                .candidate_after_revision
+                .as_deref()
+                .is_some_and(|revision| !revision.trim().is_empty()),
+        };
+        if self.schema_version != 1
+            || identity_fields
+                .iter()
+                .any(|value| value.trim().is_empty() || value.contains('\0'))
+            || !self.validated_marker_sha256.starts_with("sha256:")
+            || self
+                .completed_hook_invocation_ids
+                .iter()
+                .any(|id| !id.starts_with("sha256:") || id.contains('\0'))
+            || ordered_candidate_application_id(self) != self.application_id
+            || !after_shape_is_valid
+        {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "ordered candidate application {} is malformed or internally inconsistent",
+                self.application_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn same_binding(&self, other: &Self) -> bool {
+        self.application_id == other.application_id
+            && self.job_id == other.job_id
+            && self.plan_id == other.plan_id
+            && self.task_id == other.task_id
+            && self.task_index == other.task_index
+            && self.run_id == other.run_id
+            && self.candidate_before_revision == other.candidate_before_revision
+            && self.child_base_revision == other.child_base_revision
+            && self.child_result_revision == other.child_result_revision
+            && self.validated_marker_sha256 == other.validated_marker_sha256
+            && self.apply_strategy == other.apply_strategy
+            && self.completed_hook_invocation_ids == other.completed_hook_invocation_ids
+    }
+
+    fn same_fact(&self, other: &Self) -> bool {
+        self.same_binding(other)
+            && self.kind == other.kind
+            && self.candidate_after_revision == other.candidate_after_revision
+    }
+}
+
+fn ordered_candidate_application_id(event: &OrderedCandidateApplicationEvent) -> String {
+    let hooks = event.completed_hook_invocation_ids.join("\0");
+    crate::flight::sha256_text(&format!(
+        "ordered-candidate-application-v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{hooks}",
+        event.job_id,
+        event.plan_id,
+        event.task_id,
+        event.task_index,
+        event.run_id,
+        event.candidate_before_revision,
+        event.child_base_revision,
+        event.child_result_revision,
+        event.validated_marker_sha256,
+        match event.apply_strategy {
+            ApplyStrategy::Squash => "squash",
+            ApplyStrategy::Merge => "merge",
+            ApplyStrategy::CherryPick => "cherry-pick",
+        },
+    ))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderedCandidateApplicationFold {
+    pub expected_head_revision: String,
+    pub pending: Option<OrderedCandidateApplicationEvent>,
+    pub completed: Vec<OrderedCandidateApplicationEvent>,
 }
 
 impl PlanMessage {
@@ -895,6 +1092,20 @@ pub fn save_plan(paths: &DeadreckonPaths, plan: &Plan) -> Result<()> {
     atomic_write_json(&paths.plan_json(&plan.plan_id), plan)
 }
 
+/// Persist a Job-owned Plan only while the caller still holds the exact
+/// owning lease. Lease validation and the file replacement share the Job
+/// control lock, so a reclaimed worker cannot overwrite its successor.
+pub fn save_owned_plan_fenced(
+    paths: &DeadreckonPaths,
+    token: &crate::job_lease::LeaseToken,
+    plan: &Plan,
+) -> Result<()> {
+    validate_owned_plan_token(token, plan)?;
+    crate::job_lease::with_fenced_job_control(paths, token, Utc::now(), || {
+        atomic_write_json(&paths.plan_json(&plan.plan_id), plan)
+    })
+}
+
 pub fn load_plan(paths: &DeadreckonPaths, plan_id: &str) -> Result<Plan> {
     let path = paths.plan_json(plan_id);
     let raw = fs::read(&path).with_path(&path)?;
@@ -910,6 +1121,20 @@ pub fn append_plan_message(
     append_json_line(&paths.plan_messages(plan_id), message)
 }
 
+pub fn append_owned_plan_message_fenced(
+    paths: &DeadreckonPaths,
+    token: &crate::job_lease::LeaseToken,
+    plan_id: &str,
+    message: &PlanMessage,
+) -> Result<()> {
+    validate_message_request_id(message)?;
+    crate::job_lease::with_fenced_job_control(paths, token, Utc::now(), || {
+        let plan = load_plan(paths, plan_id)?;
+        validate_owned_plan_token(token, &plan)?;
+        append_json_line(&paths.plan_messages(plan_id), message)
+    })
+}
+
 pub fn append_plan_event(
     paths: &DeadreckonPaths,
     plan_id: &str,
@@ -923,6 +1148,35 @@ pub fn append_plan_event(
     append_json_line(&paths.plan_events(plan_id), &event)
 }
 
+/// Append Plan evidence under the same fenced authority as its owning Job.
+pub fn append_owned_plan_event_fenced(
+    paths: &DeadreckonPaths,
+    token: &crate::job_lease::LeaseToken,
+    plan_id: &str,
+    event: PlanEventKind,
+) -> Result<()> {
+    crate::job_lease::with_fenced_job_control(paths, token, Utc::now(), || {
+        let plan = load_plan(paths, plan_id)?;
+        validate_owned_plan_token(token, &plan)?;
+        let event = PlanEvent {
+            timestamp: Utc::now(),
+            plan_id: plan_id.to_string(),
+            event,
+        };
+        append_json_line(&paths.plan_events(plan_id), &event)
+    })
+}
+
+fn validate_owned_plan_token(token: &crate::job_lease::LeaseToken, plan: &Plan) -> Result<()> {
+    if plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "Plan {} is not owned by fenced Job {}",
+            plan.plan_id, token.job_id
+        )));
+    }
+    Ok(())
+}
+
 pub fn read_plan_events(paths: &DeadreckonPaths, plan_id: &str) -> Result<Vec<PlanEvent>> {
     let path = paths.plan_events(plan_id);
     match fs::read_to_string(&path) {
@@ -934,6 +1188,135 @@ pub fn read_plan_events(paths: &DeadreckonPaths, plan_id: &str) -> Result<Vec<Pl
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(source) => Err(DeadreckonError::Io { path, source }),
     }
+}
+
+pub fn ordered_candidate_application_events_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(ORDERED_CANDIDATE_APPLICATION_EVENTS_JSONL)
+}
+
+pub fn read_ordered_candidate_application_events(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Vec<OrderedCandidateApplicationEvent>> {
+    let path = ordered_candidate_application_events_path(paths, job_id);
+    match fs::read_to_string(&path) {
+        Ok(raw) => raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let event: OrderedCandidateApplicationEvent =
+                    serde_json::from_str(line).with_json_path(&path)?;
+                event.verify()?;
+                if event.job_id != job_id {
+                    return Err(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application in {} belongs to Job {}",
+                        path.display(),
+                        event.job_id
+                    )));
+                }
+                Ok(event)
+            })
+            .collect(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
+}
+
+pub fn fold_ordered_candidate_application_events(
+    events: &[OrderedCandidateApplicationEvent],
+    initial_revision: &str,
+) -> Result<OrderedCandidateApplicationFold> {
+    if initial_revision.trim().is_empty() {
+        return Err(DeadreckonError::InvalidInput(
+            "ordered candidate initial revision is empty".to_string(),
+        ));
+    }
+    let mut expected_head_revision = initial_revision.to_string();
+    let mut pending: Option<OrderedCandidateApplicationEvent> = None;
+    let mut completed = Vec::new();
+    let mut application_ids = BTreeSet::new();
+    for event in events {
+        event.verify()?;
+        match event.kind {
+            OrderedCandidateApplicationEventKind::Prepared => {
+                if pending.is_some()
+                    || event.candidate_before_revision != expected_head_revision
+                    || !application_ids.insert(event.application_id.clone())
+                {
+                    return Err(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application {} is out of order",
+                        event.application_id
+                    )));
+                }
+                pending = Some(event.clone());
+            }
+            OrderedCandidateApplicationEventKind::Completed => {
+                let prepared = pending.take().ok_or_else(|| {
+                    DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application {} completed without preparation",
+                        event.application_id
+                    ))
+                })?;
+                if !prepared.same_binding(event)
+                    || event.candidate_before_revision != expected_head_revision
+                {
+                    return Err(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application {} completion changed its prepared authority",
+                        event.application_id
+                    )));
+                }
+                expected_head_revision =
+                    event.candidate_after_revision.clone().ok_or_else(|| {
+                        DeadreckonError::InvalidInput(format!(
+                            "ordered candidate application {} completed without an after revision",
+                            event.application_id
+                        ))
+                    })?;
+                completed.push(event.clone());
+            }
+        }
+    }
+    Ok(OrderedCandidateApplicationFold {
+        expected_head_revision,
+        pending,
+        completed,
+    })
+}
+
+/// Append one ordered-candidate mutation fact while the owning Job lease is
+/// current. Folding under the same control lock makes a second preparation or
+/// an out-of-order landing impossible even across supervisor recovery.
+pub fn append_owned_ordered_candidate_application_event_fenced(
+    paths: &DeadreckonPaths,
+    token: &crate::job_lease::LeaseToken,
+    plan_id: &str,
+    initial_revision: &str,
+    event: &OrderedCandidateApplicationEvent,
+) -> Result<()> {
+    event.verify()?;
+    if event.job_id != token.job_id.as_ref() || event.plan_id != plan_id {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "ordered candidate application {} does not belong to fenced Job {} Plan {plan_id}",
+            event.application_id, token.job_id
+        )));
+    }
+    crate::job_lease::with_fenced_job_control(paths, token, event.recorded_at, || {
+        let plan = load_plan(paths, plan_id)?;
+        validate_owned_plan_token(token, &plan)?;
+        let mut existing = read_ordered_candidate_application_events(paths, token.job_id.as_ref())?;
+        fold_ordered_candidate_application_events(&existing, initial_revision)?;
+        if existing.iter().any(|prior| prior.same_fact(event)) {
+            return Ok(());
+        }
+        existing.push(event.clone());
+        fold_ordered_candidate_application_events(&existing, initial_revision)?;
+        append_json_line(
+            &ordered_candidate_application_events_path(paths, token.job_id.as_ref()),
+            event,
+        )
+    })
 }
 
 pub fn read_plan_messages(paths: &DeadreckonPaths, plan_id: &str) -> Result<Vec<PlanMessage>> {
@@ -1058,6 +1441,25 @@ pub fn write_coordinator_state(
     state: &CoordinatorState,
 ) -> Result<()> {
     atomic_write_json(&paths.coordinator_json(plan_id), state)
+}
+
+pub fn write_owned_coordinator_state_fenced(
+    paths: &DeadreckonPaths,
+    token: &crate::job_lease::LeaseToken,
+    plan_id: &str,
+    state: &CoordinatorState,
+) -> Result<()> {
+    if state.plan_id != plan_id {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "coordinator state belongs to {}, not Plan {plan_id}",
+            state.plan_id
+        )));
+    }
+    crate::job_lease::with_fenced_job_control(paths, token, Utc::now(), || {
+        let plan = load_plan(paths, plan_id)?;
+        validate_owned_plan_token(token, &plan)?;
+        atomic_write_json(&paths.coordinator_json(plan_id), state)
+    })
 }
 
 pub fn plan_task_key(plan_id: &str) -> String {
@@ -1199,6 +1601,66 @@ mod tests {
 
         assert_eq!(loaded, plan);
         assert!(paths.plan_json(&plan.plan_id).ends_with(PLAN_JSON));
+    }
+
+    #[test]
+    fn ordered_candidate_fold_keeps_all_skipped_at_initial_and_orders_landings() {
+        let initial = "1111111111111111111111111111111111111111";
+        let empty = fold_ordered_candidate_application_events(&[], initial).expect("empty fold");
+        assert_eq!(empty.expected_head_revision, initial);
+        assert!(empty.pending.is_none());
+
+        let prepared = OrderedCandidateApplicationEvent::prepared(
+            "job",
+            "plan",
+            "task-0",
+            0,
+            "run-0",
+            initial,
+            initial,
+            "2222222222222222222222222222222222222222",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ApplyStrategy::Squash,
+            vec![
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ],
+            Utc::now(),
+        )
+        .expect("prepared");
+        let pending =
+            fold_ordered_candidate_application_events(std::slice::from_ref(&prepared), initial)
+                .expect("pending fold");
+        assert_eq!(pending.expected_head_revision, initial);
+        assert_eq!(pending.pending.as_ref(), Some(&prepared));
+
+        let after = "3333333333333333333333333333333333333333";
+        let completed = OrderedCandidateApplicationEvent::completed(&prepared, after, Utc::now())
+            .expect("completed");
+        let landed =
+            fold_ordered_candidate_application_events(&[prepared.clone(), completed], initial)
+                .expect("completed fold");
+        assert_eq!(landed.expected_head_revision, after);
+        assert!(landed.pending.is_none());
+
+        let out_of_order = OrderedCandidateApplicationEvent::prepared(
+            "job",
+            "plan",
+            "task-1",
+            1,
+            "run-1",
+            initial,
+            initial,
+            "4444444444444444444444444444444444444444",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ApplyStrategy::Squash,
+            Vec::new(),
+            Utc::now(),
+        )
+        .expect("second prepared");
+        let error = fold_ordered_candidate_application_events(&[prepared, out_of_order], initial)
+            .expect_err("a second prepared application cannot bypass the pending one");
+        assert!(error.to_string().contains("out of order"));
     }
 
     #[test]
@@ -1362,6 +1824,11 @@ mod tests {
                 run_id: Some("run-0".to_string()),
                 status: "completed".to_string(),
             },
+            PlanEventKind::TaskSkipped {
+                task_id: "task-1".to_string(),
+                task_index: 1,
+                reason: "approved policy skipped this node".to_string(),
+            },
             PlanEventKind::TaskBlocked {
                 task_id: "task-1".to_string(),
                 task_index: 1,
@@ -1449,6 +1916,104 @@ mod tests {
         assert!(path.starts_with(paths.plan_dir(&plan.plan_id)));
         assert!(path.ends_with(PLAN_EVENTS_JSONL));
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn owned_plan_mutations_require_the_current_job_lease() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source_cwd = temp.path().join("source");
+        fs::create_dir_all(&source_cwd).expect("source");
+        let job_id = "fenced-plan-job";
+        crate::write_job(
+            &paths,
+            &deadreckon_protocol::Job {
+                schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+                job_id: deadreckon_protocol::JobId(job_id.to_string()),
+                scope: "fenced-plan".to_string(),
+                goal: "mutate one owned plan".to_string(),
+                shape: deadreckon_protocol::JobShape::Graph,
+                created_at: Utc::now(),
+                source_cwd,
+                launch_plan_sha256: "sha256:launch".to_string(),
+                authority_sha256: "sha256:authority".to_string(),
+                policy: deadreckon_protocol::JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 2,
+                    deadline: None,
+                    semantic_judge: deadreckon_protocol::SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+        )
+        .expect("Job");
+        let started = Utc::now();
+        let first = crate::claim_job_lease(
+            &paths,
+            &deadreckon_protocol::JobId(job_id.to_string()),
+            &crate::LeaseOwner {
+                owner_id: "first-plan-owner".to_string(),
+                boot_id: "first-plan-boot".to_string(),
+                pid: 10,
+                process_group: 10,
+            },
+            started,
+            std::time::Duration::from_secs(1),
+        )
+        .expect("first lease")
+        .token();
+
+        let mut plan = sample_plan(&temp);
+        plan.owner_job_id = Some(job_id.to_string());
+        save_owned_plan_fenced(&paths, &first, &plan).expect("current owner saves Plan");
+        append_owned_plan_event_fenced(&paths, &first, &plan.plan_id, PlanEventKind::PlanStarted)
+            .expect("current owner appends Plan event");
+
+        let second = crate::claim_job_lease(
+            &paths,
+            &deadreckon_protocol::JobId(job_id.to_string()),
+            &crate::LeaseOwner {
+                owner_id: "second-plan-owner".to_string(),
+                boot_id: "second-plan-boot".to_string(),
+                pid: 20,
+                process_group: 20,
+            },
+            started + chrono::TimeDelta::seconds(2),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("reclaimed lease")
+        .token();
+
+        plan.status = PlanStatus::Failed;
+        let stale_save = save_owned_plan_fenced(&paths, &first, &plan)
+            .expect_err("reclaimed worker must not overwrite Plan state");
+        assert!(stale_save.to_string().contains("stale lease token"));
+        let stale_event = append_owned_plan_event_fenced(
+            &paths,
+            &first,
+            &plan.plan_id,
+            PlanEventKind::PlanKilled,
+        )
+        .expect_err("reclaimed worker must not append Plan history");
+        assert!(stale_event.to_string().contains("stale lease token"));
+
+        save_owned_plan_fenced(&paths, &second, &plan).expect("new owner saves Plan");
+        append_owned_plan_event_fenced(
+            &paths,
+            &second,
+            &plan.plan_id,
+            PlanEventKind::PlanFailed {
+                reason: "bounded failure".to_string(),
+            },
+        )
+        .expect("new owner appends Plan event");
+        assert_eq!(
+            load_plan(&paths, &plan.plan_id).expect("Plan").status,
+            PlanStatus::Failed
+        );
+        let events = read_plan_events(&paths, &plan.plan_id).expect("Plan events");
+        assert_eq!(events.len(), 2, "stale event must leave no durable row");
     }
 
     #[test]

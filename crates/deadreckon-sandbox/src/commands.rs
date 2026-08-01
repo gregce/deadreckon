@@ -972,11 +972,15 @@ mod tests {
     }
 
     #[test]
-    fn seatbelt_denies_key_reads_but_keeps_evidence_readable() {
+    fn seatbelt_serializes_the_complete_run_control_boundary() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("dr-home"));
         let run_root = paths.run_root("project", "run-1");
         std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
+        std::fs::create_dir_all(run_root.join("snapshots")).expect("snapshots");
+        std::fs::write(run_root.join("sandbox.toml"), "backend = 'sandbox-exec'\n")
+            .expect("sandbox policy");
+        std::fs::write(run_root.join("provenance.jsonl"), "{}\n").expect("provenance");
         let policy = ProtectedPathPolicy::for_paths(&paths);
         let mut spec = read_only_spec(SandboxBackend::SandboxExec);
         spec.read_denylist = policy.read_denylist;
@@ -986,6 +990,9 @@ mod tests {
         let key_store = paths.home().join("gate-keys").display().to_string();
         let operator_captures = paths.operator_captures_dir().display().to_string();
         let proofs = run_root.join("proofs").display().to_string();
+        let sandbox_policy = run_root.join("sandbox.toml").display().to_string();
+        let snapshots = run_root.join("snapshots").display().to_string();
+        let provenance = run_root.join("provenance.jsonl").display().to_string();
         assert!(profile.contains(&format!("(deny file-read* (literal \"{key_store}\"))")));
         assert!(profile.contains(&format!("(deny file-write* (literal \"{key_store}\"))")));
         assert!(profile.contains(&format!(
@@ -996,6 +1003,16 @@ mod tests {
         )));
         assert!(profile.contains(&format!("(deny file-write* (literal \"{proofs}\"))")));
         assert!(!profile.contains(&format!("(deny file-read* (literal \"{proofs}\"))")));
+        for protected in [sandbox_policy, snapshots, provenance] {
+            assert!(
+                profile.contains(&format!("(deny file-write* (literal \"{protected}\"))")),
+                "Seatbelt omitted run control path {protected}: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!("(deny file-read* (literal \"{protected}\"))")),
+                "Seatbelt made inspectable run evidence unreadable: {protected}"
+            );
+        }
     }
 
     #[test]
@@ -1008,6 +1025,10 @@ mod tests {
         std::fs::create_dir_all(paths.jobs_dir()).expect("jobs");
         std::fs::create_dir_all(paths.operator_captures_dir()).expect("operator captures");
         std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
+        std::fs::create_dir_all(run_root.join("snapshots")).expect("snapshots");
+        std::fs::write(run_root.join("sandbox.toml"), "backend = 'container'\n")
+            .expect("sandbox policy");
+        std::fs::write(run_root.join("provenance.jsonl"), "{}\n").expect("provenance");
         let policy = ProtectedPathPolicy::for_paths(&paths);
         let mut spec = read_only_spec(SandboxBackend::Bwrap);
         spec.cwd = workspace;
@@ -1039,6 +1060,19 @@ mod tests {
                 .windows(2)
                 .any(|parts| parts == ["--tmpfs", &operator_captures])
         );
+        for protected in [
+            run_root.join("sandbox.toml"),
+            run_root.join("snapshots"),
+            run_root.join("provenance.jsonl"),
+        ] {
+            let protected = protected.display().to_string();
+            assert!(
+                bwrap_args
+                    .windows(3)
+                    .any(|parts| parts == ["--ro-bind", &protected, &protected]),
+                "bubblewrap omitted read-only run control mount {protected}: {bwrap_args:?}"
+            );
+        }
 
         spec.backend = SandboxBackend::Docker;
         let docker =
@@ -1063,5 +1097,18 @@ mod tests {
                 .iter()
                 .any(|arg| { arg == &format!("type=tmpfs,destination={operator_captures}") })
         );
+        for protected in [
+            run_root.join("sandbox.toml"),
+            run_root.join("snapshots"),
+            run_root.join("provenance.jsonl"),
+        ] {
+            let protected = protected.display();
+            assert!(
+                docker_args.iter().any(|arg| {
+                    arg == &format!("type=bind,source={protected},destination={protected},readonly")
+                }),
+                "Docker omitted read-only run control mount {protected}: {docker_args:?}"
+            );
+        }
     }
 }

@@ -2,7 +2,7 @@ state     : <HOME>/runstate/<SCOPE>/runs/<RUN_ID>/state.json
 launch-dir: <CWD>
 working   : <HOME>/runstate/<SCOPE>/runs/<RUN_ID>/working
 Mode fresh
-Acceptance default dr-gate behavior
+Acceptance gate: MISSING signed acceptance marker
 {
   "version": 1,
   "goal": "imported codex session",

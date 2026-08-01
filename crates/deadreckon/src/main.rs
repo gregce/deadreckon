@@ -72,8 +72,8 @@ use deadreckon_core::{
     PlanMode, PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, PromotionManifest,
     ProvenanceRecord, RUN_EVENTS_JSONL, ResolvedMode, RunListEntry, RunOptions, RunStatus,
     WorktreeOptions, acceptance_progress_path_for_run_root, acceptance_spec_path_for_run_root,
-    acquire_lock, append_chain_event, append_parent_narrative_update, append_plan_event,
-    append_plan_message, append_provenance, append_trace, apply_commit_body, cancel_marker_present,
+    acquire_lock, append_chain_event, append_parent_narrative_update, append_provenance,
+    append_trace, apply_commit_body, cancel_marker_present,
     chain_status_label as glossary_chain_status_label,
     chain_step_status_label as glossary_chain_step_status_label, clear_cancel_marker,
     copy_artifact_path, copy_deliverable_tree, copy_source_to_working, copy_tree, create_run,
@@ -82,10 +82,10 @@ use deadreckon_core::{
     marker_path_for_run_root, pid_is_alive, plan_status_label, plan_task_status_label,
     prepare_worktree_record, preview_git_state, promote_completed_run, read_chain_step_marker,
     read_codebase_record, read_plan_messages, record_for_resolved_mode, release_lock_file,
-    remove_artifact_path, resolve_mode, restore_snapshot, run_status_label, save_chain, save_plan,
-    save_state, terminate_pid, validate_acceptance_marker, validate_task_count,
-    write_acceptance_marker, write_cancel_marker, write_chain_step_marker, write_child_summary,
-    write_coordinator_state, write_plan_child_marker, write_worker_spec,
+    remove_artifact_path, resolve_mode, restore_snapshot, run_status_label, save_chain, save_state,
+    terminate_pid, validate_acceptance_marker, validate_task_count, write_acceptance_marker,
+    write_cancel_marker, write_chain_step_marker, write_child_summary, write_plan_child_marker,
+    write_worker_spec,
 };
 use deadreckon_protocol::{
     FlightEvent, FlightEventKind, RunEvent, RunEventKind, SpendRecord, TraceRecord,
@@ -131,6 +131,57 @@ mod ui;
 // crate root keeps it reachable through the `use super::super::*` that every
 // command module already relies on, so no call site had to change with the move.
 pub(crate) use commands::reference::{PlanChildSelection, resolve_plan_id};
+
+pub(crate) fn save_plan(paths: &DeadreckonPaths, plan: &Plan) -> Result<()> {
+    if let Some(token) = commands::graph_job::current_plan_mutation_token(paths, plan)? {
+        deadreckon_core::save_owned_plan_fenced(paths, &token, plan)?;
+    } else {
+        deadreckon_core::save_plan(paths, plan)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn append_plan_event(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    event: PlanEventKind,
+) -> Result<()> {
+    let plan = deadreckon_core::load_plan(paths, plan_id)?;
+    if let Some(token) = commands::graph_job::current_plan_mutation_token(paths, &plan)? {
+        deadreckon_core::append_owned_plan_event_fenced(paths, &token, plan_id, event)?;
+    } else {
+        deadreckon_core::append_plan_event(paths, plan_id, event)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn append_plan_message(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    message: &PlanMessage,
+) -> Result<()> {
+    let plan = deadreckon_core::load_plan(paths, plan_id)?;
+    if let Some(token) = commands::graph_job::current_plan_mutation_token(paths, &plan)? {
+        deadreckon_core::append_owned_plan_message_fenced(paths, &token, plan_id, message)?;
+    } else {
+        deadreckon_core::append_plan_message(paths, plan_id, message)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_coordinator_state(
+    paths: &DeadreckonPaths,
+    plan_id: &str,
+    state: &CoordinatorState,
+) -> Result<()> {
+    let plan = deadreckon_core::load_plan(paths, plan_id)?;
+    if let Some(token) = commands::graph_job::current_plan_mutation_token(paths, &plan)? {
+        deadreckon_core::write_owned_coordinator_state_fenced(paths, &token, plan_id, state)?;
+    } else {
+        deadreckon_core::write_coordinator_state(paths, plan_id, state)?;
+    }
+    Ok(())
+}
 
 use crate::cli::{
     AcceptanceCommand, AcceptancePreset, CHAIN_HELP, CampaignCommand, ChainCommandArgs, Cli,
@@ -1426,7 +1477,12 @@ async fn main_inner() -> Result<()> {
             resume_command(run_id, from_turn, max_wall_seconds, no_docs, plain).await
         }
         // The positional id wins; --run stays for anyone who scripted it.
-        Commands::Undo { id, run, turn } => undo_command(id.or(run).as_deref(), turn),
+        Commands::Undo {
+            id,
+            run,
+            turn,
+            no_confirm,
+        } => undo_command(id.or(run).as_deref(), turn, no_confirm),
         Commands::Rewind {
             run_id,
             to_turn,
@@ -1911,7 +1967,7 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
     CommandHelpEntry {
         display: "undo",
         clap_name: Some("undo"),
-        purpose: "restore an in-place snapshot",
+        purpose: "reverse a verified delivery or restore a run snapshot",
         audience: CommandAudience::Advanced,
         top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
@@ -3814,7 +3870,7 @@ impl AcceptanceDisplay {
         parts.extend(
             self.caveats
                 .iter()
-                .map(|caveat| format!("accepted (caveat: {caveat})")),
+                .map(|caveat| format!("caveat: {caveat}")),
         );
         parts.join("; ")
     }
@@ -3834,11 +3890,15 @@ fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDispl
         .ok()
         .flatten();
     let marker_path = marker_path_for_run_root(&state.run_root);
-    if marker_path.exists()
-        && let Ok(bytes) = fs::read(&marker_path)
-        && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
-    {
-        return acceptance_display_from_gate_line(marker_gate_line(&marker), tamper.as_ref());
+    if marker_path.exists() {
+        let gate = match validate_acceptance_marker(state) {
+            Ok(marker) => marker_gate_line(&marker),
+            Err(error) => format!(
+                "gate: INVALID acceptance marker - {}",
+                one_line(&error.to_string(), 96)
+            ),
+        };
+        return acceptance_display_from_gate_line(gate, tamper.as_ref());
     }
     let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
     if progress_path.exists()
@@ -3846,6 +3906,12 @@ fn acceptance_display(state: &deadreckon_core::PipelineState) -> AcceptanceDispl
         && !entries.is_empty()
     {
         return acceptance_display_from_gate_line(progress_gate_line(&entries), tamper.as_ref());
+    }
+    if state.status == RunStatus::Completed {
+        return acceptance_display_from_gate_line(
+            "gate: MISSING signed acceptance marker".to_string(),
+            tamper.as_ref(),
+        );
     }
     let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
     if spec_path.exists()
@@ -3871,13 +3937,14 @@ fn acceptance_display_from_gate_line(
         .filter(|tamper| tamper.verdict == deadreckon_core::tamper::AcceptanceTamperVerdict::Caveat)
         .map(|tamper| tamper.caveats.clone())
         .unwrap_or_default();
-    let gate_tone = if !caveats.is_empty() {
-        Tone::Warn
-    } else if gate.contains("FAILED") || gate.contains("REFUSED") {
-        Tone::Negative
-    } else {
-        Tone::Plain
-    };
+    let gate_tone =
+        if gate.contains("INVALID") || gate.contains("FAILED") || gate.contains("REFUSED") {
+            Tone::Negative
+        } else if !caveats.is_empty() || gate.contains("LEGACY") || gate.contains("MISSING") {
+            Tone::Warn
+        } else {
+            Tone::Plain
+        };
     AcceptanceDisplay {
         gate,
         gate_tone,
@@ -3909,7 +3976,22 @@ fn marker_gate_line(marker: &AcceptanceMarker) -> String {
     } else {
         marker.checks.iter().filter(|result| result.passed).count()
     };
-    gate_line_from_results(total, passed, &marker.checks, marker.check_count > 0)
+    let line = gate_line_from_results(total, passed, &marker.checks, marker.check_count > 0);
+    if !line.contains("PASSED") {
+        return line;
+    }
+    if marker.schema_version == 1 {
+        return format!(
+            "gate: LEGACY proof validated (weak) - checks report {}/{} passed",
+            passed, total
+        );
+    }
+    let proof = if marker.is_native_gate_proof() {
+        "validated signed dr-gate receipt"
+    } else {
+        "validated signed controller proof"
+    };
+    format!("{line} - {proof}")
 }
 
 fn progress_gate_line(entries: &[AcceptanceProgressEntry]) -> String {
@@ -3920,7 +4002,18 @@ fn progress_gate_line(entries: &[AcceptanceProgressEntry]) -> String {
         .cloned()
         .collect::<Vec<_>>();
     let passed = results.iter().filter(|result| result.passed).count();
-    gate_line_from_results(total, passed, &results, false)
+    let line = gate_line_from_results(total, passed, &results, false);
+    if line.contains("FAILED") {
+        return line;
+    }
+    let progress_reports_passed = entries.last().is_some_and(|entry| entry.status == "passed");
+    if total > 0 && (results.len() >= total || progress_reports_passed) {
+        return format!(
+            "gate: MISSING signed acceptance marker - checks report {}/{} passed",
+            passed, total
+        );
+    }
+    format!("gate: PENDING {}/{}", results.len(), total)
 }
 
 fn gate_line_from_results(
@@ -6683,6 +6776,26 @@ fn compose_plan_merge_working(
             prefix_error: "merge source prefix error",
         });
     }
+    if sources.is_empty()
+        && !plan.tasks.is_empty()
+        && plan
+            .tasks
+            .iter()
+            .all(|task| task.status == PlanTaskStatus::Skipped)
+    {
+        let source = plan.parent_cwd.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "an all-skipped Plan has no approved source tree".to_string(),
+            ))
+        })?;
+        remove_artifact_path(&merge_working)?;
+        copy_deliverable_tree(source, &merge_working)?;
+        write_plan_merge_conflicts(paths, plan, strategy, &[])?;
+        return Ok(PlanMergeOutcome {
+            working_dir: merge_working,
+            conflicts: Vec::new(),
+        });
+    }
     let conflicts = compose_merge_sources(
         &merge_working,
         &sources,
@@ -7375,6 +7488,119 @@ fn apply_synthesized_repair(
     Ok(())
 }
 
+fn record_merge_repair_run_discovered(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    run_id: &str,
+    pid: Option<u32>,
+) -> Result<()> {
+    if let Some(job_id) = commands::graph_job::current_parent_job_id() {
+        let job = deadreckon_core::load_job(paths, job_id)?;
+        return match job.shape {
+            deadreckon_protocol::JobShape::Graph => {
+                if !paths.plan_json(&plan.plan_id).is_file() {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "Graph merge repair parent {} lost its durable Plan",
+                        plan.plan_id
+                    ))));
+                }
+                if deadreckon_core::read_plan_events(paths, &plan.plan_id)?
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            &event.event,
+                            PlanEventKind::MergeRepairRunDiscovered {
+                                run_id: existing,
+                                ..
+                            } if existing == run_id
+                        )
+                    })
+                {
+                    return Ok(());
+                }
+                append_plan_event(
+                    paths,
+                    &plan.plan_id,
+                    PlanEventKind::MergeRepairRunDiscovered {
+                        run_id: run_id.to_string(),
+                        pid,
+                    },
+                )
+            }
+            deadreckon_protocol::JobShape::LegacyCampaign => {
+                let campaign_dir = paths.plan_dir(job_id);
+                let campaign = deadreckon_core::campaign::read_campaign(&campaign_dir)?;
+                if campaign.campaign_id != plan.plan_id || campaign.campaign_id != job_id {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "Campaign merge repair changed its durable parent identity".to_string(),
+                    )));
+                }
+                // The trusted transition is already committed to the Job's
+                // fenced authority history. Campaign does not have, and must
+                // not fabricate, a root plan.json merely for shared merge UI.
+                Ok(())
+            }
+            shape => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge repair parent has incompatible durable Job shape {shape:?}"
+            )))),
+        };
+    }
+
+    // Private legacy/characterization Plans have no durable Job ledger. Keep
+    // their historical derived event behind the characterization feature;
+    // product Job-owned Plans returned through the strict branch above.
+    #[cfg(feature = "internal-characterization")]
+    if paths.plan_json(&plan.plan_id).is_file() {
+        if deadreckon_core::read_plan_events(paths, &plan.plan_id)?
+            .iter()
+            .any(|event| {
+                matches!(
+                    &event.event,
+                    PlanEventKind::MergeRepairRunDiscovered {
+                        run_id: existing,
+                        ..
+                    } if existing == run_id
+                )
+            })
+        {
+            return Ok(());
+        }
+        return append_plan_event(
+            paths,
+            &plan.plan_id,
+            PlanEventKind::MergeRepairRunDiscovered {
+                run_id: run_id.to_string(),
+                pid,
+            },
+        );
+    }
+
+    // Private legacy/characterization Campaigns have no durable Job ledger.
+    // Preserve their historical derived event without weakening product runs.
+    let campaign_dir = paths.plan_dir(&plan.plan_id);
+    if deadreckon_core::campaign::campaign_path_for_plan_dir(&campaign_dir).is_file() {
+        if deadreckon_core::campaign::read_campaign_events(&campaign_dir)?
+            .iter()
+            .any(|event| {
+                event.kind == "campaign_repair_run_discovered"
+                    && event.detail.get("run_id").and_then(Value::as_str) == Some(run_id)
+            })
+        {
+            return Ok(());
+        }
+        return deadreckon_core::campaign::append_campaign_event(
+            &campaign_dir,
+            "campaign_repair_run_discovered",
+            json!({ "run_id": run_id, "pid": pid }),
+        )
+        .map_err(CliError::Core);
+    }
+    Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+        "merge repair parent {} has neither durable Plan nor Campaign state",
+        plan.plan_id
+    ))))
+}
+
 async fn execute_merge_repair_child(
     paths: &DeadreckonPaths,
     plan: &Plan,
@@ -7401,13 +7627,7 @@ async fn execute_merge_repair_child(
             "merge repair child refused an uncontained parent sandbox".to_string(),
         )));
     }
-    let remaining_budget = commands::graph_job::current_driver_remaining_repair_budget(
-        paths,
-        plan,
-        repair_plan.planner_spend_usd,
-        repair_plan.planner_wall_seconds,
-    )?;
-    if let Some((existing, library)) = recover_existing_merge_repair_child(
+    let existing = inspect_existing_merge_repair_child(
         paths,
         plan,
         context,
@@ -7416,12 +7636,85 @@ async fn execute_merge_repair_child(
         &repair_request_sha256,
         &repair_plan_sha256,
         inherited_sandbox,
-        remaining_budget.map(|(_, wall)| wall),
-    )
-    .await?
-    {
-        copy_repair_library_to_working(&context.working_dir, &library)?;
-        return Ok(existing);
+    )?;
+    let pending_adoption_deadline = match existing {
+        ExistingMergeRepairChild::Ready { run_id, library } => {
+            return adopt_existing_merge_repair_child(
+                paths, plan, context, &repair_id, run_id, &library,
+            );
+        }
+        ExistingMergeRepairChild::Pending {
+            adoption_deadline_at,
+        } => Some(adoption_deadline_at),
+        ExistingMergeRepairChild::Absent => None,
+    };
+    let remaining_budget = commands::graph_job::current_driver_remaining_repair_budget(
+        paths,
+        plan,
+        repair_plan.planner_spend_usd,
+        repair_plan.planner_wall_seconds,
+    )?;
+    let available_budget = match remaining_budget {
+        Some(commands::graph_job::RepairBudgetAvailability::Available {
+            spend_usd,
+            wall_seconds,
+        }) => Some((spend_usd, wall_seconds)),
+        Some(commands::graph_job::RepairBudgetAvailability::Exhausted {
+            stop_reason,
+            reason,
+        }) => {
+            record_merge_repair_budget_exhaustion(paths, plan, stop_reason, &reason)?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &reason,
+                "raise the approved parent budget before launching or waiting for more repair work",
+            )));
+        }
+        None => None,
+    };
+    if let Some(adoption_deadline_at) = pending_adoption_deadline {
+        let durable_wait_seconds = adoption_deadline_at
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .map_or(0.0, |remaining| remaining.as_secs_f64());
+        let wait_seconds = available_budget.map_or(durable_wait_seconds, |(_, wall)| {
+            wall.min(durable_wait_seconds)
+        });
+        if let Some((run_id, library)) = wait_for_existing_merge_repair_child(
+            paths,
+            plan,
+            context,
+            &repair_id,
+            repair_round,
+            &repair_request_sha256,
+            &repair_plan_sha256,
+            inherited_sandbox,
+            adoption_deadline_at,
+            wait_seconds,
+        )
+        .await?
+        {
+            return adopt_existing_merge_repair_child(
+                paths, plan, context, &repair_id, run_id, &library,
+            );
+        }
+        if available_budget.is_some() {
+            let reason = format!(
+                "merge repair child did not finish within the parent Job's remaining wall-time budget ({wait_seconds:.3}s)"
+            );
+            record_merge_repair_budget_exhaustion(
+                paths,
+                plan,
+                deadreckon_protocol::StopReason::WallCap,
+                &reason,
+            )?;
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &reason,
+                "raise the approved parent wall-time budget before waiting for more repair work",
+            )));
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "timed out adopting the exact supervised merge repair child".to_string(),
+        )));
     }
     let repair_run_id = Uuid::new_v4().simple().to_string();
     let repair_goal = format!(
@@ -7448,7 +7741,7 @@ async fn execute_merge_repair_child(
         "--sandbox".to_string(),
         inherited_sandbox.to_string(),
     ];
-    if let Some((remaining_spend, remaining_wall)) = remaining_budget {
+    if let Some((remaining_spend, remaining_wall)) = available_budget {
         argv.extend([
             "--max-spend".to_string(),
             remaining_spend.to_string(),
@@ -7519,6 +7812,7 @@ async fn execute_merge_repair_child(
         prepared.as_ref().map(|prepared| prepared.capability_id()),
         repair_plan.planner_spend_usd,
         repair_plan.planner_wall_seconds,
+        available_budget.map_or(120.0, |(_, wall_seconds)| wall_seconds),
     )?;
     let authority_path = context.proof_dir.join("repair-run.json");
     let child = if let Some(prepared) = prepared.as_ref() {
@@ -7546,14 +7840,6 @@ async fn execute_merge_repair_child(
             "deadreckon list --all",
         ))
     })?;
-    append_plan_event(
-        paths,
-        &plan.plan_id,
-        PlanEventKind::MergeRepairRunDiscovered {
-            run_id: run_id.clone(),
-            pid: Some(pid),
-        },
-    )?;
     let status = if output.status.success() {
         "completed"
     } else {
@@ -7591,8 +7877,138 @@ async fn execute_merge_repair_child(
         &repair_plan_sha256,
         inherited_sandbox,
     )?;
+    if commands::graph_job::current_parent_job_id().is_some() {
+        commands::graph_job::mark_merge_repair_trusted_fenced(
+            paths,
+            &repair_id,
+            &context.proof_dir.join("repair-run.json"),
+        )?;
+    }
+    record_merge_repair_run_discovered(paths, plan, &run_id, Some(pid))?;
+    merge_repair_test_failpoint_once(context, "after_trusted_discovery_before_copy")?;
     copy_repair_library_to_working(&context.working_dir, &library)?;
     Ok(run_id)
+}
+
+fn adopt_existing_merge_repair_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    context: &MergeRepairContext,
+    repair_id: &str,
+    run_id: String,
+    library: &Path,
+) -> Result<String> {
+    if commands::graph_job::current_parent_job_id().is_some() {
+        commands::graph_job::mark_merge_repair_trusted_fenced(
+            paths,
+            repair_id,
+            &context.proof_dir.join("repair-run.json"),
+        )?;
+    }
+    record_merge_repair_run_discovered(paths, plan, &run_id, None)?;
+    copy_repair_library_to_working(&context.working_dir, library)?;
+    Ok(run_id)
+}
+
+fn record_merge_repair_budget_exhaustion(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    stop_reason: deadreckon_protocol::StopReason,
+    reason: &str,
+) -> Result<()> {
+    let Some(job_id) = commands::graph_job::current_parent_job_id() else {
+        return Ok(());
+    };
+    let job = deadreckon_core::load_job(paths, job_id)?;
+    match job.shape {
+        deadreckon_protocol::JobShape::Graph => {
+            if !deadreckon_core::read_plan_events(paths, job_id)?
+                .iter()
+                .any(|event| matches!(event.event, PlanEventKind::RootBudgetExhausted { .. }))
+            {
+                let dimension = match stop_reason {
+                    deadreckon_protocol::StopReason::SpendCap => {
+                        deadreckon_core::plan::BudgetDimension::Spend
+                    }
+                    deadreckon_protocol::StopReason::WallCap => {
+                        deadreckon_core::plan::BudgetDimension::Wall
+                    }
+                    _ => {
+                        return Err(CliError::Core(DeadreckonError::InvalidInput(
+                            "merge repair budget exhaustion used a non-budget stop reason"
+                                .to_string(),
+                        )));
+                    }
+                };
+                append_plan_event(
+                    paths,
+                    job_id,
+                    PlanEventKind::RootBudgetExhausted {
+                        dimension,
+                        reason: reason.to_string(),
+                    },
+                )?;
+            }
+            Ok(())
+        }
+        deadreckon_protocol::JobShape::LegacyCampaign => {
+            let campaign_dir = paths.plan_dir(job_id);
+            let campaign = deadreckon_core::campaign::read_campaign(&campaign_dir)?;
+            if campaign.campaign_id != plan.plan_id || campaign.campaign_id != job_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "Campaign repair budget evidence changed its parent identity".to_string(),
+                )));
+            }
+            if !deadreckon_core::campaign::read_campaign_events(&campaign_dir)?
+                .iter()
+                .any(|event| {
+                    event.kind == "budget_exhausted"
+                        && event.detail.get("phase").and_then(Value::as_str) == Some("merge_repair")
+                })
+            {
+                deadreckon_core::campaign::append_campaign_event(
+                    &campaign_dir,
+                    "budget_exhausted",
+                    json!({
+                        "reason": reason,
+                        "phase": "merge_repair",
+                        "stop_reason": stop_reason,
+                    }),
+                )?;
+            }
+            Ok(())
+        }
+        shape => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge repair budget evidence has incompatible durable Job shape {shape:?}"
+        )))),
+    }
+}
+
+fn merge_repair_test_failpoint_once(context: &MergeRepairContext, name: &str) -> Result<()> {
+    if std::env::var("DEADRECKON_TEST_MERGE_REPAIR_FAILPOINTS").as_deref() != Ok("1")
+        || std::env::var("DEADRECKON_TEST_MERGE_REPAIR_FAILPOINT").as_deref() != Ok(name)
+    {
+        return Ok(());
+    }
+    let marker = context.proof_dir.join(format!(".test-failpoint-{name}"));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            fs::File::open(&context.proof_dir)?.sync_all()?;
+            if std::env::var("DEADRECKON_TEST_MERGE_REPAIR_FAILPOINT_PAUSE").as_deref() == Ok("1") {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            std::process::exit(86);
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(source.into()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7608,6 +8024,7 @@ fn merge_repair_launch_record(
     capability_id: Option<&str>,
     planner_spend_usd: f64,
     planner_wall_seconds: f64,
+    adoption_window_seconds: f64,
 ) -> Result<Value> {
     let path = context.proof_dir.join("repair-run.json");
     if path.exists() {
@@ -7616,8 +8033,10 @@ fn merge_repair_launch_record(
                 .to_string(),
         )));
     }
+    let created_at = Utc::now();
+    let adoption_deadline_at = merge_repair_adoption_deadline(created_at, adoption_window_seconds)?;
     Ok(json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "plan_id": &plan.plan_id,
         "root_artifact_id": commands::graph_job::current_parent_job_id()
             .unwrap_or(&plan.plan_id),
@@ -7631,14 +8050,164 @@ fn merge_repair_launch_record(
         "sandbox_requested": sandbox_requested.to_string(),
         "planner_spend_usd": planner_spend_usd,
         "planner_wall_seconds": planner_wall_seconds,
+        "adoption_window_seconds": adoption_window_seconds,
+        "adoption_deadline_at": adoption_deadline_at,
         "source": &context.working_dir,
-        "created_at": Utc::now(),
-        "updated_at": Utc::now(),
+        "created_at": created_at,
+        "updated_at": created_at,
     }))
 }
 
+fn merge_repair_adoption_deadline(
+    anchor: DateTime<Utc>,
+    adoption_window_seconds: f64,
+) -> Result<DateTime<Utc>> {
+    if !adoption_window_seconds.is_finite() || adoption_window_seconds <= 0.0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair adoption window must be finite and greater than zero".to_string(),
+        )));
+    }
+    let window = std::time::Duration::try_from_secs_f64(adoption_window_seconds).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair adoption window is outside the supported duration range".to_string(),
+        ))
+    })?;
+    let window = ChronoDuration::from_std(window).map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair adoption window is too large".to_string(),
+        ))
+    })?;
+    anchor.checked_add_signed(window).ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair adoption deadline overflows UTC time".to_string(),
+        ))
+    })
+}
+
+fn merge_repair_adoption_deadline_from_record(record: &Value) -> Result<DateTime<Utc>> {
+    let schema_version = record
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "persisted merge repair authority has no schema version".to_string(),
+            ))
+        })?;
+    if !matches!(schema_version, 2 | 3) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "persisted merge repair authority has unsupported schema version {schema_version}"
+        ))));
+    }
+    if let Some(value) = record.get("adoption_deadline_at") {
+        let deadline: DateTime<Utc> = serde_json::from_value(value.clone()).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: PathBuf::from("merge-repair-authority/adoption_deadline_at"),
+                source,
+            })
+        })?;
+        if schema_version == 3 {
+            let created_at: DateTime<Utc> =
+                serde_json::from_value(record.get("created_at").cloned().ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "persisted v3 merge repair authority has no creation time".to_string(),
+                    ))
+                })?)
+                .map_err(|source| {
+                    CliError::Core(DeadreckonError::Json {
+                        path: PathBuf::from("merge-repair-authority/created_at"),
+                        source,
+                    })
+                })?;
+            let adoption_window_seconds = record
+                .get("adoption_window_seconds")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "persisted v3 merge repair authority has no adoption window".to_string(),
+                    ))
+                })?;
+            if deadline != merge_repair_adoption_deadline(created_at, adoption_window_seconds)? {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "persisted merge repair adoption deadline does not match its immutable window"
+                        .to_string(),
+                )));
+            }
+        }
+        return Ok(deadline);
+    }
+    if schema_version == 3 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "persisted v3 merge repair authority has no adoption deadline".to_string(),
+        )));
+    }
+    let anchor = record
+        .get("process_prepared_at")
+        .or_else(|| record.get("created_at"))
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "persisted v2 merge repair authority has no committed preparation time".to_string(),
+            ))
+        })?;
+    let anchor: DateTime<Utc> = serde_json::from_value(anchor).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: PathBuf::from("merge-repair-authority/process_prepared_at"),
+            source,
+        })
+    })?;
+    merge_repair_adoption_deadline(anchor, 120.0)
+}
+
+#[cfg(test)]
+#[test]
+fn merge_repair_adoption_deadline_is_stable_and_bound_to_its_window() {
+    let created_at = DateTime::parse_from_rfc3339("2026-07-31T12:00:00Z")
+        .expect("created at")
+        .with_timezone(&Utc);
+    let deadline = merge_repair_adoption_deadline(created_at, 45.5).expect("deadline");
+    let record = json!({
+        "schema_version": 3,
+        "created_at": created_at,
+        "adoption_window_seconds": 45.5,
+        "adoption_deadline_at": deadline,
+    });
+    assert_eq!(
+        merge_repair_adoption_deadline_from_record(&record).expect("stored deadline"),
+        deadline
+    );
+
+    let mut extended = record;
+    extended["adoption_deadline_at"] =
+        serde_json::to_value(deadline + ChronoDuration::seconds(1)).expect("extended deadline");
+    let error = merge_repair_adoption_deadline_from_record(&extended)
+        .expect_err("deadline extension must fail closed");
+    assert!(error.to_string().contains("does not match"), "{error}");
+}
+
+#[cfg(test)]
+#[test]
+fn legacy_pending_repair_deadline_is_anchored_to_original_preparation() {
+    let prepared_at = DateTime::parse_from_rfc3339("2026-07-31T12:00:00Z")
+        .expect("prepared at")
+        .with_timezone(&Utc);
+    let record = json!({
+        "schema_version": 2,
+        "process_prepared_at": prepared_at,
+    });
+    assert_eq!(
+        merge_repair_adoption_deadline_from_record(&record).expect("legacy deadline"),
+        prepared_at + ChronoDuration::seconds(120)
+    );
+}
+
+enum ExistingMergeRepairChild {
+    Absent,
+    Pending { adoption_deadline_at: DateTime<Utc> },
+    Ready { run_id: String, library: PathBuf },
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn recover_existing_merge_repair_child(
+fn inspect_existing_merge_repair_child(
     paths: &DeadreckonPaths,
     plan: &Plan,
     context: &MergeRepairContext,
@@ -7647,15 +8216,16 @@ async fn recover_existing_merge_repair_child(
     repair_request_sha256: &str,
     repair_plan_sha256: &str,
     sandbox_requested: deadreckon_sandbox::SandboxBackend,
-    remaining_wall_seconds: Option<f64>,
-) -> Result<Option<(String, PathBuf)>> {
+) -> Result<ExistingMergeRepairChild> {
     let path = context.proof_dir.join("repair-run.json");
     if commands::graph_job::current_parent_job_id().is_some() {
         commands::graph_job::restore_merge_repair_projection_if_needed(paths, repair_id, &path)?;
     }
     match fs::metadata(&path) {
         Ok(metadata) if metadata.is_file() => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ExistingMergeRepairChild::Absent);
+        }
         Ok(_) => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(
                 "persisted merge repair authority is not a regular file".to_string(),
@@ -7663,82 +8233,136 @@ async fn recover_existing_merge_repair_child(
         }
         Err(error) => return Err(error.into()),
     }
-    let wait_seconds = remaining_wall_seconds.unwrap_or(120.0).clamp(0.25, 120.0);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs_f64(wait_seconds);
-    loop {
-        let record: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        if record.get("repair_id").and_then(Value::as_str) != Some(repair_id)
-            || record.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
-            || record.get("repair_request_sha256").and_then(Value::as_str)
-                != Some(repair_request_sha256)
-            || record.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
-            || record.get("sandbox_requested").and_then(Value::as_str)
-                != Some(sandbox_requested.to_string().as_str())
-        {
-            return Err(CliError::Core(DeadreckonError::InvalidInput(
-                "persisted merge repair authority changed immutable request identity".to_string(),
-            )));
+    let record: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    if record.get("repair_id").and_then(Value::as_str) != Some(repair_id)
+        || record.get("repair_round").and_then(Value::as_u64) != Some(u64::from(repair_round))
+        || record.get("repair_request_sha256").and_then(Value::as_str)
+            != Some(repair_request_sha256)
+        || record.get("repair_plan_sha256").and_then(Value::as_str) != Some(repair_plan_sha256)
+        || record.get("sandbox_requested").and_then(Value::as_str)
+            != Some(sandbox_requested.to_string().as_str())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "persisted merge repair authority changed immutable request identity".to_string(),
+        )));
+    }
+    let run_id = record
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.trim().is_empty())
+        .map(str::to_string);
+    if let Some(run_id) = run_id.as_deref()
+        && let Ok(library) = validate_merge_repair_child(
+            paths,
+            plan,
+            context,
+            run_id,
+            repair_id,
+            repair_round,
+            repair_request_sha256,
+            repair_plan_sha256,
+            sandbox_requested,
+        )
+    {
+        return Ok(ExistingMergeRepairChild::Ready {
+            run_id: run_id.to_string(),
+            library,
+        });
+    }
+    let process: deadreckon_core::SupervisedProcessRecord =
+        serde_json::from_value(record.get("process").cloned().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "persisted merge repair authority has no supervised child identity".to_string(),
+            ))
+        })?)?;
+    match process.identity() {
+        deadreckon_core::SupervisedProcessIdentity::Current => {
+            Ok(ExistingMergeRepairChild::Pending {
+                adoption_deadline_at: merge_repair_adoption_deadline_from_record(&record)?,
+            })
         }
-        let run_id = record
-            .get("run_id")
-            .and_then(Value::as_str)
-            .filter(|run_id| !run_id.trim().is_empty())
-            .map(str::to_string);
-        if let Some(run_id) = run_id.as_deref()
-            && let Ok(library) = validate_merge_repair_child(
+        deadreckon_core::SupervisedProcessIdentity::Exited
+        | deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {
+            let Some(run_id) = run_id else {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "supervised merge repair child exited before linking a Run; refusing a duplicate launch"
+                            .to_string(),
+                    )));
+            };
+            let library = validate_merge_repair_child(
                 paths,
                 plan,
                 context,
-                run_id,
+                &run_id,
                 repair_id,
                 repair_round,
                 repair_request_sha256,
                 repair_plan_sha256,
                 sandbox_requested,
-            )
-        {
-            return Ok(Some((run_id.to_string(), library)));
+            )?;
+            Ok(ExistingMergeRepairChild::Ready { run_id, library })
         }
-        let process: deadreckon_core::SupervisedProcessRecord =
-            serde_json::from_value(record.get("process").cloned().ok_or_else(|| {
-                CliError::Core(DeadreckonError::InvalidInput(
-                    "persisted merge repair authority has no supervised child identity".to_string(),
-                ))
-            })?)?;
-        match process.identity() {
-            deadreckon_core::SupervisedProcessIdentity::Current => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(CliError::Core(DeadreckonError::InvalidInput(
-                        "timed out adopting the exact supervised merge repair child".to_string(),
-                    )));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            deadreckon_core::SupervisedProcessIdentity::Exited
-            | deadreckon_core::SupervisedProcessIdentity::DifferentBoot => {
-                let Some(run_id) = run_id else {
-                    return Err(CliError::Core(DeadreckonError::InvalidInput(
-                        "supervised merge repair child exited before linking a Run; refusing a duplicate launch"
-                            .to_string(),
-                    )));
-                };
-                let library = validate_merge_repair_child(
-                    paths,
-                    plan,
-                    context,
-                    &run_id,
-                    repair_id,
-                    repair_round,
-                    repair_request_sha256,
-                    repair_plan_sha256,
-                    sandbox_requested,
-                )?;
+        deadreckon_core::SupervisedProcessIdentity::Reused
+        | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+            Err(CliError::Core(DeadreckonError::InvalidInput(
+                "supervised merge repair child identity is conflicting or unverifiable".to_string(),
+            )))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_existing_merge_repair_child(
+    paths: &DeadreckonPaths,
+    plan: &Plan,
+    context: &MergeRepairContext,
+    repair_id: &str,
+    repair_round: u32,
+    repair_request_sha256: &str,
+    repair_plan_sha256: &str,
+    sandbox_requested: deadreckon_sandbox::SandboxBackend,
+    adoption_deadline_at: DateTime<Utc>,
+    maximum_wait_seconds: f64,
+) -> Result<Option<(String, PathBuf)>> {
+    let local_deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs_f64(maximum_wait_seconds.max(0.0));
+    loop {
+        match inspect_existing_merge_repair_child(
+            paths,
+            plan,
+            context,
+            repair_id,
+            repair_round,
+            repair_request_sha256,
+            repair_plan_sha256,
+            sandbox_requested,
+        )? {
+            ExistingMergeRepairChild::Ready { run_id, library } => {
                 return Ok(Some((run_id, library)));
             }
-            deadreckon_core::SupervisedProcessIdentity::Reused
-            | deadreckon_core::SupervisedProcessIdentity::Unverifiable => {
+            ExistingMergeRepairChild::Pending {
+                adoption_deadline_at: observed_deadline,
+            } => {
+                if observed_deadline != adoption_deadline_at {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "persisted merge repair adoption deadline changed while waiting"
+                            .to_string(),
+                    )));
+                }
+                if Utc::now() >= adoption_deadline_at
+                    || tokio::time::Instant::now() >= local_deadline
+                {
+                    return Ok(None);
+                }
+                let remaining = adoption_deadline_at
+                    .signed_duration_since(Utc::now())
+                    .to_std()
+                    .unwrap_or_default();
+                tokio::time::sleep(std::time::Duration::from_millis(50).min(remaining)).await;
+            }
+            ExistingMergeRepairChild::Absent => {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(
-                    "supervised merge repair child identity is conflicting or unverifiable"
+                    "persisted merge repair authority disappeared while adopting its supervised child"
                         .to_string(),
                 )));
             }
@@ -10826,11 +11450,9 @@ async fn resume_loaded_command_with_mode(
 
 /// Put the last committed thing back, whatever kind of thing it was.
 ///
-/// A run undoes to a turn snapshot; a chain unwinds its last applied step.
-/// These were two commands (`undo --run` and `chain undo <id> --step`) with
-/// two id spaces for one intent. The resolver already knew both kinds — only
-/// this dispatch was missing.
-fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
+/// A durable Job reverts its one receipt-bound applied delivery, a run undoes
+/// to a turn snapshot, and a chain unwinds its last applied step.
+fn undo_command(run: Option<&str>, turn: Option<u32>, no_confirm: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     // One resolution, one dispatch by kind — the same shape every other
     // id-taking verb uses.
@@ -10843,8 +11465,20 @@ fn undo_command(run: Option<&str>, turn: Option<u32>) -> Result<()> {
         },
     )?;
     let state = match resolved {
+        commands::reference::ResolvedRef::Job(job) => {
+            if turn.is_some() {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "--turn restores a Run snapshot and cannot select part of a verified Job delivery",
+                    &format!(
+                        "deadreckon undo {} --no-confirm",
+                        run_prefix(job.job.job_id.as_ref())
+                    ),
+                )));
+            }
+            return commands::undo::job_undo_command(&paths, &job, no_confirm);
+        }
         commands::reference::ResolvedRef::Chain(chain) => {
-            return commands::chain::chain_undo_command(&paths, &chain.chain_id, turn, false);
+            return commands::chain::chain_undo_command(&paths, &chain.chain_id, turn, no_confirm);
         }
         commands::reference::ResolvedRef::Run(state) => *state,
         commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
@@ -13690,6 +14324,9 @@ enum AcceptanceUiStatus {
     Running,
     Passed,
     Failed,
+    Legacy,
+    Missing,
+    Invalid,
 }
 
 #[derive(Debug, Clone)]
@@ -13848,11 +14485,19 @@ fn attach_live_inventory_should_prune_dir(root: &Path, path: &Path) -> bool {
 
 fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> AcceptanceLive {
     let marker_path = marker_path_for_run_root(&state.run_root);
-    if marker_path.exists()
-        && let Ok(bytes) = fs::read(&marker_path)
-        && let Ok(marker) = serde_json::from_slice::<AcceptanceMarker>(&bytes)
-    {
-        return acceptance_live_from_marker(&marker);
+    if marker_path.exists() {
+        return match validate_acceptance_marker(state) {
+            Ok(marker) => acceptance_live_from_marker(&marker),
+            Err(error) => AcceptanceLive {
+                status: AcceptanceUiStatus::Invalid,
+                latest_detail: Some(format!(
+                    "INVALID acceptance marker: {}",
+                    one_line(&error.to_string(), 120)
+                )),
+                progress_lines: vec!["! signed acceptance marker failed validation".to_string()],
+                ..AcceptanceLive::default()
+            },
+        };
     }
 
     let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
@@ -13861,6 +14506,15 @@ fn collect_acceptance_live(state: &deadreckon_core::PipelineState) -> Acceptance
         && !entries.is_empty()
     {
         return acceptance_live_from_progress(&entries);
+    }
+
+    if state.status == RunStatus::Completed {
+        return AcceptanceLive {
+            status: AcceptanceUiStatus::Missing,
+            latest_detail: Some("MISSING signed acceptance marker".to_string()),
+            progress_lines: vec!["! no signed acceptance marker was recorded".to_string()],
+            ..AcceptanceLive::default()
+        };
     }
 
     let spec_path = acceptance_spec_path_for_run_root(&state.run_root);
@@ -13897,8 +14551,17 @@ fn acceptance_live_from_marker(marker: &AcceptanceMarker) -> AcceptanceLive {
         .count();
     let status = if required_failed > 0 {
         AcceptanceUiStatus::Failed
+    } else if marker.schema_version == 1 {
+        AcceptanceUiStatus::Legacy
     } else {
         AcceptanceUiStatus::Passed
+    };
+    let proof_detail = if marker.schema_version == 1 {
+        "validated legacy v1 proof (weak)"
+    } else if marker.is_native_gate_proof() {
+        "validated signed dr-gate receipt"
+    } else {
+        "validated signed controller proof"
     };
     AcceptanceLive {
         status,
@@ -13907,7 +14570,13 @@ fn acceptance_live_from_marker(marker: &AcceptanceMarker) -> AcceptanceLive {
         passed,
         failed,
         required_failed,
-        latest_detail: marker.checks.last().map(|result| result.detail.clone()),
+        latest_detail: Some(
+            marker
+                .checks
+                .last()
+                .map(|result| format!("{proof_detail}; {}", result.detail))
+                .unwrap_or_else(|| proof_detail.to_string()),
+        ),
         progress_lines: marker
             .checks
             .iter()
@@ -13937,26 +14606,32 @@ fn acceptance_live_from_progress(entries: &[AcceptanceProgressEntry]) -> Accepta
     let latest = entries.last();
     let status = if required_failed > 0 {
         AcceptanceUiStatus::Failed
-    } else if completed >= total && total > 0 {
-        AcceptanceUiStatus::Passed
+    } else if total > 0
+        && (completed >= total || latest.is_some_and(|entry| entry.status == "passed"))
+    {
+        AcceptanceUiStatus::Missing
     } else if latest.is_some_and(|entry| entry.status == "running" || entry.status == "started") {
         AcceptanceUiStatus::Running
     } else {
         AcceptanceUiStatus::Configured
     };
-    let latest_detail = latest.and_then(|entry| {
-        entry
-            .result
-            .as_ref()
-            .map(|result| result.detail.clone())
-            .or_else(|| {
-                if entry.status == "running" && entry.total > 0 {
-                    Some(format!("checking {} of {}", entry.index, entry.total))
-                } else {
-                    None
-                }
-            })
-    });
+    let latest_detail = if status == AcceptanceUiStatus::Missing {
+        Some("MISSING signed acceptance marker; checks alone are not acceptance".to_string())
+    } else {
+        latest.and_then(|entry| {
+            entry
+                .result
+                .as_ref()
+                .map(|result| result.detail.clone())
+                .or_else(|| {
+                    if entry.status == "running" && entry.total > 0 {
+                        Some(format!("checking {} of {}", entry.index, entry.total))
+                    } else {
+                        None
+                    }
+                })
+        })
+    };
     let mut progress_lines = entries
         .iter()
         .rev()
@@ -15610,6 +16285,15 @@ impl NarrativeAcceptanceRefreshTracker {
             AcceptanceUiStatus::Running => Some(NarrativeRefreshKind::Event("acceptance running")),
             AcceptanceUiStatus::Passed => Some(NarrativeRefreshKind::Event("acceptance passed")),
             AcceptanceUiStatus::Failed => Some(NarrativeRefreshKind::Event("acceptance failed")),
+            AcceptanceUiStatus::Legacy => {
+                Some(NarrativeRefreshKind::Event("acceptance legacy proof"))
+            }
+            AcceptanceUiStatus::Missing => {
+                Some(NarrativeRefreshKind::Event("acceptance marker missing"))
+            }
+            AcceptanceUiStatus::Invalid => {
+                Some(NarrativeRefreshKind::Event("acceptance marker invalid"))
+            }
             AcceptanceUiStatus::DefaultGate | AcceptanceUiStatus::Configured => None,
         }
     }

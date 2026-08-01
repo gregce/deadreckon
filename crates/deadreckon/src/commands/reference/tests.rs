@@ -372,13 +372,24 @@ fn export_resolves_a_durable_job_before_its_backing_run() {
     assert_eq!(resolved_id(&resolved), job.job.job_id.as_ref());
 }
 
-/// One verb, both kinds. `undo` on a run restores a turn snapshot; on a chain
-/// it unwinds an applied step. Those were two commands with two id spaces
-/// (`undo --run` and `chain undo <id> --step`) for one intent.
+/// One verb, all committed-result kinds. A Job uses its verified delivery
+/// ledger, a run restores a turn snapshot, and a chain unwinds an applied step.
 #[test]
-fn undo_accepts_a_chain_as_well_as_a_run() {
+fn undo_accepts_a_job_and_chain_as_well_as_a_run() {
     let fx = fixture();
+    let job = fx.job("6666666666666666666666666666aaaa", Utc::now());
     let chain = fx.chain("7777777777777777777777777777aaaa");
+
+    let resolved = resolve_ref(
+        &fx.paths,
+        RefQuery {
+            reference: Some("6666"),
+            all_scopes: true,
+            verb: "undo",
+        },
+    )
+    .expect("undo accepts a durable Job");
+    assert_eq!(resolved_id(&resolved), job.job.job_id.as_ref());
 
     let resolved = resolve_ref(
         &fx.paths,

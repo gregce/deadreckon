@@ -106,6 +106,35 @@ fn write_refusal_proof(state: &deadreckon_core::PipelineState) {
     deadreckon_core::tamper::write_acceptance_tamper(&state.run_root, &tamper).expect("tamper");
 }
 
+fn write_tampered_marker(state: &deadreckon_core::PipelineState) {
+    deadreckon_core::write_acceptance_marker_with_results(
+        &state.run_root,
+        state.run_id.clone(),
+        state.working_dir.clone(),
+        vec![deadreckon_core::AcceptanceCheckResult {
+            kind: "shell".to_string(),
+            passed: true,
+            must_pass: true,
+            detail: "cargo test passed".to_string(),
+            command: Some("cargo test".to_string()),
+            cwd: Some(state.working_dir.clone()),
+            duration_ms: Some(10),
+            stdout: None,
+            stderr: None,
+        }],
+    )
+    .expect("marker");
+    let path = marker_path_for_run_root(&state.run_root);
+    let mut marker: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("marker bytes")).expect("marker json");
+    marker["check_count"] = serde_json::json!(99);
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&marker).expect("tampered marker json"),
+    )
+    .expect("tampered marker");
+}
+
 #[test]
 fn exit_card_shows_per_check_verdict_and_failing_detail() {
     let (_temp, state) = fixture_state("failed gate render");
@@ -181,4 +210,66 @@ fn status_prefers_refusal_reason_over_passing_progress() {
     assert!(status.contains("gate: REFUSED"), "{status}");
     assert!(status.contains("suppression pattern '|| true'"), "{status}");
     assert!(evidence.contains("acceptance refused"), "{evidence}");
+}
+
+#[test]
+fn tampered_marker_never_renders_passed_or_accepted() {
+    let (_temp, state) = fixture_state("tampered marker render");
+    write_tampered_marker(&state);
+
+    let status = acceptance_status_line(&state);
+    let live = collect_acceptance_live(&state);
+    let activity = tui::acceptance_activity_lines(&live).join("\n");
+    let card = render_exit_summary_card(&state, &RunLoopOutcome::Done, true, true);
+
+    assert!(
+        status.contains("gate: INVALID acceptance marker"),
+        "{status}"
+    );
+    assert!(!status.contains("PASSED"), "{status}");
+    assert!(!status.contains("accepted"), "{status}");
+    assert_eq!(live.status, AcceptanceUiStatus::Invalid);
+    assert!(activity.contains("acceptance invalid"), "{activity}");
+    assert!(!activity.contains("acceptance passed"), "{activity}");
+    assert!(card.contains("gate: INVALID acceptance marker"), "{card}");
+    assert!(!card.contains("gate: PASSED"), "{card}");
+}
+
+#[test]
+fn passing_progress_without_a_marker_renders_missing_not_passed() {
+    let (_temp, state) = fixture_state("missing marker render");
+    let path = acceptance_progress_path_for_run_root(&state.run_root);
+    std::fs::create_dir_all(path.parent().expect("proofs")).expect("proofs");
+    let entry = AcceptanceProgressEntry {
+        checked_at: Utc::now(),
+        status: "passed".to_string(),
+        index: 1,
+        total: 1,
+        result: Some(deadreckon_core::AcceptanceCheckResult {
+            kind: "shell".to_string(),
+            passed: true,
+            must_pass: true,
+            detail: "cargo test passed".to_string(),
+            command: Some("cargo test".to_string()),
+            cwd: Some(state.working_dir.clone()),
+            duration_ms: Some(10),
+            stdout: None,
+            stderr: None,
+        }),
+    };
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string(&entry).expect("json")),
+    )
+    .expect("progress");
+
+    let status = acceptance_status_line(&state);
+    let live = collect_acceptance_live(&state);
+
+    assert!(
+        status.contains("gate: MISSING signed acceptance marker"),
+        "{status}"
+    );
+    assert!(!status.contains("gate: PASSED"), "{status}");
+    assert_eq!(live.status, AcceptanceUiStatus::Missing);
 }

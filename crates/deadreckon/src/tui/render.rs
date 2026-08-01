@@ -313,6 +313,9 @@ fn acceptance_narrative_summary(acceptance: &AcceptanceLive) -> String {
             "failed {} required, {} passed of {}",
             acceptance.required_failed, acceptance.passed, acceptance.total
         ),
+        AcceptanceUiStatus::Legacy => "valid legacy v1 proof (weak)".to_string(),
+        AcceptanceUiStatus::Missing => "missing signed acceptance marker".to_string(),
+        AcceptanceUiStatus::Invalid => "invalid signed acceptance marker".to_string(),
     }
 }
 
@@ -1082,13 +1085,27 @@ pub(crate) fn render_acceptance(
             "passed\n{} / {} checks\n{}",
             acceptance.passed,
             acceptance.total,
-            latest.as_deref().unwrap_or("dr-gate accepted")
+            latest
+                .as_deref()
+                .unwrap_or("validated signed acceptance marker")
         ),
         AcceptanceUiStatus::Failed => format!(
             "failed\n{} pass  {} fail\n{}",
             acceptance.passed,
             acceptance.failed,
             latest.as_deref().unwrap_or("required check failed")
+        ),
+        AcceptanceUiStatus::Legacy => format!(
+            "legacy\nweak v1 proof\n{}",
+            latest.as_deref().unwrap_or("not a trusted native receipt")
+        ),
+        AcceptanceUiStatus::Missing => format!(
+            "missing\nsigned marker\n{}",
+            latest.as_deref().unwrap_or("checks are not acceptance")
+        ),
+        AcceptanceUiStatus::Invalid => format!(
+            "invalid\nsigned marker\n{}",
+            latest.as_deref().unwrap_or("marker failed validation")
         ),
     };
     frame.render_widget(
@@ -1107,6 +1124,9 @@ fn acceptance_color(status: AcceptanceUiStatus) -> Color {
         AcceptanceUiStatus::Running => ui::TUI_PALETTE.acceptance_running,
         AcceptanceUiStatus::Passed => ui::TUI_PALETTE.acceptance_passed,
         AcceptanceUiStatus::Failed => ui::TUI_PALETTE.acceptance_failed,
+        AcceptanceUiStatus::Legacy => ui::TUI_PALETTE.acceptance_configured,
+        AcceptanceUiStatus::Missing => ui::TUI_PALETTE.acceptance_configured,
+        AcceptanceUiStatus::Invalid => ui::TUI_PALETTE.acceptance_failed,
     }
 }
 
@@ -1362,6 +1382,24 @@ pub(crate) fn acceptance_activity_lines(acceptance: &AcceptanceLive) -> Vec<Stri
                 "acceptance failed: {} required failures, {} / {} passed",
                 acceptance.required_failed, acceptance.passed, acceptance.total
             )];
+            lines.extend(acceptance.progress_lines.iter().cloned());
+            lines.push(String::new());
+            lines
+        }
+        AcceptanceUiStatus::Legacy => {
+            let mut lines = vec!["acceptance legacy: valid weak v1 proof".to_string()];
+            lines.extend(acceptance.progress_lines.iter().take(4).cloned());
+            lines.push(String::new());
+            lines
+        }
+        AcceptanceUiStatus::Missing => {
+            let mut lines = vec!["acceptance missing: signed marker not recorded".to_string()];
+            lines.extend(acceptance.progress_lines.iter().cloned());
+            lines.push(String::new());
+            lines
+        }
+        AcceptanceUiStatus::Invalid => {
+            let mut lines = vec!["acceptance invalid: signed marker failed validation".to_string()];
             lines.extend(acceptance.progress_lines.iter().cloned());
             lines.push(String::new());
             lines

@@ -121,10 +121,15 @@ pub(crate) fn finish_command(
             verb: "finish",
         },
     )?;
+    let mut finished_job_operation_lock = None;
     let (state, plan_context, dest, finished_job_id) = match resolved {
         super::reference::ResolvedRef::Job(job) => {
             let job_id = job.job.job_id.as_ref().to_string();
-            (finish_job_state(&paths, &job)?, None, dest, Some(job_id))
+            let operation_lock = deadreckon_core::acquire_job_operation_lock(&paths, &job_id)?;
+            let current_job = deadreckon_core::JobView::load(&paths, &job_id)?;
+            let state = finish_job_state(&paths, &current_job)?;
+            finished_job_operation_lock = Some(operation_lock);
+            (state, None, dest, Some(job_id))
         }
         super::reference::ResolvedRef::Run(state) => {
             super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "finish")?;
@@ -151,7 +156,7 @@ pub(crate) fn finish_command(
             if dest.is_none() && plan_apply_git_root(&result.plan)?.is_some() {
                 return apply_command_inner(
                     plan_id, strategy, branch, no_confirm, autostash, cleanup, message, false,
-                    false, None, None,
+                    false, None, None, None,
                 );
             }
             let dest = Some(dest.unwrap_or_else(|| default_plan_materialize_dest(&result.plan)));
@@ -203,6 +208,7 @@ pub(crate) fn finish_command(
                 false,
                 Some(state),
                 finished_job_id.as_deref(),
+                finished_job_operation_lock.as_ref(),
             )?;
             Ok(())
         }
@@ -1628,6 +1634,7 @@ pub(crate) fn apply_command(
         plain,
         None,
         None,
+        None,
     )
 }
 
@@ -1652,6 +1659,7 @@ pub(crate) fn apply_command_quiet(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -1670,8 +1678,36 @@ fn apply_command_inner(
     _plain: bool,
     verified_job_state: Option<deadreckon_core::PipelineState>,
     verified_job_id: Option<&str>,
+    existing_job_operation_lock: Option<&deadreckon_core::JobOperationLock>,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    // A verified finish owns one stable Job-local operation lock from before
+    // it reads lifecycle or Git authority until after receipt/event sealing,
+    // autostash restoration, and optional cleanup. Cleanup below receives the
+    // guard explicitly so it never attempts a nested acquisition.
+    if let (Some(job_id), Some(operation_lock)) = (verified_job_id, existing_job_operation_lock)
+        && operation_lock.job_id() != job_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "cannot finish Job {job_id} while holding the operation lock for Job {}",
+            operation_lock.job_id()
+        ))));
+    }
+    let acquired_job_operation_lock =
+        if verified_job_id.is_some() && existing_job_operation_lock.is_none() {
+            verified_job_id
+                .map(|job_id| deadreckon_core::acquire_job_operation_lock(&paths, job_id))
+                .transpose()?
+        } else {
+            None
+        };
+    let job_operation_lock = existing_job_operation_lock.or(acquired_job_operation_lock.as_ref());
+    let verified_job_state = if let Some(job_id) = verified_job_id {
+        let current_job = deadreckon_core::JobView::load(&paths, job_id)?;
+        Some(finish_job_state(&paths, &current_job)?)
+    } else {
+        verified_job_state
+    };
     let mut state = resolve_apply_state(&paths, &run_id, quiet, verified_job_state)?;
     ensure_completed_run(&state, "apply")?;
     let record = match lifecycle_codebase_record(&paths, &state) {
@@ -1705,13 +1741,100 @@ fn apply_command_inner(
         ))
     })?;
     refuse_non_deliverable_result_history(&state, &record, git_root, branch)?;
-    let target =
-        target_branch.unwrap_or(git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])?);
-    let delivery_before = delivered_git_revision(git_root).ok_or_else(|| {
-        CliError::Core(DeadreckonError::InvalidInput(
-            "target checkout has no Git revision before apply".to_string(),
-        ))
-    })?;
+    let verified_strategy = verified_job_id
+        .map(|_| git_delivery_strategy(&strategy))
+        .transpose()?;
+    let verified_completion = verified_job_id
+        .map(|job_id| verified_apply_completion(&paths, job_id, &state))
+        .transpose()?;
+    let verified_target = verified_job_id
+        .map(|_| deadreckon_core::GitDeliveryTarget::inspect(git_root))
+        .transpose()?;
+    if verified_job_id.is_some() {
+        refuse_in_progress_git_operation(git_root)?;
+    }
+    if let (Some(requested), Some(observed)) = (target_branch.as_deref(), verified_target.as_ref())
+    {
+        let requested = if requested.starts_with("refs/heads/") {
+            requested.to_string()
+        } else {
+            format!("refs/heads/{requested}")
+        };
+        if requested != observed.target_ref {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "verified Job finish requested target {requested}, but the checkout is attached to {}",
+                    observed.target_ref
+                ),
+                "check out the exact approved target branch and retry finish",
+            )));
+        }
+    }
+    let target = match target_branch {
+        Some(target) => target,
+        None => match verified_target.as_ref() {
+            Some(target) => target
+                .target_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&target.target_ref)
+                .to_string(),
+            None => git_stdout(git_root, &["symbolic-ref", "--short", "HEAD"])?,
+        },
+    };
+    let delivery_before = verified_target
+        .as_ref()
+        .map(|target| target.head_revision.clone())
+        .or_else(|| delivered_git_revision(git_root))
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "target checkout has no Git revision before apply".to_string(),
+            ))
+        })?;
+
+    let mut verified_intent = None;
+    if let (Some(job_id), Some(completion), Some(observed), Some(strategy)) = (
+        verified_job_id,
+        verified_completion.as_ref(),
+        verified_target.as_ref(),
+        verified_strategy,
+    ) {
+        let operation_lock = job_operation_lock.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified finish for Job {job_id} did not hold its operation lock"
+            )))
+        })?;
+        let reconciliation = reconcile_verified_job_delivery(
+            &paths,
+            job_id,
+            completion,
+            &record,
+            observed,
+            strategy,
+            operation_lock,
+        )?;
+        verified_intent = reconciliation.intent;
+        if reconciliation.applied.is_some() {
+            if !quiet {
+                print_already_applied(&state, branch, &target);
+            }
+            let cleaned = finish_apply_cleanup(
+                &paths,
+                &state,
+                &record,
+                cleanup,
+                no_confirm,
+                job_operation_lock,
+            )?;
+            if !quiet {
+                print!(
+                    "{}",
+                    apply_completed_surface(&state, &record, &target, cleaned)
+                        .render_plain(!completion_hints_enabled(false))
+                );
+            }
+            return Ok(());
+        }
+    }
     let diff_stat = git_stdout(
         git_root,
         &["diff", "--stat", &format!("{target}..{branch}")],
@@ -1721,15 +1844,14 @@ fn apply_command_inner(
         if !quiet {
             print_already_applied(&state, branch, &target);
         }
-        record_applied_job_delivery(
+        let cleaned = finish_apply_cleanup(
             &paths,
-            verified_job_id,
             &state,
             &record,
-            git_root,
-            &delivery_before,
+            cleanup,
+            no_confirm,
+            job_operation_lock,
         )?;
-        let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
         if !quiet {
             print!(
                 "{}",
@@ -1759,6 +1881,30 @@ fn apply_command_inner(
         )));
     }
 
+    if let (Some(job_id), Some(completion), Some(observed), Some(strategy)) = (
+        verified_job_id,
+        verified_completion.as_ref(),
+        verified_target.as_ref(),
+        verified_strategy,
+    ) {
+        let current = deadreckon_core::GitDeliveryTarget::inspect(git_root)?;
+        if &current != observed {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "the verified Job delivery target changed while finish was awaiting approval",
+                "restore the original attached branch and revision, then retry finish",
+            )));
+        }
+        refuse_in_progress_git_operation(git_root)?;
+        if verified_intent.is_none() {
+            verified_intent = Some(seal_verified_delivery_intent(
+                &paths, job_id, completion, observed, strategy,
+            )?);
+        }
+    }
+
+    let disabled_hooks = verified_job_id
+        .map(|job_id| disabled_delivery_hooks(&paths, job_id))
+        .transpose()?;
     let autostash = prepare_apply_autostash(git_root, &state.run_id, autostash, no_confirm)?;
 
     let (commit_subject, commit_body) = match message {
@@ -1777,14 +1923,19 @@ fn apply_command_inner(
         .map(|body| format!("{commit_subject}\n\n{body}"))
         .unwrap_or_else(|| commit_subject.clone());
     match strategy.as_str() {
-        "merge" => git_status(
+        "merge" => hardened_delivery_git_status(
             git_root,
+            disabled_hooks.as_deref(),
             &["merge", "--no-ff", branch, "-m", &full_merge_message],
         )
         .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?,
         "squash" => {
-            git_status(git_root, &["merge", "--squash", branch])
-                .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
+            hardened_delivery_git_status(
+                git_root,
+                disabled_hooks.as_deref(),
+                &["merge", "--squash", branch],
+            )
+            .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
             let staged_stat = git_stdout(git_root, &["diff", "--cached", "--stat"])?;
             if staged_stat.trim().is_empty() {
                 if let Some(stash) = autostash.as_ref() {
@@ -1793,15 +1944,14 @@ fn apply_command_inner(
                 if !quiet {
                     print_already_applied(&state, branch, &target);
                 }
-                record_applied_job_delivery(
+                let cleaned = finish_apply_cleanup(
                     &paths,
-                    verified_job_id,
                     &state,
                     &record,
-                    git_root,
-                    &delivery_before,
+                    cleanup,
+                    no_confirm,
+                    job_operation_lock,
                 )?;
-                let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
                 if !quiet {
                     print!(
                         "{}",
@@ -1812,15 +1962,27 @@ fn apply_command_inner(
                 return Ok(());
             }
             if let Some(body) = commit_body.as_deref() {
-                git_status(git_root, &["commit", "-m", &commit_subject, "-m", body])?;
+                hardened_delivery_git_status(
+                    git_root,
+                    disabled_hooks.as_deref(),
+                    &["commit", "-m", &commit_subject, "-m", body],
+                )?;
             } else {
-                git_status(git_root, &["commit", "-m", &commit_subject])?;
+                hardened_delivery_git_status(
+                    git_root,
+                    disabled_hooks.as_deref(),
+                    &["commit", "-m", &commit_subject],
+                )?;
             }
         }
         "cherry-pick" => {
             let base = record.base_sha.as_deref().unwrap_or("HEAD");
-            git_status(git_root, &["cherry-pick", &format!("{base}..{branch}")])
-                .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
+            hardened_delivery_git_status(
+                git_root,
+                disabled_hooks.as_deref(),
+                &["cherry-pick", &format!("{base}..{branch}")],
+            )
+            .map_err(|err| apply_merge_error(&state.run_id, &autostash, &err))?;
         }
         other => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -1828,14 +1990,30 @@ fn apply_command_inner(
             ))));
         }
     }
-    let verified_revision = match verify_applied_job_delivery(
-        &paths,
-        verified_job_id,
-        &state,
-        &record,
-        git_root,
-        &delivery_before,
-    ) {
+    let verified_revision = match (|| {
+        if verified_job_id.is_some() {
+            require_clean_git_state_after_delivery(git_root)?;
+        }
+        let revision = verify_applied_job_delivery(
+            &paths,
+            verified_job_id,
+            &state,
+            &record,
+            git_root,
+            &delivery_before,
+        )?;
+        if let (Some(intent), Some(revision)) = (verified_intent.as_ref(), revision.as_deref()) {
+            validate_applied_delivery_topology(
+                git_root,
+                intent.strategy,
+                &intent.pre_revision,
+                revision,
+                &intent.signed_source_revision,
+                &intent.signed_result_revision,
+            )?;
+        }
+        Ok(revision)
+    })() {
         Ok(revision) => revision,
         Err(error) => {
             return Err(rollback_refused_job_delivery(
@@ -1847,17 +2025,30 @@ fn apply_command_inner(
             ));
         }
     };
+    if let (Some(job_id), Some(revision)) = (verified_job_id, verified_revision.as_deref()) {
+        let intent = verified_intent.as_ref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified delivery for Job {job_id} mutated Git without a signed intent"
+            )))
+        })?;
+        let completion = verified_completion.as_ref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified delivery for Job {job_id} lost its completion authority"
+            )))
+        })?;
+        let operation_lock = job_operation_lock.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified finish for Job {job_id} lost its operation lock"
+            )))
+        })?;
+        let applied = seal_verified_applied_delivery(&paths, job_id, completion, intent, revision)?;
+        // The authenticated after-state and factual Job event are durable
+        // before operator dirt is restored. A stash conflict can never erase
+        // the authority needed to reconcile finish or perform a safe undo.
+        super::job::record_signed_applied_job_delivery(&paths, job_id, &applied, operation_lock)?;
+    }
     if let Some(stash) = autostash.as_ref() {
         restore_apply_autostash(git_root, &state.run_id, stash)?;
-    }
-    if let (Some(job_id), Some(revision)) = (verified_job_id, verified_revision.as_deref()) {
-        super::job::record_job_delivery(
-            &paths,
-            job_id,
-            super::job::JobDeliveryKind::Applied,
-            git_root,
-            Some(revision),
-        )?;
     }
     if !quiet {
         println!(
@@ -1868,7 +2059,14 @@ fn apply_command_inner(
         );
         println!("{}", git_stdout(git_root, &["log", "-1", "--stat"])?);
     }
-    let cleaned = finish_apply_cleanup(&state, &record, cleanup, no_confirm)?;
+    let cleaned = finish_apply_cleanup(
+        &paths,
+        &state,
+        &record,
+        cleanup,
+        no_confirm,
+        job_operation_lock,
+    )?;
     if !quiet {
         print!(
             "{}",
@@ -1879,35 +2077,412 @@ fn apply_command_inner(
     Ok(())
 }
 
-fn record_applied_job_delivery(
-    paths: &DeadreckonPaths,
-    verified_job_id: Option<&str>,
-    state: &deadreckon_core::PipelineState,
-    record: &CodebaseRecord,
+struct VerifiedDeliveryReconciliation {
+    intent: Option<deadreckon_protocol::GitDeliveryIntent>,
+    applied: Option<deadreckon_protocol::AppliedGitDeliveryReceipt>,
+}
+
+fn git_delivery_strategy(value: &str) -> Result<deadreckon_protocol::GitDeliveryStrategy> {
+    match value {
+        "merge" => Ok(deadreckon_protocol::GitDeliveryStrategy::Merge),
+        "squash" => Ok(deadreckon_protocol::GitDeliveryStrategy::Squash),
+        "cherry-pick" => Ok(deadreckon_protocol::GitDeliveryStrategy::CherryPick),
+        other => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "unknown git apply strategy {other}"
+        )))),
+    }
+}
+
+pub(crate) fn disabled_delivery_hooks(paths: &DeadreckonPaths, job_id: &str) -> Result<PathBuf> {
+    let hooks = paths.job_delivery_dir(job_id).join("disabled-git-hooks");
+    fs::create_dir_all(&hooks)?;
+    let metadata = fs::symlink_metadata(&hooks)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "disabled Git hooks path is not a real directory: {}",
+            hooks.display()
+        ))));
+    }
+    Ok(fs::canonicalize(hooks)?)
+}
+
+pub(crate) fn hardened_delivery_git_status(
     destination: &Path,
-    delivery_before: &str,
+    disabled_hooks: Option<&Path>,
+    args: &[&str],
 ) -> Result<()> {
-    let Some(job_id) = verified_job_id else {
-        return Ok(());
+    let Some(disabled_hooks) = disabled_hooks else {
+        return git_status(destination, args);
     };
-    let Some(revision) = verify_applied_job_delivery(
-        paths,
-        Some(job_id),
-        state,
-        record,
+    let hooks = disabled_hooks.to_str().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "disabled Git hooks path is not valid UTF-8: {}",
+            disabled_hooks.display()
+        )))
+    })?;
+    let hooks_config = format!("core.hooksPath={hooks}");
+    let mut hardened = vec![
+        "-c",
+        hooks_config.as_str(),
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+        "-c",
+        "gpg.format=",
+    ];
+    hardened.extend_from_slice(args);
+    git_status(destination, &hardened)
+}
+
+pub(crate) fn refuse_in_progress_git_operation(destination: &Path) -> Result<()> {
+    for (git_path, label, recovery) in [
+        ("MERGE_HEAD", "merge", "git merge --abort"),
+        ("CHERRY_PICK_HEAD", "cherry-pick", "git cherry-pick --abort"),
+        ("REVERT_HEAD", "revert", "git revert --abort"),
+        ("rebase-merge", "rebase", "git rebase --abort"),
+        ("rebase-apply", "rebase", "git rebase --abort"),
+        (
+            "sequencer",
+            "sequenced operation",
+            "inspect `git status` and abort it",
+        ),
+    ] {
+        let path = PathBuf::from(git_stdout(
+            destination,
+            &["rev-parse", "--git-path", git_path],
+        )?);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            destination.join(path)
+        };
+        if path.exists() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "Git is in the middle of a {label}; verified delivery and undo are disabled"
+                ),
+                recovery,
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn require_clean_git_state_after_delivery(destination: &Path) -> Result<()> {
+    refuse_in_progress_git_operation(destination)?;
+    let status = deadreckon_core::git::run_git(
         destination,
-        delivery_before,
-    )?
-    else {
-        return Ok(());
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "verified Git delivery did not leave a clean repository state",
+            "inspect the delivery and restore the pre-delivery revision before retrying finish",
+        )));
+    }
+    Ok(())
+}
+
+fn verified_apply_completion(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    state: &deadreckon_core::PipelineState,
+) -> Result<deadreckon_protocol::CompletionReceipt> {
+    let receipt = deadreckon_core::validate_completion_receipt(paths, state)?;
+    if receipt.job_id.as_ref() != job_id || receipt.run_id.as_ref() != state.run_id {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("verified delivery identity does not match Job {job_id}"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    require_signed_delivery_revisions(job_id, &receipt)?;
+    Ok(receipt)
+}
+
+fn require_signed_delivery_revisions<'a>(
+    job_id: &str,
+    receipt: &'a deadreckon_protocol::CompletionReceipt,
+) -> Result<(&'a str, &'a str)> {
+    let source = receipt.source_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed source revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        ))
+    })?;
+    let result = receipt.result_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed result revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        ))
+    })?;
+    Ok((source, result))
+}
+
+fn seal_verified_delivery_intent(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    completion: &deadreckon_protocol::CompletionReceipt,
+    target: &deadreckon_core::GitDeliveryTarget,
+    strategy: deadreckon_protocol::GitDeliveryStrategy,
+) -> Result<deadreckon_protocol::GitDeliveryIntent> {
+    let (source, result) = require_signed_delivery_revisions(job_id, completion)?;
+    let intent = deadreckon_protocol::GitDeliveryIntent {
+        schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+        job_id: completion.job_id.clone(),
+        run_id: completion.run_id.clone(),
+        prepared_at: Utc::now(),
+        completion_receipt_sha256: deadreckon_core::flight::sha256_file(
+            &paths.job_receipt(job_id),
+        )?,
+        repository: target.repository.clone(),
+        target_ref: target.target_ref.clone(),
+        pre_revision: target.head_revision.clone(),
+        signed_source_revision: source.to_string(),
+        signed_result_revision: result.to_string(),
+        effective_policy_sha256: completion.effective_policy_sha256.clone(),
+        strategy,
+        signature: String::new(),
     };
-    super::job::record_job_delivery(
-        paths,
-        job_id,
-        super::job::JobDeliveryKind::Applied,
+    Ok(deadreckon_core::seal_git_delivery_intent(paths, &intent)?)
+}
+
+fn seal_verified_applied_delivery(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    completion: &deadreckon_protocol::CompletionReceipt,
+    intent: &deadreckon_protocol::GitDeliveryIntent,
+    applied_revision: &str,
+) -> Result<deadreckon_protocol::AppliedGitDeliveryReceipt> {
+    validate_intent_completion_binding(paths, job_id, completion, intent)?;
+    let intent_snapshot = deadreckon_core::validate_git_delivery_intent_snapshot(paths, job_id)?;
+    if &intent_snapshot.intent != intent {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("signed delivery intent for Job {job_id} changed before receipt sealing"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    let receipt = deadreckon_protocol::AppliedGitDeliveryReceipt {
+        schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+        job_id: intent.job_id.clone(),
+        run_id: intent.run_id.clone(),
+        issued_at: Utc::now(),
+        delivery_intent_sha256: intent_snapshot.sha256,
+        completion_receipt_sha256: intent.completion_receipt_sha256.clone(),
+        repository: intent.repository.clone(),
+        target_ref: intent.target_ref.clone(),
+        pre_revision: intent.pre_revision.clone(),
+        applied_revision: applied_revision.to_string(),
+        signed_source_revision: intent.signed_source_revision.clone(),
+        signed_result_revision: intent.signed_result_revision.clone(),
+        effective_policy_sha256: intent.effective_policy_sha256.clone(),
+        strategy: intent.strategy,
+        signature: String::new(),
+    };
+    Ok(deadreckon_core::seal_applied_git_delivery_receipt(
+        paths, &receipt,
+    )?)
+}
+
+fn reconcile_verified_job_delivery(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    completion: &deadreckon_protocol::CompletionReceipt,
+    record: &CodebaseRecord,
+    target: &deadreckon_core::GitDeliveryTarget,
+    strategy: deadreckon_protocol::GitDeliveryStrategy,
+    operation_lock: &deadreckon_core::JobOperationLock,
+) -> Result<VerifiedDeliveryReconciliation> {
+    if paths.job_applied_delivery_receipt(job_id).exists() {
+        let applied = deadreckon_core::validate_applied_git_delivery_receipt(paths, job_id)?;
+        validate_applied_completion_binding(paths, job_id, completion, &applied)?;
+        require_current_signed_delivery_target(job_id, target, &applied)?;
+        verify_applied_receipt_identity(
+            job_id,
+            completion,
+            record,
+            &target.repository.worktree_root,
+            &applied.pre_revision,
+        )?;
+        validate_applied_delivery_topology(
+            &target.repository.worktree_root,
+            applied.strategy,
+            &applied.pre_revision,
+            &applied.applied_revision,
+            &applied.signed_source_revision,
+            &applied.signed_result_revision,
+        )?;
+        super::job::record_signed_applied_job_delivery(paths, job_id, &applied, operation_lock)?;
+        return Ok(VerifiedDeliveryReconciliation {
+            intent: None,
+            applied: Some(applied),
+        });
+    }
+
+    if paths.job_delivery_intent(job_id).exists() {
+        let intent = deadreckon_core::validate_git_delivery_intent(paths, job_id)?;
+        validate_intent_completion_binding(paths, job_id, completion, &intent)?;
+        if intent.repository != target.repository
+            || intent.target_ref != target.target_ref
+            || intent.strategy != strategy
+        {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "signed delivery intent for Job {job_id} names a different repository, ref, or strategy"
+                ),
+                "restore the exact intended delivery target and retry finish",
+            )));
+        }
+        if target.head_revision == intent.pre_revision {
+            return Ok(VerifiedDeliveryReconciliation {
+                intent: Some(intent),
+                applied: None,
+            });
+        }
+
+        // The controller may have died after Git committed but before it could
+        // seal the after-state. Re-prove the exact delta from the signed
+        // pre-state and finish recording it; never execute Git a second time.
+        require_clean_git_state_after_delivery(&target.repository.worktree_root)?;
+        verify_applied_receipt_identity(
+            job_id,
+            completion,
+            record,
+            &target.repository.worktree_root,
+            &intent.pre_revision,
+        )?;
+        validate_applied_delivery_topology(
+            &target.repository.worktree_root,
+            intent.strategy,
+            &intent.pre_revision,
+            &target.head_revision,
+            &intent.signed_source_revision,
+            &intent.signed_result_revision,
+        )?;
+        let applied = seal_verified_applied_delivery(
+            paths,
+            job_id,
+            completion,
+            &intent,
+            &target.head_revision,
+        )?;
+        super::job::record_signed_applied_job_delivery(paths, job_id, &applied, operation_lock)?;
+        return Ok(VerifiedDeliveryReconciliation {
+            intent: None,
+            applied: Some(applied),
+        });
+    }
+
+    Ok(VerifiedDeliveryReconciliation {
+        intent: None,
+        applied: None,
+    })
+}
+
+fn validate_intent_completion_binding(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    completion: &deadreckon_protocol::CompletionReceipt,
+    intent: &deadreckon_protocol::GitDeliveryIntent,
+) -> Result<()> {
+    let (source, result) = require_signed_delivery_revisions(job_id, completion)?;
+    if intent.job_id != completion.job_id
+        || intent.run_id != completion.run_id
+        || intent.completion_receipt_sha256
+            != deadreckon_core::flight::sha256_file(&paths.job_receipt(job_id))?
+        || intent.signed_source_revision != source
+        || intent.signed_result_revision != result
+        || intent.effective_policy_sha256 != completion.effective_policy_sha256
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "signed delivery intent for Job {job_id} does not match its completion receipt"
+            ),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    Ok(())
+}
+
+fn validate_applied_completion_binding(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    completion: &deadreckon_protocol::CompletionReceipt,
+    applied: &deadreckon_protocol::AppliedGitDeliveryReceipt,
+) -> Result<()> {
+    let intent = deadreckon_core::validate_git_delivery_intent(paths, job_id)?;
+    validate_intent_completion_binding(paths, job_id, completion, &intent)?;
+    if applied.completion_receipt_sha256 != intent.completion_receipt_sha256
+        || applied.signed_source_revision != intent.signed_source_revision
+        || applied.signed_result_revision != intent.signed_result_revision
+        || applied.effective_policy_sha256 != intent.effective_policy_sha256
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "signed applied delivery for Job {job_id} does not match its completion receipt"
+            ),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        )));
+    }
+    Ok(())
+}
+
+fn require_current_signed_delivery_target(
+    job_id: &str,
+    target: &deadreckon_core::GitDeliveryTarget,
+    applied: &deadreckon_protocol::AppliedGitDeliveryReceipt,
+) -> Result<()> {
+    if target.repository != applied.repository
+        || target.target_ref != applied.target_ref
+        || target.head_revision != applied.applied_revision
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "the current Git target no longer matches the signed applied delivery for Job {job_id}"
+            ),
+            "restore the original worktree, attached target ref, and applied revision before retrying finish",
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_applied_delivery_topology(
+    destination: &Path,
+    strategy: deadreckon_protocol::GitDeliveryStrategy,
+    pre_revision: &str,
+    applied_revision: &str,
+    signed_source_revision: &str,
+    signed_result_revision: &str,
+) -> Result<()> {
+    let line = git_stdout(
         destination,
-        Some(&revision),
-    )
+        &["rev-list", "--parents", "-n", "1", applied_revision],
+    )?;
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some(applied_revision) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Git resolved the applied delivery to an unexpected commit".to_string(),
+        )));
+    }
+    let parents = fields.collect::<Vec<_>>();
+    let valid = match strategy {
+        deadreckon_protocol::GitDeliveryStrategy::Merge => {
+            parents.as_slice() == [pre_revision, signed_result_revision]
+        }
+        deadreckon_protocol::GitDeliveryStrategy::Squash => parents.as_slice() == [pre_revision],
+        deadreckon_protocol::GitDeliveryStrategy::CherryPick => {
+            let range = format!("{signed_source_revision}..{signed_result_revision}");
+            let count = git_stdout(destination, &["rev-list", "--count", &range])?;
+            count == "1" && parents.as_slice() == [pre_revision]
+        }
+    };
+    if !valid {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "the applied Git commit topology does not match the signed delivery strategy",
+            "restore the pre-delivery revision and retry finish; verified cherry-pick delivery supports one commit",
+        )));
+    }
+    Ok(())
 }
 
 fn verify_applied_job_delivery(
@@ -2016,16 +2591,32 @@ fn verify_applied_receipt_identity(
             &format!("deadreckon verdict {}", run_prefix(job_id)),
         )));
     }
-    let result = receipt.result_revision.as_deref().ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("job {job_id} receipt has no signed result revision"),
-            &format!("deadreckon verdict {}", run_prefix(job_id)),
-        ))
-    })?;
     let delivered = delivered_git_revision(destination).ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             &format!("applied job {job_id}, but the delivered Git revision is unavailable"),
             &format!("deadreckon show {}", run_prefix(job_id)),
+        ))
+    })?;
+    verify_signed_delivery_delta(job_id, receipt, destination, delivery_before, &delivered)
+}
+
+pub(crate) fn verify_signed_delivery_delta(
+    job_id: &str,
+    receipt: &deadreckon_protocol::CompletionReceipt,
+    destination: &Path,
+    delivery_before: &str,
+    delivered: &str,
+) -> Result<()> {
+    let base = receipt.source_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed source revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
+        ))
+    })?;
+    let result = receipt.result_revision.as_deref().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("job {job_id} receipt has no signed result revision"),
+            &format!("deadreckon verdict {}", run_prefix(job_id)),
         ))
     })?;
     let changed =
@@ -2036,7 +2627,7 @@ fn verify_applied_receipt_identity(
         .collect::<std::collections::BTreeSet<_>>();
     for path in changed {
         let signed = git_tree_entry(destination, result, &path)?;
-        let applied = git_tree_entry(destination, &delivered, &path)?;
+        let applied = git_tree_entry(destination, delivered, &path)?;
         if signed != applied {
             return Err(CliError::Core(deadreckon_core::user_error(
                 &format!(
@@ -2050,7 +2641,7 @@ fn verify_applied_receipt_identity(
     let delivered_paths = deadreckon_core::completion::git_delivery_history_paths(
         destination,
         delivery_before,
-        &delivered,
+        delivered,
     )?;
     let unexpected = delivered_paths
         .into_iter()
@@ -2330,14 +2921,27 @@ fn apply_completed_surface(
 }
 
 fn finish_apply_cleanup(
+    paths: &DeadreckonPaths,
     state: &deadreckon_core::PipelineState,
     record: &CodebaseRecord,
     cleanup: bool,
     no_confirm: bool,
+    operation_lock: Option<&deadreckon_core::JobOperationLock>,
 ) -> Result<bool> {
     let cleanup_now = cleanup || should_prompt_cleanup(no_confirm)?;
     if cleanup_now {
-        cleanup_worktree_run(state, record, false, false, CleanupReason::Applied)?;
+        if let Some(operation_lock) = operation_lock {
+            if operation_lock.job_id() != state.run_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "cannot clean Job {} while holding the operation lock for Job {}",
+                    state.run_id,
+                    operation_lock.job_id()
+                ))));
+            }
+            cleanup_worktree_run_inner(state, record, false, false, CleanupReason::Applied)?;
+        } else {
+            cleanup_worktree_run(paths, state, record, false, false, CleanupReason::Applied)?;
+        }
     }
     Ok(cleanup_now)
 }
@@ -2563,6 +3167,7 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
         let _ = kill_loaded_run(&paths, &mut state, true);
     }
     let result = cleanup_worktree_run(
+        &paths,
         &state,
         &record,
         keep_branch,
@@ -2610,6 +3215,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
         }
         let record = lifecycle_codebase_record(&paths, &state)?;
         let result = cleanup_worktree_run(
+            &paths,
             &state,
             &record,
             keep_branch,
@@ -2659,6 +3265,7 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
             let _ = kill_loaded_run(&paths, &mut candidate.state, escalate);
         }
         let result = cleanup_worktree_run(
+            &paths,
             &candidate.state,
             &candidate.record,
             keep_branch,
@@ -2792,6 +3399,27 @@ struct CleanupRunResult {
 }
 
 fn cleanup_worktree_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    keep_branch: bool,
+    force: bool,
+    reason: CleanupReason,
+) -> Result<CleanupRunResult> {
+    if !paths.job_json(&state.run_id).is_file() {
+        return cleanup_worktree_run_inner(state, record, keep_branch, force, reason);
+    }
+
+    let _operation_lock = deadreckon_core::acquire_job_operation_lock(paths, &state.run_id)?;
+    // The candidate list and confirmation may be old by the time the lock is
+    // acquired. Reload every path-bearing authority artifact under the same
+    // guard that protects the following Git removal.
+    let current_state = load_run(paths, &state.run_id)?;
+    let current_record = lifecycle_codebase_record(paths, &current_state)?;
+    cleanup_worktree_run_inner(&current_state, &current_record, keep_branch, force, reason)
+}
+
+fn cleanup_worktree_run_inner(
     state: &deadreckon_core::PipelineState,
     record: &CodebaseRecord,
     keep_branch: bool,
@@ -4340,10 +4968,23 @@ fn parent_summary(parent: &deadreckon_core::PipelineState, context_turns: Option
     } else {
         format!("${:.6}", parent.total_spend_usd)
     };
-    let acceptance = if parent.run_root.join("proofs/turn-acceptance.json").exists() {
-        "dr-gate accepted"
+    let marker_path = marker_path_for_run_root(&parent.run_root);
+    let acceptance = if marker_path.exists() {
+        match validate_acceptance_marker(parent) {
+            Ok(marker) if marker.schema_version == 1 => {
+                "validated legacy v1 proof (weak; not a native trusted receipt)".to_string()
+            }
+            Ok(marker) if marker.is_native_gate_proof() => {
+                "validated signed dr-gate receipt".to_string()
+            }
+            Ok(_) => "validated signed controller proof".to_string(),
+            Err(error) => format!(
+                "INVALID acceptance marker ({})",
+                one_line(&error.to_string(), 120)
+            ),
+        }
     } else {
-        "not recorded"
+        "MISSING signed acceptance marker".to_string()
     };
     let mut summary = format!(
         "# Previous run summary ({})\n\n**Original goal.** {}\n**Completed.** {}\n**Total turns.** {}\n**Total spend.** {}\n**Acceptance.** {}\n",
@@ -4548,14 +5189,70 @@ mod tests {
     use deadreckon_core::{JobProjection, JobView};
     use deadreckon_protocol::{
         AuthorityAcceptedBy, CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer,
-        GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent, JobEventKind,
-        JobEventSequence, JobId, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion, JobShape,
-        RunId, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
-        SemanticJudgeMode, SemanticJudgment, StopReason,
+        GitDeliveryStrategy, GoalCoverage, GoalCoverageStatus, Job, JobAuthority, JobEvent,
+        JobEventKind, JobEventSequence, JobId, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion,
+        JobShape, RunId, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer,
+        SemanticDecision, SemanticJudgeMode, SemanticJudgment, StopReason,
     };
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn parent_summary_never_accepts_a_tampered_marker() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "summarize prior work".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("parent-summary-tamper".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        deadreckon_core::write_acceptance_marker_with_results(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "shell".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "cargo test passed".to_string(),
+                command: Some("cargo test".to_string()),
+                cwd: Some(state.working_dir.clone()),
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+        )
+        .expect("marker");
+        let marker_path = marker_path_for_run_root(&state.run_root);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).expect("marker bytes"))
+                .expect("marker json");
+        marker["check_count"] = serde_json::json!(99);
+        fs::write(
+            marker_path,
+            serde_json::to_vec_pretty(&marker).expect("tampered marker json"),
+        )
+        .expect("tampered marker");
+
+        let summary = parent_summary(&state, None);
+
+        assert!(
+            summary.contains("**Acceptance.** INVALID acceptance marker"),
+            "{summary}"
+        );
+        assert!(!summary.contains("dr-gate accepted"), "{summary}");
+    }
 
     fn job_view(
         root: &Path,
@@ -4603,6 +5300,7 @@ mod tests {
             },
             attempts: Vec::new(),
             missing_attempts: Vec::new(),
+            verified_receipt_error: None,
         }
     }
 
@@ -4611,6 +5309,8 @@ mod tests {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job_id.clone(),
             run_id: RunId(job_id.as_ref().to_string()),
+            attempt: 1,
+            outer_launch_id: "00000000-0000-4000-8000-000000000001".to_string(),
             issued_at: Utc::now(),
             issuer: CompletionReceiptIssuer::DeadreckonSupervisor,
             proof_kind: CompletionProofKind::TwoKeyCompletion,
@@ -4628,6 +5328,7 @@ mod tests {
             deterministic_marker_sha256: "marker".to_string(),
             semantic_judgment_sha256: "semantic".to_string(),
             sandbox_boundary_observation_sha256: "sandbox-observation".to_string(),
+            execution_evidence: None,
             contained: false,
             sandbox_backend: "none".to_string(),
             signature: "not-trusted".to_string(),
@@ -4668,6 +5369,114 @@ mod tests {
             created_at: Utc::now(),
             deadreckon_version: env!("CARGO_PKG_VERSION").to_string(),
             doc_polish_hash: None,
+        }
+    }
+
+    #[test]
+    fn durable_job_cleanup_shares_operation_lock_and_retains_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "dededededededededededededededede";
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "retain durable Job authority after cleanup".to_string(),
+                cwd: source,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some(job_id.to_string()),
+                codebase: None,
+            },
+        )
+        .expect("durable run");
+        let record = CodebaseRecord::fresh();
+        deadreckon_core::write_trusted_codebase_record(&state.run_root, &record)
+            .expect("trusted codebase record");
+        deadreckon_core::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: state.cwd.clone(),
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+        )
+        .expect("Job");
+        let gate_key_before =
+            deadreckon_core::read_gate_key(&paths, job_id).expect("created gate key");
+        fs::create_dir_all(paths.job_delivery_dir(job_id)).expect("delivery authority dir");
+        fs::write(
+            paths.job_receipt(job_id),
+            b"immutable completion evidence\n",
+        )
+        .expect("completion evidence");
+        fs::write(
+            paths.job_delivery_intent(job_id),
+            b"immutable delivery intent\n",
+        )
+        .expect("delivery intent evidence");
+        fs::write(
+            paths.job_applied_delivery_receipt(job_id),
+            b"immutable applied evidence\n",
+        )
+        .expect("applied evidence");
+        fs::write(state.working_dir.join("result.txt"), b"durable result\n")
+            .expect("result evidence");
+
+        let held =
+            deadreckon_core::acquire_job_operation_lock(&paths, job_id).expect("held finish lock");
+        let error = cleanup_worktree_run(
+            &paths,
+            &state,
+            &record,
+            false,
+            false,
+            CleanupReason::Cleaned,
+        )
+        .expect_err("cleanup must share the finish/undo lock");
+        assert!(error.to_string().contains("active finish"), "{error}");
+        drop(held);
+
+        cleanup_worktree_run(
+            &paths,
+            &state,
+            &record,
+            false,
+            false,
+            CleanupReason::Cleaned,
+        )
+        .expect("cleanup after lock release");
+        assert_eq!(
+            deadreckon_core::read_gate_key(&paths, job_id).expect("retained gate key"),
+            gate_key_before
+        );
+        for retained in [
+            paths.job_json(job_id),
+            paths.job_receipt(job_id),
+            paths.job_delivery_intent(job_id),
+            paths.job_applied_delivery_receipt(job_id),
+            paths.job_operation_lock(job_id),
+            state.working_dir.join("result.txt"),
+        ] {
+            assert!(retained.is_file(), "cleanup removed {}", retained.display());
         }
     }
 
@@ -5473,6 +6282,131 @@ mod tests {
         assert!(
             error.to_string().contains("non-deliverable paths"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn finish_reconciles_crash_after_git_mutation_once_without_second_delivery() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("signed.txt"), "verified result\n").expect("result file");
+        git_status(&repo, &["add", "signed.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "signed result"]).expect("commit result");
+        let signed_result = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("result revision");
+        git_status(&repo, &["switch", &base_branch]).expect("target branch");
+
+        let job_id = "bcbcbcbcbcbcbcbcbcbcbcbcbcbcbcbc";
+        let policy_sha256 = deadreckon_core::flight::sha256_text("delivery policy");
+        deadreckon_core::write_job(
+            &paths,
+            &Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId(job_id.to_string()),
+                scope: "delivery-recovery".to_string(),
+                goal: "recover one exact delivery".to_string(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: repo.clone(),
+                launch_plan_sha256: "launch".to_string(),
+                authority_sha256: "authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+        )
+        .expect("Job");
+        append_test_job_event(&paths, job_id, 1, JobEventKind::Created);
+        append_test_job_event(&paths, job_id, 2, JobEventKind::Verified);
+        deadreckon_core::write_gate_key(&paths, job_id, &[31_u8; 32]).expect("delivery key");
+        let mut completion = uncontained_receipt(&JobId(job_id.to_string()));
+        completion.source_revision = Some(base.clone());
+        completion.result_revision = Some(signed_result.clone());
+        completion.effective_policy_sha256 = policy_sha256;
+        fs::write(
+            paths.job_receipt(job_id),
+            serde_json::to_vec_pretty(&completion).expect("completion json"),
+        )
+        .expect("completion receipt");
+
+        let before = deadreckon_core::GitDeliveryTarget::inspect(&repo).expect("target before");
+        let intent = seal_verified_delivery_intent(
+            &paths,
+            job_id,
+            &completion,
+            &before,
+            GitDeliveryStrategy::Squash,
+        )
+        .expect("intent before mutation");
+        git_status(&repo, &["merge", "--squash", "result"]).expect("squash result");
+        git_status(
+            &repo,
+            &["commit", "-m", "delivered before controller crash"],
+        )
+        .expect("delivery commit");
+        let applied = git_stdout(&repo, &["rev-parse", "HEAD"]).expect("applied revision");
+        assert!(!paths.job_applied_delivery_receipt(job_id).exists());
+
+        let record = worktree_record(&repo, &base, "result");
+        let after = deadreckon_core::GitDeliveryTarget::inspect(&repo).expect("target after");
+        let operation_lock =
+            deadreckon_core::acquire_job_operation_lock(&paths, job_id).expect("operation lock");
+        let recovered = reconcile_verified_job_delivery(
+            &paths,
+            job_id,
+            &completion,
+            &record,
+            &after,
+            GitDeliveryStrategy::Squash,
+            &operation_lock,
+        )
+        .expect("reconcile crash window");
+        assert_eq!(
+            recovered
+                .applied
+                .as_ref()
+                .map(|receipt| receipt.applied_revision.as_str()),
+            Some(applied.as_str())
+        );
+        assert_eq!(intent.pre_revision, base);
+
+        let repeated = reconcile_verified_job_delivery(
+            &paths,
+            job_id,
+            &completion,
+            &record,
+            &after,
+            GitDeliveryStrategy::Squash,
+            &operation_lock,
+        )
+        .expect("repeated finish converges");
+        assert_eq!(
+            repeated
+                .applied
+                .as_ref()
+                .map(|receipt| receipt.applied_revision.as_str()),
+            Some(applied.as_str())
+        );
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "HEAD"]).expect("same HEAD"),
+            applied
+        );
+        let history =
+            deadreckon_core::read_job_history(&paths.job_events(job_id)).expect("Job history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::ResultApplied)
+                .count(),
+            1
         );
     }
 
