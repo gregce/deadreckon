@@ -59,6 +59,7 @@
         "queued",
         "lease_acquired",
         "lease_reclaimed",
+        "workspace_prepared",
         "child_launch_prepared",
         "attempt_started",
         "child_linked",
@@ -80,7 +81,10 @@
         "failed",
         "verified",
         "result_applied",
-        "result_exported"
+        "result_exported",
+        "undo_started",
+        "undo_completed",
+        "undo_failed"
       ]
     }
   }

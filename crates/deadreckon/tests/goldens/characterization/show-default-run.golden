@@ -6,7 +6,7 @@ launch-dir: <TMP>/repo
 artifact  : <TMP>/home/library/repo-<ID8>/<ID32>
 note: launch-dir is unchanged; completed output lives in artifact
 Mode fresh
-Acceptance gate: PASSED 1/1; tests modified this run: no
+Acceptance gate: PASSED 1/1 - validated signed dr-gate receipt; tests modified this run: no
 AcceptanceSpec <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/acceptance.yaml
 {
   "version": 1,

@@ -13,10 +13,11 @@ use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
-    AuthorityAcceptedBy, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
-    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, Job, JobAuthority,
-    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobId, JobPolicy,
-    JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
+    AppliedGitDeliveryReceipt, AuthorityAcceptedBy, DockerGateIdentity,
+    GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity,
+    GateEvaluatorIdentity, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
+    JobExecutionPolicy, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
+    StopReason,
 };
 use sha2::Sha256;
 
@@ -364,6 +365,9 @@ pub(crate) fn list_jobs(
 }
 
 pub(crate) fn job_status_label(view: &deadreckon_core::JobView) -> String {
+    if view.verified_receipt_error.is_some() {
+        return "verified_proof_invalid".to_string();
+    }
     view.projection
         .outcome
         .map(serialized_label)
@@ -383,15 +387,90 @@ pub(crate) fn print_job_status_after_attach(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JobDeliveryKind {
-    Applied,
     Exported,
 }
 
-/// Record the successful operator delivery transition after it happens.
+/// Mirror one already-authenticated applied-delivery receipt into the Job event
+/// history. This event is a lifecycle fact, never delivery or undo authority:
+/// consumers must validate the protected signed receipt and require this fact
+/// to match it exactly.
+pub(crate) fn record_signed_applied_job_delivery(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    receipt: &AppliedGitDeliveryReceipt,
+    operation_lock: &deadreckon_core::JobOperationLock,
+) -> Result<()> {
+    if operation_lock.job_id() != job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "cannot record delivery for Job {job_id} while holding the operation lock for Job {}",
+            operation_lock.job_id()
+        ))));
+    }
+    let validated = deadreckon_core::validate_applied_git_delivery_receipt_snapshot(paths, job_id)?;
+    if &validated.receipt != receipt {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "signed applied delivery receipt changed before recording Job {job_id}"
+        ))));
+    }
+    let detail = signed_applied_job_delivery_detail(receipt, &validated.sha256);
+    let history = deadreckon_core::read_job_history(&paths.job_events(job_id))?;
+    let existing = history
+        .events()
+        .iter()
+        .filter(|event| event.kind == JobEventKind::ResultApplied)
+        .collect::<Vec<_>>();
+    if existing.len() > 1 || existing.first().is_some_and(|event| event.detail != detail) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "Job {job_id} has conflicting unsigned applied-delivery history; the signed receipt was not redirected"
+            ),
+            &format!("deadreckon show {}", run_prefix(job_id)),
+        )));
+    }
+    record_job_delivery_detail(paths, job_id, JobEventKind::ResultApplied, &detail)?;
+    let history = deadreckon_core::read_job_history(&paths.job_events(job_id))?;
+    let applied = history
+        .events()
+        .iter()
+        .filter(|event| event.kind == JobEventKind::ResultApplied)
+        .collect::<Vec<_>>();
+    if applied.len() != 1 || applied[0].detail != detail {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "Job {job_id} has conflicting applied-delivery history; the signed receipt remains the only delivery authority"
+            ),
+            &format!("deadreckon show {}", run_prefix(job_id)),
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn signed_applied_job_delivery_detail(
+    receipt: &AppliedGitDeliveryReceipt,
+    delivery_receipt_sha256: &str,
+) -> Value {
+    json!({
+        "delivery_receipt_sha256": delivery_receipt_sha256,
+        "completion_receipt_sha256": receipt.completion_receipt_sha256,
+        "delivery_intent_sha256": receipt.delivery_intent_sha256,
+        "destination": receipt.repository.worktree_root,
+        "git_common_dir": receipt.repository.git_common_dir,
+        "target_ref": receipt.target_ref,
+        "destination_revision_before": receipt.pre_revision,
+        "resulting_revision": receipt.applied_revision,
+        "source_revision": receipt.signed_source_revision,
+        "result_revision": receipt.signed_result_revision,
+        "effective_policy_sha256": receipt.effective_policy_sha256,
+        "strategy": receipt.strategy,
+    })
+}
+
+/// Record a successful operator export transition after it happens.
 ///
 /// The event is idempotent for the same kind, destination and resulting
 /// revision. It intentionally does not authorize delivery: `finish` validates
-/// the sealed receipt first and calls this only after apply/export succeeds.
+/// verified Git apply is deliberately excluded: it must pass through the
+/// signed applied-receipt path above.
 pub(crate) fn record_job_delivery(
     paths: &DeadreckonPaths,
     job_id: &str,
@@ -400,7 +479,6 @@ pub(crate) fn record_job_delivery(
     resulting_revision: Option<&str>,
 ) -> Result<()> {
     let event_kind = match kind {
-        JobDeliveryKind::Applied => JobEventKind::ResultApplied,
         JobDeliveryKind::Exported => JobEventKind::ResultExported,
     };
     let destination = destination.to_path_buf();
@@ -408,6 +486,15 @@ pub(crate) fn record_job_delivery(
         "destination": destination,
         "resulting_revision": resulting_revision,
     });
+    record_job_delivery_detail(paths, job_id, event_kind, &detail)
+}
+
+fn record_job_delivery_detail(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    event_kind: JobEventKind,
+    detail: &Value,
+) -> Result<()> {
     let event_fingerprint = deadreckon_core::flight::sha256_text(&format!(
         "{}:{}",
         serialized_label(event_kind),
@@ -430,7 +517,7 @@ pub(crate) fn record_job_delivery(
         if history
             .events()
             .iter()
-            .any(|event| event.kind == event_kind && event.detail == detail)
+            .any(|event| event.kind == event_kind && &event.detail == detail)
         {
             return Ok(());
         }
@@ -465,6 +552,79 @@ pub(crate) fn record_job_delivery(
     })))
 }
 
+/// Append one factual Job undo transition under the same per-Job control lock
+/// used by every lifecycle event. `operation_id` is stable across crash
+/// recovery, so repeated completion writes are byte-idempotent.
+pub(crate) fn record_job_undo_event(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    kind: JobEventKind,
+    operation_id: &str,
+    detail: &Value,
+) -> Result<()> {
+    if !matches!(
+        kind,
+        JobEventKind::UndoStarted | JobEventKind::UndoCompleted | JobEventKind::UndoFailed
+    ) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "job undo recorder received a non-undo event".to_string(),
+        )));
+    }
+    let suffix = serialized_label(kind);
+    let event_id = format!("undo:{operation_id}:{suffix}");
+    let mut last_error = None;
+    for _ in 0..4 {
+        let view = deadreckon_core::JobView::load(paths, job_id)?;
+        if view.projection.outcome != Some(deadreckon_protocol::JobOutcome::Verified) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "cannot record undo evidence for unverified job {job_id}"
+            ))));
+        }
+        let history = deadreckon_core::read_job_history(&paths.job_events(job_id))?;
+        if let Some(existing) = history
+            .events()
+            .iter()
+            .find(|event| event.event_id == event_id)
+        {
+            return if existing.kind == kind && &existing.detail == detail {
+                Ok(())
+            } else {
+                Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "job {job_id} undo event {event_id} already has different evidence"
+                ))))
+            };
+        }
+        let sequence =
+            JobEventSequence::new(view.projection.last_sequence + 1).ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "job {job_id} event sequence exhausted"
+                )))
+            })?;
+        match deadreckon_core::append_job_event(
+            paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: view.job.job_id,
+                sequence,
+                event_id: event_id.clone(),
+                causation_id: format!("undo:{operation_id}"),
+                timestamp: Utc::now(),
+                lease_epoch: view.projection.current_lease_epoch,
+                kind,
+                detail: detail.clone(),
+            },
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(CliError::Core(last_error.unwrap_or_else(|| {
+        DeadreckonError::InvalidInput(format!(
+            "could not record undo evidence for job {job_id} after bounded retries"
+        ))
+    })))
+}
+
 fn print_job_status_with_open_action(
     view: &deadreckon_core::JobView,
     json_output: bool,
@@ -491,6 +651,14 @@ fn print_job_status_with_open_action(
         .as_ref()
         .map(|delivery| delivery.destination.display().to_string())
         .unwrap_or_else(|| "-".to_string());
+    let proof_status = match (
+        view.projection.outcome,
+        view.verified_receipt_error.as_deref(),
+    ) {
+        (Some(deadreckon_protocol::JobOutcome::Verified), None) => "valid",
+        (Some(deadreckon_protocol::JobOutcome::Verified), Some(_)) => "invalid",
+        _ => "not-applicable",
+    };
     if json_output {
         let paths = DeadreckonPaths::discover();
         println!(
@@ -499,6 +667,10 @@ fn print_job_status_with_open_action(
                 "kind": "job_status",
                 "id": id,
                 "status": status,
+                "verified_proof": {
+                    "status": proof_status,
+                    "error": view.verified_receipt_error.as_deref(),
+                },
                 "next_actions": [&next_action],
                 "try_lines": Vec::<String>::new(),
                 "paths": job_status_paths(&paths, view),
@@ -530,7 +702,12 @@ fn print_job_status_with_open_action(
         ("machine restart", &machine_restart_durability),
         ("delivery", &delivery),
         ("delivered to", &delivered_to),
+        ("verified proof", proof_status),
     ]);
+    if let Some(error) = view.verified_receipt_error.as_deref() {
+        println!();
+        println!("  {} {}", ui_muted("proof error:"), error);
+    }
     println!();
     println!("  {} {}", ui_muted("next:"), ui_command(next_action));
     Ok(())
@@ -549,6 +726,9 @@ pub(crate) fn job_primary_action<'a>(
 ) -> &'a str {
     if !view.projection.is_terminal() {
         return open_action;
+    }
+    if view.verified_receipt_error.is_some() {
+        return "status";
     }
     match view.projection.outcome {
         Some(deadreckon_protocol::JobOutcome::Verified) if view.projection.delivery.is_some() => {
@@ -1967,7 +2147,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_graph_job_freezes_shape_and_normalizes_parent_delivery_to_at_end() {
+    fn durable_graph_job_freezes_shape_and_preserves_isolated_per_node_delivery() {
         use commands::course::{CoursePiece, CourseSubplan};
         use deadreckon_core::plan::ApplyWhen;
 
@@ -2063,7 +2243,7 @@ mod tests {
             frozen_driver.kind,
             commands::graph_job::DriverKind::FullPlan
         );
-        assert_eq!(frozen_driver.apply, ApplyWhen::AtEnd);
+        assert_eq!(frozen_driver.apply, ApplyWhen::PerNode);
     }
 
     #[test]
@@ -2095,6 +2275,24 @@ mod tests {
             serialized_label(view.projection.stop_reason.expect("stop reason")),
             "lost_containment"
         );
+    }
+
+    #[test]
+    fn status_never_presents_a_tampered_terminal_proof_as_verified() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let job = create_job(request(&paths, &source, None)).expect("job");
+        let mut view =
+            deadreckon_core::JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        view.projection.phase = deadreckon_protocol::JobPhase::Terminal;
+        view.projection.outcome = Some(deadreckon_protocol::JobOutcome::Verified);
+        view.projection.stop_reason = Some(deadreckon_protocol::StopReason::Verified);
+        view.verified_receipt_error = Some("receipt signature is invalid".to_string());
+
+        assert_eq!(job_status_label(&view), "verified_proof_invalid");
+        assert_eq!(job_primary_action(&view, "attach"), "status");
     }
 
     #[test]
@@ -2250,7 +2448,11 @@ mod tests {
             delivery.resulting_revision.as_deref(),
             Some("result-revision")
         );
-        assert_eq!(job_primary_action(&view, "attach"), "report");
+        assert!(
+            view.verified_receipt_error.is_some(),
+            "the synthetic terminal event has no authenticated receipt binding"
+        );
+        assert_eq!(job_primary_action(&view, "attach"), "status");
     }
 
     #[test]
@@ -2286,7 +2488,7 @@ mod tests {
                         record_job_delivery(
                             &paths,
                             job.job_id.as_ref(),
-                            JobDeliveryKind::Applied,
+                            JobDeliveryKind::Exported,
                             &destination,
                             Some("revision-after-apply"),
                         )
@@ -2304,7 +2506,7 @@ mod tests {
             history
                 .events()
                 .iter()
-                .filter(|event| event.kind == JobEventKind::ResultApplied)
+                .filter(|event| event.kind == JobEventKind::ResultExported)
                 .count(),
             1
         );

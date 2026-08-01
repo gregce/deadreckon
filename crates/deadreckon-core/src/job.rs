@@ -88,6 +88,11 @@ pub struct JobView {
     pub projection: JobProjection,
     pub attempts: Vec<RunView>,
     pub missing_attempts: Vec<String>,
+    /// A terminal lifecycle fact remains immutable, but its external proof may
+    /// later be deleted or tampered with. Status surfaces must expose that
+    /// distinction instead of continuing to present an unvalidated Verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_receipt_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,11 +232,66 @@ impl JobView {
                 Err(_) => missing_attempts.push(run_id.clone()),
             }
         }
+        let verified_receipt_error = if projection.outcome == Some(JobOutcome::Verified) {
+            match crate::state::load_run(paths, job_id)
+                .and_then(|state| crate::completion::validate_completion_receipt(paths, &state))
+            {
+                Ok(receipt) => {
+                    let terminal = history
+                        .events()
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == JobEventKind::Verified);
+                    let receipt_sha256 = crate::flight::sha256_file(&paths.job_receipt(job_id));
+                    match (terminal, receipt_sha256) {
+                        (Some(terminal), Ok(receipt_sha256))
+                            if terminal
+                                .detail
+                                .get("receipt_sha256")
+                                .and_then(Value::as_str)
+                                == Some(receipt_sha256.as_str())
+                                && terminal.detail.get("attempt").and_then(Value::as_u64)
+                                    == Some(u64::from(receipt.attempt))
+                                && terminal
+                                    .detail
+                                    .get("receipt_run_id")
+                                    .and_then(Value::as_str)
+                                    == Some(receipt.run_id.as_ref())
+                                && terminal
+                                    .detail
+                                    .get("outer_launch_id")
+                                    .and_then(Value::as_str)
+                                    == Some(receipt.outer_launch_id.as_str())
+                                && terminal
+                                    .detail
+                                    .get("result_run_id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|value| !value.trim().is_empty()) =>
+                        {
+                            None
+                        }
+                        (Some(_), Ok(_)) => Some(
+                            "terminal Verified fact is not bound to the current signed receipt"
+                                .to_string(),
+                        ),
+                        (None, _) => Some(
+                            "terminal projection has no durable Verified lifecycle fact"
+                                .to_string(),
+                        ),
+                        (_, Err(error)) => Some(error.to_string()),
+                    }
+                }
+                Err(error) => Some(error.to_string()),
+            }
+        } else {
+            None
+        };
         Ok(Self {
             job,
             projection,
             attempts,
             missing_attempts,
+            verified_receipt_error,
         })
     }
 }
@@ -346,6 +406,7 @@ pub fn reduce_job_history(job_id: &JobId, history: &JobHistory) -> Result<JobPro
     let mut expected = 1_u64;
     let mut seen = BTreeMap::<&str, &[u8]>::new();
     let mut child_ids = BTreeSet::new();
+    let mut undo_operations = BTreeMap::new();
 
     for (event, raw) in history.events.iter().zip(&history.raw_lines) {
         if event.job_id != *job_id {
@@ -376,7 +437,7 @@ pub fn reduce_job_history(job_id: &JobId, history: &JobHistory) -> Result<JobPro
         expected += 1;
         projection.last_sequence = event.sequence.get();
         projection.updated_at = Some(event.timestamp);
-        reduce_event(&mut projection, event, &mut child_ids)?;
+        reduce_event(&mut projection, event, &mut child_ids, &mut undo_operations)?;
     }
     projection.child_run_ids = child_ids.into_iter().collect();
     Ok(projection)
@@ -491,6 +552,7 @@ fn reduce_event(
     projection: &mut JobProjection,
     event: &JobEvent,
     child_ids: &mut BTreeSet<String>,
+    undo_operations: &mut BTreeMap<String, UndoEventState>,
 ) -> Result<()> {
     use JobEventKind::{
         AttemptStarted, AttemptStopped, Blocked, CancelRequested, Cancelled, ChildLaunchPrepared,
@@ -498,6 +560,22 @@ fn reduce_event(
         Failed, LeaseAcquired, LeaseReclaimed, NeedsReview, Queued, RetryScheduled,
         SemanticJudgeAchieved, SemanticJudgeRevise, SemanticJudgeUncertain, Verified,
     };
+
+    if projection.is_terminal()
+        && !matches!(
+            event.kind,
+            JobEventKind::ResultApplied
+                | JobEventKind::ResultExported
+                | JobEventKind::UndoStarted
+                | JobEventKind::UndoCompleted
+                | JobEventKind::UndoFailed
+        )
+    {
+        return Err(history_corrupt(
+            event.job_id.as_ref(),
+            "lifecycle history continued after its terminal outcome",
+        ));
+    }
 
     match event.kind {
         Created | Queued => projection.phase = JobPhase::Queued,
@@ -523,11 +601,19 @@ fn reduce_event(
         }
         AttemptStopped => {
             projection.phase = JobPhase::Waiting;
-            projection.stop_reason = detail_stop_reason(&event.detail);
+            let reason = detail_stop_reason(event)?;
+            // Operator cancellation is sticky once durably requested. A
+            // concurrently exiting worker must not overwrite it with its own
+            // completion/failure reason before terminal classification.
+            if projection.stop_reason != Some(StopReason::CancelRequested) {
+                projection.stop_reason = reason;
+            }
         }
         RetryScheduled => {
             projection.phase = JobPhase::Waiting;
-            projection.stop_reason = None;
+            if projection.stop_reason != Some(StopReason::CancelRequested) {
+                projection.stop_reason = None;
+            }
         }
         DeterministicGatePassed => projection.phase = JobPhase::VerifyingMeaning,
         DeterministicGateFailed => projection.phase = JobPhase::Running,
@@ -537,69 +623,203 @@ fn reduce_event(
         SemanticJudgeRevise => projection.phase = JobPhase::Running,
         NeedsReview => terminal(
             projection,
+            event,
             JobOutcome::NeedsReview,
-            detail_stop_reason(&event.detail).unwrap_or(StopReason::SemanticUncertain),
-        ),
+            detail_stop_reason(event)?.unwrap_or(StopReason::SemanticUncertain),
+        )?,
         Blocked => terminal(
             projection,
+            event,
             JobOutcome::Blocked,
-            detail_stop_reason(&event.detail).unwrap_or(StopReason::OperatorInputRequired),
-        ),
+            detail_stop_reason(event)?.unwrap_or(StopReason::OperatorInputRequired),
+        )?,
         JobEventKind::BudgetExhausted => terminal(
             projection,
+            event,
             JobOutcome::BudgetExhausted,
-            detail_stop_reason(&event.detail).unwrap_or(StopReason::SpendCap),
-        ),
+            detail_stop_reason(event)?.unwrap_or(StopReason::SpendCap),
+        )?,
         DeadlineReached => terminal(
             projection,
+            event,
             JobOutcome::DeadlineReached,
             StopReason::Deadline,
-        ),
+        )?,
         CancelRequested => {
             projection.phase = JobPhase::Waiting;
             projection.stop_reason = Some(StopReason::CancelRequested);
         }
         Cancelled => terminal(
             projection,
+            event,
             JobOutcome::Cancelled,
             StopReason::CancelRequested,
-        ),
+        )?,
         Failed => {
-            let reason = detail_stop_reason(&event.detail).unwrap_or(StopReason::FatalProvider);
+            let reason = detail_stop_reason(event)?.unwrap_or(StopReason::FatalProvider);
             let outcome = if reason == StopReason::AttemptLimit {
                 JobOutcome::RetryExhausted
             } else {
                 JobOutcome::Failed
             };
-            terminal(projection, outcome, reason);
+            terminal(projection, event, outcome, reason)?;
         }
-        Verified => terminal(projection, JobOutcome::Verified, StopReason::Verified),
+        Verified => terminal(
+            projection,
+            event,
+            JobOutcome::Verified,
+            StopReason::Verified,
+        )?,
         JobEventKind::ResultApplied => {
+            if projection.outcome != Some(JobOutcome::Verified) || projection.delivery.is_some() {
+                return Err(history_corrupt(
+                    event.job_id.as_ref(),
+                    "applied delivery must follow one Verified result and may be recorded only once",
+                ));
+            }
             projection.delivery = Some(job_delivery(event, JobDeliveryKind::Applied)?);
         }
         JobEventKind::ResultExported => {
+            if projection.outcome != Some(JobOutcome::Verified) || projection.delivery.is_some() {
+                return Err(history_corrupt(
+                    event.job_id.as_ref(),
+                    "exported delivery must follow one Verified result and may be recorded only once",
+                ));
+            }
             projection.delivery = Some(job_delivery(event, JobDeliveryKind::Exported)?);
         }
         JobEventKind::ContractApproved
+        | JobEventKind::WorkspacePrepared
         | JobEventKind::CampaignSubAuthorityChanged
         | JobEventKind::RepairChildAuthorityChanged => {}
+        JobEventKind::UndoStarted | JobEventKind::UndoCompleted | JobEventKind::UndoFailed => {
+            reduce_undo_event(projection, event, undo_operations)?;
+        }
     }
     Ok(())
 }
 
-fn terminal(projection: &mut JobProjection, outcome: JobOutcome, reason: StopReason) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoEventState {
+    Started,
+    Completed,
+    Failed,
+}
+
+fn reduce_undo_event(
+    projection: &JobProjection,
+    event: &JobEvent,
+    operations: &mut BTreeMap<String, UndoEventState>,
+) -> Result<()> {
+    if projection.outcome != Some(JobOutcome::Verified)
+        || projection.delivery.as_ref().map(|delivery| delivery.kind)
+            != Some(JobDeliveryKind::Applied)
+    {
+        return Err(history_corrupt(
+            event.job_id.as_ref(),
+            "undo lifecycle facts require one previously applied Verified delivery",
+        ));
+    }
+    let operation_id = detail_string(&event.detail, "operation_id")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            history_corrupt(
+                event.job_id.as_ref(),
+                "undo lifecycle fact omitted its operation_id",
+            )
+        })?
+        .to_string();
+    match event.kind {
+        JobEventKind::UndoStarted => {
+            if operations
+                .values()
+                .any(|state| matches!(state, UndoEventState::Started | UndoEventState::Completed))
+                || operations
+                    .insert(operation_id, UndoEventState::Started)
+                    .is_some()
+            {
+                return Err(history_corrupt(
+                    event.job_id.as_ref(),
+                    "undo lifecycle contains a duplicate, concurrent, or post-completion start",
+                ));
+            }
+        }
+        JobEventKind::UndoCompleted | JobEventKind::UndoFailed => {
+            if operations.get(&operation_id) != Some(&UndoEventState::Started) {
+                return Err(history_corrupt(
+                    event.job_id.as_ref(),
+                    "undo terminal fact has no unique matching start",
+                ));
+            }
+            if event.kind == JobEventKind::UndoCompleted
+                && detail_string(&event.detail, "undo_revision")
+                    .is_none_or(|revision| revision.trim().is_empty())
+            {
+                return Err(history_corrupt(
+                    event.job_id.as_ref(),
+                    "completed undo omitted its resulting revision",
+                ));
+            }
+            operations.insert(
+                operation_id,
+                if event.kind == JobEventKind::UndoCompleted {
+                    UndoEventState::Completed
+                } else {
+                    UndoEventState::Failed
+                },
+            );
+        }
+        _ => unreachable!("caller filters undo event kinds"),
+    }
+    Ok(())
+}
+
+fn terminal(
+    projection: &mut JobProjection,
+    event: &JobEvent,
+    outcome: JobOutcome,
+    reason: StopReason,
+) -> Result<()> {
+    if !outcome.accepts_stop_reason(reason) {
+        return Err(history_corrupt(
+            event.job_id.as_ref(),
+            &format!(
+                "terminal event {:?} cannot classify the Job as {:?} with stop reason {:?}",
+                event.kind, outcome, reason
+            ),
+        ));
+    }
+    if projection.stop_reason == Some(StopReason::CancelRequested)
+        && outcome != JobOutcome::Cancelled
+        && !(outcome == JobOutcome::Blocked && reason == StopReason::LostContainment)
+    {
+        return Err(history_corrupt(
+            event.job_id.as_ref(),
+            "a durable cancellation request was overwritten by another terminal outcome",
+        ));
+    }
     projection.phase = JobPhase::Terminal;
     projection.outcome = Some(outcome);
     projection.stop_reason = Some(reason);
+    Ok(())
 }
 
 fn detail_string<'a>(detail: &'a Value, name: &str) -> Option<&'a str> {
     detail.get(name).and_then(Value::as_str)
 }
 
-fn detail_stop_reason(detail: &Value) -> Option<StopReason> {
-    let value = detail.get("stop_reason")?.clone();
-    serde_json::from_value(value).ok()
+fn detail_stop_reason(event: &JobEvent) -> Result<Option<StopReason>> {
+    let Some(value) = event.detail.get("stop_reason") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| {
+            history_corrupt(
+                event.job_id.as_ref(),
+                &format!("event {} has an invalid typed stop_reason", event.event_id),
+            )
+        })
 }
 
 fn job_delivery(event: &JobEvent, kind: JobDeliveryKind) -> Result<JobDelivery> {
@@ -900,6 +1120,120 @@ mod tests {
                 "{name} reused an existing outcome and stop-reason classification"
             );
         }
+    }
+
+    #[test]
+    fn incompatible_terminal_outcome_and_stop_reason_pairs_fail_closed() {
+        let cases = [
+            (
+                "corrupt-is-not-blocked",
+                JobEventKind::Blocked,
+                StopReason::CorruptHistory,
+            ),
+            (
+                "lost-containment-is-not-failed",
+                JobEventKind::Failed,
+                StopReason::LostContainment,
+            ),
+            (
+                "deadline-is-not-budget",
+                JobEventKind::BudgetExhausted,
+                StopReason::Deadline,
+            ),
+            (
+                "gate-failure-is-not-review",
+                JobEventKind::NeedsReview,
+                StopReason::FatalGate,
+            ),
+        ];
+
+        for (name, kind, reason) in cases {
+            let created = event(1, &format!("{name}-created"), JobEventKind::Created);
+            let mut stopped = event(2, &format!("{name}-stopped"), kind);
+            stopped.detail = json!({ "stop_reason": reason });
+            let events = vec![created, stopped];
+            let history = JobHistory {
+                raw_lines: events
+                    .iter()
+                    .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                    .collect(),
+                events,
+                caveats: Vec::new(),
+            };
+
+            let error = reduce_job_history(&JobId("job-1".into()), &history)
+                .expect_err("incompatible terminal pair must fail closed")
+                .to_string();
+            assert!(error.contains("cannot classify"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn malformed_typed_stop_reason_fails_closed() {
+        let created = event(1, "created", JobEventKind::Created);
+        let mut failed = event(2, "failed", JobEventKind::Failed);
+        failed.detail = json!({ "stop_reason": "definitely_not_a_reason" });
+        let events = vec![created, failed];
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+
+        let error = reduce_job_history(&JobId("job-1".into()), &history)
+            .expect_err("malformed stop reason must fail closed")
+            .to_string();
+        assert!(error.contains("invalid typed stop_reason"), "{error}");
+    }
+
+    #[test]
+    fn cancellation_remains_sticky_across_a_racing_verified_attempt_stop() {
+        let created = event(1, "created", JobEventKind::Created);
+        let cancelled_requested = event(2, "cancel-requested", JobEventKind::CancelRequested);
+        let mut stopped = event(3, "stopped", JobEventKind::AttemptStopped);
+        stopped.detail = json!({ "stop_reason": StopReason::Verified });
+        let cancelled = event(4, "cancelled", JobEventKind::Cancelled);
+        let events = vec![created, cancelled_requested, stopped, cancelled];
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+
+        let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("cancel wins");
+        assert_eq!(projection.outcome, Some(JobOutcome::Cancelled));
+        assert_eq!(projection.stop_reason, Some(StopReason::CancelRequested));
+    }
+
+    #[test]
+    fn terminal_verified_cannot_overwrite_a_durable_cancellation_request() {
+        let events = vec![
+            event(1, "created", JobEventKind::Created),
+            event(2, "cancel-requested", JobEventKind::CancelRequested),
+            event(3, "verified", JobEventKind::Verified),
+        ];
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+
+        let error = reduce_job_history(&JobId("job-1".into()), &history)
+            .expect_err("verified must not overwrite cancellation")
+            .to_string();
+        assert!(
+            error.contains("cancellation request was overwritten"),
+            "{error}"
+        );
     }
 
     #[test]

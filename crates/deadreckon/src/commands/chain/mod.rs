@@ -811,7 +811,8 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         }
         return Ok(chain.chain_id);
     }
-    validate_durable_chain_compatibility(&chain, base.as_deref(), no_hints)?;
+    let adapter_manifest =
+        validate_durable_chain_compatibility(&paths, &chain, base.as_deref(), no_hints)?;
     if !yes {
         if !io::stdin().is_terminal() {
             return Err(chain_create_refusal_surface(
@@ -847,6 +848,7 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
                 "durable chain launch is missing its contract preview".to_string(),
             ))
         })?,
+        &adapter_manifest,
         quiet,
     )
 }
@@ -1126,6 +1128,35 @@ fn durable_chain_migration_command(chain: &Chain) -> String {
     parts.join(" ")
 }
 
+const DURABLE_CHAIN_ADAPTER_SIGNAL: &str = "watchkeeper_chain_adapter";
+
+fn discovered_chain_hooks(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+) -> Result<Vec<deadreckon_core::chain::FrozenChainHook>> {
+    deadreckon_core::chain::ChainHookName::ALL
+        .into_iter()
+        .filter_map(|name| {
+            resolve_chain_hook_with_source(paths, cwd, name.as_str())
+                .map(|(source, path)| (name, source, path))
+        })
+        .map(|(name, source, path)| {
+            deadreckon_core::chain::FrozenChainHook::freeze(name, source, &path)
+                .map_err(CliError::from)
+        })
+        .collect()
+}
+
+fn durable_chain_adapter_manifest(
+    paths: &DeadreckonPaths,
+    chain: &Chain,
+) -> Result<deadreckon_core::chain::DurableChainAdapterManifest> {
+    Ok(deadreckon_core::chain::DurableChainAdapterManifest::new(
+        chain,
+        discovered_chain_hooks(paths, &chain.cwd)?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn unsupported_durable_chain_policy(
     step_count: usize,
@@ -1203,10 +1234,11 @@ fn durable_chain_policy_refusal(
 }
 
 fn validate_durable_chain_compatibility(
+    paths: &DeadreckonPaths,
     chain: &Chain,
     requested_base: Option<&str>,
     no_hints: bool,
-) -> Result<()> {
+) -> Result<deadreckon_core::chain::DurableChainAdapterManifest> {
     let unsupported = unsupported_durable_chain_policy(
         chain.steps.len(),
         chain.branch_policy,
@@ -1218,17 +1250,20 @@ fn validate_durable_chain_compatibility(
         &chain.sandbox,
         requested_base,
     );
-    if unsupported.is_empty() {
-        return Ok(());
+    if !unsupported.is_empty() {
+        return Err(durable_chain_policy_refusal(
+            &unsupported,
+            durable_chain_migration_command(chain),
+            no_hints,
+        ));
     }
-    Err(durable_chain_policy_refusal(
-        &unsupported,
-        durable_chain_migration_command(chain),
-        no_hints,
-    ))
+    durable_chain_adapter_manifest(paths, chain)
 }
 
-fn linear_chain_launch_plan(chain: &Chain) -> commands::course::LaunchPlan {
+fn linear_chain_launch_plan(
+    chain: &Chain,
+    adapter: &deadreckon_core::chain::DurableChainAdapterManifest,
+) -> Result<commands::course::LaunchPlan> {
     let ordered_goal = ordered_chain_goal(
         &chain
             .steps
@@ -1271,7 +1306,13 @@ fn linear_chain_launch_plan(chain: &Chain) -> commands::course::LaunchPlan {
             }
         })
         .collect();
-    launch
+    let mut signals = launch.signals.as_object().cloned().unwrap_or_default();
+    signals.insert(
+        DURABLE_CHAIN_ADAPTER_SIGNAL.to_string(),
+        serde_json::to_value(adapter)?,
+    );
+    launch.signals = serde_json::Value::Object(signals);
+    Ok(launch)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1284,6 +1325,7 @@ fn schedule_linear_chain_job(
     acceptance: Option<&Path>,
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
     contract_preview: &ChainContractPreview,
+    adapter_manifest: &deadreckon_core::chain::DurableChainAdapterManifest,
     quiet: bool,
 ) -> Result<String> {
     let job = create_linear_chain_job(
@@ -1296,6 +1338,7 @@ fn schedule_linear_chain_job(
             acceptance,
             accepted_by,
             contract_preview,
+            adapter_manifest,
         },
     )?;
     commands::job::launch_detached_supervisor(paths, &job.job_id)?;
@@ -1315,6 +1358,7 @@ struct LinearChainJobRequest<'a> {
     acceptance: Option<&'a Path>,
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
     contract_preview: &'a ChainContractPreview,
+    adapter_manifest: &'a deadreckon_core::chain::DurableChainAdapterManifest,
 }
 
 fn create_linear_chain_job(
@@ -1328,6 +1372,8 @@ fn create_linear_chain_job(
     let acceptance = request.acceptance;
     let accepted_by = request.accepted_by;
     let contract_preview = request.contract_preview;
+    let adapter_manifest = request.adapter_manifest;
+    adapter_manifest.verify()?;
     let defaults = config_defaults(paths)?;
     let approved_max_spend_usd = chain.max_spend_usd.or(defaults.max_spend).unwrap_or(10.0);
     let approved_max_wall_seconds = chain
@@ -1372,7 +1418,7 @@ fn create_linear_chain_job(
             "raise --max-wall-seconds or provide ordered goals directly to skip planning",
         )));
     }
-    let mut launch = linear_chain_launch_plan(chain);
+    let mut launch = linear_chain_launch_plan(chain, adapter_manifest)?;
     launch.budget.ceiling_usd = Some(execution_max_spend_usd);
     launch.budget.wall_seconds = Some(execution_max_wall_seconds);
     launch.budget.deadline = deadline;
@@ -1422,7 +1468,10 @@ fn create_linear_chain_job(
         driver: Some(commands::graph_job::DriverSpec {
             kind: commands::graph_job::DriverKind::FullPlan,
             child_count: Some(child_count),
-            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            // A chain is ordered delivery: each verified step lands inside
+            // the Job-local candidate before the next step starts. The
+            // candidate is promoted only after the parent gate and judge.
+            apply: deadreckon_core::plan::ApplyWhen::PerNode,
             planner_provider: None,
             child_provider: chain.provider.clone(),
             child_provider_overrides: Vec::new(),
@@ -2426,14 +2475,31 @@ fn invoke_chain_hook(
 }
 
 fn resolve_chain_hook(paths: &DeadreckonPaths, cwd: &Path, hook: &str) -> Option<PathBuf> {
+    resolve_chain_hook_with_source(paths, cwd, hook).map(|(_, path)| path)
+}
+
+fn resolve_chain_hook_with_source(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    hook: &str,
+) -> Option<(deadreckon_core::chain::ChainHookSource, PathBuf)> {
     let mut candidates = vec![
-        cwd.join(".deadreckon/hooks/chain").join(hook),
-        paths.home().join("hooks/chain").join(hook),
+        (
+            deadreckon_core::chain::ChainHookSource::Workspace,
+            cwd.join(".deadreckon/hooks/chain").join(hook),
+        ),
+        (
+            deadreckon_core::chain::ChainHookSource::User,
+            paths.home().join("hooks/chain").join(hook),
+        ),
     ];
     if let Some(root) = deadreckon_core::source_root() {
-        candidates.push(root.join("hooks/chain").join(hook));
+        candidates.push((
+            deadreckon_core::chain::ChainHookSource::Installation,
+            root.join("hooks/chain").join(hook),
+        ));
     }
-    candidates.into_iter().find(|path| path.exists())
+    candidates.into_iter().find(|(_, path)| path.exists())
 }
 
 fn chain_status_command(
@@ -4636,7 +4702,8 @@ mod tests {
     #[test]
     fn durable_chain_compiles_to_a_strict_linear_graph() {
         let chain = sample_chain(&["first", "second", "third"]);
-        let launch = linear_chain_launch_plan(&chain);
+        let adapter = deadreckon_core::chain::DurableChainAdapterManifest::new(&chain, Vec::new());
+        let launch = linear_chain_launch_plan(&chain, &adapter).expect("launch plan");
 
         assert_eq!(launch.shape, commands::course::CourseShape::Plan);
         assert_eq!(launch.n, Some(3));
@@ -4656,7 +4723,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_chain_freezes_one_graph_job_with_at_end_verification() {
+    fn durable_chain_freezes_one_graph_job_with_isolated_per_node_delivery() {
         let home = tempfile::tempdir().expect("home");
         let source = tempfile::tempdir().expect("source");
         fs::write(source.path().join("README.md"), "source\n").expect("source file");
@@ -4672,6 +4739,7 @@ mod tests {
         let contract_preview =
             chain_contract_preview(Some(&acceptance), &chain.cwd).expect("contract preview");
         let deadline = Utc::now() + chrono::TimeDelta::hours(2);
+        let adapter = durable_chain_adapter_manifest(&paths, &chain).expect("chain adapter");
 
         let job = create_linear_chain_job(
             &paths,
@@ -4683,6 +4751,7 @@ mod tests {
                 acceptance: Some(&acceptance),
                 accepted_by: deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
                 contract_preview: &contract_preview,
+                adapter_manifest: &adapter,
             },
         )
         .expect("create graph job");
@@ -4699,7 +4768,7 @@ mod tests {
         assert_ne!(job.job_id.as_ref(), chain.chain_id);
         assert_eq!(launch.pieces.len(), 3);
         assert_eq!(driver.kind, commands::graph_job::DriverKind::FullPlan);
-        assert_eq!(driver.apply, deadreckon_core::plan::ApplyWhen::AtEnd);
+        assert_eq!(driver.apply, deadreckon_core::plan::ApplyWhen::PerNode);
         assert_eq!(driver.child_count, Some(3));
         assert_eq!(
             launch.signals["watchkeeper_pre_job_budget"]["approved_total_spend_usd"],
@@ -4712,6 +4781,18 @@ mod tests {
         assert_eq!(
             launch.signals["watchkeeper_pre_job_budget"]["job_execution_spend_cap_usd"],
             2.5
+        );
+        assert_eq!(
+            launch.signals[DURABLE_CHAIN_ADAPTER_SIGNAL]["undo"]["kind"],
+            "revert_applied_delivery"
+        );
+        assert_eq!(
+            launch.signals[DURABLE_CHAIN_ADAPTER_SIGNAL]["source_base_sha"],
+            chain.base_sha
+        );
+        assert_eq!(
+            launch.signals[DURABLE_CHAIN_ADAPTER_SIGNAL]["hooks"],
+            json!([])
         );
         assert!(paths.job_authority(job.job_id.as_ref()).is_file());
         assert!(paths.job_events(job.job_id.as_ref()).is_file());
@@ -4734,6 +4815,65 @@ mod tests {
     }
 
     #[test]
+    fn chain_hooks_and_undo_survive_job_adapter_without_silent_execution() {
+        let home = tempfile::tempdir().expect("home");
+        let source = tempfile::tempdir().expect("source");
+        let paths = DeadreckonPaths::from_home(home.path());
+        fs::write(source.path().join("README.md"), "source\n").expect("source file");
+        let hook_dir = source.path().join(".deadreckon/hooks/chain");
+        fs::create_dir_all(&hook_dir).expect("hook dir");
+        let hook_path = hook_dir.join("pre-step");
+        let approved_bytes = b"#!/bin/sh\necho checked\nexit 0\n";
+        fs::write(&hook_path, approved_bytes).expect("hook");
+        let mut chain = sample_chain(&["first", "second"]);
+        chain.cwd = source.path().to_path_buf();
+
+        let manifest = durable_chain_adapter_manifest(&paths, &chain).expect("adapter manifest");
+        assert_eq!(manifest.hooks.len(), 1);
+        assert_eq!(
+            manifest.hooks[0].name,
+            deadreckon_core::chain::ChainHookName::PreStep
+        );
+        assert_eq!(
+            manifest.hooks[0].source,
+            deadreckon_core::chain::ChainHookSource::Workspace
+        );
+        assert_eq!(
+            manifest.hooks[0].content_sha256,
+            deadreckon_core::flight::sha256_file(&hook_path).expect("hook digest")
+        );
+        assert_eq!(manifest.hooks[0].approved_bytes, approved_bytes);
+        assert!(manifest.hooks[0].identity_sha256.starts_with("sha256:"));
+        assert_eq!(
+            manifest.undo.kind,
+            deadreckon_core::chain::DurableChainUndoKind::RevertAppliedDelivery
+        );
+
+        let launch = linear_chain_launch_plan(&chain, &manifest).expect("signed launch input");
+        let embedded: deadreckon_core::chain::DurableChainAdapterManifest =
+            serde_json::from_value(launch.signals[DURABLE_CHAIN_ADAPTER_SIGNAL].clone())
+                .expect("embedded adapter");
+        assert_eq!(embedded.hooks[0].approved_bytes, approved_bytes);
+        fs::write(&hook_path, b"#!/bin/sh\necho changed\nexit 2\n").expect("mutate original");
+        fs::remove_file(&hook_path).expect("delete original");
+        embedded
+            .verify()
+            .expect("signed launch bytes do not depend on the original path");
+
+        let compatible = validate_durable_chain_compatibility(&paths, &chain, None, false)
+            .expect("deleted hook no longer participates in a new preflight");
+        assert!(compatible.hooks.is_empty());
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .next()
+                    .is_none(),
+            "compatibility preflight must not create Job state"
+        );
+    }
+
+    #[test]
     fn exhausted_pre_job_planner_budget_refuses_before_job_creation() {
         let home = tempfile::tempdir().expect("home");
         let source = tempfile::tempdir().expect("source");
@@ -4741,6 +4881,7 @@ mod tests {
         let mut chain = sample_chain(&["first", "second"]);
         chain.cwd = source.path().to_path_buf();
         let contract_preview = chain_contract_preview(None, &chain.cwd).expect("contract preview");
+        let adapter = durable_chain_adapter_manifest(&paths, &chain).expect("chain adapter");
 
         let error = create_linear_chain_job(
             &paths,
@@ -4752,6 +4893,7 @@ mod tests {
                 acceptance: None,
                 accepted_by: deadreckon_protocol::AuthorityAcceptedBy::Operator,
                 contract_preview: &contract_preview,
+                adapter_manifest: &adapter,
             },
         )
         .expect_err("planner exhausted the approved total");
@@ -4762,6 +4904,8 @@ mod tests {
 
     #[test]
     fn durable_chain_refuses_policies_the_graph_cannot_preserve() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = DeadreckonPaths::from_home(temp.path());
         let mut chain = sample_chain(&["first", "second"]);
         chain.branch_policy = BranchPolicy::Base;
         chain.apply_mode = ApplyMode::Manual;
@@ -4770,8 +4914,9 @@ mod tests {
         chain.on_fail = OnFail::Continue;
         chain.circuit_breaker_threshold = 4;
 
-        let error = validate_durable_chain_compatibility(&chain, Some("release/base"), false)
-            .expect_err("manual apply must remain a legacy-only inspection artifact");
+        let error =
+            validate_durable_chain_compatibility(&paths, &chain, Some("release/base"), false)
+                .expect_err("manual apply must remain a legacy-only inspection artifact");
         let rendered = error.to_string();
 
         assert!(rendered.contains("legacy conductor-only policies"));
@@ -4807,10 +4952,12 @@ mod tests {
 
     #[test]
     fn durable_chain_refuses_unsandboxed_trusted_execution() {
+        let temp = tempfile::tempdir().expect("home");
+        let paths = DeadreckonPaths::from_home(temp.path());
         let mut chain = sample_chain(&["first", "second"]);
         chain.sandbox = "none".to_string();
 
-        let error = validate_durable_chain_compatibility(&chain, None, false)
+        let error = validate_durable_chain_compatibility(&paths, &chain, None, false)
             .expect_err("sandbox none must fail closed");
 
         assert!(error.to_string().contains("sandbox none"));

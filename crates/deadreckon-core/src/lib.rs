@@ -11,6 +11,7 @@ pub mod cancel;
 pub mod chain;
 pub mod codebase;
 pub mod completion;
+pub mod delivery;
 pub mod docs;
 pub mod error;
 pub mod events;
@@ -70,6 +71,13 @@ pub use codebase::{
 pub use completion::{
     SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
 };
+pub use delivery::{
+    GitDeliveryTarget, JobOperationLock, ValidatedAppliedGitDeliveryReceipt,
+    ValidatedGitDeliveryIntent, acquire_job_operation_lock, seal_applied_git_delivery_receipt,
+    seal_git_delivery_intent, validate_applied_git_delivery_receipt,
+    validate_applied_git_delivery_receipt_snapshot, validate_git_delivery_intent,
+    validate_git_delivery_intent_snapshot,
+};
 pub use docs::{
     AS_BUILT_DELTA, DOCS_DIR, DocKind, DocsStatus, FileChange, FrontmatterFields,
     IMPLEMENTATION_NOTES_HTML, INCREMENTAL_JSONL, ImplementationNotesStatus, POLISH_JSON,
@@ -125,9 +133,10 @@ pub use job::{
     reduce_job_history, write_job,
 };
 pub use job_lease::{
-    FencedJobJsonEvent, LeaseClaim, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason,
-    LeaseToken, append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease,
-    replace_fenced_job_json_and_append_event,
+    CreateFencedJobJsonDisposition, FencedJobJsonEvent, LeaseClaim, LeaseClaimDisposition,
+    LeaseOwner, LeaseReclaimReason, LeaseToken, append_fenced_job_event,
+    append_next_fenced_job_event, claim_job_lease, create_fenced_job_json_and_append_event,
+    heartbeat_job_lease, load_job_lease, replace_fenced_job_json_and_append_event,
 };
 pub use lock::{
     LockGuard, LockState, LockStatus, acquire_lock, lock_status, pid_is_alive, release_lock_file,
@@ -147,10 +156,11 @@ pub use plan::{
     PLAN_CHILD_PARENT_JSON, PLAN_EVENTS_JSONL, PLAN_JSON, PLAN_MESSAGES_JSONL, Plan,
     PlanChildMarker, PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode,
     PlanProviders, PlanRole, PlanStatus, PlanTask, PlanTaskStatus, SUMMARIES_DIR, WORKER_SPECS_DIR,
-    append_plan_event, append_plan_message, child_summary_relative_path, load_plan, plan_task_key,
-    read_plan_events, read_plan_messages, save_plan, validate_task_count, validate_task_graph,
-    worker_spec_relative_path, write_child_summary, write_coordinator_state,
-    write_plan_child_marker, write_worker_spec,
+    append_owned_plan_event_fenced, append_owned_plan_message_fenced, append_plan_event,
+    append_plan_message, child_summary_relative_path, load_plan, plan_task_key, read_plan_events,
+    read_plan_messages, save_owned_plan_fenced, save_plan, validate_task_count,
+    validate_task_graph, worker_spec_relative_path, write_child_summary, write_coordinator_state,
+    write_owned_coordinator_state_fenced, write_plan_child_marker, write_worker_spec,
 };
 pub use polish_subcalls::{
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DocProviderSelection,

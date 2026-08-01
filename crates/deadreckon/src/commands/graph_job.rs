@@ -4,14 +4,14 @@
 //! mutable sidecar records which existing Plan or Campaign artifact belongs to
 //! the parent Job; it is navigation evidence, never completion authority.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
     CompletionReceipt, JobEventKind, JobId, JobShape, SemanticDecision, SpendRecord, StopReason,
     TraceRecord,
@@ -36,6 +36,22 @@ const CAMPAIGN_SUB_LAUNCH_PROTOCOL: &str = "delegated_campaign_sub_v1";
 const CAMPAIGN_SUB_LAUNCH_DIR: &str = "campaign-sub-launches";
 const CAMPAIGN_SUB_RELEASE_ACK_DIR: &str = "release-acks";
 const MERGE_REPAIR_AUTHORITY_DIR: &str = "merge-repair-authorities";
+const ORDERED_CANDIDATE_MANIFEST: &str = "ordered-candidate.json";
+const ORDERED_CANDIDATE_DIR: &str = "ordered-candidate";
+const ORDERED_CANDIDATE_BRANCH: &str = "deadreckon-ordered-candidate";
+const DURABLE_CHAIN_ADAPTER_SIGNAL: &str = "watchkeeper_chain_adapter";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrderedCandidateManifest {
+    schema_version: u32,
+    job_id: String,
+    source_tree_sha256: String,
+    workspace: PathBuf,
+    branch: String,
+    initial_revision: String,
+    prepared_at: chrono::DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,11 +91,14 @@ struct DriverContext {
     acceptance_path: PathBuf,
     authority: commands::supervisor::GuardedDriverAuthority,
     root_artifact: bool,
+    durable_chain: Option<deadreckon_core::chain::DurableChainAdapterManifest>,
 }
 
 static DRIVER_CONTEXT: OnceLock<DriverContext> = OnceLock::new();
 static DELEGATED_PLAN_CHILD: OnceLock<deadreckon_core::RunOwnership> = OnceLock::new();
 static DELEGATED_CHILD_RUN_ID: OnceLock<String> = OnceLock::new();
+static DELEGATED_PLAN_AUTHORITY: OnceLock<commands::supervisor::GuardedDriverAuthority> =
+    OnceLock::new();
 static DELEGATED_REPAIR_AUTHORITY: OnceLock<commands::supervisor::GuardedDriverAuthority> =
     OnceLock::new();
 
@@ -91,6 +110,7 @@ pub(crate) enum DelegatedAction {
         task_id: String,
         task_index: u32,
         task_attempt: u32,
+        run_id: String,
     },
     PlanFork {
         plan_id: String,
@@ -353,6 +373,10 @@ pub(crate) enum ParentCompletion {
         reason: String,
         stop_reason: StopReason,
     },
+    Failed {
+        reason: String,
+        stop_reason: StopReason,
+    },
     Cancelled {
         reason: String,
     },
@@ -512,13 +536,10 @@ pub(crate) fn embed_driver_spec(
     driver: &DriverSpec,
 ) -> Result<()> {
     let mut driver = driver.clone();
-    if matches!(
-        driver.kind,
-        DriverKind::Review | DriverKind::FullPlan | DriverKind::Campaign
-    ) {
-        // A PerNode plan mutates the approved source while the durable parent
-        // is still being verified. Strict Graph Jobs therefore always merge
-        // in isolation and expose one receipt-bound parent result at the end.
+    if driver.kind == DriverKind::Campaign {
+        // The legacy Campaign adapter has no ordered candidate workspace.
+        // Provider-drawn nested graphs now remain Plans, whose PerNode mode is
+        // isolated below instead of being silently rewritten.
         driver.apply = deadreckon_core::plan::ApplyWhen::AtEnd;
     }
     let mut signals = plan.signals.as_object().cloned().unwrap_or_default();
@@ -538,6 +559,285 @@ pub(crate) fn driver_spec(plan: &commands::course::LaunchPlan) -> Result<DriverS
 
 pub(crate) fn driver_state_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
     paths.job_dir(job_id).join(DRIVER_STATE_FILE)
+}
+
+fn ordered_candidate_manifest_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
+    paths.job_dir(job_id).join(ORDERED_CANDIDATE_MANIFEST)
+}
+
+fn ordered_candidate_workspace(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(ORDERED_CANDIDATE_DIR)
+        .join("workspace")
+}
+
+fn load_ordered_candidate_manifest(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<OrderedCandidateManifest> {
+    let path = ordered_candidate_manifest_path(paths, job_id);
+    serde_json::from_slice(&fs::read(&path)?).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })
+    })
+}
+
+fn validate_ordered_candidate_manifest(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    authority: &deadreckon_protocol::JobAuthority,
+    manifest: &OrderedCandidateManifest,
+) -> Result<PathBuf> {
+    let expected = ordered_candidate_workspace(paths, job.job_id.as_ref());
+    if manifest.schema_version != 1
+        || manifest.job_id != job.job_id.as_ref()
+        || manifest.source_tree_sha256 != authority.source_tree_sha256
+        || manifest.workspace != expected
+        || manifest.branch != ORDERED_CANDIDATE_BRANCH
+        || manifest.initial_revision.trim().is_empty()
+        || !manifest.workspace.is_dir()
+        || !manifest.workspace.join(".git").exists()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} changed or is incomplete",
+            job.job_id
+        ))));
+    }
+    let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))?;
+    let durable_manifest = history.events().iter().any(|event| {
+        event.kind == JobEventKind::WorkspacePrepared
+            && event
+                .detail
+                .get("workspace_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("ordered_candidate")
+            && event
+                .detail
+                .get("workspace")
+                .and_then(serde_json::Value::as_str)
+                == manifest.workspace.to_str()
+            && event
+                .detail
+                .get("branch")
+                .and_then(serde_json::Value::as_str)
+                == Some(manifest.branch.as_str())
+            && event
+                .detail
+                .get("initial_revision")
+                .and_then(serde_json::Value::as_str)
+                == Some(manifest.initial_revision.as_str())
+            && event
+                .detail
+                .get("source_tree_sha256")
+                .and_then(serde_json::Value::as_str)
+                == Some(manifest.source_tree_sha256.as_str())
+    });
+    if !durable_manifest {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} is not backed by Job history",
+            job.job_id
+        ))));
+    }
+    let branch = git_stdout(&manifest.workspace, &["symbolic-ref", "--short", "HEAD"])?;
+    if branch != manifest.branch {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} changed branch from {} to {branch}",
+            job.job_id, manifest.branch
+        ))));
+    }
+    git_status(
+        &manifest.workspace,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &manifest.initial_revision,
+            "HEAD",
+        ],
+    )
+    .map_err(|_| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} no longer descends from its approved baseline",
+            job.job_id
+        )))
+    })?;
+    let dirty = git_stdout(&manifest.workspace, &["status", "--porcelain"])?;
+    if !dirty.trim().is_empty() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} has an incomplete landing",
+            job.job_id
+        ))));
+    }
+    let head = git_stdout(&manifest.workspace, &["rev-parse", "HEAD^{commit}"])?;
+    let application_events = deadreckon_core::plan::read_ordered_candidate_application_events(
+        paths,
+        job.job_id.as_ref(),
+    )?;
+    if application_events
+        .iter()
+        .any(|event| event.plan_id != job.job_id.as_ref())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} has application evidence for another Plan",
+            job.job_id
+        ))));
+    }
+    let application_fold = deadreckon_core::plan::fold_ordered_candidate_application_events(
+        &application_events,
+        &manifest.initial_revision,
+    )?;
+    if head != application_fold.expected_head_revision {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate workspace for Job {} has clean unledgered HEAD {head}; expected {}",
+            job.job_id, application_fold.expected_head_revision
+        ))));
+    }
+    Ok(manifest.workspace.clone())
+}
+
+fn persist_ordered_candidate_manifest(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    manifest: &OrderedCandidateManifest,
+) -> Result<()> {
+    deadreckon_core::replace_fenced_job_json_and_append_event(
+        paths,
+        token,
+        Utc::now(),
+        &ordered_candidate_manifest_path(paths, token.job_id.as_ref()),
+        deadreckon_core::FencedJobJsonEvent {
+            kind: JobEventKind::WorkspacePrepared,
+            causation_id: format!("ordered-candidate:{}:{}", token.job_id, token.epoch),
+            detail: json!({
+                "workspace_kind": "ordered_candidate",
+                "workspace": manifest.workspace,
+                "branch": manifest.branch,
+                "initial_revision": manifest.initial_revision,
+                "source_tree_sha256": manifest.source_tree_sha256,
+            }),
+        },
+        manifest,
+    )?;
+    Ok(())
+}
+
+fn prepare_ordered_candidate(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    authority: &deadreckon_protocol::JobAuthority,
+    token: &deadreckon_core::LeaseToken,
+) -> Result<PathBuf> {
+    if token.job_id != job.job_id || authority.job_id != job.job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate authority does not match its Job".to_string(),
+        )));
+    }
+    let manifest_path = ordered_candidate_manifest_path(paths, job.job_id.as_ref());
+    if manifest_path.is_file() {
+        let manifest = load_ordered_candidate_manifest(paths, job.job_id.as_ref())?;
+        super::plan::reconcile_prepared_ordered_candidate_application(
+            paths,
+            token,
+            &manifest.initial_revision,
+            &manifest.workspace,
+        )?;
+        return validate_ordered_candidate_manifest(paths, job, authority, &manifest);
+    }
+    let workspace = ordered_candidate_workspace(paths, job.job_id.as_ref());
+    let candidate_root = workspace.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "ordered candidate path has no protected parent".to_string(),
+        ))
+    })?;
+    fs::create_dir_all(candidate_root)?;
+    let staging = candidate_root.join(format!("workspace-preparing-{}", token.epoch));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+
+    let initial_revision = if workspace.is_dir() {
+        let candidate_tree =
+            deadreckon_core::flight::build_deliverable_file_index(&workspace)?.tree_hash();
+        let branch = git_stdout(&workspace, &["symbolic-ref", "--short", "HEAD"])?;
+        let dirty = git_stdout(&workspace, &["status", "--porcelain"])?;
+        if candidate_tree != authority.source_tree_sha256
+            || branch != ORDERED_CANDIDATE_BRANCH
+            || !dirty.trim().is_empty()
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "uncommitted ordered candidate workspace for Job {} cannot be recovered safely",
+                job.job_id
+            ))));
+        }
+        git_stdout(&workspace, &["rev-parse", "HEAD"])?
+    } else {
+        let current_source_tree =
+            deadreckon_core::flight::build_deliverable_file_index(&job.source_cwd)?.tree_hash();
+        if current_source_tree != authority.source_tree_sha256 {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate refused because Job {} source changed after approval",
+                job.job_id
+            ))));
+        }
+        deadreckon_core::copy_deliverable_tree(&job.source_cwd, &staging)?;
+        let staged_tree =
+            deadreckon_core::flight::build_deliverable_file_index(&staging)?.tree_hash();
+        if staged_tree != authority.source_tree_sha256 {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "ordered candidate copy does not match the approved source tree".to_string(),
+            )));
+        }
+        git_status(&staging, &["init", "--quiet"])?;
+        git_status(
+            &staging,
+            &["checkout", "--quiet", "-b", ORDERED_CANDIDATE_BRANCH],
+        )?;
+        git_status(&staging, &["add", "--all"])?;
+        git_status(
+            &staging,
+            &[
+                "-c",
+                "user.name=DeadReckon",
+                "-c",
+                "user.email=deadreckon@localhost",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "DeadReckon approved ordered candidate",
+            ],
+        )?;
+        let revision = git_stdout(&staging, &["rev-parse", "HEAD"])?;
+        fs::rename(&staging, &workspace)?;
+        revision
+    };
+
+    let manifest = OrderedCandidateManifest {
+        schema_version: 1,
+        job_id: job.job_id.as_ref().to_string(),
+        source_tree_sha256: authority.source_tree_sha256.clone(),
+        workspace: workspace.clone(),
+        branch: ORDERED_CANDIDATE_BRANCH.to_string(),
+        initial_revision,
+        prepared_at: Utc::now(),
+    };
+    persist_ordered_candidate_manifest(paths, token, &manifest)?;
+    validate_ordered_candidate_manifest(paths, job, authority, &manifest)
+}
+
+fn expected_plan_parent_cwd(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    authority: &deadreckon_protocol::JobAuthority,
+    driver: &DriverSpec,
+) -> Result<PathBuf> {
+    if driver.apply != deadreckon_core::plan::ApplyWhen::PerNode {
+        return Ok(job.source_cwd.clone());
+    }
+    let manifest = load_ordered_candidate_manifest(paths, job.job_id.as_ref())?;
+    validate_ordered_candidate_manifest(paths, job, authority, &manifest)
 }
 
 fn parent_repair_intent_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
@@ -725,6 +1025,540 @@ pub(crate) fn current_parent_job_id() -> Option<&'static str> {
     DRIVER_CONTEXT.get().map(|context| context.job_id.as_str())
 }
 
+fn durable_chain_adapter_from_launch(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Option<deadreckon_core::chain::DurableChainAdapterManifest>> {
+    let job = deadreckon_core::load_job(paths, job_id)?;
+    let launch_path = paths.job_launch_plan(job_id);
+    if deadreckon_core::flight::sha256_file(&launch_path)? != job.launch_plan_sha256 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain launch plan changed after approval".to_string(),
+        )));
+    }
+    let authority_path = paths.job_authority(job_id);
+    if deadreckon_core::flight::sha256_file(&authority_path)? != job.authority_sha256 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain authority changed after approval".to_string(),
+        )));
+    }
+    let launch = commands::course::load_launch_plan(&launch_path)?;
+    let Some(value) = launch.signals.get(DURABLE_CHAIN_ADAPTER_SIGNAL) else {
+        return Ok(None);
+    };
+    let adapter: deadreckon_core::chain::DurableChainAdapterManifest =
+        serde_json::from_value(value.clone())?;
+    adapter.verify()?;
+    if adapter.branch_policy != deadreckon_core::plan::BranchPolicy::Stack
+        || adapter.apply_mode != deadreckon_core::plan::ApplyMode::Auto
+        || adapter.apply_strategy != deadreckon_core::plan::ApplyStrategy::Squash
+        || adapter.on_fail != deadreckon_core::plan::OnFail::Stop
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain adapter contains a policy the Graph executor cannot preserve"
+                .to_string(),
+        )));
+    }
+    let authority: deadreckon_protocol::JobAuthority =
+        serde_json::from_slice(&fs::read(&authority_path)?)?;
+    if authority.job_id.as_ref() != job_id
+        || authority.source_revision.as_deref() != Some(adapter.source_base_sha.as_str())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain source base is not bound to the approved Job authority".to_string(),
+        )));
+    }
+    Ok(Some(adapter))
+}
+
+fn current_durable_chain_adapter(
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<Option<&'static deadreckon_core::chain::DurableChainAdapterManifest>> {
+    let Some(context) = DRIVER_CONTEXT.get() else {
+        return Ok(None);
+    };
+    let Some(adapter) = context.durable_chain.as_ref() else {
+        return Ok(None);
+    };
+    if plan.owner_job_id.as_deref() != Some(context.job_id.as_str())
+        || plan.plan_id != context.job_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain hooks may execute only for the owning root Job Plan".to_string(),
+        )));
+    }
+    if plan.apply != deadreckon_core::plan::ApplyWhen::PerNode
+        || plan.branch_policy != adapter.branch_policy
+        || plan.apply_strategy != adapter.apply_strategy
+        || plan.on_fail != adapter.on_fail
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain Plan changed an approved execution policy".to_string(),
+        )));
+    }
+    Ok(Some(adapter))
+}
+
+fn durable_chain_hook_for(
+    adapter: &deadreckon_core::chain::DurableChainAdapterManifest,
+    name: deadreckon_core::chain::ChainHookName,
+) -> Option<&deadreckon_core::chain::FrozenChainHook> {
+    adapter.hooks.iter().find(|hook| hook.name == name)
+}
+
+fn validate_durable_chain_hook_history(
+    events: &[deadreckon_core::chain::DurableChainHookEvent],
+    job_id: &str,
+    adapter: &deadreckon_core::chain::DurableChainAdapterManifest,
+) -> Result<()> {
+    use deadreckon_core::chain::DurableChainHookEventKind;
+
+    let mut seen = std::collections::BTreeMap::<String, (bool, bool)>::new();
+    for event in events {
+        event.verify()?;
+        let hook = durable_chain_hook_for(adapter, event.hook.name).ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "durable chain hook history names unapproved hook {}",
+                event.hook.name.as_str()
+            )))
+        })?;
+        if event.schema_version != 1
+            || event.job_id.as_ref() != job_id
+            || event.source_chain_id != adapter.source_chain_id
+            || event.attempt == 0
+            || (event.hook.name == deadreckon_core::chain::ChainHookName::OnChainEnd)
+                != event.step_index.is_none()
+            || &event.hook != hook
+            || event.invocation_id
+                != deadreckon_core::chain::durable_chain_hook_invocation_id(
+                    job_id,
+                    &adapter.source_chain_id,
+                    hook,
+                    event.step_index,
+                    event.attempt,
+                    &event.payload_sha256,
+                )
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "durable chain hook history is not bound to its approved invocation".to_string(),
+            )));
+        }
+        let state = seen.entry(event.invocation_id.clone()).or_default();
+        match event.kind {
+            DurableChainHookEventKind::Started if !state.0 && !state.1 => state.0 = true,
+            DurableChainHookEventKind::Completed if state.0 && !state.1 => {
+                if event.exit_code.is_none() {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "completed durable chain hook evidence has no exit code".to_string(),
+                    )));
+                }
+                state.1 = true;
+            }
+            _ => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "durable chain hook invocation {} has duplicate or out-of-order evidence",
+                    event.invocation_id
+                ))));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_durable_chain_completion_evidence(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    authority: &deadreckon_protocol::JobAuthority,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<()> {
+    let Some(adapter) = durable_chain_adapter_from_launch(paths, job.job_id.as_ref())? else {
+        return Ok(());
+    };
+    if plan.plan_id != job.job_id.as_ref()
+        || plan.owner_job_id.as_deref() != Some(job.job_id.as_ref())
+        || plan.apply != deadreckon_core::plan::ApplyWhen::PerNode
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain completion lost its approved ordered Plan identity".to_string(),
+        )));
+    }
+    let manifest = load_ordered_candidate_manifest(paths, job.job_id.as_ref())?;
+    validate_ordered_candidate_manifest(paths, job, authority, &manifest)?;
+
+    use deadreckon_core::chain::DurableChainHookEventKind;
+    let events = deadreckon_core::chain::read_durable_chain_hook_events(paths, &job.job_id)?;
+    validate_durable_chain_hook_history(&events, job.job_id.as_ref(), &adapter)?;
+    let mut completion = std::collections::BTreeMap::<&str, (bool, bool)>::new();
+    for event in &events {
+        let state = completion.entry(event.invocation_id.as_str()).or_default();
+        match event.kind {
+            DurableChainHookEventKind::Started => state.0 = true,
+            DurableChainHookEventKind::Completed => state.1 = true,
+        }
+    }
+    if completion.values().any(|state| !state.0 || !state.1) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain completion has a hook invocation with unknown external outcome"
+                .to_string(),
+        )));
+    }
+    Ok(())
+}
+
+fn write_durable_hook_payload(
+    stdin: &mut dyn std::io::Write,
+    canonical_payload: &[u8],
+) -> Result<()> {
+    match stdin.write_all(canonical_payload) {
+        Ok(()) => match stdin.write_all(b"\n") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_frozen_durable_chain_hook(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    adapter: &deadreckon_core::chain::DurableChainAdapterManifest,
+    hook: &deadreckon_core::chain::FrozenChainHook,
+    step_index: Option<u32>,
+    attempt: u32,
+    cwd: &Path,
+    payload: &serde_json::Value,
+) -> Result<i32> {
+    use deadreckon_core::chain::{DurableChainHookEvent, DurableChainHookEventKind};
+
+    adapter.verify()?;
+    if attempt == 0 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain hook invocation has invalid fenced identity".to_string(),
+        )));
+    }
+    let requested = DurableChainHookEvent::started(
+        token.job_id.clone(),
+        adapter.source_chain_id.clone(),
+        hook.clone(),
+        step_index,
+        attempt,
+        Utc::now(),
+        payload,
+    )?;
+    let invocation_id = requested.invocation_id.clone();
+    let events = deadreckon_core::chain::read_durable_chain_hook_events(paths, &token.job_id)?;
+    validate_durable_chain_hook_history(&events, token.job_id.as_ref(), adapter)?;
+    if let Some(completed) =
+        deadreckon_core::chain::reusable_durable_chain_hook_completion(&events, &requested)?
+    {
+        return completed.exit_code.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "completed durable chain hook evidence has no exit code".to_string(),
+            ))
+        });
+    }
+    let mut started = None;
+    for event in events
+        .into_iter()
+        .filter(|event| event.invocation_id == invocation_id)
+    {
+        match event.kind {
+            DurableChainHookEventKind::Started => started = Some(event),
+            DurableChainHookEventKind::Completed => {}
+        }
+    }
+    if started.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "chain hook {} started before the worker was interrupted; its external outcome is unknown",
+                hook.name.as_str()
+            ),
+            "inspect the Job hook evidence and explicitly replace or terminate the Job",
+        )));
+    }
+
+    let approved_hook_path = deadreckon_core::chain::materialize_fenced_approved_chain_hook(
+        paths,
+        token,
+        hook,
+        Utc::now(),
+    )?;
+    if fs::read(&approved_hook_path)? != hook.approved_bytes {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "protected chain hook {} changed before sandbox materialization",
+            hook.name.as_str()
+        ))));
+    }
+    // The Job directory is read-denied inside the hook sandbox, so execute a
+    // second exact copy from a controller-owned temporary directory. This
+    // keeps the launch-bound bytes while withholding every other Job proof and
+    // the real DEADRECKON_HOME from workspace/user hook code.
+    let hook_sandbox = tempfile::TempDir::new()?;
+    let hook_program_dir = hook_sandbox.path().join("program");
+    let hook_home = hook_sandbox.path().join("home");
+    fs::create_dir_all(&hook_program_dir)?;
+    fs::create_dir_all(&hook_home)?;
+    let sandboxed_hook_path = hook_program_dir.join("hook");
+    fs::write(&sandboxed_hook_path, &hook.approved_bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&sandboxed_hook_path, fs::Permissions::from_mode(0o500))?;
+    }
+    let mut hook_env = BTreeMap::new();
+    hook_env.insert(
+        "DEADRECKON_JOB_ID".to_string(),
+        token.job_id.as_ref().to_string(),
+    );
+    hook_env.insert(
+        "DEADRECKON_CHAIN_ID".to_string(),
+        adapter.source_chain_id.clone(),
+    );
+    hook_env.insert(
+        "DEADRECKON_STEP_INDEX".to_string(),
+        step_index.map_or_else(|| "-".to_string(), |index| index.to_string()),
+    );
+    hook_env.insert(
+        "DEADRECKON_HOME".to_string(),
+        hook_home.display().to_string(),
+    );
+    hook_env.insert("HOME".to_string(), hook_home.display().to_string());
+    let sandbox_backend =
+        current_driver_sandbox_backend(paths)?.unwrap_or(deadreckon_sandbox::SandboxBackend::Auto);
+    let sandbox_spec = deadreckon_sandbox::SandboxSpec {
+        backend: sandbox_backend,
+        docker: None,
+        cwd: cwd.to_path_buf(),
+        program: sandboxed_hook_path.into_os_string(),
+        args: Vec::new(),
+        stdin: None,
+        env: hook_env,
+        allow_network: true,
+        pid_file: None,
+        cancellation_token: None,
+        profile_dir: None,
+        read_allowlist: vec![cwd.to_path_buf(), hook_program_dir],
+        write_allowlist: vec![cwd.to_path_buf(), hook_home],
+        read_denylist: vec![paths.jobs_dir(), paths.home().join("gate-keys")],
+        write_denylist: vec![paths.jobs_dir(), paths.home().join("gate-keys")],
+        network_allowlist: vec!["*".to_string()],
+        workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
+        cleanup_process_group: false,
+        guarded_launch: None,
+    };
+    let sandbox_command = deadreckon_sandbox::build_command(&sandbox_spec)?;
+    if sandbox_command.backend == deadreckon_sandbox::SandboxBackend::None && !cfg!(test) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "chain hook {} cannot execute without a sandbox that denies controller authority",
+                hook.name.as_str()
+            ),
+            "select sandbox-exec, bwrap, or docker for this durable Job",
+        )));
+    }
+    let started = requested;
+    deadreckon_core::chain::append_fenced_durable_chain_hook_event(paths, token, &started)?;
+
+    let mut command = Command::new(&sandbox_command.program);
+    command
+        .args(&sandbox_command.args)
+        .current_dir(&sandbox_command.cwd)
+        .envs(&sandbox_command.env)
+        .env_remove(deadreckon_core::GATE_KEY_ENV)
+        .env_remove(deadreckon_core::GATE_CONTAINED_ENV)
+        .env_remove(deadreckon_core::GATE_SANDBOX_BACKEND_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let completed = DurableChainHookEvent::completed(
+                &started,
+                Utc::now(),
+                -1,
+                "",
+                format!("hook could not start: {error}"),
+            )?;
+            deadreckon_core::chain::append_fenced_durable_chain_hook_event(
+                paths, token, &completed,
+            )?;
+            return Ok(-1);
+        }
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        write_durable_hook_payload(stdin, &started.payload_bytes)?;
+    }
+    let output = child.wait_with_output()?;
+    let exit_code = output.status.code().unwrap_or(-2);
+    let completed = DurableChainHookEvent::completed(
+        &started,
+        Utc::now(),
+        exit_code,
+        truncate_text(&String::from_utf8_lossy(&output.stdout), 4096),
+        truncate_text(&String::from_utf8_lossy(&output.stderr), 4096),
+    )?;
+    deadreckon_core::chain::append_fenced_durable_chain_hook_event(paths, token, &completed)?;
+    Ok(exit_code)
+}
+
+fn bind_durable_chain_hook_payload(
+    adapter: &deadreckon_core::chain::DurableChainAdapterManifest,
+    job_id: &str,
+    mut payload: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let object = payload.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain hook payload must be a JSON object".to_string(),
+        ))
+    })?;
+    object.insert(
+        "chain_id".to_string(),
+        serde_json::Value::String(adapter.source_chain_id.clone()),
+    );
+    object.insert(
+        "job_id".to_string(),
+        serde_json::Value::String(job_id.to_string()),
+    );
+    Ok(payload)
+}
+
+pub(crate) fn invoke_current_durable_chain_hook(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    name: deadreckon_core::chain::ChainHookName,
+    step_index: Option<u32>,
+    attempt: u32,
+    payload: serde_json::Value,
+) -> Result<Option<i32>> {
+    let Some(adapter) = current_durable_chain_adapter(plan)? else {
+        return Ok(None);
+    };
+    let Some(hook) = durable_chain_hook_for(adapter, name) else {
+        return Ok(None);
+    };
+    let token = current_driver_lease_token(paths, &plan.plan_id)?;
+    let payload = bind_durable_chain_hook_payload(adapter, &plan.plan_id, payload)?;
+    let cwd = plan.parent_cwd.as_deref().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "durable chain Plan has no isolated execution workspace".to_string(),
+        ))
+    })?;
+    invoke_frozen_durable_chain_hook(
+        paths, &token, adapter, hook, step_index, attempt, cwd, &payload,
+    )
+    .map(Some)
+}
+
+pub(crate) fn current_durable_chain_has_hook(
+    plan: &deadreckon_core::plan::Plan,
+    name: deadreckon_core::chain::ChainHookName,
+) -> Result<bool> {
+    Ok(current_durable_chain_adapter(plan)?
+        .and_then(|adapter| durable_chain_hook_for(adapter, name))
+        .is_some())
+}
+
+pub(crate) fn completed_current_durable_chain_hook_invocation_ids(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    step_index: u32,
+    attempt: u32,
+) -> Result<Vec<String>> {
+    use deadreckon_core::chain::{ChainHookName, DurableChainHookEventKind};
+
+    let Some(adapter) = current_durable_chain_adapter(plan)? else {
+        return Ok(Vec::new());
+    };
+    let events = deadreckon_core::chain::read_durable_chain_hook_events(
+        paths,
+        &JobId(plan.plan_id.clone()),
+    )?;
+    validate_durable_chain_hook_history(&events, &plan.plan_id, adapter)?;
+    let mut completed = Vec::new();
+    for name in [
+        ChainHookName::PreStep,
+        ChainHookName::PostStep,
+        ChainHookName::OnPromote,
+    ] {
+        if durable_chain_hook_for(adapter, name).is_none() {
+            continue;
+        }
+        let matches = events
+            .iter()
+            .filter(|event| {
+                event.hook.name == name
+                    && event.step_index == Some(step_index)
+                    && event.attempt == attempt
+                    && event.kind == DurableChainHookEventKind::Completed
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "durable chain hook {} has no unique completed invocation for step {step_index} attempt {attempt}",
+                name.as_str()
+            ))));
+        }
+        completed.push(matches[0].invocation_id.clone());
+    }
+    Ok(completed)
+}
+
+pub(crate) fn durable_chain_end_hook_pending(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<bool> {
+    use deadreckon_core::chain::ChainHookName;
+
+    let Some(adapter) = current_durable_chain_adapter(plan)? else {
+        return Ok(false);
+    };
+    let Some(hook) = durable_chain_hook_for(adapter, ChainHookName::OnChainEnd) else {
+        return Ok(false);
+    };
+    let events = deadreckon_core::chain::read_durable_chain_hook_events(
+        paths,
+        &JobId(plan.plan_id.clone()),
+    )?;
+    validate_durable_chain_hook_history(&events, &plan.plan_id, adapter)?;
+    let completed = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == deadreckon_core::plan::PlanTaskStatus::Completed)
+        .count();
+    let skipped = plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == deadreckon_core::plan::PlanTaskStatus::Skipped)
+        .count();
+    let payload = bind_durable_chain_hook_payload(
+        adapter,
+        &plan.plan_id,
+        json!({
+            "status": "completed",
+            "steps_completed": completed,
+            "steps_skipped": skipped,
+            "total_spend_usd": plan.attempts_spend_usd(),
+        }),
+    )?;
+    let requested = deadreckon_core::chain::DurableChainHookEvent::started(
+        JobId(plan.plan_id.clone()),
+        adapter.source_chain_id.clone(),
+        hook.clone(),
+        None,
+        1,
+        Utc::now(),
+        &payload,
+    )?;
+    Ok(
+        deadreckon_core::chain::reusable_durable_chain_hook_completion(&events, &requested)?
+            .is_none(),
+    )
+}
+
 pub(crate) fn current_driver_sandbox_backend(
     paths: &DeadreckonPaths,
 ) -> Result<Option<deadreckon_sandbox::SandboxBackend>> {
@@ -760,6 +1594,56 @@ pub(crate) fn current_driver_owns_root_artifact() -> bool {
         .is_some_and(|context| context.root_artifact)
 }
 
+pub(crate) fn current_plan_mutation_token(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<Option<deadreckon_core::LeaseToken>> {
+    let Some(owner_job_id) = plan.owner_job_id.as_deref() else {
+        return Ok(None);
+    };
+    if cfg!(test) && DRIVER_CONTEXT.get().is_none() {
+        return Ok(None);
+    }
+    current_driver_lease_token(paths, owner_job_id).map(Some)
+}
+
+pub(crate) fn current_ordered_candidate_initial_revision(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<Option<String>> {
+    let Some(owner_job_id) = plan.owner_job_id.as_deref() else {
+        return Ok(None);
+    };
+    let manifest = load_ordered_candidate_manifest(paths, owner_job_id)?;
+    if manifest.job_id != owner_job_id
+        || plan.parent_cwd.as_deref() != Some(manifest.workspace.as_path())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Plan {} is not bound to its Job ordered candidate workspace",
+            plan.plan_id
+        ))));
+    }
+    Ok(Some(manifest.initial_revision))
+}
+
+fn current_driver_lease_token(
+    paths: &DeadreckonPaths,
+    owner_job_id: &str,
+) -> Result<deadreckon_core::LeaseToken> {
+    let context = DRIVER_CONTEXT.get().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Job {owner_job_id} cannot mutate outside its fenced driver"
+        )))
+    })?;
+    if context.job_id != owner_job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "requested Job {owner_job_id} does not match active Job {}",
+            context.job_id
+        ))));
+    }
+    guarded_authority_lease_token(paths, &context.authority)
+}
+
 pub(crate) fn delegated_plan_child_authorized() -> bool {
     DELEGATED_PLAN_CHILD.get().is_some()
 }
@@ -772,7 +1656,57 @@ pub(crate) fn delegated_plan_child_run_id() -> Option<String> {
     DELEGATED_CHILD_RUN_ID.get().cloned()
 }
 
-pub(crate) fn link_delegated_repair_run(state: &deadreckon_core::PipelineState) -> Result<()> {
+pub(crate) fn plan_task_run_id(
+    job_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    task_attempt: u32,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"deadreckon-plan-task-run-v1\0");
+    for value in [job_id, plan_id, task_id, &task_attempt.to_string()] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())[..32].to_string()
+}
+
+pub(crate) fn link_delegated_owned_run(state: &deadreckon_core::PipelineState) -> Result<()> {
+    if let Some(deadreckon_core::RunOwnership {
+        job_id,
+        artifact:
+            deadreckon_core::RunOwnershipArtifact::PlanTask {
+                plan_id,
+                task_id,
+                task_index,
+                task_attempt,
+            },
+        ..
+    }) = state.ownership.as_ref()
+    {
+        let authority = DELEGATED_PLAN_AUTHORITY.get().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "Plan child Run has no consumed fenced driver authority".to_string(),
+            ))
+        })?;
+        if authority.job_id != *job_id {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "Plan child Run cannot link across its immutable Job authority".to_string(),
+            )));
+        }
+        let paths = DeadreckonPaths::discover();
+        let token = guarded_authority_lease_token(&paths, authority)?;
+        return link_plan_task_run_fenced(
+            &paths,
+            &token,
+            state,
+            plan_id,
+            task_id,
+            *task_index,
+            *task_attempt,
+        );
+    }
+
     let Some(deadreckon_core::RunOwnership {
         job_id,
         artifact:
@@ -791,13 +1725,35 @@ pub(crate) fn link_delegated_repair_run(state: &deadreckon_core::PipelineState) 
         return Ok(());
     };
     let path = proof_dir.join("repair-run.json");
-    let mut record: serde_json::Value =
+    let delegated_authority = DELEGATED_REPAIR_AUTHORITY.get();
+    let paths = DeadreckonPaths::discover();
+    let mut record: serde_json::Value = if let Some(authority) = delegated_authority {
+        let protected_path = merge_repair_authority_path(&paths, &authority.job_id, repair_id);
+        let raw =
+            read_bounded_regular_control_file(&protected_path, "protected merge-repair authority")?
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "merge repair Run has no protected launch authority".to_string(),
+                    ))
+                })?;
+        serde_json::from_slice(&raw).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: protected_path,
+                source,
+            })
+        })?
+    } else if cfg!(test) {
         serde_json::from_slice(&fs::read(&path)?).map_err(|source| {
             CliError::Core(DeadreckonError::Json {
                 path: path.clone(),
                 source,
             })
-        })?;
+        })?
+    } else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge repair Run has no consumed fenced driver authority".to_string(),
+        )));
+    };
     let object = record.as_object_mut().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "merge repair launch authority is not an object".to_string(),
@@ -838,20 +1794,302 @@ pub(crate) fn link_delegated_repair_run(state: &deadreckon_core::PipelineState) 
         serde_json::Value::String("child_linked".to_string()),
     );
     object.insert("linked_at".to_string(), serde_json::to_value(Utc::now())?);
-    if let Some(authority) = DELEGATED_REPAIR_AUTHORITY.get() {
-        replace_merge_repair_authority_fenced(
-            &DeadreckonPaths::discover(),
-            authority,
-            repair_id,
-            "run_linked",
-            &record,
-        )?;
-    } else if !cfg!(test) {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "merge repair Run has no consumed fenced driver authority".to_string(),
-        )));
+    if let Some(authority) = delegated_authority {
+        replace_merge_repair_authority_fenced(&paths, authority, repair_id, "run_linked", &record)?;
     }
     commands::job::replace_json_synced(&path, &record)
+}
+
+fn link_plan_task_run_fenced(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    state: &deadreckon_core::PipelineState,
+    plan_id: &str,
+    task_id: &str,
+    task_index: u32,
+    task_attempt: u32,
+) -> Result<()> {
+    let Some(deadreckon_core::RunOwnership {
+        job_id,
+        artifact:
+            deadreckon_core::RunOwnershipArtifact::PlanTask {
+                plan_id: owned_plan_id,
+                task_id: owned_task_id,
+                task_index: owned_task_index,
+                task_attempt: owned_task_attempt,
+            },
+        ..
+    }) = state.ownership.as_ref()
+    else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "only an owned Plan task Run can be linked to Job history".to_string(),
+        )));
+    };
+    if token.job_id.as_ref() != job_id
+        || owned_plan_id != plan_id
+        || owned_task_id != task_id
+        || *owned_task_index != task_index
+        || *owned_task_attempt != task_attempt
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Plan child Run cannot link across its immutable task authority".to_string(),
+        )));
+    }
+
+    let history = deadreckon_core::read_job_history(&paths.job_events(job_id))?;
+    let prepared = history.events().iter().any(|event| {
+        plan_task_event_matches(
+            event,
+            JobEventKind::ChildLaunchPrepared,
+            plan_id,
+            task_id,
+            task_index,
+            task_attempt,
+        ) && event
+            .detail
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(state.run_id.as_str())
+    });
+    if !prepared {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Plan task {plan_id}/{task_id} attempt {task_attempt} has no fenced launch record for Run {}",
+            state.run_id
+        ))));
+    }
+    let existing = history.events().iter().find(|event| {
+        plan_task_event_matches(
+            event,
+            JobEventKind::ChildLinked,
+            plan_id,
+            task_id,
+            task_index,
+            task_attempt,
+        )
+    });
+    if let Some(existing) = existing {
+        if existing
+            .detail
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(state.run_id.as_str())
+        {
+            return Ok(());
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Plan task {plan_id}/{task_id} attempt {task_attempt} is already linked to another Run"
+        ))));
+    }
+
+    commands::supervisor::append_control_event(
+        paths,
+        token,
+        JobEventKind::ChildLinked,
+        format!("plan-task:{plan_id}:{task_id}:{task_attempt}:run-linked"),
+        json!({
+            "relationship": "plan_task",
+            "run_id": state.run_id,
+            "plan_id": plan_id,
+            "task_id": task_id,
+            "task_index": task_index,
+            "task_attempt": task_attempt,
+        }),
+    )?;
+    Ok(())
+}
+
+fn plan_task_event_matches(
+    event: &deadreckon_protocol::JobEvent,
+    kind: JobEventKind,
+    plan_id: &str,
+    task_id: &str,
+    task_index: u32,
+    task_attempt: u32,
+) -> bool {
+    event.kind == kind
+        && event
+            .detail
+            .get("relationship")
+            .and_then(serde_json::Value::as_str)
+            == Some("plan_task")
+        && event
+            .detail
+            .get("plan_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(plan_id)
+        && event
+            .detail
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(task_id)
+        && event
+            .detail
+            .get("task_index")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(task_index))
+        && event
+            .detail
+            .get("task_attempt")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(task_attempt))
+}
+
+fn prepare_plan_task_run_fenced(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    plan_id: &str,
+    task_id: &str,
+    task_index: u32,
+    task_attempt: u32,
+    run_id: &str,
+) -> Result<()> {
+    let expected = plan_task_run_id(token.job_id.as_ref(), plan_id, task_id, task_attempt);
+    if run_id != expected {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Plan task {plan_id}/{task_id} attempt {task_attempt} received a non-deterministic Run identity"
+        ))));
+    }
+    let history = deadreckon_core::read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    if let Some(existing) = history.events().iter().find(|event| {
+        plan_task_event_matches(
+            event,
+            JobEventKind::ChildLaunchPrepared,
+            plan_id,
+            task_id,
+            task_index,
+            task_attempt,
+        )
+    }) {
+        if existing
+            .detail
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(run_id)
+        {
+            return Ok(());
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Plan task {plan_id}/{task_id} attempt {task_attempt} changed its prepared Run identity"
+        ))));
+    }
+    commands::supervisor::append_control_event(
+        paths,
+        token,
+        JobEventKind::ChildLaunchPrepared,
+        format!("plan-task:{plan_id}:{task_id}:{task_attempt}:launch-prepared"),
+        json!({
+            "relationship": "plan_task",
+            "run_id": run_id,
+            "plan_id": plan_id,
+            "task_id": task_id,
+            "task_index": task_index,
+            "task_attempt": task_attempt,
+        }),
+    )?;
+    Ok(())
+}
+
+fn reconcile_plan_task_run_links(
+    paths: &DeadreckonPaths,
+    token: &deadreckon_core::LeaseToken,
+    plan: &deadreckon_core::plan::Plan,
+) -> Result<()> {
+    let history = deadreckon_core::read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let prepared = history
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind == JobEventKind::ChildLaunchPrepared
+                && event
+                    .detail
+                    .get("relationship")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("plan_task")
+        })
+        .filter_map(|event| {
+            Some((
+                event.detail.get("plan_id")?.as_str()?.to_string(),
+                event.detail.get("task_id")?.as_str()?.to_string(),
+                u32::try_from(event.detail.get("task_index")?.as_u64()?).ok()?,
+                u32::try_from(event.detail.get("task_attempt")?.as_u64()?).ok()?,
+                event.detail.get("run_id")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (plan_id, task_id, task_index, task_attempt, run_id) in prepared {
+        if plan_id != plan.plan_id && plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
+            continue;
+        }
+        let Ok(state) = deadreckon_core::load_run(paths, &run_id) else {
+            continue;
+        };
+        link_plan_task_run_fenced(
+            paths,
+            token,
+            &state,
+            &plan_id,
+            &task_id,
+            task_index,
+            task_attempt,
+        )?;
+        let mut linked_plan = deadreckon_core::load_plan(paths, &plan_id)?;
+        if linked_plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "prepared Plan task Run {run_id} changed its owning Job"
+            ))));
+        }
+        let task = linked_plan
+            .tasks
+            .get_mut(task_index as usize)
+            .filter(|task| task.task_id == task_id)
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "prepared Plan task {plan_id}/{task_id} disappeared before recovery"
+                )))
+            })?;
+        if task
+            .child_run_id
+            .as_deref()
+            .is_some_and(|existing| existing != run_id)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "prepared Plan task {plan_id}/{task_id} already points to another Run"
+            ))));
+        }
+        if task.child_run_id.is_none() {
+            task.child_run_id = Some(run_id.clone());
+            deadreckon_core::save_owned_plan_fenced(paths, token, &linked_plan)?;
+            let already_discovered = deadreckon_core::read_plan_events(paths, &plan_id)?
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.event,
+                        deadreckon_core::PlanEventKind::TaskRunDiscovered {
+                            task_id: discovered_task,
+                            task_index: discovered_index,
+                            run_id: Some(discovered_run),
+                            ..
+                        } if discovered_task == &task_id
+                            && *discovered_index == task_index as usize
+                            && discovered_run == &run_id
+                    )
+                });
+            if !already_discovered {
+                deadreckon_core::append_owned_plan_event_fenced(
+                    paths,
+                    token,
+                    &plan_id,
+                    deadreckon_core::PlanEventKind::TaskRunDiscovered {
+                        task_id: task_id.clone(),
+                        task_index: task_index as usize,
+                        run_id: Some(run_id.clone()),
+                        pid: None,
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn install_driver_context(
@@ -860,12 +2098,14 @@ fn install_driver_context(
     root_artifact: bool,
 ) -> Result<()> {
     let job_id = authority.job_id.clone();
+    let durable_chain = durable_chain_adapter_from_launch(paths, &job_id)?;
     DRIVER_CONTEXT
         .set(DriverContext {
             acceptance_path: commands::job::job_acceptance_path(paths, &job_id),
             job_id,
             authority,
             root_artifact,
+            durable_chain,
         })
         .map_err(|_| {
             CliError::Core(DeadreckonError::InvalidInput(
@@ -1313,14 +2553,100 @@ fn replace_merge_repair_authority_fenced(
     Ok(())
 }
 
+pub(crate) fn mark_merge_repair_trusted_fenced(
+    paths: &DeadreckonPaths,
+    repair_id: &str,
+    proof_path: &Path,
+) -> Result<()> {
+    let context = DRIVER_CONTEXT.get().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "only a current Job driver can trust merge-repair evidence".to_string(),
+        ))
+    })?;
+    if !commands::supervisor::guarded_driver_authority_is_live(paths, &context.authority)? {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge-repair evidence cannot become trusted without the current fenced lease"
+                .to_string(),
+        )));
+    }
+    let mut proof: serde_json::Value =
+        serde_json::from_slice(&fs::read(proof_path)?).map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: proof_path.to_path_buf(),
+                source,
+            })
+        })?;
+    let authority_path = merge_repair_authority_path(paths, &context.job_id, repair_id);
+    let authority: serde_json::Value = serde_json::from_slice(&fs::read(&authority_path)?)
+        .map_err(|source| {
+            CliError::Core(DeadreckonError::Json {
+                path: authority_path.clone(),
+                source,
+            })
+        })?;
+    for field in [
+        "schema_version",
+        "plan_id",
+        "root_artifact_id",
+        "repair_id",
+        "repair_round",
+        "repair_request_sha256",
+        "repair_plan_sha256",
+        "capability_id",
+        "run_id",
+        "sandbox_requested",
+        "process",
+        "adoption_window_seconds",
+        "adoption_deadline_at",
+    ] {
+        if authority.get(field) != proof.get(field) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "trusted merge-repair proof changed its fenced {field} authority"
+            ))));
+        }
+    }
+    if proof.get("trusted").and_then(serde_json::Value::as_bool) != Some(true)
+        || proof
+            .get("acceptance_marker_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        || proof
+            .get("result_tree_sha256")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "merge-repair proof is not independently validated as trusted".to_string(),
+        )));
+    }
+    if authority.get("status").and_then(serde_json::Value::as_str) == Some("trusted") {
+        for field in ["trusted", "acceptance_marker_sha256", "result_tree_sha256"] {
+            if authority.get(field) != proof.get(field) {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "trusted merge-repair authority changed its {field} evidence"
+                ))));
+            }
+        }
+        return Ok(());
+    }
+    let object = proof.as_object_mut().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "trusted merge-repair proof is not an object".to_string(),
+        ))
+    })?;
+    object.insert(
+        "status".to_string(),
+        serde_json::Value::String("trusted".to_string()),
+    );
+    object.insert("trusted_at".to_string(), serde_json::to_value(Utc::now())?);
+    replace_merge_repair_authority_fenced(paths, &context.authority, repair_id, "trusted", &proof)
+}
+
 pub(crate) fn restore_merge_repair_projection_if_needed(
     paths: &DeadreckonPaths,
     repair_id: &str,
     projection_path: &Path,
 ) -> Result<()> {
-    if projection_path.is_file() {
-        return Ok(());
-    }
     let context = DRIVER_CONTEXT.get().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "only a current Job driver can restore merge repair authority".to_string(),
@@ -1333,10 +2659,17 @@ pub(crate) fn restore_merge_repair_projection_if_needed(
         )));
     }
     let authority_path = merge_repair_authority_path(paths, &context.job_id, repair_id);
-    let raw = match fs::read(&authority_path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let raw = match read_bounded_regular_control_file(
+        &authority_path,
+        "protected merge-repair authority",
+    )? {
+        Some(raw) => raw,
+        None if projection_path.exists() => {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "merge repair projection exists without protected Job authority".to_string(),
+            )));
+        }
+        None => return Ok(()),
     };
     let authority: serde_json::Value = serde_json::from_slice(&raw).map_err(|source| {
         CliError::Core(DeadreckonError::Json {
@@ -1345,21 +2678,47 @@ pub(crate) fn restore_merge_repair_projection_if_needed(
         })
     })?;
     let history = deadreckon_core::read_job_history(&paths.job_events(&context.job_id))?;
-    let committed = history.events().iter().rev().any(|event| {
-        event.kind == JobEventKind::RepairChildAuthorityChanged
-            && event
-                .detail
-                .get("repair_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(repair_id)
-            && event.detail.get("authority") == Some(&authority)
-    });
+    let committed = latest_merge_repair_authority_matches(history.events(), repair_id, &authority);
     if !committed {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "merge repair projection has no committed fenced authority event".to_string(),
         )));
     }
+    if let Some(projection_raw) =
+        read_bounded_regular_control_file(projection_path, "merge-repair projection")?
+    {
+        let projection: serde_json::Value =
+            serde_json::from_slice(&projection_raw).map_err(|source| {
+                CliError::Core(DeadreckonError::Json {
+                    path: projection_path.to_path_buf(),
+                    source,
+                })
+            })?;
+        if projection != authority {
+            commands::job::replace_json_synced(projection_path, &authority)?;
+        }
+        return Ok(());
+    }
     commands::job::write_json_synced(projection_path, &authority)
+}
+
+fn latest_merge_repair_authority_matches(
+    events: &[deadreckon_protocol::JobEvent],
+    repair_id: &str,
+    authority: &serde_json::Value,
+) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == JobEventKind::RepairChildAuthorityChanged
+                && event
+                    .detail
+                    .get("repair_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(repair_id)
+        })
+        .is_some_and(|event| event.detail.get("authority") == Some(authority))
 }
 
 fn campaign_sub_launch_key(sub_id: &str, plan_id: &str) -> String {
@@ -1898,6 +3257,25 @@ pub(crate) fn prepare_delegated_invocation<S: AsRef<OsStr>>(
             .map(|launch| launch.launch_id.clone()),
         issued_at: Utc::now(),
     };
+    if let DelegatedAction::PlanChild {
+        plan_id,
+        task_id,
+        task_index,
+        task_attempt,
+        run_id,
+    } = &record.action
+    {
+        let lease_token = guarded_authority_lease_token(paths, &context.authority)?;
+        prepare_plan_task_run_fenced(
+            paths,
+            &lease_token,
+            plan_id,
+            task_id,
+            *task_index,
+            *task_attempt,
+            run_id,
+        )?;
+    }
     commands::job::write_json_synced(
         &delegation_pending_path(paths, &context.job_id, &capability_id),
         &record,
@@ -1997,6 +3375,13 @@ pub(crate) fn spawn_merge_repair_delegated(
             "durable merge repair launch lost its fenced parent authority".to_string(),
         )));
     }
+    let token = match guarded_authority_lease_token(paths, &context.authority) {
+        Ok(token) => token,
+        Err(error) => {
+            revoke_pending_delegation(paths, prepared)?;
+            return Err(error);
+        }
+    };
     apply_delegation(&mut command, prepared);
     let (mut child, terminator) = match deadreckon_core::spawn_grouped(command) {
         Ok(spawned) => spawned,
@@ -2049,15 +3434,37 @@ pub(crate) fn spawn_merge_repair_delegated(
                 "merge repair authority is missing its repair identity".to_string(),
             ))
         })?;
-    if let Err(error) = replace_merge_repair_authority_fenced(
+    let protected_path = merge_repair_authority_path(paths, &context.job_id, repair_id);
+    let creation = deadreckon_core::create_fenced_job_json_and_append_event(
         paths,
-        &context.authority,
-        repair_id,
-        "process_prepared",
+        &token,
+        Utc::now(),
+        &protected_path,
+        deadreckon_core::FencedJobJsonEvent {
+            kind: JobEventKind::RepairChildAuthorityChanged,
+            causation_id: format!("merge-repair-authority:{repair_id}:process_prepared"),
+            detail: json!({
+                "repair_id": repair_id,
+                "transition": "process_prepared",
+                "run_id": authority.get("run_id"),
+                "authority": &authority,
+            }),
+        },
         &authority,
-    )
-    .and_then(|()| commands::job::write_json_synced(authority_path, &authority))
-    {
+    );
+    let durable = match creation {
+        Ok(deadreckon_core::CreateFencedJobJsonDisposition::Created(_)) => {
+            commands::job::write_json_synced(authority_path, &authority)
+        }
+        Ok(deadreckon_core::CreateFencedJobJsonDisposition::AlreadyExists) => {
+            Err(CliError::Core(DeadreckonError::InvalidInput(
+                "merge repair launch authority already exists; refusing a duplicate child"
+                    .to_string(),
+            )))
+        }
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = durable {
         let _ = terminator.terminate(std::time::Duration::from_secs(2));
         revoke_pending_delegation(paths, prepared)?;
         return Err(error);
@@ -2670,10 +4077,22 @@ pub(crate) fn validate_merge_repair_process_inventory_for_job(
         let repair_id = required_merge_repair_string(object, "repair_id", &path)?;
         let capability_id = required_merge_repair_string(object, "capability_id", &path)?;
         let run_id = required_merge_repair_string(object, "run_id", &path)?;
-        if object
+        let schema_version = object
             .get("schema_version")
-            .and_then(serde_json::Value::as_u64)
-            != Some(2)
+            .and_then(serde_json::Value::as_u64);
+        let valid_adoption_deadline = schema_version != Some(3)
+            || object
+                .get("adoption_deadline_at")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok());
+        let valid_adoption_window = schema_version != Some(3)
+            || object
+                .get("adoption_window_seconds")
+                .and_then(serde_json::Value::as_f64)
+                .is_some_and(|value| value.is_finite() && value > 0.0);
+        if !matches!(schema_version, Some(2 | 3))
+            || !valid_adoption_deadline
+            || !valid_adoption_window
             || object
                 .get("root_artifact_id")
                 .and_then(serde_json::Value::as_str)
@@ -2683,7 +4102,7 @@ pub(crate) fn validate_merge_repair_process_inventory_for_job(
             || Uuid::parse_str(&run_id).is_err()
             || !matches!(
                 object.get("status").and_then(serde_json::Value::as_str),
-                Some("process_prepared" | "child_linked")
+                Some("process_prepared" | "child_linked" | "trusted")
             )
         {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -3346,6 +4765,7 @@ fn validate_delegated_action(paths: &DeadreckonPaths, record: &DelegatedInvocati
             task_id,
             task_index,
             task_attempt,
+            run_id,
         } => {
             let plan = deadreckon_core::load_plan(paths, plan_id)?;
             let owner = resolve_plan_owner(paths, &plan)?.ok_or_else(|| {
@@ -3374,6 +4794,7 @@ fn validate_delegated_action(paths: &DeadreckonPaths, record: &DelegatedInvocati
             if task.task_id != *task_id
                 || task.status != deadreckon_core::PlanTaskStatus::Running
                 || task.attempts.len() as u32 + 1 != *task_attempt
+                || *run_id != plan_task_run_id(&record.job_id, plan_id, task_id, *task_attempt)
             {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(
                     "delegated child does not match the exact running task attempt".to_string(),
@@ -3743,7 +5164,15 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
             task_id,
             task_index,
             task_attempt,
+            run_id,
         } => {
+            DELEGATED_PLAN_AUTHORITY
+                .set(record.authority.clone())
+                .map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "this process already consumed another Plan child authority".to_string(),
+                    ))
+                })?;
             DELEGATED_PLAN_CHILD
                 .set(deadreckon_core::RunOwnership::plan_task(
                     record.job_id.clone(),
@@ -3757,6 +5186,11 @@ pub(crate) fn authorize_delegated_invocation_if_present() -> Result<bool> {
                         "this process already consumed another Plan child capability".to_string(),
                     ))
                 })?;
+            DELEGATED_CHILD_RUN_ID.set(run_id.clone()).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "this process already consumed another delegated Run identity".to_string(),
+                ))
+            })?;
         }
         DelegatedAction::PlanFork { .. }
         | DelegatedAction::PlanMerge { .. }
@@ -4395,7 +5829,14 @@ fn validated_driver_spec_for_recovery(
 pub(crate) fn recover_pending_driver_state(
     paths: &DeadreckonPaths,
     job: &deadreckon_protocol::Job,
+    token: &deadreckon_core::LeaseToken,
 ) -> Result<PendingDriverRecovery> {
+    if token.job_id != job.job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "advanced recovery token belongs to {}, not Job {}",
+            token.job_id, job.job_id
+        ))));
+    }
     if !matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign) {
         return Ok(PendingDriverRecovery::Unchanged);
     }
@@ -4405,6 +5846,8 @@ pub(crate) fn recover_pending_driver_state(
     }
     let mapping_exists = driver_state_path(paths, job.job_id.as_ref()).exists();
     let driver = validated_driver_spec_for_recovery(paths, job)?;
+    let authority: deadreckon_protocol::JobAuthority =
+        serde_json::from_slice(&fs::read(paths.job_authority(job.job_id.as_ref()))?)?;
     match job.shape {
         JobShape::Graph => {
             if !paths.plan_json(job.job_id.as_ref()).is_file() {
@@ -4421,12 +5864,13 @@ pub(crate) fn recover_pending_driver_state(
                 deadreckon_core::plan::PlanMode::Review => DriverKind::Review,
                 deadreckon_core::plan::PlanMode::FullPlan => DriverKind::FullPlan,
             };
+            let expected_parent_cwd = expected_plan_parent_cwd(paths, job, &authority, &driver)?;
             if plan.plan_id != job.job_id.as_ref()
                 || plan.owner_job_id.as_deref() != Some(job.job_id.as_ref())
                 || plan.parent_plan_id.is_some()
                 || plan.root_goal != job.goal
                 || plan.parent_scope.as_deref() != Some(job.scope.as_str())
-                || plan.parent_cwd.as_deref() != Some(job.source_cwd.as_path())
+                || plan.parent_cwd.as_deref() != Some(expected_parent_cwd.as_path())
                 || plan.acceptance_path.as_deref()
                     != Some(
                         commands::job::job_acceptance_path(paths, job.job_id.as_ref()).as_path(),
@@ -4438,6 +5882,8 @@ pub(crate) fn recover_pending_driver_state(
                     plan.plan_id, job.job_id
                 ))));
             }
+            reconcile_plan_task_run_links(paths, token, &plan)?;
+            plan = deadreckon_core::plan::load_plan(paths, job.job_id.as_ref())?;
             if plan.status != deadreckon_core::plan::PlanStatus::Pending {
                 if mapping_exists {
                     return Ok(PendingDriverRecovery::Unchanged);
@@ -4476,8 +5922,9 @@ pub(crate) fn recover_pending_driver_state(
                         )
                     })
                 {
-                    deadreckon_core::append_plan_event(
+                    deadreckon_core::append_owned_plan_event_fenced(
                         paths,
+                        token,
                         &plan.plan_id,
                         deadreckon_core::PlanEventKind::RootBudgetExhausted {
                             dimension: exhaustion.dimension,
@@ -4486,7 +5933,7 @@ pub(crate) fn recover_pending_driver_state(
                     )?;
                 }
                 plan.status = deadreckon_core::plan::PlanStatus::Failed;
-                deadreckon_core::plan::save_plan(paths, &plan)?;
+                deadreckon_core::save_owned_plan_fenced(paths, token, &plan)?;
                 return Ok(PendingDriverRecovery::BudgetExhausted {
                     stop_reason: exhaustion.stop_reason,
                     reason: exhaustion.reason,
@@ -4639,6 +6086,13 @@ async fn drive_plan(
 ) -> Result<()> {
     let authority: deadreckon_protocol::JobAuthority =
         serde_json::from_slice(&fs::read(paths.job_authority(job.job_id.as_ref()))?)?;
+    let execution_cwd = if driver.apply == deadreckon_core::plan::ApplyWhen::PerNode {
+        let token = current_driver_lease_token(paths, job.job_id.as_ref())?;
+        prepare_ordered_candidate(paths, job, &authority, &token)?
+    } else {
+        job.source_cwd.clone()
+    };
+    std::env::set_current_dir(&execution_cwd)?;
     let execution = commands::orchestrate::durable_orchestration_spec(&plan)?.unwrap_or_default();
     if driver_state_path(paths, job.job_id.as_ref()).is_file() {
         return resume_plan(paths, job, &authority, driver, execution).await;
@@ -4702,7 +6156,7 @@ async fn resume_plan(
     driver: DriverSpec,
     execution: commands::orchestrate::DurableOrchestrationSpec,
 ) -> Result<()> {
-    use deadreckon_core::plan::{PlanStatus, PlanTaskStatus};
+    use deadreckon_core::plan::PlanStatus;
 
     let plan = deadreckon_core::plan::load_plan(paths, job.job_id.as_ref())?;
     match plan.status {
@@ -4718,8 +6172,8 @@ async fn resume_plan(
     let all_children_completed = plan
         .tasks
         .iter()
-        .all(|task| task.status == PlanTaskStatus::Completed);
-    if !all_children_completed {
+        .all(|task| task.status.is_successful_terminal());
+    if !all_children_completed || commands::plan::plan_requires_durable_resume(paths, &plan)? {
         commands::plan::fork_command(ForkCommandArgs {
             plan_id: job.job_id.as_ref().to_string(),
             max_spend: Some(job.policy.max_spend_usd),
@@ -5042,20 +6496,6 @@ pub(crate) async fn complete_merged_plan_parent(
             job.job_id
         )))
     })?;
-    if let Ok(mut existing) = deadreckon_core::load_run(paths, job.job_id.as_ref()) {
-        if deadreckon_core::cancel_marker_present(&existing) {
-            remove_if_exists(&paths.job_receipt(job.job_id.as_ref()))?;
-            return parent_cancelled(
-                &mut existing,
-                "operator cancelled before the existing parent receipt was classified",
-            );
-        }
-        if let Ok(receipt) = deadreckon_core::validate_completion_receipt(paths, &existing) {
-            let receipt = validate_and_promote_parent(paths, &mut existing, &receipt)?;
-            return Ok(ParentCompletion::Verified(Box::new(receipt)));
-        }
-    }
-
     let merged = deadreckon_core::load_run(paths, merged_run_id)?;
     if merged.status != deadreckon_core::RunStatus::Completed {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -5068,13 +6508,25 @@ pub(crate) async fn complete_merged_plan_parent(
         ))
     })?;
     validate_owned_plan_lineage(paths, &owner)?;
+    validate_durable_chain_completion_evidence(paths, job, authority, plan)?;
     if let Ok(mut existing) = deadreckon_core::load_run(paths, job.job_id.as_ref()) {
+        if deadreckon_core::cancel_marker_present(&existing) {
+            remove_if_exists(&paths.job_receipt(job.job_id.as_ref()))?;
+            return parent_cancelled(
+                &mut existing,
+                "operator cancelled before the existing parent receipt was classified",
+            );
+        }
         if let Some(completion) =
             pending_parent_repair_completion(paths, job, &mut existing, &merged)?
         {
             return Ok(completion);
         }
         verify_parent_result_identity(paths, job, &existing, &merged)?;
+        if let Ok(receipt) = deadreckon_core::validate_completion_receipt(paths, &existing) {
+            let receipt = validate_and_promote_parent(paths, &mut existing, &receipt)?;
+            return Ok(ParentCompletion::Verified(Box::new(receipt)));
+        }
         if let Some(reason) = existing
             .failure_reason
             .as_deref()
@@ -5189,10 +6641,9 @@ pub(crate) async fn complete_merged_plan_parent(
     let execution_usage = match plan_execution_usage(paths, plan) {
         Ok(usage) => usage,
         Err(error) => {
-            return parent_needs_review(
+            return parent_failed(
                 &mut parent,
                 &format!("graph budget accounting is incomplete or corrupt: {error}"),
-                None,
                 StopReason::CorruptHistory,
             );
         }
@@ -5513,10 +6964,9 @@ pub(crate) async fn complete_merged_campaign_parent(
     let execution_usage = match campaign_execution_usage(paths, campaign) {
         Ok(usage) => usage,
         Err(error) => {
-            return parent_needs_review(
+            return parent_failed(
                 &mut parent,
                 &format!("campaign budget accounting is incomplete or corrupt: {error}"),
-                None,
                 StopReason::CorruptHistory,
             );
         }
@@ -5758,7 +7208,12 @@ fn repair_provider_selection(
 
 fn parent_tree_sha256(state: &deadreckon_core::PipelineState) -> Result<String> {
     let mut index = deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)?;
+    // Promotion and verified materialization add controller lifecycle
+    // metadata after the parent result was sealed. Keep this identity check
+    // aligned with completion-receipt validation so replay still compares the
+    // actual result tree, not DeadReckon's own delivery bookkeeping.
     index.files.remove(Path::new("manifest.json"));
+    index.files.remove(Path::new(".materialized-to"));
     Ok(index.tree_hash())
 }
 
@@ -6663,11 +8118,43 @@ fn add_plan_execution_usage(
                 usage,
             )?;
         }
-        if require_complete && task.attempts.iter().any(|attempt| attempt.run_id.is_none()) {
-            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "cannot verify parent budget because graph task {} has an attempt without a run ID",
-                task.task_id
-            ))));
+        for attempt in task
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.run_id.is_none())
+        {
+            let Some(finished_at) = attempt.finished_at else {
+                if require_complete {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "cannot verify parent budget because graph task {} has an unfinished attempt without a run ID",
+                        task.task_id
+                    ))));
+                }
+                continue;
+            };
+            let elapsed_ms = (finished_at - attempt.started_at).num_milliseconds();
+            if elapsed_ms < 0 {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "cannot verify parent budget because graph task {} attempt {} ends before it starts",
+                    task.task_id, attempt.attempt
+                ))));
+            }
+            // A child can fail during source preparation or process spawn,
+            // before any Run identity exists. TaskAttempt is the durable
+            // evidence for exactly that case, so charge its recorded spend
+            // and elapsed time instead of treating the permitted None as
+            // corrupt history.
+            add_usage(
+                &format!(
+                    "graph task {} attempt {} without a run ID",
+                    task.task_id, attempt.attempt
+                ),
+                ParentExecutionUsage {
+                    spend_usd: attempt.spend_usd,
+                    wall_seconds: elapsed_ms as f64 / 1_000.0,
+                },
+                usage,
+            )?;
         }
         if require_complete && task.child_run_id.is_none() {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -6709,32 +8196,37 @@ fn add_plan_execution_usage(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RepairBudgetAvailability {
+    Available {
+        spend_usd: f64,
+        wall_seconds: f64,
+    },
+    Exhausted {
+        stop_reason: StopReason,
+        reason: String,
+    },
+}
+
 pub(crate) fn current_driver_remaining_repair_budget(
     paths: &DeadreckonPaths,
     plan: &deadreckon_core::plan::Plan,
     repair_planner_spend_usd: f64,
     repair_planner_wall_seconds: f64,
-) -> Result<Option<(f64, f64)>> {
+) -> Result<Option<RepairBudgetAvailability>> {
     let Some(context) = DRIVER_CONTEXT.get() else {
         return Ok(None);
     };
     let job = deadreckon_core::load_job(paths, &context.job_id)?;
     let mut usage = match job.shape {
-        JobShape::Graph => {
-            let mut seen_runs = std::collections::BTreeSet::new();
-            let mut seen_plans = std::collections::BTreeSet::new();
-            let mut usage = ParentExecutionUsage::default();
-            add_plan_execution_usage(
-                paths,
-                plan,
-                &mut seen_runs,
-                &mut seen_plans,
-                &mut usage,
-                false,
-            )?;
-            usage
-        }
+        JobShape::Graph => graph_repair_execution_usage(paths, plan, &context.job_id)?,
         JobShape::LegacyCampaign => {
+            if plan.plan_id != context.job_id {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Campaign merge-repair adapter {} does not match current Job {}",
+                    plan.plan_id, context.job_id
+                ))));
+            }
             let campaign =
                 deadreckon_core::campaign::read_campaign(&paths.plan_dir(&context.job_id))?;
             campaign_execution_usage(paths, &campaign)?
@@ -6753,32 +8245,78 @@ pub(crate) fn current_driver_remaining_repair_budget(
         },
         &mut usage,
     )?;
-    remaining_repair_budget(
+    Ok(Some(repair_budget_availability(
         job.policy.max_spend_usd,
         job.policy.max_wall_seconds as f64,
         usage,
-    )
-    .map(Some)
+    )))
 }
 
-fn remaining_repair_budget(
+fn graph_repair_execution_usage(
+    paths: &DeadreckonPaths,
+    plan: &deadreckon_core::plan::Plan,
+    current_job_id: &str,
+) -> Result<ParentExecutionUsage> {
+    let owner = resolve_plan_owner(paths, plan)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Graph merge-repair Plan {} has no durable Job owner",
+            plan.plan_id
+        )))
+    })?;
+    if owner.job.job_id.as_ref() != current_job_id || owner.root_plan_id != current_job_id {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "Graph merge-repair Plan {} does not belong to current root Job {current_job_id}",
+            plan.plan_id
+        ))));
+    }
+    let root = if plan.plan_id == owner.root_plan_id {
+        plan.clone()
+    } else {
+        deadreckon_core::load_plan(paths, &owner.root_plan_id)?
+    };
+    let mut seen_runs = std::collections::BTreeSet::new();
+    let mut seen_plans = std::collections::BTreeSet::new();
+    let mut usage = ParentExecutionUsage::default();
+    add_plan_execution_usage(
+        paths,
+        &root,
+        &mut seen_runs,
+        &mut seen_plans,
+        &mut usage,
+        false,
+    )?;
+    Ok(usage)
+}
+
+fn repair_budget_availability(
     max_spend_usd: f64,
     max_wall_seconds: f64,
     usage: ParentExecutionUsage,
-) -> Result<(f64, f64)> {
+) -> RepairBudgetAvailability {
     let remaining_spend = max_spend_usd - usage.spend_usd;
     let remaining_wall = max_wall_seconds - usage.wall_seconds;
-    if remaining_spend <= 0.0 || remaining_wall <= 0.0 {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "merge repair child refused because the parent Job has no remaining {} budget",
-            if remaining_spend <= 0.0 {
-                "spend"
-            } else {
-                "wall-time"
-            }
-        ))));
+    if remaining_spend <= 0.0 {
+        return RepairBudgetAvailability::Exhausted {
+            stop_reason: StopReason::SpendCap,
+            reason: format!(
+                "merge repair child refused because the parent Job exhausted its approved spend cap (${:.6} used of ${max_spend_usd:.6})",
+                usage.spend_usd
+            ),
+        };
     }
-    Ok((remaining_spend, remaining_wall))
+    if remaining_wall <= 0.0 {
+        return RepairBudgetAvailability::Exhausted {
+            stop_reason: StopReason::WallCap,
+            reason: format!(
+                "merge repair child refused because the parent Job exhausted its approved wall-time cap ({:.3}s used of {max_wall_seconds:.3}s)",
+                usage.wall_seconds
+            ),
+        };
+    }
+    RepairBudgetAvailability::Available {
+        spend_usd: remaining_spend,
+        wall_seconds: remaining_wall,
+    }
 }
 
 fn campaign_execution_usage(
@@ -6850,18 +8388,38 @@ fn campaign_execution_usage(
             true,
         )?;
     }
-    for event in deadreckon_core::read_plan_events(paths, &campaign.campaign_id)? {
-        let run_id = match event.event {
+    let mut repair_run_ids = deadreckon_core::read_plan_events(paths, &campaign.campaign_id)?
+        .into_iter()
+        .filter_map(|event| match event.event {
             deadreckon_core::PlanEventKind::MergeRepairRunDiscovered { run_id, .. } => Some(run_id),
             deadreckon_core::PlanEventKind::MergeRepaired {
                 repair_run_id: Some(run_id),
                 ..
             } => Some(run_id),
             _ => None,
-        };
-        let Some(run_id) = run_id else {
-            continue;
-        };
+        })
+        .collect::<Vec<_>>();
+    repair_run_ids.extend(
+        deadreckon_core::read_job_history(&paths.job_events(&campaign.campaign_id))?
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind == JobEventKind::RepairChildAuthorityChanged
+                    && event
+                        .detail
+                        .get("transition")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("trusted")
+            })
+            .filter_map(|event| {
+                event
+                    .detail
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
+    );
+    for run_id in repair_run_ids {
         if !seen_runs.insert(run_id.clone()) {
             continue;
         }
@@ -7552,6 +9110,20 @@ fn parent_needs_review(
     })
 }
 
+fn parent_failed(
+    state: &mut deadreckon_core::PipelineState,
+    reason: &str,
+    stop_reason: StopReason,
+) -> Result<ParentCompletion> {
+    state.failure_reason = Some(reason.to_string());
+    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    deadreckon_core::save_state(state)?;
+    Ok(ParentCompletion::Failed {
+        reason: reason.to_string(),
+        stop_reason,
+    })
+}
+
 fn driver_shape_error(job_id: &str) -> CliError {
     CliError::Core(DeadreckonError::InvalidInput(format!(
         "advanced driver kind does not match job {job_id}"
@@ -7633,6 +9205,137 @@ mod tests {
         save_plan(&paths, &child).expect("save child");
         save_plan(&paths, &root).expect("save root");
         (temp, paths, root, child)
+    }
+
+    #[test]
+    fn plan_task_run_is_linked_once_in_owning_job_history() {
+        let (_temp, paths, root, _child) = owned_plan_fixture();
+        let owner = deadreckon_core::LeaseOwner {
+            owner_id: "plan-child-link-test".to_string(),
+            boot_id: "plan-child-link-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &JobId(root.plan_id.clone()),
+            &owner,
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("claim owning Job")
+        .token();
+        let task = &root.tasks[0];
+        let run_id = plan_task_run_id(&root.plan_id, &root.plan_id, &task.task_id, 1);
+        prepare_plan_task_run_fenced(
+            &paths,
+            &token,
+            &root.plan_id,
+            &task.task_id,
+            task.index,
+            1,
+            &run_id,
+        )
+        .expect("prepare Plan task Run");
+        let ownership = deadreckon_core::RunOwnership::plan_task(
+            root.plan_id.clone(),
+            root.plan_id.clone(),
+            task.task_id.clone(),
+            task.index,
+            1,
+        );
+        let job = deadreckon_core::load_job(&paths, &root.plan_id).expect("Job");
+        let state = deadreckon_core::create_owned_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: task.goal.clone(),
+                cwd: job.source_cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some(run_id.clone()),
+                codebase: None,
+            },
+            ownership,
+        )
+        .expect("owned Plan task Run");
+
+        reconcile_plan_task_run_links(&paths, &token, &root)
+            .expect("recovery links the preassigned Run after a crash window");
+        link_plan_task_run_fenced(
+            &paths,
+            &token,
+            &state,
+            &root.plan_id,
+            &task.task_id,
+            task.index,
+            1,
+        )
+        .expect("same link is idempotent");
+
+        let history = deadreckon_core::read_job_history(&paths.job_events(&root.plan_id))
+            .expect("Job history");
+        let links = history
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind == JobEventKind::ChildLinked
+                    && event
+                        .detail
+                        .get("relationship")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("plan_task")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| {
+                    plan_task_event_matches(
+                        event,
+                        JobEventKind::ChildLaunchPrepared,
+                        &root.plan_id,
+                        &task.task_id,
+                        task.index,
+                        1,
+                    )
+                })
+                .count(),
+            1
+        );
+        assert_eq!(links[0].detail["run_id"], state.run_id);
+        let view = deadreckon_core::JobView::load(&paths, &root.plan_id).expect("Job view");
+        assert!(
+            view.projection.child_run_ids.contains(&state.run_id),
+            "the Job projection must own its leaf Run"
+        );
+        assert_eq!(
+            deadreckon_core::load_plan(&paths, &root.plan_id)
+                .expect("recovered Plan")
+                .tasks[0]
+                .child_run_id
+                .as_deref(),
+            Some(state.run_id.as_str()),
+            "recovery must also restore the Plan's child pointer"
+        );
+
+        let mut conflicting = state.clone();
+        conflicting.run_id = "different-plan-child-run".to_string();
+        let error = link_plan_task_run_fenced(
+            &paths,
+            &token,
+            &conflicting,
+            &root.plan_id,
+            &task.task_id,
+            task.index,
+            1,
+        )
+        .expect_err("same task attempt cannot link another Run");
+        assert!(error.to_string().contains("has no fenced launch record"));
     }
 
     struct ParentRepairAuthorityFixture {
@@ -8217,6 +9920,35 @@ mod tests {
         save_plan(&paths, &grandchild).expect("grandchild");
         let depth = resolve_plan_owner(&paths, &grandchild).expect_err("excess depth");
         assert!(depth.to_string().contains("nesting cap"), "{depth}");
+    }
+
+    #[test]
+    fn merge_repair_authority_cannot_roll_back_to_an_older_committed_value() {
+        let repair_id = "sha256:repair";
+        let old = json!({"status": "process_prepared", "run_id": "run-1"});
+        let current = json!({"status": "trusted", "run_id": "run-1"});
+        let event = |sequence, authority: &serde_json::Value| deadreckon_protocol::JobEvent {
+            schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+            job_id: JobId("authority-rollback-job".to_string()),
+            sequence: deadreckon_protocol::JobEventSequence::new(sequence).expect("sequence"),
+            event_id: Uuid::new_v4().to_string(),
+            causation_id: format!("authority:{sequence}"),
+            timestamp: Utc::now(),
+            lease_epoch: 1,
+            kind: JobEventKind::RepairChildAuthorityChanged,
+            detail: json!({
+                "repair_id": repair_id,
+                "authority": authority,
+            }),
+        };
+        let events = vec![event(1, &old), event(2, &current)];
+
+        assert!(latest_merge_repair_authority_matches(
+            &events, repair_id, &current
+        ));
+        assert!(!latest_merge_repair_authority_matches(
+            &events, repair_id, &old
+        ));
     }
 
     #[test]
@@ -9232,6 +10964,15 @@ mod tests {
         let mut second_task =
             PlanTask::new(1, "same child", "reuse durable work", PlanRole::Child, None);
         second_task.child_run_id = Some(run.run_id.clone());
+        let mut failed_spawn = TaskAttempt::failed(
+            1,
+            None,
+            Some("source preparation failed before Run creation".to_string()),
+            0.1,
+        );
+        failed_spawn.started_at = Utc::now();
+        failed_spawn.finished_at = Some(failed_spawn.started_at + chrono::Duration::seconds(2));
+        second_task.attempts.push(failed_spawn);
         let plan = Plan::new(
             "bounded graph",
             PlanMode::FullPlan,
@@ -9269,10 +11010,52 @@ mod tests {
         assert_eq!(
             usage,
             ParentExecutionUsage {
-                spend_usd: 1.5,
-                wall_seconds: 5.5,
+                spend_usd: 1.6,
+                wall_seconds: 7.5,
             }
         );
+    }
+
+    #[test]
+    fn nested_graph_repair_usage_includes_root_siblings() {
+        use deadreckon_core::plan::save_plan;
+
+        let (temp, paths, mut root, mut child) = owned_plan_fixture();
+        let source = temp.path().join("source");
+        let create_costed_run = |goal: &str, spend_usd: f64, wall_seconds: f64| {
+            let mut run = deadreckon_core::create_run(
+                &paths,
+                deadreckon_core::RunOptions {
+                    goal: goal.to_string(),
+                    cwd: source.clone(),
+                    sandbox: "none".to_string(),
+                    provider: Some("smoke".to_string()),
+                    skill_name: "test".to_string(),
+                    max_spend_usd: None,
+                    max_wall_seconds: None,
+                    run_id: None,
+                    codebase: None,
+                },
+            )
+            .expect("run");
+            run.total_spend_usd = spend_usd;
+            run.total_wall_seconds = wall_seconds;
+            deadreckon_core::save_state(&run).expect("state");
+            run.run_id
+        };
+        child.tasks[0].child_run_id = Some(create_costed_run("nested", 0.3, 3.0));
+        root.tasks[1].child_run_id = Some(create_costed_run("root sibling", 0.4, 4.0));
+        save_plan(&paths, &child).expect("nested Plan");
+        save_plan(&paths, &root).expect("root Plan");
+        record_plan_planner_accounting(&paths, &root.plan_id, None)
+            .expect("root planner accounting");
+        record_plan_planner_accounting(&paths, &child.plan_id, None)
+            .expect("nested planner accounting");
+
+        let usage = graph_repair_execution_usage(&paths, &child, &root.plan_id)
+            .expect("root-scoped repair usage");
+        assert!((usage.spend_usd - 0.7).abs() < f64::EPSILON);
+        assert!((usage.wall_seconds - 7.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -9392,7 +11175,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_graph_driver_never_persists_per_node_apply() {
+    fn durable_graph_driver_preserves_per_node_apply_for_isolated_execution() {
         let mut plan = commands::course::trivial_operator_plan(
             "verify only after the isolated graph is merged",
             commands::course::CourseShape::Plan,
@@ -9414,7 +11197,128 @@ mod tests {
         embed_driver_spec(&mut plan, &requested).expect("embed");
         let frozen = driver_spec(&plan).expect("frozen driver");
         assert_eq!(requested.apply, deadreckon_core::plan::ApplyWhen::PerNode);
-        assert_eq!(frozen.apply, deadreckon_core::plan::ApplyWhen::AtEnd);
+        assert_eq!(frozen.apply, deadreckon_core::plan::ApplyWhen::PerNode);
+    }
+
+    #[test]
+    fn ordered_candidate_rejects_clean_unledgered_commit_and_leaves_source_untouched() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("approved.txt"), "approved\n").expect("approved source");
+        let source_tree_sha256 = deadreckon_core::flight::build_deliverable_file_index(&source)
+            .expect("source index")
+            .tree_hash();
+        let job_id = JobId("ordered-candidate-job".to_string());
+        let job = deadreckon_protocol::Job {
+            schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            scope: "ordered-candidate".to_string(),
+            goal: "land two ordered changes".to_string(),
+            shape: JobShape::Graph,
+            created_at: Utc::now(),
+            source_cwd: source.clone(),
+            launch_plan_sha256: "sha256:launch".to_string(),
+            authority_sha256: "sha256:authority".to_string(),
+            policy: deadreckon_protocol::JobPolicy {
+                max_spend_usd: 1.0,
+                max_wall_seconds: 60,
+                max_attempts: 2,
+                deadline: None,
+                semantic_judge: deadreckon_protocol::SemanticJudgeMode::Required,
+                execution: None,
+            },
+        };
+        deadreckon_core::write_job(&paths, &job).expect("Job");
+        let authority = deadreckon_protocol::JobAuthority {
+            schema_version: deadreckon_protocol::JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            run_id: deadreckon_protocol::RunId(job_id.as_ref().to_string()),
+            approved_at: Utc::now(),
+            accepted_by: deadreckon_protocol::AuthorityAcceptedBy::Operator,
+            goal_sha256: deadreckon_core::flight::sha256_text(&job.goal),
+            contract_sha256: "sha256:contract".to_string(),
+            effective_policy_sha256: "sha256:policy".to_string(),
+            launch_plan_sha256: job.launch_plan_sha256.clone(),
+            source_tree_sha256: source_tree_sha256.clone(),
+            source_revision: None,
+            sandbox_requested: "sandbox-exec".to_string(),
+            semantic_judge_mode: deadreckon_protocol::SemanticJudgeMode::Required,
+            gate_evaluator_sha256: None,
+        };
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &job_id,
+            &deadreckon_core::LeaseOwner {
+                owner_id: "ordered-candidate-owner".to_string(),
+                boot_id: "ordered-candidate-boot".to_string(),
+                pid: std::process::id(),
+                process_group: std::process::id(),
+            },
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("lease")
+        .token();
+
+        let candidate = prepare_ordered_candidate(&paths, &job, &authority, &token)
+            .expect("prepare ordered candidate");
+        assert_ne!(candidate, source);
+        assert_eq!(
+            fs::read_to_string(candidate.join("approved.txt")).expect("candidate source"),
+            "approved\n"
+        );
+        assert!(!source.join(".git").exists());
+
+        fs::write(candidate.join("landed.txt"), "first node\n").expect("landed result");
+        git_status(&candidate, &["add", "--all"]).expect("stage landed result");
+        git_status(
+            &candidate,
+            &[
+                "-c",
+                "user.name=DeadReckon",
+                "-c",
+                "user.email=deadreckon@localhost",
+                "commit",
+                "--quiet",
+                "-m",
+                "land first node",
+            ],
+        )
+        .expect("commit landed result");
+        fs::write(
+            source.join("operator-later.txt"),
+            "outside the isolated Job\n",
+        )
+        .expect("operator source can move independently");
+        let error = prepare_ordered_candidate(&paths, &job, &authority, &token)
+            .expect_err("clean commits without an application fact must fail closed");
+        assert!(error.to_string().contains("clean unledgered HEAD"));
+        assert!(!source.join("landed.txt").exists());
+
+        git_status(&candidate, &["reset", "--hard", "HEAD^"])
+            .expect("restore manifest initial revision");
+        assert_eq!(
+            prepare_ordered_candidate(&paths, &job, &authority, &token)
+                .expect("recover exact initial candidate"),
+            candidate
+        );
+
+        let history =
+            deadreckon_core::read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::WorkspacePrepared)
+                .count(),
+            1
+        );
+        fs::write(candidate.join("partial.txt"), "incomplete landing\n").expect("partial landing");
+        let error = prepare_ordered_candidate(&paths, &job, &authority, &token)
+            .expect_err("dirty recovery must fail closed");
+        assert!(error.to_string().contains("incomplete landing"));
     }
 
     #[test]
@@ -9513,7 +11417,7 @@ mod tests {
     #[test]
     fn dependency_repair_links_exact_run_before_output_and_refuses_duplicate() {
         let (_temp, _paths, state, proof_dir) = dependency_repair_link_fixture(false);
-        link_delegated_repair_run(&state).expect("link exact repair Run");
+        link_delegated_owned_run(&state).expect("link exact repair Run");
         let linked: Value = serde_json::from_slice(
             &fs::read(proof_dir.join("repair-run.json")).expect("linked record"),
         )
@@ -9523,7 +11427,7 @@ mod tests {
 
         let mut duplicate = state.clone();
         duplicate.run_id = "duplicate-repair-run".to_string();
-        link_delegated_repair_run(&duplicate)
+        link_delegated_owned_run(&duplicate)
             .expect_err("durable authority must not link a second repair Run");
         let unchanged: Value = serde_json::from_slice(
             &fs::read(proof_dir.join("repair-run.json")).expect("unchanged record"),
@@ -9535,8 +11439,7 @@ mod tests {
     #[test]
     fn dependency_repair_digest_tamper_fails_before_run_link() {
         let (_temp, _paths, state, proof_dir) = dependency_repair_link_fixture(true);
-        link_delegated_repair_run(&state)
-            .expect_err("tampered immutable repair plan must not link");
+        link_delegated_owned_run(&state).expect_err("tampered immutable repair plan must not link");
         let record: Value = serde_json::from_slice(
             &fs::read(proof_dir.join("repair-run.json")).expect("launch record"),
         )
@@ -9570,19 +11473,129 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_parent_budget_refuses_repair_child() {
-        for usage in [
-            ParentExecutionUsage {
-                spend_usd: 4.0,
-                wall_seconds: 1.0,
-            },
-            ParentExecutionUsage {
-                spend_usd: 1.0,
-                wall_seconds: 90.0,
-            },
-        ] {
-            remaining_repair_budget(4.0, 90.0, usage)
-                .expect_err("repair child must fail closed at either parent cap");
-        }
+    fn exhausted_parent_budget_refuses_repair_child_with_a_bounded_reason() {
+        assert!(matches!(
+            repair_budget_availability(
+                4.0,
+                90.0,
+                ParentExecutionUsage {
+                    spend_usd: 4.0,
+                    wall_seconds: 1.0,
+                },
+            ),
+            RepairBudgetAvailability::Exhausted {
+                stop_reason: StopReason::SpendCap,
+                ..
+            }
+        ));
+        assert!(matches!(
+            repair_budget_availability(
+                4.0,
+                90.0,
+                ParentExecutionUsage {
+                    spend_usd: 1.0,
+                    wall_seconds: 90.0,
+                },
+            ),
+            RepairBudgetAvailability::Exhausted {
+                stop_reason: StopReason::WallCap,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_chain_executes_approved_bytes_after_original_mutation_and_deletion() {
+        use deadreckon_core::chain::{
+            ApplyMode, ApplyStrategy, BranchPolicy, Chain, ChainHookName, ChainHookSource,
+            ChainNewOptions, DurableChainAdapterManifest, DurableChainHookEventKind,
+            FrozenChainHook, OnFail,
+        };
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let hook_path = temp.path().join("pre-step");
+        fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\nif [ \"$DEADRECKON_HOME\" = \"{}\" ]; then echo controller-home-exposed; exit 8; fi\necho approved-program\nexit 0\n",
+                paths.home().display()
+            ),
+        )
+        .expect("approved hook");
+        let hook = FrozenChainHook::freeze(
+            ChainHookName::PreStep,
+            ChainHookSource::Workspace,
+            &hook_path,
+        )
+        .expect("freeze hook");
+        let chain = Chain::new(ChainNewOptions {
+            root_goal: "manual: 2 steps".to_string(),
+            goals: vec!["one".to_string(), "two".to_string()],
+            scope: "hook-test".to_string(),
+            base_branch: "main".to_string(),
+            base_sha: "approved-base".to_string(),
+            cwd: temp.path().to_path_buf(),
+            provider: Some("smoke".to_string()),
+            model: None,
+            sandbox: "auto".to_string(),
+            branch_policy: BranchPolicy::Stack,
+            apply_mode: ApplyMode::Auto,
+            apply_strategy: ApplyStrategy::Squash,
+            apply_allowlist: Vec::new(),
+            on_fail: OnFail::Stop,
+            circuit_breaker_threshold: 2,
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: Some(60.0),
+            deadreckon_version: "test".to_string(),
+        })
+        .expect("chain");
+        let adapter = DurableChainAdapterManifest::new(&chain, vec![hook.clone()]);
+        fs::write(&hook_path, b"#!/bin/sh\necho mutable-program\nexit 9\n")
+            .expect("mutate original hook");
+        fs::remove_file(&hook_path).expect("delete original hook");
+
+        let job_id = JobId("approved-chain-hook-job".to_string());
+        let owner = deadreckon_core::LeaseOwner {
+            owner_id: "approved-hook-owner".to_string(),
+            boot_id: "approved-hook-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &job_id,
+            &owner,
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("claim")
+        .token();
+
+        let exit_code = invoke_frozen_durable_chain_hook(
+            &paths,
+            &token,
+            &adapter,
+            &hook,
+            Some(0),
+            1,
+            temp.path(),
+            &json!({"step_goal": "one", "base_ref": "approved-base"}),
+        )
+        .expect("invoke approved hook bytes");
+
+        assert_eq!(exit_code, 0);
+        assert!(!hook_path.exists());
+        let events = deadreckon_core::chain::read_durable_chain_hook_events(&paths, &job_id)
+            .expect("hook evidence");
+        let completed = events
+            .iter()
+            .find(|event| event.kind == DurableChainHookEventKind::Completed)
+            .expect("completed event");
+        assert!(completed.stdout.contains("approved-program"));
+        assert!(!completed.stdout.contains("mutable-program"));
+        assert!(!completed.stdout.contains("controller-home-exposed"));
+        assert_eq!(completed.hook.approved_bytes, hook.approved_bytes);
     }
 }

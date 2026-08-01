@@ -1153,6 +1153,8 @@ mod tests {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: job_id.clone(),
             run_id: RunId(job_id.as_ref().to_string()),
+            attempt: 1,
+            outer_launch_id: "00000000-0000-4000-8000-000000000001".to_string(),
             issued_at: chrono::Utc::now(),
             issuer: CompletionReceiptIssuer::DeadreckonSupervisor,
             proof_kind: CompletionProofKind::TwoKeyCompletion,
@@ -1170,6 +1172,7 @@ mod tests {
             deterministic_marker_sha256: "marker".to_string(),
             semantic_judgment_sha256: "semantic".to_string(),
             sandbox_boundary_observation_sha256: "sandbox-observation".to_string(),
+            execution_evidence: None,
             contained: true,
             sandbox_backend: "sandbox-exec".to_string(),
             signature: "signature".to_string(),
@@ -1379,6 +1382,7 @@ mod tests {
             },
             attempts: Vec::new(),
             missing_attempts: Vec::new(),
+            verified_receipt_error: None,
         };
         let mut missing = MissingEvidenceReport::default();
 

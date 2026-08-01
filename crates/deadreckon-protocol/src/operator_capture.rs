@@ -172,34 +172,7 @@ pub struct OperatorCaptureExpectedJobResult {
 
 impl OperatorCaptureExpectedJobResult {
     pub fn is_valid(self) -> bool {
-        match self.outcome {
-            JobOutcome::Verified => self.stop_reason == StopReason::Verified,
-            JobOutcome::NeedsReview => matches!(
-                self.stop_reason,
-                StopReason::SemanticRevise
-                    | StopReason::SemanticUncertain
-                    | StopReason::SemanticUnavailable
-            ),
-            JobOutcome::Blocked => matches!(
-                self.stop_reason,
-                StopReason::OperatorInputRequired | StopReason::LostContainment
-            ),
-            JobOutcome::BudgetExhausted => {
-                matches!(self.stop_reason, StopReason::SpendCap | StopReason::WallCap)
-            }
-            JobOutcome::DeadlineReached => self.stop_reason == StopReason::Deadline,
-            JobOutcome::RetryExhausted => self.stop_reason == StopReason::AttemptLimit,
-            JobOutcome::Cancelled => self.stop_reason == StopReason::CancelRequested,
-            JobOutcome::Failed => matches!(
-                self.stop_reason,
-                StopReason::TransientProvider
-                    | StopReason::FatalProvider
-                    | StopReason::FatalGate
-                    | StopReason::LostContainment
-                    | StopReason::CorruptHistory
-                    | StopReason::LegacyUnknown
-            ),
-        }
+        self.outcome.accepts_stop_reason(self.stop_reason)
     }
 }
 

@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::artifacts::{DiffSummary, snapshot_diff};
 use crate::docs::{DocKind, doc_path_for_kind};
-use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::error::{DeadreckonError, IoContext, Result};
 use crate::events::RUN_EVENTS_JSONL;
 use crate::gate::{
     AcceptanceCheckResult, AcceptanceMarker, AcceptanceProgressEntry,
@@ -370,17 +370,13 @@ fn proof_band(state: &PipelineState, missing: &mut Vec<Artifact>) -> Result<Proo
         missing.push(Artifact::Proofs);
     }
     let marker_path = marker_path_for_run_root(&state.run_root);
-    let marker = if marker_path.exists() {
-        Some(
-            serde_json::from_slice::<AcceptanceMarker>(
-                &fs::read(&marker_path).with_path(&marker_path)?,
-            )
-            .with_json_path(&marker_path)?,
-        )
+    let marker_present = marker_path.exists();
+    let marker = if marker_present {
+        validate_acceptance_marker(state).ok()
     } else {
         None
     };
-    let marker_valid = marker.is_some() && validate_acceptance_marker(state).is_ok();
+    let marker_valid = marker.is_some();
     let progress_path = acceptance_progress_path_for_run_root(&state.run_root);
     let progress = read_jsonl_or_missing::<AcceptanceProgressEntry>(
         &progress_path,
@@ -400,7 +396,7 @@ fn proof_band(state: &PipelineState, missing: &mut Vec<Artifact>) -> Result<Proo
     let tamper = crate::tamper::read_acceptance_tamper_for_run_root(&state.run_root)?;
     let tamper_path = tamper_path.exists().then_some(tamper_path);
     Ok(ProofBand {
-        marker_path: marker.as_ref().map(|_| marker_path),
+        marker_path: marker_present.then_some(marker_path),
         marker_valid,
         marker,
         checks,
@@ -430,17 +426,21 @@ fn signature_fact(proof: &ProofBand) -> SignatureFact {
 }
 
 fn verdict_band(state: &PipelineState, proof: &ProofBand) -> VerdictBand {
-    let state_label = if proof.marker_path.is_some() && proof.marker_valid {
-        "VERIFIED"
-    } else if proof.marker_path.is_some() {
-        "REGRESSED"
-    } else {
-        "UNVERIFIED"
+    let (state_label, proof_label) = match (&proof.marker, proof.marker_path.is_some()) {
+        (Some(marker), _) if marker.schema_version == 1 => {
+            ("UNVERIFIED", "a valid legacy v1 weak acceptance proof")
+        }
+        (Some(marker), _) if marker.is_native_gate_proof() => {
+            ("VERIFIED", "a validated signed dr-gate receipt")
+        }
+        (Some(_), _) => ("VERIFIED", "a validated signed controller proof"),
+        (None, true) => ("REGRESSED", "an invalid acceptance marker"),
+        (None, false) => ("UNVERIFIED", "no signed acceptance marker"),
     };
     VerdictBand {
         state: state_label.to_string(),
         summary: format!(
-            "{} run with {} proof check(s)",
+            "{} run with {proof_label} and {} proof check(s)",
             state.status,
             proof.checks.len()
         ),
@@ -749,7 +749,7 @@ mod tests {
     use crate::state::{RunOptions, create_run, save_state};
     use crate::{DeadreckonPaths, RunStatus};
 
-    use super::{Artifact, RunView};
+    use super::{Artifact, RunView, SignatureStatus};
 
     fn fixture_run() -> (TempDir, crate::PipelineState, DeadreckonPaths) {
         let temp = TempDir::new().expect("tempdir");
@@ -880,6 +880,53 @@ mod tests {
         );
         assert_eq!(view.turns[0].sandbox_events.len(), 1);
         assert_eq!(view.proof.checks.len(), 1);
+    }
+
+    #[test]
+    fn run_view_records_tampered_marker_as_invalid_without_using_its_checks() {
+        let (_temp, state, _paths) = fixture_run();
+        crate::write_acceptance_marker_with_results(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            vec![AcceptanceCheckResult {
+                kind: "forged-check".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "claim supplied by marker".to_string(),
+                command: Some("true".to_string()),
+                cwd: Some(state.working_dir.clone()),
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+        )
+        .expect("marker");
+        let marker_path = crate::marker_path_for_run_root(&state.run_root);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).expect("marker bytes"))
+                .expect("marker json");
+        marker["check_count"] = serde_json::json!(99);
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&marker).expect("tampered marker json"),
+        )
+        .expect("tampered marker");
+
+        let view = RunView::from_state(&state).expect("view remains inspectable");
+
+        assert_eq!(view.signature.status, SignatureStatus::Invalid);
+        assert!(view.proof.marker_path.is_some());
+        assert!(!view.proof.marker_valid);
+        assert!(view.proof.marker.is_none());
+        assert_eq!(view.verdict.state, "REGRESSED");
+        assert!(view.verdict.summary.contains("invalid acceptance marker"));
+        assert!(
+            view.proof
+                .checks
+                .iter()
+                .all(|check| check.kind != "forged-check")
+        );
     }
 
     #[test]

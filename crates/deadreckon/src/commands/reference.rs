@@ -200,10 +200,10 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
     },
     // Undo reverses the last committed step of whatever it is handed. For a
     // run that is a snapshot restore; for a chain it is unwinding an applied
-    // step. Both are "put this back", so both belong on one verb.
+    // step; for a durable Job it is the one receipt-bound applied delivery.
     VerbRefSpec {
         verb: "undo",
-        accepts: RUN_LIKE.union(RefKinds::CHAIN),
+        accepts: RefKinds::JOB.union(RUN_LIKE).union(RefKinds::CHAIN),
     },
     VerbRefSpec {
         verb: "rewind",

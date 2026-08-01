@@ -10,12 +10,12 @@ status: 0
 |   Evidence                                                                                                           |
 |   run           <ID8>                                                                                             |
 |   provider      smoke                                                                                                |
-|   gate          gate: PASSED 1/1                                                                                     |
+|   gate          gate: PASSED 1/1 - validated signed dr-gate receipt                                                  |
 |   working       <TMP>/home/library/repo-<ID8>/<ID32>         |
 |   turns         3                                                                                                    |
 |   tokens        in 1762  out 429                                                                                     |
 |   spend         $0.000000 · wall <DURATION> · 3 turns                                                                      |
-|   gate          gate: PASSED 1/1                                                                                     |
+|   gate          gate: PASSED 1/1 - validated signed dr-gate receipt                                                  |
 |   tests modified this run  no                                                                                        |
 |   working                  <TMP>/home/library/repo-<ID8>/<HEX>... |
 |                                                                                                                      |

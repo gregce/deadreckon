@@ -483,6 +483,7 @@ fn plan_task_status(status: PlanTaskStatus) -> NodeStatus {
         PlanTaskStatus::Pending => NodeStatus::Pending,
         PlanTaskStatus::Running => NodeStatus::Running,
         PlanTaskStatus::Completed => NodeStatus::Verified,
+        PlanTaskStatus::Skipped => NodeStatus::Paused,
         PlanTaskStatus::Failed => NodeStatus::Failed,
         PlanTaskStatus::Killed => NodeStatus::Killed,
     }
@@ -635,6 +636,13 @@ fn fold_plan_event(model: &mut TreeModel, event: &PlanEvent) {
                 ensure_task_run_child(model, task_id, run_id, status);
                 set_status(model, &NodeId::run(run_id), status);
             }
+        }
+        PlanEventKind::TaskSkipped { task_id, .. } => {
+            set_status(
+                model,
+                &NodeId::task(&event.plan_id, task_id),
+                NodeStatus::Paused,
+            );
         }
         PlanEventKind::TaskBlocked { task_id, .. } => {
             set_status(

@@ -70,9 +70,12 @@ impl ProtectedPathPolicy {
             policy.write_denylist.extend([
                 run_root.join("acceptance.yaml"),
                 run_root.join(deadreckon_core::TRUSTED_CODEBASE_RECORD),
+                run_root.join("sandbox.toml"),
                 run_root.join("gate"),
                 run_root.join("provider-evidence"),
                 run_root.join("proofs"),
+                run_root.join("snapshots"),
+                run_root.join("provenance.jsonl"),
             ]);
             policy
                 .write_denylist
@@ -261,9 +264,12 @@ mod tests {
             paths.operator_captures_dir(),
             run_root.join("acceptance.yaml"),
             run_root.join(deadreckon_core::TRUSTED_CODEBASE_RECORD),
+            run_root.join("sandbox.toml"),
             run_root.join("gate"),
             run_root.join("provider-evidence"),
             run_root.join("proofs"),
+            run_root.join("snapshots"),
+            run_root.join("provenance.jsonl"),
         ] {
             assert!(
                 policy.write_denylist.contains(&protected),

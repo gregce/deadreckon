@@ -5,6 +5,7 @@
 //! used by fenced worker events.
 
 use std::fs;
+use std::io::Write;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -13,6 +14,7 @@ use deadreckon_protocol::{
 };
 use fs2::FileExt;
 use serde_json::{Map, Value};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
@@ -50,6 +52,13 @@ pub struct FencedJobJsonEvent {
     pub kind: JobEventKind,
     pub causation_id: String,
     pub detail: Value,
+}
+
+/// Result of atomically reserving one controller-owned JSON authority path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateFencedJobJsonDisposition {
+    Created(JobProjection),
+    AlreadyExists,
 }
 
 impl From<&JobLease> for LeaseToken {
@@ -250,6 +259,88 @@ pub fn append_fenced_job_event(
     append_job_event_locked(paths, event)
 }
 
+/// Append one worker lifecycle fact using the next sequence chosen while the
+/// Job control lock is held.
+///
+/// Callers that already possess a complete immutable event should use
+/// [`append_fenced_job_event`]. Concurrent supervised children should use this
+/// seam instead: deriving a sequence before taking the lock lets two valid
+/// children race with the same sequence and turns ordinary concurrency into a
+/// false corrupt-history failure.
+pub fn append_next_fenced_job_event(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    now: DateTime<Utc>,
+    kind: JobEventKind,
+    causation_id: String,
+    detail: Value,
+) -> Result<JobProjection> {
+    let lock_path = paths.job_dir(token.job_id.as_ref()).join(JOB_CONTROL_LOCK);
+    let lock = open_job_control_lock(&lock_path)?;
+    FileExt::lock_exclusive(&lock).with_path(&lock_path)?;
+
+    let lease = load_job_lease(paths, &token.job_id)?;
+    validate_token(&lease, token, now)?;
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let projection = reduce_job_history(&token.job_id, &history)?;
+    if projection.is_terminal() {
+        return Ok(projection);
+    }
+    if projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested) {
+        let cancellation_stop = kind == JobEventKind::AttemptStopped
+            && detail.get("stop_reason").and_then(Value::as_str) == Some("cancel_requested");
+        if kind != JobEventKind::Cancelled && !cancellation_stop {
+            return Ok(projection);
+        }
+    }
+    let sequence = projection
+        .last_sequence
+        .checked_add(1)
+        .and_then(JobEventSequence::new)
+        .ok_or_else(|| lease_error(&token.job_id, "job event sequence exhausted"))?;
+    let event = JobEvent {
+        schema_version: JobSchemaVersion::CURRENT,
+        job_id: token.job_id.clone(),
+        sequence,
+        event_id: Uuid::new_v4().to_string(),
+        causation_id,
+        timestamp: now,
+        lease_epoch: token.epoch,
+        kind,
+        detail,
+    };
+    append_job_event_locked(paths, &event)
+}
+
+/// Run one controller-owned mutation while the current Job lease is validated
+/// and its control lock is held. This is the common authority boundary for
+/// derived orchestration state that lives outside the Job directory (for
+/// example an owned Plan projection).
+pub(crate) fn with_fenced_job_control<T>(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    now: DateTime<Utc>,
+    mutate: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lock_path = paths.job_dir(token.job_id.as_ref()).join(JOB_CONTROL_LOCK);
+    let lock = open_job_control_lock(&lock_path)?;
+    FileExt::lock_exclusive(&lock).with_path(&lock_path)?;
+
+    let lease = load_job_lease(paths, &token.job_id)?;
+    validate_token(&lease, token, now)?;
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let projection = reduce_job_history(&token.job_id, &history)?;
+    if projection.is_terminal()
+        || projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested)
+    {
+        return Err(lease_error(
+            &token.job_id,
+            "cannot mutate an owned artifact after the Job stopped",
+        ));
+    }
+    mutate()
+}
+
 /// Replace one controller-owned JSON projection and append the event that
 /// authorizes that exact replacement while holding the Job control lock.
 ///
@@ -315,6 +406,114 @@ pub fn replace_fenced_job_json_and_append_event<T: serde::Serialize>(
     };
     atomic_write_json(artifact_path, value)?;
     append_job_event_locked(paths, &event)
+}
+
+/// Create one controller-owned JSON authority and append its authorizing event
+/// while holding the Job control lock.
+///
+/// Unlike [`replace_fenced_job_json_and_append_event`], this operation never
+/// replaces an existing path. It is the launch-boundary primitive for child
+/// authorities whose first durable identity must be chosen exactly once.
+/// The artifact is written before the event, so a crash between the writes
+/// leaves an uncommitted authority that recovery must reject rather than
+/// silently replacing.
+pub fn create_fenced_job_json_and_append_event<T: serde::Serialize>(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    now: DateTime<Utc>,
+    artifact_path: &std::path::Path,
+    event: FencedJobJsonEvent,
+    value: &T,
+) -> Result<CreateFencedJobJsonDisposition> {
+    let job_dir = paths.job_dir(token.job_id.as_ref());
+    let relative_artifact = artifact_path.strip_prefix(&job_dir).map_err(|_| {
+        lease_error(
+            &token.job_id,
+            "fenced artifact path is outside the protected Job directory",
+        )
+    })?;
+    if relative_artifact.as_os_str().is_empty()
+        || relative_artifact
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(lease_error(
+            &token.job_id,
+            "fenced artifact path is not a normalized protected Job child",
+        ));
+    }
+    let lock_path = job_dir.join(JOB_CONTROL_LOCK);
+    let lock = open_job_control_lock(&lock_path)?;
+    FileExt::lock_exclusive(&lock).with_path(&lock_path)?;
+
+    let lease = load_job_lease(paths, &token.job_id)?;
+    validate_token(&lease, token, now)?;
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let projection = reduce_job_history(&token.job_id, &history)?;
+    if projection.is_terminal()
+        || projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested)
+    {
+        return Err(lease_error(
+            &token.job_id,
+            "cannot create a fenced artifact after the Job stopped",
+        ));
+    }
+    let sequence = projection
+        .last_sequence
+        .checked_add(1)
+        .and_then(JobEventSequence::new)
+        .ok_or_else(|| lease_error(&token.job_id, "job event sequence exhausted"))?;
+    let event = JobEvent {
+        schema_version: JobSchemaVersion::CURRENT,
+        job_id: token.job_id.clone(),
+        sequence,
+        event_id: Uuid::new_v4().to_string(),
+        causation_id: event.causation_id,
+        timestamp: now,
+        lease_epoch: token.epoch,
+        kind: event.kind,
+        detail: event.detail,
+    };
+    if !persist_new_json(artifact_path, value)? {
+        return Ok(CreateFencedJobJsonDisposition::AlreadyExists);
+    }
+    append_job_event_locked(paths, &event).map(CreateFencedJobJsonDisposition::Created)
+}
+
+fn persist_new_json(path: &std::path::Path, value: &impl serde::Serialize) -> Result<bool> {
+    let parent = path.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput(format!("path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(parent).with_path(parent)?;
+    let mut temp = NamedTempFile::new_in(parent).with_path(parent)?;
+    serde_json::to_writer_pretty(&mut temp, value).with_json_path(path)?;
+    temp.write_all(b"\n").with_path(path)?;
+    temp.as_file_mut().sync_all().with_path(path)?;
+    match temp.persist_noclobber(path) {
+        Ok(file) => {
+            file.sync_all().with_path(path)?;
+            sync_parent(parent)?;
+            Ok(true)
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source: error.error,
+        }),
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent(parent: &std::path::Path) -> Result<()> {
+    fs::File::open(parent)
+        .with_path(parent)?
+        .sync_all()
+        .with_path(parent)
+}
+
+#[cfg(not(unix))]
+fn sync_parent(_parent: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn load_job_lease(paths: &DeadreckonPaths, job_id: &JobId) -> Result<JobLease> {
@@ -451,6 +650,7 @@ fn lease_error(job_id: &JobId, detail: &str) -> DeadreckonError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
@@ -461,8 +661,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FencedJobJsonEvent, LeaseClaimDisposition, LeaseOwner, LeaseReclaimReason,
-        append_fenced_job_event, claim_job_lease, heartbeat_job_lease,
+        CreateFencedJobJsonDisposition, FencedJobJsonEvent, LeaseClaimDisposition, LeaseOwner,
+        LeaseReclaimReason, append_fenced_job_event, append_next_fenced_job_event, claim_job_lease,
+        create_fenced_job_json_and_append_event, heartbeat_job_lease,
         replace_fenced_job_json_and_append_event,
     };
     use crate::job::{load_job_projection, read_job_history};
@@ -521,6 +722,56 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
         let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
         assert_eq!(history.events().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_fenced_facts_receive_distinct_sequences_under_the_lock() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = Arc::new(paths(&temp));
+        let job_id = JobId("job-concurrent-facts".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let token = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", "boot-a", 4050),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("claim")
+        .token();
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for index in 1..=2 {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            let token = token.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                append_next_fenced_job_event(
+                    &paths,
+                    &token,
+                    now,
+                    JobEventKind::CampaignSubAuthorityChanged,
+                    format!("concurrent-fact-{index}"),
+                    json!({ "index": index }),
+                )
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().expect("worker").expect("append fact");
+        }
+
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .map(|event| event.sequence.get())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -637,8 +888,180 @@ mod tests {
 
         assert!(error.to_string().contains("stale lease token"));
         assert!(!artifact.exists(), "stale projection must not be written");
+        let create_error = create_fenced_job_json_and_append_event(
+            &paths,
+            &stale,
+            now + TimeDelta::seconds(17),
+            &artifact,
+            FencedJobJsonEvent {
+                kind: JobEventKind::RepairChildAuthorityChanged,
+                causation_id: "stale-create".to_string(),
+                detail: json!({"transition": "process_prepared"}),
+            },
+            &json!({"authority": "stale"}),
+        )
+        .expect_err("stale worker must not create an authority");
+        assert!(create_error.to_string().contains("stale lease token"));
+        assert!(!artifact.exists(), "stale authority must not be created");
         let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
         assert_eq!(history.events().len(), 2);
+    }
+
+    #[test]
+    fn fenced_json_authority_is_created_exactly_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = Arc::new(paths(&temp));
+        let job_id = JobId("job-create-authority".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let token = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", "boot-a", 4355),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("claim")
+        .token();
+        let artifact = paths.job_dir(job_id.as_ref()).join("authority.json");
+        let barrier = Arc::new(Barrier::new(3));
+        let mut creators = Vec::new();
+        for authority in ["first", "second"] {
+            let paths = Arc::clone(&paths);
+            let token = token.clone();
+            let artifact = artifact.clone();
+            let barrier = Arc::clone(&barrier);
+            creators.push(thread::spawn(move || {
+                barrier.wait();
+                (
+                    authority,
+                    create_fenced_job_json_and_append_event(
+                        &paths,
+                        &token,
+                        now + TimeDelta::seconds(1),
+                        &artifact,
+                        FencedJobJsonEvent {
+                            kind: JobEventKind::RepairChildAuthorityChanged,
+                            causation_id: format!("create-authority:{authority}"),
+                            detail: json!({
+                                "transition": "process_prepared",
+                                "authority": authority,
+                            }),
+                        },
+                        &json!({"authority": authority}),
+                    )
+                    .expect("create classification"),
+                )
+            }));
+        }
+        barrier.wait();
+        let results = creators
+            .into_iter()
+            .map(|creator| creator.join().expect("creator"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| matches!(result, CreateFencedJobJsonDisposition::Created(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, result)| *result == CreateFencedJobJsonDisposition::AlreadyExists)
+                .count(),
+            1
+        );
+        let winner = results
+            .iter()
+            .find_map(|(authority, result)| {
+                matches!(result, CreateFencedJobJsonDisposition::Created(_)).then_some(*authority)
+            })
+            .expect("winner");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(&artifact).expect("authority bytes")
+            )
+            .expect("authority JSON"),
+            json!({"authority": winner})
+        );
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::RepairChildAuthorityChanged)
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fenced_json_create_preserves_existing_files_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-create-noclobber".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let token = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", "boot-a", 4356),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("claim")
+        .token();
+        let event = || FencedJobJsonEvent {
+            kind: JobEventKind::RepairChildAuthorityChanged,
+            causation_id: "create-noclobber".to_string(),
+            detail: json!({"transition": "process_prepared"}),
+        };
+
+        let regular = paths.job_dir(job_id.as_ref()).join("regular.json");
+        fs::write(&regular, b"operator bytes\n").expect("existing regular file");
+        assert_eq!(
+            create_fenced_job_json_and_append_event(
+                &paths,
+                &token,
+                now + TimeDelta::seconds(1),
+                &regular,
+                event(),
+                &json!({"authority": "replacement"}),
+            )
+            .expect("regular classification"),
+            CreateFencedJobJsonDisposition::AlreadyExists
+        );
+        assert_eq!(
+            fs::read(&regular).expect("regular bytes"),
+            b"operator bytes\n"
+        );
+
+        let target = temp.path().join("foreign-target.json");
+        fs::write(&target, b"foreign bytes\n").expect("foreign target");
+        let link = paths.job_dir(job_id.as_ref()).join("symlink.json");
+        symlink(&target, &link).expect("authority symlink");
+        assert_eq!(
+            create_fenced_job_json_and_append_event(
+                &paths,
+                &token,
+                now + TimeDelta::seconds(2),
+                &link,
+                event(),
+                &json!({"authority": "replacement"}),
+            )
+            .expect("symlink classification"),
+            CreateFencedJobJsonDisposition::AlreadyExists
+        );
+        assert_eq!(fs::read(&target).expect("target bytes"), b"foreign bytes\n");
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(
+            history.events().len(),
+            1,
+            "only lease acquisition is durable"
+        );
     }
 
     #[test]

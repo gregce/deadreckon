@@ -15,8 +15,11 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use deadreckon_core::{
-    DeadreckonPaths, JobView, PipelineState, RunOwnership, validate_acceptance_marker,
+    DeadreckonPaths, JobView, PipelineState, RunOwnership, load_run, read_supervised_process,
+    save_state, validate_acceptance_marker,
 };
+#[cfg(target_os = "macos")]
+use deadreckon_protocol::{JobEventKind, JobOutcome, StopReason};
 #[cfg(target_os = "macos")]
 use serde_json::{Value, json};
 #[cfg(target_os = "macos")]
@@ -30,14 +33,12 @@ use common::SupervisorServiceFixture;
 
 /// Depth test for the HIGH merge-repair trust-boundary gap.
 ///
-/// Run this ignored test while developing the fix:
+/// Run this test while developing the fix:
 ///
 /// cargo test -p deadreckon --test watchkeeper_repair_child_ownership \
-///   graph_final_repair_child_must_be_trusted_before_parent_consumes_it -- --ignored --exact
+///   graph_final_repair_child_must_be_trusted_before_parent_consumes_it -- --exact
 ///
-/// It is intentionally ignored until the production path delegates the repair
-/// Run under the parent Job. The invariant is deliberately future-proof:
-/// consuming the repair is allowed once it is both owned and contained, but an
+/// Consuming the repair is allowed once it is both owned and contained, but an
 /// untrusted repair must leave the parent without a result or receipt.
 #[cfg(target_os = "macos")]
 #[test]
@@ -60,6 +61,78 @@ fn durable_campaign_final_repair_child_must_be_trusted_before_parent_consumes_it
 
     assert_repair_trust_invariant(&observation);
     assert_trusted_repair_launched(&observation);
+}
+
+/// Crash after the exact trusted repair is durable but before it is copied into
+/// the parent result. Even when that repair consumed the final approved spend,
+/// restart must adopt it before refusing any new work. A second repair launch
+/// would cross both the immutable request identity and the approved budget.
+#[cfg(target_os = "macos")]
+#[test]
+fn graph_and_campaign_adopt_final_budget_repair_after_driver_crash() {
+    for shape in [RepairShape::Graph, RepairShape::Campaign] {
+        let fixture = RepairFixture::new_with_repair_crash(shape);
+        let output = match shape {
+            RepairShape::Graph => fixture.start_graph(),
+            RepairShape::Campaign => fixture.start_campaign(),
+        };
+        assert!(
+            output.status.success(),
+            "{shape:?} dispatch failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let job_id = only_directory_name(&fixture.paths.jobs_dir());
+        let proof_dir = fixture.paths.merge_proofs(&job_id);
+        wait_for_path(
+            &proof_dir.join(".test-failpoint-after_trusted_discovery_before_copy"),
+            Duration::from_secs(120),
+            &fixture.paths,
+            &job_id,
+        );
+        let repair_record: Value = serde_json::from_slice(
+            &fs::read(proof_dir.join("repair-run.json")).expect("repair authority projection"),
+        )
+        .expect("repair authority JSON");
+        let repair_run_id = repair_record["run_id"]
+            .as_str()
+            .expect("repair Run ID")
+            .to_string();
+        let job = deadreckon_core::load_job(&fixture.paths, &job_id).expect("parent Job");
+        let mut repair = load_run(&fixture.paths, &repair_run_id).expect("repair Run");
+        repair.total_spend_usd = job.policy.max_spend_usd;
+        save_state(&repair).expect("persist final approved repair spend");
+
+        let driver =
+            read_supervised_process(&fixture.paths.job_dir(&job_id).join("supervised-child.json"))
+                .expect("supervised driver process");
+        signal_pid(driver.pid, nix::sys::signal::Signal::SIGKILL);
+
+        let view = wait_for_terminal_job(&fixture.paths, &job_id);
+        assert_eq!(view.projection.outcome, Some(JobOutcome::BudgetExhausted));
+        assert_eq!(view.projection.stop_reason, Some(StopReason::SpendCap));
+        let result = fixture
+            .result_run(&job_id)
+            .expect("trusted repair must be composed before bounded stop");
+        assert_eq!(
+            result_file(&fixture.paths, &result, "README.md").as_deref(),
+            Some(shape.expected_repair_body())
+        );
+
+        let history = deadreckon_core::read_job_history(&fixture.paths.job_events(&job_id))
+            .expect("Job history");
+        let repair_ids = history
+            .events()
+            .iter()
+            .filter(|event| event.kind == JobEventKind::RepairChildAuthorityChanged)
+            .filter_map(|event| event.detail.get("run_id").and_then(Value::as_str))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            repair_ids,
+            std::collections::BTreeSet::from([repair_run_id.as_str()])
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -99,6 +172,24 @@ struct RepairFixture {
 #[cfg(target_os = "macos")]
 impl RepairFixture {
     fn new(shape: RepairShape) -> Self {
+        Self::new_with_supervisor_env(shape, &[])
+    }
+
+    fn new_with_repair_crash(shape: RepairShape) -> Self {
+        Self::new_with_supervisor_env(
+            shape,
+            &[
+                ("DEADRECKON_TEST_MERGE_REPAIR_FAILPOINTS", "1"),
+                (
+                    "DEADRECKON_TEST_MERGE_REPAIR_FAILPOINT",
+                    "after_trusted_discovery_before_copy",
+                ),
+                ("DEADRECKON_TEST_MERGE_REPAIR_FAILPOINT_PAUSE", "1"),
+            ],
+        )
+    }
+
+    fn new_with_supervisor_env(shape: RepairShape, env: &[(&str, &str)]) -> Self {
         let temp = TempDir::new().expect("tempdir");
         let workspace = temp.path().join("workspace");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -119,7 +210,7 @@ impl RepairFixture {
         .expect("acceptance");
         init_git_repo(&workspace);
         write_repair_fixture_provider(&paths, temp.path(), &provider_id);
-        let supervisor = SupervisorServiceFixture::configured(&paths);
+        let supervisor = SupervisorServiceFixture::configured_with_env(&paths, env);
 
         Self {
             _supervisor: supervisor,
@@ -256,7 +347,9 @@ impl RepairFixture {
     }
 
     fn start_campaign(&self) -> std::process::Output {
-        deadreckon(&self.paths, &self.workspace)
+        self._supervisor
+            .deadreckon()
+            .current_dir(&self.workspace)
             .args([
                 "campaign",
                 self.shape.root_goal(),
@@ -516,15 +609,6 @@ binary = "{binary}"
 }
 
 #[cfg(target_os = "macos")]
-fn deadreckon(paths: &DeadreckonPaths, workspace: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_deadreckon"));
-    command
-        .current_dir(workspace)
-        .env("DEADRECKON_HOME", paths.home());
-    command
-}
-
-#[cfg(target_os = "macos")]
 fn init_git_repo(workspace: &Path) {
     for args in [
         &["init", "--initial-branch=main"][..],
@@ -563,6 +647,29 @@ fn wait_for_terminal_job(paths: &DeadreckonPaths, job_id: &str) -> JobView {
         );
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_path(path: &Path, timeout: Duration, paths: &DeadreckonPaths, job_id: &str) {
+    let deadline = Instant::now() + timeout;
+    while !path.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "{} was not created before timeout\nDriver stderr:\n{}",
+            path.display(),
+            driver_stderr(paths, job_id)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn signal_pid(pid: u32, signal: nix::sys::signal::Signal) {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(pid).expect("driver PID")),
+        Some(signal),
+    )
+    .expect("signal driver process");
 }
 
 #[cfg(target_os = "macos")]

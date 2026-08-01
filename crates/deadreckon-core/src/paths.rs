@@ -132,6 +132,26 @@ impl DeadreckonPaths {
         self.job_dir(job_id).join("receipt.json")
     }
 
+    pub fn job_delivery_dir(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("delivery")
+    }
+
+    pub fn job_delivery_intent(&self, job_id: &str) -> PathBuf {
+        self.job_delivery_dir(job_id).join("intent.json")
+    }
+
+    pub fn job_applied_delivery_receipt(&self, job_id: &str) -> PathBuf {
+        self.job_delivery_dir(job_id).join("applied-receipt.json")
+    }
+
+    /// Stable inode used to serialize every mutating operator operation for a
+    /// durable Job. The file is deliberately retained after unlock so a new
+    /// caller can never lock a replacement inode while an older caller still
+    /// holds the original one.
+    pub fn job_operation_lock(&self, job_id: &str) -> PathBuf {
+        self.job_dir(job_id).join("operation.lock")
+    }
+
     pub fn job_sandbox_boundary_observation(&self, job_id: &str) -> PathBuf {
         self.job_dir(job_id)
             .join("sandbox-boundary-observation.json")
@@ -454,6 +474,10 @@ mod tests {
             paths.job_frozen_controller_gate("job-1"),
             paths.job_frozen_evaluator_gate("job-1"),
             paths.job_receipt("job-1"),
+            paths.job_delivery_dir("job-1"),
+            paths.job_delivery_intent("job-1"),
+            paths.job_applied_delivery_receipt("job-1"),
+            paths.job_operation_lock("job-1"),
         ] {
             assert!(
                 path.starts_with(&root),

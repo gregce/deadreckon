@@ -28,4 +28,5 @@ pub(crate) mod start;
 pub(crate) mod steer;
 pub(crate) mod supervisor;
 pub(crate) mod supervisor_service;
+pub(crate) mod undo;
 pub(crate) mod verdict;

@@ -877,7 +877,7 @@ pub(crate) async fn run_command_with_launch_plan(
     } else {
         create_run(&paths, run_options)?
     };
-    commands::graph_job::link_delegated_repair_run(&state)?;
+    commands::graph_job::link_delegated_owned_run(&state)?;
     if untrusted {
         commands::course::save_launch_plan(
             &commands::course::launch_plan_path(&state.run_root),

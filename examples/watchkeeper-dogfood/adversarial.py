@@ -534,9 +534,66 @@ TRIALS = (
     ),
     Trial(
         "semantic_parent_repair",
-        "Graph and Campaign semantic revise decisions run bounded parent-only repairs, recover candidate-ready work and preserve one parent Job identity.",
+        "Graph and Campaign semantic revise decisions run bounded, fenced parent-only repairs, recover candidate-ready work within one durable deadline and preserve one parent Job identity.",
         "hermetic_parent_repair",
         (
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon-core",
+                    "--lib",
+                    "job_lease::tests::fenced_json_authority_is_created_exactly_once",
+                    "--",
+                    "--exact",
+                ),
+                "job_lease::tests::fenced_json_authority_is_created_exactly_once",
+            ),
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon",
+                    "--bin",
+                    "deadreckon",
+                    "--no-default-features",
+                    "merge_repair_adoption_deadline_is_stable_and_bound_to_its_window",
+                    "--",
+                    "--exact",
+                ),
+                "merge_repair_adoption_deadline_is_stable_and_bound_to_its_window",
+            ),
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon",
+                    "--bin",
+                    "deadreckon",
+                    "--no-default-features",
+                    "legacy_pending_repair_deadline_is_anchored_to_original_preparation",
+                    "--",
+                    "--exact",
+                ),
+                "legacy_pending_repair_deadline_is_anchored_to_original_preparation",
+            ),
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon",
+                    "--test",
+                    "watchkeeper_repair_child_ownership",
+                    "graph_and_campaign_adopt_final_budget_repair_after_driver_crash",
+                    "--",
+                    "--exact",
+                ),
+                "graph_and_campaign_adopt_final_budget_repair_after_driver_crash",
+            ),
             ProofCommand(
                 (
                     "cargo",
@@ -583,7 +640,7 @@ TRIALS = (
                 "commands::supervisor::tests::campaign_parent_semantic_revise_repairs_only_the_parent_then_verifies_the_same_job",
             ),
         ),
-        "This uses scripted providers and persisted crash fixtures; a naturally occurring live provider revise remains an operator trial.",
+        "This uses scripted providers, real process interruption and persisted crash fixtures; a naturally occurring live provider revise remains an operator trial.",
     ),
     Trial(
         "repair_lineage_tamper",

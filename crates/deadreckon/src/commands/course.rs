@@ -1039,15 +1039,17 @@ fn normalized_apply(value: &str) -> String {
 /// Read a shape out of the drafted graph.
 ///
 /// The shape is no longer something the planner picks — it is a description of
-/// what it drew. One node is a single run; any node carrying its own graph is
-/// campaign-shaped; anything else is a plan.
+/// what it drew. One flat node is a single run. Every multi-node or nested DAG
+/// is a Plan: Plan already owns dependency edges and subplans, so routing a
+/// nested answer through Campaign would discard the graph the operator
+/// approved and ask a second planner to invent a different one.
 fn shape_of_graph(nodes: &[ProviderCourseNodeDraft]) -> CourseShape {
     if nodes.iter().any(|node| {
         node.subplan
             .as_deref()
             .is_some_and(|subplan| !subplan.nodes.is_empty())
     }) {
-        return CourseShape::Campaign;
+        return CourseShape::Plan;
     }
     if nodes.len() <= 1 {
         return CourseShape::Single;
@@ -2679,6 +2681,51 @@ checks:
                 .any(|clamp| clamp.contains("pieces truncated 9->6")),
             "{resolution:?}"
         );
+    }
+
+    #[test]
+    fn provider_drawn_nested_graph_stays_one_plan_shape() {
+        let signals = bundle_with(
+            analyze_goal_structure("build the api and its migration, then document it"),
+            0,
+            HistorySignal::default(),
+            Some(20.0),
+        );
+        let ladder = ladder_decision(&signals);
+        let draft = r#"{
+            "nodes": [
+                {
+                    "id": "api",
+                    "goal": "build the api",
+                    "depends_on": [],
+                    "subplan": {
+                        "apply": "per-node",
+                        "nodes": [
+                            {"id": "schema", "goal": "add the schema", "depends_on": []},
+                            {"id": "migrate", "goal": "add the migration", "depends_on": ["schema"]}
+                        ]
+                    }
+                },
+                {"id": "docs", "goal": "document the api", "depends_on": ["api"]}
+            ],
+            "apply": "at-end",
+            "confidence": 0.95,
+            "rationale": "the migration is a nested ordered project"
+        }"#;
+
+        let (shape, n, pieces, apply, resolution) =
+            resolve_provider_course_plan(draft, &signals, &ladder, SHAPE_CONFIDENCE_FLOOR_DEFAULT)
+                .expect("nested graph resolves");
+
+        assert_eq!(shape, CourseShape::Plan, "{resolution:?}");
+        assert_eq!(n, Some(2));
+        assert_eq!(apply, deadreckon_core::plan::ApplyWhen::AtEnd);
+        assert_eq!(pieces.len(), 2);
+        let subplan = pieces[0].subplan.as_ref().expect("nested subplan retained");
+        assert_eq!(subplan.apply, deadreckon_core::plan::ApplyWhen::PerNode);
+        assert_eq!(subplan.pieces.len(), 2);
+        assert_eq!(subplan.pieces[1].depends_on, ["p1"]);
+        assert_eq!(pieces[1].depends_on, ["p1"]);
     }
 
     #[test]

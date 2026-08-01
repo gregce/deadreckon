@@ -669,7 +669,10 @@ fn plan_attention(plan: &Plan) -> Vec<Attention> {
                 format!("child {} was killed", task.task_id),
                 task.summary_path.clone(),
             )),
-            PlanTaskStatus::Pending | PlanTaskStatus::Running | PlanTaskStatus::Completed => {}
+            PlanTaskStatus::Pending
+            | PlanTaskStatus::Running
+            | PlanTaskStatus::Completed
+            | PlanTaskStatus::Skipped => {}
         }
     }
     if plan.status == PlanStatus::Failed && wrong.is_empty() {
@@ -964,6 +967,7 @@ fn newest_plan_failure(events: &[PlanEvent]) -> Option<String> {
         // A retry is the plan healing itself, not a failure state to surface.
         deadreckon_core::PlanEventKind::TaskRetrying { .. }
         | deadreckon_core::PlanEventKind::TaskApplied { .. }
+        | deadreckon_core::PlanEventKind::TaskSkipped { .. }
         | deadreckon_core::PlanEventKind::PlanCreated { .. }
         | deadreckon_core::PlanEventKind::PlanStarted
         | deadreckon_core::PlanEventKind::TaskReady { .. }

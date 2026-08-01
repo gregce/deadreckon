@@ -13,16 +13,17 @@ use chrono::Utc;
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, JobProjection, JobView, LeaseClaimDisposition, LeaseOwner,
     LeaseReclaimReason, LeaseToken, ProviderFailureDisposition, SupervisedProcess,
-    append_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease, load_run,
+    append_next_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease, load_run,
     pid_is_alive, read_job_history, read_supervised_process, spawn_grouped,
     validate_acceptance_marker, validate_completion_receipt,
 };
 use deadreckon_protocol::{
-    Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence, JobId, JobSchemaVersion, JobShape,
-    RunId, SemanticDecision, SemanticJudgment, StopReason,
+    CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobId, JobShape, RunId,
+    SemanticDecision, SemanticJudgment, StopReason,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::super::{CliError, Result};
@@ -680,7 +681,7 @@ async fn supervise_one_job(
     if finish_deadline_reached(paths, &token, &initial.job, None)? {
         return Ok(());
     }
-    match super::graph_job::recover_pending_driver_state(paths, &initial.job) {
+    match super::graph_job::recover_pending_driver_state(paths, &initial.job, &token) {
         Ok(super::graph_job::PendingDriverRecovery::BudgetExhausted {
             stop_reason,
             reason,
@@ -711,7 +712,7 @@ async fn supervise_one_job(
             append_terminal_event(
                 paths,
                 &token,
-                JobEventKind::Blocked,
+                JobEventKind::Failed,
                 StopReason::CorruptHistory,
                 json!({
                     "reason": format!(
@@ -725,27 +726,39 @@ async fn supervise_one_job(
 
     let max_attempts = initial.job.policy.max_attempts.max(1);
     let mut resuming_advanced = false;
-    let mut guarded_recovery =
+    // A valid Single receipt is stronger evidence than the absence of the
+    // now-removed private release acknowledgement. In the crash window after
+    // child reconciliation and receipt sealing, the append-only history still
+    // contains ChildLaunchPrepared but its one-shot control files are already
+    // gone. Do not mistake that completed launch for a pre-release launch and
+    // start the provider a second time. Stored child metadata, when present,
+    // is still reconciled below before any terminal fact is projected.
+    let persisted_single_terminal_evidence =
+        persisted_single_receipt_waits_for_terminal_classification(paths, &initial.job);
+    let mut guarded_recovery = if persisted_single_terminal_evidence {
+        None
+    } else {
         match recoverable_unlinked_guarded_launch(paths, job_id, &initial.projection) {
             Ok(recovery) => recovery,
             Err(error) => {
                 append_terminal_event(
                     paths,
                     &token,
-                    JobEventKind::Blocked,
+                    JobEventKind::Failed,
                     StopReason::CorruptHistory,
                     json!({ "reason": error.to_string() }),
                 )?;
                 return Ok(());
             }
-        };
+        }
+    };
     let mut stored_child = match child_metadata(paths, job_id) {
         Ok(metadata) => metadata,
         Err(error) => {
             append_terminal_event(
                 paths,
                 &token,
-                JobEventKind::Blocked,
+                JobEventKind::Failed,
                 StopReason::CorruptHistory,
                 json!({ "reason": error.to_string() }),
             )?;
@@ -774,7 +787,7 @@ async fn supervise_one_job(
                         append_terminal_event(
                             paths,
                             &token,
-                            JobEventKind::Blocked,
+                            JobEventKind::Failed,
                             StopReason::CorruptHistory,
                             json!({ "reason": error.to_string() }),
                         )?;
@@ -870,6 +883,27 @@ async fn supervise_one_job(
         reconcile_attempt_processes(paths, job_id, None, Duration::from_secs(2), reboot_reclaim)
     {
         block_for_lost_containment(paths, &token, &error.to_string())?;
+        return Ok(());
+    }
+
+    // A strict leaf persists its combined receipt before the supervisor writes
+    // the outer lifecycle projection. If the supervisor dies in that narrow
+    // window, the receipt is stronger recovery evidence than the now-absent
+    // child sidecar: project it instead of launching another provider or
+    // declaring the completed attempt lost.
+    if initial.job.shape == JobShape::Single
+        && persisted_single_receipt_waits_for_terminal_classification(paths, &initial.job)
+    {
+        classify_persisted_attempt(
+            paths,
+            &initial.job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: true,
+            },
+            false,
+        )?;
         return Ok(());
     }
 
@@ -1216,6 +1250,20 @@ fn advanced_artifact_waits_for_terminal_classification(paths: &DeadreckonPaths, 
             false
         }
     }
+}
+
+fn persisted_single_receipt_waits_for_terminal_classification(
+    paths: &DeadreckonPaths,
+    job: &Job,
+) -> bool {
+    if job.shape != JobShape::Single {
+        return false;
+    }
+    let Ok(state) = load_run(paths, job.job_id.as_ref()) else {
+        return false;
+    };
+    state.status == deadreckon_core::RunStatus::Completed
+        && validate_completion_receipt(paths, &state).is_ok()
 }
 
 fn schedule_advanced_recovery(
@@ -2297,7 +2345,7 @@ async fn reconcile_child_exit(
         return Ok(ChildReconciliation::Finished);
     }
     if matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign) {
-        match super::graph_job::recover_pending_driver_state(paths, job) {
+        match super::graph_job::recover_pending_driver_state(paths, job, token) {
             Ok(super::graph_job::PendingDriverRecovery::BudgetExhausted {
                 stop_reason,
                 reason,
@@ -2329,7 +2377,7 @@ async fn reconcile_child_exit(
                 append_terminal_event(
                     paths,
                     token,
-                    JobEventKind::Blocked,
+                    JobEventKind::Failed,
                     StopReason::CorruptHistory,
                     json!({
                         "reason": format!(
@@ -2565,46 +2613,36 @@ async fn classify_advanced_attempt(
                     .await
                     {
                         Ok(super::graph_job::ParentCompletion::Verified(receipt)) => {
-                            append_control_event(
+                            let parent = load_run(paths, job.job_id.as_ref())?;
+                            project_verified_attempt(
                                 paths,
                                 token,
-                                JobEventKind::DeterministicGatePassed,
+                                &receipt,
+                                plan.merged_run_id.as_deref().ok_or_else(|| {
+                                    CliError::Core(DeadreckonError::InvalidInput(
+                                        "merged graph lost its result Run identity".to_string(),
+                                    ))
+                                })?,
                                 format!("graph-gate-passed:{}", token.epoch),
                                 json!({
                                     "marker": deadreckon_core::marker_path_for_run_root(
-                                        &load_run(paths, job.job_id.as_ref())?.run_root
+                                        &parent.run_root
                                     ),
                                     "merged_run_id": plan.merged_run_id,
                                 }),
-                            )?;
-                            append_control_event(
-                                paths,
-                                token,
-                                JobEventKind::SemanticJudgeAchieved,
                                 format!("graph-semantic-achieved:{}", token.epoch),
                                 json!({
-                                    "judgment": load_run(paths, job.job_id.as_ref())?
+                                    "judgment": parent
                                         .run_root
                                         .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON),
                                     "merged_run_id": plan.merged_run_id,
                                 }),
-                            )?;
-                            append_attempt_stopped(
-                                paths,
-                                token,
-                                StopReason::Verified,
                                 json!({
                                     "exit": exit_detail(&exit),
                                     "artifact": "plan",
                                     "result_run_id": plan.merged_run_id,
                                     "receipt_issued_at": receipt.issued_at,
                                 }),
-                            )?;
-                            append_terminal_event(
-                                paths,
-                                token,
-                                JobEventKind::Verified,
-                                StopReason::Verified,
                                 json!({
                                     "receipt": paths.job_receipt(job.job_id.as_ref()),
                                     "result_run_id": plan.merged_run_id,
@@ -2657,6 +2695,25 @@ async fn classify_advanced_attempt(
                             stop_reason,
                             &format!("graph parent repair failed: {reason}"),
                         ),
+                        Ok(super::graph_job::ParentCompletion::Failed {
+                            reason,
+                            stop_reason,
+                        }) => {
+                            append_parent_gate_passed_if_present(
+                                paths,
+                                job,
+                                token,
+                                "graph",
+                                plan.merged_run_id.as_deref(),
+                            )?;
+                            fail_advanced_attempt(
+                                paths,
+                                token,
+                                exit,
+                                stop_reason,
+                                &format!("graph parent verification failed: {reason}"),
+                            )
+                        }
                         Ok(super::graph_job::ParentCompletion::Cancelled { reason }) => {
                             finish_cancelled_parent_completion(paths, token, &exit, "plan", &reason)
                         }
@@ -2796,6 +2853,42 @@ async fn classify_advanced_attempt(
                     }
                 }
                 deadreckon_core::plan::PlanStatus::Failed => {
+                    match super::plan::durable_chain_operator_block_reason(paths, &plan.plan_id) {
+                        Ok(Some(reason)) => {
+                            append_attempt_stopped(
+                                paths,
+                                token,
+                                StopReason::OperatorInputRequired,
+                                json!({
+                                    "exit": exit_detail(&exit),
+                                    "artifact": "plan",
+                                    "reason": reason,
+                                }),
+                            )?;
+                            append_terminal_event(
+                                paths,
+                                token,
+                                JobEventKind::Blocked,
+                                StopReason::OperatorInputRequired,
+                                json!({
+                                    "reason": reason,
+                                    "artifact": "plan",
+                                    "artifact_id": token.job_id.as_ref(),
+                                }),
+                            )?;
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return fail_advanced_attempt(
+                                paths,
+                                token,
+                                exit,
+                                StopReason::CorruptHistory,
+                                &format!("graph chain-hook history is malformed: {error}"),
+                            );
+                        }
+                        Ok(None) => {}
+                    }
                     match plan_budget_exhaustion(paths, &plan.plan_id) {
                         Ok(Some((stop_reason, reason))) => finish_advanced_budget_attempt(
                             paths,
@@ -2902,46 +2995,36 @@ async fn classify_advanced_attempt(
                     .await
                     {
                         Ok(super::graph_job::ParentCompletion::Verified(receipt)) => {
-                            append_control_event(
+                            let parent = load_run(paths, job.job_id.as_ref())?;
+                            project_verified_attempt(
                                 paths,
                                 token,
-                                JobEventKind::DeterministicGatePassed,
+                                &receipt,
+                                campaign.merged_run_id.as_deref().ok_or_else(|| {
+                                    CliError::Core(DeadreckonError::InvalidInput(
+                                        "merged campaign lost its result Run identity".to_string(),
+                                    ))
+                                })?,
                                 format!("campaign-gate-passed:{}", token.epoch),
                                 json!({
                                     "marker": deadreckon_core::marker_path_for_run_root(
-                                        &load_run(paths, job.job_id.as_ref())?.run_root
+                                        &parent.run_root
                                     ),
                                     "merged_run_id": campaign.merged_run_id,
                                 }),
-                            )?;
-                            append_control_event(
-                                paths,
-                                token,
-                                JobEventKind::SemanticJudgeAchieved,
                                 format!("campaign-semantic-achieved:{}", token.epoch),
                                 json!({
-                                    "judgment": load_run(paths, job.job_id.as_ref())?
+                                    "judgment": parent
                                         .run_root
                                         .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON),
                                     "merged_run_id": campaign.merged_run_id,
                                 }),
-                            )?;
-                            append_attempt_stopped(
-                                paths,
-                                token,
-                                StopReason::Verified,
                                 json!({
                                     "exit": exit_detail(&exit),
                                     "artifact": "campaign",
                                     "result_run_id": campaign.merged_run_id,
                                     "receipt_issued_at": receipt.issued_at,
                                 }),
-                            )?;
-                            append_terminal_event(
-                                paths,
-                                token,
-                                JobEventKind::Verified,
-                                StopReason::Verified,
                                 json!({
                                     "receipt": paths.job_receipt(job.job_id.as_ref()),
                                     "result_run_id": campaign.merged_run_id,
@@ -2994,6 +3077,25 @@ async fn classify_advanced_attempt(
                             stop_reason,
                             &format!("campaign parent repair failed: {reason}"),
                         ),
+                        Ok(super::graph_job::ParentCompletion::Failed {
+                            reason,
+                            stop_reason,
+                        }) => {
+                            append_parent_gate_passed_if_present(
+                                paths,
+                                job,
+                                token,
+                                "campaign",
+                                campaign.merged_run_id.as_deref(),
+                            )?;
+                            fail_advanced_attempt(
+                                paths,
+                                token,
+                                exit,
+                                stop_reason,
+                                &format!("campaign parent verification failed: {reason}"),
+                            )
+                        }
                         Ok(super::graph_job::ParentCompletion::Cancelled { reason }) => {
                             finish_cancelled_parent_completion(
                                 paths, token, &exit, "campaign", &reason,
@@ -3473,6 +3575,34 @@ fn finish_advanced_budget_attempt(
     artifact: &str,
     reason: &str,
 ) -> Result<()> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if let Err(error) =
+        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
+            .and_then(|()| {
+                super::graph_job::reconcile_campaign_sub_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| {
+                super::graph_job::reconcile_merge_repair_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+    {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "approved budget was exhausted, but not every supervised process could be proven stopped: {error}"
+            ),
+        )?;
+        return Ok(());
+    }
     if attempt_is_active(paths, token.job_id.as_ref())? {
         let projection = append_attempt_stopped(
             paths,
@@ -3525,6 +3655,286 @@ fn fail_advanced_attempt(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct VerifiedProjectionProgress {
+    deterministic_gate_passed: bool,
+    semantic_judge_achieved: bool,
+    attempt_stopped: bool,
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedReceiptBinding {
+    attempt: u32,
+    receipt_sha256: String,
+    receipt_run_id: String,
+    result_run_id: String,
+    outer_launch_id: String,
+}
+
+fn verified_receipt_binding(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    receipt: &CompletionReceipt,
+    result_run_id: &str,
+) -> Result<VerifiedReceiptBinding> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    let attempt = view.projection.attempt_count;
+    if attempt == 0
+        || receipt.attempt != attempt
+        || receipt.job_id != token.job_id
+        || receipt.run_id.as_ref() != token.job_id.as_ref()
+        || result_run_id.trim().is_empty()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified receipt does not belong to the active attempt of Job {}",
+            token.job_id
+        ))));
+    }
+
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let (start_index, started) = history
+        .events()
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, event)| {
+            event.kind == JobEventKind::AttemptStarted
+                && event.detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
+        })
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Job {} has no durable start for receipt attempt {attempt}",
+                token.job_id
+            )))
+        })?;
+    if receipt.issued_at < started.timestamp {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified receipt for Job {} predates its active attempt",
+            token.job_id
+        ))));
+    }
+    let linked = history.events()[start_index + 1..]
+        .iter()
+        .filter(|event| {
+            event.kind == JobEventKind::ChildLinked
+                && event.detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(attempt))
+        })
+        .collect::<Vec<_>>();
+    if linked.len() != 1
+        || linked[0].detail.get("launch_id").and_then(Value::as_str)
+            != Some(receipt.outer_launch_id.as_str())
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified receipt for Job {} is not bound to the active supervised child launch",
+            token.job_id
+        ))));
+    }
+
+    let receipt_path = paths.job_receipt(token.job_id.as_ref());
+    let metadata = fs::symlink_metadata(&receipt_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified receipt for Job {} is not a regular controller-owned file",
+            token.job_id
+        ))));
+    }
+    let receipt_bytes = fs::read(&receipt_path)?;
+    let persisted: CompletionReceipt = serde_json::from_slice(&receipt_bytes)?;
+    if &persisted != receipt {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "verified receipt for Job {} changed after validation",
+            token.job_id
+        ))));
+    }
+    let receipt_sha256 = format!("sha256:{:x}", Sha256::digest(&receipt_bytes));
+    Ok(VerifiedReceiptBinding {
+        attempt,
+        receipt_sha256,
+        receipt_run_id: receipt.run_id.as_ref().to_string(),
+        result_run_id: result_run_id.to_string(),
+        outer_launch_id: receipt.outer_launch_id.clone(),
+    })
+}
+
+fn bind_verified_projection_detail(
+    detail: Value,
+    binding: &VerifiedReceiptBinding,
+) -> Result<Value> {
+    let Value::Object(mut detail) = detail else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "verified lifecycle detail must be a JSON object".to_string(),
+        )));
+    };
+    for (name, expected) in [
+        ("attempt", Value::from(binding.attempt)),
+        (
+            "receipt_sha256",
+            Value::String(binding.receipt_sha256.clone()),
+        ),
+        (
+            "receipt_run_id",
+            Value::String(binding.receipt_run_id.clone()),
+        ),
+        (
+            "result_run_id",
+            Value::String(binding.result_run_id.clone()),
+        ),
+        (
+            "outer_launch_id",
+            Value::String(binding.outer_launch_id.clone()),
+        ),
+    ] {
+        if detail.get(name).is_some_and(|actual| actual != &expected) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "verified lifecycle detail changed its {name} binding"
+            ))));
+        }
+        detail.insert(name.to_string(), expected);
+    }
+    Ok(Value::Object(detail))
+}
+
+fn verified_event_matches_binding(event: &JobEvent, binding: &VerifiedReceiptBinding) -> bool {
+    event.detail.get("attempt").and_then(Value::as_u64) == Some(u64::from(binding.attempt))
+        && event.detail.get("receipt_sha256").and_then(Value::as_str)
+            == Some(binding.receipt_sha256.as_str())
+        && event.detail.get("receipt_run_id").and_then(Value::as_str)
+            == Some(binding.receipt_run_id.as_str())
+        && event.detail.get("result_run_id").and_then(Value::as_str)
+            == Some(binding.result_run_id.as_str())
+        && event.detail.get("outer_launch_id").and_then(Value::as_str)
+            == Some(binding.outer_launch_id.as_str())
+}
+
+fn verified_projection_progress(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    binding: &VerifiedReceiptBinding,
+) -> Result<VerifiedProjectionProgress> {
+    let history = read_job_history(&paths.job_events(token.job_id.as_ref()))?;
+    let start = history
+        .events()
+        .iter()
+        .rposition(|event| {
+            event.kind == JobEventKind::AttemptStarted
+                && event.detail.get("attempt").and_then(Value::as_u64)
+                    == Some(u64::from(binding.attempt))
+        })
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "job {} has receipt attempt {} without its AttemptStarted event",
+                token.job_id, binding.attempt
+            )))
+        })?;
+    let events = &history.events()[start + 1..];
+    let mut stage = 0_u8;
+    for event in events {
+        let valid = match event.kind {
+            JobEventKind::DeterministicGatePassed => {
+                let valid = stage == 0 && verified_event_matches_binding(event, binding);
+                stage = 1;
+                valid
+            }
+            JobEventKind::SemanticJudgeAchieved => {
+                let valid = stage == 1 && verified_event_matches_binding(event, binding);
+                stage = 2;
+                valid
+            }
+            JobEventKind::AttemptStopped => {
+                let valid = stage == 2
+                    && verified_event_matches_binding(event, binding)
+                    && event.detail.get("stop_reason").and_then(Value::as_str) == Some("verified");
+                stage = 3;
+                valid
+            }
+            JobEventKind::DeterministicGateFailed
+            | JobEventKind::SemanticJudgeRevise
+            | JobEventKind::SemanticJudgeUncertain
+            | JobEventKind::Verified => false,
+            _ => continue,
+        };
+        if !valid {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "job {} has out-of-order, conflicting, or differently bound verified-completion facts",
+                token.job_id
+            ))));
+        }
+    }
+    Ok(VerifiedProjectionProgress {
+        deterministic_gate_passed: stage >= 1,
+        semantic_judge_achieved: stage >= 2,
+        attempt_stopped: stage >= 3,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_verified_attempt(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    receipt: &CompletionReceipt,
+    result_run_id: &str,
+    gate_causation_id: String,
+    gate_detail: Value,
+    semantic_causation_id: String,
+    semantic_detail: Value,
+    attempt_detail: Value,
+    terminal_detail: Value,
+) -> Result<()> {
+    let binding = verified_receipt_binding(paths, token, receipt, result_run_id)?;
+    let gate_detail = bind_verified_projection_detail(gate_detail, &binding)?;
+    let semantic_detail = bind_verified_projection_detail(semantic_detail, &binding)?;
+    let attempt_detail = bind_verified_projection_detail(attempt_detail, &binding)?;
+    let terminal_detail = bind_verified_projection_detail(terminal_detail, &binding)?;
+    // At this point the caller has either freshly sealed or independently
+    // revalidated the durable combined receipt. These process-exit seams model
+    // the three remaining gaps before the outer Job history catches up.
+    supervisor_test_failpoint("after_verified_receipt_before_control_events");
+    if finish_cancel_requested(paths, token, None)? {
+        return Ok(());
+    }
+    let progress = verified_projection_progress(paths, token, &binding)?;
+    if !progress.deterministic_gate_passed {
+        append_control_event(
+            paths,
+            token,
+            JobEventKind::DeterministicGatePassed,
+            gate_causation_id,
+            gate_detail,
+        )?;
+    }
+    if finish_cancel_requested(paths, token, None)? {
+        return Ok(());
+    }
+    if !progress.semantic_judge_achieved {
+        append_control_event(
+            paths,
+            token,
+            JobEventKind::SemanticJudgeAchieved,
+            semantic_causation_id,
+            semantic_detail,
+        )?;
+    }
+    supervisor_test_failpoint("after_semantic_achieved_before_attempt_stopped");
+    if finish_cancel_requested(paths, token, None)? {
+        return Ok(());
+    }
+    if !progress.attempt_stopped {
+        append_attempt_stopped(paths, token, StopReason::Verified, attempt_detail)?;
+    }
+    supervisor_test_failpoint("after_verified_attempt_stopped_before_terminal");
+    if finish_cancel_requested(paths, token, None)? {
+        return Ok(());
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::Verified,
+        StopReason::Verified,
+        terminal_detail,
+    )?;
+    Ok(())
+}
+
 fn classify_persisted_attempt(
     paths: &DeadreckonPaths,
     job: &Job,
@@ -3556,35 +3966,26 @@ fn classify_persisted_attempt(
     match state.status {
         deadreckon_core::RunStatus::Completed => {
             if let Ok(receipt) = validate_completion_receipt(paths, &state) {
-                append_control_event(
+                project_verified_attempt(
                     paths,
                     token,
-                    JobEventKind::DeterministicGatePassed,
+                    &receipt,
+                    &state.run_id,
                     format!("deterministic-gate-passed:{}:{}", token.epoch, state.turn),
-                    json!({ "marker": deadreckon_core::marker_path_for_run_root(&state.run_root) }),
-                )?;
-                append_control_event(
-                    paths,
-                    token,
-                    JobEventKind::SemanticJudgeAchieved,
+                    json!({
+                        "marker": deadreckon_core::marker_path_for_run_root(&state.run_root)
+                    }),
                     format!("semantic-judge-achieved:{}:{}", token.epoch, state.turn),
-                    json!({ "judgment": state.run_root.join(deadreckon_core::SEMANTIC_JUDGMENT_JSON) }),
-                )?;
-                append_attempt_stopped(
-                    paths,
-                    token,
-                    StopReason::Verified,
+                    json!({
+                        "judgment": state
+                            .run_root
+                            .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON)
+                    }),
                     json!({
                         "exit": exit_detail,
                         "run_status": "completed",
                         "receipt_issued_at": receipt.issued_at
                     }),
-                )?;
-                append_terminal_event(
-                    paths,
-                    token,
-                    JobEventKind::Verified,
-                    StopReason::Verified,
                     json!({ "receipt": paths.job_receipt(job.job_id.as_ref()) }),
                 )?;
             } else if let Err(error) = validate_acceptance_marker(&state) {
@@ -4119,7 +4520,7 @@ fn merge_stop_reason(reason: StopReason, extra: Value) -> Value {
     Value::Object(detail)
 }
 
-fn append_control_event(
+pub(crate) fn append_control_event(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
     kind: JobEventKind,
@@ -4127,29 +4528,14 @@ fn append_control_event(
     detail: Value,
 ) -> Result<JobProjection> {
     let now = Utc::now();
-    let projection = JobView::load(paths, token.job_id.as_ref())?.projection;
-    let sequence = projection
-        .last_sequence
-        .checked_add(1)
-        .and_then(JobEventSequence::new)
-        .ok_or_else(|| {
-            CliError::Core(DeadreckonError::InvalidInput(format!(
-                "job {} event sequence exhausted",
-                token.job_id
-            )))
-        })?;
-    let event = JobEvent {
-        schema_version: JobSchemaVersion::CURRENT,
-        job_id: token.job_id.clone(),
-        sequence,
-        event_id: Uuid::new_v4().to_string(),
-        causation_id,
-        timestamp: now,
-        lease_epoch: token.epoch,
+    Ok(append_next_fenced_job_event(
+        paths,
+        token,
+        now,
         kind,
+        causation_id,
         detail,
-    };
-    Ok(append_fenced_job_event(paths, token, now, &event)?)
+    )?)
 }
 
 fn live_lease_refusal(error: &CliError) -> bool {
@@ -4252,7 +4638,7 @@ mod tests {
     };
     use deadreckon_protocol::{
         AuthorityAcceptedBy, JobEvent, JobEventKind, JobEventSequence, JobId, JobPolicy,
-        SemanticJudgeMode,
+        JobSchemaVersion, SemanticJudgeMode,
     };
     use tempfile::TempDir;
 
@@ -4618,6 +5004,24 @@ mod tests {
         attempt: u32,
         backend: &str,
     ) {
+        let outer_launch_id = read_job_history(&paths.job_events(authority.job_id.as_ref()))
+            .ok()
+            .and_then(|history| {
+                history.events().iter().rev().find_map(|event| {
+                    (event.kind == JobEventKind::ChildLinked
+                        && event.detail.get("attempt").and_then(Value::as_u64)
+                            == Some(u64::from(attempt)))
+                    .then(|| {
+                        event
+                            .detail
+                            .get("launch_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string)
+                    })
+                    .flatten()
+                })
+            })
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let observation = deadreckon_protocol::SandboxBoundaryObservation {
             schema_version: JobSchemaVersion::CURRENT,
             job_id: authority.job_id.clone(),
@@ -4626,7 +5030,7 @@ mod tests {
             issuer: deadreckon_protocol::SandboxBoundaryObservationIssuer::DeadreckonController,
             probe_id: Uuid::new_v4().to_string(),
             attempt,
-            outer_launch_id: Uuid::new_v4().to_string(),
+            outer_launch_id,
             authority_sha256: deadreckon_core::flight::sha256_file(
                 &paths.job_authority(authority.job_id.as_ref()),
             )
@@ -4651,6 +5055,196 @@ mod tests {
         };
         deadreckon_core::seal_sandbox_boundary_observation(paths, parent, authority, &observation)
             .expect("sandbox boundary observation");
+    }
+
+    fn seal_verified_single_receipt(
+        paths: &DeadreckonPaths,
+        job: &Job,
+    ) -> deadreckon_core::PipelineState {
+        let mut state = create_run(
+            paths,
+            RunOptions {
+                goal: job.goal.clone(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(job.policy.max_spend_usd),
+                max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
+                run_id: Some(job.job_id.as_ref().to_string()),
+                codebase: None,
+            },
+        )
+        .expect("single result run");
+        fs::copy(
+            job.source_cwd.join("fixture-proof.txt"),
+            state.working_dir.join("fixture-proof.txt"),
+        )
+        .expect("single result");
+        fs::copy(
+            super::super::job::job_acceptance_path(paths, job.job_id.as_ref()),
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+        )
+        .expect("approved contract");
+        state.status = RunStatus::Completed;
+        state.updated_at = Utc::now();
+        save_state(&state).expect("completed single state");
+
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority bytes"),
+        )
+        .expect("authority");
+        let key = deadreckon_core::read_gate_key(paths, job.job_id.as_ref()).expect("gate key");
+        let marker = deadreckon_core::write_native_acceptance_marker_with_results_and_key(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "fixture result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("native single marker");
+        seal_test_sandbox_boundary_observation(paths, &state, &authority, 1, "sandbox-exec");
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job.job_id.clone(),
+            run_id: RunId(job.job_id.as_ref().to_string()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the persisted leaf satisfies its approved goal".to_string(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved leaf goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec!["fixture-proof.txt".to_string()],
+            }],
+            missing: Vec::new(),
+            input_sha256: parent_semantic_input_sha256(&state, job),
+            spend_usd: 0.0,
+        };
+        deadreckon_runtime::persist_semantic_judgment(&state.run_root, &judgment)
+            .expect("single semantic judgment");
+        deadreckon_core::seal_completion_receipt(paths, &state, &authority, &marker, &judgment)
+            .expect("single completion receipt");
+        state
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum VerifiedCrashBoundary {
+        ReceiptAvailable,
+        SemanticAchieved,
+        AttemptStopped,
+    }
+
+    fn seed_verified_projection_boundary(
+        paths: &DeadreckonPaths,
+        token: &LeaseToken,
+        receipt: &CompletionReceipt,
+        result_run_id: &str,
+        boundary: VerifiedCrashBoundary,
+    ) {
+        let binding = verified_receipt_binding(paths, token, receipt, result_run_id)
+            .expect("verified receipt binding");
+        if matches!(
+            boundary,
+            VerifiedCrashBoundary::SemanticAchieved | VerifiedCrashBoundary::AttemptStopped
+        ) {
+            append_control_event(
+                paths,
+                token,
+                JobEventKind::DeterministicGatePassed,
+                "crash-fixture-gate".to_string(),
+                bind_verified_projection_detail(json!({ "marker": "persisted" }), &binding)
+                    .expect("gate binding"),
+            )
+            .expect("persisted gate projection");
+            append_control_event(
+                paths,
+                token,
+                JobEventKind::SemanticJudgeAchieved,
+                "crash-fixture-semantic".to_string(),
+                bind_verified_projection_detail(json!({ "judgment": "persisted" }), &binding)
+                    .expect("semantic binding"),
+            )
+            .expect("persisted semantic projection");
+        }
+        if matches!(boundary, VerifiedCrashBoundary::AttemptStopped) {
+            append_attempt_stopped(
+                paths,
+                token,
+                StopReason::Verified,
+                bind_verified_projection_detail(
+                    json!({ "reason": "receipt already verified before crash" }),
+                    &binding,
+                )
+                .expect("attempt-stop binding"),
+            )
+            .expect("persisted verified attempt stop");
+        }
+    }
+
+    fn expire_supervisor_lease(paths: &DeadreckonPaths, job: &Job) {
+        let mut lease = deadreckon_core::load_job_lease(paths, &job.job_id).expect("active lease");
+        lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        fs::write(
+            paths.job_lease(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&lease).expect("expired lease json"),
+        )
+        .expect("expire supervisor lease");
+    }
+
+    fn assert_exact_verified_projection(paths: &DeadreckonPaths, job: &Job) {
+        let view = JobView::load(paths, job.job_id.as_ref()).expect("recovered Job view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Verified)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::Verified));
+        assert_eq!(view.projection.attempt_count, 1);
+        let history = read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+        for kind in [
+            JobEventKind::AttemptStarted,
+            JobEventKind::DeterministicGatePassed,
+            JobEventKind::SemanticJudgeAchieved,
+            JobEventKind::AttemptStopped,
+            JobEventKind::Verified,
+        ] {
+            assert_eq!(
+                history
+                    .events()
+                    .iter()
+                    .filter(|event| event.kind == kind)
+                    .count(),
+                1,
+                "recovery duplicated {kind:?}: {:?}",
+                history.events()
+            );
+        }
+        assert!(
+            history
+                .events()
+                .iter()
+                .any(|event| event.kind == JobEventKind::LeaseReclaimed),
+            "replacement supervisor did not durably reclaim the expired lease"
+        );
+        assert!(
+            history.events().iter().all(|event| !matches!(
+                event.kind,
+                JobEventKind::ChildLaunchPrepared | JobEventKind::RetryScheduled
+            )),
+            "receipt recovery launched or scheduled another worker/provider"
+        );
     }
 
     fn graph_fixture(
@@ -4748,6 +5342,286 @@ mod tests {
         )
         .expect("driver state");
         (paths, job)
+    }
+
+    async fn graph_fixture_with_verified_receipt(
+        temp: &TempDir,
+    ) -> (DeadreckonPaths, Job, LeaseToken) {
+        let (paths, job) = graph_fixture(temp, deadreckon_core::plan::PlanStatus::Merged);
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
+        let mut merged = create_run(
+            &paths,
+            RunOptions {
+                goal: job.goal.clone(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("result-run".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("merged evidence run");
+        fs::write(merged.working_dir.join("result.txt"), "merged evidence\n")
+            .expect("merged result");
+        merged
+            .set_phase_status(
+                deadreckon_core::PhaseId(60),
+                deadreckon_core::PhaseStatus::Completed,
+            )
+            .expect("merged complete");
+        save_state(&merged).expect("merged state");
+        let mut plan = deadreckon_core::load_plan(&paths, job.job_id.as_ref()).expect("graph plan");
+        for task in &mut plan.tasks {
+            task.child_run_id = Some(merged.run_id.clone());
+        }
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("graph accounting links");
+
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let parent =
+            super::super::graph_job::prepare_parent_result_run(&paths, &job, &authority, &merged)
+                .expect("parent result");
+        let key = deadreckon_core::read_gate_key(&paths, job.job_id.as_ref()).expect("gate key");
+        deadreckon_core::write_native_acceptance_marker_with_results_and_key(
+            &parent.run_root,
+            parent.run_id.clone(),
+            parent.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "merged result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("native marker");
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 1, "sandbox-exec");
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job.job_id.clone(),
+            run_id: RunId(job.job_id.as_ref().to_string()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the merged result satisfies the parent goal".to_string(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved graph goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec!["merged-result".to_string()],
+            }],
+            missing: Vec::new(),
+            input_sha256: parent_semantic_input_sha256(&parent, &job),
+            spend_usd: 0.0,
+        };
+        deadreckon_runtime::persist_semantic_judgment(&parent.run_root, &judgment)
+            .expect("graph semantic judgment");
+        let completion =
+            super::super::graph_job::complete_merged_plan_parent(&paths, &job, &authority, &plan)
+                .await
+                .expect("seal graph receipt");
+        assert!(matches!(
+            completion,
+            super::super::graph_job::ParentCompletion::Verified(_)
+        ));
+        assert!(paths.job_receipt(job.job_id.as_ref()).is_file());
+        (paths, job, token)
+    }
+
+    async fn campaign_fixture_with_verified_receipt(
+        temp: &TempDir,
+    ) -> (DeadreckonPaths, Job, LeaseToken) {
+        use deadreckon_core::plan::{Plan, PlanMode, PlanProviders, PlanRole, PlanTask, save_plan};
+
+        let (paths, job, mut campaign) =
+            campaign_fixture(temp, deadreckon_core::campaign::CampaignStatus::Merged);
+        for (index, sub) in campaign.sub_goals.iter_mut().enumerate() {
+            let run_id = format!("campaign-leaf-{index}");
+            let mut leaf = create_run(
+                &paths,
+                RunOptions {
+                    goal: sub.goal.clone(),
+                    cwd: job.source_cwd.clone(),
+                    sandbox: "none".to_string(),
+                    provider: None,
+                    skill_name: "default-coding".to_string(),
+                    max_spend_usd: None,
+                    max_wall_seconds: None,
+                    run_id: Some(run_id.clone()),
+                    codebase: None,
+                },
+            )
+            .expect("leaf run");
+            fs::write(leaf.working_dir.join(format!("leaf-{index}.txt")), "done\n")
+                .expect("leaf output");
+            deadreckon_core::write_acceptance_marker(
+                &leaf.run_root,
+                leaf.run_id.clone(),
+                leaf.working_dir.clone(),
+                1,
+            )
+            .expect("leaf marker");
+            leaf.set_phase_status(
+                deadreckon_core::PhaseId(60),
+                deadreckon_core::PhaseStatus::Completed,
+            )
+            .expect("leaf complete");
+            save_state(&leaf).expect("leaf state");
+            let mut first = PlanTask::new(0, "first", "work", PlanRole::Child, None);
+            first.child_run_id = Some(leaf.run_id.clone());
+            let mut second = PlanTask::new(1, "second", "reuse", PlanRole::Child, None);
+            second.child_run_id = Some(leaf.run_id.clone());
+            let mut subplan = Plan::new(
+                sub.goal.clone(),
+                PlanMode::FullPlan,
+                vec![first, second],
+                PlanProviders::default(),
+                None,
+                "test",
+            )
+            .expect("subplan");
+            subplan.plan_id = format!("campaign-subplan-{index}");
+            save_plan(&paths, &subplan).expect("subplan state");
+            super::super::graph_job::record_plan_planner_accounting(&paths, &subplan.plan_id, None)
+                .expect("subplan planner accounting");
+            sub.sub_plan_id = Some(subplan.plan_id);
+            sub.result_run_id = Some(run_id);
+        }
+        let rollup = deadreckon_core::campaign::build_rollup(&campaign, |run_id| {
+            let state = load_run(&paths, run_id).expect("leaf");
+            let gate = if deadreckon_core::validate_acceptance_marker(&state).is_ok() {
+                "signed".to_string()
+            } else {
+                "refused".to_string()
+            };
+            (
+                gate,
+                deadreckon_core::tamper::AcceptanceTamperVerdict::Clean,
+                Vec::new(),
+            )
+        });
+        assert!(deadreckon_core::campaign::campaign_can_complete(
+            &campaign, &rollup
+        ));
+        let campaign_dir = paths.plan_dir(job.job_id.as_ref());
+        deadreckon_core::campaign::write_campaign(&campaign_dir, &campaign)
+            .expect("campaign state");
+        deadreckon_core::campaign::write_campaign_rollup(&campaign_dir, &rollup)
+            .expect("campaign rollup");
+
+        let mut merged = create_run(
+            &paths,
+            RunOptions {
+                goal: "campaign merged evidence".to_string(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("campaign-result".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("merged run");
+        fs::write(merged.working_dir.join("campaign.txt"), "merged campaign\n")
+            .expect("merged output");
+        deadreckon_core::campaign::write_campaign_rollup_at_run_root(&merged.run_root, &rollup)
+            .expect("merged rollup");
+        deadreckon_core::write_acceptance_marker(
+            &merged.run_root,
+            merged.run_id.clone(),
+            merged.working_dir.clone(),
+            1,
+        )
+        .expect("merged marker");
+        merged
+            .set_phase_status(
+                deadreckon_core::PhaseId(60),
+                deadreckon_core::PhaseStatus::Completed,
+            )
+            .expect("merged complete");
+        save_state(&merged).expect("merged state");
+
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let parent =
+            super::super::graph_job::prepare_parent_result_run(&paths, &job, &authority, &merged)
+                .expect("parent");
+        deadreckon_core::campaign::write_campaign_rollup_at_run_root(&parent.run_root, &rollup)
+            .expect("parent rollup");
+        let key = deadreckon_core::read_gate_key(&paths, job.job_id.as_ref()).expect("gate key");
+        deadreckon_core::write_native_acceptance_marker_with_results_and_key(
+            &parent.run_root,
+            parent.run_id.clone(),
+            parent.working_dir.clone(),
+            vec![deadreckon_core::AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "campaign merged result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: Some(1),
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("native parent marker");
+
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
+        seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 1, "sandbox-exec");
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job.job_id.clone(),
+            run_id: RunId(job.job_id.as_ref().to_string()),
+            judged_at: Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the campaign result satisfies the approved goal".to_string(),
+            goal_coverage: vec![deadreckon_protocol::GoalCoverage {
+                claim: "approved campaign goal".to_string(),
+                status: deadreckon_protocol::GoalCoverageStatus::Met,
+                evidence: vec![
+                    "approved-goal".to_string(),
+                    "deterministic-gate".to_string(),
+                ],
+            }],
+            missing: Vec::new(),
+            input_sha256: parent_semantic_input_sha256(&parent, &job),
+            spend_usd: 0.0,
+        };
+        deadreckon_runtime::persist_semantic_judgment(&parent.run_root, &judgment)
+            .expect("campaign semantic judgment");
+        let completion = super::super::graph_job::complete_merged_campaign_parent(
+            &paths, &job, &authority, &campaign,
+        )
+        .await
+        .expect("seal campaign receipt");
+        assert!(matches!(
+            completion,
+            super::super::graph_job::ParentCompletion::Verified(_)
+        ));
+        assert!(paths.job_receipt(job.job_id.as_ref()).is_file());
+        (paths, job, token)
     }
 
     fn campaign_fixture(
@@ -4849,6 +5723,305 @@ mod tests {
         )
         .expect("driver state");
         (paths, job, campaign)
+    }
+
+    #[tokio::test]
+    async fn reclaimed_single_receipt_projects_each_crash_boundary_exactly_once() {
+        for boundary in [
+            VerifiedCrashBoundary::ReceiptAvailable,
+            VerifiedCrashBoundary::SemanticAchieved,
+            VerifiedCrashBoundary::AttemptStopped,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, job) = fixture(&temp, 1);
+            let token = claim_started_attempt(&paths, &job, 1);
+            append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
+            let state = seal_verified_single_receipt(&paths, &job);
+            let receipt = deadreckon_core::validate_completion_receipt(&paths, &state)
+                .expect("durable single receipt");
+            seed_verified_projection_boundary(&paths, &token, &receipt, &state.run_id, boundary);
+            expire_supervisor_lease(&paths, &job);
+            let recovery = SupervisorInstance {
+                owner: LeaseOwner {
+                    owner_id: format!("single-recovery-{boundary:?}"),
+                    boot_id: token.boot_id.clone(),
+                    pid: std::process::id(),
+                    process_group: std::process::id(),
+                },
+                executable: temp.path().join("worker-must-not-launch"),
+            };
+
+            supervise_one_job(&paths, &recovery, job.job_id.as_ref())
+                .await
+                .expect("replacement supervisor projects single receipt");
+
+            assert_exact_verified_projection(&paths, &job);
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_graph_receipt_projects_each_crash_boundary_exactly_once() {
+        for boundary in [
+            VerifiedCrashBoundary::ReceiptAvailable,
+            VerifiedCrashBoundary::SemanticAchieved,
+            VerifiedCrashBoundary::AttemptStopped,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, job, token) = graph_fixture_with_verified_receipt(&temp).await;
+            let parent = load_run(&paths, job.job_id.as_ref()).expect("graph parent result");
+            let receipt = deadreckon_core::validate_completion_receipt(&paths, &parent)
+                .expect("durable graph receipt");
+            seed_verified_projection_boundary(&paths, &token, &receipt, "result-run", boundary);
+            expire_supervisor_lease(&paths, &job);
+            let recovery = SupervisorInstance {
+                owner: LeaseOwner {
+                    owner_id: format!("graph-recovery-{boundary:?}"),
+                    boot_id: token.boot_id.clone(),
+                    pid: std::process::id(),
+                    process_group: std::process::id(),
+                },
+                executable: temp.path().join("provider-must-not-launch"),
+            };
+
+            supervise_one_job(&paths, &recovery, job.job_id.as_ref())
+                .await
+                .expect("replacement supervisor projects graph receipt");
+
+            assert_exact_verified_projection(&paths, &job);
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_receipt_rejects_reversed_verified_projection_facts() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
+        let state = seal_verified_single_receipt(&paths, &job);
+        let receipt = deadreckon_core::validate_completion_receipt(&paths, &state)
+            .expect("durable single receipt");
+        let binding = verified_receipt_binding(&paths, &token, &receipt, &state.run_id)
+            .expect("verified receipt binding");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::SemanticJudgeAchieved,
+            "reversed-semantic-before-gate".to_string(),
+            bind_verified_projection_detail(json!({ "judgment": "persisted" }), &binding)
+                .expect("semantic binding"),
+        )
+        .expect("reversed semantic projection");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::DeterministicGatePassed,
+            "reversed-gate-after-semantic".to_string(),
+            bind_verified_projection_detail(json!({ "marker": "persisted" }), &binding)
+                .expect("gate binding"),
+        )
+        .expect("reversed gate projection");
+        append_attempt_stopped(
+            &paths,
+            &token,
+            StopReason::Verified,
+            bind_verified_projection_detail(
+                json!({ "reason": "persisted in reversed chronology" }),
+                &binding,
+            )
+            .expect("attempt-stop binding"),
+        )
+        .expect("reversed attempt stop");
+        expire_supervisor_lease(&paths, &job);
+        let recovery = SupervisorInstance {
+            owner: LeaseOwner {
+                owner_id: "reversed-projection-recovery".to_string(),
+                boot_id: token.boot_id.clone(),
+                pid: std::process::id(),
+                process_group: std::process::id(),
+            },
+            executable: temp.path().join("provider-must-not-launch"),
+        };
+
+        let error = supervise_one_job(&paths, &recovery, job.job_id.as_ref())
+            .await
+            .expect_err("recovery must reject reversed verified facts");
+        assert!(
+            error.to_string().contains(
+                "out-of-order, conflicting, or differently bound verified-completion facts"
+            ),
+            "unexpected recovery error: {error}"
+        );
+        let history = read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::Verified)
+        );
+        assert!(history.events().iter().all(|event| !matches!(
+            event.kind,
+            JobEventKind::ChildLaunchPrepared | JobEventKind::RetryScheduled
+        )));
+    }
+
+    #[tokio::test]
+    async fn reclaimed_receipt_rejects_differently_bound_verified_facts() {
+        for mismatched_field in ["receipt_sha256", "result_run_id"] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, job) = fixture(&temp, 1);
+            let token = claim_started_attempt(&paths, &job, 1);
+            append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
+            let state = seal_verified_single_receipt(&paths, &job);
+            let receipt = deadreckon_core::validate_completion_receipt(&paths, &state)
+                .expect("durable single receipt");
+            let binding = verified_receipt_binding(&paths, &token, &receipt, &state.run_id)
+                .expect("verified receipt binding");
+            append_control_event(
+                &paths,
+                &token,
+                JobEventKind::DeterministicGatePassed,
+                format!("mismatch-gate-{mismatched_field}"),
+                bind_verified_projection_detail(json!({ "marker": "persisted" }), &binding)
+                    .expect("gate binding"),
+            )
+            .expect("persisted gate projection");
+            let mut semantic =
+                bind_verified_projection_detail(json!({ "judgment": "persisted" }), &binding)
+                    .expect("semantic binding");
+            semantic[mismatched_field] = Value::String(format!("mismatched-{mismatched_field}"));
+            append_control_event(
+                &paths,
+                &token,
+                JobEventKind::SemanticJudgeAchieved,
+                format!("mismatch-semantic-{mismatched_field}"),
+                semantic,
+            )
+            .expect("differently bound semantic projection");
+            expire_supervisor_lease(&paths, &job);
+            let recovery = SupervisorInstance {
+                owner: LeaseOwner {
+                    owner_id: format!("binding-recovery-{mismatched_field}"),
+                    boot_id: token.boot_id.clone(),
+                    pid: std::process::id(),
+                    process_group: std::process::id(),
+                },
+                executable: temp.path().join("provider-must-not-launch"),
+            };
+
+            let error = supervise_one_job(&paths, &recovery, job.job_id.as_ref())
+                .await
+                .expect_err("recovery must reject differently bound verified facts");
+            assert!(
+                error.to_string().contains(
+                    "out-of-order, conflicting, or differently bound verified-completion facts"
+                ),
+                "unexpected recovery error for {mismatched_field}: {error}"
+            );
+            let history =
+                read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+            assert!(
+                history
+                    .events()
+                    .iter()
+                    .all(|event| event.kind != JobEventKind::Verified)
+            );
+            assert!(history.events().iter().all(|event| !matches!(
+                event.kind,
+                JobEventKind::ChildLaunchPrepared | JobEventKind::RetryScheduled
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaimed_campaign_receipt_projects_each_crash_boundary_exactly_once() {
+        for boundary in [
+            VerifiedCrashBoundary::ReceiptAvailable,
+            VerifiedCrashBoundary::SemanticAchieved,
+            VerifiedCrashBoundary::AttemptStopped,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, job, token) = campaign_fixture_with_verified_receipt(&temp).await;
+            let parent = load_run(&paths, job.job_id.as_ref()).expect("campaign parent result");
+            let receipt = deadreckon_core::validate_completion_receipt(&paths, &parent)
+                .expect("durable campaign receipt");
+            seed_verified_projection_boundary(
+                &paths,
+                &token,
+                &receipt,
+                "campaign-result",
+                boundary,
+            );
+            expire_supervisor_lease(&paths, &job);
+            let recovery = SupervisorInstance {
+                owner: LeaseOwner {
+                    owner_id: format!("campaign-recovery-{boundary:?}"),
+                    boot_id: token.boot_id.clone(),
+                    pid: std::process::id(),
+                    process_group: std::process::id(),
+                },
+                executable: temp.path().join("provider-must-not-launch"),
+            };
+
+            supervise_one_job(&paths, &recovery, job.job_id.as_ref())
+                .await
+                .expect("replacement supervisor projects campaign receipt");
+
+            assert_exact_verified_projection(&paths, &job);
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_receipt_cannot_be_reused_for_a_changed_merged_result() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job, _token) = graph_fixture_with_verified_receipt(&temp).await;
+        let mut replacement = create_run(
+            &paths,
+            RunOptions {
+                goal: job.goal.clone(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("replacement-result-run".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("replacement merged run");
+        fs::write(
+            replacement.working_dir.join("result.txt"),
+            "different merged evidence\n",
+        )
+        .expect("replacement result");
+        replacement
+            .set_phase_status(
+                deadreckon_core::PhaseId(60),
+                deadreckon_core::PhaseStatus::Completed,
+            )
+            .expect("replacement complete");
+        save_state(&replacement).expect("replacement state");
+
+        let mut plan = deadreckon_core::load_plan(&paths, job.job_id.as_ref()).expect("graph plan");
+        plan.merged_run_id = Some(replacement.run_id.clone());
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("changed merged result identity");
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+
+        let error =
+            super::super::graph_job::complete_merged_plan_parent(&paths, &job, &authority, &plan)
+                .await
+                .expect_err("a stale receipt must not verify a different merged result")
+                .to_string();
+        assert!(
+            error.contains("different")
+                || error.contains("changed")
+                || error.contains("identity")
+                || error.contains("tree"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -5251,7 +6424,6 @@ mod tests {
                 _ => unreachable!(),
             };
             let token = claim_started_attempt(&paths, &job, 1);
-            drop(token);
             fs::remove_file(super::super::graph_job::driver_state_path(
                 &paths,
                 job.job_id.as_ref(),
@@ -5259,12 +6431,12 @@ mod tests {
             .expect("remove crash-partial mapping");
 
             assert_eq!(
-                super::super::graph_job::recover_pending_driver_state(&paths, &job)
+                super::super::graph_job::recover_pending_driver_state(&paths, &job, &token)
                     .expect("repair mapping"),
                 super::super::graph_job::PendingDriverRecovery::Recovered
             );
             assert_eq!(
-                super::super::graph_job::recover_pending_driver_state(&paths, &job)
+                super::super::graph_job::recover_pending_driver_state(&paths, &job, &token)
                     .expect("idempotent mapping"),
                 super::super::graph_job::PendingDriverRecovery::Unchanged
             );
@@ -6424,6 +7596,20 @@ mod tests {
             deadreckon_core::AcceptanceContainment::contained("sandbox-exec"),
         )
         .expect("native parent marker");
+
+        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
+        let claim =
+            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL).expect("claim");
+        let token = claim.token();
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "campaign-attempt".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("attempt");
+        append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
         seal_test_sandbox_boundary_observation(&paths, &parent, &authority, 1, "sandbox-exec");
         let judgment = SemanticJudgment {
             schema_version: JobSchemaVersion::CURRENT,
@@ -6454,18 +7640,6 @@ mod tests {
         )
         .expect("judgment");
 
-        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
-        let claim =
-            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL).expect("claim");
-        let token = claim.token();
-        append_control_event(
-            &paths,
-            &token,
-            JobEventKind::AttemptStarted,
-            "campaign-attempt".to_string(),
-            attempt_detail(&job, 1),
-        )
-        .expect("attempt");
         classify_advanced_attempt(
             &paths,
             &job,
@@ -6557,6 +7731,19 @@ mod tests {
      {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Merged);
+        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
+        let claim =
+            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL).expect("claim");
+        let token = claim.token();
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "graph-attempt".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("attempt");
+        append_test_child_link(&paths, &token, 1, &Uuid::new_v4().to_string());
         let mut merged = create_run(
             &paths,
             RunOptions {
@@ -6649,19 +7836,6 @@ mod tests {
             !paths.job_receipt(job.job_id.as_ref()).exists(),
             "fixture stops after persisted semantic proof but before receipt sealing"
         );
-
-        let owner = instance(PathBuf::from("/opt/deadreckon")).owner;
-        let claim =
-            claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL).expect("claim");
-        let token = claim.token();
-        append_control_event(
-            &paths,
-            &token,
-            JobEventKind::AttemptStarted,
-            "graph-attempt".to_string(),
-            attempt_detail(&job, 1),
-        )
-        .expect("attempt");
         classify_advanced_attempt(
             &paths,
             &job,
@@ -8893,10 +10067,10 @@ mod tests {
             .await
             .expect("forged acknowledgement is classified");
 
-        let view = JobView::load(&paths, job.job_id.as_ref()).expect("blocked view");
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("failed view");
         assert_eq!(
             view.projection.outcome,
-            Some(deadreckon_protocol::JobOutcome::Blocked)
+            Some(deadreckon_protocol::JobOutcome::Failed)
         );
         assert_eq!(
             view.projection.stop_reason,

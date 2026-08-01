@@ -278,6 +278,41 @@ impl StopReason {
     ];
 }
 
+impl JobOutcome {
+    /// Return whether `reason` is a valid causal explanation for this terminal
+    /// classification. This is the canonical vocabulary shared by lifecycle
+    /// projection, operator evidence and every user-facing status surface.
+    pub const fn accepts_stop_reason(self, reason: StopReason) -> bool {
+        match self {
+            Self::Verified => matches!(reason, StopReason::Verified),
+            Self::NeedsReview => matches!(
+                reason,
+                StopReason::SemanticRevise
+                    | StopReason::SemanticUncertain
+                    | StopReason::SemanticUnavailable
+            ),
+            Self::Blocked => matches!(
+                reason,
+                StopReason::OperatorInputRequired | StopReason::LostContainment
+            ),
+            Self::BudgetExhausted => {
+                matches!(reason, StopReason::SpendCap | StopReason::WallCap)
+            }
+            Self::DeadlineReached => matches!(reason, StopReason::Deadline),
+            Self::RetryExhausted => matches!(reason, StopReason::AttemptLimit),
+            Self::Cancelled => matches!(reason, StopReason::CancelRequested),
+            Self::Failed => matches!(
+                reason,
+                StopReason::TransientProvider
+                    | StopReason::FatalProvider
+                    | StopReason::FatalGate
+                    | StopReason::CorruptHistory
+                    | StopReason::LegacyUnknown
+            ),
+        }
+    }
+}
+
 /// A non-zero position in a job's append-only lifecycle history.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
@@ -328,6 +363,7 @@ pub enum JobEventKind {
     Queued,
     LeaseAcquired,
     LeaseReclaimed,
+    WorkspacePrepared,
     ChildLaunchPrepared,
     AttemptStarted,
     ChildLinked,
@@ -350,6 +386,9 @@ pub enum JobEventKind {
     Verified,
     ResultApplied,
     ResultExported,
+    UndoStarted,
+    UndoCompleted,
+    UndoFailed,
 }
 
 /// Current fenced ownership persisted in `lease.json`.
@@ -429,6 +468,17 @@ pub struct GoalCoverage {
     pub evidence: Vec<String>,
 }
 
+/// Exact controller-owned execution ledgers covered by a verified receipt.
+/// Present for durable ordered chains, whose final tree alone cannot explain
+/// which approved hooks ran or which child result was landed at each step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionExecutionEvidence {
+    pub ordered_candidate_manifest_sha256: String,
+    pub candidate_application_events_sha256: Option<String>,
+    pub chain_hook_events_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalCoverageStatus {
@@ -444,6 +494,10 @@ pub struct CompletionReceipt {
     pub schema_version: JobSchemaVersion,
     pub job_id: JobId,
     pub run_id: RunId,
+    /// Durable Job attempt whose contained gate produced this result.
+    pub attempt: u32,
+    /// Exact supervisor child launch that owned the contained gate.
+    pub outer_launch_id: String,
     pub issued_at: DateTime<Utc>,
     pub issuer: CompletionReceiptIssuer,
     pub proof_kind: CompletionProofKind,
@@ -461,8 +515,72 @@ pub struct CompletionReceipt {
     pub deterministic_marker_sha256: String,
     pub semantic_judgment_sha256: String,
     pub sandbox_boundary_observation_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_evidence: Option<CompletionExecutionEvidence>,
     pub contained: bool,
     pub sandbox_backend: String,
+    pub signature: String,
+}
+
+/// Stable identity of the exact Git worktree and repository selected for a
+/// verified delivery. Both paths are canonical controller observations; a
+/// workspace alias or a different worktree in the same repository is not the
+/// same delivery target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitDeliveryRepositoryIdentity {
+    pub worktree_root: PathBuf,
+    pub git_common_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum GitDeliveryStrategy {
+    Merge,
+    Squash,
+    CherryPick,
+}
+
+/// Controller-authenticated authority written before finish is allowed to
+/// mutate the operator's Git repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitDeliveryIntent {
+    pub schema_version: JobSchemaVersion,
+    pub job_id: JobId,
+    pub run_id: RunId,
+    pub prepared_at: DateTime<Utc>,
+    pub completion_receipt_sha256: String,
+    pub repository: GitDeliveryRepositoryIdentity,
+    /// Full symbolic ref, for example `refs/heads/main`.
+    pub target_ref: String,
+    pub pre_revision: String,
+    pub signed_source_revision: String,
+    pub signed_result_revision: String,
+    pub effective_policy_sha256: String,
+    pub strategy: GitDeliveryStrategy,
+    pub signature: String,
+}
+
+/// Controller-authenticated after-state written once the exact intended
+/// delivery has been re-proved in the operator repository.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedGitDeliveryReceipt {
+    pub schema_version: JobSchemaVersion,
+    pub job_id: JobId,
+    pub run_id: RunId,
+    pub issued_at: DateTime<Utc>,
+    pub delivery_intent_sha256: String,
+    pub completion_receipt_sha256: String,
+    pub repository: GitDeliveryRepositoryIdentity,
+    pub target_ref: String,
+    pub pre_revision: String,
+    pub applied_revision: String,
+    pub signed_source_revision: String,
+    pub signed_result_revision: String,
+    pub effective_policy_sha256: String,
+    pub strategy: GitDeliveryStrategy,
     pub signature: String,
 }
 

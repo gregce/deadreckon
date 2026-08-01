@@ -4,19 +4,22 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_core::glossary::NOUN_DONE_CONTRACT;
 use deadreckon_core::lock::lock_path;
 use deadreckon_core::{
-    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, PLAN_EVENTS_JSONL, Plan, PlanEvent,
-    PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus, PlanTaskStatus,
-    RUN_EVENTS_JSONL, RunOptions, RunStatus, append_plan_event, append_plan_message, append_trace,
-    create_run, list_runs, load_plan, load_run, pid_is_alive, read_codebase_record,
-    read_plan_events, read_plan_messages, save_plan, save_state,
+    CHAIN_EVENTS_JSONL, CoordinatorState, DeadreckonPaths, JobView, PLAN_EVENTS_JSONL, Plan,
+    PlanEvent, PlanEventKind, PlanMessage, PlanMessageKind, PlanMode, PlanRole, PlanStatus,
+    PlanTaskStatus, RUN_EVENTS_JSONL, RunOptions, RunStatus, append_plan_event,
+    append_plan_message, append_trace, create_run, list_runs, load_job_lease, load_plan, load_run,
+    pid_is_alive, read_codebase_record, read_job_history, read_plan_events, read_plan_messages,
+    save_plan, save_state,
 };
-use deadreckon_protocol::TraceRecord;
+use deadreckon_protocol::{JobEventKind, JobId, JobOutcome, TraceRecord};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -7517,6 +7520,445 @@ fn configured_supervisor_fixture_allows_public_start_launch() {
 
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_returns_job_id_before_worker_finishes() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let barrier = SmokeCargoBarrier::install(&repo);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    write_bounded_start_config(&paths);
+    let service = SupervisorServiceFixture::configured(&paths);
+
+    let mut launch = service.deadreckon();
+    launch
+        .current_dir(&repo)
+        .args([
+            "start",
+            "return durable identity while smoke work remains live",
+            "--mode",
+            "run",
+            "--provider",
+            "smoke",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--plain",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let launch = wait_with_output_before(
+        launch.spawn().expect("spawn public start"),
+        Duration::from_secs(10),
+        "public start did not detach from its worker",
+    );
+
+    assert_success(&launch);
+    let envelope: Value = serde_json::from_slice(&launch.stdout).expect("launch JSON");
+    let job_id = envelope["dispatched"]["ids"][0]
+        .as_str()
+        .expect("dispatched Job ID");
+    assert!(paths.job_dir(job_id).is_dir(), "{envelope}");
+
+    let state = barrier.wait_until_started(&paths, job_id);
+    assert!(
+        !barrier.finished(&state),
+        "start returned only after the worker finished"
+    );
+    let live = JobView::load(&paths, job_id).expect("live Job view");
+    assert!(
+        !live.projection.is_terminal(),
+        "start returned a terminal Job instead of detached live work: {live:?}"
+    );
+
+    barrier.release(&state);
+    let terminal = wait_for_terminal_job(&paths, job_id, Duration::from_secs(60));
+    assert!(barrier.finished(&state), "smoke worker did not finish");
+    assert_eq!(barrier.invocation_count(&state), 1);
+    assert_ne!(terminal.projection.outcome, Some(JobOutcome::Cancelled));
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn attach_disconnect_does_not_cancel_execution() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let barrier = SmokeCargoBarrier::install(&repo);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    write_bounded_start_config(&paths);
+    let service = SupervisorServiceFixture::configured(&paths);
+
+    let launch = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "keep smoke execution alive after its observer disconnects",
+            "--mode",
+            "run",
+            "--provider",
+            "smoke",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--plain",
+            "--json",
+        ])
+        .output()
+        .expect("public start");
+    assert_success(&launch);
+    let envelope: Value = serde_json::from_slice(&launch.stdout).expect("launch JSON");
+    let job_id = envelope["dispatched"]["ids"][0]
+        .as_str()
+        .expect("dispatched Job ID");
+    let state = barrier.wait_until_started(&paths, job_id);
+
+    let attach = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args(["attach", job_id, "--plain"])
+        .output()
+        .expect("plain attach snapshot");
+    assert_success(&attach);
+    assert!(
+        !barrier.finished(&state),
+        "attach remained coupled to the worker until it finished"
+    );
+    let live = JobView::load(&paths, job_id).expect("Job after attach disconnect");
+    assert!(
+        !live.projection.is_terminal(),
+        "disconnecting attach made the live Job terminal: {live:?}"
+    );
+    assert_no_cancellation(&paths, job_id);
+
+    barrier.release(&state);
+    // The approved worker wall cap is 60 seconds; allow a second cap-length
+    // window for the detached supervisor to persist its terminal projection
+    // when the host is under executable-scanning or parallel-test pressure.
+    let terminal = wait_for_terminal_job(&paths, job_id, Duration::from_secs(120));
+    assert!(barrier.finished(&state), "smoke worker did not finish");
+    assert_eq!(barrier.invocation_count(&state), 1);
+    assert_ne!(terminal.projection.outcome, Some(JobOutcome::Cancelled));
+    assert_no_cancellation(&paths, job_id);
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn two_supervisor_processes_racing_execute_smoke_worker_once() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let barrier = SmokeCargoBarrier::install(&repo);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    write_bounded_start_config(&paths);
+    let service = SupervisorServiceFixture::configured_with_env(
+        &paths,
+        &[("DEADRECKON_BOOT_ID", "watchkeeper-race-before")],
+    );
+
+    // Leave a real queued Job behind a crashed lazy supervisor. No worker has
+    // been released yet, so the two explicit processes below are the only
+    // contenders capable of producing the durable smoke side effect.
+    let launch = service
+        .deadreckon()
+        .current_dir(&repo)
+        .env("DEADRECKON_TEST_SUPERVISOR_FAILPOINTS", "1")
+        .env(
+            "DEADRECKON_TEST_SUPERVISOR_FAILPOINT",
+            "after_launch_prepared",
+        )
+        .args([
+            "start",
+            "execute one smoke worker under two racing supervisors",
+            "--mode",
+            "run",
+            "--provider",
+            "smoke",
+            "--max-spend",
+            "1",
+            "--yes",
+            "--plain",
+            "--json",
+        ])
+        .output()
+        .expect("public start");
+    assert_success(&launch);
+    let envelope: Value = serde_json::from_slice(&launch.stdout).expect("launch JSON");
+    let job_id = envelope["dispatched"]["ids"][0]
+        .as_str()
+        .expect("dispatched Job ID");
+    wait_for_job_event(&paths, job_id, JobEventKind::ChildLaunchPrepared);
+    wait_for_failed_job_supervisor(&paths, job_id);
+
+    let spawn_contender = || {
+        let mut command = service.deadreckon();
+        command
+            .current_dir(&repo)
+            .env("DEADRECKON_BOOT_ID", "watchkeeper-race-after")
+            .args(["supervisor", "serve", "--once", job_id])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.spawn().expect("spawn racing supervisor")
+    };
+    let mut first = spawn_contender();
+    let mut second = spawn_contender();
+
+    let state = barrier.wait_until_started(&paths, job_id);
+    wait_for_one_process_to_lose(&mut first, &mut second, Duration::from_secs(10));
+    assert_eq!(
+        barrier.invocation_count(&state),
+        1,
+        "both supervisors released a smoke worker"
+    );
+
+    barrier.release(&state);
+    let first = wait_with_output_before(
+        first,
+        Duration::from_secs(60),
+        "first racing supervisor did not exit",
+    );
+    let second = wait_with_output_before(
+        second,
+        Duration::from_secs(60),
+        "second racing supervisor did not exit",
+    );
+    let outputs = [&first, &second];
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1,
+        "exactly one supervisor must own the live lease\nfirst: {}{}\nsecond: {}{}",
+        stdout(&first),
+        stderr(&first),
+        stdout(&second),
+        stderr(&second),
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|output| stderr(output).contains("live lease held by owner")),
+        "the losing process did not report the fenced lease\nfirst: {}\nsecond: {}",
+        stderr(&first),
+        stderr(&second),
+    );
+
+    let terminal = wait_for_terminal_job(&paths, job_id, Duration::from_secs(60));
+    assert!(terminal.projection.is_terminal(), "{terminal:?}");
+    assert_eq!(barrier.invocation_count(&state), 1);
+    let history = read_job_history(&paths.job_events(job_id)).expect("Job history");
+    assert_eq!(
+        history
+            .events()
+            .iter()
+            .filter(|event| event.kind == JobEventKind::AttemptStarted)
+            .count(),
+        1,
+        "the lease race consumed more than one logical attempt"
+    );
+}
+
+struct SmokeCargoBarrier;
+
+impl SmokeCargoBarrier {
+    const FINISHED: &'static str = ".deadreckon-test-smoke-finished";
+    const INVOCATIONS: &'static str = ".deadreckon-test-smoke-invocations";
+    const RELEASE: &'static str = ".deadreckon-test-smoke-release";
+    const STARTED: &'static str = ".deadreckon-test-smoke-started";
+
+    fn install(repo: &std::path::Path) -> Self {
+        let cargo_dir = repo.join(".cargo");
+        fs::create_dir_all(&cargo_dir).expect("smoke Cargo config directory");
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\nrustc-wrapper = \"./deadreckon-test-rustc-wrapper\"\n",
+        )
+        .expect("smoke Cargo wrapper config");
+        let wrapper = repo.join("deadreckon-test-rustc-wrapper");
+        fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+set -eu
+claim=".deadreckon-test-smoke-cargo-$PPID"
+if mkdir "$claim" 2>/dev/null; then
+  printf '%s\n' "$PPID" >> {invocations}
+  : > {started}
+  while [ ! -f {release} ]; do
+    sleep 0.02
+  done
+  : > {finished}
+fi
+exec "$@"
+"#,
+                invocations = Self::INVOCATIONS,
+                started = Self::STARTED,
+                release = Self::RELEASE,
+                finished = Self::FINISHED,
+            ),
+        )
+        .expect("smoke Cargo wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))
+            .expect("smoke Cargo wrapper executable");
+        git(
+            repo,
+            &["add", ".cargo/config.toml", "deadreckon-test-rustc-wrapper"],
+        )
+        .expect("stage smoke Cargo barrier");
+        git(repo, &["commit", "-m", "add smoke execution barrier"])
+            .expect("commit smoke Cargo barrier");
+        Self
+    }
+
+    fn wait_until_started(
+        &self,
+        paths: &DeadreckonPaths,
+        job_id: &str,
+    ) -> deadreckon_core::PipelineState {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(state) = load_run(paths, job_id)
+                && state.working_dir.join(Self::STARTED).is_file()
+            {
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "smoke Job {job_id} never reached its durable worker barrier"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn release(&self, state: &deadreckon_core::PipelineState) {
+        fs::write(state.working_dir.join(Self::RELEASE), "release\n")
+            .expect("release smoke Cargo barrier");
+    }
+
+    fn finished(&self, state: &deadreckon_core::PipelineState) -> bool {
+        state.working_dir.join(Self::FINISHED).is_file()
+    }
+
+    fn invocation_count(&self, state: &deadreckon_core::PipelineState) -> usize {
+        fs::read_to_string(state.working_dir.join(Self::INVOCATIONS))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+fn write_bounded_start_config(paths: &DeadreckonPaths) {
+    fs::write(
+        paths.config_path(),
+        concat!(
+            "default_provider = \"smoke\"\n",
+            "\n[defaults]\n",
+            "cli_max_wall_seconds = 60\n",
+        ),
+    )
+    .expect("bounded start config");
+}
+
+fn wait_with_output_before(
+    mut child: Child,
+    timeout: Duration,
+    timeout_message: &str,
+) -> std::process::Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll child process").is_some() {
+            return child.wait_with_output().expect("collect child output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("collect timed-out output");
+            panic!(
+                "{timeout_message}\nstdout:\n{}\nstderr:\n{}",
+                stdout(&output),
+                stderr(&output)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_terminal_job(paths: &DeadreckonPaths, job_id: &str, timeout: Duration) -> JobView {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(view) = JobView::load(paths, job_id)
+            && view.projection.is_terminal()
+        {
+            return view;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Job {job_id} did not become terminal"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_job_event(paths: &DeadreckonPaths, job_id: &str, kind: JobEventKind) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(history) = read_job_history(&paths.job_events(job_id))
+            && history.events().iter().any(|event| event.kind == kind)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Job {job_id} never persisted {kind:?}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_failed_job_supervisor(paths: &DeadreckonPaths, job_id: &str) {
+    let lease = load_job_lease(paths, &JobId(job_id.to_string())).expect("failed supervisor lease");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_is_alive(lease.pid) {
+        assert!(
+            Instant::now() < deadline,
+            "failpoint supervisor {} did not exit",
+            lease.pid
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_one_process_to_lose(first: &mut Child, second: &mut Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let first_exited = first.try_wait().expect("poll first supervisor").is_some();
+        let second_exited = second.try_wait().expect("poll second supervisor").is_some();
+        if first_exited || second_exited {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "neither racing supervisor lost the live lease"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn assert_no_cancellation(paths: &DeadreckonPaths, job_id: &str) {
+    let history = read_job_history(&paths.job_events(job_id)).expect("Job history");
+    assert!(
+        history.events().iter().all(|event| !matches!(
+            event.kind,
+            JobEventKind::CancelRequested | JobEventKind::Cancelled
+        )),
+        "attach disconnect persisted a cancellation: {:?}",
+        history.events()
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn setup_supervisor_alias_installs_current_unit_without_host_mutation() {
     let temp = repo_tempdir();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -7941,7 +8383,7 @@ fn a_per_node_plan_retries_a_failed_node_and_still_lands_everything() {
     let out = stdout(&output);
     assert!(out.contains("retry 2/"), "the failed node retried: {out}");
     assert!(
-        out.matches("landed on the branch").count() == 2,
+        out.matches("landed on the isolated candidate").count() == 2,
         "both nodes landed: {out}"
     );
     let after = git_stdout_count(&repo);
