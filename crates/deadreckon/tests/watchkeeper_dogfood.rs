@@ -169,7 +169,7 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
     assert_eq!(schema_live_ids, expected_live_ids);
     for unified_job_proof in [
         "guided_continuation_preserves_approved_authority_provenance",
-        "durable_chain_freezes_one_graph_job_with_at_end_verification",
+        "durable_chain_freezes_one_graph_job_with_isolated_per_node_delivery",
         "public_resume_of_unowned_legacy_run_refuses_without_state_mutation",
         "product_chain_run_refuses_without_mutating_the_stored_chain",
         "product_chain_extend_refuses_without_mutation_and_preserves_the_requested_goal",
