@@ -991,13 +991,21 @@ Optionally writes the profile to `spec.profile_dir` for debugging (`commands.rs:
 
 ### 11.5 Linux Bubblewrap
 
-`commands.rs:62-116`. Constructs `bwrap` args with:
+`commands.rs` constructs `bwrap` args with:
 
 - `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts`
-- `--tmpfs <cwd>/.deadreckon-home` and `--setenv HOME <cwd>/.deadreckon-home` (ephemeral tmpfs `$HOME`)
-- `--ro-bind <path> <path>` for each entry in `system_read_allowlist(cwd, spec.read_allowlist)`
-- `--bind <path> <path>` for each entry in `spec.write_allowlist`
-- `--bind <cwd> <cwd>`, `--proc /proc`, `--dev /dev`, `--chdir <cwd>`
+- a private `--tmpfs /tmp` before any workspace or provider path below `/tmp`
+  is rebuilt, so the temporary mount cannot hide earlier bindings
+- explicit destination parents for absolute allowlisted paths in bubblewrap's
+  initially empty mount namespace
+- `--ro-bind <path> <path>` for each existing entry in
+  `system_read_allowlist(cwd, spec.read_allowlist)`, excluding host `/tmp`
+- `--bind-try <path> <path>` for optional CLI state roots and other write
+  allowlist entries, followed by the authoritative workspace mount
+- an ephemeral `$HOME` applied after the workspace mount so the broader mount
+  cannot hide it
+- `--bind` or `--ro-bind` for `<cwd>` according to workspace access, then
+  `--proc /proc`, `--dev /dev`, and `--chdir <cwd>`
 - `--unshare-net` unless `allow_network=true`
 
 ### 11.6 Docker

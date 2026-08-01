@@ -16,8 +16,11 @@
   the command and reconciles a DeadReckon-managed supervisor service. It
   refuses to claim another binary's receipt or overwrite an unmanaged service;
 - service discovery captures `XDG_CONFIG_HOME` once, avoiding cross-test and
-  cross-thread path drift, and Linux CI now installs bubblewrap before running
-  operational sandbox coverage.
+  cross-thread path drift;
+- Linux bubblewrap setup now creates its private `/tmp` before reconstructing
+  absolute workspace paths, treats absent CLI state roots as optional mounts,
+  and does not attempt impossible masks beneath read-only parents. Linux CI
+  installs bubblewrap so these operational paths remain exercised.
 
 Seven slices collapsing six named orchestration shapes onto the one graph
 executor that was already underneath them. (Chart)
