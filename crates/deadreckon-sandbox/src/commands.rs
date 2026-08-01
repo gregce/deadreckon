@@ -548,6 +548,15 @@ fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = vec![
         PathBuf::from("/bin"),
         PathBuf::from("/sbin"),
+        // Bubblewrap starts from an empty filesystem. Even when the program
+        // and `/usr` are mounted, dynamically linked Linux executables still
+        // fail with ENOENT unless their ELF interpreter is visible at its
+        // absolute path (commonly `/lib64/ld-linux-*.so.*`). Keep the standard
+        // merged-/usr compatibility roots read-only when they exist.
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib32"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/libx32"),
         PathBuf::from("/usr"),
         PathBuf::from("/System"),
         PathBuf::from("/System/Volumes/Preboot/Cryptexes"),
@@ -707,6 +716,27 @@ mod tests {
                 .any(|parts| parts == ["--ro-bind", "/tmp", "/tmp"]),
             "host /tmp would hide or expose nested mounts: {args:?}"
         );
+    }
+
+    #[test]
+    fn bwrap_mounts_linux_dynamic_loader_roots_when_present() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut expected = Vec::new();
+        for root in ["/lib", "/lib32", "/lib64", "/libx32"] {
+            let root = PathBuf::from(root);
+            if root.exists() {
+                expected.push(root);
+            }
+        }
+
+        let mounts = system_read_allowlist(temp.path(), &[]);
+        for root in expected {
+            assert!(
+                mounts.contains(&root),
+                "missing Linux dynamic-loader root {} from {mounts:?}",
+                root.display()
+            );
+        }
     }
 
     #[test]

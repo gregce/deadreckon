@@ -19,8 +19,10 @@
   cross-thread path drift;
 - Linux bubblewrap setup now creates its private `/tmp` before reconstructing
   absolute workspace paths, treats absent CLI state roots as optional mounts,
-  and does not attempt impossible masks beneath read-only parents. Linux CI
-  installs bubblewrap so these operational paths remain exercised.
+  does not attempt impossible masks beneath read-only parents, and mounts the
+  standard Linux dynamic-loader roots read-only so approved executables remain
+  runnable. Linux CI installs bubblewrap so these operational paths remain
+  exercised.
 
 Seven slices collapsing six named orchestration shapes onto the one graph
 executor that was already underneath them. (Chart)

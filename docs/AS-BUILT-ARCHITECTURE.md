@@ -996,6 +996,9 @@ Optionally writes the profile to `spec.profile_dir` for debugging (`commands.rs:
 - `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts`
 - a private `--tmpfs /tmp` before any workspace or provider path below `/tmp`
   is rebuilt, so the temporary mount cannot hide earlier bindings
+- read-only mounts for existing standard Linux dynamic-loader roots (`/lib`,
+  `/lib32`, `/lib64`, and `/libx32`), without which an approved dynamic
+  executable appears missing even when its own file is mounted
 - explicit destination parents for absolute allowlisted paths in bubblewrap's
   initially empty mount namespace
 - `--ro-bind <path> <path>` for each existing entry in
