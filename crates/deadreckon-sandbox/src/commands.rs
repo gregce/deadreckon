@@ -103,7 +103,14 @@ fn bwrap_command(
     warning: Option<String>,
 ) -> Result<SandboxCommand> {
     let cwd = spec.cwd.to_string_lossy().to_string();
-    let read_mounts = system_read_allowlist(&spec.cwd, &spec.read_allowlist);
+    // Bubblewrap starts from an empty mount namespace. Give it a private /tmp
+    // before reconstructing absolute host paths beneath that directory;
+    // mounting host /tmp and replacing it later would hide the workspace and
+    // test/provider binaries that were already mounted below it.
+    let read_mounts = system_read_allowlist(&spec.cwd, &spec.read_allowlist)
+        .into_iter()
+        .filter(|path| path != Path::new("/tmp") && path != Path::new("/private/tmp"))
+        .collect::<Vec<_>>();
     let sandbox_home = match spec.workspace_access {
         WorkspaceAccess::ReadWrite => {
             let path = spec.cwd.join(".deadreckon-home");
@@ -131,11 +138,14 @@ fn bwrap_command(
         "--setenv".into(),
         "HOME".into(),
         sandbox_home.to_string_lossy().to_string().into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
     ];
-    if spec.workspace_access == WorkspaceAccess::ReadWrite {
-        args.push("--tmpfs".into());
-        args.push(sandbox_home.to_string_lossy().to_string().into());
-    }
+    let mut destinations = read_mounts.clone();
+    destinations.extend(spec.write_allowlist.iter().cloned());
+    destinations.push(spec.cwd.clone());
+    destinations.push(sandbox_home.clone());
+    append_bwrap_destination_parents(&mut args, &destinations);
     for path in &read_mounts {
         let path = path.to_string_lossy().to_string();
         args.push("--ro-bind".into());
@@ -144,7 +154,10 @@ fn bwrap_command(
     }
     for path in &spec.write_allowlist {
         let path = path.to_string_lossy().to_string();
-        args.push("--bind".into());
+        // Provider state roots are optional until their CLI creates them. A
+        // missing optional source must not make an otherwise valid sandbox
+        // unusable; existing sources retain their explicit writable mount.
+        args.push("--bind-try".into());
         args.push(path.clone().into());
         args.push(path.into());
     }
@@ -156,12 +169,19 @@ fn bwrap_command(
         },
         cwd.clone().into(),
         cwd.clone().into(),
-        "--tmpfs".into(),
-        "/tmp".into(),
     ]);
-    if spec.workspace_access == WorkspaceAccess::ReadOnly {
-        args.push("--dir".into());
-        args.push(sandbox_home.to_string_lossy().to_string().into());
+    match spec.workspace_access {
+        WorkspaceAccess::ReadWrite => {
+            // Apply this after the workspace bind so it cannot be hidden by
+            // that broader mount and leak CLI state into the worktree.
+            args.push("--tmpfs".into());
+            args.push(sandbox_home.to_string_lossy().to_string().into());
+        }
+        WorkspaceAccess::ReadOnly => {
+            args.push("--dir".into());
+            args.push(sandbox_home.to_string_lossy().to_string().into());
+        }
+        WorkspaceAccess::Disposable => {}
     }
     append_bwrap_protected_mounts(&mut args, spec, &read_mounts, &spec.write_allowlist);
     args.extend([
@@ -186,6 +206,24 @@ fn bwrap_command(
         cwd: spec.cwd.clone(),
         warning,
     })
+}
+
+fn append_bwrap_destination_parents(args: &mut Vec<OsString>, paths: &[PathBuf]) {
+    let mut parents = std::collections::BTreeSet::new();
+    for path in paths {
+        for parent in path.ancestors().skip(1) {
+            if parent == Path::new("/") || parent == Path::new("/tmp") {
+                continue;
+            }
+            parents.insert(parent.to_path_buf());
+        }
+    }
+    let mut parents = parents.into_iter().collect::<Vec<_>>();
+    parents.sort_by_key(|path| path.components().count());
+    for parent in parents {
+        args.push("--dir".into());
+        args.push(parent.into_os_string());
+    }
 }
 
 fn docker_command(
@@ -339,7 +377,7 @@ fn append_bwrap_protected_mounts(
     exposed.push(spec.cwd.clone());
 
     for path in &spec.read_denylist {
-        if path_is_exposed(path, &exposed) {
+        if path.exists() && path_is_exposed(path, &exposed) {
             args.push("--tmpfs".into());
             args.push(path.to_string_lossy().to_string().into());
         }
@@ -650,6 +688,87 @@ mod tests {
             !args
                 .windows(3)
                 .any(|parts| parts == ["--bind", &workspace, &workspace])
+        );
+        let private_tmp = args
+            .windows(2)
+            .position(|parts| parts == ["--tmpfs", "/tmp"])
+            .expect("private tmp mount");
+        let workspace_mount = args
+            .windows(3)
+            .position(|parts| parts == ["--ro-bind", &workspace, &workspace])
+            .expect("workspace mount");
+        assert!(
+            private_tmp < workspace_mount,
+            "private /tmp must exist before rebuilding the workspace path: {args:?}"
+        );
+        assert!(
+            !args
+                .windows(3)
+                .any(|parts| parts == ["--ro-bind", "/tmp", "/tmp"]),
+            "host /tmp would hide or expose nested mounts: {args:?}"
+        );
+    }
+
+    #[test]
+    fn bwrap_tolerates_missing_optional_write_roots_and_masks_home_after_workspace() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("project");
+        let missing = temp.path().join("optional-cli-home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut spec = read_only_spec(SandboxBackend::Bwrap);
+        spec.cwd = workspace.clone();
+        spec.workspace_access = WorkspaceAccess::ReadWrite;
+        spec.write_allowlist = vec![workspace.clone(), missing.clone()];
+
+        let command = bwrap_command(&spec, PathBuf::from("/usr/bin/bwrap"), None).expect("command");
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let missing = missing.to_string_lossy().into_owned();
+        let sandbox_home = format!("{workspace}/.deadreckon-home");
+        assert!(
+            args.windows(3)
+                .any(|parts| parts == ["--bind-try", &missing, &missing]),
+            "missing optional provider state should be a try-mount: {args:?}"
+        );
+        assert!(!std::path::Path::new(&missing).exists());
+        let workspace_mount = args
+            .windows(3)
+            .rposition(|parts| parts == ["--bind", &workspace, &workspace])
+            .expect("final workspace mount");
+        let home_mask = args
+            .windows(2)
+            .position(|parts| parts == ["--tmpfs", &sandbox_home])
+            .expect("sandbox home mask");
+        assert!(
+            workspace_mount < home_mask,
+            "the workspace mount must not hide the private CLI home: {args:?}"
+        );
+    }
+
+    #[test]
+    fn bwrap_omits_nonexistent_protected_mount_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("project");
+        let missing = workspace.join("operator-captures");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut spec = read_only_spec(SandboxBackend::Bwrap);
+        spec.cwd = workspace;
+        spec.read_denylist = vec![missing.clone()];
+
+        let command = bwrap_command(&spec, PathBuf::from("/usr/bin/bwrap"), None).expect("command");
+        let args = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let missing = missing.to_string_lossy().into_owned();
+        assert!(
+            !args.windows(2).any(|parts| parts == ["--tmpfs", &missing]),
+            "bubblewrap cannot mount over a missing child of a read-only parent: {args:?}"
         );
     }
 
