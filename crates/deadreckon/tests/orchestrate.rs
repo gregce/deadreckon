@@ -2068,6 +2068,41 @@ fn planner_prompt_is_read_only() {
         &capture,
         r#"{"tasks":[{"subject":"Edit README","goal":"Edit README for tiny hello rust","active_form":"Editing README","depends_on":[]},{"subject":"Add source","goal":"Add source for tiny hello rust","active_form":"Adding source","depends_on":["task-0"]}]}"#,
     );
+    // The planner is intentionally read-only, so it cannot prove its prompt
+    // by writing a host capture file. Make the fixture validate the prompt in
+    // process and return the response only when every contract phrase exists.
+    let binary = temp.path().join("fake-planner");
+    let response = temp.path().join("fake-planner-response.json");
+    fs::write(
+        &binary,
+        format!(
+            r#"#!/bin/sh
+set -eu
+prompt=$(printf '%s\n' "$@")
+for required in \
+  'read-only planning agent' \
+  'Do not write files' \
+  'create temporary files' \
+  'install packages' \
+  'commit' \
+  'Return JSON only' \
+  'Dependencies must refer to earlier child ids' \
+  'child goals must be implementation or verification slices' \
+  'Do not return research-only'
+do
+  case "$prompt" in
+    *"$required"*) ;;
+    *) printf 'missing planner contract phrase: %s\n' "$required" >&2; exit 41 ;;
+  esac
+done
+cat '{}'
+"#,
+            response.display()
+        ),
+    )
+    .expect("asserting fake planner");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+        .expect("asserting fake planner executable");
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
@@ -2087,22 +2122,10 @@ fn planner_prompt_is_read_only() {
         .expect("plan");
 
     assert_success(&output);
-    let prompt = fs::read_to_string(&capture).expect("planner prompt");
-    assert!(prompt.contains("read-only planning agent"), "{prompt}");
-    assert!(prompt.contains("Do not write files"), "{prompt}");
-    assert!(prompt.contains("create temporary files"), "{prompt}");
-    assert!(prompt.contains("install packages"), "{prompt}");
-    assert!(prompt.contains("commit"), "{prompt}");
-    assert!(prompt.contains("Return JSON only"), "{prompt}");
     assert!(
-        prompt.contains("Dependencies must refer to earlier child ids"),
-        "{prompt}"
+        !capture.exists(),
+        "read-only planner wrote a host prompt capture"
     );
-    assert!(
-        prompt.contains("child goals must be implementation or verification slices"),
-        "{prompt}"
-    );
-    assert!(prompt.contains("Do not return research-only"), "{prompt}");
 }
 
 #[test]
@@ -7824,10 +7847,14 @@ exec "$@"
             {
                 return state;
             }
-            assert!(
-                Instant::now() < deadline,
-                "smoke Job {job_id} never reached its durable worker barrier"
-            );
+            if Instant::now() >= deadline {
+                let view = JobView::load(paths, job_id);
+                let state = load_run(paths, job_id);
+                let events = fs::read_to_string(paths.job_events(job_id));
+                panic!(
+                    "smoke Job {job_id} never reached its durable worker barrier\nview: {view:#?}\nstate: {state:#?}\nevents: {events:#?}"
+                );
+            }
             thread::sleep(Duration::from_millis(25));
         }
     }

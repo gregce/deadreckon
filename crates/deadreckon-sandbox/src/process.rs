@@ -77,6 +77,16 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         // signing material, or host-specific command routing.
         process.env_clear();
     }
+    if guarded.is_some()
+        && let Some(boot_id) = std::env::var_os("DEADRECKON_BOOT_ID")
+        && !boot_id.is_empty()
+    {
+        // The guarded helper must compare the child against the same boot
+        // identity used to prepare its durable record. This is principally a
+        // reboot-test seam; dr-gate removes it before executing repository
+        // code, so it does not weaken the sandbox environment boundary.
+        process.env("DEADRECKON_BOOT_ID", boot_id);
+    }
     process
         .envs(&command.env)
         // Signing inputs belong only to the trusted gate-signing phase. The

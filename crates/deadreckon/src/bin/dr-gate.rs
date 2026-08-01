@@ -300,7 +300,12 @@ fn guarded_exec(args: &GuardedExecArgs) -> Result<(), Box<dyn std::error::Error>
     write_supervised_process_record(&args.metadata, &record)?;
 
     let mut command = Command::new(&args.program);
-    command.args(&args.args);
+    command
+        .args(&args.args)
+        // This internal override is needed only while checking the durable
+        // guarded-process identity in restart tests. Never expose it to the
+        // approved repository command or let it impersonate a host reboot.
+        .env_remove("DEADRECKON_BOOT_ID");
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;

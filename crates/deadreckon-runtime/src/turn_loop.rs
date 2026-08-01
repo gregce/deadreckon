@@ -949,7 +949,12 @@ async fn run_turn_loop_inner(
                     docker: None,
                     cwd: state.working_dir.clone(),
                     program: OsString::from("sh"),
-                    args: vec![OsString::from("-lc"), OsString::from(command.clone())],
+                    // A login shell rewrites PATH from /etc/profile. That
+                    // discards the supervisor's approved toolchain paths
+                    // (for example ~/.cargo/bin) inside an otherwise valid
+                    // sandbox. The private sandbox HOME has no user profile
+                    // to load, so preserve the inherited PATH with `-c`.
+                    args: vec![OsString::from("-c"), OsString::from(command.clone())],
                     stdin: None,
                     env: BTreeMap::new(),
                     allow_network: policy.allow_network,

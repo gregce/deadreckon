@@ -151,6 +151,42 @@ mod tests {
         assert_eq!(output.stdout, "loader-ok");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bwrap_executes_a_tool_from_the_explicit_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if which::which("bwrap").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let tool_bin = temp.path().join("tool-bin");
+        let helper = tool_bin.join("approved-tool");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&tool_bin).expect("tool bin");
+        std::fs::write(&helper, "#!/bin/sh\nprintf path-ok\n").expect("helper");
+        let mut permissions = std::fs::metadata(&helper).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("permissions");
+
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::Bwrap;
+        spec.cwd = workspace;
+        spec.program = OsString::from("/bin/sh");
+        spec.args = vec![OsString::from("-c"), OsString::from("approved-tool")];
+        spec.env.insert(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", tool_bin.display()),
+        );
+        spec.workspace_access = WorkspaceAccess::ReadOnly;
+
+        let output = run(spec).await.expect("bubblewrap PATH run");
+
+        assert_eq!(output.status_code, Some(0), "{}", output.stderr);
+        assert_eq!(output.stdout, "path-ok");
+    }
+
     #[tokio::test]
     async fn subprocess_cancel_escalates_sigterm_to_sigkill() {
         let token = CancellationToken::new();
