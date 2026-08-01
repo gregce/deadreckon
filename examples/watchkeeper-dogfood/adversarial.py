@@ -355,11 +355,11 @@ TRIALS = (
                     "--bin",
                     "deadreckon",
                     "--no-default-features",
-                    "commands::chain::tests::durable_chain_freezes_one_graph_job_with_at_end_verification",
+                    "commands::chain::tests::durable_chain_freezes_one_graph_job_with_isolated_per_node_delivery",
                     "--",
                     "--exact",
                 ),
-                "commands::chain::tests::durable_chain_freezes_one_graph_job_with_at_end_verification",
+                "commands::chain::tests::durable_chain_freezes_one_graph_job_with_isolated_per_node_delivery",
             ),
             ProofCommand(
                 (
