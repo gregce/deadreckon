@@ -120,6 +120,37 @@ mod tests {
         assert!(output.warning.expect("warning").contains("unsafe"));
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bwrap_executes_an_approved_temp_script_with_a_private_tmp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if which::which("bwrap").is_err() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let helper = temp.path().join("approved-helper");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(&helper, "#!/bin/sh\nprintf loader-ok\n").expect("helper");
+        let mut permissions = std::fs::metadata(&helper).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("permissions");
+
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::Bwrap;
+        spec.cwd = workspace;
+        spec.program = helper.clone().into_os_string();
+        spec.args.clear();
+        spec.read_allowlist = vec![helper];
+        spec.workspace_access = WorkspaceAccess::ReadOnly;
+
+        let output = run(spec).await.expect("bubblewrap run");
+
+        assert_eq!(output.status_code, Some(0), "{}", output.stderr);
+        assert_eq!(output.stdout, "loader-ok");
+    }
+
     #[tokio::test]
     async fn subprocess_cancel_escalates_sigterm_to_sigkill() {
         let token = CancellationToken::new();
