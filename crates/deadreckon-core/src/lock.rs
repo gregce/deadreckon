@@ -255,12 +255,37 @@ fn pid_is_alive_platform(pid: u32) -> bool {
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
+    // `kill(pid, 0)` succeeds for a zombie because the kernel still retains
+    // its process-table entry. A zombie cannot execute or own useful work,
+    // though, and may remain unreaped under a container PID 1 long enough to
+    // block lease recovery. Treat Linux's terminal process states as dead.
+    #[cfg(target_os = "linux")]
+    if linux_process_state(pid).is_some_and(|state| matches!(state, 'Z' | 'X')) {
+        return false;
+    }
+
     match kill(Pid::from_raw(pid as i32), None) {
         Ok(()) => true,
         Err(Errno::EPERM) => true,
         Err(Errno::ESRCH) => false,
         Err(_) => false,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: u32) -> Option<char> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    linux_process_state_from_stat(&raw)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state_from_stat(raw: &str) -> Option<char> {
+    let command_end = raw.rfind(')')?;
+    raw[command_end + 1..]
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 #[cfg(not(unix))]
@@ -309,6 +334,21 @@ mod tests {
     use super::{LockState, acquire_lock, lock_path, lock_status};
     use crate::DeadreckonError;
     use crate::paths::DeadreckonPaths;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_state_parser_handles_commands_with_parentheses() {
+        assert_eq!(
+            super::linux_process_state_from_stat(
+                "42 (worker (test)) Z 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19"
+            ),
+            Some('Z')
+        );
+        assert_eq!(
+            super::linux_process_state_from_stat("43 (worker) R 1 2 3"),
+            Some('R')
+        );
+    }
 
     #[test]
     fn held_file_lock_blocks_same_scope_second_owner() {

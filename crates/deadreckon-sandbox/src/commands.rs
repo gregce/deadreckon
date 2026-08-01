@@ -107,7 +107,7 @@ fn bwrap_command(
     // before reconstructing absolute host paths beneath that directory;
     // mounting host /tmp and replacing it later would hide the workspace and
     // test/provider binaries that were already mounted below it.
-    let read_mounts = system_read_allowlist(&spec.cwd, &spec.read_allowlist)
+    let read_mounts = sandbox_read_allowlist(spec)
         .into_iter()
         .filter(|path| path != Path::new("/tmp") && path != Path::new("/private/tmp"))
         .collect::<Vec<_>>();
@@ -446,7 +446,7 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     } else {
         "(deny network*)".to_string()
     };
-    let read_rules = seatbelt_read_rules(&system_read_allowlist(&spec.cwd, &spec.read_allowlist));
+    let read_rules = seatbelt_read_rules(&sandbox_read_allowlist(spec));
     let mut writable_paths = vec![spec.cwd.clone()];
     writable_paths.extend(spec.write_allowlist.iter().cloned());
     writable_paths.extend(
@@ -585,6 +585,45 @@ fn system_read_allowlist(cwd: &Path, extra: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
+fn sandbox_read_allowlist(spec: &SandboxSpec) -> Vec<PathBuf> {
+    let mut extra = spec.read_allowlist.clone();
+    let path = spec
+        .env
+        .get("PATH")
+        .map(OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path) = path {
+        extra.extend(
+            std::env::split_paths(&path).filter(|entry| entry.is_absolute() && entry.exists()),
+        );
+    }
+    // PATH entries expose launchers, but several common tool managers keep
+    // their selected runtime and libraries in a separate, explicitly named
+    // root. These roots are execution dependencies, not writable state.
+    for key in [
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "NVM_DIR",
+        "VOLTA_HOME",
+        "BUN_INSTALL",
+        "PNPM_HOME",
+        "JAVA_HOME",
+    ] {
+        let value = spec
+            .env
+            .get(key)
+            .map(OsString::from)
+            .or_else(|| std::env::var_os(key));
+        if let Some(path) = value.map(PathBuf::from)
+            && path.is_absolute()
+            && path.exists()
+        {
+            extra.push(path);
+        }
+    }
+    system_read_allowlist(&spec.cwd, &extra)
+}
+
 fn escape_seatbelt_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
@@ -611,8 +650,8 @@ mod tests {
     use deadreckon_core::DeadreckonPaths;
 
     use super::{
-        bwrap_command, docker_command, sandbox_exec_profile, system_read_allowlist,
-        with_protected_boundary,
+        bwrap_command, docker_command, sandbox_exec_profile, sandbox_read_allowlist,
+        system_read_allowlist, with_protected_boundary,
     };
     use crate::{
         DOCKER_SIDECAR_CONTAINER_PROGRAM, DockerExecution, DockerImage, DockerPlatform,
@@ -737,6 +776,38 @@ mod tests {
                 root.display()
             );
         }
+    }
+
+    #[test]
+    fn sandbox_mounts_explicit_path_and_runtime_roots_read_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let tool_bin = temp.path().join("tools/bin");
+        let rustup_home = temp.path().join("rustup");
+        for directory in [&workspace, &tool_bin, &rustup_home] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let mut spec = read_only_spec(SandboxBackend::Bwrap);
+        spec.cwd = workspace;
+        spec.env.insert(
+            "PATH".to_string(),
+            std::env::join_paths([&tool_bin])
+                .expect("fixture PATH")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        spec.env.insert(
+            "RUSTUP_HOME".to_string(),
+            rustup_home.to_string_lossy().into_owned(),
+        );
+
+        let mounts = sandbox_read_allowlist(&spec);
+
+        assert!(mounts.contains(&tool_bin), "missing PATH root: {mounts:?}");
+        assert!(
+            mounts.contains(&rustup_home),
+            "missing runtime home: {mounts:?}"
+        );
     }
 
     #[test]

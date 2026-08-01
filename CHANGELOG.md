@@ -21,8 +21,12 @@
   absolute workspace paths, treats absent CLI state roots as optional mounts,
   does not attempt impossible masks beneath read-only parents, and mounts the
   standard Linux dynamic-loader roots read-only so approved executables remain
-  runnable. Linux CI installs bubblewrap so these operational paths remain
-  exercised.
+  runnable. Approved `PATH` entries and explicitly named runtime homes are
+  mounted read-only, and tool shells preserve that PATH instead of replacing
+  it through login-shell startup. Linux zombie processes no longer masquerade
+  as live lease owners, and guarded helpers preserve the internal restart-test
+  boot identity only long enough to validate their durable record. Linux CI
+  installs bubblewrap so these operational paths remain exercised.
 
 Seven slices collapsing six named orchestration shapes onto the one graph
 executor that was already underneath them. (Chart)

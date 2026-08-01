@@ -999,6 +999,10 @@ Optionally writes the profile to `spec.profile_dir` for debugging (`commands.rs:
 - read-only mounts for existing standard Linux dynamic-loader roots (`/lib`,
   `/lib32`, `/lib64`, and `/libx32`), without which an approved dynamic
   executable appears missing even when its own file is mounted
+- read-only mounts for existing directories on the effective `PATH` and for
+  explicitly named runtime roots such as `CARGO_HOME`, `RUSTUP_HOME`,
+  `NVM_DIR`, and `JAVA_HOME`; tool shells use `sh -c` so `/etc/profile` cannot
+  discard those approved routes
 - explicit destination parents for absolute allowlisted paths in bubblewrap's
   initially empty mount namespace
 - `--ro-bind <path> <path>` for each existing entry in
@@ -1163,7 +1167,11 @@ helper revalidates that record may it create the new process group, rewrite the
 record as `running`, and execute the sandbox command. If the worker disappears
 before release, EOF makes the helper exit without running a check. Per-launch
 filenames prevent a later attempt from overwriting or deleting the earlier
-identity.
+identity. Linux process liveness treats terminal zombie/dead states as exited,
+because `kill(pid, 0)` alone reports an unreaped zombie as present even though
+it cannot own work. The internal boot-ID override used by restart tests crosses
+the guarded validation boundary, then `dr-gate` removes it before repository
+code executes.
 
 If the resolved backend is `none`, a strict Job refuses before reading the
 key. Otherwise, and only after evaluator cleanup, the controller starts
