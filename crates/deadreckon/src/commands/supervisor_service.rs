@@ -46,6 +46,7 @@ struct ServiceContext {
     binary: PathBuf,
     deadreckon_home: PathBuf,
     user_home: PathBuf,
+    xdg_config_home: Option<PathBuf>,
     path_env: String,
 }
 
@@ -471,6 +472,54 @@ pub(crate) fn supervisor_service_preflight() -> Result<SupervisorServicePrefligh
     }
 }
 
+/// Return the binary recorded by the last supervisor checkpoint. This is
+/// diagnostic evidence only: readiness still comes from the stronger service
+/// preflight, which also checks the managed unit and live process identity.
+pub(crate) fn supervisor_service_checkpoint_binary(
+    paths: &DeadreckonPaths,
+) -> Result<Option<PathBuf>> {
+    Ok(
+        read_service_instance_checkpoint(&service_instance_checkpoint_path(paths))?
+            .map(|checkpoint| checkpoint.binary),
+    )
+}
+
+/// Reconcile a DeadReckon-managed service to the binary executing this command
+/// and wait until the service manager plus live checkpoint prove readiness.
+/// Unmanaged units remain a hard boundary and are never overwritten.
+pub(crate) fn repair_supervisor_service() -> Result<String> {
+    let before = supervisor_service_preflight()?;
+    if before.is_ready() {
+        return Ok("managed supervisor already matches this binary and is ready".to_string());
+    }
+    if !before.setup_is_supported() {
+        return Err(invalid_input(before.reason().unwrap_or(
+            "the supervisor service cannot be repaired on this platform",
+        )));
+    }
+
+    supervisor_service_install_command()?;
+    supervisor_service_start_command()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match supervisor_service_preflight() {
+            Ok(ready) if ready.is_ready() => {
+                return Ok(
+                    "managed supervisor now matches this binary and is restart-ready".to_string(),
+                );
+            }
+            Ok(not_ready) if std::time::Instant::now() >= deadline => {
+                return Err(invalid_input(format!(
+                    "supervisor repair did not become ready: {}",
+                    not_ready.reason().unwrap_or("readiness was not proven")
+                )));
+            }
+            Err(error) if std::time::Instant::now() >= deadline => return Err(error),
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
 fn service_preflight_from_status(
     report: &SupervisorServiceStatusReport,
 ) -> SupervisorServicePreflight {
@@ -758,10 +807,11 @@ fn launchd_manager_runtime(loaded: &Output, disabled: &Output) -> Result<Service
     })
 }
 
-/// `launchctl print-disabled <domain>` reports override values as
-/// `"label" => true|false`; `true` means disabled. Absence is not accepted as
-/// enabled because the ordinary `start` promise needs affirmative persistence
-/// evidence, not launchd's implicit default.
+/// `launchctl print-disabled <domain>` has emitted both boolean and textual
+/// override values across macOS releases. `true`/`disabled` mean disabled;
+/// `false`/`enabled` mean enabled. Absence is not accepted as enabled because
+/// the ordinary `start` promise needs affirmative persistence evidence, not
+/// launchd's implicit default.
 fn parse_launchd_enabled_state(output: &str) -> Result<String> {
     for line in output.lines() {
         let Some((raw_label, raw_disabled)) = line.split_once("=>") else {
@@ -773,8 +823,8 @@ fn parse_launchd_enabled_state(output: &str) -> Result<String> {
         }
         let disabled = raw_disabled.trim().trim_end_matches([';', ',']).trim();
         return match disabled {
-            "false" => Ok("enabled".to_string()),
-            "true" => Ok("disabled".to_string()),
+            "false" | "enabled" => Ok("enabled".to_string()),
+            "true" | "disabled" => Ok("disabled".to_string()),
             _ => Err(invalid_input(format!(
                 "launchd returned an invalid enablement value for {LAUNCHD_LABEL}: {disabled:?}"
             ))),
@@ -1073,6 +1123,10 @@ impl ServiceContext {
                 )
             })
             .and_then(absolute_path)?;
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute());
         let path_env = std::env::var("PATH")
             .map_err(|_| invalid_input("PATH must be valid UTF-8 for service installation"))?;
         validate_service_value("PATH", &path_env)?;
@@ -1081,6 +1135,7 @@ impl ServiceContext {
             binary,
             deadreckon_home,
             user_home,
+            xdg_config_home,
             path_env,
         })
     }
@@ -1092,10 +1147,9 @@ impl ServiceContext {
                 .join("Library")
                 .join("LaunchAgents")
                 .join(format!("{LAUNCHD_LABEL}.plist")),
-            ServicePlatform::Systemd => std::env::var_os("XDG_CONFIG_HOME")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from)
-                .filter(|path| path.is_absolute())
+            ServicePlatform::Systemd => self
+                .xdg_config_home
+                .clone()
                 .unwrap_or_else(|| self.user_home.join(".config"))
                 .join("systemd")
                 .join("user")
@@ -1782,6 +1836,7 @@ mod tests {
             binary: PathBuf::from("/opt/Dead Reckon/bin/deadreckon"),
             deadreckon_home: PathBuf::from("/Users/test/Dead Reckon State"),
             user_home: PathBuf::from("/Users/test"),
+            xdg_config_home: None,
             path_env: "/opt/Agent CLIs/bin:/usr/bin:/bin".to_string(),
         }
     }
@@ -1967,6 +2022,34 @@ mod tests {
         );
         assert_eq!(
             launchd_manager_runtime(&stopped, &disabled).expect("stopped and disabled"),
+            ServiceManagerRuntime {
+                loaded: Some(false),
+                enabled: Some("disabled".to_string()),
+                active: None,
+            }
+        );
+        let textual_enabled = command_output(
+            "disabled services = {\n  \"com.deadreckon.supervisor\" => enabled\n}\n",
+            "",
+            true,
+        );
+        let textual_disabled = command_output(
+            "disabled services = {\n  \"com.deadreckon.supervisor\" => disabled\n}\n",
+            "",
+            true,
+        );
+        assert_eq!(
+            launchd_manager_runtime(&loaded, &textual_enabled)
+                .expect("textual launchd enabled state"),
+            ServiceManagerRuntime {
+                loaded: Some(true),
+                enabled: Some("enabled".to_string()),
+                active: None,
+            }
+        );
+        assert_eq!(
+            launchd_manager_runtime(&stopped, &textual_disabled)
+                .expect("textual launchd disabled state"),
             ServiceManagerRuntime {
                 loaded: Some(false),
                 enabled: Some("disabled".to_string()),
@@ -2493,6 +2576,7 @@ mod tests {
             binary: temp.path().join("deadreckon"),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
+            xdg_config_home: None,
             path_env: "/usr/bin:/bin".to_string(),
         };
         assert_eq!(
@@ -2509,6 +2593,7 @@ mod tests {
             binary: temp.path().join("deadreckon"),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
+            xdg_config_home: None,
             path_env: "/usr/bin:/bin".to_string(),
         };
         let unit_path = context.unit_path();
@@ -2609,6 +2694,7 @@ mod tests {
             binary: temp.path().join("deadreckon"),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
+            xdg_config_home: None,
             path_env: "/usr/bin:/bin".to_string(),
         };
         let unit_path = context.unit_path();

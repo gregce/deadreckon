@@ -1302,7 +1302,7 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .current_dir(cwd)

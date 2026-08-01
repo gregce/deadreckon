@@ -432,15 +432,105 @@ pub(crate) fn update_receipt_for_current_binary(
     paths: &DeadreckonPaths,
     persist_detected: bool,
 ) -> Result<deadreckon_core::install_receipt::Receipt> {
-    if let Some(receipt) = read_receipt(paths)? {
+    let binary = std::env::current_exe()?;
+    let detected = detect_receipt(&binary);
+    let Some(mut receipt) = read_receipt(paths)? else {
+        if persist_detected {
+            write_receipt(paths, &detected)?;
+        }
+        return Ok(detected);
+    };
+    if !same_binary(&receipt.binary_path, &binary) {
+        // Update is deliberately routed by the durable receipt: package
+        // wrappers and update tests may manage a target distinct from the
+        // executable hosting this process. Doctor reports that relationship;
+        // its explicit repair path is stricter and will not claim the target.
         return Ok(receipt);
     }
-    let binary = std::env::current_exe()?;
-    let receipt = detect_receipt(&binary);
-    if persist_detected {
-        write_receipt(paths, &receipt)?;
+    let receipt_is_stale = receipt.channel != detected.channel
+        || receipt.channel_version != detected.channel_version
+        || receipt.binary_path != detected.binary_path
+        || receipt.platform_package != detected.platform_package;
+    if receipt_is_stale {
+        receipt.channel = detected.channel;
+        receipt.channel_version = detected.channel_version;
+        receipt.binary_path = detected.binary_path;
+        receipt.installed_at = detected.installed_at;
+        receipt.platform_package = detected.platform_package;
+        if persist_detected {
+            write_receipt(paths, &receipt)?;
+        }
     }
     Ok(receipt)
+}
+
+pub(crate) fn reconcile_receipt_for_current_binary(
+    paths: &DeadreckonPaths,
+    announce: bool,
+) -> Result<String> {
+    let before = read_receipt(paths)?;
+    if let Some(prior) = before.as_ref() {
+        let binary = std::env::current_exe()?;
+        if !same_binary(&prior.binary_path, &binary) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "the install receipt belongs to {}, but the running DeadReckon binary is {}",
+                    prior.binary_path.display(),
+                    binary.display()
+                ),
+                "invoke the intended DeadReckon binary explicitly, then run deadreckon doctor --repair",
+            )));
+        }
+    }
+    let receipt = update_receipt_for_current_binary(paths, true)?;
+    let detail = match before {
+        None => format!(
+            "created install receipt for {} {} at {}",
+            receipt.channel.as_str(),
+            receipt.channel_version,
+            receipt.binary_path.display()
+        ),
+        Some(prior)
+            if prior.channel != receipt.channel
+                || prior.channel_version != receipt.channel_version
+                || prior.binary_path != receipt.binary_path
+                || prior.platform_package != receipt.platform_package =>
+        {
+            format!(
+                "reconciled install receipt to {} {} at {}",
+                receipt.channel.as_str(),
+                receipt.channel_version,
+                receipt.binary_path.display()
+            )
+        }
+        Some(_) => format!(
+            "install receipt already matches {} {} at {}",
+            receipt.channel.as_str(),
+            receipt.channel_version,
+            receipt.binary_path.display()
+        ),
+    };
+    if announce {
+        println!("{detail}");
+    }
+    Ok(detail)
+}
+
+fn same_binary(left: &Path, right: &Path) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+pub(crate) fn channel_native_update_command(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Npm => "bun update -g deadreckon",
+        Channel::Brew => "brew upgrade gregce/tap/deadreckon",
+        Channel::Cargo => "cargo binstall --force deadreckon",
+        Channel::Shell => "deadreckon update",
+        Channel::Source => "cargo install --path crates/deadreckon",
+    }
 }
 
 pub(crate) fn update_current_version(
@@ -514,16 +604,6 @@ fn update_source_surface(current: &str) -> VerdictSurface {
         vec![("Recommended", "cargo install --path crates/deadreckon")],
         vec![("Secondary", "deadreckon update --check")],
     )
-}
-
-fn channel_native_update_command(channel: Channel) -> &'static str {
-    match channel {
-        Channel::Npm => "bun update -g deadreckon",
-        Channel::Brew => "brew upgrade gregce/tap/deadreckon",
-        Channel::Cargo => "cargo binstall --force deadreckon",
-        Channel::Shell => "deadreckon update",
-        Channel::Source => "cargo install --path crates/deadreckon",
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1142,6 +1222,63 @@ mod tests {
             }
             other => panic!("expected verdict surface error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn receipt_reconciliation_refreshes_stale_metadata_for_running_binary() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let binary = std::env::current_exe().expect("current exe");
+        let detected = detect_receipt(&binary);
+        let stale = Receipt {
+            channel_version: "0.0.1".to_string(),
+            binary_path: binary,
+            ..detected
+        };
+        write_receipt(&paths, &stale).expect("write stale receipt");
+
+        let detail =
+            reconcile_receipt_for_current_binary(&paths, false).expect("reconcile current receipt");
+        let repaired = read_receipt(&paths)
+            .expect("read receipt")
+            .expect("receipt exists");
+
+        assert!(detail.contains("reconciled install receipt"), "{detail}");
+        assert_eq!(repaired.channel_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            std::fs::canonicalize(&repaired.binary_path).expect("receipt binary"),
+            std::fs::canonicalize(std::env::current_exe().expect("current exe"))
+                .expect("current binary")
+        );
+    }
+
+    #[test]
+    fn receipt_reconciliation_refuses_to_claim_another_binary() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let other = temp.path().join("other-deadreckon");
+        std::fs::write(&other, b"not the running executable").expect("other binary");
+        let receipt = Receipt {
+            channel: Channel::Source,
+            channel_version: "9.9.9".to_string(),
+            binary_path: other.clone(),
+            installed_at: Utc::now(),
+            install_source: Some("test".to_string()),
+            platform_package: None,
+            receipt_version: INSTALL_RECEIPT_VERSION,
+        };
+        write_receipt(&paths, &receipt).expect("write receipt");
+
+        let error = reconcile_receipt_for_current_binary(&paths, false)
+            .expect_err("must refuse another binary")
+            .to_string();
+        let unchanged = read_receipt(&paths)
+            .expect("read receipt")
+            .expect("receipt exists");
+
+        assert!(error.contains("receipt belongs to"), "{error}");
+        assert_eq!(unchanged.binary_path, other);
+        assert_eq!(unchanged.channel_version, "9.9.9");
     }
 }
 

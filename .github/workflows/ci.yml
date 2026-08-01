@@ -22,13 +22,16 @@ jobs:
           # expect(1) drives the interactive-prompt tests; the suite fails
           # loudly in CI when it is missing rather than skipping coverage.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq expect
+          sudo apt-get install -y -qq bubblewrap expect
       - name: Format check
         shell: bash
         run: cargo fmt --check
       - name: Workspace tests
         shell: bash
         run: |
+          # Characterization integration tests invoke the gated compatibility
+          # binary directly; build it first just as `make test` does.
+          cargo build -p deadreckon --features internal-characterization --bin deadreckon-characterization --locked
           cargo test --workspace --locked --no-fail-fast
           cargo test -p deadreckon --features internal-characterization --test chain --test orchestrate --locked
       - name: Fresh release binary size

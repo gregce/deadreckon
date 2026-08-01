@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Supervisor readiness and binary reconciliation
+
+- launchd readiness accepts both the boolean values emitted by older macOS
+  releases and the textual `enabled` / `disabled` values emitted by current
+  releases, so a healthy managed supervisor is no longer rejected after
+  installation;
+- `doctor` inventories the running executable, PATH-selected copies, known
+  install locations, the install receipt, and the last supervisor checkpoint,
+  including versions, channels, hashes, roles, and channel-native update
+  commands in JSON;
+- `doctor --repair` refreshes stale metadata for the binary actually executing
+  the command and reconciles a DeadReckon-managed supervisor service. It
+  refuses to claim another binary's receipt or overwrite an unmanaged service;
+- service discovery captures `XDG_CONFIG_HOME` once, avoiding cross-test and
+  cross-thread path drift, and Linux CI now installs bubblewrap before running
+  operational sandbox coverage.
+
 Seven slices collapsing six named orchestration shapes onto the one graph
 executor that was already underneath them. (Chart)
 
