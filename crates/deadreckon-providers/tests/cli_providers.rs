@@ -126,7 +126,8 @@ async fn enforceably_read_only_request_denies_a_hostile_cli_workspace_write() {
             assert!(
                 detail.contains("read-only")
                     || detail.contains("sandbox")
-                    || detail.contains("Operation not permitted"),
+                    || detail.contains("Operation not permitted")
+                    || detail.contains("Read-only file system"),
                 "{detail}"
             );
         }
