@@ -221,7 +221,7 @@ control-path boundary. Three public strict Docker Job tests using a static
 Linux evaluator sidecar also pass on macOS arm64: deterministic completion
 followed by semantic `NEEDS_REVIEW`, operator cancellation without retry or
 receipt, and worker `SIGKILL` cleanup before exactly one bounded retry. Those
-results are bound to clean source `e87c70f` by evidence commit `e7b9bb2`. Live
+results are bound to clean source `a0d262d` by evidence commit `e1d0825`. Live
 Linux/bubblewrap proof and a real service-backed reboot remain outstanding.
 The network-loss recorder is no longer structurally incapable of passing: it
 signs the registry-derived worker route and endpoint, records a strict
@@ -441,8 +441,8 @@ document asks whether the operator outcome is actually met. The real macOS
 public-command gate trial proves the contained two-phase Seatbelt path. Opt-in
 Docker trials prove the common container control boundary and, on macOS arm64,
 public strict-Job completion, cancellation and worker-death recovery. The
-Docker results are recorded against clean source `e87c70f` by evidence commit
-`e7b9bb2`.
+Docker results are recorded against clean source `a0d262d` by evidence commit
+`e1d0825`.
 Unit and integration tests and the 24-row dogfood result, with 2 attempted
 tasks, 22 not run and 0 verified, do not establish live Linux/bubblewrap,
 successful reboot recovery, live cross-provider behavior, or false-accept and
