@@ -606,17 +606,24 @@ fn public_smoke_job_can_never_issue_a_trusted_completion_receipt() {
     assert_eq!(ids.len(), 1, "{envelope}");
     let job_id = ids[0].as_str().expect("job id");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // A full parallel workspace run can keep the debug supervisor and bwrap
+    // launch behind linker and scheduler contention for more than 20 seconds.
+    // Keep the proof bounded, but use the same recovery window as the
+    // interruption tests above rather than turning host load into a failure.
+    let deadline = Instant::now() + Duration::from_secs(45);
     let view = loop {
         if let Ok(view) = JobView::load(&paths, job_id)
             && view.projection.is_terminal()
         {
             break view;
         }
-        assert!(
-            Instant::now() < deadline,
-            "public smoke Job {job_id} did not reach a bounded terminal state"
-        );
+        if Instant::now() >= deadline {
+            let view = JobView::load(&paths, job_id);
+            let events = fs::read_to_string(paths.job_events(job_id));
+            panic!(
+                "public smoke Job {job_id} did not reach a bounded terminal state\nview: {view:#?}\nevents: {events:#?}"
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     };
 
