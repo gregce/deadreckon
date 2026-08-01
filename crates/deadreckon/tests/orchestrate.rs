@@ -7572,7 +7572,11 @@ fn start_returns_job_id_before_worker_finishes() {
         .stderr(Stdio::piped());
     let launch = wait_with_output_before(
         launch.spawn().expect("spawn public start"),
-        Duration::from_secs(10),
+        // The smoke worker remains blocked until this test releases it, so a
+        // longer process-start allowance does not weaken the detach proof.
+        // Keep it below the worker's 60-second wall cap: a coupled `start`
+        // would still time out here instead of returning after that cap.
+        Duration::from_secs(30),
         "public start did not detach from its worker",
     );
 
