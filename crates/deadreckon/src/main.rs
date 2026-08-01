@@ -689,6 +689,10 @@ async fn main_inner() -> Result<()> {
             supervisor,
         } => {
             if supervisor {
+                commands::providers::reconcile_receipt_for_current_binary(
+                    &DeadreckonPaths::discover(),
+                    false,
+                )?;
                 commands::supervisor_service::supervisor_service_install_command()?;
                 commands::supervisor_service::supervisor_service_start_command()
             } else {
@@ -1236,7 +1240,7 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Doctor { json } => commands::doctor::doctor_command(json).await,
+        Commands::Doctor { json, repair } => commands::doctor::doctor_command(json, repair).await,
         Commands::Seams { command } => commands::seams::seams_command(command).await,
         Commands::Detect { id, json, ping } => {
             commands::providers::detect_command(id, json, ping).await

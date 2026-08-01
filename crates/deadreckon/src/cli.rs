@@ -317,10 +317,15 @@ Compatibility:
 const DOCTOR_HELP: &str = "\
 Lifecycle:
   deadreckon doctor
+  deadreckon doctor --json
+  deadreckon doctor --repair
   deadreckon init
   deadreckon start \"goal\"
 
-Doctor checks providers, CLI binaries, sandboxes, disk space, write permissions, and OS details.";
+Doctor checks DeadReckon installations and supervisor readiness as well as
+providers, CLI binaries, sandboxes, disk, permissions, and OS details.
+Repair only reconciles the running binary's receipt and DeadReckon-managed
+service; package-manager copies remain under their package manager.";
 
 const SEAMS_HELP: &str = "\
 Lifecycle:
@@ -1368,6 +1373,12 @@ pub(crate) enum Commands {
     Doctor {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
+        #[arg(
+            long,
+            conflicts_with = "json",
+            help = "Repair this binary's receipt and the managed supervisor binding"
+        )]
+        repair: bool,
     },
     #[command(
         next_help_heading = "Setup",

@@ -2682,6 +2682,7 @@ fn require_start_supervisor_service(mut prompter: Option<&mut dyn StartPrompter>
         return Err(start_service_preflight_error(&preflight));
     }
 
+    commands::providers::reconcile_receipt_for_current_binary(&DeadreckonPaths::discover(), false)?;
     commands::supervisor_service::supervisor_service_install_command()?;
     commands::supervisor_service::supervisor_service_start_command()?;
 

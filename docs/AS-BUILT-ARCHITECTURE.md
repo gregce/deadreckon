@@ -2341,7 +2341,9 @@ The plan event feed is still durable-file backed for cross-process attach, and l
 
 The install channel is durable, not guessed on every command. `crates/deadreckon-core/src/install_receipt.rs` defines `Receipt` with `channel` (a lowercase enum: `npm`, `brew`, `shell`, `cargo`, or `source`), `channel_version`, `binary_path`, `installed_at` (ISO-8601 UTC), optional `install_source` and `platform_package`, and `receipt_version`. The receipt is stored at `~/.deadreckon/install-receipt.json`.
 
-When a receipt is missing, normal `deadreckon update` detects the current binary path and persists the inferred receipt before routing the update. `deadreckon update --check` deliberately remains read-only and does not write that receipt. Detection recognizes npm package layouts, Homebrew Cellar paths, `~/.cargo/bin`, shell installer paths under `~/.local/share/deadreckon` or `%LOCALAPPDATA%/deadreckon`, and falls back to `source`.
+When a receipt is missing, normal `deadreckon update` detects the current binary path and persists the inferred receipt before routing the update. A stale receipt for that same canonical executable is refreshed in memory and persisted by mutating update/setup flows. Update continues to honor an existing durable receipt when a package wrapper manages a distinct target; doctor reports that relationship, while its explicit repair path refuses to claim the other executable. `deadreckon update --check` deliberately remains read-only and does not write that receipt. Detection recognizes npm package layouts, Homebrew Cellar paths, `~/.cargo/bin`, shell installer paths under `~/.local/share/deadreckon` or `%LOCALAPPDATA%/deadreckon`, and falls back to `source`.
+
+`deadreckon doctor` inventories the running executable, every executable found on `PATH`, known shell/Cargo/Homebrew locations, the receipt target, and the last supervisor checkpoint. The JSON report includes canonical paths, observed aliases, roles, channel, probed version, SHA-256, probe errors, and the native update command for each distinct binary. Version and ownership conflicts are warnings with concrete evidence. `deadreckon doctor --repair` is an explicit mutation: it repairs a missing or stale receipt only when it belongs to the running executable, then installs or replaces and restarts only a DeadReckon-managed supervisor definition. It never overwrites an unmanaged service definition or a separate npm, Homebrew, Cargo, or shell binary.
 
 `crates/deadreckon-core/src/update_cache.rs` stores `~/.deadreckon/update-check.json` with a 24-hour TTL. Startup update checks are opportunistic: they skip non-TTYs, `doctor`, `update`, source installs, and `DEADRECKON_UPDATE_CHECK=0`, then print only a stale-version hint instead of blocking the requested command.
 
@@ -4170,6 +4172,9 @@ guarantee.
 A real approved `start --yes` is admitted only when the managed per-user
 service definition is current, the platform manager reports it enabled and
 active, and the supervisor has published a live schema-version-2 checkpoint.
+launchd enablement accepts both the historical boolean form and current macOS
+textual `enabled` / `disabled` form. Service discovery captures environment
+paths once so concurrent checks cannot redirect a context after discovery.
 Read-only preview and JSON inspection without `--yes` do not require or mutate
 service state. `deadreckon setup --supervisor` is the one-step setup path; a
 non-interactive launch otherwise refuses before provider classification or Job

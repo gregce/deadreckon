@@ -1,11 +1,19 @@
 use super::super::*;
+use deadreckon_core::install_receipt::detect_channel;
 use deadreckon_providers::{CliAuthStatus, probe_cli_auth};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-pub(crate) async fn doctor_command(json_output: bool) -> Result<()> {
+pub(crate) async fn doctor_command(json_output: bool, repair: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
+    let repair_findings = if repair {
+        perform_doctor_repairs(&paths)
+    } else {
+        Vec::new()
+    };
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let report = build_doctor_report(&paths, source).await?;
+    let report = build_doctor_report(&paths, source, true, repair_findings).await?;
     let surface = doctor_verdict_surface(&report);
     if json_output {
         println!(
@@ -26,7 +34,40 @@ struct DoctorReport {
     config_present: bool,
     sandboxes: Vec<Value>,
     seams: Value,
+    binary_health: DeadreckonBinaryHealth,
     findings: Vec<DoctorFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadreckonBinaryHealth {
+    current_path: PathBuf,
+    current_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_selected: Option<PathBuf>,
+    installations: Vec<DeadreckonBinaryInstallation>,
+    conflicts: Vec<String>,
+    repairable_receipt: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadreckonBinaryInstallation {
+    canonical_path: PathBuf,
+    locations: Vec<PathBuf>,
+    roles: Vec<String>,
+    channel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe_error: Option<String>,
+    update_command: String,
+}
+
+#[derive(Debug, Default)]
+struct BinaryCandidate {
+    locations: BTreeSet<PathBuf>,
+    roles: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -124,15 +165,24 @@ impl From<&DoctorReport> for DoctorSetupSummary {
 pub(crate) async fn doctor_setup_summary() -> Result<DoctorSetupSummary> {
     let paths = DeadreckonPaths::discover();
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let report = build_doctor_report(&paths, source).await?;
+    let report = build_doctor_report(&paths, source, false, Vec::new()).await?;
     Ok(DoctorSetupSummary::from(&report))
 }
 
-async fn build_doctor_report(paths: &DeadreckonPaths, source: PathBuf) -> Result<DoctorReport> {
+async fn build_doctor_report(
+    paths: &DeadreckonPaths,
+    source: PathBuf,
+    include_supervisor: bool,
+    mut repair_findings: Vec<DoctorFinding>,
+) -> Result<DoctorReport> {
     let mut findings = vec![
         DoctorFinding::passed("source", source.display().to_string(), None),
         DoctorFinding::passed("home", paths.home().display().to_string(), None),
     ];
+    findings.append(&mut repair_findings);
+
+    let binary_health = inspect_deadreckon_binaries(paths)?;
+    findings.push(binary_health_finding(&binary_health));
 
     let mut sandboxes = Vec::new();
     for backend in deadreckon_sandbox::doctor() {
@@ -252,14 +302,328 @@ async fn build_doctor_report(paths: &DeadreckonPaths, source: PathBuf) -> Result
     collect_doctor_sleep_finding(&mut findings);
     collect_doctor_subscription_binary_finding("claude", &mut findings);
     collect_doctor_subscription_binary_finding("codex", &mut findings);
+    if include_supervisor {
+        // Configuration and provider failures stay ahead of service repair in
+        // the one-primary-action surface. A user with no usable setup should
+        // finish initialization before binding a durable supervisor to it.
+        findings.push(supervisor_service_finding());
+    }
 
     Ok(DoctorReport {
         source,
         config_present,
         sandboxes,
         seams,
+        binary_health,
         findings,
     })
+}
+
+fn perform_doctor_repairs(paths: &DeadreckonPaths) -> Vec<DoctorFinding> {
+    let mut findings = Vec::new();
+    match super::providers::reconcile_receipt_for_current_binary(paths, false) {
+        Ok(detail) => findings.push(DoctorFinding::passed(
+            "repair install receipt",
+            detail,
+            None,
+        )),
+        Err(error) => findings.push(DoctorFinding::failed(
+            "repair install receipt",
+            format!("left unchanged: {error}"),
+            Some("invoke the intended DeadReckon binary explicitly, then run deadreckon doctor --repair".to_string()),
+        )),
+    }
+    match super::supervisor_service::repair_supervisor_service() {
+        Ok(detail) => findings.push(DoctorFinding::passed(
+            "repair supervisor service",
+            detail,
+            None,
+        )),
+        Err(error) => findings.push(DoctorFinding::failed(
+            "repair supervisor service",
+            format!("left unchanged: {error}"),
+            Some("deadreckon supervisor status".to_string()),
+        )),
+    }
+    findings
+}
+
+fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBinaryHealth> {
+    let current_path = std::env::current_exe()?;
+    let current_canonical = canonical_binary_path(&current_path);
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let mut candidates = BTreeMap::<PathBuf, BinaryCandidate>::new();
+    add_binary_candidate(&mut candidates, &current_path, "current");
+
+    let mut path_selected = None;
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path_env) {
+            let candidate = directory.join(deadreckon_binary_name());
+            if candidate.is_file() {
+                if path_selected.is_none() {
+                    path_selected = Some(candidate.clone());
+                    add_binary_candidate(&mut candidates, &candidate, "path-selected");
+                }
+                add_binary_candidate(&mut candidates, &candidate, "path");
+            }
+        }
+    }
+
+    if let Some(home) = std::env::home_dir() {
+        for candidate in [
+            home.join(".local/share/deadreckon/bin")
+                .join(deadreckon_binary_name()),
+            home.join(".local/bin").join(deadreckon_binary_name()),
+            home.join(".cargo/bin").join(deadreckon_binary_name()),
+        ] {
+            add_binary_candidate(&mut candidates, &candidate, "known-install-location");
+        }
+    }
+    #[cfg(unix)]
+    for candidate in [
+        PathBuf::from("/opt/homebrew/bin").join(deadreckon_binary_name()),
+        PathBuf::from("/usr/local/bin").join(deadreckon_binary_name()),
+    ] {
+        add_binary_candidate(&mut candidates, &candidate, "known-install-location");
+    }
+
+    let mut conflicts = Vec::new();
+    let mut repairable_receipt = false;
+    match read_receipt(paths) {
+        Ok(Some(receipt)) => {
+            add_binary_candidate(&mut candidates, &receipt.binary_path, "install-receipt");
+            if canonical_binary_path(&receipt.binary_path) != current_canonical {
+                conflicts.push(format!(
+                    "install receipt points at {}, not the running binary {}",
+                    receipt.binary_path.display(),
+                    current_path.display()
+                ));
+            } else if receipt.channel_version != current_version
+                || receipt.binary_path != current_path
+            {
+                repairable_receipt = true;
+                conflicts.push(format!(
+                    "install receipt says {} at {}; the running binary is {} at {}",
+                    receipt.channel_version,
+                    receipt.binary_path.display(),
+                    current_version,
+                    current_path.display()
+                ));
+            }
+        }
+        Ok(None) => {
+            repairable_receipt = true;
+            conflicts.push(format!(
+                "install receipt is missing at {}",
+                deadreckon_core::install_receipt::receipt_path(paths).display()
+            ));
+        }
+        Err(error) => conflicts.push(format!("install receipt could not be read: {error}")),
+    }
+
+    match super::supervisor_service::supervisor_service_checkpoint_binary(paths) {
+        Ok(Some(binary)) => add_binary_candidate(&mut candidates, &binary, "supervisor-checkpoint"),
+        Ok(None) => {}
+        Err(error) => conflicts.push(format!(
+            "supervisor checkpoint binary could not be inspected: {error}"
+        )),
+    }
+
+    let mut installations = Vec::new();
+    for (canonical_path, candidate) in candidates {
+        let is_current = canonical_path == current_canonical;
+        let (version, probe_error) = if is_current {
+            (Some(current_version.clone()), None)
+        } else {
+            probe_deadreckon_version(&canonical_path)
+        };
+        if let Some(version) = version.as_deref()
+            && version != current_version
+        {
+            conflicts.push(format!(
+                "{} is version {version}; the running binary is version {current_version}",
+                canonical_path.display()
+            ));
+        }
+        let channel = detect_channel(&canonical_path);
+        installations.push(DeadreckonBinaryInstallation {
+            sha256: deadreckon_core::flight::sha256_file(&canonical_path).ok(),
+            canonical_path,
+            locations: candidate.locations.into_iter().collect(),
+            roles: candidate.roles.into_iter().collect(),
+            channel: channel.as_str().to_string(),
+            version,
+            probe_error,
+            update_command: super::providers::channel_native_update_command(channel).to_string(),
+        });
+    }
+
+    if let Some(selected) = path_selected.as_ref()
+        && canonical_binary_path(selected) != current_canonical
+    {
+        conflicts.push(format!(
+            "PATH selects {}, but this process is running {}",
+            selected.display(),
+            current_path.display()
+        ));
+    }
+    conflicts.sort();
+    conflicts.dedup();
+
+    Ok(DeadreckonBinaryHealth {
+        current_path,
+        current_version,
+        path_selected,
+        installations,
+        conflicts,
+        repairable_receipt,
+    })
+}
+
+fn add_binary_candidate(
+    candidates: &mut BTreeMap<PathBuf, BinaryCandidate>,
+    path: &Path,
+    role: &str,
+) {
+    if !path.is_file() {
+        return;
+    }
+    let canonical = canonical_binary_path(path);
+    let candidate = candidates.entry(canonical).or_default();
+    candidate.locations.insert(path.to_path_buf());
+    candidate.roles.insert(role.to_string());
+}
+
+fn canonical_binary_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn deadreckon_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "deadreckon.exe"
+    } else {
+        "deadreckon"
+    }
+}
+
+fn probe_deadreckon_version(path: &Path) -> (Option<String>, Option<String>) {
+    let mut child = match Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return (None, Some(error.to_string())),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => match child.wait_with_output() {
+                Ok(output) => break output,
+                Err(error) => return (None, Some(error.to_string())),
+            },
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (
+                    None,
+                    Some("version probe exceeded the 2 second limit".to_string()),
+                );
+            }
+            Err(error) => return (None, Some(error.to_string())),
+        }
+    };
+    if !output.status.success() {
+        return (
+            None,
+            Some(format!("version probe exited with {}", output.status)),
+        );
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = text
+        .split_whitespace()
+        .find(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+        .map(|part| part.trim_start_matches('v').to_string());
+    match version {
+        Some(version) => (Some(version), None),
+        None => (
+            None,
+            Some(format!("unrecognized version output: {}", text.trim())),
+        ),
+    }
+}
+
+fn binary_health_finding(health: &DeadreckonBinaryHealth) -> DoctorFinding {
+    let detail = if health.conflicts.is_empty() {
+        format!(
+            "{} installation(s) inspected; running {} from {}",
+            health.installations.len(),
+            health.current_version,
+            health.current_path.display()
+        )
+    } else {
+        format!(
+            "{} installation(s) inspected; {} conflict(s): {}",
+            health.installations.len(),
+            health.conflicts.len(),
+            health.conflicts.join("; ")
+        )
+    };
+    if health.conflicts.is_empty() {
+        DoctorFinding::passed("deadreckon binaries", detail, None)
+    } else {
+        DoctorFinding::warning(
+            "deadreckon binaries",
+            detail,
+            health
+                .repairable_receipt
+                .then(|| "deadreckon doctor --repair".to_string()),
+        )
+    }
+}
+
+fn supervisor_service_finding() -> DoctorFinding {
+    match super::supervisor_service::supervisor_service_preflight() {
+        Ok(preflight) if preflight.is_ready() => DoctorFinding::passed(
+            "supervisor service",
+            "managed unit, service-manager state, and live checkpoint agree",
+            Some("deadreckon supervisor status".to_string()),
+        ),
+        Ok(preflight) if preflight.setup_is_supported() => {
+            let reason = preflight.reason().unwrap_or("setup is required");
+            if reason.contains("is not installed") {
+                DoctorFinding::warning(
+                    "supervisor service",
+                    format!("{reason}; durable start is unavailable until it is installed"),
+                    Some("deadreckon doctor --repair".to_string()),
+                )
+            } else {
+                DoctorFinding::failed(
+                    "supervisor service",
+                    reason,
+                    Some("deadreckon doctor --repair".to_string()),
+                )
+            }
+        }
+        Ok(preflight) => DoctorFinding::failed(
+            "supervisor service",
+            preflight.reason().unwrap_or("readiness was refused"),
+            Some("deadreckon supervisor status".to_string()),
+        ),
+        Err(error) => DoctorFinding::failed(
+            "supervisor service",
+            format!("readiness could not be inspected: {error}"),
+            Some("deadreckon doctor --repair".to_string()),
+        ),
+    }
 }
 
 fn doctor_verdict_surface(report: &DoctorReport) -> VerdictSurface {
@@ -381,6 +745,7 @@ fn doctor_json_payload(
         "config_present": report.config_present,
         "sandboxes": report.sandboxes,
         "seams": report.seams,
+        "binary_health": report.binary_health,
         "findings": report.findings,
     })
 }
@@ -786,7 +1151,7 @@ timeout_ms = 1234
         let source = temp.path().join("repo");
         std::fs::create_dir_all(&source).expect("source");
 
-        let report = build_doctor_report(&paths, source)
+        let report = build_doctor_report(&paths, source, false, Vec::new())
             .await
             .expect("doctor report");
         let rendered = doctor_verdict_surface(&report).render_plain(false);
@@ -813,13 +1178,14 @@ timeout_ms = 1234
         let source = temp.path().join("repo");
         std::fs::create_dir_all(&source).expect("source");
 
-        let report = build_doctor_report(&paths, source)
+        let report = build_doctor_report(&paths, source, false, Vec::new())
             .await
             .expect("doctor report");
         let surface = doctor_verdict_surface(&report);
         let value = surface.add_to_json(doctor_json_payload(&paths, &report, &surface));
 
         assert!(value["findings"].as_array().expect("findings").len() > 3);
+        assert!(value["binary_health"]["installations"].is_array());
         assert_eq!(value["primary_action"], "deadreckon init");
         assert_eq!(value["verdict"]["kind"], "blocked");
         assert_eq!(

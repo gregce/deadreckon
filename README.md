@@ -79,6 +79,10 @@ Everything else (budgets, undo, multi-step chains, provider routing) is optional
   policy, source digest, and launch plan before detaching a supervised process.
   Install and start the per-user supervisor service for restart-at-login
   posture; without it, durability is process-level rather than machine-level.
+  `deadreckon doctor` shows which DeadReckon binaries, versions, install
+  channels, receipt, and supervisor checkpoint are in play. `doctor --repair`
+  can realign the running binary's metadata and a DeadReckon-managed service;
+  it will not overwrite another package manager's copy.
 - **Evidence, not a transcript.** A verified Job leaves an HMAC-SHA-256 receipt
   binding its authority, deterministic marker, semantic judgment, source and
   result digests, revisions, and confinement facts.
