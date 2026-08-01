@@ -1040,9 +1040,9 @@ mod tests {
     fn reconciliation_retains_cid_when_forced_removal_does_not_make_container_absent() {
         let fixture = docker_reconciliation_fixture(false);
         let record = fixture.execution.record();
-        fs::write(
-            &fixture.docker,
-            format!(
+        replace_executable_script(
+            &fixture,
+            &format!(
                 "#!/bin/sh\n\
                  state='{}'\n\
                  log='{}'\n\
@@ -1056,8 +1056,7 @@ mod tests {
                 fixture.state.display(),
                 fixture.log.display()
             ),
-        )
-        .expect("replacement Docker script");
+        );
 
         let error = reconcile_docker_execution_with(&fixture.docker, &record)
             .expect_err("container remained");
@@ -1187,9 +1186,9 @@ mod tests {
         let foreign_path = record_path.with_extension("foreign");
         foreign.write_to(&foreign_path).expect("foreign record");
         let swapped = record_path.with_extension("swapped");
-        fs::write(
-            &fixture.docker,
-            format!(
+        replace_executable_script(
+            &fixture,
+            &format!(
                 "#!/bin/sh\n\
                  state='{}'\n\
                  log='{}'\n\
@@ -1214,8 +1213,7 @@ mod tests {
                 foreign_path.display(),
                 swapped.display(),
             ),
-        )
-        .expect("swapping Docker script");
+        );
 
         let error =
             reconcile_docker_execution_record_for_job_with(&fixture.docker, &record_path, "job-1")
@@ -1324,11 +1322,10 @@ mod tests {
         write_docker_execution_record(&record_path, &fixture.execution).expect("write record");
         fs::remove_file(&fixture.state).expect("no visible container");
         fs::remove_file(fixture.execution.cid_file()).expect("no cid");
-        fs::write(
-            &fixture.docker,
+        replace_executable_script(
+            &fixture,
             "#!/bin/sh\nprintf 'daemon unavailable\\n' >&2\nexit 73\n",
-        )
-        .expect("unavailable Docker script");
+        );
 
         let error = reconcile_docker_execution_record_with(&fixture.docker, &record_path)
             .expect_err("uncertain daemon state");
@@ -1515,6 +1512,16 @@ mod tests {
         let mut permissions = file.metadata().expect("metadata").permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("permissions");
+        drop(file);
         path
+    }
+
+    #[cfg(unix)]
+    fn replace_executable_script(fixture: &ReconciliationFixture, content: &str) {
+        // Replacing an executable inode in place can race Linux exec and
+        // produce ETXTBSY under parallel CI. Build a complete executable on a
+        // fresh inode, close it, then atomically publish it over the fixture.
+        let replacement = executable_script(&fixture._temp, "docker-replacement", content);
+        fs::rename(replacement, &fixture.docker).expect("replace Docker script");
     }
 }
