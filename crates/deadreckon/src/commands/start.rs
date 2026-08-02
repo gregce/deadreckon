@@ -3803,6 +3803,11 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     if emit_start_read_only_result(&decision, &args, &paths)? {
         return Ok(());
     }
+    if decision.recovery.is_some() {
+        let surface = start_preview_surface(&decision, &args, &paths)?
+            .render_plain(!completion_hints_enabled(false));
+        return Err(CliError::Surface { code: 1, surface });
+    }
     let review_prompter: Option<&mut dyn StartPrompter> = eligibility
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
