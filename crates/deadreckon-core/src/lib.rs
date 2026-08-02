@@ -37,6 +37,7 @@ pub mod state;
 pub mod steer_inbox;
 pub mod tamper;
 pub mod update_cache;
+pub mod workspace_capture;
 
 pub use artifact_policy::{
     WorkspacePathClass, classify_workspace_path, delivery_git_exclude_pathspecs,
@@ -64,10 +65,10 @@ pub use chain::{
 pub use codebase::{
     CODEBASE_RECORD_PATH, CodebaseMode, CodebaseRecord, ModeFlags, PreviewGitState, ResolvedMode,
     TRUSTED_CODEBASE_RECORD, WorktreeOptions, codebase_record_path, copy_source_to_working,
-    create_worktree, find_git_root, prepare_worktree_record, preview_git_state,
-    read_codebase_record, read_run_codebase_record, read_trusted_codebase_record,
-    record_for_resolved_mode, resolve_mode, user_error, write_codebase_record,
-    write_trusted_codebase_record,
+    copy_source_to_working_with_policy, create_worktree, find_git_root, prepare_worktree_record,
+    preview_git_state, read_codebase_record, read_run_codebase_record,
+    read_trusted_codebase_record, record_for_resolved_mode, resolve_mode, user_error,
+    write_codebase_record, write_trusted_codebase_record,
 };
 pub use completion::{
     SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
@@ -183,4 +184,13 @@ pub use state::{
     CurrentRunPointer, MergeRepairOwnership, PhaseId, PhaseState, PhaseStatus, PipelineState,
     ProviderFailureDisposition, RunListEntry, RunOptions, RunOwnership, RunOwnershipArtifact,
     RunStatus, create_owned_run, create_run, list_runs, load_run, save_state,
+};
+pub use workspace_capture::{
+    CaptureBudgets, CaptureEntry, CaptureEntryKind, CaptureOmission, CaptureOmissionReason,
+    CaptureProjection, CapturePurpose, EncodedWorkspacePath, GeneratedOutputRoot,
+    GeneratedOutputSource, GitHydrationState, SOURCE_HYDRATION_MANIFEST_JSON,
+    WorkspaceCaptureManifest, WorkspaceCapturePlan, WorkspaceCapturePolicy, capture_workspace,
+    ensure_workspace_capture_policy, freeze_workspace_capture_policy, materialize_capture_plan,
+    read_capture_manifest, read_workspace_capture_policy, workspace_capture_policy_path,
+    write_capture_manifest, write_workspace_capture_policy,
 };
