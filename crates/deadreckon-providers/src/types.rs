@@ -102,8 +102,11 @@ pub struct ProviderRequest {
     /// Run root holding the per-run `provider-session.json` (Semaphore).
     /// Threaded from the turn loop; providers that don't resume ignore it.
     pub session_dir: Option<PathBuf>,
-    /// JSON Schema for schema-constrained final output where the binary
-    /// supports it (codex `--output-schema`); a caveat elsewhere.
+    /// JSON Schema for schema-constrained final output. Setting this enters a
+    /// request-scoped structured-text-only posture: adapters must both enforce
+    /// the exact schema and remove their tool surfaces, or fail closed before
+    /// starting model work. It must never silently degrade to unconstrained
+    /// text or an agentic/tool-enabled invocation.
     pub output_schema: Option<Value>,
     /// Existing run capability facts used to answer app-server approvals.
     /// This is request-scoped transport, not a second persisted policy schema.

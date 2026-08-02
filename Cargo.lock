@@ -726,6 +726,7 @@ dependencies = [
  "chrono",
  "deadreckon-core",
  "deadreckon-sandbox",
+ "nix",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

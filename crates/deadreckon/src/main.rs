@@ -4063,6 +4063,7 @@ struct ConfigDefaults {
     sandbox: Option<String>,
     max_spend: Option<f64>,
     cli_max_wall_seconds: Option<f64>,
+    done_contract_max_wall_seconds: Option<f64>,
     prevent_sleep: Option<String>,
     plain: Option<bool>,
     ui_motion: Option<String>,
@@ -4104,6 +4105,16 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
                     .and_then(toml::Value::as_integer)
                     .map(|value| value as f64)
             }),
+        done_contract_max_wall_seconds: get_toml_path(
+            &root,
+            "defaults.done_contract_max_wall_seconds",
+        )
+        .and_then(toml::Value::as_float)
+        .or_else(|| {
+            get_toml_path(&root, "defaults.done_contract_max_wall_seconds")
+                .and_then(toml::Value::as_integer)
+                .map(|value| value as f64)
+        }),
         prevent_sleep: get_toml_path(&root, "defaults.prevent_sleep")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
@@ -9952,6 +9963,38 @@ where
     }
 }
 
+async fn with_cli_wait_status_limit<F, T>(label: &str, limit: std::time::Duration, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if !ui::enabled(ui::Stream::Stderr) {
+        return future.await;
+    }
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(180));
+    let started = std::time::Instant::now();
+    let mut tick = 0usize;
+    let mut printed = false;
+    loop {
+        tokio::select! {
+            result = &mut future => {
+                if printed {
+                    finish_cli_wait_status();
+                } else {
+                    clear_cli_wait_status();
+                }
+                return result;
+            }
+            _ = interval.tick() => {
+                tick = tick.wrapping_add(1);
+                printed = true;
+                let line = cli_wait_status_line_with_limit(label, started.elapsed(), limit, tick);
+                let _ = ui::replace_current_line(ui::Stream::Stderr, line);
+            }
+        }
+    }
+}
+
 async fn maybe_with_cli_wait_status<F, T>(enabled: bool, label: &str, future: F) -> T
 where
     F: Future<Output = T>,
@@ -10370,6 +10413,23 @@ fn cli_wait_status_line(label: &str, elapsed: std::time::Duration, tick: usize) 
     )
 }
 
+fn cli_wait_status_line_with_limit(
+    label: &str,
+    elapsed: std::time::Duration,
+    limit: std::time::Duration,
+    tick: usize,
+) -> String {
+    let course = deadreckoning_course_ascii(18, tick);
+    format!(
+        "{} {} {}  {}s / {}s",
+        ui::render(ui::Stream::Stderr, ui::Tone::Heading, "deadreckoning"),
+        ui::render(ui::Stream::Stderr, ui::Tone::Command, course),
+        label,
+        elapsed.as_secs(),
+        limit.as_secs()
+    )
+}
+
 fn deadreckoning_course_ascii(width: usize, tick: usize) -> String {
     if width == 0 {
         return String::new();
@@ -10414,7 +10474,7 @@ fn init_config_text(
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]".to_string(),
     };
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 36000\nprevent_sleep = \"auto\"\nplain = false\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 36000\ndone_contract_max_wall_seconds = 120\nprevent_sleep = \"auto\"\nplain = false\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {

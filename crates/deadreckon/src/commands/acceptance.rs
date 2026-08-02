@@ -1,5 +1,7 @@
 use super::super::*;
 
+mod dossier;
+
 const PROJECT_ACCEPTANCE_DIR: &str = ".deadreckon";
 const PROJECT_ACCEPTANCE_YAML: &str = "acceptance.yaml";
 const PROJECT_ACCEPTANCE_MD: &str = "acceptance.md";
@@ -17,6 +19,16 @@ pub(crate) struct AcceptanceDraft {
     pub(crate) yaml: String,
     pub(crate) markdown: String,
     pub(crate) files: BTreeMap<PathBuf, String>,
+}
+
+/// Request-scoped roots for done-contract authoring. Contract artifacts are
+/// owned by the launch project, while project facts come from the resolved
+/// source. Direct `def-done` intentionally supplies the same path twice.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AcceptanceAuthoringContext<'a> {
+    pub(crate) write_root: &'a Path,
+    pub(crate) inspect_root: &'a Path,
+    pub(crate) goal: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +125,234 @@ pub(crate) struct CriticVerdict {
     pub(crate) uncovered_goal_clauses: Vec<String>,
     pub(crate) weak_check_indices: Vec<u32>,
     pub(crate) verdict: CriticDecision,
+}
+
+const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 120.0;
+const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 30.0;
+const MAX_DONE_AUTHORING_WALL_SECONDS: f64 = 600.0;
+
+#[derive(Clone, Copy, Debug)]
+enum DoneAuthoringStage {
+    Draft,
+    Critic,
+    Redraft,
+}
+
+impl DoneAuthoringStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "initial draft",
+            Self::Critic => "critic",
+            Self::Redraft => "redraft",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DoneAuthoringBudget {
+    started: Instant,
+    deadline: Instant,
+    total: Duration,
+}
+
+impl DoneAuthoringBudget {
+    fn from_config(configured_seconds: Option<f64>) -> Self {
+        let seconds = configured_seconds
+            .filter(|value| value.is_finite())
+            .unwrap_or(DEFAULT_DONE_AUTHORING_WALL_SECONDS)
+            .clamp(
+                MIN_DONE_AUTHORING_WALL_SECONDS,
+                MAX_DONE_AUTHORING_WALL_SECONDS,
+            );
+        Self::new(Duration::from_secs_f64(seconds))
+    }
+
+    fn new(total: Duration) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            deadline: started + total,
+            total,
+        }
+    }
+
+    fn allocation(self, stage: DoneAuthoringStage) -> Option<Duration> {
+        let remaining = self.deadline.checked_duration_since(Instant::now())?;
+        let stage_cap = match stage {
+            DoneAuthoringStage::Draft => self.total.div_f64(2.0).min(Duration::from_secs(60)),
+            DoneAuthoringStage::Critic => Duration::from_secs(20),
+            DoneAuthoringStage::Redraft => Duration::from_secs(60),
+        };
+        Some(remaining.min(stage_cap))
+    }
+
+    fn elapsed(self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+struct DoneAuthoringTempFiles(Vec<PathBuf>);
+
+impl Drop for DoneAuthoringTempFiles {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+async fn await_done_authoring_stage<F, T>(
+    future: F,
+    token: &CancellationToken,
+    allocation: Duration,
+    cleanup_grace: Duration,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        output = &mut future => Some(output),
+        () = tokio::time::sleep(allocation) => {
+            token.cancel();
+            let _ = tokio::time::timeout(cleanup_grace, &mut future).await;
+            None
+        }
+    }
+}
+
+fn acceptance_draft_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["acceptance_yaml", "acceptance_md", "files"],
+        "properties": {
+            "acceptance_yaml": {"type": "string"},
+            "acceptance_md": {"type": "string"},
+            "files": {
+                "type": "object",
+                "additionalProperties": {"type": "string"}
+            }
+        }
+    })
+}
+
+fn critic_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "stub_would_pass",
+            "uncovered_goal_clauses",
+            "weak_check_indices",
+            "verdict"
+        ],
+        "properties": {
+            "stub_would_pass": {"type": "boolean"},
+            "uncovered_goal_clauses": {
+                "type": "array",
+                "items": {"type": "string"}
+            },
+            "weak_check_indices": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1}
+            },
+            "verdict": {"type": "string", "enum": ["pass", "redraft"]}
+        }
+    })
+}
+
+async fn run_done_authoring_stage(
+    router: &ProviderRouter,
+    cwd: &Path,
+    prompt: String,
+    output_schema: Value,
+    max_output_tokens: u32,
+    budget: DoneAuthoringBudget,
+    stage: DoneAuthoringStage,
+    wait_label: &str,
+) -> Result<deadreckon_providers::ProviderResponse> {
+    let route = router.selected_route_info();
+    let route_label = route
+        .as_ref()
+        .map(|route| format!("{} / {}", route.name, route.model))
+        .unwrap_or_else(|| "configured provider".to_string());
+    let allocation = budget.allocation(stage).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done criteria {} exhausted the {:.1}s cumulative authoring budget via {route_label}",
+                stage.label(),
+                budget.total.as_secs_f64()
+            ),
+            "deadreckon def-done \"builds and passes behavioral tests\"",
+        ))
+    })?;
+    let token = CancellationToken::new();
+    let id = Uuid::new_v4().simple().to_string();
+    let pid_file = std::env::temp_dir().join(format!("deadreckon-done-authoring-{id}.pid"));
+    let output_path = std::env::temp_dir().join(format!("deadreckon-done-authoring-{id}.out"));
+    let _temp_files = DoneAuthoringTempFiles(vec![
+        pid_file.clone(),
+        output_path.clone(),
+        output_path.with_extension("last.txt"),
+    ]);
+    let mut request = ProviderRequest::enforceably_read_only(prompt, max_output_tokens, cwd);
+    request.output_schema = Some(output_schema);
+    request.output_path = Some(output_path);
+    request.pid_file = Some(pid_file);
+    request.cancellation_token = Some(token.clone());
+
+    // CLI adapters reap the process group before resolving. A transport that
+    // ignores cancellation is dropped after a bounded cleanup grace rather
+    // than extending the authoring deadline indefinitely.
+    let cleanup_grace = Duration::from_secs(3).min(allocation);
+    let active_allocation = allocation.saturating_sub(cleanup_grace);
+    let wait_label = format!("{wait_label} [{} · {route_label}]", stage.label());
+    let response = with_cli_wait_status_limit(
+        &wait_label,
+        budget.total,
+        await_done_authoring_stage(
+            router.complete(&request),
+            &token,
+            active_allocation,
+            cleanup_grace,
+        ),
+    )
+    .await;
+    match response {
+        Some(Ok(response)) => Ok(response),
+        Some(Err(error)) => Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done criteria {} provider failed via {route_label}: {error}",
+                stage.label()
+            ),
+            "deadreckon config provider <compatible-doc-provider>",
+        ))),
+        None => Err(done_authoring_timeout_error(
+            stage,
+            budget,
+            allocation,
+            &route_label,
+        )),
+    }
+}
+
+fn done_authoring_timeout_error(
+    stage: DoneAuthoringStage,
+    budget: DoneAuthoringBudget,
+    allocation: Duration,
+    route_label: &str,
+) -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "done criteria {} timed out after {:.1}s (elapsed {:.1}s of {:.1}s cumulative) via {route_label}",
+            stage.label(),
+            allocation.as_secs_f64(),
+            budget.elapsed().as_secs_f64(),
+            budget.total.as_secs_f64()
+        ),
+        "deadreckon def-done \"builds and passes behavioral tests\"",
+    ))
 }
 
 #[cfg(test)]
@@ -622,8 +862,61 @@ pub(crate) async fn acceptance_agent_command_in_dir(
     model: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let yaml_path = project_acceptance_yaml(cwd);
-    let md_path = project_acceptance_md(cwd);
+    acceptance_agent_command_with_context(
+        AcceptanceAuthoringContext {
+            write_root: cwd,
+            inspect_root: cwd,
+            goal,
+        },
+        mode,
+        request,
+        provider,
+        model,
+        force,
+    )
+    .await
+}
+
+pub(crate) async fn acceptance_agent_command_with_context(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+) -> Result<()> {
+    acceptance_agent_command_with_review_policy(
+        context, mode, request, provider, model, force, false,
+    )
+    .await
+}
+
+pub(crate) async fn acceptance_agent_command_with_explicit_review(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+) -> Result<()> {
+    acceptance_agent_command_with_review_policy(
+        context, mode, request, provider, model, force, true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acceptance_agent_command_with_review_policy(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+    explicit_human_review: bool,
+) -> Result<()> {
+    let yaml_path = project_acceptance_yaml(context.write_root);
+    let md_path = project_acceptance_md(context.write_root);
     let existing_yaml = read_optional_text(&yaml_path)?;
     let existing_md = read_optional_text(&md_path)?;
     if matches!(mode, AcceptanceAgentMode::Refine) && existing_yaml.is_none() {
@@ -641,95 +934,126 @@ pub(crate) async fn acceptance_agent_command_in_dir(
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    let selected_provider = provider.or(defaults.doc_provider).or(defaults.provider);
+    let authoring_budget =
+        DoneAuthoringBudget::from_config(defaults.done_contract_max_wall_seconds);
+    let selected_provider = select_done_authoring_provider(provider, &defaults);
     let router = ProviderRouter::from_config_path_with_model(
         &paths.config_path(),
         selected_provider.as_deref(),
         model.as_deref(),
     )?;
     let route = router.selected_route_info();
-    let prompt = acceptance_agent_prompt(
+    let prompt = acceptance_agent_prompt_with_context(
         mode,
         &request,
-        goal,
-        cwd,
+        context,
         existing_yaml.as_deref(),
         existing_md.as_deref(),
     )?;
-    let response = with_cli_wait_status(
+    let response = run_done_authoring_stage(
+        &router,
+        context.inspect_root,
+        prompt,
+        acceptance_draft_output_schema(),
+        6_000,
+        authoring_budget,
+        DoneAuthoringStage::Draft,
         match mode {
             AcceptanceAgentMode::Draft => "compiling done criteria",
             AcceptanceAgentMode::Refine => "refining done criteria",
         },
-        router.complete(&ProviderRequest::enforceably_read_only(prompt, 6_000, cwd)),
     )
-    .await
-    .map_err(|err| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!("done criteria provider failed: {err}"),
-            "deadreckon def-done \"builds and passes tests\"",
-        ))
-    })?;
-    let mut draft = parse_acceptance_agent_response(&response.content)?;
+    .await?;
+    let mut draft = parse_schema_constrained_acceptance_response(&response.content)?;
     let mut compiled = compile_contract_with_source(
         &draft.yaml,
         Some(&draft.markdown),
-        project_acceptance_yaml(cwd),
+        project_acceptance_yaml(context.write_root),
     )?;
     let mut lint_findings = lint_contract(&compiled);
+    let initial_floor = critic_floor_verdict(context.goal, &compiled, &lint_findings);
     let mut critic = if route.is_some() {
-        run_contract_critic(&router, cwd, goal, &compiled, &lint_findings).await
+        match run_contract_critic(
+            &router,
+            context.inspect_root,
+            context.goal,
+            &compiled,
+            &lint_findings,
+            authoring_budget,
+        )
+        .await
+        {
+            Ok(verdict) => Some(verdict),
+            Err(error) if critic_fallback_allowed(explicit_human_review, &initial_floor) => {
+                eprintln!(
+                    "{}",
+                    ui_warn(format!(
+                        "done contract critic unavailable; explicit review is required before launch: {error}"
+                    ))
+                );
+                Some(initial_floor)
+            }
+            Err(error) => return Err(error),
+        }
+    } else if critic_fallback_allowed(explicit_human_review, &initial_floor) {
+        Some(initial_floor)
     } else {
-        None
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "done contract critic is unavailable for a strict launch",
+            "deadreckon config provider <compatible-doc-provider>",
+        )));
     };
     if let Some(verdict) = critic
         .as_ref()
         .filter(|verdict| matches!(verdict.verdict, CriticDecision::Redraft))
     {
-        let redraft_request = critic_redraft_request(&request, verdict);
-        let redraft_prompt = acceptance_agent_prompt(
+        let redraft_request = critic_redraft_request(&request, &draft, &lint_findings, verdict);
+        let redraft_prompt = acceptance_agent_prompt_with_context(
             AcceptanceAgentMode::Draft,
             &redraft_request,
-            goal,
-            cwd,
+            context,
             existing_yaml.as_deref(),
             existing_md.as_deref(),
         )?;
-        let redraft_response = with_cli_wait_status(
+        let redraft_response = run_done_authoring_stage(
+            &router,
+            context.inspect_root,
+            redraft_prompt,
+            acceptance_draft_output_schema(),
+            6_000,
+            authoring_budget,
+            DoneAuthoringStage::Redraft,
             "redrafting done criteria once",
-            router.complete(&ProviderRequest::enforceably_read_only(
-                redraft_prompt,
-                6_000,
-                cwd,
-            )),
         )
-        .await
-        .map_err(|err| {
-            CliError::Core(deadreckon_core::user_error(
-                &format!("done criteria redraft failed: {err}"),
-                "deadreckon def-done \"builds and passes tests\"",
-            ))
-        })?;
-        draft = parse_acceptance_agent_response(&redraft_response.content)?;
+        .await?;
+        draft = parse_schema_constrained_acceptance_response(&redraft_response.content)?;
         compiled = compile_contract_with_source(
             &draft.yaml,
             Some(&draft.markdown),
-            project_acceptance_yaml(cwd),
+            project_acceptance_yaml(context.write_root),
         )?;
         lint_findings = lint_contract(&compiled);
-        critic = Some(critic_floor_verdict(goal, &compiled, &lint_findings));
+        let final_floor = critic_floor_verdict(context.goal, &compiled, &lint_findings);
+        if matches!(final_floor.verdict, CriticDecision::Redraft) {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "redrafted done criteria still fail deterministic coverage and lint checks",
+                "deadreckon def-done refine \"add behavioral checks for every goal clause\"",
+            )));
+        }
+        critic = Some(final_floor);
     }
     acceptance_check_count(&draft.yaml)?;
-    write_project_acceptance(cwd, &draft, true, true)?;
+    validate_generated_acceptance_draft(&draft, context.inspect_root)?;
+    write_project_acceptance(context.write_root, &draft, true, true)?;
     let route_label = route
         .map(|route| format!("{} / {}", route.name, route.model))
         .unwrap_or_else(|| "configured provider".to_string());
     print_acceptance_written(
-        cwd,
+        context.write_root,
         &format!("agent draft via {route_label}"),
         acceptance_check_count(&draft.yaml)?,
     );
-    let divergence = goal.map(|goal| reconcile(goal, &compiled));
+    let divergence = context.goal.map(|goal| reconcile(goal, &compiled));
     if let Some(verdict) = critic.as_ref()
         && verdict.stub_would_pass
     {
@@ -741,6 +1065,40 @@ pub(crate) async fn acceptance_agent_command_in_dir(
     println!("{}", ui_heading("compiled done contract"));
     print_compiled_contract(&compiled, divergence.as_ref());
     Ok(())
+}
+
+fn select_done_authoring_provider(
+    explicit: Option<String>,
+    defaults: &ConfigDefaults,
+) -> Option<String> {
+    explicit
+        .or_else(|| defaults.doc_provider.clone())
+        .or_else(|| defaults.provider.clone())
+}
+
+pub(crate) fn done_authoring_wall_seconds(defaults: &ConfigDefaults) -> f64 {
+    defaults
+        .done_contract_max_wall_seconds
+        .filter(|value| value.is_finite())
+        .unwrap_or(DEFAULT_DONE_AUTHORING_WALL_SECONDS)
+        .clamp(
+            MIN_DONE_AUTHORING_WALL_SECONDS,
+            MAX_DONE_AUTHORING_WALL_SECONDS,
+        )
+}
+
+pub(crate) fn done_authoring_route_label(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+) -> Option<String> {
+    let provider = select_done_authoring_provider(None, defaults)?;
+    let router =
+        ProviderRouter::from_config_path_with_model(&paths.config_path(), Some(&provider), None)
+            .ok()?;
+    router
+        .selected_route_info()
+        .map(|route| format!("{} / {} (structured text)", route.name, route.model))
+        .or_else(|| Some(format!("{provider} / provider default (structured text)")))
 }
 
 async fn acceptance_add_command(
@@ -1099,6 +1457,7 @@ fn acceptance_request_text(request: &[String], mode: AcceptanceAgentMode) -> Res
     }
 }
 
+#[cfg(test)]
 pub(crate) fn acceptance_agent_prompt(
     mode: AcceptanceAgentMode,
     request: &str,
@@ -1107,15 +1466,36 @@ pub(crate) fn acceptance_agent_prompt(
     existing_yaml: Option<&str>,
     existing_md: Option<&str>,
 ) -> Result<String> {
+    acceptance_agent_prompt_with_context(
+        mode,
+        request,
+        AcceptanceAuthoringContext {
+            write_root: cwd,
+            inspect_root: cwd,
+            goal,
+        },
+        existing_yaml,
+        existing_md,
+    )
+}
+
+fn acceptance_agent_prompt_with_context(
+    mode: AcceptanceAgentMode,
+    request: &str,
+    context: AcceptanceAuthoringContext<'_>,
+    existing_yaml: Option<&str>,
+    existing_md: Option<&str>,
+) -> Result<String> {
     let mode_label = match mode {
         AcceptanceAgentMode::Draft => "draft",
         AcceptanceAgentMode::Refine => "refine",
     };
-    let project = acceptance_project_summary(cwd)?;
-    let goal_block = goal
+    let dossier = dossier::acceptance_source_dossier(context.inspect_root)?;
+    let goal_block = context
+        .goal
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("(no run goal provided; derive from the request and project summary)");
+        .unwrap_or("(no run goal provided; derive from the request and source dossier)");
     Ok(format!(
         "\
 You are helping configure deadreckon acceptance criteria for an unattended coding run.
@@ -1149,8 +1529,8 @@ Run goal:
 User request:
 {request}
 
-Project summary:
-{project}
+Source dossier:
+{dossier}
 
 Existing acceptance.yaml:
 {existing_yaml}
@@ -1163,102 +1543,134 @@ Existing acceptance.md:
     ))
 }
 
-fn acceptance_project_summary(cwd: &Path) -> Result<String> {
-    let mut lines = vec![format!("root: {}", cwd.display())];
-    if cwd.join("Cargo.toml").exists() {
-        lines.push("stack: rust".to_string());
-    }
-    if cwd.join("package.json").exists() {
-        lines.push("stack: node".to_string());
-        if let Ok(package) = fs::read_to_string(cwd.join("package.json"))
-            && let Ok(value) = serde_json::from_str::<Value>(&package)
-            && let Some(scripts) = value.get("scripts").and_then(Value::as_object)
-        {
-            let mut script_names = scripts.keys().cloned().collect::<Vec<_>>();
-            script_names.sort();
-            lines.push(format!("package scripts: {}", script_names.join(", ")));
-        }
-    }
-    let files = project_file_sample(cwd, 80)?;
-    lines.push("files:".to_string());
-    for file in files {
-        lines.push(format!("  - {}", file.display()));
-    }
-    Ok(lines.join("\n"))
-}
+fn validate_generated_acceptance_draft(draft: &AcceptanceDraft, inspect_root: &Path) -> Result<()> {
+    use deadreckon_core::gate::AcceptanceCheck;
 
-fn project_file_sample(cwd: &Path, limit: usize) -> Result<Vec<PathBuf>> {
-    fn walk(
-        root: &Path,
-        current: &Path,
-        depth: usize,
-        out: &mut Vec<PathBuf>,
-        limit: usize,
-    ) -> io::Result<()> {
-        if depth > 3 || out.len() >= limit {
+    let checks = deadreckon_core::gate::acceptance_checks_from_yaml(&draft.yaml)?;
+    let source_roots = absolute_source_root_spellings(inspect_root);
+    let embeds_source_root = |value: &str| {
+        source_roots
+            .iter()
+            .any(|source_root| value.contains(source_root))
+    };
+    let require_working_dir_path = |field: &str, value: &str| -> Result<()> {
+        if value == "{working_dir}"
+            || value.starts_with("{working_dir}/")
+            || value.starts_with("{working_dir}\\")
+        {
             return Ok(());
         }
-        let mut entries = fs::read_dir(current)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            if out.len() >= limit {
-                break;
+        Err(CliError::Core(deadreckon_core::user_error(
+            &format!("generated done criteria used {field} outside {{working_dir}}: {value}"),
+            "regenerate the done criteria and keep run paths under {working_dir}",
+        )))
+    };
+
+    for check in checks {
+        match check {
+            AcceptanceCheck::FileExists { path, .. }
+            | AcceptanceCheck::ContentMatch { path, .. } => {
+                require_working_dir_path("path", &path)?;
             }
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git" | "target" | "node_modules" | ".deadreckon" | "dist" | "build"
-            ) {
-                continue;
+            AcceptanceCheck::BuildSuccess { cwd, .. } => {
+                require_working_dir_path("cwd", &cwd)?;
             }
-            if path.is_dir() {
-                walk(root, &path, depth + 1, out, limit)?;
-            } else if let Ok(relative) = path.strip_prefix(root) {
-                out.push(relative.to_path_buf());
+            AcceptanceCheck::Shell { command, cwd, .. } => {
+                if let Some(cwd) = cwd {
+                    require_working_dir_path("cwd", &cwd)?;
+                }
+                if embeds_source_root(&command) {
+                    return Err(generated_source_path_error());
+                }
+            }
+            AcceptanceCheck::CargoTest { args, .. } => {
+                if args.iter().any(|argument| embeds_source_root(argument)) {
+                    return Err(generated_source_path_error());
+                }
             }
         }
-        Ok(())
     }
-    let mut files = Vec::new();
-    walk(cwd, cwd, 0, &mut files, limit)?;
-    Ok(files)
+    if embeds_source_root(&draft.yaml)
+        || draft
+            .files
+            .values()
+            .any(|contents| embeds_source_root(contents))
+    {
+        return Err(generated_source_path_error());
+    }
+    Ok(())
 }
 
-fn parse_acceptance_agent_response(content: &str) -> Result<AcceptanceDraft> {
-    let cleaned = strip_code_fence(content.trim());
-    if let Ok(value) = serde_json::from_str::<Value>(&cleaned)
-        && let Some(parsed) = acceptance_json_payload(&value)?
-    {
-        return Ok(parsed);
-    }
-    if let Some(json) = extract_json_object(&cleaned)
-        && let Ok(value) = serde_json::from_str::<Value>(&json)
-        && let Some(parsed) = acceptance_json_payload(&value)?
-    {
-        return Ok(parsed);
-    }
-    if let Some(yaml) = extract_fenced_block(&cleaned, &["yaml", "yml"]).or_else(|| {
-        if cleaned.contains("checks:") {
-            Some(cleaned.clone())
-        } else {
-            None
+fn absolute_source_root_spellings(inspect_root: &Path) -> Vec<String> {
+    let mut roots = Vec::new();
+    for path in [
+        inspect_root.to_path_buf(),
+        inspect_root
+            .canonicalize()
+            .unwrap_or_else(|_| inspect_root.to_path_buf()),
+    ] {
+        if path.is_absolute() {
+            let rendered = path
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            if rendered.len() > 1 && !roots.contains(&rendered) {
+                roots.push(rendered);
+            }
         }
-    }) {
-        let markdown = extract_fenced_block(&cleaned, &["markdown", "md"])
-            .unwrap_or_else(|| acceptance_markdown_from_yaml(&yaml));
-        acceptance_check_count(&yaml)?;
-        return Ok(AcceptanceDraft {
-            yaml,
-            markdown,
-            files: BTreeMap::new(),
-        });
     }
-    Err(CliError::Core(deadreckon_core::user_error(
-        "provider did not return acceptance JSON or YAML",
-        "rerun `deadreckon def-done ...` or use `deadreckon def-done check` after editing criteria",
-    )))
+    roots
+}
+
+fn generated_source_path_error() -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        "generated done criteria embedded the original absolute source path",
+        "regenerate the done criteria and use {working_dir} for run paths",
+    ))
+}
+
+fn parse_schema_constrained_acceptance_response(content: &str) -> Result<AcceptanceDraft> {
+    let cleaned = strip_code_fence(content.trim());
+    let value: Value = serde_json::from_str(&cleaned).map_err(|error| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("done criteria provider returned invalid structured JSON: {error}"),
+            "deadreckon def-done \"builds and passes behavioral tests\"",
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "done criteria provider returned a non-object structured result",
+            "deadreckon def-done \"builds and passes behavioral tests\"",
+        ))
+    })?;
+    let expected = ["acceptance_yaml", "acceptance_md", "files"];
+    if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "done criteria provider result did not match the exact acceptance schema",
+            "deadreckon config provider <compatible-doc-provider>",
+        )));
+    }
+    if object
+        .get("acceptance_yaml")
+        .and_then(Value::as_str)
+        .is_none()
+        || object
+            .get("acceptance_md")
+            .and_then(Value::as_str)
+            .is_none()
+        || object.get("files").and_then(Value::as_object).is_none()
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "done criteria provider result used invalid acceptance field types",
+            "deadreckon config provider <compatible-doc-provider>",
+        )));
+    }
+    acceptance_json_payload(&value)?.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "done criteria provider result did not contain valid acceptance strings",
+            "deadreckon def-done \"builds and passes behavioral tests\"",
+        ))
+    })
 }
 
 fn acceptance_json_payload(value: &Value) -> Result<Option<AcceptanceDraft>> {
@@ -1639,7 +2051,12 @@ fn parse_critic_verdict(content: &str) -> Option<CriticVerdict> {
     if let Some(verdict) = value.get_mut("verdict")
         && let Some(text) = verdict.as_str()
     {
-        *verdict = serde_json::Value::String(text.to_ascii_lowercase());
+        let normalized = text.to_ascii_lowercase();
+        *verdict = serde_json::Value::String(if normalized == "reject" {
+            "redraft".to_string()
+        } else {
+            normalized
+        });
     }
     serde_json::from_value(value).ok()
 }
@@ -1650,55 +2067,105 @@ async fn run_contract_critic(
     goal: Option<&str>,
     contract: &CompiledContract,
     lint_findings: &[LintFinding],
-) -> Option<CriticVerdict> {
+    budget: DoneAuthoringBudget,
+) -> Result<CriticVerdict> {
     let prompt = critic_prompt(goal, contract, lint_findings);
-    let floor = || critic_floor_verdict(goal, contract, lint_findings);
-    match with_cli_wait_status(
+    let response = run_done_authoring_stage(
+        router,
+        cwd,
+        prompt,
+        critic_output_schema(),
+        1_000,
+        budget,
+        DoneAuthoringStage::Critic,
         "critiquing done criteria",
-        router.complete(&ProviderRequest::enforceably_read_only(prompt, 1_000, cwd)),
     )
-    .await
-    {
-        Ok(response) => Some(parse_critic_verdict(&response.content).unwrap_or_else(floor)),
-        Err(err) => {
-            eprintln!(
-                "{}",
-                ui_warn(format!(
-                    "done contract critic unavailable; using deterministic lint floor: {err}"
-                ))
-            );
-            None
-        }
-    }
+    .await?;
+    let provider = parse_critic_verdict(&response.content).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "done contract critic returned invalid structured output",
+            "deadreckon config provider <compatible-doc-provider>",
+        ))
+    })?;
+    Ok(apply_critic_floor(
+        provider,
+        critic_floor_verdict(goal, contract, lint_findings),
+    ))
 }
 
-fn critic_redraft_request(request: &str, verdict: &CriticVerdict) -> String {
+fn apply_critic_floor(mut provider: CriticVerdict, floor: CriticVerdict) -> CriticVerdict {
+    provider.stub_would_pass |= floor.stub_would_pass;
+    for clause in floor.uncovered_goal_clauses {
+        if !provider.uncovered_goal_clauses.contains(&clause) {
+            provider.uncovered_goal_clauses.push(clause);
+        }
+    }
+    for index in floor.weak_check_indices {
+        if !provider.weak_check_indices.contains(&index) {
+            provider.weak_check_indices.push(index);
+        }
+    }
+    provider.uncovered_goal_clauses.sort();
+    provider.weak_check_indices.sort_unstable();
+    if matches!(floor.verdict, CriticDecision::Redraft) {
+        provider.verdict = CriticDecision::Redraft;
+    }
+    provider
+}
+
+fn critic_fallback_allowed(explicit_human_review: bool, floor: &CriticVerdict) -> bool {
+    explicit_human_review && matches!(floor.verdict, CriticDecision::Pass)
+}
+
+fn critic_redraft_request(
+    request: &str,
+    prior: &AcceptanceDraft,
+    lint_findings: &[LintFinding],
+    verdict: &CriticVerdict,
+) -> String {
+    let prior_helpers = prior
+        .files
+        .iter()
+        .map(|(path, body)| (path.display().to_string(), body))
+        .collect::<BTreeMap<_, _>>();
+    let lint_json =
+        serde_json::to_string_pretty(lint_findings).unwrap_or_else(|_| "[]".to_string());
+    let verdict_json = serde_json::to_string_pretty(verdict).unwrap_or_else(|_| "{}".to_string());
+    let helpers_json =
+        serde_json::to_string_pretty(&prior_helpers).unwrap_or_else(|_| "{}".to_string());
     format!(
         "\
 {request}
 
-The done-contract critic rejected the prior draft. Redraft once to address:
-- stub_would_pass: {}
-- uncovered goal clauses: {}
-- weak check indices: {}
+The done-contract critic rejected the prior draft. Redraft exactly once. Preserve useful detail, but address every critic and deterministic lint finding.
+
+Prior acceptance.yaml:
+```yaml
+{}
+```
+
+Prior acceptance.md:
+```markdown
+{}
+```
+
+Prior helper files (complete path -> content map):
+```json
+{helpers_json}
+```
+
+Deterministic lint findings (complete):
+```json
+{lint_json}
+```
+
+Normalized critic verdict (complete):
+```json
+{verdict_json}
+```
 
 Replace keyword-only or source-scan-only checks with behavioral checks that build, start, drive, and assert, or with known input -> known expected output tests.",
-        verdict.stub_would_pass,
-        if verdict.uncovered_goal_clauses.is_empty() {
-            "none".to_string()
-        } else {
-            verdict.uncovered_goal_clauses.join("; ")
-        },
-        if verdict.weak_check_indices.is_empty() {
-            "none".to_string()
-        } else {
-            verdict
-                .weak_check_indices
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        }
+        prior.yaml, prior.markdown
     )
 }
 
@@ -2330,6 +2797,197 @@ mod tests {
         compile_contract(raw, Some("# Done\n")).expect("compile contract")
     }
 
+    fn sample_draft() -> AcceptanceDraft {
+        AcceptanceDraft {
+            yaml: "name: prior\nchecks:\n  - kind: cargo_test\n".to_string(),
+            markdown: "# Prior done contract\n\nCargo tests pass.\n".to_string(),
+            files: [(
+                PathBuf::from(".deadreckon/acceptance/probe.sh"),
+                "echo probe\n".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn acceptance_draft_request_carries_exact_output_schema() {
+        assert_eq!(
+            acceptance_draft_output_schema(),
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["acceptance_yaml", "acceptance_md", "files"],
+                "properties": {
+                    "acceptance_yaml": {"type": "string"},
+                    "acceptance_md": {"type": "string"},
+                    "files": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"}
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn critic_request_carries_pass_redraft_output_schema() {
+        let schema = critic_output_schema();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["verdict"]["enum"],
+            json!(["pass", "redraft"])
+        );
+        assert_eq!(
+            schema["required"],
+            json!([
+                "stub_would_pass",
+                "uncovered_goal_clauses",
+                "weak_check_indices",
+                "verdict"
+            ])
+        );
+    }
+
+    #[test]
+    fn done_authoring_prefers_configured_doc_provider() {
+        let defaults = ConfigDefaults {
+            provider: Some("cli:codex".to_string()),
+            doc_provider: Some("cli:claude-code".to_string()),
+            ..ConfigDefaults::default()
+        };
+        assert_eq!(
+            select_done_authoring_provider(None, &defaults).as_deref(),
+            Some("cli:claude-code")
+        );
+        assert_eq!(
+            select_done_authoring_provider(Some("openai".to_string()), &defaults).as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn done_contract_wall_budget_defaults_and_clamps() {
+        assert_eq!(
+            DoneAuthoringBudget::from_config(None).total,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            DoneAuthoringBudget::from_config(Some(1.0)).total,
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            DoneAuthoringBudget::from_config(Some(9_999.0)).total,
+            Duration::from_secs(600)
+        );
+    }
+
+    #[tokio::test]
+    async fn never_returning_done_draft_stops_within_cumulative_budget() {
+        let token = CancellationToken::new();
+        let started = Instant::now();
+        let output = await_done_authoring_stage(
+            std::future::pending::<()>(),
+            &token,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(output.is_none());
+        assert!(token.is_cancelled());
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn never_returning_redraft_uses_remaining_budget_not_a_fresh_clock() {
+        let budget = DoneAuthoringBudget::new(Duration::from_millis(80));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = budget
+            .allocation(DoneAuthoringStage::Redraft)
+            .expect("remaining budget");
+        assert!(remaining <= Duration::from_millis(35), "{remaining:?}");
+    }
+
+    #[tokio::test]
+    async fn initial_draft_timeout_writes_nothing_and_prints_one_try() {
+        let project = tempfile::tempdir().expect("project");
+        let token = CancellationToken::new();
+        let budget = DoneAuthoringBudget::new(Duration::from_millis(20));
+        let result = await_done_authoring_stage(
+            std::future::pending::<()>(),
+            &token,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await;
+        assert!(result.is_none());
+        let error = done_authoring_timeout_error(
+            DoneAuthoringStage::Draft,
+            budget,
+            Duration::from_millis(5),
+            "cli:test / fixture",
+        )
+        .to_string();
+        assert_eq!(error.matches("try:").count(), 1, "{error}");
+        assert!(!project_acceptance_yaml(project.path()).exists());
+        assert!(!project_acceptance_md(project.path()).exists());
+    }
+
+    #[test]
+    fn critic_timeout_allows_only_explicit_acceptance_of_lint_clean_draft() {
+        let contract = compile(
+            "name: behavior\nchecks:\n  - kind: shell\n    command: swift test\n    cwd: \"{working_dir}\"\n",
+        );
+        let clean = critic_floor_verdict(Some("swift test"), &contract, &lint_contract(&contract));
+        assert!(critic_fallback_allowed(true, &clean));
+        assert!(!critic_fallback_allowed(false, &clean));
+
+        let weak = compile(
+            "name: weak\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        );
+        let weak_floor = critic_floor_verdict(Some("ship behavior"), &weak, &lint_contract(&weak));
+        assert!(!critic_fallback_allowed(true, &weak_floor));
+    }
+
+    #[test]
+    fn redraft_timeout_never_approves_stub_passable_prior_draft() {
+        let prior = CriticVerdict {
+            stub_would_pass: true,
+            uncovered_goal_clauses: vec!["verified gameplay".to_string()],
+            weak_check_indices: vec![1],
+            verdict: CriticDecision::Redraft,
+        };
+        assert!(!critic_fallback_allowed(true, &prior));
+    }
+
+    #[test]
+    fn wait_surface_shows_stage_provider_and_cumulative_limit() {
+        let line = cli_wait_status_line_with_limit(
+            "initial draft [initial draft · cli:codex / gpt-test]",
+            Duration::from_secs(7),
+            Duration::from_secs(120),
+            0,
+        );
+        let plain = crate::ui::strip_ansi(&line);
+        assert!(plain.contains("initial draft"), "{plain}");
+        assert!(plain.contains("cli:codex / gpt-test"), "{plain}");
+        assert!(plain.contains("7s / 120s"), "{plain}");
+    }
+
+    #[test]
+    fn done_timeout_removes_schema_pid_and_partial_output_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths =
+            ["schema.json", "provider.pid", "partial.out"].map(|name| dir.path().join(name));
+        for path in &paths {
+            fs::write(path, "partial").expect("temp artifact");
+        }
+        {
+            let _cleanup = DoneAuthoringTempFiles(paths.to_vec());
+        }
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
     #[test]
     fn compile_contract_classifies_shell_build_as_behavioral() {
         let contract = compile(
@@ -2397,6 +3055,229 @@ checks:
             prompt.contains("Run goal:\nbuild a realtime canvas app"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn guided_from_writes_contract_to_launch_project_and_inspects_source() {
+        let launch = tempfile::tempdir().expect("launch");
+        let source = tempfile::tempdir().expect("source");
+        fs::write(
+            source.path().join("Package.swift"),
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "Cloudwing",
+    products: [.executable(name: "Cloudwing", targets: ["Cloudwing"])],
+    targets: [
+        .executableTarget(name: "Cloudwing"),
+        .testTarget(name: "CloudwingTests", dependencies: ["Cloudwing"])
+    ]
+)
+"#,
+        )
+        .expect("manifest");
+        fs::create_dir_all(source.path().join("Sources/Cloudwing")).expect("sources");
+        fs::write(
+            source.path().join("Sources/Cloudwing/main.swift"),
+            "print(\"Cloudwing\")\n",
+        )
+        .expect("source");
+        fs::write(launch.path().join("launch-only.txt"), "not source\n").expect("launch marker");
+        let context = AcceptanceAuthoringContext {
+            write_root: launch.path(),
+            inspect_root: source.path(),
+            goal: Some("ship Cloudwing"),
+        };
+
+        let prompt = acceptance_agent_prompt_with_context(
+            AcceptanceAgentMode::Draft,
+            "build and test it",
+            context,
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(prompt.contains("CloudwingTests"), "{prompt}");
+        assert!(prompt.contains("Sources/Cloudwing/main.swift"), "{prompt}");
+        assert!(!prompt.contains("launch-only.txt"), "{prompt}");
+        assert!(
+            !prompt.contains(&source.path().display().to_string()),
+            "{prompt}"
+        );
+
+        let draft = AcceptanceDraft {
+            yaml: "name: Cloudwing\nchecks:\n  - kind: shell\n    command: swift test\n    cwd: \"{working_dir}\"\n".to_string(),
+            markdown: "# Cloudwing done\n".to_string(),
+            files: BTreeMap::from([(
+                PathBuf::from(".deadreckon/acceptance/smoke.sh"),
+                "#!/bin/sh\nswift test\n".to_string(),
+            )]),
+        };
+        write_project_acceptance(context.write_root, &draft, true, true).expect("write contract");
+
+        assert!(project_acceptance_yaml(launch.path()).is_file());
+        assert!(project_acceptance_md(launch.path()).is_file());
+        assert!(
+            launch
+                .path()
+                .join(".deadreckon/acceptance/smoke.sh")
+                .is_file()
+        );
+        assert!(!source.path().join(".deadreckon").exists());
+    }
+
+    #[test]
+    fn done_authoring_currently_inspects_launch_cwd_not_from_source() {
+        // Historical characterization name retained as the Soundings regression:
+        // the assertion now proves that the bug is fixed.
+        guided_from_writes_contract_to_launch_project_and_inspects_source();
+    }
+
+    #[test]
+    fn flappy_contract_uses_cloudwing_and_resolved_source_facts() {
+        let launch = tempfile::tempdir().expect("launch");
+        let source = tempfile::tempdir().expect("source");
+        fs::write(
+            source.path().join("Package.swift"),
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "Cloudwing",
+    products: [.executable(name: "Cloudwing", targets: ["Cloudwing"])],
+    targets: [
+        .executableTarget(name: "Cloudwing"),
+        .testTarget(name: "CloudwingTests", dependencies: ["Cloudwing"])
+    ]
+)
+"#,
+        )
+        .expect("manifest");
+        fs::create_dir_all(source.path().join("Sources/Cloudwing")).expect("sources");
+        fs::create_dir_all(source.path().join("Tests/CloudwingTests")).expect("tests");
+        fs::write(
+            source.path().join("Sources/Cloudwing/GameScene.swift"),
+            "struct GameScene {}\n",
+        )
+        .expect("game source");
+        fs::write(
+            source
+                .path()
+                .join("Tests/CloudwingTests/GameMathTests.swift"),
+            "import XCTest\n",
+        )
+        .expect("game tests");
+        fs::write(launch.path().join("empty-destination.txt"), "launch only\n")
+            .expect("launch marker");
+
+        let context = AcceptanceAuthoringContext {
+            write_root: launch.path(),
+            inspect_root: source.path(),
+            goal: Some("Continue the native macOS Flappy Bird app"),
+        };
+        let prompt = acceptance_agent_prompt_with_context(
+            AcceptanceAgentMode::Draft,
+            "verify gameplay and polish",
+            context,
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(prompt.contains("Cloudwing"), "{prompt}");
+        assert!(prompt.contains("CloudwingTests"), "{prompt}");
+        assert!(prompt.contains("GameScene.swift"), "{prompt}");
+        assert!(!prompt.contains("empty-destination.txt"), "{prompt}");
+        assert!(!prompt.contains("name: \"FlappyBird\""), "{prompt}");
+
+        let draft = AcceptanceDraft {
+            yaml: concat!(
+                "name: Cloudwing gameplay continuation\n",
+                "checks:\n",
+                "  - kind: shell\n",
+                "    command: swift test --disable-sandbox\n",
+                "    cwd: \"{working_dir}\"\n",
+                "  - kind: file_exists\n",
+                "    path: \"{working_dir}/Sources/Cloudwing/GameScene.swift\"\n",
+            )
+            .to_string(),
+            markdown: "# Cloudwing gameplay done\n".to_string(),
+            files: BTreeMap::new(),
+        };
+        validate_generated_acceptance_draft(&draft, context.inspect_root)
+            .expect("portable generated contract");
+        let contract = compile_contract(&draft.yaml, Some(&draft.markdown)).expect("compile");
+
+        assert_eq!(contract.name, "Cloudwing gameplay continuation");
+        assert_eq!(contract.checks[0].kind, CheckKind::Shell);
+        assert!(contract.checks[0].behavioral, "{contract:#?}");
+        assert!(contract.checks[0].can_fail, "{contract:#?}");
+        assert!(
+            serde_json::to_string(&contract)
+                .expect("contract json")
+                .contains("Cloudwing"),
+            "{contract:#?}"
+        );
+    }
+
+    #[test]
+    fn direct_def_done_uses_project_as_both_roots() {
+        let project = tempfile::tempdir().expect("project");
+        fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"same\"\n",
+        )
+        .expect("manifest");
+
+        let compatibility = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "test it",
+            Some("same roots"),
+            project.path(),
+            None,
+            None,
+        )
+        .expect("compatibility prompt");
+        let contextual = acceptance_agent_prompt_with_context(
+            AcceptanceAgentMode::Draft,
+            "test it",
+            AcceptanceAuthoringContext {
+                write_root: project.path(),
+                inspect_root: project.path(),
+                goal: Some("same roots"),
+            },
+            None,
+            None,
+        )
+        .expect("context prompt");
+
+        assert_eq!(compatibility, contextual);
+    }
+
+    #[test]
+    fn generated_checks_never_embed_original_absolute_source_path() {
+        let source = tempfile::tempdir().expect("source");
+        let invalid = AcceptanceDraft {
+            yaml: format!(
+                "name: invalid\nchecks:\n  - kind: file_exists\n    path: \"{}/Package.swift\"\n",
+                source.path().display()
+            ),
+            markdown: "# invalid\n".to_string(),
+            files: BTreeMap::new(),
+        };
+        let valid = AcceptanceDraft {
+            yaml: "name: valid\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/Package.swift\"\n".to_string(),
+            markdown: "# valid\n".to_string(),
+            files: BTreeMap::new(),
+        };
+
+        let error = validate_generated_acceptance_draft(&invalid, source.path())
+            .expect_err("absolute source path must fail");
+        assert!(
+            error.to_string().contains("outside {working_dir}"),
+            "{error}"
+        );
+        validate_generated_acceptance_draft(&valid, source.path()).expect("working-dir path");
     }
 
     #[test]
@@ -2532,7 +3413,7 @@ checks:
     }
 
     #[test]
-    fn critic_redraft_fires_at_most_once() {
+    fn critic_and_redraft_still_run_at_most_once_each() {
         let contract = compile(
             r#"
 name: weak
@@ -2544,10 +3425,124 @@ checks:
         );
         let lint = lint_contract(&contract);
         let verdict = critic_floor_verdict(Some("build a realtime app"), &contract, &lint);
-        let request = critic_redraft_request("draft", &verdict);
+        let request = critic_redraft_request("draft", &sample_draft(), &lint, &verdict);
 
         assert_eq!(verdict.verdict, CriticDecision::Redraft);
-        assert_eq!(request.matches("Redraft once").count(), 1, "{request}");
+        assert_eq!(
+            request.matches("Redraft exactly once").count(),
+            1,
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn critic_reject_alias_preserves_missing_clauses_and_weak_indices() {
+        let verdict = parse_critic_verdict(
+            r#"{"stub_would_pass":true,"uncovered_goal_clauses":["opens app","saves score"],"weak_check_indices":[2,5],"verdict":"REJECT"}"#,
+        )
+        .expect("normalized verdict");
+        assert_eq!(verdict.verdict, CriticDecision::Redraft);
+        assert_eq!(verdict.uncovered_goal_clauses, ["opens app", "saves score"]);
+        assert_eq!(verdict.weak_check_indices, [2, 5]);
+    }
+
+    #[test]
+    fn redraft_prompt_contains_prior_yaml_markdown_and_helpers() {
+        let draft = sample_draft();
+        let verdict = CriticVerdict {
+            stub_would_pass: true,
+            uncovered_goal_clauses: vec!["opens app".to_string()],
+            weak_check_indices: vec![1],
+            verdict: CriticDecision::Redraft,
+        };
+        let prompt = critic_redraft_request(
+            "build it",
+            &draft,
+            &[LintFinding::NoBehavioralCheck],
+            &verdict,
+        );
+        assert!(prompt.contains(&draft.yaml), "{prompt}");
+        assert!(prompt.contains(&draft.markdown), "{prompt}");
+        assert!(
+            prompt.contains(".deadreckon/acceptance/probe.sh"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("echo probe"), "{prompt}");
+    }
+
+    #[test]
+    fn redraft_prompt_contains_full_critic_and_same_source_dossier() {
+        let source = tempfile::tempdir().expect("source");
+        fs::write(
+            source.path().join("Cargo.toml"),
+            "[package]\nname = \"soundings\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        let verdict = CriticVerdict {
+            stub_would_pass: true,
+            uncovered_goal_clauses: vec!["opens app".to_string(), "saves score".to_string()],
+            weak_check_indices: vec![2, 5],
+            verdict: CriticDecision::Redraft,
+        };
+        let redraft_request = critic_redraft_request(
+            "build it",
+            &sample_draft(),
+            &[LintFinding::NoBehavioralCheck],
+            &verdict,
+        );
+        let initial = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "build it",
+            Some("ship the app"),
+            source.path(),
+            None,
+            None,
+        )
+        .expect("initial prompt");
+        let redraft = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            &redraft_request,
+            Some("ship the app"),
+            source.path(),
+            None,
+            None,
+        )
+        .expect("redraft prompt");
+        let dossier = initial
+            .split_once("Source dossier:\n")
+            .expect("initial dossier")
+            .1
+            .split_once("\n\nExisting acceptance.yaml:")
+            .expect("dossier end")
+            .0;
+        assert!(redraft.contains(dossier), "{redraft}");
+        assert!(redraft.contains("opens app") && redraft.contains("saves score"));
+        assert!(redraft.contains("\"weak_check_indices\""), "{redraft}");
+        assert!(
+            redraft.contains("    2,") && redraft.contains("    5"),
+            "{redraft}"
+        );
+    }
+
+    #[test]
+    fn redraft_never_searches_transcripts_for_its_predecessor() {
+        let verdict = CriticVerdict {
+            stub_would_pass: true,
+            uncovered_goal_clauses: vec![],
+            weak_check_indices: vec![1],
+            verdict: CriticDecision::Redraft,
+        };
+        let prompt = critic_redraft_request(
+            "draft",
+            &sample_draft(),
+            &[LintFinding::NoBehavioralCheck],
+            &verdict,
+        );
+        assert!(
+            !prompt.to_ascii_lowercase().contains("transcript"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Prior acceptance.yaml:"), "{prompt}");
     }
 
     #[test]

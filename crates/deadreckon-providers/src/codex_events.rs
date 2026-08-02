@@ -24,6 +24,12 @@ pub(crate) struct CodexCapabilities {
     pub output_last_message: bool,
     pub output_schema: bool,
     pub resume: bool,
+    pub ephemeral: bool,
+    pub ignore_user_config: bool,
+    pub ignore_rules: bool,
+    pub strict_config: bool,
+    pub disable_features: bool,
+    pub structured_text_features: bool,
 }
 
 impl CodexCapabilities {
@@ -35,6 +41,12 @@ impl CodexCapabilities {
             output_last_message: false,
             output_schema: false,
             resume: false,
+            ephemeral: false,
+            ignore_user_config: false,
+            ignore_rules: false,
+            strict_config: false,
+            disable_features: false,
+            structured_text_features: false,
         }
     }
 }
@@ -42,12 +54,52 @@ impl CodexCapabilities {
 /// Parse a `codex exec --help` payload into a capability set. Pure and
 /// help-text-driven so it is unit-testable without invoking the binary.
 pub(crate) fn parse_codex_capabilities(help: &str) -> CodexCapabilities {
+    parse_codex_capabilities_with_features(help, "")
+}
+
+/// Tool-bearing Codex surfaces that a schema-only request must explicitly
+/// disable. The capability probe proves every name before argv construction;
+/// unknown flags are never guessed into a trusted request.
+pub(crate) const STRUCTURED_TEXT_DISABLED_FEATURES: &[&str] = &[
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode",
+    "code_mode_host",
+    "computer_use",
+    "enable_mcp_apps",
+    "in_app_browser",
+    "multi_agent",
+    "plugins",
+    "shell_tool",
+    "standalone_web_search",
+    "unified_exec",
+    "web_search_request",
+];
+
+pub(crate) fn parse_codex_capabilities_with_features(
+    help: &str,
+    feature_listing: &str,
+) -> CodexCapabilities {
+    let feature_names = feature_listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<std::collections::HashSet<_>>();
     CodexCapabilities {
         json: help.contains("--json"),
         output_last_message: help.contains("--output-last-message"),
         output_schema: help.contains("--output-schema"),
         // `resume` is a subcommand of `codex exec`, listed under Commands.
         resume: help.contains("resume"),
+        ephemeral: help.contains("--ephemeral"),
+        ignore_user_config: help.contains("--ignore-user-config"),
+        ignore_rules: help.contains("--ignore-rules"),
+        strict_config: help.contains("--strict-config"),
+        disable_features: help.contains("--disable"),
+        structured_text_features: STRUCTURED_TEXT_DISABLED_FEATURES
+            .iter()
+            .all(|name| feature_names.contains(name)),
     }
 }
 

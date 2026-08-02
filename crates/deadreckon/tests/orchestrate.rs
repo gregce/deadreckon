@@ -1291,6 +1291,248 @@ fn start_dispatches_explicit_review_to_graph_job() {
 }
 
 #[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn full_plan_from_preview_currently_disagrees_with_dispatch() {
+    assert_full_plan_from_preview_contract_authority_and_driver_agree();
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn full_plan_from_preview_contract_authority_and_driver_agree() {
+    assert_full_plan_from_preview_contract_authority_and_driver_agree();
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
+    let temp = repo_tempdir();
+    let launch = temp.path().join("empty-launch");
+    fs::create_dir_all(&launch).expect("launch directory");
+    let source = soundings_swift_fixture(temp.path());
+    let source = source.canonicalize().expect("canonical source");
+    let source_before = deadreckon_core::flight::build_deliverable_file_index(&source)
+        .expect("source before")
+        .tree_hash();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &launch);
+    let service = characterization_service(&paths);
+
+    let preview = service
+        .deadreckon()
+        .current_dir(&launch)
+        .args([
+            "start",
+            "continue Cloudwing customization and gameplay review",
+            "--mode",
+            "full-plan",
+            "--from",
+            source.to_str().expect("utf8 source"),
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("full-plan copy preview");
+    assert_success(&preview);
+    let preview = stdout(&preview);
+    assert!(
+        preview.contains(&format!("copy from {}", source.display())),
+        "{preview}"
+    );
+
+    let launched = service
+        .deadreckon()
+        .current_dir(&launch)
+        .args([
+            "start",
+            "continue Cloudwing customization and gameplay review",
+            "--mode",
+            "full-plan",
+            "--from",
+            source.to_str().expect("utf8 source"),
+            "--yes",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("full-plan copy launch");
+    assert_success(&launched);
+
+    let root = only_job_root(&paths);
+    let job: Value =
+        serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
+    let approved = PathBuf::from(job["source_cwd"].as_str().expect("source cwd"));
+    assert!(
+        approved.starts_with(&root),
+        "{approved:?} is not below {root:?}"
+    );
+    assert_ne!(
+        approved, source,
+        "Graph execution must not retain the mutable source"
+    );
+    assert_eq!(
+        deadreckon_core::flight::build_deliverable_file_index(&approved)
+            .expect("approved source")
+            .tree_hash(),
+        source_before
+    );
+    assert_eq!(
+        deadreckon_core::flight::build_deliverable_file_index(&source)
+            .expect("source after")
+            .tree_hash(),
+        source_before,
+        "launch must leave the operator source byte-identical"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("acceptance.yaml")).expect("frozen acceptance"),
+        fs::read_to_string(launch.join(".deadreckon/acceptance.yaml")).expect("launch acceptance"),
+        "the accepted contract must be frozen with the resolved-source Job"
+    );
+
+    let authority: Value =
+        serde_json::from_slice(&fs::read(root.join("authority.json")).expect("authority"))
+            .expect("authority json");
+    assert_eq!(
+        authority["source_tree_sha256"], source_before,
+        "authority must bind the same source tree previewed and copied"
+    );
+
+    let plan = read_launch_plan(&root);
+    assert_eq!(plan["signals"]["watchkeeper_source"]["mode"], "copy");
+    assert_eq!(
+        plan["signals"]["watchkeeper_source"]["from"],
+        source.display().to_string()
+    );
+    assert_eq!(
+        plan["signals"]["watchkeeper_driver"]["source_init_git"], true,
+        "Graph children must initialize Git inside the approved copy"
+    );
+}
+
+#[test]
+fn soundings_swift_fixture_contains_tracked_modified_and_untracked_inputs() {
+    let temp = repo_tempdir();
+    let source = soundings_swift_fixture(temp.path());
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["status", "--short"])
+        .output()
+        .expect("git status");
+    assert!(status.status.success());
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains(" M Sources/Cloudwing/GameScene.swift"),
+        "{status}"
+    );
+    assert!(
+        status.contains("?? Sources/Cloudwing/Customization.swift"),
+        "{status}"
+    );
+
+    let index =
+        deadreckon_core::flight::build_deliverable_file_index(&source).expect("deliverable index");
+    let paths = index
+        .files
+        .keys()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        "Package.swift",
+        "Sources/Cloudwing/GameScene.swift",
+        "Sources/Cloudwing/Customization.swift",
+        "Tests/CloudwingTests/GameMathTests.swift",
+    ] {
+        assert!(paths.contains(expected), "missing {expected} in {paths:#?}");
+    }
+}
+
+#[test]
+fn unsupported_launch_input_must_not_reach_provider_or_write_contract() {
+    let temp = repo_tempdir();
+    let launch = temp.path().join("launch");
+    fs::create_dir_all(&launch).expect("launch");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let provider_root = temp.path().join("provider");
+    let called = temp.path().join("provider-called");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &provider_root,
+        "cli:soundings-counter",
+        &format!("printf called > '{}'\nprintf '{{}}'\n", called.display()),
+    );
+    let missing = temp.path().join("missing-source");
+
+    let output = deadreckon(&paths)
+        .current_dir(&launch)
+        .args([
+            "start",
+            "continue Cloudwing",
+            "--mode",
+            "full-plan",
+            "--from",
+            missing.to_str().expect("utf8 missing source"),
+            "--provider",
+            "cli:soundings-counter",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("invalid source preview");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(!called.exists(), "invalid source reached the provider");
+    assert!(
+        !launch.join(".deadreckon/acceptance.yaml").exists(),
+        "invalid source wrote a done contract"
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs directory")
+                .next()
+                .is_none(),
+        "invalid source wrote a Job"
+    );
+}
+
+#[test]
+fn retry_reuses_valid_generated_contract_without_provider_call() {
+    let temp = repo_tempdir();
+    let launch = temp.path().join("launch");
+    fs::create_dir_all(&launch).expect("launch");
+    let source = soundings_swift_fixture(temp.path());
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &launch);
+    let called = temp.path().join("provider-called");
+    write_fake_cli_subagent_provider(
+        &paths,
+        &temp.path().join("provider"),
+        "cli:retry-counter",
+        &format!("printf called > '{}'\nprintf '{{}}'\n", called.display()),
+    );
+
+    let output = deadreckon(&paths)
+        .current_dir(&launch)
+        .args([
+            "start",
+            "continue Cloudwing",
+            "--mode",
+            "full-plan",
+            "--from",
+            source.to_str().expect("utf8 source"),
+            "--provider",
+            "cli:retry-counter",
+            "--preview",
+            "--plain",
+        ])
+        .output()
+        .expect("retry preview");
+
+    assert_success(&output);
+    assert!(!called.exists(), "valid contract caused a provider call");
+    assert!(launch.join(".deadreckon/acceptance.yaml").is_file());
+}
+
+#[test]
 fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -8598,6 +8840,55 @@ fn clean_git_repo(temp: &TempDir) -> PathBuf {
     git(&repo, &["add", "-A"]).expect("add");
     git(&repo, &["commit", "-m", "initial"]).expect("commit");
     repo
+}
+
+fn soundings_swift_fixture(root: &std::path::Path) -> PathBuf {
+    let source = root.join("cloudwing-source");
+    fs::create_dir_all(source.join("Sources/Cloudwing")).expect("Swift sources");
+    fs::create_dir_all(source.join("Tests/CloudwingTests")).expect("Swift tests");
+    git(&source, &["init", "--initial-branch=main"]).expect("git init");
+    fs::write(
+        source.join("Package.swift"),
+        r#"// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "Cloudwing",
+    platforms: [.macOS(.v14)],
+    products: [.executable(name: "Cloudwing", targets: ["Cloudwing"])],
+    targets: [
+        .executableTarget(name: "Cloudwing"),
+        .testTarget(name: "CloudwingTests", dependencies: ["Cloudwing"]),
+    ]
+)
+"#,
+    )
+    .expect("Package.swift");
+    fs::write(source.join("README.md"), "# Cloudwing\n").expect("README");
+    fs::write(
+        source.join("Sources/Cloudwing/GameScene.swift"),
+        "struct GameScene { let gravity = 9.8 }\n",
+    )
+    .expect("GameScene");
+    fs::write(
+        source.join("Tests/CloudwingTests/GameMathTests.swift"),
+        "import Testing\n@Test func scoreStartsAtZero() { #expect(0 == 0) }\n",
+    )
+    .expect("GameMathTests");
+    git(&source, &["add", "-A"]).expect("git add");
+    git(&source, &["commit", "-m", "Cloudwing foundation"]).expect("git commit");
+
+    fs::write(
+        source.join("Sources/Cloudwing/GameScene.swift"),
+        "struct GameScene { let gravity = 9.8; let boost = 1.25 }\n",
+    )
+    .expect("modified GameScene");
+    fs::write(
+        source.join("Sources/Cloudwing/Customization.swift"),
+        "struct Customization { var trail = \"aurora\" }\n",
+    )
+    .expect("untracked customization");
+    source
 }
 
 fn seed_trace_run(paths: &DeadreckonPaths, repo: &std::path::Path, run_id: &str, message: &str) {

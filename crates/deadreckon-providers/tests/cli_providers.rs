@@ -1773,14 +1773,40 @@ Commands:
   resume  Resume a previous session by id
 Options:
       --output-schema <FILE>
+      --ephemeral
+      --ignore-user-config
+      --ignore-rules
+      --strict-config
+      --disable <FEATURE>
       --json
   -o, --output-last-message <FILE>
+";
+
+const FAKE_CODEX_FEATURES: &str = "\
+apps stable true
+browser_use stable true
+browser_use_external stable true
+browser_use_full_cdp_access stable true
+code_mode stable true
+code_mode_host stable true
+computer_use stable true
+enable_mcp_apps stable true
+in_app_browser stable true
+multi_agent stable true
+plugins stable true
+shell_tool stable true
+standalone_web_search stable true
+unified_exec stable true
+web_search_request stable true
 ";
 
 #[allow(clippy::expect_used)]
 fn write_fake_codex(path: &std::path::Path, jsonl: &str, answer: &str) {
     let script = format!(
         "#!/bin/sh\n\
+if printf '%s\\n' \"$*\" | grep -q -- '--version'; then echo 'codex-cli fake-1'; exit 0; fi\n\
+if [ \"$*\" = \"features list\" ]; then\n\
+cat <<'FEATURES'\n{features}\nFEATURES\n  exit 0\nfi\n\
 for a in \"$@\"; do\n\
   if [ \"$a\" = \"--help\" ]; then\n\
 cat <<'HELP'\n{help}\nHELP\n    exit 0\n  fi\n\
@@ -1794,6 +1820,7 @@ cat <<'JSONL'\n{jsonl}\nJSONL\n\
 if [ -n \"$out\" ]; then\ncat > \"$out\" <<'ANSWER'\n{answer}\nANSWER\nfi\n\
 exit 0\n",
         help = FAKE_CODEX_HELP,
+        features = FAKE_CODEX_FEATURES,
         jsonl = jsonl,
         answer = answer,
     );
@@ -2205,7 +2232,15 @@ async fn read_only_codex_judge_without_session_uses_schema_and_clean_answer() {
     assert!(args.iter().any(|arg| arg == "--output-schema"));
     assert!(!args.iter().any(|arg| arg == "-o"));
     assert!(!args.iter().any(|arg| arg == "resume"));
-    assert!(judge_workspace.join("provider-output-schema.json").exists());
+    assert!(
+        fs::read_dir(&judge_workspace)
+            .expect("judge workspace")
+            .all(|entry| !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("provider-output-schema-"))
+    );
 }
 
 #[allow(clippy::expect_used)]
@@ -2299,46 +2334,48 @@ async fn output_schema_passes_schema_file_to_codex() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-codex");
     write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"action\":\"done\"}");
-    let session_dir = temp.path().join("run");
     let schema = serde_json::json!({"type":"object","properties":{"action":{"type":"string"}}});
     let response = codex_router(&binary)
         .complete(&ProviderRequest {
             prompt: "hi".to_string(),
             cwd: Some(temp.path().to_path_buf()),
             output_path: Some(temp.path().join("turns/turn-1/codex.out")),
-            session_dir: Some(session_dir.clone()),
+            session_dir: None,
             output_schema: Some(schema),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            sandbox_backend: None,
             ..Default::default()
         })
         .await
         .expect("completion");
     let args = response.trace["args"].as_array().expect("args");
     assert!(args.iter().any(|a| a == "--output-schema"));
-    assert!(session_dir.join("provider-output-schema.json").exists());
+    assert!(fs::read_dir(temp.path()).expect("tempdir").all(|entry| {
+        !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with("provider-output-schema-")
+    }));
 }
 
 #[tokio::test]
-async fn schema_incapable_provider_caveats_and_proceeds() {
+async fn schema_incapable_provider_fails_closed() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-codex");
     write_fake_codex_no_schema(&binary, CODEX_TURN_JSONL);
-    let response = codex_router(&binary)
+    let error = codex_router(&binary)
         .complete(&ProviderRequest {
             prompt: "hi".to_string(),
             cwd: Some(temp.path().to_path_buf()),
             output_path: Some(temp.path().join("turns/turn-1/codex.out")),
             session_dir: Some(temp.path().join("run")),
             output_schema: Some(serde_json::json!({"type":"object"})),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            sandbox_backend: None,
             ..Default::default()
         })
         .await
-        .expect("completion proceeds unconstrained");
-    let args = response.trace["args"].as_array().expect("args");
-    assert!(!args.iter().any(|a| a == "--output-schema"));
-    let caveats = response.trace["caveats"].as_array().expect("caveats");
-    assert!(
-        caveats
-            .iter()
-            .any(|c| c["code"] == "provider.output_schema.unsupported")
-    );
+        .expect_err("schema-only posture must fail closed");
+    assert!(error.to_string().contains("schema-only"), "{error}");
 }

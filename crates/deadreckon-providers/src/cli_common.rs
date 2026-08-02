@@ -70,6 +70,7 @@ pub(crate) async fn run_cli_with_options(
     args: &[String],
     options: CliRunOptions,
 ) -> Result<CliOutput> {
+    let cleanup_process_group = options.cancellation_token.is_some();
     if options.workspace_access == WorkspaceAccess::ReadOnly
         && options.sandbox_backend.is_none()
         && !options.inner_read_only_enforced
@@ -116,7 +117,9 @@ pub(crate) async fn run_cli_with_options(
             write_denylist: Vec::new(),
             network_allowlist: policy.network_allowlist,
             workspace_access: options.workspace_access,
-            cleanup_process_group: false,
+            // A deadline/cancellation is not complete until every descendant
+            // has been reaped. Provider CLIs routinely launch helper trees.
+            cleanup_process_group,
             guarded_launch: None,
         })
         .await
@@ -143,6 +146,7 @@ pub(crate) async fn run_cli_with_options(
     }
     if cancellation_token.is_some() {
         command.kill_on_drop(true);
+        configure_process_group(&mut command);
     }
     let child = command
         .stdout(Stdio::piped())
@@ -170,9 +174,18 @@ pub(crate) async fn run_cli_with_options(
             })?;
     }
     let wait = child.wait_with_output();
+    tokio::pin!(wait);
     let output = if let Some(token) = cancellation_token {
         tokio::select! {
             _ = token.cancelled() => {
+                if let Some(pid) = pid {
+                    signal_process_group(pid, false);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    signal_process_group(pid, true);
+                }
+                // wait_with_output drains both pipes and reaps the direct
+                // child after the whole process group has been signalled.
+                let _ = wait.await;
                 if let Some(pid_file) = pid_file.as_ref() {
                     let _ = tokio::fs::remove_file(pid_file).await;
                 }
@@ -181,7 +194,7 @@ pub(crate) async fn run_cli_with_options(
                     detail: "request cancelled".to_string(),
                 });
             }
-            output = wait => output
+            output = &mut wait => output
         }
     } else {
         wait.await
@@ -202,6 +215,34 @@ pub(crate) async fn run_cli_with_options(
         sandbox_warning: None,
     })
 }
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, force: bool) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if let Ok(pid) = i32::try_from(pid) {
+        let signal = if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGTERM
+        };
+        let _ = kill(Pid::from_raw(-pid), Some(signal));
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_pid: u32, _force: bool) {}
 
 #[derive(Debug)]
 struct ResolvedCliBinary {
@@ -335,6 +376,7 @@ pub(crate) fn ensure_success(provider: &str, output: &CliOutput) -> Result<()> {
 mod tests {
     use super::{CliRunOptions, cli_provider_write_allowlist, run_cli_with_options};
     use deadreckon_sandbox::WorkspaceAccess;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn migrated_cli_codex_uses_descriptor_sandbox_writes() {
@@ -367,5 +409,68 @@ mod tests {
                 .to_string()
                 .contains("requires an enforceable sandbox backend")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn done_timeout_reaps_provider_and_grandchild_processes() {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let grandchild_file = temp.path().join("grandchild.pid");
+        let token = CancellationToken::new();
+        let args = vec![
+            "-c".to_string(),
+            format!(
+                "sleep 30 & child=$!; echo $child > '{}'; wait",
+                grandchild_file.display()
+            ),
+        ];
+        let completion = run_cli_with_options(
+            "cli:test",
+            "sh",
+            &args,
+            CliRunOptions {
+                cwd: Some(temp.path().to_path_buf()),
+                sandbox_backend: None,
+                pid_file: Some(temp.path().join("provider.pid")),
+                cancellation_token: Some(token.clone()),
+                extra_write_allowlist: Vec::new(),
+                workspace_access: WorkspaceAccess::ReadWrite,
+                inner_read_only_enforced: false,
+            },
+        );
+        tokio::pin!(completion);
+        let grandchild_started = async {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !grandchild_file.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut completion => panic!("provider exited before cancellation: {result:?}"),
+            () = grandchild_started => {}
+        }
+        let grandchild = std::fs::read_to_string(&grandchild_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric pid");
+        token.cancel();
+        completion.await.expect_err("cancelled completion");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match kill(Pid::from_raw(grandchild), None) {
+                Err(Errno::ESRCH) => break,
+                _ if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                result => panic!("grandchild survived cancellation: {result:?}"),
+            }
+        }
+        assert!(!temp.path().join("provider.pid").exists());
     }
 }

@@ -248,6 +248,45 @@ pub(crate) struct StartLaunchInput<'a> {
     pub(crate) stdin_is_tty: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartSourceProvenance {
+    CurrentCleanWorktree,
+    ExplicitCopy,
+    ExplicitFresh,
+    InitGit,
+}
+
+impl StartSourceProvenance {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentCleanWorktree => "current-clean-worktree",
+            Self::ExplicitCopy => "explicit-copy",
+            Self::ExplicitFresh => "explicit-fresh",
+            Self::InitGit => "init-git",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedStartSource {
+    pub(crate) mode: commands::job::DurableSourceMode,
+    pub(crate) requested_from: Option<PathBuf>,
+    pub(crate) inspection_root: PathBuf,
+    pub(crate) contract_write_root: PathBuf,
+    pub(crate) allow_dirty: bool,
+    pub(crate) provenance: StartSourceProvenance,
+}
+
+impl ResolvedStartSource {
+    fn durable_source(&self) -> commands::job::DurableSource {
+        commands::job::DurableSource {
+            mode: self.mode,
+            from: self.requested_from.clone(),
+            allow_dirty: self.allow_dirty,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StartLaunchDecision {
     pub(crate) goal: String,
@@ -281,6 +320,7 @@ pub(crate) struct StartLaunchDecision {
     pub(crate) source_from: Option<PathBuf>,
     pub(crate) source_init_git: bool,
     pub(crate) source_allow_dirty: bool,
+    pub(crate) resolved_source: Option<ResolvedStartSource>,
     pub(crate) base_run_id: Option<String>,
     pub(crate) base_run_label: Option<String>,
     pub(crate) history_action_label: Option<String>,
@@ -349,6 +389,7 @@ pub(crate) fn start_launch_decision(input: StartLaunchInput<'_>) -> StartLaunchD
         source_from: None,
         source_init_git: false,
         source_allow_dirty: false,
+        resolved_source: None,
         base_run_id: None,
         base_run_label: None,
         history_action_label: None,
@@ -2274,82 +2315,164 @@ fn resolve_start_setup(
     prompter: Option<&mut dyn StartPrompter>,
     stdin_is_tty: bool,
 ) -> Result<()> {
+    match prompter {
+        Some(prompter) => {
+            resolve_start_source_setup(decision, args, Some(&mut *prompter), stdin_is_tty)?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_provider_and_done_setup(decision, args, Some(prompter))
+        }
+        None => {
+            resolve_start_source_setup(decision, args, None, stdin_is_tty)?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_provider_and_done_setup(decision, args, None)
+        }
+    }
+}
+
+fn resolve_start_source_setup(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    prompter: Option<&mut dyn StartPrompter>,
+    stdin_is_tty: bool,
+) -> Result<()> {
+    let paths = DeadreckonPaths::discover();
+    let cwd = std::env::current_dir()?;
+    validate_start_source_compatibility(decision, args, &cwd)?;
+    if decision.recovery.is_some() {
+        return Ok(());
+    }
+    if decision.resolved_source.is_none()
+        && !matches!(
+            decision.selected_mode,
+            StartSelectedMode::Extend | StartSelectedMode::Campaign
+        )
+    {
+        resolve_start_source_mode(
+            decision,
+            &paths,
+            &cwd,
+            prompter,
+            StartSourceModeRequest {
+                fresh: args.fresh,
+                worktree: args.worktree,
+                from: args.from.as_deref(),
+                allow_dirty: args.allow_dirty,
+                stdin_is_tty,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn resolve_start_provider_and_done_setup(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    prompter: Option<&mut dyn StartPrompter>,
+) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    if let Some(prompter) = prompter {
-        resolve_start_provider(decision, args, &paths, &defaults, Some(&mut *prompter))?;
-        if decision.recovery.is_some() {
-            return Ok(());
-        }
-        resolve_start_orchestration_options(
-            decision,
-            args,
-            &paths,
-            &defaults,
-            Some(&mut *prompter),
-        )?;
-        if decision.recovery.is_some() {
-            return Ok(());
-        }
-        let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(
-            decision,
-            &cwd,
-            Some(&mut *prompter),
-            args.yes,
-            !args.json && !args.quiet,
-        )?;
-        if decision.recovery.is_none()
-            && !matches!(
-                decision.selected_mode,
-                StartSelectedMode::Extend | StartSelectedMode::Campaign
+    let cwd = std::env::current_dir()?;
+    let (write_root, inspect_root) = decision.resolved_source.as_ref().map_or_else(
+        || (cwd.clone(), cwd.clone()),
+        |source| {
+            (
+                source.contract_write_root.clone(),
+                source.inspection_root.clone(),
             )
-        {
-            resolve_start_source_mode(
+        },
+    );
+    match prompter {
+        Some(prompter) => {
+            resolve_start_provider(decision, args, &paths, &defaults, Some(&mut *prompter))?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_orchestration_options(
                 decision,
+                args,
                 &paths,
-                &cwd,
+                &defaults,
                 Some(&mut *prompter),
-                StartSourceModeRequest {
-                    fresh: args.fresh,
-                    worktree: args.worktree,
-                    from: args.from.as_deref(),
-                    allow_dirty: args.allow_dirty,
-                    stdin_is_tty,
-                },
             )?;
-        }
-    } else {
-        resolve_start_provider(decision, args, &paths, &defaults, None)?;
-        if decision.recovery.is_some() {
-            return Ok(());
-        }
-        resolve_start_orchestration_options(decision, args, &paths, &defaults, None)?;
-        if decision.recovery.is_some() {
-            return Ok(());
-        }
-        let cwd = std::env::current_dir()?;
-        resolve_start_done_criteria(decision, &cwd, None, args.yes, !args.json && !args.quiet)?;
-        if decision.recovery.is_none()
-            && !matches!(
-                decision.selected_mode,
-                StartSelectedMode::Extend | StartSelectedMode::Campaign
-            )
-        {
-            resolve_start_source_mode(
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_done_criteria_with_roots(
                 decision,
-                &paths,
-                &cwd,
-                None,
-                StartSourceModeRequest {
-                    fresh: args.fresh,
-                    worktree: args.worktree,
-                    from: args.from.as_deref(),
-                    allow_dirty: args.allow_dirty,
-                    stdin_is_tty,
-                },
-            )?;
+                &write_root,
+                &inspect_root,
+                Some(prompter),
+                args.yes,
+                !args.json && !args.quiet,
+            )
         }
+        None => {
+            resolve_start_provider(decision, args, &paths, &defaults, None)?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_orchestration_options(decision, args, &paths, &defaults, None)?;
+            if decision.recovery.is_some() {
+                return Ok(());
+            }
+            resolve_start_done_criteria_with_roots(
+                decision,
+                &write_root,
+                &inspect_root,
+                None,
+                args.yes,
+                !args.json && !args.quiet,
+            )
+        }
+    }
+}
+
+fn validate_start_source_compatibility(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    cwd: &Path,
+) -> Result<()> {
+    if start_source_flags_present(args)
+        && matches!(
+            decision.selected_mode,
+            StartSelectedMode::Extend | StartSelectedMode::Campaign
+        )
+    {
+        set_start_recovery(
+            decision,
+            format!(
+                "{} launches do not accept a replacement source",
+                decision.selected_mode.label()
+            ),
+            vec![format!(
+                "deadreckon start \"{}\" --mode {}",
+                shell_display_quote(&decision.goal),
+                decision.selected_mode.label()
+            )],
+        );
+        return Ok(());
+    }
+    if args.allow_dirty
+        && args.from.is_none()
+        && matches!(
+            decision.selected_mode,
+            StartSelectedMode::Review | StartSelectedMode::FullPlan
+        )
+    {
+        set_start_recovery(
+            decision,
+            "Graph Jobs freeze dirty and untracked inputs through an explicit copy source",
+            vec![format!(
+                "deadreckon start \"{}\" --mode {} --from {}",
+                shell_display_quote(&decision.goal),
+                decision.selected_mode.label(),
+                cwd.display()
+            )],
+        );
     }
     Ok(())
 }
@@ -2444,6 +2567,7 @@ fn detected_start_provider_label(provider: &str) -> String {
     format!("{provider} (detected) - run deadreckon config provider {provider} to make permanent")
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_start_done_criteria(
     decision: &mut StartLaunchDecision,
     cwd: &Path,
@@ -2451,11 +2575,22 @@ pub(crate) fn resolve_start_done_criteria(
     yes: bool,
     emit_human_output: bool,
 ) -> Result<()> {
-    let source = commands::acceptance::resolve_acceptance_source(cwd, None)?;
+    resolve_start_done_criteria_with_roots(decision, cwd, cwd, prompter, yes, emit_human_output)
+}
+
+fn resolve_start_done_criteria_with_roots(
+    decision: &mut StartLaunchDecision,
+    write_root: &Path,
+    inspect_root: &Path,
+    prompter: Option<&mut dyn StartPrompter>,
+    yes: bool,
+    emit_human_output: bool,
+) -> Result<()> {
+    let source = commands::acceptance::resolve_acceptance_source(write_root, None)?;
     if source.is_some() {
         let selection = commands::acceptance::done_criteria_selection(&source)?;
         if let Some(prompter) = prompter {
-            prompt_start_existing_done_criteria(decision, cwd, &selection, prompter)?;
+            prompt_start_existing_done_criteria(decision, write_root, &selection, prompter)?;
             return Ok(());
         }
         apply_done_criteria_selection(
@@ -2484,7 +2619,7 @@ pub(crate) fn resolve_start_done_criteria(
 
     // C-P8: the one-question flow. A detected contract means everything
     // about "done" is already known — zero questions, interactive or not.
-    let contract = commands::course::contract_signal(cwd);
+    let contract = commands::course::contract_signal(inspect_root);
     if contract.detected {
         decision.done_criteria_source = StartDoneCriteriaSource::Detected;
         decision.done_action = StartDoneAction::DefaultGate;
@@ -2563,34 +2698,21 @@ fn resolve_start_source_mode(
                     decision.source_mode_label = "git init, then worktree".to_string();
                     decision.source_init_git = true;
                     decision.source_worktree = true;
+                    set_resolved_start_source(
+                        decision,
+                        cwd,
+                        commands::job::DurableSourceMode::InitGit,
+                        None,
+                        cwd,
+                        false,
+                        StartSourceProvenance::InitGit,
+                    )?;
                     return Ok(());
                 }
                 StartNonGitChoice::Copy => {
-                    if !matches!(decision.selected_mode, StartSelectedMode::Run) {
-                        set_start_recovery(
-                            decision,
-                            "copy source mode is only supported by start --mode run",
-                            vec![format!(
-                                "deadreckon start \"{}\" --mode run --from .",
-                                shell_display_quote(&decision.goal)
-                            )],
-                        );
-                        return Ok(());
-                    }
                     flags.from = Some(cwd.to_path_buf());
                 }
                 StartNonGitChoice::Fresh => {
-                    if !matches!(decision.selected_mode, StartSelectedMode::Run) {
-                        set_start_recovery(
-                            decision,
-                            "fresh source mode is only supported by start --mode run",
-                            vec![format!(
-                                "deadreckon start \"{}\" --mode run --fresh",
-                                shell_display_quote(&decision.goal)
-                            )],
-                        );
-                        return Ok(());
-                    }
                     flags.fresh = true;
                 }
                 StartNonGitChoice::Cancel => {
@@ -2647,6 +2769,15 @@ fn resolve_start_source_mode(
                     decision.source_mode_label = format!("worktree from {}", source_path.display());
                     decision.source_worktree = flags.worktree;
                     decision.source_allow_dirty = request.allow_dirty;
+                    set_resolved_start_source(
+                        decision,
+                        cwd,
+                        commands::job::DurableSourceMode::Worktree,
+                        None,
+                        &source_path,
+                        request.allow_dirty,
+                        StartSourceProvenance::CurrentCleanWorktree,
+                    )?;
                 }
                 Err(DeadreckonError::InvalidInput(message))
                     if message.contains("working tree has uncommitted changes") =>
@@ -2683,6 +2814,15 @@ fn resolve_start_source_mode(
                                 );
                                 decision.source_worktree = flags.worktree;
                                 decision.source_allow_dirty = true;
+                                set_resolved_start_source(
+                                    decision,
+                                    cwd,
+                                    commands::job::DurableSourceMode::Worktree,
+                                    None,
+                                    &source_path,
+                                    true,
+                                    StartSourceProvenance::CurrentCleanWorktree,
+                                )?;
                             }
                             StartDirtyGitChoice::Cancel => set_start_recovery(
                                 decision,
@@ -2732,19 +2872,119 @@ fn resolve_start_source_mode(
         ResolvedMode::Copy { source_path } => {
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("copy from {}", source_path.display());
-            decision.source_from = Some(source_path);
+            decision.source_from = Some(source_path.clone());
+            set_resolved_start_source(
+                decision,
+                cwd,
+                commands::job::DurableSourceMode::Copy,
+                Some(source_path.clone()),
+                &source_path,
+                false,
+                StartSourceProvenance::ExplicitCopy,
+            )?;
         }
         ResolvedMode::Fresh => {
             decision.source_mode = StartSourceMode::Fresh;
             decision.source_mode_label = "fresh".to_string();
             decision.source_fresh = true;
+            set_resolved_start_source(
+                decision,
+                cwd,
+                commands::job::DurableSourceMode::Fresh,
+                None,
+                cwd,
+                false,
+                StartSourceProvenance::ExplicitFresh,
+            )?;
         }
         ResolvedMode::InPlace { source_path } => {
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("in-place from {}", source_path.display());
-            decision.source_from = Some(source_path);
+            decision.source_from = Some(source_path.clone());
+            set_resolved_start_source(
+                decision,
+                cwd,
+                commands::job::DurableSourceMode::Copy,
+                Some(source_path.clone()),
+                &source_path,
+                false,
+                StartSourceProvenance::ExplicitCopy,
+            )?;
         }
     }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn set_resolved_start_source(
+    decision: &mut StartLaunchDecision,
+    contract_write_root: &Path,
+    mode: commands::job::DurableSourceMode,
+    requested_from: Option<PathBuf>,
+    inspection_root: &Path,
+    allow_dirty: bool,
+    provenance: StartSourceProvenance,
+) -> Result<()> {
+    let contract_write_root = contract_write_root.canonicalize()?;
+    let inspection_root = inspection_root.canonicalize().map_err(|error| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "source directory cannot be resolved: {} ({error})",
+                inspection_root.display()
+            ),
+            "deadreckon start \"<goal>\" --mode full-plan --from <existing-dir>",
+        ))
+    })?;
+    if !inspection_root.is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("source is not a directory: {}", inspection_root.display()),
+            "deadreckon start \"<goal>\" --mode full-plan --from <existing-dir>",
+        )));
+    }
+    fs::read_dir(&inspection_root).map_err(|error| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "source directory cannot be read: {} ({error})",
+                inspection_root.display()
+            ),
+            "deadreckon start \"<goal>\" --mode full-plan --from <readable-dir>",
+        ))
+    })?;
+    let resolved = ResolvedStartSource {
+        mode,
+        requested_from,
+        inspection_root: inspection_root.clone(),
+        contract_write_root,
+        allow_dirty,
+        provenance,
+    };
+    if let Some(existing) = decision.resolved_source.as_ref() {
+        if existing == &resolved {
+            return Ok(());
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "start source was already resolved and cannot be reinterpreted".to_string(),
+        )));
+    }
+    decision.source_mode_label = match mode {
+        commands::job::DurableSourceMode::Copy => {
+            format!("approved copy from {}", inspection_root.display())
+        }
+        commands::job::DurableSourceMode::Fresh => "fresh approved source".to_string(),
+        commands::job::DurableSourceMode::InitGit => {
+            format!("git init from {}", inspection_root.display())
+        }
+        commands::job::DurableSourceMode::Worktree if allow_dirty => {
+            format!(
+                "worktree from {} with dirty files",
+                inspection_root.display()
+            )
+        }
+        commands::job::DurableSourceMode::Worktree => {
+            format!("worktree from {}", inspection_root.display())
+        }
+    };
+    decision.resolved_source = Some(resolved);
     Ok(())
 }
 
@@ -2802,23 +3042,48 @@ async fn materialize_start_done_criteria(
     mut prompter: Option<&mut dyn StartPrompter>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
+    let (write_root, inspect_root) = decision.resolved_source.as_ref().map_or_else(
+        || (cwd.clone(), cwd.clone()),
+        |source| {
+            (
+                source.contract_write_root.clone(),
+                source.inspection_root.clone(),
+            )
+        },
+    );
     loop {
         let Some((request, overwrite_existing)) = start_done_materialization_request(decision)
         else {
             return Ok(());
         };
-        commands::acceptance::acceptance_agent_command_in_dir(
-            &cwd,
-            commands::acceptance::AcceptanceAgentMode::Draft,
-            vec![request],
-            Some(&decision.goal),
-            decision.provider_route.clone(),
-            None,
-            overwrite_existing,
-        )
-        .await?;
+        let context = commands::acceptance::AcceptanceAuthoringContext {
+            write_root: &write_root,
+            inspect_root: &inspect_root,
+            goal: Some(&decision.goal),
+        };
+        if prompter.is_some() {
+            commands::acceptance::acceptance_agent_command_with_explicit_review(
+                context,
+                commands::acceptance::AcceptanceAgentMode::Draft,
+                vec![request],
+                None,
+                None,
+                overwrite_existing,
+            )
+            .await?;
+        } else {
+            commands::acceptance::acceptance_agent_command_with_context(
+                context,
+                commands::acceptance::AcceptanceAgentMode::Draft,
+                vec![request],
+                None,
+                None,
+                overwrite_existing,
+            )
+            .await?;
+        }
         let Some(source) = commands::acceptance::mark_generated_done_criteria(
-            commands::acceptance::resolve_acceptance_source(&cwd, None)?,
+            commands::acceptance::resolve_acceptance_source(&write_root, None)?,
         ) else {
             return Ok(());
         };
@@ -2839,7 +3104,12 @@ async fn materialize_start_done_criteria(
         let Some(active_prompter) = prompter.as_mut() else {
             return Ok(());
         };
-        prompt_start_existing_done_criteria(decision, &cwd, &selection, &mut **active_prompter)?;
+        prompt_start_existing_done_criteria(
+            decision,
+            &write_root,
+            &selection,
+            &mut **active_prompter,
+        )?;
         if decision.recovery.is_some() {
             return Ok(());
         }
@@ -2877,6 +3147,35 @@ fn start_launch_preview_rows(
     paths: &DeadreckonPaths,
 ) -> Result<Vec<(String, String)>> {
     let mut rows = launch_preview_rows(&start_launch_preview_facts(decision));
+    if start_done_materialization_request(decision).is_some()
+        && let Some(source) = decision.resolved_source.as_ref()
+    {
+        let defaults = config_defaults(paths)?;
+        rows.push((
+            "done inspect".to_string(),
+            source.inspection_root.display().to_string(),
+        ));
+        rows.push((
+            "done writer".to_string(),
+            source
+                .contract_write_root
+                .join(".deadreckon")
+                .display()
+                .to_string(),
+        ));
+        rows.push((
+            "done provider".to_string(),
+            commands::acceptance::done_authoring_route_label(paths, &defaults)
+                .unwrap_or_else(|| "unavailable (structured text required)".to_string()),
+        ));
+        rows.push((
+            "done limit".to_string(),
+            format!(
+                "{}s total",
+                commands::acceptance::done_authoring_wall_seconds(&defaults)
+            ),
+        ));
+    }
     let seams = read_seams_config(&paths.config_path(), args.no_seams)?;
     rows.push(("seams".to_string(), seam_preview_label(&seams)));
     rows.push((
@@ -2929,6 +3228,41 @@ fn start_done_contract_json(decision: &StartLaunchDecision) -> serde_json::Value
         "checks": decision.done_contract.as_ref().map(|contract| &contract.checks),
         "divergence": decision.done_divergence,
     })
+}
+
+fn start_source_json(decision: &StartLaunchDecision) -> serde_json::Value {
+    decision.resolved_source.as_ref().map_or_else(
+        || serde_json::Value::Null,
+        |source| {
+            json!({
+                "mode": source.mode,
+                "requested_from": &source.requested_from,
+                "inspection_root": &source.inspection_root,
+                "contract_write_root": &source.contract_write_root,
+                "allow_dirty": source.allow_dirty,
+                "provenance": source.provenance.label(),
+                "label": &decision.source_mode_label,
+            })
+        },
+    )
+}
+
+fn start_done_authoring_json(
+    decision: &StartLaunchDecision,
+    paths: &DeadreckonPaths,
+) -> Result<serde_json::Value> {
+    let Some(source) = decision.resolved_source.as_ref() else {
+        return Ok(serde_json::Value::Null);
+    };
+    let defaults = config_defaults(paths)?;
+    Ok(json!({
+        "needed": start_done_materialization_request(decision).is_some(),
+        "inspect_root": &source.inspection_root,
+        "write_root": source.contract_write_root.join(".deadreckon"),
+        "provider": commands::acceptance::done_authoring_route_label(paths, &defaults),
+        "wall_seconds": commands::acceptance::done_authoring_wall_seconds(&defaults),
+        "posture": "structured_text",
+    }))
 }
 
 fn apply_forced_contract_review_guard(
@@ -3128,6 +3462,8 @@ fn emit_start_read_only_result(
             "done_criteria_source": decision.done_criteria_source.label(),
             "done_contract": start_done_contract_json(decision),
             "source_mode": decision.source_mode.label(),
+            "source": start_source_json(decision),
+            "done_authoring": start_done_authoring_json(decision, paths)?,
             "goal_shape": &decision.goal_shape,
             "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
@@ -3395,17 +3731,29 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
     let mut terminal_prompter = TerminalStartPrompter;
-    if start_launch_intent(&args) == StartLaunchIntent::Launch {
-        let service_prompter = eligibility
-            .allows_prompts()
-            .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-        require_start_supervisor_service(service_prompter)?;
-    }
-    if start_goal_shape_should_classify(&args, eligibility) {
+
+    // Soundings: source policy is an admission decision, not a dispatch
+    // afterthought. Resolve it once before any provider process, contract
+    // authoring, service-install prompt, or final launch confirmation.
+    let source_prompter = eligibility
+        .allows_prompts()
+        .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+    resolve_start_source_setup(&mut decision, &args, source_prompter, stdin_is_tty)?;
+
+    if decision.recovery.is_none() && start_goal_shape_should_classify(&args, eligibility) {
+        let inspection_root = decision
+            .resolved_source
+            .as_ref()
+            .map(|source| source.inspection_root.as_path())
+            .unwrap_or(cwd.as_path());
         let defaults = config_defaults(&paths)?;
-        let provider = start_should_ask_provider_for_shape(&args, eligibility)
-            .then(|| start_goal_shape_provider_route(&paths, &defaults, &args))
-            .flatten();
+        // A source-bearing auto launch first takes the deterministic ladder.
+        // That lets an unsupported Campaign/source combination refuse without
+        // ever starting a provider merely to discover that it cannot launch.
+        let provider = (!start_source_flags_present(&args)
+            && start_should_ask_provider_for_shape(&args, eligibility))
+        .then(|| start_goal_shape_provider_route(&paths, &defaults, &args))
+        .flatten();
         let planner_sandbox = defaults
             .sandbox
             .as_deref()
@@ -3413,18 +3761,21 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .parse::<deadreckon_sandbox::SandboxBackend>()?;
         let recommendation = classify_goal_shape_for_start(
             &paths,
-            &cwd,
+            inspection_root,
             &args.goal,
             provider.as_deref(),
             planner_sandbox,
             args.plain,
         )
         .await;
-        let scope = workspace_scope(&cwd)?;
-        write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
-        apply_goal_shape_recommendation(&mut decision, recommendation);
+        apply_goal_shape_recommendation(&mut decision, recommendation.clone());
+        validate_start_source_compatibility(&mut decision, &args, &cwd)?;
+        if decision.recovery.is_none() {
+            let scope = workspace_scope(&cwd)?;
+            write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
+        }
     }
-    if eligibility.allows_prompts() {
+    if decision.recovery.is_none() && eligibility.allows_prompts() {
         maybe_prompt_start_mode(
             &mut decision,
             &args,
@@ -3432,15 +3783,23 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             &mut terminal_prompter,
         )?;
         if decision.recovery.is_none() {
-            resolve_start_setup(
+            validate_start_source_compatibility(&mut decision, &args, &cwd)?;
+        }
+        if decision.recovery.is_none() {
+            resolve_start_provider_and_done_setup(
                 &mut decision,
                 &args,
                 Some(&mut terminal_prompter),
-                stdin_is_tty,
             )?;
         }
     } else if decision.recovery.is_none() {
-        resolve_start_setup(&mut decision, &args, None, stdin_is_tty)?;
+        resolve_start_provider_and_done_setup(&mut decision, &args, None)?;
+    }
+    if decision.recovery.is_none() && start_launch_intent(&args) == StartLaunchIntent::Launch {
+        let service_prompter = eligibility
+            .allows_prompts()
+            .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+        require_start_supervisor_service(service_prompter)?;
     }
     let force_contract_review = args.review_done
         || config_defaults(&paths)
@@ -3450,6 +3809,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     apply_forced_contract_review_guard(&mut decision, eligibility, force_contract_review);
     if emit_start_read_only_result(&decision, &args, &paths)? {
         return Ok(());
+    }
+    let review_prompter: Option<&mut dyn StartPrompter> = eligibility
+        .allows_prompts()
+        .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+    materialize_start_done_criteria(&mut decision, review_prompter).await?;
+    if let Some(recovery) = decision.recovery.as_ref() {
+        return Err(start_recovery_error(recovery));
     }
     if decision.recovery.is_none() && eligibility.allows_prompts() {
         prompt_start_launch_confirmation(&mut decision, &args, &paths, &mut terminal_prompter)?;
@@ -3512,13 +3878,6 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         let surface = start_preview_surface(&decision, &args, &paths)?
             .render_plain(!completion_hints_enabled(false));
         return Err(CliError::Surface { code: 1, surface });
-    }
-    let review_prompter: Option<&mut dyn StartPrompter> = eligibility
-        .allows_prompts()
-        .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-    materialize_start_done_criteria(&mut decision, review_prompter).await?;
-    if let Some(recovery) = decision.recovery.as_ref() {
-        return Err(start_recovery_error(recovery));
     }
     // C-P9: the decision becomes the durable artifact before anything runs.
     let accepted_by = if decision.confirmed_by_start_picker {
@@ -3656,22 +4015,15 @@ async fn dispatch_start_command(
                 defaults.cli_max_wall_seconds.unwrap_or(36_000.0),
             )?;
             let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());
-            let source = commands::job::DurableSource {
-                mode: match decision.source_mode {
-                    StartSourceMode::Worktree => commands::job::DurableSourceMode::Worktree,
-                    StartSourceMode::Copy => commands::job::DurableSourceMode::Copy,
-                    StartSourceMode::Fresh => commands::job::DurableSourceMode::Fresh,
-                    StartSourceMode::InitGit => commands::job::DurableSourceMode::InitGit,
-                    StartSourceMode::ParentArtifact | StartSourceMode::Missing => {
-                        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                            "durable start cannot freeze source mode {}",
-                            decision.source_mode.label()
-                        ))));
-                    }
-                },
-                from: decision.source_from.clone().or(args.from),
-                allow_dirty: args.allow_dirty || decision.source_allow_dirty,
-            };
+            let source = decision
+                .resolved_source
+                .as_ref()
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "durable start is missing its resolved source".to_string(),
+                    ))
+                })?
+                .durable_source();
             let accepted_by = if launch_plan.accepted_by.as_deref() == Some("yes-flag-guardrail") {
                 deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
             } else {
@@ -3804,16 +4156,6 @@ async fn dispatch_advanced_start_job(
     attach_flags: StartAttachFlags,
     kind: commands::graph_job::DriverKind,
 ) -> Result<StartDispatch> {
-    if start_source_flags_present(&args)
-        || decision.source_fresh
-        || decision.source_from.is_some()
-        || decision.source_allow_dirty
-    {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "source mode flags are only supported by start --mode run",
-            "omit source flags; graph jobs isolate their child workspaces internally",
-        )));
-    }
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
     let defaults = config_defaults(&paths)?;
@@ -3874,12 +4216,36 @@ async fn dispatch_advanced_start_job(
         coder_model: review.then(|| decision.coder_model.clone()).flatten(),
         reviewer_model: review.then(|| decision.reviewer_model.clone()).flatten(),
         model: None,
-        source_init_git: decision.source_init_git,
+        source_init_git: decision.resolved_source.as_ref().is_some_and(|source| {
+            matches!(
+                source.mode,
+                commands::job::DurableSourceMode::Copy
+                    | commands::job::DurableSourceMode::Fresh
+                    | commands::job::DurableSourceMode::InitGit
+            )
+        }),
     };
     let accepted_by = if launch_plan.accepted_by.as_deref() == Some("yes-flag-guardrail") {
         deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail
     } else {
         deadreckon_protocol::AuthorityAcceptedBy::Operator
+    };
+    let source = if graph {
+        decision
+            .resolved_source
+            .as_ref()
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "durable Graph start is missing its resolved source".to_string(),
+                ))
+            })?
+            .durable_source()
+    } else {
+        commands::job::DurableSource {
+            mode: commands::job::DurableSourceMode::Worktree,
+            from: None,
+            allow_dirty: false,
+        }
     };
     let job = commands::job::create_job(commands::job::CreateJob {
         paths: &paths,
@@ -3896,15 +4262,7 @@ async fn dispatch_advanced_start_job(
             .done_contract
             .as_ref()
             .map(|contract| contract.source_path.as_path()),
-        source: commands::job::DurableSource {
-            mode: if decision.source_init_git {
-                commands::job::DurableSourceMode::InitGit
-            } else {
-                commands::job::DurableSourceMode::Worktree
-            },
-            from: None,
-            allow_dirty: false,
-        },
+        source,
         max_spend_usd,
         max_wall_seconds,
         max_attempts: 3,
@@ -4185,9 +4543,10 @@ id = "custom-small"
 #[cfg(test)]
 mod start_footer_tests {
     use super::{
-        StartLaunchInput, StartLaunchIntent, StartLaunchState, StartSelectedMode,
-        StartSupervisorAdmission, guided_extension_args, plan_launch_state_from, run_launch_state,
-        start_footer_content, start_launch_decision, start_launch_intent,
+        ResolvedStartSource, StartLaunchInput, StartLaunchIntent, StartLaunchState,
+        StartSelectedMode, StartSourceProvenance, StartSupervisorAdmission, guided_extension_args,
+        plan_launch_state_from, run_launch_state, set_resolved_start_source, start_footer_content,
+        start_launch_decision, start_launch_intent, start_launch_preview_facts, start_source_json,
         start_supervisor_admission,
     };
     use crate::cli::{CliStartMode, StartCommandArgs};
@@ -4281,6 +4640,131 @@ mod start_footer_tests {
 
         args.yes = true;
         assert_eq!(start_launch_intent(&args), StartLaunchIntent::Launch);
+    }
+
+    #[test]
+    fn json_plain_and_card_project_identical_source_truth() {
+        let canonical = std::path::PathBuf::from("/canonical/Cloudwing");
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "continue Cloudwing",
+            requested_mode: CliStartMode::FullPlan,
+            stdin_is_tty: false,
+        });
+        decision.source_mode = super::StartSourceMode::Copy;
+        decision.source_mode_label = format!("approved copy from {}", canonical.display());
+        decision.resolved_source = Some(ResolvedStartSource {
+            mode: crate::commands::job::DurableSourceMode::Copy,
+            requested_from: Some(canonical.clone()),
+            inspection_root: canonical.clone(),
+            contract_write_root: std::path::PathBuf::from("/launch"),
+            allow_dirty: false,
+            provenance: StartSourceProvenance::ExplicitCopy,
+        });
+
+        let card = start_launch_preview_facts(&decision).workspace.to_string();
+        let json = start_source_json(&decision);
+        let plain = decision.source_mode_label.clone();
+        for projection in [
+            card,
+            plain,
+            json["label"].as_str().expect("json label").to_string(),
+        ] {
+            assert!(projection.contains("/canonical/Cloudwing"), "{projection}");
+        }
+        assert_eq!(
+            json["inspection_root"],
+            serde_json::Value::String("/canonical/Cloudwing".to_string())
+        );
+    }
+
+    #[test]
+    fn start_resolves_source_once_before_done_authoring() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let launch = temp.path().join("launch");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for path in [&launch, &first, &second] {
+            std::fs::create_dir_all(path).expect("source directory");
+        }
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "continue Cloudwing",
+            requested_mode: CliStartMode::FullPlan,
+            stdin_is_tty: false,
+        });
+        set_resolved_start_source(
+            &mut decision,
+            &launch,
+            crate::commands::job::DurableSourceMode::Copy,
+            Some(first.clone()),
+            &first,
+            false,
+            StartSourceProvenance::ExplicitCopy,
+        )
+        .expect("first resolution");
+        let error = set_resolved_start_source(
+            &mut decision,
+            &launch,
+            crate::commands::job::DurableSourceMode::Copy,
+            Some(second),
+            &temp.path().join("second"),
+            false,
+            StartSourceProvenance::ExplicitCopy,
+        )
+        .expect_err("source reinterpretation must fail");
+
+        assert!(error.to_string().contains("already resolved"), "{error}");
+        assert_eq!(
+            decision
+                .resolved_source
+                .as_ref()
+                .expect("resolved source")
+                .inspection_root,
+            first.canonicalize().expect("canonical first")
+        );
+    }
+
+    #[test]
+    fn preview_and_dispatch_share_the_same_resolved_source() {
+        let canonical = std::path::PathBuf::from("/canonical/Cloudwing");
+        let resolved = ResolvedStartSource {
+            mode: crate::commands::job::DurableSourceMode::Copy,
+            requested_from: Some(canonical.clone()),
+            inspection_root: canonical.clone(),
+            contract_write_root: std::path::PathBuf::from("/launch"),
+            allow_dirty: false,
+            provenance: StartSourceProvenance::ExplicitCopy,
+        };
+        let durable = resolved.durable_source();
+        assert_eq!(durable.mode, crate::commands::job::DurableSourceMode::Copy);
+        assert_eq!(durable.from.as_deref(), Some(canonical.as_path()));
+        assert_eq!(resolved.inspection_root, canonical);
+    }
+
+    #[test]
+    fn invalid_source_refuses_before_provider_confirmation_or_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut decision = start_launch_decision(StartLaunchInput {
+            goal: "continue Cloudwing",
+            requested_mode: CliStartMode::FullPlan,
+            stdin_is_tty: false,
+        });
+        let missing = temp.path().join("missing");
+        let error = set_resolved_start_source(
+            &mut decision,
+            temp.path(),
+            crate::commands::job::DurableSourceMode::Copy,
+            Some(missing.clone()),
+            &missing,
+            false,
+            StartSourceProvenance::ExplicitCopy,
+        )
+        .expect_err("missing source must refuse");
+
+        assert!(error.to_string().contains("cannot be resolved"), "{error}");
+        assert!(decision.provider_route.is_none());
+        assert!(decision.resolved_source.is_none());
+        assert!(!temp.path().join(".deadreckon/acceptance.yaml").exists());
+        assert!(!decision.requires_confirmation);
     }
 
     #[test]

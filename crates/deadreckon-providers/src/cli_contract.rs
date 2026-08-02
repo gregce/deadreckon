@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -768,7 +769,12 @@ pub(crate) async fn write_schema_file(
     dir: &Path,
     schema: &Value,
 ) -> Result<PathBuf, ProviderError> {
-    let path = dir.join("provider-output-schema.json");
+    static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "provider-output-schema-{}-{id}.json",
+        std::process::id()
+    ));
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await

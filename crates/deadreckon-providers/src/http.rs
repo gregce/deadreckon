@@ -95,17 +95,38 @@ impl ProviderAdapter {
 
     fn payload(&self, request: &ProviderRequest) -> Value {
         match &self.kind {
-            ProviderKind::Anthropic => json!({
-                "model": self.model,
-                "max_tokens": request.max_output_tokens,
-                "messages": [{"role": "user", "content": request.prompt}],
-            }),
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => json!({
-                "model": self.model,
-                "messages": [{"role": "user", "content": request.prompt}],
-                "max_tokens": request.max_output_tokens,
-                "stream": false,
-            }),
+            ProviderKind::Anthropic => {
+                let mut payload = json!({
+                    "model": self.model,
+                    "max_tokens": request.max_output_tokens,
+                    "messages": [{"role": "user", "content": request.prompt}],
+                });
+                if let Some(schema) = request.output_schema.as_ref() {
+                    payload["output_config"] = json!({
+                        "format": {"type": "json_schema", "schema": schema}
+                    });
+                }
+                payload
+            }
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => {
+                let mut payload = json!({
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": request.prompt}],
+                    "max_tokens": request.max_output_tokens,
+                    "stream": false,
+                });
+                if let Some(schema) = request.output_schema.as_ref() {
+                    payload["response_format"] = json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "deadreckon_structured_text",
+                            "strict": true,
+                            "schema": schema,
+                        }
+                    });
+                }
+                payload
+            }
             ProviderKind::CliClaudeCode
             | ProviderKind::CliCodex
             | ProviderKind::ScriptedSmoke

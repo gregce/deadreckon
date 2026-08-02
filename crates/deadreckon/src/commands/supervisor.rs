@@ -1726,9 +1726,10 @@ fn build_leaf_command(
                 command.arg("--worktree");
             }
             super::job::DurableSourceMode::Copy => {
-                command
-                    .arg("--from")
-                    .arg(source.from.as_deref().unwrap_or(&job.source_cwd));
+                // `source.from` is immutable launch provenance. Execution is
+                // always seeded from the controller-owned approved copy bound
+                // into Job authority.
+                command.arg("--from").arg(&job.source_cwd);
             }
             super::job::DurableSourceMode::Fresh => {
                 command.arg("--fresh");
