@@ -31,8 +31,9 @@ use deadreckon_core::artifact_policy::{
     delivery_git_exclude_pathspecs, evidence_only_roots, is_deliverable_workspace_path,
 };
 use deadreckon_core::artifacts::{
-    ProvenanceRecord, append_provenance, append_spend, append_trace, copy_recoverable_tree,
-    copy_tree, inventory_recoverable_files, snapshot_working,
+    ProvenanceRecord, append_provenance, append_spend, append_trace,
+    copy_recoverable_tree_with_policy, copy_tree, inventory_files,
+    inventory_recoverable_files_for_state, snapshot_working,
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use deadreckon_core::codebase::{
@@ -1375,7 +1376,7 @@ fn persist_parent_repair_candidate(
             context.path.display()
         )));
     }
-    let mut index = deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)?;
+    let mut index = deadreckon_core::flight::build_deliverable_file_index_for_state(state)?;
     index.files.remove(Path::new("manifest.json"));
     let candidate = ParentRepairCandidate {
         schema_version: 1,
@@ -2150,7 +2151,7 @@ fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Re
         .join("snapshots")
         .join(format!("turn-{snapshot_turn}"));
     let before = file_set(&snapshot_dir)?;
-    let after_files = inventory_recoverable_files(&state.working_dir)?;
+    let after_files = inventory_recoverable_files_for_state(state)?;
     let mut changed = Vec::new();
     for file in after_files {
         let relative = file.strip_prefix(&state.working_dir).map_err(|err| {
@@ -2185,7 +2186,7 @@ fn deliverable_changed_files(state: &PipelineState, changed: &[PathBuf]) -> Resu
 }
 
 fn file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    Ok(inventory_recoverable_files(root)?
+    Ok(inventory_files(root)?
         .into_iter()
         .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
         .collect())
@@ -2491,6 +2492,25 @@ fn truncate_run_artifacts_after_turn(state: &PipelineState, from_turn: u32) -> R
             };
             if turn > from_turn {
                 std::fs::remove_dir_all(&path).with_path(&path)?;
+            }
+        }
+    }
+    let snapshot_manifests = state
+        .run_root
+        .join(deadreckon_core::SNAPSHOT_CAPTURE_MANIFESTS_DIR);
+    if let Ok(entries) = std::fs::read_dir(&snapshot_manifests) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(turn) = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("turn-"))
+                .and_then(|turn| turn.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if turn > from_turn {
+                std::fs::remove_file(&path).with_path(&path)?;
             }
         }
     }
@@ -3364,7 +3384,8 @@ pub async fn run_contained_verdict_evaluation(
 
     let scratch = TempDir::new().with_path(PathBuf::from("verdict-scratch"))?;
     let scratch_working_dir = scratch.path().join("workspace");
-    copy_recoverable_tree(&state.working_dir, &scratch_working_dir)?;
+    let capture_policy = deadreckon_core::ensure_workspace_capture_policy(state)?;
+    copy_recoverable_tree_with_policy(&state.working_dir, &scratch_working_dir, &capture_policy)?;
     let pid_file = scratch.path().join("dr-gate-evaluate.pid");
     let result = run_keyless_gate_evaluation(
         state,
@@ -4792,7 +4813,7 @@ fn refuse_external_git_filters(
     // This check must precede reset, restore, add, or any other Git command
     // which can convert worktree content. `check-attr` only resolves metadata;
     // it does not execute the configured clean, smudge, or process command.
-    let current = deadreckon_core::flight::build_workspace_guard_file_index(&state.working_dir)?;
+    let current = deadreckon_core::flight::build_workspace_guard_file_index_for_state(state)?;
     let mut paths = current.files.into_keys().collect::<BTreeSet<_>>();
     let base_tree = trusted_git_output(
         control,
@@ -5578,7 +5599,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&candidate_path).expect("candidate record"))
                 .expect("candidate json");
         let mut result_index =
-            deadreckon_core::flight::build_deliverable_file_index(&state.working_dir)
+            deadreckon_core::flight::build_deliverable_file_index_for_state(&state)
                 .expect("candidate result index");
         result_index.files.remove(Path::new("manifest.json"));
         assert_eq!(candidate.job_id, state.run_id);

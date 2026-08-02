@@ -4,6 +4,15 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::artifacts::{copy_artifact_path, copy_tree, remove_artifact_path};
+use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
+use crate::ledger_io::append_ledger_item;
+use crate::state::{PipelineState, append_json_line, atomic_write_json};
+use crate::workspace_capture::{
+    CaptureEntryKind, CaptureProjection, CapturePurpose, WorkspaceCaptureManifest,
+    WorkspaceCapturePolicy, capture_workspace, ensure_workspace_capture_policy,
+    freeze_workspace_capture_policy, materialize_capture_plan,
+};
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{FlightEvent, LedgerItem};
 #[cfg(test)]
@@ -11,16 +20,6 @@ use deadreckon_protocol::{FlightEventKind, FlightUsage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
-use walkdir::WalkDir;
-
-use crate::artifact_policy::{
-    WorkspacePathClass, classify_workspace_path, is_checkpointable_workspace_path,
-    is_deliverable_workspace_path,
-};
-use crate::artifacts::{copy_recoverable_tree, copy_tree};
-use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
-use crate::ledger_io::append_ledger_item;
-use crate::state::{PipelineState, append_json_line, atomic_write_json};
 
 pub const FLIGHT_MANIFEST_JSON: &str = "flight-manifest.json";
 pub const FLIGHT_EVENTS_JSONL: &str = "flight-events.jsonl";
@@ -115,6 +114,8 @@ pub struct CheckpointManifest {
     pub full_anchor: bool,
     pub files: Vec<CheckpointFileChange>,
     pub working_tree_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<WorkspaceCaptureManifest>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +212,7 @@ pub struct FileFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkingFileIndex {
     pub files: BTreeMap<PathBuf, FileFingerprint>,
+    pub capture: Option<WorkspaceCaptureManifest>,
 }
 
 /// The filesystem kind bound into a verified deliverable tree.
@@ -347,53 +349,30 @@ pub fn list_checkpoint_manifests(state: &PipelineState) -> Result<Vec<Checkpoint
 }
 
 pub fn build_working_file_index(root: &Path) -> Result<WorkingFileIndex> {
-    let mut files = BTreeMap::new();
-    if !root.exists() {
-        return Ok(WorkingFileIndex { files });
-    }
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|entry| !ignored_working_entry(entry.path(), root))
-    {
-        let entry = entry.map_err(|source| DeadreckonError::Io {
-            path: root.to_path_buf(),
-            source: source.into(),
-        })?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("working path prefix error: {err}"))
-        })?;
-        let metadata = match fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
-                return Err(DeadreckonError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        let hash = match sha256_file(path) {
-            Ok(hash) => hash,
-            Err(DeadreckonError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        files.insert(
-            relative.to_path_buf(),
-            FileFingerprint {
-                hash,
-                size: metadata.len(),
-            },
-        );
-    }
-    Ok(WorkingFileIndex { files })
+    let policy = freeze_workspace_capture_policy(root)?;
+    build_working_file_index_with_policy(root, &policy)
+}
+
+pub fn build_working_file_index_for_state(state: &PipelineState) -> Result<WorkingFileIndex> {
+    let policy = ensure_workspace_capture_policy(state)?;
+    build_working_file_index_with_policy(&state.working_dir, &policy)
+}
+
+pub fn build_working_file_index_with_policy(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<WorkingFileIndex> {
+    let capture = capture_workspace(
+        root,
+        policy,
+        CaptureProjection::Checkpoint,
+        CapturePurpose::FlightCheckpoint,
+    )?;
+    let files = fingerprint_working_capture(&capture)?;
+    Ok(WorkingFileIndex {
+        files,
+        capture: Some(capture.manifest),
+    })
 }
 
 /// Hash only paths eligible to cross the verified result boundary.
@@ -402,7 +381,23 @@ pub fn build_working_file_index(root: &Path) -> Result<WorkingFileIndex> {
 /// provider evidence is recoverable. Authority, semantic, receipt and
 /// promotion code must use this narrower projection.
 pub fn build_deliverable_file_index(root: &Path) -> Result<ArtifactFileIndex> {
-    build_artifact_file_index(root, is_deliverable_workspace_path)
+    let policy = freeze_workspace_capture_policy(root)?;
+    build_artifact_file_index(
+        root,
+        &policy,
+        CaptureProjection::Deliverable,
+        CapturePurpose::DeliverableIndex,
+    )
+}
+
+pub fn build_deliverable_file_index_for_state(state: &PipelineState) -> Result<ArtifactFileIndex> {
+    let policy = ensure_workspace_capture_policy(state)?;
+    build_artifact_file_index(
+        &state.working_dir,
+        &policy,
+        CaptureProjection::Deliverable,
+        CapturePurpose::DeliverableIndex,
+    )
 }
 
 /// Hash every agent-visible workspace path while excluding only runtime
@@ -412,80 +407,79 @@ pub fn build_deliverable_file_index(root: &Path) -> Result<ArtifactFileIndex> {
 /// guard: provider evidence and lifecycle metadata are not deliverables, but a
 /// judge must not be allowed to change them.
 pub fn build_workspace_guard_file_index(root: &Path) -> Result<ArtifactFileIndex> {
-    build_artifact_file_index(root, |path| {
-        classify_workspace_path(path) != WorkspacePathClass::RuntimeOnly
-    })
+    let policy = freeze_workspace_capture_policy(root)?;
+    build_artifact_file_index(
+        root,
+        &policy,
+        CaptureProjection::WorkspaceGuard,
+        CapturePurpose::WorkspaceGuard,
+    )
 }
 
-fn build_artifact_file_index(root: &Path, include: fn(&Path) -> bool) -> Result<ArtifactFileIndex> {
-    let mut files = BTreeMap::new();
-    let root_metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ArtifactFileIndex { files });
-        }
-        Err(source) => {
-            return Err(DeadreckonError::Io {
-                path: root.to_path_buf(),
-                source,
-            });
-        }
-    };
-    if !root_metadata.file_type().is_dir() {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "deliverable index root is not a directory: {}",
-            root.display()
-        )));
-    }
+pub fn build_workspace_guard_file_index_for_state(
+    state: &PipelineState,
+) -> Result<ArtifactFileIndex> {
+    let policy = ensure_workspace_capture_policy(state)?;
+    build_artifact_file_index(
+        &state.working_dir,
+        &policy,
+        CaptureProjection::WorkspaceGuard,
+        CapturePurpose::WorkspaceGuard,
+    )
+}
 
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry
-                .path()
-                .strip_prefix(root)
-                .ok()
-                .is_none_or(|relative| relative.as_os_str().is_empty() || include(relative))
-        })
-    {
-        let entry = entry.map_err(|source| DeadreckonError::Io {
-            path: root.to_path_buf(),
-            source: source.into(),
-        })?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).map_err(|err| {
-            DeadreckonError::InvalidInput(format!("deliverable path prefix error: {err}"))
-        })?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(path).with_path(path)?;
-        let file_type = metadata.file_type();
-        let fingerprint = if file_type.is_file() {
-            ArtifactFileFingerprint {
+fn build_artifact_file_index(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+    projection: CaptureProjection,
+    purpose: CapturePurpose,
+) -> Result<ArtifactFileIndex> {
+    let capture = capture_workspace(root, policy, projection, purpose)?;
+    capture.require_complete("verified artifact index")?;
+    let mut files = BTreeMap::new();
+    for entry in capture.entries {
+        let metadata = fs::symlink_metadata(&entry.source).with_path(&entry.source)?;
+        let fingerprint = match entry.kind {
+            CaptureEntryKind::RegularFile => ArtifactFileFingerprint {
                 kind: regular_file_kind(&metadata),
-                hash: sha256_file(path)?,
+                hash: sha256_file(&entry.source)?,
                 size: metadata.len(),
+            },
+            CaptureEntryKind::SymbolicLink => {
+                let target = fs::read_link(&entry.source).with_path(&entry.source)?;
+                ArtifactFileFingerprint {
+                    kind: ArtifactFileKind::SymbolicLink,
+                    hash: sha256_path_identity(&target),
+                    size: path_identity_len(&target),
+                }
             }
-        } else if file_type.is_symlink() {
-            let target = fs::read_link(path).with_path(path)?;
-            ArtifactFileFingerprint {
-                kind: ArtifactFileKind::SymbolicLink,
-                hash: sha256_path_identity(&target),
-                size: path_identity_len(&target),
-            }
-        } else if file_type.is_dir() {
-            continue;
-        } else {
-            return Err(DeadreckonError::InvalidInput(format!(
-                "unsupported deliverable filesystem entry at {}",
-                path.display()
-            )));
         };
-        files.insert(relative.to_path_buf(), fingerprint);
+        files.insert(entry.relative, fingerprint);
     }
     Ok(ArtifactFileIndex { files })
+}
+
+fn fingerprint_working_capture(
+    capture: &crate::workspace_capture::WorkspaceCapturePlan,
+) -> Result<BTreeMap<PathBuf, FileFingerprint>> {
+    let mut files = BTreeMap::new();
+    for entry in &capture.entries {
+        let fingerprint = match entry.kind {
+            CaptureEntryKind::RegularFile => FileFingerprint {
+                hash: sha256_file(&entry.source)?,
+                size: entry.size,
+            },
+            CaptureEntryKind::SymbolicLink => {
+                let target = fs::read_link(&entry.source).with_path(&entry.source)?;
+                FileFingerprint {
+                    hash: sha256_path_identity(&target),
+                    size: path_identity_len(&target),
+                }
+            }
+        };
+        files.insert(entry.relative.clone(), fingerprint);
+    }
+    Ok(files)
 }
 
 pub fn capture_delta_checkpoint(
@@ -532,25 +526,41 @@ pub fn capture_delta_checkpoint(
             Some(_) => {}
         }
     }
-    for (relative, before_fingerprint) in &before.files {
-        if after.files.contains_key(relative) {
-            continue;
+    let capture_partial = after
+        .capture
+        .as_ref()
+        .is_some_and(|capture| capture.partial);
+    if !capture_partial {
+        for (relative, before_fingerprint) in &before.files {
+            if after.files.contains_key(relative) {
+                continue;
+            }
+            files.push(CheckpointFileChange {
+                path: relative.clone(),
+                change: CheckpointChangeKind::Deleted,
+                before_hash: Some(before_fingerprint.hash.clone()),
+                after_hash: None,
+                after_bytes: None,
+            });
         }
-        files.push(CheckpointFileChange {
-            path: relative.clone(),
-            change: CheckpointChangeKind::Deleted,
-            before_hash: Some(before_fingerprint.hash.clone()),
-            after_hash: None,
-            after_bytes: None,
-        });
     }
 
-    if request.full_anchor {
-        copy_recoverable_tree(&state.working_dir, &tmp_dir.join("anchor"))?;
-    }
+    let capture = if request.full_anchor {
+        let policy = ensure_workspace_capture_policy(state)?;
+        let anchor = capture_workspace(
+            &state.working_dir,
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::FlightCheckpoint,
+        )?;
+        materialize_capture_plan(&anchor, &tmp_dir.join("anchor"))?;
+        Some(anchor.manifest)
+    } else {
+        after.capture.clone()
+    };
 
     let manifest = CheckpointManifest {
-        version: 1,
+        version: 2,
         checkpoint_id: request.checkpoint_id.clone(),
         run_id: state.run_id.clone(),
         flight_session_id: request.flight_session_id,
@@ -563,6 +573,7 @@ pub fn capture_delta_checkpoint(
         full_anchor: request.full_anchor,
         files,
         working_tree_hash: after.tree_hash(),
+        capture,
     };
     write_json_pretty_atomic(&tmp_dir.join("manifest.json"), &manifest)?;
     fs::rename(&tmp_dir, &final_dir).with_path(&final_dir)?;
@@ -584,6 +595,17 @@ pub fn materialize_checkpoint(
                 && manifest.checkpoint_id <= target.checkpoint_id
         })
         .collect::<Vec<_>>();
+
+    if session_manifests.iter().any(|manifest| {
+        manifest
+            .capture
+            .as_ref()
+            .is_some_and(|capture| capture.partial)
+    }) {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "checkpoint {checkpoint_id} cannot be materialized because its workspace capture is partial"
+        )));
+    }
 
     if output_dir.exists() {
         fs::remove_dir_all(output_dir).with_path(output_dir)?;
@@ -615,11 +637,27 @@ pub fn materialize_checkpoint(
 impl WorkingFileIndex {
     pub fn tree_hash(&self) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(b"deadreckon-working-tree-v2\0");
         for (path, fingerprint) in &self.files {
-            hasher.update(path.to_string_lossy().as_bytes());
+            update_path_identity(&mut hasher, path);
             hasher.update(b"\0");
             hasher.update(fingerprint.hash.as_bytes());
             hasher.update(b"\0");
+        }
+        if let Some(capture) = &self.capture {
+            hasher.update(capture.policy_sha256.as_bytes());
+            hasher.update([u8::from(capture.partial)]);
+            for omission in &capture.omissions {
+                update_path_identity(&mut hasher, &omission.path);
+                if let Ok(reason) = serde_json::to_vec(&omission.reason) {
+                    hasher.update(reason);
+                }
+                hasher.update(omission.file_count.to_le_bytes());
+                hasher.update(omission.total_bytes.to_le_bytes());
+                if let Some(digest) = &omission.metadata_sha256 {
+                    hasher.update(digest.as_bytes());
+                }
+            }
         }
         let digest = hasher.finalize();
         format_sha256(&digest)
@@ -759,19 +797,10 @@ where
         .collect()
 }
 
-fn ignored_working_entry(path: &Path, root: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    !relative.as_os_str().is_empty() && !is_checkpointable_workspace_path(relative)
-}
-
 fn copy_checkpoint_file(working_dir: &Path, checkpoint_tmp: &Path, relative: &Path) -> Result<()> {
     let source = working_dir.join(relative);
     let dest = checkpoint_tmp.join("files").join(relative);
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_path(parent)?;
-    }
-    fs::copy(&source, &dest).with_path(&dest)?;
-    Ok(())
+    copy_artifact_path(&source, &dest)
 }
 
 fn apply_checkpoint_delta(
@@ -791,15 +820,10 @@ fn apply_checkpoint_delta(
                         change.path.display()
                     ))
                 })?;
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent).with_path(parent)?;
-                }
-                fs::copy(checkpoint.join(after), &target).with_path(&target)?;
+                copy_artifact_path(&checkpoint.join(after), &target)?;
             }
             CheckpointChangeKind::Deleted => {
-                if target.exists() {
-                    fs::remove_file(&target).with_path(&target)?;
-                }
+                remove_artifact_path(&target)?;
             }
             CheckpointChangeKind::SkippedOversize => {}
         }
@@ -1006,6 +1030,49 @@ mod tests {
                 .join("files/created.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn partial_checkpoint_reports_omissions_and_cannot_be_materialized() {
+        let (_temp, state) = fixture();
+        let mut policy =
+            crate::freeze_workspace_capture_policy(&state.working_dir).expect("capture policy");
+        policy.budgets.max_total_bytes = 1;
+        crate::write_workspace_capture_policy(&state.run_root, &policy).expect("persist policy");
+        fs::write(state.working_dir.join("answer.txt"), "more than one byte").expect("answer");
+        let mut before = WorkingFileIndex::default();
+        before.files.insert(
+            PathBuf::from("missing-from-partial.txt"),
+            FileFingerprint {
+                hash: sha256_text("before"),
+                size: 6,
+            },
+        );
+        let after = build_working_file_index_for_state(&state).expect("bounded index");
+        assert!(
+            after
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.partial)
+        );
+
+        let manifest =
+            capture_delta_checkpoint(&state, &before, &after, request("cp-000001", false))
+                .expect("partial checkpoint manifest");
+        assert!(
+            manifest
+                .capture
+                .as_ref()
+                .is_some_and(|capture| capture.partial)
+        );
+        assert!(manifest.files.iter().all(|change| {
+            change.path != Path::new("missing-from-partial.txt")
+                || change.change != CheckpointChangeKind::Deleted
+        }));
+        let error =
+            materialize_checkpoint(&state, "cp-000001", &state.run_root.join("partial-preview"))
+                .expect_err("partial checkpoint must fail closed");
+        assert!(error.to_string().contains("workspace capture is partial"));
     }
 
     #[test]

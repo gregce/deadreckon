@@ -1572,6 +1572,7 @@ fn write_timeline_checkpoint(
         full_anchor: false,
         files,
         working_tree_hash: format!("hash-{checkpoint_id}"),
+        capture: None,
     };
     let dir = deadreckon_core::flight::checkpoint_dir(state, checkpoint_id);
     std::fs::create_dir_all(&dir).expect("checkpoint dir");

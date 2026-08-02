@@ -45,10 +45,12 @@ pub use artifact_policy::{
     is_promotable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
 };
 pub use artifacts::{
-    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, append_provenance, append_spend,
-    append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
-    copy_recoverable_tree, copy_tree, diff_snapshots, diff_working_trees, inventory_files,
-    inventory_recoverable_files, remove_artifact_path, restore_snapshot, snapshot_diff,
+    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, SNAPSHOT_CAPTURE_MANIFESTS_DIR,
+    append_provenance, append_spend, append_trace, copy_artifact_path, copy_deliverable_tree,
+    copy_promotable_tree, copy_recoverable_tree, copy_recoverable_tree_with_policy, copy_tree,
+    diff_snapshots, diff_working_trees, inventory_files, inventory_recoverable_files,
+    inventory_recoverable_files_for_state, inventory_recoverable_files_with_policy,
+    remove_artifact_path, restore_snapshot, snapshot_capture_manifest_path, snapshot_diff,
     snapshot_working,
 };
 pub use cancel::{

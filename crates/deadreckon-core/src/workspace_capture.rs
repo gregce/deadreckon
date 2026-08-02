@@ -611,8 +611,11 @@ pub fn capture_workspace(
         .lock()
         .map_err(|_| DeadreckonError::InvalidInput("capture prune ledger poisoned".to_string()))?
         .clone();
+    let capture_deadline = started
+        .checked_add(Duration::from_millis(policy.budgets.max_traversal_millis))
+        .unwrap_or_else(Instant::now);
     for (path, reason) in pruned {
-        let summary = summarize_omitted_subtree(root, &path);
+        let summary = summarize_omitted_subtree(root, &path, capture_deadline);
         push_omission(
             &mut omissions,
             &mut omissions_truncated,
@@ -1427,7 +1430,11 @@ struct SubtreeSummary {
     partial: bool,
 }
 
-fn summarize_omitted_subtree(root: &Path, relative: &Path) -> SubtreeSummary {
+fn summarize_omitted_subtree(
+    root: &Path,
+    relative: &Path,
+    capture_deadline: Instant,
+) -> SubtreeSummary {
     let absolute = root.join(relative);
     let started = Instant::now();
     let mut files = 0_u64;
@@ -1448,7 +1455,8 @@ fn summarize_omitted_subtree(root: &Path, relative: &Path) -> SubtreeSummary {
         .hidden(false)
         .follow_links(false);
     for entry in builder.build() {
-        if files >= OMITTED_SUMMARY_FILES
+        if Instant::now() >= capture_deadline
+            || files >= OMITTED_SUMMARY_FILES
             || started.elapsed() > Duration::from_millis(OMITTED_SUMMARY_MILLIS)
         {
             partial = true;
