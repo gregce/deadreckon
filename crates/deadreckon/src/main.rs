@@ -8873,7 +8873,16 @@ fn seed_plan_result_worktree(
 }
 
 fn clear_plan_result_deliverables(worktree_path: &Path) -> Result<()> {
-    for relative in build_deliverable_file_index(worktree_path)?.files.keys() {
+    // The verified index deliberately retains tracked files under conventional
+    // runtime roots so they cannot disappear from evidence. Plan replacement
+    // has a narrower mutation boundary: clear only paths the plan is allowed
+    // to commit, preserving private base state such as a tracked `target/`
+    // artifact without promoting a child's generated output.
+    for relative in build_deliverable_file_index(worktree_path)?
+        .files
+        .keys()
+        .filter(|relative| is_plan_committable_path(relative))
+    {
         remove_artifact_path(&worktree_path.join(relative))?;
     }
     Ok(())
