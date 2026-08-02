@@ -144,7 +144,6 @@ pub(crate) enum StartDoneCriteriaSource {
     Detected,
     /// The operator answered the one launch question in English.
     Asked,
-    DefaultGate,
     Missing,
 }
 
@@ -156,7 +155,6 @@ impl StartDoneCriteriaSource {
             Self::Manual => "manual",
             Self::Detected => "detected",
             Self::Asked => "asked",
-            Self::DefaultGate => "default",
             Self::Missing => "missing",
         }
     }
@@ -1811,21 +1809,29 @@ pub(crate) fn resolve_start_orchestration_options(
 
 /// The one question `start` may ask (C-P8), and only when no contract was
 /// found or detected: "How will you know it worked?". A one-line answer is
-/// compiled through the existing def-done flow; pressing Enter accepts the
-/// default gate with its caveat. No menus, no second question.
+/// compiled through the existing def-done flow. Pressing Enter asks that same
+/// flow to draft practical, goal-derived criteria; an unknown project must not
+/// silently arm the directory-exists fallback that strict completion rejects.
 pub(crate) fn prompt_start_done_criteria(
     decision: &mut StartLaunchDecision,
     prompter: &mut dyn StartPrompter,
 ) -> Result<()> {
     let text = prompter.input(
-        "How will you know it worked? (one line; Enter = default gate) ",
+        "How will you know it worked? (one line; Enter = draft from goal) ",
         None,
     )?;
     let text = text.trim();
     if text.is_empty() {
-        decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
-        decision.done_action = StartDoneAction::DefaultGate;
-        decision.done_criteria_label = "default dr-gate behavior".to_string();
+        let request = format!(
+            "Draft practical acceptance checks that independently prove this goal: {}",
+            decision.goal
+        );
+        decision.done_criteria_source = StartDoneCriteriaSource::Asked;
+        decision.done_action = StartDoneAction::ManualText {
+            text: request,
+            overwrite_existing: false,
+        };
+        decision.done_criteria_label = "draft goal-derived done contract before launch".to_string();
         return Ok(());
     }
     decision.done_criteria_source = StartDoneCriteriaSource::Asked;
@@ -2495,14 +2501,20 @@ pub(crate) fn resolve_start_done_criteria(
     }
 
     if yes {
-        // Explicit consent to proceed: skip the question, carry the caveat
-        // (Polyglot doctrine — the gate will surface it, never silent green).
-        let caveat = contract
-            .caveat
-            .unwrap_or_else(|| "no test contract detected".to_string());
-        decision.done_criteria_source = StartDoneCriteriaSource::DefaultGate;
-        decision.done_action = StartDoneAction::DefaultGate;
-        decision.done_criteria_label = format!("default gate - caveat: {caveat}");
+        // `--yes` may approve a resolved launch, but it cannot invent and
+        // approve a definition of done. Unknown projects fail closed before a
+        // durable Job is created instead of starting with an unsealable gate.
+        decision.done_criteria_source = StartDoneCriteriaSource::Missing;
+        decision.done_action = StartDoneAction::Missing;
+        decision.done_criteria_label = format!("missing {NOUN_DONE_CONTRACT}");
+        set_start_recovery(
+            decision,
+            "unknown project has no durable done contract; --yes cannot approve the directory-exists fallback",
+            vec![format!(
+                "deadreckon def-done \"what should count as done\" && deadreckon start \"{}\" --yes",
+                shell_display_quote(&decision.goal)
+            )],
+        );
         return Ok(());
     }
 

@@ -681,6 +681,9 @@ async fn supervise_one_job(
     if finish_deadline_reached(paths, &token, &initial.job, None)? {
         return Ok(());
     }
+    if finish_wall_cap_reached(paths, &token, &initial.job, None)? {
+        return Ok(());
+    }
     match super::graph_job::recover_pending_driver_state(paths, &initial.job, &token) {
         Ok(super::graph_job::PendingDriverRecovery::BudgetExhausted {
             stop_reason,
@@ -1019,6 +1022,9 @@ async fn supervise_one_job(
         if finish_deadline_reached(paths, &token, &initial.job, None)? {
             return Ok(());
         }
+        if finish_wall_cap_reached(paths, &token, &initial.job, None)? {
+            return Ok(());
+        }
         let attempt_already_started = guarded_recovery
             .as_ref()
             .is_some_and(|recovery| recovery.attempt == attempt && recovery.attempt_started);
@@ -1050,6 +1056,9 @@ async fn supervise_one_job(
             return Ok(());
         }
         if finish_deadline_reached(paths, &token, &initial.job, None)? {
+            return Ok(());
+        }
+        if finish_wall_cap_reached(paths, &token, &initial.job, None)? {
             return Ok(());
         }
         match spawn_job_driver(paths, &initial.job, &instance.executable, &prepared) {
@@ -1741,7 +1750,12 @@ fn build_leaf_command(
     {
         command.arg("--provider").arg(provider);
     }
-    if let Some(model) = piece.and_then(|piece| piece.model.as_deref()) {
+    if let Some(model) = piece.and_then(|piece| piece.model.as_deref()).or(launch
+        .plan
+        .providers
+        .coder_model
+        .as_deref())
+    {
         command.arg("--model").arg(model);
     }
     if let Ok(Some(leaf)) = durable_leaf_spec(&launch.plan) {
@@ -2271,6 +2285,33 @@ async fn monitor_child(
         {
             return Ok(ChildMonitorOutcome::PolicyTerminal);
         }
+        if active_attempt_wall(paths, token.job_id.as_ref(), Utc::now())?
+            >= Duration::from_secs(job.policy.max_wall_seconds)
+        {
+            let terminalized = match &mut child {
+                MonitoredChild::Owned(child) => {
+                    // As with deadline enforcement, reap the owned leader in
+                    // parallel while reconciliation proves that its whole
+                    // process tree has stopped.
+                    let cleanup_paths = paths.clone();
+                    let cleanup_token = token.clone();
+                    let cleanup_job = job.clone();
+                    let cleanup = std::thread::spawn(move || {
+                        finish_wall_cap_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
+                    });
+                    let _ = child.wait();
+                    cleanup.join().map_err(|_| {
+                        CliError::Core(DeadreckonError::InvalidInput(
+                            "wall-cap cleanup thread panicked".to_string(),
+                        ))
+                    })??
+                }
+                MonitoredChild::Adopted(_) => finish_wall_cap_reached(paths, token, job, None)?,
+            };
+            if terminalized {
+                return Ok(ChildMonitorOutcome::PolicyTerminal);
+            }
+        }
         let status = match &mut child {
             MonitoredChild::Owned(child) => child.try_wait()?,
             MonitoredChild::Adopted(pid) if !pid_is_alive(*pid) => {
@@ -2287,13 +2328,18 @@ async fn monitor_child(
                 adopted: false,
             }));
         }
-        let sleep_for = job.policy.deadline.map_or(HEARTBEAT_INTERVAL, |deadline| {
+        let deadline_sleep = job.policy.deadline.map_or(HEARTBEAT_INTERVAL, |deadline| {
             deadline
                 .signed_duration_since(Utc::now())
                 .to_std()
                 .unwrap_or(Duration::ZERO)
                 .min(HEARTBEAT_INTERVAL)
         });
+        let active_wall = active_attempt_wall(paths, token.job_id.as_ref(), Utc::now())?;
+        let wall_sleep = Duration::from_secs(job.policy.max_wall_seconds)
+            .saturating_sub(active_wall)
+            .min(HEARTBEAT_INTERVAL);
+        let sleep_for = deadline_sleep.min(wall_sleep);
         tokio::time::sleep(sleep_for).await;
         heartbeat_job_lease(paths, token, Utc::now(), LEASE_TTL)?;
     }
@@ -2342,6 +2388,9 @@ async fn reconcile_child_exit(
         return Ok(ChildReconciliation::Finished);
     }
     if finish_deadline_reached(paths, token, job, Some(&exit))? {
+        return Ok(ChildReconciliation::Finished);
+    }
+    if finish_wall_cap_reached(paths, token, job, Some(&exit))? {
         return Ok(ChildReconciliation::Finished);
     }
     if matches!(job.shape, JobShape::Graph | JobShape::LegacyCampaign) {
@@ -4466,6 +4515,89 @@ fn finish_deadline_reached(
     Ok(true)
 }
 
+/// Enforce the approved wall budget across every active attempt interval.
+///
+/// The child process's own wall timer cannot cover controller work after the
+/// provider exits, such as evidence capture, Git inspection, or receipt
+/// sealing. The supervisor therefore derives cumulative active time from the
+/// append-only AttemptStarted/AttemptStopped history and applies the boundary
+/// to the complete process tree. An attempt left active across a supervisor or
+/// machine restart continues consuming its wall allowance.
+fn finish_wall_cap_reached(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    let wall_cap = Duration::from_secs(job.policy.max_wall_seconds);
+    let active_wall = active_attempt_wall(paths, token.job_id.as_ref(), Utc::now())?;
+    if active_wall < wall_cap {
+        return Ok(false);
+    }
+    if let Err(error) =
+        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
+            .and_then(|()| {
+                super::graph_job::reconcile_campaign_sub_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| {
+                super::graph_job::reconcile_merge_repair_processes_for_job(
+                    paths,
+                    token.job_id.as_ref(),
+                    Duration::from_secs(2),
+                )
+            })
+            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+    {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "approved wall cap was exhausted, but not every supervised process could be proven stopped: {error}"
+            ),
+        )?;
+        return Ok(true);
+    }
+    let active_wall = active_attempt_wall(paths, token.job_id.as_ref(), Utc::now())?;
+    let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
+    if attempt_active {
+        append_attempt_stopped(
+            paths,
+            token,
+            StopReason::WallCap,
+            json!({
+                "reason": "approved cumulative active-attempt wall cap was exhausted",
+                "max_wall_seconds": job.policy.max_wall_seconds,
+                "active_wall_seconds": active_wall.as_secs_f64(),
+                "exit": exit.map(exit_detail),
+            }),
+        )?;
+    }
+    append_terminal_event(
+        paths,
+        token,
+        JobEventKind::BudgetExhausted,
+        StopReason::WallCap,
+        json!({
+            "reason": if attempt_active {
+                "approved cumulative active-attempt wall cap was exhausted during the active durable attempt"
+            } else {
+                "approved cumulative active-attempt wall cap was exhausted before the next attempt"
+            },
+            "max_wall_seconds": job.policy.max_wall_seconds,
+            "active_wall_seconds": active_wall.as_secs_f64(),
+        }),
+    )?;
+    Ok(true)
+}
+
 fn block_for_lost_containment(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
@@ -4501,6 +4633,68 @@ fn attempt_is_active(paths: &DeadreckonPaths, job_id: &str) -> Result<bool> {
             _ => None,
         })
         .unwrap_or(false))
+}
+
+fn active_attempt_wall(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<Duration> {
+    let history = read_job_history(&paths.job_events(job_id))?;
+    let mut total = Duration::ZERO;
+    let mut active_since = None;
+    for event in history.events() {
+        match event.kind {
+            JobEventKind::AttemptStarted => {
+                if active_since.is_some() {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "job history starts a new attempt before stopping the previous attempt"
+                            .to_string(),
+                    )));
+                }
+                active_since = Some(event.timestamp);
+            }
+            JobEventKind::AttemptStopped => {
+                let started = active_since.take().ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "job history stops an attempt that was not active".to_string(),
+                    ))
+                })?;
+                total = total
+                    .checked_add(nonnegative_wall_interval(started, event.timestamp)?)
+                    .ok_or_else(|| {
+                        CliError::Core(DeadreckonError::InvalidInput(
+                            "cumulative active-attempt wall time overflowed".to_string(),
+                        ))
+                    })?;
+            }
+            _ => {}
+        }
+    }
+    if let Some(started) = active_since {
+        total = total
+            .checked_add(nonnegative_wall_interval(started, now)?)
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "cumulative active-attempt wall time overflowed".to_string(),
+                ))
+            })?;
+    }
+    Ok(total)
+}
+
+fn nonnegative_wall_interval(
+    started: chrono::DateTime<Utc>,
+    stopped: chrono::DateTime<Utc>,
+) -> Result<Duration> {
+    stopped
+        .signed_duration_since(started)
+        .to_std()
+        .map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "job attempt timestamps move backwards".to_string(),
+            ))
+        })
 }
 
 fn merge_stop_reason(reason: StopReason, extra: Value) -> Value {
@@ -4647,6 +4841,16 @@ mod tests {
         CourseBudget, CourseContract, CourseEscape, CourseProviders, CourseResolution,
         ResolutionSource,
     };
+
+    fn write_admission_contract(source: &Path) -> PathBuf {
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: supervisor fixture\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/fixture-proof.txt'\n    must_pass: true\n",
+        )
+        .expect("fixture contract");
+        contract
+    }
 
     #[test]
     fn release_ack_persists_only_the_capability_digest() {
@@ -6116,6 +6320,7 @@ mod tests {
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
+        let contract = write_admission_contract(&source);
         let deadline = Utc::now() - chrono::TimeDelta::seconds(1);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
@@ -6128,7 +6333,7 @@ mod tests {
             ),
             shape: deadreckon_protocol::JobShape::Single,
             driver: None,
-            contract_source: None,
+            contract_source: Some(&contract),
             source: super::super::job::DurableSource {
                 mode: super::super::job::DurableSourceMode::Copy,
                 from: Some(source.clone()),
@@ -6209,6 +6414,7 @@ mod tests {
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
+        let contract = write_admission_contract(&source);
         let deadline = Utc::now() + chrono::TimeDelta::milliseconds(300);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
@@ -6221,7 +6427,7 @@ mod tests {
             ),
             shape: deadreckon_protocol::JobShape::Single,
             driver: None,
-            contract_source: None,
+            contract_source: Some(&contract),
             source: super::super::job::DurableSource {
                 mode: super::super::job::DurableSourceMode::Copy,
                 from: Some(source.clone()),
@@ -6312,6 +6518,231 @@ mod tests {
             Some(deadreckon_protocol::JobOutcome::DeadlineReached)
         );
         assert_eq!(view.projection.stop_reason, Some(StopReason::Deadline));
+    }
+
+    #[test]
+    fn active_attempt_wall_accumulates_completed_and_current_attempts() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 2);
+        let started = Utc::now() - chrono::TimeDelta::seconds(10);
+        for (sequence, kind, timestamp, detail) in [
+            (
+                3,
+                JobEventKind::AttemptStarted,
+                started,
+                attempt_detail(&job, 1),
+            ),
+            (
+                4,
+                JobEventKind::AttemptStopped,
+                started + chrono::TimeDelta::seconds(2),
+                merge_stop_reason(StopReason::TransientProvider, Value::Null),
+            ),
+            (
+                5,
+                JobEventKind::AttemptStarted,
+                started + chrono::TimeDelta::seconds(4),
+                attempt_detail(&job, 2),
+            ),
+        ] {
+            append_job_event(
+                &paths,
+                &JobEvent {
+                    schema_version: JobSchemaVersion::CURRENT,
+                    job_id: job.job_id.clone(),
+                    sequence: JobEventSequence::new(sequence).expect("sequence"),
+                    event_id: format!("wall-history-{sequence}"),
+                    causation_id: format!("wall-history-{sequence}"),
+                    timestamp,
+                    lease_epoch: 0,
+                    kind,
+                    detail,
+                },
+            )
+            .expect("wall history event");
+        }
+
+        assert_eq!(
+            active_attempt_wall(
+                &paths,
+                job.job_id.as_ref(),
+                started + chrono::TimeDelta::seconds(7),
+            )
+            .expect("active wall"),
+            Duration::from_secs(5),
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_cumulative_wall_stops_before_another_attempt_is_launched() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 2);
+        job.policy.max_wall_seconds = 1;
+        fs::write(
+            paths.job_json(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&job).expect("job json"),
+        )
+        .expect("wall-limited job");
+        let started = Utc::now() - chrono::TimeDelta::seconds(3);
+        for (sequence, kind, timestamp, detail) in [
+            (
+                3,
+                JobEventKind::AttemptStarted,
+                started,
+                attempt_detail(&job, 1),
+            ),
+            (
+                4,
+                JobEventKind::AttemptStopped,
+                started + chrono::TimeDelta::seconds(2),
+                merge_stop_reason(StopReason::TransientProvider, Value::Null),
+            ),
+        ] {
+            append_job_event(
+                &paths,
+                &JobEvent {
+                    schema_version: JobSchemaVersion::CURRENT,
+                    job_id: job.job_id.clone(),
+                    sequence: JobEventSequence::new(sequence).expect("sequence"),
+                    event_id: format!("spent-wall-{sequence}"),
+                    causation_id: format!("spent-wall-{sequence}"),
+                    timestamp,
+                    lease_epoch: 0,
+                    kind,
+                    detail,
+                },
+            )
+            .expect("spent wall event");
+        }
+
+        supervise_one_job(
+            &paths,
+            &instance(temp.path().join("must-not-launch")),
+            job.job_id.as_ref(),
+        )
+        .await
+        .expect("wall-cap classification");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("job view");
+        assert_eq!(view.projection.attempt_count, 1);
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::BudgetExhausted)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::WallCap));
+        let history =
+            read_job_history(&paths.job_events(job.job_id.as_ref())).expect("wall history");
+        assert_eq!(
+            history
+                .events()
+                .iter()
+                .filter(|event| event.kind == JobEventKind::AttemptStarted)
+                .count(),
+            1,
+            "the exhausted Job launched another attempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_wall_cap_stops_the_active_process_tree_before_terminalizing() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 2);
+        job.policy.max_wall_seconds = 1;
+        fs::write(
+            paths.job_json(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&job).expect("job json"),
+        )
+        .expect("wall-limited job");
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let (child, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("sleep 30 & echo $! > \"$DEADRECKON_TEST_PID_FILE\"; wait")
+                .env("DEADRECKON_TEST_PID_FILE", &descendant_pid_path);
+            command
+        })
+        .expect("long-running process tree");
+        let child_pid = child.id();
+        let descendant_deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_pid_path.is_file() && Instant::now() < descendant_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = fs::read_to_string(&descendant_pid_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        let launch_id = Uuid::new_v4().to_string();
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: child_pid,
+                pgid: Some(child_pid),
+            },
+            launch_id: Some(launch_id),
+            attempt: Some(1),
+            release_token_sha256: Some(deadreckon_core::flight::sha256_text("wall-test")),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start_identity(child_pid),
+        };
+        write_child_metadata(&child_metadata_path(&paths, job.job_id.as_ref()), &metadata)
+            .expect("child metadata");
+        let owner = instance(temp.path().join("must-not-launch")).owner;
+        let token = claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL)
+            .expect("claim")
+            .token();
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "active-wall-attempt".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("attempt started");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "active-wall-child".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("child linked");
+
+        let outcome = monitor_child(&paths, &token, &job, MonitoredChild::Owned(child))
+            .await
+            .expect("wall cap stops active process tree");
+
+        assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
+        assert!(!pid_is_alive(child_pid));
+        let descendant_exit_deadline = Instant::now() + Duration::from_secs(2);
+        while pid_is_alive(descendant_pid) && Instant::now() < descendant_exit_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !pid_is_alive(descendant_pid),
+            "the descendant survived wall-cap process-tree reconciliation"
+        );
+        assert!(!child_metadata_path(&paths, job.job_id.as_ref()).exists());
+        let history =
+            read_job_history(&paths.job_events(job.job_id.as_ref())).expect("wall-cap history");
+        assert!(history.events().iter().any(|event| {
+            event.kind == JobEventKind::AttemptStopped
+                && event.detail.get("stop_reason")
+                    == Some(&serde_json::to_value(StopReason::WallCap).expect("stop reason"))
+        }));
+        assert!(
+            !history
+                .events()
+                .iter()
+                .any(|event| event.kind == JobEventKind::RetryScheduled)
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("wall-cap view");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::BudgetExhausted)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::WallCap));
     }
 
     #[test]
@@ -9424,6 +9855,47 @@ mod tests {
                 .find(|(key, _)| *key == "DEADRECKON_SCOPE_ROOT")
                 .and_then(|(_, value)| value),
             Some(job.source_cwd.as_os_str())
+        );
+    }
+
+    #[test]
+    fn root_run_uses_the_frozen_coder_model_unless_the_piece_overrides_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let mut launch = load_launch_inputs(&paths, &job).expect("launch");
+        launch.plan.providers.coder_model = Some("provider-current-model".to_string());
+
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let model = args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("--model");
+        assert_eq!(
+            args.get(model + 1),
+            Some(&OsString::from("provider-current-model"))
+        );
+
+        launch.plan.pieces.push(super::super::course::CoursePiece {
+            id: "direct".to_string(),
+            goal: job.goal.clone(),
+            done_hint: None,
+            role: Some("coder".to_string()),
+            provider: None,
+            model: Some("piece-override-model".to_string()),
+            budget_usd: None,
+            depends_on: Vec::new(),
+            subplan: None,
+        });
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        let model = args
+            .iter()
+            .position(|arg| arg == "--model")
+            .expect("--model");
+        assert_eq!(
+            args.get(model + 1),
+            Some(&OsString::from("piece-override-model"))
         );
     }
 

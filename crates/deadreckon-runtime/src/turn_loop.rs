@@ -31,8 +31,8 @@ use deadreckon_core::artifact_policy::{
     delivery_git_exclude_pathspecs, evidence_only_roots, is_deliverable_workspace_path,
 };
 use deadreckon_core::artifacts::{
-    ProvenanceRecord, append_provenance, append_spend, append_trace, copy_tree, inventory_files,
-    snapshot_working,
+    ProvenanceRecord, append_provenance, append_spend, append_trace, copy_recoverable_tree,
+    copy_tree, inventory_recoverable_files, snapshot_working,
 };
 use deadreckon_core::cancel::{cancel_marker_path_for_run_root, cancel_marker_present};
 use deadreckon_core::codebase::{
@@ -657,6 +657,13 @@ async fn run_turn_loop_inner(
                 wall_time_seconds: response.spend.wall_time_seconds,
             },
         )?;
+        // Provider completion is a durable progress boundary. Everything that
+        // follows (snapshotting, provenance, Git post-processing, docs, and
+        // gates) is local work that can fail or be interrupted independently.
+        // Persist the provider accounting before entering that boundary so a
+        // supervisor/operator never sees a turn-0, zero-spend zombie after the
+        // provider has already returned useful work.
+        save_state(state)?;
         if config
             .max_spend_usd
             .is_some_and(|cap| state.total_spend_usd > cap)
@@ -2143,7 +2150,7 @@ fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Re
         .join("snapshots")
         .join(format!("turn-{snapshot_turn}"));
     let before = file_set(&snapshot_dir)?;
-    let after_files = inventory_files(&state.working_dir)?;
+    let after_files = inventory_recoverable_files(&state.working_dir)?;
     let mut changed = Vec::new();
     for file in after_files {
         let relative = file.strip_prefix(&state.working_dir).map_err(|err| {
@@ -2178,7 +2185,7 @@ fn deliverable_changed_files(state: &PipelineState, changed: &[PathBuf]) -> Resu
 }
 
 fn file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    Ok(inventory_files(root)?
+    Ok(inventory_recoverable_files(root)?
         .into_iter()
         .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf))
         .collect())
@@ -3357,7 +3364,7 @@ pub async fn run_contained_verdict_evaluation(
 
     let scratch = TempDir::new().with_path(PathBuf::from("verdict-scratch"))?;
     let scratch_working_dir = scratch.path().join("workspace");
-    copy_tree(&state.working_dir, &scratch_working_dir)?;
+    copy_recoverable_tree(&state.working_dir, &scratch_working_dir)?;
     let pid_file = scratch.path().join("dr-gate-evaluate.pid");
     let result = run_keyless_gate_evaluation(
         state,
@@ -7711,6 +7718,12 @@ storage = "jsonl"
             "provider-private untracked evidence\n",
         )
         .expect("untracked private evidence");
+        std::fs::create_dir_all(repository.join(".build/debug")).expect("SwiftPM output");
+        std::fs::write(
+            repository.join(".build/debug/Cloudwing"),
+            "rebuildable binary",
+        )
+        .expect("SwiftPM artifact");
 
         let raw_changed = changed_files_since_snapshot(&state, 0).expect("raw changes");
         let deliverable =
@@ -7719,6 +7732,12 @@ storage = "jsonl"
             raw_changed
                 .iter()
                 .any(|path| path.ends_with(".specstory/history/untracked.md"))
+        );
+        assert!(
+            raw_changed
+                .iter()
+                .all(|path| !path.ends_with(".build/debug/Cloudwing")),
+            "disposable build output must be pruned before changed-file and provenance scanning"
         );
         assert_eq!(
             deliverable
@@ -7743,6 +7762,10 @@ storage = "jsonl"
             std::fs::read_to_string(state.run_root.join("provenance.jsonl"))
                 .expect("provenance")
                 .contains(".specstory")
+        );
+        assert!(
+            !state.run_root.join("snapshots/turn-1/.build").exists(),
+            "disposable build output must never enter turn snapshots"
         );
 
         commit_worktree_turn(&state, 1, "cli_subagent").expect("sanitized first turn");

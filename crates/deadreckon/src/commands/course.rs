@@ -1675,8 +1675,7 @@ pub(crate) fn launch_plan_from_decision(
             super::start::StartDoneCriteriaSource::Project
             | super::start::StartDoneCriteriaSource::Generated
             | super::start::StartDoneCriteriaSource::Manual => ContractOrigin::Operator,
-            super::start::StartDoneCriteriaSource::DefaultGate
-            | super::start::StartDoneCriteriaSource::Missing => ContractOrigin::None,
+            super::start::StartDoneCriteriaSource::Missing => ContractOrigin::None,
         },
         kind: None,
         summary: Some(decision.done_criteria_label.clone()),

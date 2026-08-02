@@ -210,6 +210,12 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         &authority_source_cwd,
         &contract_path,
     )?;
+    deadreckon_core::validate_strict_contract(&contract_path, job_id.as_ref()).map_err(|error| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!("durable Job cannot start: {error}"),
+            "review or create a behavioral contract with: deadreckon def-done \"what should count as done\"",
+        ))
+    })?;
     let contract_sha256 = deadreckon_core::flight::sha256_file(&contract_path)?;
 
     let gate_evaluator =
@@ -1616,6 +1622,16 @@ mod tests {
         source: &'a Path,
         contract: Option<&'a Path>,
     ) -> CreateJob<'a> {
+        if contract.is_none() {
+            fs::create_dir_all(source).expect("fixture source");
+            fs::write(source.join("fixture-proof.txt"), "approved fixture\n")
+                .expect("fixture proof");
+            fs::write(
+                source.join("Makefile"),
+                "test:\n\t@test -f fixture-proof.txt\n",
+            )
+            .expect("fixture test contract");
+        }
         let mut plan = commands::course::trivial_operator_plan(
             "finish the durable fixture",
             commands::course::CourseShape::Single,
@@ -1931,7 +1947,7 @@ mod tests {
         fs::create_dir_all(&launch_source).expect("launch source");
         fs::write(launch_source.join("unrelated.txt"), "before").expect("launch file");
         let contract = launch_source.join("acceptance.yaml");
-        let contract_body = "name: fresh\nchecks: []\n";
+        let contract_body = "name: fresh\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/result.txt'\n    must_pass: true\n";
         fs::write(&contract, contract_body).expect("contract");
         let mut request = request(&paths, &launch_source, Some(&contract));
         request.source = DurableSource {
@@ -2044,7 +2060,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_default_contract_is_detected_from_empty_approved_source() {
+    fn fresh_default_contract_is_rejected_before_job_admission() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let launch_source = temp.path().join("node-project");
@@ -2061,11 +2077,53 @@ mod tests {
             allow_dirty: false,
         };
 
-        let job = create_job(request).expect("create fresh job");
-        let frozen =
-            fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref())).expect("frozen");
-        assert!(frozen.contains("deadreckon detected unknown"), "{frozen}");
-        assert!(!frozen.contains("npm run real-tests"), "{frozen}");
+        let error = create_job(request).expect_err("empty fresh source has no durable contract");
+        assert!(
+            error
+                .to_string()
+                .contains("only proves that its pre-created working directory exists"),
+            "{error}"
+        );
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs directory")
+                    .next()
+                    .is_none(),
+            "failed admission must not leave a pending Job behind"
+        );
+    }
+
+    #[test]
+    fn explicit_directory_only_contract_is_rejected_before_job_admission() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: noop\nchecks:\n  - kind: file_exists\n    path: '{working_dir}'\n    must_pass: true\n",
+        )
+        .expect("contract");
+
+        let error = create_job(request(&paths, &source, Some(&contract)))
+            .expect_err("explicit no-op contract must fail admission");
+
+        assert!(
+            error
+                .to_string()
+                .contains("only proves that its pre-created working directory exists"),
+            "{error}"
+        );
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs directory")
+                    .next()
+                    .is_none(),
+            "failed admission must be atomic"
+        );
     }
 
     #[test]
@@ -2076,6 +2134,12 @@ mod tests {
         let copy_source = launch_source.join("fixtures/source");
         fs::create_dir_all(&copy_source).expect("copy source");
         fs::write(copy_source.join("README.md"), "copy").expect("copy file");
+        fs::write(copy_source.join("fixture-proof.txt"), "approved fixture\n").expect("copy proof");
+        fs::write(
+            copy_source.join("Makefile"),
+            "test:\n\t@test -f fixture-proof.txt\n",
+        )
+        .expect("copy test contract");
         let mut request = request(&paths, &launch_source, None);
         request.source = DurableSource {
             mode: DurableSourceMode::Copy,
@@ -2123,7 +2187,11 @@ mod tests {
         let launch_source = repository.join("launch");
         fs::create_dir_all(&launch_source).expect("launch source");
         let contract = launch_source.join("acceptance.yaml");
-        fs::write(&contract, "name: fresh\nchecks: []\n").expect("contract");
+        fs::write(
+            &contract,
+            "name: fresh\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/result.txt'\n    must_pass: true\n",
+        )
+        .expect("contract");
         let mut request = request(&paths, &launch_source, Some(&contract));
         request.source = DurableSource {
             mode: DurableSourceMode::Fresh,

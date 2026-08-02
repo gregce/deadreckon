@@ -13,7 +13,8 @@ pub enum WorkspacePathClass {
 }
 
 const EVIDENCE_ONLY_ROOTS: [&str; 1] = [".specstory"];
-const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 8] = [
+const DISPOSABLE_RUNTIME_ROOTS: [&str; 3] = ["target", "node_modules", ".build"];
+const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 10] = [
     ":(glob,exclude)**/.specstory",
     ":(glob,exclude)**/.specstory/**",
     ":(glob,exclude)**/.deadreckon",
@@ -22,6 +23,8 @@ const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 8] = [
     ":(glob,exclude)**/target/**",
     ":(glob,exclude)**/node_modules",
     ":(glob,exclude)**/node_modules/**",
+    ":(glob,exclude)**/.build",
+    ":(glob,exclude)**/.build/**",
 ];
 
 pub const fn evidence_only_roots() -> &'static [&'static str] {
@@ -43,10 +46,7 @@ pub fn classify_workspace_path(path: &Path) -> WorkspacePathClass {
         let Component::Normal(name) = component else {
             continue;
         };
-        if matches!(
-            name.to_string_lossy().as_ref(),
-            ".git" | "target" | "node_modules"
-        ) {
+        if name == ".git" || is_disposable_runtime_root(name) {
             return WorkspacePathClass::RuntimeOnly;
         }
         if name == ".deadreckon" {
@@ -80,7 +80,7 @@ pub fn runtime_output_root(path: &Path) -> Option<PathBuf> {
             continue;
         };
         root.push(name);
-        if name == "target" || name == "node_modules" {
+        if is_disposable_runtime_root(name) {
             return Some(root);
         }
     }
@@ -89,6 +89,31 @@ pub fn runtime_output_root(path: &Path) -> Option<PathBuf> {
 
 pub fn is_deliverable_workspace_path(path: &Path) -> bool {
     classify_workspace_path(path) == WorkspacePathClass::Deliverable
+}
+
+/// Whether a path belongs in a recoverable workspace copy.
+///
+/// Git control is retained because restoring a linked worktree requires it;
+/// disposable build/dependency roots are omitted because they can be rebuilt.
+pub fn is_recoverable_workspace_path(path: &Path) -> bool {
+    runtime_output_root(path).is_none()
+}
+
+/// Whether provider-flight checkpoints should track a workspace path.
+///
+/// Flight evidence intentionally retains provider-private evidence while
+/// excluding lifecycle control and disposable runtime output.
+pub fn is_checkpointable_workspace_path(path: &Path) -> bool {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == ".deadreckon")
+    {
+        return false;
+    }
+    matches!(
+        classify_workspace_path(path),
+        WorkspacePathClass::Deliverable | WorkspacePathClass::EvidenceOnly
+    )
 }
 
 pub fn is_promotable_workspace_path(path: &Path) -> bool {
@@ -102,6 +127,12 @@ pub fn is_promotable_workspace_path(path: &Path) -> bool {
     }
 }
 
+fn is_disposable_runtime_root(name: &std::ffi::OsStr) -> bool {
+    DISPOSABLE_RUNTIME_ROOTS
+        .iter()
+        .any(|root| name == std::ffi::OsStr::new(root))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -111,7 +142,8 @@ mod tests {
 
     use super::{
         WorkspacePathClass, classify_workspace_path, delivery_git_exclude_pathspecs,
-        is_deliverable_workspace_path, is_promotable_workspace_path, runtime_output_root,
+        is_checkpointable_workspace_path, is_deliverable_workspace_path,
+        is_promotable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
     };
 
     #[test]
@@ -143,6 +175,10 @@ mod tests {
             WorkspacePathClass::RuntimeOnly
         );
         assert_eq!(
+            classify_workspace_path(Path::new(".build/debug/App")),
+            WorkspacePathClass::RuntimeOnly
+        );
+        assert_eq!(
             classify_workspace_path(Path::new(".deadreckon/.specstory/session.md")),
             WorkspacePathClass::EvidenceOnly
         );
@@ -154,6 +190,19 @@ mod tests {
                 .iter()
                 .any(|pathspec| pathspec.contains(".specstory"))
         );
+        assert!(is_recoverable_workspace_path(Path::new(".git/index")));
+        assert!(!is_recoverable_workspace_path(Path::new(
+            ".build/debug/App"
+        )));
+        assert!(is_checkpointable_workspace_path(Path::new(
+            ".specstory/history/session.md"
+        )));
+        assert!(!is_checkpointable_workspace_path(Path::new(
+            ".deadreckon/codebase.json"
+        )));
+        assert!(!is_checkpointable_workspace_path(Path::new(
+            ".deadreckon/.specstory/session.md"
+        )));
     }
 
     #[test]
@@ -176,6 +225,7 @@ mod tests {
             ".deadreckon",
             "target/debug",
             "web/node_modules/pkg",
+            ".build/debug",
         ] {
             fs::create_dir_all(root.join(directory)).expect("directory");
         }
@@ -185,6 +235,7 @@ mod tests {
             ".deadreckon/codebase.json",
             "target/debug/output",
             "web/node_modules/pkg/index.js",
+            ".build/debug/app",
         ] {
             fs::write(root.join(file), "fixture\n").expect("file");
         }
@@ -210,6 +261,10 @@ mod tests {
         assert_eq!(
             runtime_output_root(Path::new("target/nested/node_modules/pkg")),
             Some(Path::new("target").to_path_buf())
+        );
+        assert_eq!(
+            runtime_output_root(Path::new("apps/game/.build/debug/App")),
+            Some(Path::new("apps/game/.build").to_path_buf())
         );
         assert_eq!(runtime_output_root(Path::new(".git/index")), None);
         assert_eq!(runtime_output_root(Path::new("src/lib.rs")), None);
