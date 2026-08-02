@@ -1,8 +1,9 @@
 # Map of DeadReckon
 
-Status: repository analysis updated 2026-07-31 through Watchkeeper durable
-continuation, protected operator capture, trust-boundary hardening and
-credential-free adversarial trials.
+Status: repository analysis refreshed 2026-08-01 at `bb594a3`, through
+role-aware execution teams, strict durable-Job admission, cumulative wall-cap
+enforcement, durable provider progress, Linux sandbox/toolchain hardening and
+the previously recorded Watchkeeper adversarial trials.
 
 ## Executive map
 
@@ -31,10 +32,14 @@ That is the essential product. The strongest reason for it to exist is the gap b
 The repository now contains three different things which should not be judged alike:
 
 1. A differentiated Job kernel: immutable authority, append-only lifecycle,
-   fenced local supervision and isolated work across guided and ordinary
-   direct execution. Durable Single, Graph and Campaign Jobs prove 2
-   independent completion decisions before deliberate promotion. Preserve and
-   dogfood this.
+   fenced local supervision, frozen role-specific execution choices and
+   isolated result workspaces across guided and ordinary direct execution.
+   This separates result changes from the target checkout; it does not claim
+   universal host filesystem confinement. Durable Single,
+   Graph and Campaign Jobs admit only a sealable deterministic contract, stop
+   at attempt-count, cumulative active-attempt wall-time and absolute-deadline
+   limits, and prove 2 independent completion decisions before deliberate
+   promotion. Preserve and dogfood this.
 2. Established graph/campaign conductors, direct advanced commands, reports,
    imports, and narration. Ordinary direct orchestration, new chains,
    stored-plan forks and campaigns now run those conductors under a parent Job
@@ -68,11 +73,17 @@ The repository has extensive automated coverage, but it has no product-usage tel
 | Operator surface | `crates/deadreckon` | CLI, guided `start`, Course, lifecycle commands, attach, orchestration entry points | Keeps the default flow approachable while exposing advanced control. |
 | Runtime | `crates/deadreckon-runtime` | Outer turn loop, provider/sandbox composition, process execution, flight recording, docs and seams | Enforces policy around an inner harness rather than trusting that harness to supervise itself. |
 | Core | `crates/deadreckon-core` | Job event store/reducer, fenced leases, process groups, receipts, paths, run state, gates, promotion and `RunView`/`JobView` | Durable source of truth and most of the product's invariants. |
-| Providers | `crates/deadreckon-providers` | Provider trait/router, direct HTTP models, concrete CLIs, descriptor-driven CLIs and Codex app-server support | Makes the control vocabulary portable across changing agent harnesses. |
-| Sandbox | `crates/deadreckon-sandbox` | Seatbelt, bubblewrap, Docker and explicit no-sandbox execution | Creates the capability boundary between delegated work and the host. |
-| Protocol | `crates/deadreckon-protocol` | Versioned run ledgers plus checked Job, lease, authority, semantic-judgment and completion-receipt wire types | Separates durable evidence from implementation internals. |
+| Providers | `crates/deadreckon-providers` | Provider trait/router, provider-scoped model catalogs, direct HTTP models, concrete CLIs, descriptor-driven CLIs and Codex app-server support | Makes the control vocabulary portable across changing agent harnesses. |
+| Sandbox | `crates/deadreckon-sandbox` | Seatbelt, bubblewrap, Docker and explicit no-sandbox execution, including approved toolchain/runtime mounts | Creates the capability boundary between delegated work and the host. |
+| Protocol | `crates/deadreckon-protocol` | Versioned run ledgers plus Job, lease, authority, evaluator/sandbox evidence, semantic judgment, execution evidence, completion receipt, Git delivery and authenticated operator-capture wire types | Separates durable evidence from implementation internals. |
 
 The intended dependency direction is operator surface -> runtime -> provider/sandbox/core -> protocol. Keel moved the persisted ledger types, readers and writers onto that downward dependency and added checked schemas without changing the stored bytes.
+
+The checked JSON-schema set covers ledgers, Job control, sandbox observation,
+completion and operator capture. `GitDeliveryIntent` and
+`AppliedGitDeliveryReceipt` are typed and authenticated protocol artifacts but
+are not yet exported by `all_schemas()` into `docs/schemas`; that is a real
+schema-coverage gap, not evidence that delivery is untyped.
 
 ### Two execution engines, one outer contract
 
@@ -83,17 +94,37 @@ The provider abstraction deliberately spans two materially different inner loops
 
 Provider descriptors turn compatible CLIs into configuration rather than one bespoke Rust implementation per tool. This is a genuinely important abstraction: the stable product is the outer contract, not any vendor's current command-line syntax.
 
+### Execution teams are frozen, provider-scoped inputs
+
+Guided `start` now treats a provider and model as one execution choice. A
+review can use one pair for both coder and reviewer or customize them. A full
+plan can do the same for planner, default implementor and individual children.
+Codex routes can discover visible models from Codex-owned cache state; every
+other route, including user descriptors, uses its own descriptor catalog.
+Discovery failure falls back to that same provider's descriptor and never
+borrows another provider's models.
+
+The exact per-role provider/model pairs are written through the accepted
+launch plan and durable driver, then restored on supervisor recovery and
+replay. Older persisted Jobs retain a deliberately narrow fallback from their
+single global model field. This is a material correction to the old model in
+which provider roles were explicit but one model value could leak across them.
+
 ### One verified Job is the compositional atom
 
 Guided `start` and ordinary direct execution now prove the stronger atom: one
 approved Job, one append-only lifecycle, one same-ID parent result, contained
 deterministic checks, one fresh semantic judgment, and one signed receipt.
+Before creating the Job, admission rejects contracts with no checks, no
+required checks, or only the pre-created working-directory existence check.
 
 Direct `run` creates a durable Single Job. Direct `orchestrate`, stored-plan
 `fork`, and new supported chains create durable Graph Jobs. Direct `campaign`
-creates a durable Campaign Job. A Graph always merges at the end. A Campaign
-can recover exact persisted sub-plans and revalidates its worst-of roll-up. The
-supervisor then verifies, receipts and promotes the same-ID parent result.
+creates a durable Campaign Job. Ordinary Graph plans compose at the end;
+durable chain Graphs apply accepted nodes sequentially into an isolated ordered
+candidate. Both materialize and verify one same-ID parent result at completion.
+A Campaign can recover exact persisted sub-plans and revalidates its worst-of
+roll-up. The supervisor then receipts and promotes the same-ID parent result.
 Preview and explicit in-place/uncontained execution remain foreground and
 untrusted, so they cannot issue a trusted Job receipt. Public historical
 `chain run|resume` refuses before mutation or execution. Public `chain extend`
@@ -102,7 +133,18 @@ schedule. Unsupported policy-rich chain launch also refuses rather than
 silently choosing the old conductor. Only the characterization binary retains
 that legacy behavior for tests. Public `deadreckon extend` and a follow-up
 selected by guided `start` freeze the completed parent state,
-promoted-artifact tree and verified receipt, then queue a durable Single Job.
+promoted-artifact tree and, for a verified Job parent, its receipt, then queue
+a durable Single Job. A `LegacyUnowned` parent has no receipt to freeze and is
+recorded explicitly as that weaker parent kind.
+
+The wall cap is cumulative across active attempt intervals, including an
+attempt that spans supervisor or machine restart. At exhaustion the supervisor
+reconciles the owned worker, nested evaluator, Campaign sub-plan, repair and
+Docker process authorities before recording `WallCap`; inability to prove that
+cleanup records `LostContainment`. Provider completion and accounting are
+persisted before local Git, snapshot, provenance, documentation or gate
+post-processing, so later interruption does not leave a completed provider
+turn looking like a turn-zero zombie.
 
 Graph and Campaign parents can now act on semantic `revise` through bounded,
 fenced parent-only repair. The next consolidation step is dogfooding that
@@ -113,34 +155,56 @@ truthfully by Jobs.
 
 | Capability | Need and abstracted pattern | How it works | What is distinctive | Maturity | Disposition |
 |---|---|---|---|---|---|
-| Guided `start` and Course | Turn an underspecified request into a bounded run contract | Interactive/non-interactive intake selects codebase, provider, budget and done conditions; Course can decompose scope before launch | A friendly entry to a rigorous outer harness | **Maturing**: strong surface, but accepted Course pieces influence count while the plan can re-decompose them | **Preserve and align**; keep planning advisory and make accepted decomposition authoritative enough to avoid surprise |
-| Definition-of-done compiler | Make acceptance executable instead of conversational | `def-done` and setup infer or generate the independent gate command and persist the contract | Converts repository conventions into a machine-checkable boundary | **Stable / bounded** | **Essential; extend** with rules-as-gate and clearer explanations |
-| Persisted run kernel | Retain work and evidence when a process fails | A run directory stores state, working tree, snapshots, events and evidence | File-backed facts survive their original terminal | **Hardened as persistence**, not by itself a relaunch guarantee | **Essential; keep rich run evidence below Job control** |
-| Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job, then a fenced lease supervises the root process group | Separates process exit from lifecycle truth and gives one durable parent ID | **Stable / bounded**: supported new launches can earn a verified receipt; explicit compatibility modes remain and the live reboot drill is outstanding | **Highest-priority dogfood; close live recovery proof** |
-| Lifecycle control | Start, observe, cancel and finish Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason | Ordinary operations read persisted control truth | **Stable / bounded**: the cross-kind journey and Job resolver are tested | **Preserve one resolver and one Job event truth** |
-| Codebase isolation | Contain changes and make promotion deliberate | Worktree, copy, fresh-repo and in-place modes separate the agent's workspace from the user's target | Isolation is part of the run contract, not a provider feature | **Hardened** | **Essential; preserve** |
-| Sandbox backends | Restrict process capabilities consistently | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; protected Job/key/proof paths are denied or read-only across provider routes | Provider-independent capability boundary | **Stable / bounded for strict receipts**: strict Jobs refuse `none` before signing; real Docker tests prove the common control boundary and the public strict-Job completion, cancellation and worker-recovery paths on macOS arm64. Clean-source recording and live Linux gate proof remain outstanding | **Preserve fail-closed receipt rule; continue backend parity tests** |
-| Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event and steering parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
-| Structured provider contracts | Replace output scraping with declared event semantics | Pi/Copilot and app-server paths emit/consume typed events; other adapters retain parsing gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
-| Budgets and context | Bound delegated work and reveal consumption | Exact positive wall caps, one absolute deadline across every durable creation route, turn/API-spend caps and spend/context records drive typed stopping | The outer harness enforces expiry while work is live and reconciles nested process authorities before terminal state | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
+| Guided `start` and Course | Turn an underspecified request into a bounded run contract | Interactive/non-interactive intake selects codebase, an execution team, budget and done conditions; Course can decompose scope before launch | A friendly entry to a rigorous outer harness | **Maturing**: provider/model choice is now coherent, but accepted Course pieces influence count while the plan can re-decompose them | **Preserve and align**; keep planning advisory and make accepted decomposition authoritative enough to avoid surprise |
+| Execution teams and model catalogs | Keep intelligence choices explicit for every orchestration role | A uniform provider/model pair or custom planner, coder, reviewer, default-child and per-child choices are resolved per provider and frozen into plans/drivers | Recovery and replay use the approved team without cross-provider model leakage | **Maturing**: role freezing/recovery are tested, but live discovery is Codex-cache-only and other/custom routes use static descriptor catalogs | **Preserve the provider-scoped contract; add discovery only where the provider owns a reliable source** |
+| Definition-of-done compiler and admission | Make acceptance executable instead of conversational | `def-done` and setup infer or generate the independent gate command; durable admission atomically refuses empty, optional-only and working-directory-only contracts before a Job exists | Converts repository conventions into a machine-checkable boundary and prevents knowingly unsealable work | **Stable / bounded** | **Essential; extend** with rules-as-gate and clearer explanations |
+| Persisted run kernel | Retain work and evidence when a process fails | A run directory stores state, working tree, snapshots, events and evidence; provider outcome/accounting are saved before fallible local post-processing | File-backed facts survive their original terminal and completed provider work cannot remain falsely at turn zero | **Hardened as persistence**, not by itself a relaunch guarantee | **Essential; keep rich run evidence below Job control** |
+| Durable Job supervisor | Approve before work, detach safely and stop for typed reasons | Guided and ordinary direct single, review, full-plan, chain, stored-plan fork and campaign launches write immutable authority and one append-only parent Job; a fenced lease supervises the root tree and enforces cumulative active-attempt wall time | Separates process exit from lifecycle truth, gives one durable parent ID and fails closed if the whole owned tree cannot be reconciled | **Stable / bounded**: supported launches have bounded wall/deadline/retry semantics and can earn a verified receipt; live reboot proof remains outstanding | **Highest-priority dogfood; close live recovery proof** |
+| Lifecycle control | Start, observe, cancel, deliver and undo Jobs coherently | The shared resolver includes Jobs; `list` suppresses backing duplicates; status/attach/kill/finish use typed outcome and stop reason; apply/export and undo append post-terminal delivery events | Ordinary operations and later delivery read one persisted control truth without rewriting terminal verification | **Stable / bounded**: the cross-kind journey, Job resolver and post-terminal reducer are tested | **Preserve one resolver and one Job event truth** |
+| Codebase isolation | Separate intended result changes and make promotion deliberate | Worktree, copy, fresh-repo and explicit in-place modes separate the result workspace from the user's target; host access is governed separately by the selected sandbox | Result isolation is part of the run contract, not a provider feature or a claim of universal host confinement | **Hardened** | **Essential; preserve** |
+| Sandbox backends | Protect the strict Job control plane across different host mechanisms | Seatbelt, bubblewrap or Docker wrap workers and keyless gate evaluation; Linux bubblewrap reconstructs private-temp paths and mounts approved loaders, `PATH` entries and named runtime homes read-only | Provider-independent receipt/key/control confinement without making approved tools disappear | **Stable / bounded for the strict control boundary on tested backends; maturing for general filesystem/network and platform parity**: Seatbelt is targeted-deny, and named-host network lists are approval policy rather than a proxy-enforced domain boundary | **Preserve fail-closed receipt rule; continue backend parity tests** |
+| Provider abstraction | Route the same run contract across APIs and CLI harnesses | Provider trait, router, capability registry, provider-scoped model resolution, concrete adapters and descriptor ingestion | Harness-of-harness portability | **Stable / maturing**: broad coverage, uneven structured-event, accounting, steering and approval parity | **Essential; extend via contracts/descriptors, not bespoke surface growth** |
+| Structured provider contracts | Replace output scraping with declared event semantics | Codex exec, Claude Code, Pi, Copilot and Codex app-server have typed event/usage/session paths; malformed streams degrade with explicit caveats, while Gemini/OpenCode retain gaps | Makes evidence and control portable rather than terminal-shaped | **Maturing** | **Essential direction; finish parity** |
+| Budgets and context | Bound delegated work and reveal consumption | Exact positive wall caps, cumulative active-attempt accounting, one absolute deadline across every durable creation route, turn/API-spend caps and spend/context records drive typed stopping | The outer harness cuts in-flight work, carries elapsed attempt time across recovery and reconciles nested process authorities before terminal state | **Stable / bounded**: subscription quotas and context visibility vary by provider | **Preserve and extend** |
 | Evidence ledgers and protocol | Make every important decision reconstructable | Append-only run, trace, spend, flight and narrative records feed a shared projection | Evidence is a first-class artifact, not a log side effect | **Stable**: Keel centralized the wire vocabulary, persistence policy, readers, writers and checked schemas | **Essential; preserve compatibility and route new formats through the protocol** |
-| `RunView` and `JobView` projections | Give surfaces one interpretation of evidence and lifecycle | `RunView` retains rich run facts; `JobView` folds Job events and composes the linked run | Separates control truth from evidence without duplicating either | **Stable / maturing**: legacy adapters are read-only; all surfaces are not yet Job-native | **Essential; complete projection/resolver parity** |
+| `RunView` and `JobView` projections | Give surfaces one interpretation of evidence and lifecycle | `RunView` retains rich run facts; `JobView` folds Job events, composes the linked run and revalidates a terminal receipt against its recorded digest, attempt, run and outer launch | A terminal Verified event stays immutable while stale or tampered proof is surfaced through `verified_receipt_error`, not presented as valid | **Stable / maturing**: completed run-ledger parsing is less fail-closed and all surfaces are not yet Job-native | **Essential; complete projection/resolver parity** |
 | Two-key completion and verdict | Separate "agent finished" from "work accepted" | A native contained HMAC gate must pass, then a fresh read-only semantic judge must return `achieved`; the supervisor seals a combined receipt | Natural-language meaning is checked without weakening deterministic failure | **Stable / bounded for durable Jobs**; explicitly legacy objects remain deterministic-only | **Core differentiator; benchmark false acceptance/rejection** |
-| Snapshots, undo and rewind | Recover from autonomous mistakes without throwing away the whole run | File snapshots and diffs support undo; flight events provide checkpoint-like rewind | Recovery belongs to the outer control plane | **Stable / bounded**: file rollback is real; provider conversation rollback is not | **Preserve; state the boundary clearly** |
-| Finish, promotion and library | Make acceptance and reuse explicit | Durable Job promotion revalidates authority, marker, semantic judgment, HMAC and result-tree digest; legacy promotion retains its marker path | The user accepts evidence-backed work, not an opaque session | **Hardened for the Job validator; compatibility split remains** | **Essential; preserve validation before promotion** |
-| Attach / Helm | Observe long-running work from the operator's seat | A file-backed TUI reads the same durable state and supports bounded control actions | The UI can disappear without taking the run with it | **Stable / maturing** | **Essential operator surface; preserve and improve responsiveness** |
-| Show, status, history and static report | Turn durable evidence into an inspectable artifact | Deterministic summaries and HTML reports render the shared projection | Strong local-first auditability without a service | **Stable / bounded** | **Preserve deterministic core; treat richer rendering as optional** |
+| Snapshots, undo and rewind | Recover from autonomous mistakes without throwing away the whole run | Recoverable-file snapshots and diffs support undo; flight events provide checkpoint-like rewind; rebuildable roots such as SwiftPM `.build` are omitted from snapshots, recoverable/source copies and changed-file/provenance inventories | Recovery belongs to the outer control plane without preserving disposable tool output as product state | **Stable / bounded**: file rollback is real; provider conversation rollback is not | **Preserve; state the boundary clearly** |
+| Finish, promotion and library | Make acceptance and reuse explicit | Durable Job promotion revalidates authority, marker, semantic judgment, HMAC and result-tree digest; Git delivery seals an HMAC intent before mutation and an applied receipt after re-proving the exact after-state | The user accepts evidence-backed work, and apply/undo cannot be confused with the earlier verification decision | **Hardened for the Job validator and authenticated Git delivery; compatibility split remains** | **Essential; preserve validation before promotion and delivery** |
+| Attach TUI | Observe long-running work from the operator's seat | Activity, narrative and split views read file-backed Job/run/plan-child/plan/chain/campaign state; visual modes cover architecture, agents, files and evidence, and plain/JSON/why variants detach without cancelling work | The UI can disappear without taking the run with it | **Stable / maturing**: its inline steer cannot target a durable Job backing run | **Essential operator surface; preserve and improve responsiveness** |
+| Status, show, history, verdict and report | Turn durable evidence into inspectable answers | `status` gives the current next action; `show` exposes raw legacy detail but is status-like for a Job; `history grep` searches JSONL; `verdict` rechecks current evidence; `report` renders full Job/run Markdown, HTML or JSON | Distinct local-first views serve navigation, forensic search, current re-verification and review packets | **Stable / bounded**, with uneven Job-native depth between commands | **Preserve deterministic core; make the distinctions clearer in help** |
 | Docs and narration | Explain what happened at human scale | Deterministic docs plus optional provider-generated narrative summarize progress and artifacts | Evidence can be consumed without reading raw event streams | **Maturing / experimental**: several overlapping narrative paths | **Preserve one deterministic path; consolidate and validate model-generated variants** |
-| Import | Bring work from other agent harnesses into the same evidence model | Parsers ingest supported transcript/session formats into local run artifacts | A partial cross-tool memory bridge | **Stable / bounded**: deliberately one-way, not shared live state | **Preserve; do not claim the broader need is solved** |
-| Chains | Express sequential verified work | New supported chains compile into a durable linear Graph Job verified once at the end; public historical execution, mutating extension, and unsupported conductor policies refuse before execution or mutation and offer a durable migration where possible | Reuses one scheduler without pretending unsupported hooks/apply policy survived translation | **Maturing**: ordinary creation is Job-scheduled; stored historical state is inspectable and legacy behavior is characterization-only | **Dogfood the durable path; decide the stored-state and characterization retirement policy** |
-| Plans, fork/merge and review | Coordinate dependent work and reconcile branches | A saved DAG launches child runs, reviews results and merges accepted work; direct orchestration and stored-plan fork force at-end delivery, verify the same-ID Graph parent and can repair that parent after semantic `revise` without rerunning successful leaves | Established graph semantics under one parent lease and receipt | **Maturing**: verified parent completion, bounded parent repair and durable direct launch exist; live interruption drills do not | **Dogfood parent repair; keep compatibility modes honest** |
-| Campaigns and reshape | Lift orchestration one level for broad goals | Bounded depth-two sub-orchestrations can recover exact persisted sub-plans; durable direct/guided parent completion revalidates the worst-of roll-up and can repair the merged parent before a two-key receipt | Worst-of roll-up and parent gate prevent child-result laundering | **Experimental / maturing**: durable parent recovery, bounded parent repair and receipt exist; live interruption drills do not | **Freeze depth; dogfood recovery, repair and no-laundering behavior** |
+| Import | Bring work from other agent harnesses into the same evidence model | Descriptor-driven Codex, Claude, Pi and Copilot import plus Cursor SQLite ingestion create read-only local run artifacts | A partial cross-tool memory bridge | **Stable / bounded**: deliberately one-way, not shared live state | **Preserve; do not claim the broader need is solved** |
+| Chains | Express sequential verified work | New supported chains freeze approved hook bytes and a typed undo policy into an adapter, then compile to a durable linear Graph Job; the receipt binds the ordered candidate-manifest digest and, when present, candidate-application and hook-event ledgers; unsupported policies and historical mutation/execution refuse publicly | Final-tree equivalence cannot hide a different ordered execution or hook history | **Maturing**: ordinary creation preserves supported hooks under Job scheduling; stored historical state is inspectable and legacy behavior is characterization-only | **Dogfood the durable path; decide the stored-state and characterization retirement policy** |
+| Plans, fork/merge and review | Coordinate dependent work and reconcile branches | Public `fork` compiles a pending unowned Plan into a durable Graph Job; its driver launches/reviews children, merges accepted work, verifies the same-ID parent and can repair only that parent after semantic `revise` | Established graph semantics under one parent lease and receipt without rerunning successful leaves | **Maturing**: driver-owned merge is real, while public standalone `merge` is refusal-only and live interruption drills do not exist | **Dogfood parent repair; remove or accurately relabel the public merge surface** |
+| Campaigns and reshape | Lift orchestration one level for broad goals | Bounded depth-two sub-orchestrations recover exact persisted sub-plans and revalidate worst-of roll-up; accepted inert `reshape` proposals schedule a durable Graph with the accepted decomposition | Parent verification prevents child-result laundering while reshape can promote one run into explicit orchestration | **Experimental / maturing**: durable recovery/repair exists, public `campaign repair` is refusal-only, and live interruption drills do not | **Freeze depth; dogfood recovery, repair and no-laundering behavior** |
 | Seams | Let policy hooks compose without taking over the kernel | Four fixed subprocess seams receive versioned input and produce bounded output; conformance tooling checks them | Extensibility at explicit control points | **Stable / bounded** | **Preserve the fixed model; resist universal hook proliferation** |
-| App-server steering | Control a live inner harness through a richer protocol | Codex app-server integration and a provider-neutral inbox support bounded steering/approvals | Moves beyond stdout scraping | **Experimental**, opt-in and Codex-led | **Preserve the neutral pattern; validate before broad surface investment** |
-| Learning and self-improve | Mine prior runs and propose changes to DeadReckon itself | Indexing and learning commands derive observations/proposals from artifacts | A self-hosted improvement loop | **Experimental**; weak connection to the original highest-priority needs | **Strong product-decision/deprecation candidate** unless usage and proposal quality justify it |
+| App-server steering | Control a live inner harness through a richer protocol | A durable provider-neutral steer inbox tracks pending/delivered entries; Codex app-server polls mid-turn, uses expected-turn preconditions, answers capability approvals, interrupts before kill and can degrade to Codex exec with a caveat | Moves beyond stdout scraping without dropping or duplicating a stale steer | **Experimental**, opt-in and publicly hard-coded to the Codex server route | **Preserve the neutral inbox pattern; validate before broad surface investment** |
+| Learning and self-improve | Mine prior runs and propose changes to DeadReckon itself | Deterministic redacted indexing/report/export/import feeds provider proposals; improvement candidates run in isolation, and PR creation remains an explicit gated action | A self-hosted improvement loop with a redacted evidence boundary | **Experimental**; weak connection to the original highest-priority needs and `learn index --since` is still a no-op | **Strong product-decision/deprecation candidate** unless usage and proposal quality justify it |
 | Notifications and sleep inhibition | Support unattended operation | Optional notifications and platform sleep handling wrap long runs | Useful operational polish | **Stable / peripheral** | **Keep while cheap; not strategic** |
 | Supervisor service operations | Restore local work after the worker shell or supervisor disappears | `setup --supervisor` installs and starts an identity-bound launchd/systemd user service; real approved `start` requires a current active definition and live boot/PID/start-identity checkpoint | Machine-level posture is explicit, inspectable and a launch prerequisite | **Implemented and hermetically exercised; live cross-platform reboot acceptance outstanding** | **Dogfood the real reboot path before claiming machine recovery** |
-| Doctor, setup, update and release trust | Make the binary installable and diagnosable | Environment checks, full local binary/version/channel inventory, supervisor readiness, conservative receipt/service repair, update flow, signing/attestation and packaging support operations | Necessary for trusting a local supervisor binary without letting one install silently replace another | **Stable / maturing** | **Dogfood repair across release channels; maintain as infrastructure** |
+| Doctor, setup, update and release trust | Make the binary installable and diagnosable | Environment checks, full local binary/version/channel inventory, supervisor readiness, conservative receipt/service repair, update flow, macOS signing/notarization, checksums/SBOM/attestations and packaging operations | Necessary for trusting a local supervisor binary without letting one install silently replace another | **Stable / maturing**: npm publication/provenance and Windows Authenticode remain explicitly deferred | **Dogfood repair across release channels; maintain as infrastructure** |
+
+## Current command surface
+
+Default help highlights the five-command typical flow—`start`, `attach`,
+`status`, `list`, and `finish`—while also exposing `try`, setup/health and
+selected control commands. The full `help-all` catalog is much broader:
+
+| Surface | Commands | Current truth |
+|---|---|---|
+| Front door and catalog | `try`, `start`, `attach`, `status`, `list`, `finish`, `help-all` | `try` is a keyless local proof, not a trusted Job receipt; `help-all` reveals advanced and compatibility surfaces. |
+| Contract, setup and provider discovery | `init`, `config`, `completion`, `doctor`, `detect`, `providers`, `models`, `seams`, `def-done`, `update` | `models` is provider-scoped; hidden `acceptance` is the older done-criteria surface. |
+| Durable launch and control | `run`, `orchestrate`, `campaign`, `chain`, `supervisor`, `steer`, `kill`, `extend` | Supported non-preview launches enter Jobs except explicit in-place/uncontained `run`; `steer` is Codex app-server-only and does not target a Job backing run. |
+| Orchestration building blocks | `plan`, `fork`, `merge`, `reshape`, `campaign repair` | `plan`, public `fork`, and accepted reshape are real; merge and campaign repair execute only inside the current Job driver, so their public forms refuse. |
+| Delivery and recovery | `library`, `cleanup`, `undo`, `rewind`, `apply`, `export`, `abandon`, `resume` | `finish` is the trusted front door. `resume`/`continue` is public refusal-only; trusted supervisor recovery is internal. Several older verbs remain hidden or alias-led. |
+| Inspection, docs and import | `report`, `verdict`, `history`, `show`, `doc`, `import` | These are read-only or artifact-writing views/imports; they do not alter Job completion truth. |
+| Learning and self-improvement | `learn`, `improve` | Implemented but experimental and not part of the primary product promise. |
+
+This inventory is descriptive, not an endorsement of every public name. The
+generated help still over-promises standalone `resume`, `merge`,
+`campaign repair`, and historical chain-extension behavior that the public
+boundary correctly refuses. That help/behavior mismatch is compatibility debt.
 
 ## Durable Job gates are closed; refused legacy routes and foreground escapes remain
 
@@ -148,6 +212,9 @@ Watchkeeper closes the concrete trust gaps identified by the previous map for
 durable Single, Graph and Campaign Jobs created through guided or supported
 ordinary direct launches:
 
+- before any Job state is admitted, the trusted controller rejects an empty
+  contract, a contract with no required checks, or a contract whose only proof
+  is that the already-created working directory exists;
 - the trusted controller materializes the approved `acceptance.yaml` before
   evaluation;
 - keyless `dr-gate evaluate` runs under the backend that actually resolves,
@@ -221,8 +288,13 @@ control-path boundary. Three public strict Docker Job tests using a static
 Linux evaluator sidecar also pass on macOS arm64: deterministic completion
 followed by semantic `NEEDS_REVIEW`, operator cancellation without retry or
 receipt, and worker `SIGKILL` cleanup before exactly one bounded retry. Those
-results are bound to clean source `a0d262d` by evidence commit `e1d0825`. Live
-Linux/bubblewrap proof and a real service-backed reboot remain outstanding.
+results are bound to clean source `a0d262d` by evidence commit `e1d0825`; they
+do not automatically cover the later execution-team, supervisor or Linux
+sandbox changes. Ubuntu CI now runs real bubblewrap tool/private-temp tests,
+hostile read-only provider checks and the public smoke Job's refusal to issue a
+trusted receipt. The full live positive strict-Job claim—protected signing
+material plus a valid receipt bound to bubblewrap—and a real service-backed
+reboot remain outstanding.
 The network-loss recorder is no longer structurally incapable of passing: it
 signs the registry-derived worker route and endpoint, records a strict
 reachable/unreachable/reachable transition for one durably linked attempt, and
@@ -242,25 +314,25 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 
 | # | Unmet need | Current outcome | Assessment |
 |---:|---|---|---|
-| 1 | Live context and spend visibility | Spend records, caps, context meter and status exist; subscription/model telemetry remains uneven | **Partly met** |
+| 1 | Live context and spend visibility | Spend records, caps, context meter, provider-scoped model catalogs and status exist; subscription/context telemetry remains uneven | **Partly met** |
 | 2 | Multi-agent worktree coordination | Plans, supported new chains, stored-plan forks and campaigns coordinate isolated runs under a durable verified parent Job; unsupported policy-rich chain launch now refuses, while resource leasing remains | **Mostly met; live outcome unvalidated** |
-| 3 | Undo for agent changes | Snapshots, diff, undo and file rewind exist | **Strongly met**, within file-state scope |
+| 3 | Undo for agent changes | Recoverable source/control/evidence snapshots, diff, receipt-bound delivery undo and hash-guarded rewind exist; rebuildable output is intentionally discarded | **Strongly met**, within recoverable file-state scope |
 | 4 | Provenance for generated code | Events, traces, artifacts and lineage are persisted | **Strongly met** |
 | 5 | Searchable team memory | Local library, docs and import are searchable; shared team memory and automatic carryover are absent | **Partly met** |
 | 6 | Cross-tool state | Multiple tools can be imported and providers share a control vocabulary; state is not bidirectionally live across tools | **Partly met** |
-| 7 | Serious operator UI | Helm and reports provide dense terminal/static inspection; no live web/API or desktop control plane | **Partly met** |
+| 7 | Serious operator UI | The Attach TUI and reports provide dense terminal/static inspection; no live web/API or desktop control plane | **Partly met** |
 | 8 | Observability, evals and root-cause analysis | Flight, traces, verdict and reports exist; automated RCA and cross-run evals do not | **Partly met** |
-| 9 | Sandboxed execution | Multiple real backends and isolated codebases exist; strict receipts fail closed when resolution yields `none`, while compatibility runs may still request it | **Mostly met; compatibility/default gap** |
-| 10 | Billing guardrails | API spend, turn and wall caps exist; subscription quota semantics and universal usage accounting do not | **Partly met** |
-| 11 | Permission controls | Sandbox policies, tool handling and app-server approvals exist; Watchkeeper protects key and authority paths across those routes | **Mostly met; broader provider parity remains** |
+| 9 | Sandboxed execution | Multiple real backends and result workspaces exist; strict receipts fail closed on `none`; Linux CI executes bubblewrap, but Seatbelt is targeted-deny and backend filesystem/network/Windows semantics remain uneven | **Mostly met for the strict control boundary; broader parity is maturing** |
+| 10 | Billing guardrails | API spend, turn, absolute-deadline and cumulative active-attempt wall caps exist; subscription quota semantics and universal usage accounting do not | **Partly met** |
+| 11 | Permission controls | Sandbox policies, tool handling and app-server approvals exist; Watchkeeper protects key/authority paths, but named-host network lists are approval logic rather than proxy-enforced domain filtering | **Mostly met for Job control; broader capability parity remains** |
 | 12 | MCP client/server interoperability | No general MCP server or client surface | **Absent** |
-| 13 | Team onboarding | Setup, doctor, provider discovery and contract inference exist | **Implemented; outcome unvalidated** |
+| 13 | Team onboarding | Setup, doctor, provider/model discovery, unified execution-team selection and contract inference exist | **Implemented; outcome unvalidated** |
 | 14 | Structural verification of completion | Durable Single, Graph and Campaign Jobs created through guided or ordinary direct launches require contained deterministic checks plus independent semantic `achieved` and a combined parent receipt | **Strongly met in implementation; live false-decision rates unvalidated** |
 | 15 | Discoverable hooks and gates | `def-done`, doctor, four seams and conformance tooling exist | **Strongly met** |
-| 16 | Provider routing | Registry, capabilities, descriptors and routing cover several providers | **Mostly met; provider parity remains** |
-| 17 | Handoff and continuity | Attach, status and docs help a human resume; public and guided follow-ups now freeze verified parent identity and context into a durable child Job, while first-class handoff export and selective memory carryover remain absent | **Mostly met for local continuation** |
+| 16 | Provider routing | Registry, capabilities, descriptors, provider-scoped model catalogs and per-role execution teams cover several providers | **Mostly met; event/accounting/steering parity remains** |
+| 17 | Handoff and continuity | Attach, status and docs help a human re-enter context; public/guided follow-ups freeze parent state, library tree, bounded context and a verified receipt when the parent has one into a durable child Job; first-class handoff export/selective carryover remain absent | **Mostly met for local continuation** |
 | 18 | Port and environment isolation | Worktrees and process sandboxes isolate files/processes; there is no port/env lease broker | **Partly met** |
-| 19 | Governance receipts | Durable Jobs bind approved authority, checks, semantic judgment, optional revisions, result digest and confinement in an HMAC receipt; rules/skill receipts remain absent | **Mostly met; live cross-provider proof remains** |
+| 19 | Governance receipts | Durable Jobs bind approved authority, checks, semantic judgment, optional revisions, result/confinement and ordered chain execution in HMAC evidence; Git delivery has authenticated intent/applied receipts, while rules/skill receipts remain absent | **Mostly met; live cross-provider proof remains** |
 | 20 | Paid-review continuity | Review runs exist, but no specific paid-review workflow or continuity layer | **Mostly absent / not prioritized** |
 | 21 | Local-first operation | Durable file-backed state and static artifacts are foundational | **Strongly met** |
 | 22 | Meeting-to-code traceability | No dedicated workflow | **Absent / intentionally out of scope so far** |
@@ -273,15 +345,21 @@ The original research ranked 25 needs. The table distinguishes implemented primi
 These capabilities form the product's defensible spine and should be preserved, improved and extended:
 
 1. **The verified Job kernel**: immutable authority, append-only lifecycle,
-   fenced supervision, typed stop reasons and deliberate promotion.
+   fenced supervision, cumulative limits, typed stop reasons and deliberate
+   promotion/delivery.
 2. **Executable two-key completion**: definition of done, contained deterministic gate, read-only semantic judge and explainable receipt.
 3. **Isolation and recovery**: codebase modes, process sandboxing, snapshots, undo and retained failed evidence.
-4. **Provider-neutral outer control**: one contract across direct APIs, CLI harnesses and structured app-server protocols.
-5. **Evidence as a protocol**: append-only records, provenance, spend, flight data and composed `RunView`/`JobView` projections.
+4. **Provider-neutral outer control**: one contract across direct APIs, CLI
+   harnesses and structured app-server protocols, with provider/model choices
+   frozen per role.
+5. **Evidence as a protocol**: append-only records, provenance, spend, flight
+   data, delivery records and receipt-revalidating `RunView`/`JobView`
+   projections.
 6. **Operator control without UI ownership**: attach/status/finish surfaces that read durable truth rather than holding it in memory.
-7. **A migration path from verified runs to Jobs**: keep public chain
-   execution on the Job scheduler, retain read-only access to historical chain
-   state, and turn refused legacy mutations into explicit durable schedules.
+7. **A migration path from verified runs to Jobs**: keep new supported chain
+   creation on the Job scheduler, retain read-only access to historical chain
+   state, and turn refused legacy execution/mutation into explicit durable
+   schedules.
 8. **Local-first inspectability**: reports, library artifacts and import/export that do not require a hosted service.
 
 The uniqueness is not any individual command. It is the combination: provider-independent delegation + durable evidence + independent acceptance + recoverable promotion.
@@ -295,6 +373,9 @@ These are candidates, not automatic deletions. Each should be checked against ac
 | Hidden `acceptance` beside canonical `def-done` | Duplicate name for the same concept | Warn, document `def-done`, remove after a stated window |
 | Hidden `materialize` while visible `export` is its alias | Canonical/internal naming is inverted | Make one name canonical, migrate tests/scripts, remove the other |
 | `abandon` / `discard` overlap with `cleanup` | Similar destructive lifecycle vocabulary increases operator uncertainty | Keep only a distinct single-run semantic; otherwise fold into cleanup |
+| Public `resume`, standalone `merge`, and `campaign repair` help for refusal-only routes | The catalog advertises operator mutations that only a trusted Job driver may perform | Retire the public command or make help state the refusal and point to `start`/`fork`/internal recovery |
+| Historical chain-extension help beside a refusing boundary | `chain extend` and `redo --extend` copy still imply mutation even though the safe public behavior is to print a durable schedule | Describe the migration schedule, not the retired mutation |
+| Wire name `JobShape::LegacyCampaign` for every current Campaign Job | A current product concept is serialized under a compatibility name | Preserve decoding compatibility but introduce a current discriminator/versioned migration before legacy retirement |
 | `list --full` compatibility mode that is accepted but ignored | Code and tests preserve behavior with no present meaning | Deprecate directly and remove after compatibility check |
 | Legacy aliases such as `--force`, `--all`, `--branch`, `--strategy`, `--budget-cap` | Expands permanent parsing and documentation surface | Publish one migration table, then delete together |
 | Reserved no-op pipeline phase 10 `plan` | Implies functionality without executing it | Remove or implement only when a real consumer requires it |
@@ -303,7 +384,12 @@ These are candidates, not automatic deletions. Each should be checked against ac
 | Stale architecture/version text and placeholder comments | Makes repository evidence contradict the code | Regenerate/trim `AS-BUILT-ARCHITECTURE.md`; remove stale verdict placeholder language |
 | Motion/effects and multiple generated-narrative variants | Optional decoration can accumulate latency and maintenance | Keep behind one cheap optional layer; do not let it affect run truth |
 
-There is also structural cruft risk in the breadth of the top-level CLI. Advanced primitives are not themselves cruft, but exposing nearly every internal capability as a peer command makes the product harder to understand. The default five-command flow—`start`, `attach`, `status`, `list`, `finish`—should remain the front door; advanced operations should be grouped into a coherent namespace or progressive-disclosure surface.
+There is also structural cruft risk in the breadth of `help-all` and the
+top-level parser. Default help highlights the five-command flow and a bounded
+set of nearby setup/control commands, but advanced, internal and refusal-only
+capabilities still appear as peers in the full catalog. Keep that progressive
+disclosure and group or remove the remainder instead of letting it become an
+archive of obsolete names.
 
 ## What is half-built or awaiting a product decision
 
@@ -322,8 +408,11 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   execution and run continuation are Job-scheduled. Historical chain
   execution and mutation, including policy-rich launch, now refuse at the
   public boundary; only the characterization binary retains their old
-  behavior for tests. Stored chain-state and characterization retirement still
-  need a decision. Explicit in-place/uncontained execution and previews remain
+  behavior for tests. Public `resume`, standalone `merge` and
+  `campaign repair` also refuse because only the trusted supervisor/Job driver
+  may perform those transitions, although help still advertises them. Stored
+  chain-state, refused-command and characterization retirement still need a
+  decision. Explicit in-place/uncontained execution and previews remain
   foreground, untrusted escape hatches.
 - **Outer-worker crash-window closure**: the supervisor records the prepared
   launch and attempt before spawn. The worker blocks on a private pipe until
@@ -332,12 +421,18 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   valid release acknowledgement tied to that linked launch, plus matching boot
   and process-start identity. Missing or conflicting evidence fails closed.
   Same-ID root mappings and reserved Campaign sub-plan IDs are recoverable
-  without replanning.
+  without replanning. Recovery also restores the frozen root coder model unless
+  an individual piece carries an explicit override.
 - **Aggregate advanced budgets**: root planner spend/wall usage is embedded
   before child work, restored after mapping crashes, subtracted from the Job
   policy and divided across children. Typed Graph/Campaign budget exhaustion
   remains terminal after sidecar loss or a supervisor restart.
-- **Provider parity**: structured events, context accounting, steering and approvals differ across adapters.
+- **Protocol schema coverage**: Git delivery intent and applied-receipt types
+  are real authenticated protocol artifacts, but the checked `all_schemas()`
+  export and `docs/schemas` directory do not yet include them.
+- **Provider parity**: provider-scoped model selection is coherent, but
+  structured events, context accounting, steering and approvals still differ
+  across adapters.
 - **Fault injection and measurement**: the repository has deterministic tests
   for protocol corruption, lease races and reclaim, protected paths, receipt
   tampering, promotion refusal and service rendering. The real macOS
@@ -359,8 +454,10 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
   outcome requires distinct signed terminal-history lineage and the absence of
   a completion receipt. The public strict
   Docker results are bound to the clean committed source named by that result
-  artifact. There is no live Linux/bubblewrap result, reboot result, or
-  measured false-accept and false-reject rate.
+  artifact. Ubuntu CI now supplies real bubblewrap execution and negative
+  smoke-receipt coverage, but there is no recorded live positive strict-Job
+  bubblewrap receipt, reboot result, or measured false-accept and false-reject
+  rate.
 
 ### Product bets needing validation
 
@@ -386,18 +483,22 @@ There is also structural cruft risk in the breadth of the top-level CLI. Advance
 
 ## Recommended sequence
 
-1. **Dogfood the durable-Job promise.** Execute the existing 24-row kit across
-   its two repositories and providers, recording verified completion,
-   recovery, intervention, comprehension time and supervision/judging cost.
+1. **Dogfood the durable-Job promise at current HEAD.** Execute the existing
+   24-row kit across its two repositories and providers, recording verified
+   completion, recovery, intervention, comprehension time and
+   supervision/judging cost. Refresh older clean-source evidence rather than
+   treating it as proof of subsequent supervisor and sandbox changes.
 2. **Exercise crash and service recovery.** Kill workers and supervisors, remove
-   network access, restart the machine, and attempt gate tampering. Close only
-   the crash windows demonstrated by those drills.
+   network access, restart the machine, attempt gate tampering, and complete a
+   positive strict-Job receipt on Linux/bubblewrap. Close only the crash
+   windows demonstrated by those drills.
 3. **Finish the compatibility migration.** The public historical chain
-   execution and mutation boundary is closed. Decide when to retire the
-   characterization-only conductor and stored legacy schema, and whether
-   printed migration schedules need a first-class import command. Keep preview
-   and explicit in-place/uncontained behavior foreground and untrusted without
-   weakening the Job lifecycle.
+   execution and mutation boundary is closed. Retire or relabel public
+   `resume`, standalone `merge`, `campaign repair`, stale chain mutation help,
+   the characterization-only conductor and stored legacy schema; decide
+   whether printed migration schedules need a first-class import command. Keep
+   preview and explicit in-place/uncontained behavior foreground and untrusted
+   without weakening the Job lifecycle.
 4. **Turn team policy into an acceptance input.** Deliver rules-as-gate on top
    of the existing done contract and combined receipt.
 5. **Add resource leasing only after scheduler parity.** Keep cross-machine
@@ -429,7 +530,7 @@ It is suspect when it:
 
 ## Evidence base and limits
 
-This map was derived from the current CLI and crate graph, implementation
+This map was derived from the CLI and crate graph at `bb594a3`, implementation
 paths, tests, changelog, goal and rider history, [`PRODUCT.md`](../PRODUCT.md),
 [`README.md`](../README.md), [`CONCEPTS.md`](CONCEPTS.md),
 [`AUDIT-2026-05-11.md`](AUDIT-2026-05-11.md), and
@@ -442,9 +543,12 @@ public-command gate trial proves the contained two-phase Seatbelt path. Opt-in
 Docker trials prove the common container control boundary and, on macOS arm64,
 public strict-Job completion, cancellation and worker-death recovery. The
 Docker results are recorded against clean source `a0d262d` by evidence commit
-`e1d0825`.
-Unit and integration tests and the 24-row dogfood result, with 2 attempted
-tasks, 22 not run and 0 verified, do not establish live Linux/bubblewrap,
-successful reboot recovery, live cross-provider behavior, or false-accept and
-false-reject rates. Market maturity, frequency of use and willingness to pay
-cannot be inferred from this repository and remain validation questions.
+`e1d0825`, before the later execution-team, supervisor and Linux sandbox
+commits. Ubuntu CI now establishes real bubblewrap command/toolchain execution
+and the negative public smoke-receipt boundary. Unit and integration tests and
+the 24-row dogfood result, with 2 attempted tasks, 22 not run and 0 verified,
+still do not establish a positive live strict-Job receipt on Linux/bubblewrap,
+successful reboot recovery, live current cross-provider behavior, or
+false-accept and false-reject rates. Market maturity, frequency of use and
+willingness to pay cannot be inferred from this repository and remain
+validation questions.
