@@ -561,6 +561,13 @@ async fn extend_creates_new_run_with_parent_artifacts() {
 async fn public_extend_queues_one_parent_bound_durable_job() {
     let temp = repo_tempdir();
     let (paths, parent) = completed_parent(&temp, "durable extend parent");
+    fs::create_dir_all(parent.cwd.join(".deadreckon")).expect("acceptance dir");
+    let acceptance = parent.cwd.join(".deadreckon/acceptance.yaml");
+    fs::write(
+        &acceptance,
+        "name: durable extend acceptance\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/child.txt\"\n",
+    )
+    .expect("acceptance yaml");
     let server = MockServer::start(extend_script()).await;
     write_config(paths.home(), &server.base_url());
 
@@ -575,6 +582,8 @@ async fn public_extend_queues_one_parent_bound_durable_job() {
         .arg("auto")
         .arg("--max-spend")
         .arg("1")
+        .arg("--acceptance")
+        .arg(&acceptance)
         .arg("--no-docs")
         .arg("--yes")
         .output()
