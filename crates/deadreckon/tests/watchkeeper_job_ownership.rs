@@ -987,6 +987,8 @@ fn assert_root_mapping_recovery(shape: JobShape) {
                 "--quiet",
                 "--plain",
             ])
+            .arg("--acceptance")
+            .arg(workspace.join(".deadreckon/acceptance.yaml"))
             .output()
             .expect("Campaign start"),
         _ => unreachable!(),
@@ -1165,6 +1167,8 @@ fn assert_campaign_recovery_case(failpoint: &str, minimum_job_attempts: u32) {
             "--quiet",
             "--plain",
         ])
+        .arg("--acceptance")
+        .arg(workspace.join(".deadreckon/acceptance.yaml"))
         .output()
         .expect("durable Campaign start");
     assert!(
