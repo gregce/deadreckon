@@ -1,5 +1,5 @@
 use super::super::*;
-use deadreckon_core::install_receipt::detect_channel;
+use deadreckon_core::install_receipt::{Channel, detect_channel};
 use deadreckon_providers::{CliAuthStatus, probe_cli_auth};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -46,7 +46,9 @@ struct DeadreckonBinaryHealth {
     path_selected: Option<PathBuf>,
     installations: Vec<DeadreckonBinaryInstallation>,
     conflicts: Vec<String>,
+    advisories: Vec<String>,
     repairable_receipt: bool,
+    repairable_active_installation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +323,18 @@ async fn build_doctor_report(
 
 fn perform_doctor_repairs(paths: &DeadreckonPaths) -> Vec<DoctorFinding> {
     let mut findings = Vec::new();
+    match repair_active_shell_installation(paths) {
+        Ok(detail) => findings.push(DoctorFinding::passed(
+            "repair active installation",
+            detail,
+            None,
+        )),
+        Err(error) => findings.push(DoctorFinding::failed(
+            "repair active installation",
+            format!("left unchanged: {error}"),
+            Some("invoke the intended DeadReckon binary explicitly, then run deadreckon doctor --repair".to_string()),
+        )),
+    }
     match super::providers::reconcile_receipt_for_current_binary(paths, false) {
         Ok(detail) => findings.push(DoctorFinding::passed(
             "repair install receipt",
@@ -346,6 +360,207 @@ fn perform_doctor_repairs(paths: &DeadreckonPaths) -> Vec<DoctorFinding> {
         )),
     }
     findings
+}
+
+/// Reconcile the executable that a new shell would select with the binary the
+/// operator explicitly invoked for `doctor --repair`.
+///
+/// Only the shell-installer-owned path is mutable here. Package-manager paths
+/// remain under npm, Homebrew, or Cargo. On Unix the selected path becomes an
+/// atomic symbolic-link alias, so the binary, adjacent helpers, receipt, and
+/// supervisor all continue to resolve to one canonical installation.
+fn repair_active_shell_installation(paths: &DeadreckonPaths) -> Result<String> {
+    let health = inspect_deadreckon_binaries(paths)?;
+    let Some(selected) = health.path_selected.as_deref() else {
+        return Ok("PATH does not currently select a DeadReckon installation".to_string());
+    };
+    if same_binary_identity(&health.current_path, selected) {
+        return Ok(format!(
+            "PATH already resolves to the running binary through {}",
+            selected.display()
+        ));
+    }
+    if detect_channel(selected) != Channel::Shell || !is_managed_shell_binary_path(selected) {
+        let channel = detect_channel(selected);
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "PATH selects a conflicting {} installation at {}; doctor will not overwrite a package-manager or user-owned executable",
+                channel.as_str(),
+                selected.display()
+            ),
+            super::providers::channel_native_update_command(channel),
+        )));
+    }
+    let selected_metadata = fs::symlink_metadata(selected)?;
+    if !selected_metadata.file_type().is_file() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "PATH-selected shell entry at {} is not a regular installer-owned binary; refusing to replace it",
+                selected.display()
+            ),
+            "replace the custom alias yourself, then rerun deadreckon doctor",
+        )));
+    }
+
+    let (selected_version, selected_probe_error) = probe_deadreckon_version(selected);
+    if let Some(selected_version) = selected_version.as_deref()
+        && version_is_newer(selected_version, &health.current_version)
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "PATH selects newer DeadReckon {selected_version} at {}; refusing to replace it with the explicitly invoked {}",
+                selected.display(),
+                health.current_version
+            ),
+            &format!("{} doctor --repair", selected.display()),
+        )));
+    }
+    if let Some(error) = selected_probe_error {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "PATH-selected DeadReckon at {} could not be verified before repair: {error}",
+                selected.display()
+            ),
+            "repair or reinstall that shell-managed copy, then rerun deadreckon doctor --repair",
+        )));
+    }
+
+    let backup = replace_shell_binary_with_alias(
+        &health.current_path,
+        selected,
+        &paths.home().join("install-repair-backups"),
+    )?;
+    Ok(format!(
+        "PATH now resolves {} to the explicitly invoked DeadReckon {} {}; previous binary backed up at {}",
+        selected.display(),
+        health.current_version,
+        health.current_path.display(),
+        backup.display()
+    ))
+}
+
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(candidate.trim_start_matches('v')),
+        semver::Version::parse(current.trim_start_matches('v')),
+    ) {
+        (Ok(candidate), Ok(current)) => candidate > current,
+        _ => false,
+    }
+}
+
+fn is_managed_shell_binary_path(path: &Path) -> bool {
+    let Some(user_home) = std::env::home_dir() else {
+        return false;
+    };
+    #[cfg(windows)]
+    let expected = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home.join("AppData/Local"))
+        .join("deadreckon/bin")
+        .join(deadreckon_binary_name());
+    #[cfg(not(windows))]
+    let expected = user_home
+        .join(".local/share/deadreckon/bin")
+        .join(deadreckon_binary_name());
+    path == expected
+}
+
+fn repair_backup_dir(root: &Path) -> PathBuf {
+    root.join(format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+        std::process::id()
+    ))
+}
+
+fn backup_binary(source: &Path, backup_root: &Path) -> Result<PathBuf> {
+    let backup_dir = repair_backup_dir(backup_root);
+    fs::create_dir_all(&backup_dir)?;
+    let backup = backup_dir.join(deadreckon_binary_name());
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_file() {
+        fs::copy(source, &backup)?;
+        fs::set_permissions(&backup, metadata.permissions())?;
+    } else {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "PATH-selected DeadReckon is not a regular installer-owned file: {}",
+            source.display()
+        ))));
+    }
+    Ok(backup)
+}
+
+fn replace_shell_binary_with_alias(
+    current: &Path,
+    selected: &Path,
+    backup_root: &Path,
+) -> Result<PathBuf> {
+    let current = std::fs::canonicalize(current)?;
+    if !current.is_file() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "running DeadReckon binary is unavailable at {}",
+            current.display()
+        ))));
+    }
+    let parent = selected.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "PATH-selected DeadReckon has no parent directory: {}",
+            selected.display()
+        )))
+    })?;
+    fs::create_dir_all(parent)?;
+    let backup = backup_binary(selected, backup_root)?;
+    let temporary = parent.join(format!(
+        ".deadreckon-repair-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    create_binary_alias(&current, &temporary)?;
+    if let Err(error) = replace_binary_alias(&temporary, selected) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(backup)
+}
+
+#[cfg(unix)]
+fn create_binary_alias(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_binary_alias(target: &Path, link: &Path) -> Result<()> {
+    fs::copy(target, link)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_binary_alias(temporary: &Path, selected: &Path) -> Result<()> {
+    // POSIX rename replaces the old directory entry atomically. The verified
+    // backup remains available if the operator wants to undo the repair.
+    fs::rename(temporary, selected)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_binary_alias(temporary: &Path, selected: &Path) -> Result<()> {
+    let displaced = selected.with_extension("deadreckon-repair-old");
+    if displaced.exists() {
+        fs::remove_file(&displaced)?;
+    }
+    fs::rename(selected, &displaced)?;
+    match fs::rename(temporary, selected) {
+        Ok(()) => {
+            fs::remove_file(displaced)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::rename(displaced, selected);
+            Err(error.into())
+        }
+    }
 }
 
 fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBinaryHealth> {
@@ -388,11 +603,12 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
     }
 
     let mut conflicts = Vec::new();
+    let mut advisories = Vec::new();
     let mut repairable_receipt = false;
     match read_receipt(paths) {
         Ok(Some(receipt)) => {
             add_binary_candidate(&mut candidates, &receipt.binary_path, "install-receipt");
-            if canonical_binary_path(&receipt.binary_path) != current_canonical {
+            if !same_binary_identity(&receipt.binary_path, &current_path) {
                 conflicts.push(format!(
                     "install receipt points at {}, not the running binary {}",
                     receipt.binary_path.display(),
@@ -432,6 +648,7 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
     let mut installations = Vec::new();
     for (canonical_path, candidate) in candidates {
         let is_current = canonical_path == current_canonical;
+        let active = candidate_has_active_role(&candidate.roles);
         let (version, probe_error) = if is_current {
             (Some(current_version.clone()), None)
         } else {
@@ -440,10 +657,15 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
         if let Some(version) = version.as_deref()
             && version != current_version
         {
-            conflicts.push(format!(
+            let message = format!(
                 "{} is version {version}; the running binary is version {current_version}",
                 canonical_path.display()
-            ));
+            );
+            if active {
+                conflicts.push(message);
+            } else {
+                advisories.push(message);
+            }
         }
         let channel = detect_channel(&canonical_path);
         installations.push(DeadreckonBinaryInstallation {
@@ -459,7 +681,7 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
     }
 
     if let Some(selected) = path_selected.as_ref()
-        && canonical_binary_path(selected) != current_canonical
+        && !same_binary_identity(selected, &current_path)
     {
         conflicts.push(format!(
             "PATH selects {}, but this process is running {}",
@@ -469,6 +691,13 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
     }
     conflicts.sort();
     conflicts.dedup();
+    advisories.sort();
+    advisories.dedup();
+    let repairable_active_installation = path_selected.as_ref().is_some_and(|selected| {
+        !same_binary_identity(selected, &current_path)
+            && detect_channel(selected) == Channel::Shell
+            && is_managed_shell_binary_path(selected)
+    });
 
     Ok(DeadreckonBinaryHealth {
         current_path,
@@ -476,8 +705,32 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
         path_selected,
         installations,
         conflicts,
+        advisories,
         repairable_receipt,
+        repairable_active_installation,
     })
+}
+
+fn candidate_has_active_role(roles: &BTreeSet<String>) -> bool {
+    roles.iter().any(|role| {
+        matches!(
+            role.as_str(),
+            "current" | "path-selected" | "install-receipt" | "supervisor-checkpoint"
+        )
+    })
+}
+
+fn same_binary_identity(left: &Path, right: &Path) -> bool {
+    if canonical_binary_path(left) == canonical_binary_path(right) {
+        return true;
+    }
+    match (
+        deadreckon_core::flight::sha256_file(left),
+        deadreckon_core::flight::sha256_file(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn add_binary_candidate(
@@ -562,7 +815,7 @@ fn probe_deadreckon_version(path: &Path) -> (Option<String>, Option<String>) {
 }
 
 fn binary_health_finding(health: &DeadreckonBinaryHealth) -> DoctorFinding {
-    let detail = if health.conflicts.is_empty() {
+    let mut detail = if health.conflicts.is_empty() {
         format!(
             "{} installation(s) inspected; running {} from {}",
             health.installations.len(),
@@ -577,14 +830,20 @@ fn binary_health_finding(health: &DeadreckonBinaryHealth) -> DoctorFinding {
             health.conflicts.join("; ")
         )
     };
+    if !health.advisories.is_empty() {
+        detail.push_str(&format!(
+            "; {} shadowed installation advisory(s): {}",
+            health.advisories.len(),
+            health.advisories.join("; ")
+        ));
+    }
     if health.conflicts.is_empty() {
         DoctorFinding::passed("deadreckon binaries", detail, None)
     } else {
         DoctorFinding::warning(
             "deadreckon binaries",
             detail,
-            health
-                .repairable_receipt
+            (health.repairable_receipt || health.repairable_active_installation)
                 .then(|| "deadreckon doctor --repair".to_string()),
         )
     }
@@ -1193,5 +1452,88 @@ timeout_ms = 1234
             value["primary_action"]
         );
         assert_eq!(value["next_actions"][0], value["primary_action"]);
+    }
+
+    #[test]
+    fn only_authoritative_installation_roles_create_version_conflicts() {
+        let shadowed = BTreeSet::from(["path".to_string(), "known-install-location".to_string()]);
+        let selected = BTreeSet::from(["path".to_string(), "path-selected".to_string()]);
+        let receipt = BTreeSet::from(["install-receipt".to_string()]);
+
+        assert!(!candidate_has_active_role(&shadowed));
+        assert!(candidate_has_active_role(&selected));
+        assert!(candidate_has_active_role(&receipt));
+    }
+
+    #[test]
+    fn install_repair_never_downgrades_a_newer_selected_version() {
+        assert!(version_is_newer("0.8.0", "0.7.0"));
+        assert!(!version_is_newer("0.7.0", "0.7.0"));
+        assert!(!version_is_newer("0.6.9", "0.7.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_install_repair_backs_up_and_atomically_aliases_running_binary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let current = temp.path().join("source/deadreckon");
+        let selected = temp.path().join("shell/bin/deadreckon");
+        fs::create_dir_all(current.parent().expect("current parent")).expect("current parent");
+        fs::create_dir_all(selected.parent().expect("selected parent")).expect("selected parent");
+        fs::write(&current, b"new binary").expect("current");
+        fs::write(&selected, b"old binary").expect("selected");
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o755)).expect("current mode");
+        fs::set_permissions(&selected, fs::Permissions::from_mode(0o755)).expect("selected mode");
+
+        let backup = replace_shell_binary_with_alias(
+            &current,
+            &selected,
+            &temp.path().join("repair-backups"),
+        )
+        .expect("repair");
+
+        assert_eq!(fs::read(&backup).expect("backup bytes"), b"old binary");
+        assert!(
+            fs::symlink_metadata(&selected)
+                .expect("selected metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::canonicalize(&selected).expect("selected canonical"),
+            fs::canonicalize(&current).expect("current canonical")
+        );
+        assert!(same_binary_identity(&current, &selected));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_install_repair_refuses_an_existing_custom_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let current = temp.path().join("current-deadreckon");
+        let custom = temp.path().join("custom-deadreckon");
+        let selected = temp.path().join("bin/deadreckon");
+        fs::create_dir_all(selected.parent().expect("selected parent")).expect("selected parent");
+        fs::write(&current, b"current").expect("current");
+        fs::write(&custom, b"custom").expect("custom");
+        symlink(&custom, &selected).expect("custom alias");
+
+        let error = replace_shell_binary_with_alias(
+            &current,
+            &selected,
+            &temp.path().join("repair-backups"),
+        )
+        .expect_err("custom alias must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not a regular installer-owned file")
+        );
+        assert_eq!(fs::read_link(&selected).expect("alias retained"), custom);
     }
 }

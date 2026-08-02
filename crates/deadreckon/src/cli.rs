@@ -328,8 +328,9 @@ Lifecycle:
 
 Doctor checks DeadReckon installations and supervisor readiness as well as
 providers, CLI binaries, sandboxes, disk, permissions, and OS details.
-Repair only reconciles the running binary's receipt and DeadReckon-managed
-service; package-manager copies remain under their package manager.";
+Repair treats the explicitly invoked binary as authoritative. It can back up
+and repoint the PATH-selected shell installation, then reconciles the receipt
+and managed service. Package-manager copies remain under their package manager.";
 
 const SEAMS_HELP: &str = "\
 Lifecycle:
@@ -1392,7 +1393,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             conflicts_with = "json",
-            help = "Repair this binary's receipt and the managed supervisor binding"
+            help = "Repair the active shell install, receipt, and managed supervisor binding"
         )]
         repair: bool,
     },

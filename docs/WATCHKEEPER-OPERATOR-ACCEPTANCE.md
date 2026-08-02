@@ -683,9 +683,10 @@ Before repair, inspect `binary_health.installations` in the JSON and confirm
 that the intended executable is marked `current`, the first shell-resolved copy
 is marked `path-selected`, and any receipt or supervisor checkpoint roles name
 the expected versions. If the running binary's own receipt is stale, run
-`"$WK_BIN" doctor --repair`; it may refresh that receipt and a managed service,
-but must leave separate Homebrew/npm/Cargo/shell binaries unchanged and report
-their channel-native update command.
+`"$WK_BIN" doctor --repair`; it may back up and repoint the standard
+shell-installer-owned executable selected by `PATH`, refresh the receipt, and
+repair a managed service. It must leave Homebrew/npm/Cargo and arbitrary
+user-owned binaries unchanged and report their channel-native update command.
 
 Start a sufficiently long disposable Job, record its ID, and restart the
 machine. After login:
@@ -703,7 +704,8 @@ Accept when:
 - [ ] the installed definition names the intended binary, state directory, and
   `PATH`;
 - [ ] `doctor --json` identifies every reachable/known DeadReckon copy with its
-  version and role, and `doctor --repair` does not overwrite a different copy;
+  version and role; `doctor --repair` backs up and aliases only the standard
+  active shell installation and does not overwrite package-manager/user copies;
 - [ ] an unmanaged same-name definition is refused rather than overwritten;
 - [ ] status reports a live schema-version-2 checkpoint whose boot ID, PID,
   process-start identity and instance belong to the current service;
