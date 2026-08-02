@@ -2,8 +2,10 @@ crate: deadreckon-core
   artifact_policy::classify_workspace_path
   artifact_policy::delivery_git_exclude_pathspecs
   artifact_policy::evidence_only_roots
+  artifact_policy::is_checkpointable_workspace_path
   artifact_policy::is_deliverable_workspace_path
   artifact_policy::is_promotable_workspace_path
+  artifact_policy::is_recoverable_workspace_path
   artifact_policy::runtime_output_root
   artifact_policy::WorkspacePathClass
   artifacts::append_provenance
@@ -12,6 +14,8 @@ crate: deadreckon-core
   artifacts::copy_artifact_path
   artifacts::copy_deliverable_tree
   artifacts::copy_promotable_tree
+  artifacts::copy_recoverable_tree
+  artifacts::copy_recoverable_tree_with_policy
   artifacts::copy_tree
   artifacts::diff_snapshots
   artifacts::diff_working_trees
@@ -19,9 +23,14 @@ crate: deadreckon-core
   artifacts::FileDelta
   artifacts::FileDeltaStatus
   artifacts::inventory_files
+  artifacts::inventory_recoverable_files
+  artifacts::inventory_recoverable_files_for_state
+  artifacts::inventory_recoverable_files_with_policy
   artifacts::ProvenanceRecord
   artifacts::remove_artifact_path
   artifacts::restore_snapshot
+  artifacts::SNAPSHOT_CAPTURE_MANIFESTS_DIR
+  artifacts::snapshot_capture_manifest_path
   artifacts::snapshot_diff
   artifacts::snapshot_working
   cancel::CANCEL_MARKER
@@ -61,6 +70,7 @@ crate: deadreckon-core
   codebase::CodebaseMode
   codebase::CodebaseRecord
   codebase::copy_source_to_working
+  codebase::copy_source_to_working_with_policy
   codebase::create_worktree
   codebase::find_git_root
   codebase::ModeFlags
@@ -78,6 +88,7 @@ crate: deadreckon-core
   codebase::WorktreeOptions
   codebase::write_codebase_record
   codebase::write_trusted_codebase_record
+  completion::validate_strict_contract
   completion::seal_completion_receipt
   completion::SEMANTIC_JUDGMENT_JSON
   completion::validate_completion_receipt
@@ -377,6 +388,34 @@ crate: deadreckon-core
   state::RunOwnershipArtifact
   state::RunStatus
   state::save_state
+  workspace_capture::capture_workspace
+  workspace_capture::CaptureBudgets
+  workspace_capture::CaptureEntry
+  workspace_capture::CaptureEntryKind
+  workspace_capture::CaptureMaterialization
+  workspace_capture::CaptureOmission
+  workspace_capture::CaptureOmissionReason
+  workspace_capture::CaptureProjection
+  workspace_capture::CapturePurpose
+  workspace_capture::EncodedWorkspacePath
+  workspace_capture::ensure_workspace_capture_policy
+  workspace_capture::freeze_workspace_capture_policy
+  workspace_capture::GeneratedOutputRoot
+  workspace_capture::GeneratedOutputSource
+  workspace_capture::GitHydrationState
+  workspace_capture::materialize_capture_entry_with_blob_store
+  workspace_capture::materialize_capture_plan
+  workspace_capture::materialize_capture_plan_with_blob_store
+  workspace_capture::read_capture_manifest
+  workspace_capture::read_workspace_capture_policy
+  workspace_capture::SOURCE_HYDRATION_MANIFEST_JSON
+  workspace_capture::workspace_capture_policy_path
+  workspace_capture::WorkspaceCaptureManifest
+  workspace_capture::WorkspaceCapturePlan
+  workspace_capture::WorkspaceCapturePolicy
+  workspace_capture::WORKSPACE_BLOBS_DIR
+  workspace_capture::write_capture_manifest
+  workspace_capture::write_workspace_capture_policy
 crate: deadreckon-providers
   auth_probe::CliAuthStatus
   auth_probe::probe_cli_auth
@@ -386,6 +425,9 @@ crate: deadreckon-providers
   error::ProviderError
   error::Result
   http::ProviderAdapter
+  model_catalog::ModelCatalogSource
+  model_catalog::ResolvedModelCatalog
+  model_catalog::resolve_model_catalog
   narrator::NarratorBackend
   narrator::NarratorCandidate
   narrator::narrator_route_available
