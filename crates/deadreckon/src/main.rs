@@ -1625,9 +1625,20 @@ fn start_startup_update_check(
     }
     Some(tokio::spawn(async {
         let paths = DeadreckonPaths::discover();
-        let Ok(receipt) = commands::providers::update_receipt_for_current_binary(&paths, false)
-        else {
-            return None;
+        // Startup notification is a bounded, read-only convenience.  Do not
+        // reconcile binary identity here: that can hash a large executable
+        // synchronously and delay every otherwise-fast command.  Installed
+        // channels route from their durable receipt; a missing receipt falls
+        // back to cheap path-based detection without persisting anything.
+        let receipt = match read_receipt(&paths) {
+            Ok(Some(receipt)) => receipt,
+            Ok(None) => {
+                let Ok(binary) = std::env::current_exe() else {
+                    return None;
+                };
+                detect_receipt(&binary)
+            }
+            Err(_) => return None,
         };
         if receipt.channel == Channel::Source {
             return None;
