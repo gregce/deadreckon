@@ -8,7 +8,7 @@ use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::flight::{
     CheckpointBase, CheckpointBaseKind, CheckpointCaptureRequest, CheckpointTrigger,
     FlightManifest, FlightSession, FlightSessionStatus, FlightSourcePath, WorkingFileIndex,
-    append_flight_event, build_working_file_index, capture_delta_checkpoint,
+    append_flight_event, build_working_file_index_for_state, capture_delta_checkpoint,
     list_checkpoint_manifests, read_flight_events, read_flight_manifest, sha256_text,
     write_flight_manifest,
 };
@@ -161,7 +161,7 @@ impl ProviderFlightRecorder {
             .max()
             .unwrap_or(0)
             + 1;
-        let last_checkpoint_index = build_working_file_index(&state.working_dir)?;
+        let last_checkpoint_index = build_working_file_index_for_state(state)?;
         let last_observed_index = last_checkpoint_index.clone();
         let mut recorder = Self {
             provider: provider_name.to_string(),
@@ -348,7 +348,7 @@ impl ProviderFlightRecorder {
         state: &PipelineState,
         trigger: CheckpointTrigger,
     ) -> Result<Option<String>> {
-        let after = build_working_file_index(&state.working_dir)?;
+        let after = build_working_file_index_for_state(state)?;
         self.capture_checkpoint_with_after(state, after, trigger)
     }
 
@@ -356,7 +356,7 @@ impl ProviderFlightRecorder {
         &mut self,
         state: &PipelineState,
     ) -> Result<Option<String>> {
-        let after = build_working_file_index(&state.working_dir)?;
+        let after = build_working_file_index_for_state(state)?;
         if after.tree_hash() == self.last_checkpoint_index.tree_hash() {
             self.last_observed_index = after;
             self.pending_checkpoint_since = None;

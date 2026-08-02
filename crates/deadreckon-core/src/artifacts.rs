@@ -11,12 +11,17 @@ use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::artifact_policy::{
-    is_deliverable_workspace_path, is_promotable_workspace_path, is_recoverable_workspace_path,
-};
+use crate::artifact_policy::{is_deliverable_workspace_path, is_promotable_workspace_path};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
+use crate::workspace_capture::{
+    CaptureProjection, CapturePurpose, WorkspaceCapturePolicy, capture_workspace,
+    ensure_workspace_capture_policy, freeze_workspace_capture_policy, materialize_capture_plan,
+    read_capture_manifest, write_capture_manifest,
+};
+
+pub const SNAPSHOT_CAPTURE_MANIFESTS_DIR: &str = "snapshot-manifests";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
@@ -93,8 +98,26 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
     if snapshot_dir.exists() {
         fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
     }
-    copy_recoverable_tree(&state.working_dir, &snapshot_dir)?;
+    let policy = ensure_workspace_capture_policy(state)?;
+    let capture = capture_workspace(
+        &state.working_dir,
+        &policy,
+        CaptureProjection::Recoverable,
+        CapturePurpose::TurnSnapshot,
+    )?;
+    materialize_capture_plan(&capture, &snapshot_dir)?;
+    write_capture_manifest(
+        &snapshot_capture_manifest_path(state, turn),
+        &capture.manifest,
+    )?;
     Ok(snapshot_dir)
+}
+
+pub fn snapshot_capture_manifest_path(state: &PipelineState, turn: u32) -> PathBuf {
+    state
+        .run_root
+        .join(SNAPSHOT_CAPTURE_MANIFESTS_DIR)
+        .join(format!("turn-{turn}.json"))
 }
 
 pub fn restore_snapshot(state: &PipelineState, turn: u32) -> Result<()> {
@@ -110,10 +133,39 @@ pub fn restore_snapshot(state: &PipelineState, turn: u32) -> Result<()> {
             state.run_id
         )));
     }
-    if state.working_dir.exists() {
-        fs::remove_dir_all(&state.working_dir).with_path(&state.working_dir)?;
+    let manifest_path = snapshot_capture_manifest_path(state, turn);
+    if manifest_path.is_file() {
+        let manifest = read_capture_manifest(&manifest_path)?;
+        if manifest.partial {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "restore refused partial snapshot turn-{turn}: {}",
+                manifest.omission_summary()
+            )));
+        }
     }
+    clear_workspace_preserving_git(&state.working_dir)?;
     copy_tree(&snapshot_dir, &state.working_dir)
+}
+
+fn clear_workspace_preserving_git(working_dir: &Path) -> Result<()> {
+    if !working_dir.exists() {
+        fs::create_dir_all(working_dir).with_path(working_dir)?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(working_dir).with_path(working_dir)? {
+        let entry = entry.with_path(working_dir)?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).with_path(&path)?;
+        if metadata.file_type().is_dir() {
+            fs::remove_dir_all(&path).with_path(&path)?;
+        } else {
+            fs::remove_file(&path).with_path(&path)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn diff_snapshots(a: &Path, b: &Path) -> Result<DiffSummary> {
@@ -276,10 +328,31 @@ pub fn inventory_files(root: &Path) -> Result<Vec<PathBuf>> {
 /// Inventory workspace files needed for recovery while pruning disposable
 /// build and dependency trees before traversal.
 pub fn inventory_recoverable_files(root: &Path) -> Result<Vec<PathBuf>> {
-    Ok(inventory_files_with_filter(
+    let policy = freeze_workspace_capture_policy(root)?;
+    inventory_recoverable_files_with_policy(root, &policy)
+}
+
+pub fn inventory_recoverable_files_with_policy(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<Vec<PathBuf>> {
+    let capture = capture_workspace(
         root,
-        is_recoverable_workspace_path,
-    ))
+        policy,
+        CaptureProjection::Recoverable,
+        CapturePurpose::WorkingInventory,
+    )?;
+    capture.require_complete("working inventory")?;
+    Ok(capture
+        .entries
+        .into_iter()
+        .map(|entry| entry.source)
+        .collect())
+}
+
+pub fn inventory_recoverable_files_for_state(state: &PipelineState) -> Result<Vec<PathBuf>> {
+    let policy = ensure_workspace_capture_policy(state)?;
+    inventory_recoverable_files_with_policy(&state.working_dir, &policy)
 }
 
 fn inventory_files_with_filter(root: &Path, include: fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -313,7 +386,24 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 /// build/dependency output. Git control, lifecycle metadata and provider
 /// evidence remain recoverable.
 pub fn copy_recoverable_tree(from: &Path, to: &Path) -> Result<()> {
-    copy_classified_tree(from, to, is_recoverable_workspace_path)
+    let policy = freeze_workspace_capture_policy(from)?;
+    copy_recoverable_tree_with_policy(from, to, &policy).map(|_| ())
+}
+
+pub fn copy_recoverable_tree_with_policy(
+    from: &Path,
+    to: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<crate::workspace_capture::WorkspaceCaptureManifest> {
+    let capture = capture_workspace(
+        from,
+        policy,
+        CaptureProjection::Recoverable,
+        CapturePurpose::WorkingInventory,
+    )?;
+    capture.require_complete("recoverable workspace copy")?;
+    materialize_capture_plan(&capture, to)?;
+    Ok(capture.manifest)
 }
 
 pub fn copy_deliverable_tree(from: &Path, to: &Path) -> Result<()> {
@@ -579,6 +669,10 @@ mod tests {
 
     use crate::DeadreckonPaths;
     use crate::state::{RunOptions, create_run};
+    use crate::workspace_capture::{
+        CaptureOmissionReason, freeze_workspace_capture_policy, read_capture_manifest,
+        write_workspace_capture_policy,
+    };
 
     use super::{
         copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree, diff_snapshots,
@@ -658,6 +752,14 @@ mod tests {
         fs::write(state.working_dir.join("file.txt"), "one").expect("write");
         snapshot_working(&state, 1).expect("snapshot");
         let snapshot = state.run_root.join("snapshots/turn-1");
+        let manifest = read_capture_manifest(&super::snapshot_capture_manifest_path(&state, 1))
+            .expect("snapshot capture manifest");
+        assert!(!manifest.partial);
+        assert!(manifest.omissions.iter().any(|omission| {
+            omission.path == Path::new(".build")
+                && omission.reason == CaptureOmissionReason::GeneratedOutput
+                && omission.file_count == 1
+        }));
         assert!(!snapshot.join(".build").exists());
         assert!(snapshot.join(".git").is_file());
         fs::write(state.working_dir.join("file.txt"), "two").expect("mutate");
@@ -685,6 +787,46 @@ mod tests {
             recoverable
                 .iter()
                 .all(|path| !path.ends_with(".build/debug/app"))
+        );
+    }
+
+    #[test]
+    fn partial_snapshot_is_reported_but_refused_as_an_undo_point() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "bounded snapshot".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(state.working_dir.join("answer.txt"), "large enough").expect("answer");
+        let mut policy = freeze_workspace_capture_policy(&state.working_dir).expect("policy");
+        policy.budgets.max_total_bytes = 1;
+        write_workspace_capture_policy(&state.run_root, &policy).expect("frozen policy");
+
+        snapshot_working(&state, 1).expect("bounded partial snapshot");
+        let manifest = read_capture_manifest(&super::snapshot_capture_manifest_path(&state, 1))
+            .expect("manifest");
+        assert!(manifest.partial);
+        let error = restore_snapshot(&state, 1).expect_err("partial restore must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("restore refused partial snapshot")
+        );
+        assert_eq!(
+            fs::read_to_string(state.working_dir.join("answer.txt")).expect("original remains"),
+            "large enough"
         );
     }
 
