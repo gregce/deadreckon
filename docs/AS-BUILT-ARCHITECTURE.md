@@ -2,9 +2,9 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-07-31 (Watchkeeper durable continuation, protected
-operator capture, observed sandbox boundaries, trusted executable/filter
-hardening and regenerated adversarial evidence)
+**Last updated:** 2026-08-02 (unified execution-team selection, strict durable
+admission, cumulative Job wall caps, stall prevention and current Soundings
+launch/contract limits)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -725,6 +725,7 @@ for turn in (state.turn+1)..=max_turns:
     state.total_spend_usd += response.spend.cost_usd
     state.total_wall_seconds += response.spend.wall_time_seconds
     append_spend(...)
+    save_state()                    # provider completion is a durable boundary
     if max_spend exceeded: return PausedAtCap
     if subscription and max_wall_seconds exceeded: return PausedAtCap
 
@@ -824,9 +825,15 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-`ProviderRequest` (`types.rs:89`) carries: `prompt`, `max_output_tokens`, optional `cwd`, optional `output_path`, optional `sandbox_backend`, optional `pid_file`, optional `cancellation_token`.
+`ProviderRequest` carries `prompt`, `max_output_tokens`, optional `cwd`,
+optional `output_path`, optional `sandbox_backend`, `workspace_access`, optional
+`pid_file`, optional `cancellation_token`, optional `session_dir`, optional
+`output_schema`, and optional request-scoped `capability_posture`. The last 4
+fields support CLI conversation state, constrained output, cancellation and
+Codex app-server approval answers without adding a second durable policy.
 
-`ProviderResponse` (`types.rs:100`) carries: `provider`, `model`, `content`, `usage`, `spend`, `trace` (JSON value).
+`ProviderResponse` carries `provider`, `model`, `content`, `usage`, `spend`, and
+the JSON `trace` value.
 
 ### 10.2 Kinds
 
@@ -862,31 +869,46 @@ Cancellation: `tokio::select!` on `token.cancelled()` vs `client.post().send()` 
 
 ### 10.4 CLI sub-agent adapters
 
-**`cli:claude-code` (`crates/deadreckon-providers/src/cli_claude_code.rs:1-142`).** Invocation:
+**`cli:claude-code` (`crates/deadreckon-providers/src/cli_claude_code.rs`).** A
+normal read-write worker invocation is:
 
 ```zsh
 claude [--model <model>] --dangerously-skip-permissions -p "<prompt>"
 ```
 
-The `--dangerously-skip-permissions` flag is non-negotiable (no human is in the loop). The subprocess runs **inside** the deadreckon sandbox profile, so Claude's bypass only disables its own permission gate; deadreckon's outer Seatbelt/bwrap still scopes the process. Stdout is captured to `request.output_path` (the turn's `claude.out`).
+Read-write workers use `--dangerously-skip-permissions` because no human is in
+the loop. Read-only requests remove that flag and require an enforceable outer
+sandbox. Structured-capable binaries add stream JSON and may resume the
+run-scoped conversation. DeadReckon's outer Seatbelt, bubblewrap or Docker
+profile still defines the filesystem boundary. Stdout is captured to
+`request.output_path`.
 
-**`cli:codex` (`crates/deadreckon-providers/src/cli_codex.rs:1-164`).** Invocation:
+**`cli:codex` (`crates/deadreckon-providers/src/cli_codex.rs`).** A fresh
+invocation starts as:
 
 ```zsh
-codex --ask-for-approval never exec --skip-git-repo-check --sandbox <mode> -- "<prompt>"
+codex --ask-for-approval never exec [--model <model>] --skip-git-repo-check --sandbox <mode> [--json] [-o <last-message>] [--output-schema <schema>] -- "<prompt>"
 ```
 
-`<mode>` (`cli_codex.rs:121-131`) is `workspace-write` when the outer sandbox is `None`/`SandboxBackend::None` (safer, codex limits itself to cwd), and `danger-full-access` when an outer sandbox is active (the outer sandbox is doing the isolating; codex needs full filesystem access inside).
+`<mode>` is `read-only` for a read-only request. It is `workspace-write` when a
+read-write request has no outer sandbox, and `danger-full-access` when an outer
+sandbox provides the boundary. Resume uses `exec resume <id>` and inherits the
+session's original sandbox policy.
 
 The trailing `--` delimiter is non-negotiable: doc-polish prompts often begin with YAML frontmatter (`---`), which `clap`-based Codex CLIs otherwise interpret as an option-like argument. Adding `--` forces the prompt to be parsed as the positional value.
 
 **Descriptor-backed CLI providers.** The provider registry now owns compiled-in TOML descriptors plus `providers.d` overrides. Generic CLI descriptors (`ProviderKind::Generic(id)` where the descriptor kind is `cli`) are launched by `GenericCliProvider`, which renders `exec_template.args_template` with `{prompt}`, `{sandbox}`, and `{cwd}` placeholders and applies the descriptor `model_arg` near the prompt without splitting prompt-value flags like `-p <prompt>`. `cli:gemini`, `cli:opencode`, `cli:copilot`, and `cli:pi` are built-in generic CLIs; `cli:claude-code` and `cli:codex` remain concrete adapters for compatibility with their established launch quirks. Copilot launches as `copilot -p <prompt> --output-format json --stream off --no-color --allow-all`; Pi launches as `pi --mode json --print <prompt>` so its default saved sessions remain available to the TUI.
 
-**Shared subprocess machinery (`cli_common.rs:22-120`).** Builds a `SandboxSpec` with explicit allowlists (`cli_common.rs:154-166`):
+**Shared subprocess machinery (`cli_common.rs`).** Builds a `SandboxSpec` with
+explicit allowlists:
 
 - Write allowlist: descriptor `sandbox_writes` for registered CLIs, with concrete compatibility fallbacks for codex and claude.
 - Read allowlist: binary location + `~/.bun`, `~/.local`, `~/.npm-global`, `~/.opencode`.
 - `allow_network: true` (CLI agents need outbound for their own API calls).
+
+The common runner observes `cancellation_token` when one is present. Without a
+token it waits for the child process to exit. It does not add a generic wall
+timeout. Callers that promise a time bound must supply and enforce one.
 
 **Spend (subscription).** Per `cli_claude_code.rs:100-110` and the equivalent in `cli_codex.rs`:
 
@@ -1490,17 +1512,57 @@ first screen.
 
 ### 17.1 Guided first use
 
-`deadreckon start "<goal>"` is the guided production command. It is intentionally a thin CLI-layer decision helper, not a new runtime state machine: each invocation builds an ephemeral launch decision, prints the selected path and reason, and either previews or dispatches to the existing `run`, `extend`, and `orchestrate` handlers. In an interactive TTY, `start` uses normal terminal selection prompts for launch mode, provider route, done contract, source mode, and final confirmation when flags have not already made those choices explicit. No `PipelineState` schema changes were introduced for this path, and previews remain state-free.
+`deadreckon start "<goal>"` is the guided production command. It is a thin
+CLI-layer decision helper, not a second runtime state machine. Each invocation
+builds an ephemeral launch decision, prints the selected path and reason, and
+either previews or dispatches to the durable Single, Graph or Campaign
+scheduler described in §58. In an interactive TTY, `start` can prompt for the
+launch shape, execution team, done contract, source mode and final confirmation.
+Explicit flags skip the matching prompt. Previews remain state-free and this
+path adds no fields to `PipelineState`.
 
-The launch decision resolves provider setup, done contract, source mode, history, and run-vs-orchestrate/campaign mode before any provider work begins. Provider resolution uses configured defaults first and only probes installed subscription CLIs when no default route is configured; TTY users can select a detected route ephemerally for that launch without writing config, while non-TTY or scripted users still get concrete `try:` lines for `init`, `detect`, `config provider`, or `providers list --all`. Done-contract resolution uses the same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs: existing project criteria trigger a TTY keep/view/check/update/cancel prompt so users can inspect or change the contract before launch, missing criteria can be generated or defaulted, and non-TTY callers get deterministic recovery lines. Source-mode resolution follows the existing run safety posture: git worktree by default in repositories, TTY selection for init-git/copy/fresh in non-git directories, and explicit stash or `--allow-dirty` choices for dirty worktrees.
+Guided setup treats provider and model choice as one execution-team decision.
+A uniform choice applies one provider/model pair to every required role. The
+custom path can set planner and implementor, implementor and reviewer, or
+individual full-plan implementor overrides. Full-plan also asks for 2 to 6
+implementors. Provider-specific model choices come from the registry and its
+cached model catalog when available. The exact role routes and models persist
+in the launch plan, durable driver and recovery/replay inputs; a model chosen
+for one provider does not leak to another provider. Legacy global `--model`
+continues to work.
+
+Within guided setup, DeadReckon resolves the provider and role options before
+the done contract, then resolves the source mode. Provider resolution uses
+configured defaults first and probes installed subscription CLIs only when no
+default route is configured. A TTY choice is launch-local and does not rewrite
+config. Non-TTY callers get concrete `try:` lines for `init`, `detect`,
+`config provider`, or `providers list --all`. Existing project criteria use the
+same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs.
+Source resolution keeps the direct-run safety posture: git worktree by default,
+explicit copy or fresh modes, and explicit dirty-worktree consent.
 
 History-aware `start` scans the current project scope for the newest completed, promoted, non-in-place run. When one exists, the TTY launch picker adds a "Follow up" choice that dispatches through `extend`; preview and JSON output also include exact commands for `deadreckon extend <run-id> "<goal>"`, `deadreckon start "<goal>" --mode review --yes`, and `deadreckon start "<goal>" --mode full-plan --yes`. This keeps scripted `start` deterministic while making it obvious how to continue prior work or launch a new orchestration pass.
 
 Auto mode is advisory. When a usable provider exists, `start` makes one bounded read-only classifier call through the existing provider router to recommend a single verified run, review/full-plan orchestration, or campaign with a count and rationale. The validated recommendation is preview-scoped and state-free; no personal preference is persisted. Smoke/no-provider paths use deterministic fallback heuristics. In a TTY, the recommendation appears first in the picker and the user can override it with an explicit selection or flag.
 
-`start --preview`, `run --preview`, and `orchestrate --preview` share launch-preview rows: path, provider, done contract, workspace, watch, stop, and finish, with optional base/history rows when a follow-up is selected or available. Orchestrated `start` previews also show role reuse when one selected provider route is used for coder/reviewer or planner/child roles. Successful guided launches add a `start lifecycle` footer with exact `attach`, `status`, `kill`, and `finish` commands for the created run or plan. Existing `run`, `extend`, `orchestrate`, and `campaign` remain the canonical direct commands for users who already know the path they want.
+`start --preview`, `run --preview`, and `orchestrate --preview` share launch
+facts for the path, provider, done contract, workspace, watch, stop and finish.
+Guided previews also show the exact provider/model pair for each execution role,
+the implementor count and any child overrides. Successful launches add exact
+`attach`, `status`, `kill`, and `finish` commands for the new Job. Existing
+`run`, `extend`, `orchestrate`, and `campaign` remain the direct commands for
+users who already know the path they want.
 
 Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-contract files are only generated for an actual launch after final confirmation.
+
+There is one current ordering defect. For `review` and `full-plan`, `start`
+can resolve and preview `--from`, then materialize or review a contract, before
+the advanced Graph dispatcher rejects source flags as run-only. The rejection
+creates no Job, but it arrives after the expensive contract work. Contract
+authoring also writes to and inspects the launch directory, not the `--from`
+source. The Soundings [goal](goals/2026-08-02-0016-deadreckon-soundings-goal.md)
+and [rider](goals/2026-08-02-0016-deadreckon-soundings-rider.md) specify the
+planned correction. They do not describe shipped behavior.
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -1788,6 +1850,14 @@ The codebase is more complete than a typical first pass, and the 2026-05-11 hard
 - `ratatui` attach TUI with spend/context/acceptance telemetry, provider activity, in-TUI Markdown docs rendering, live files, process panel, scrollable panels, campaign sub-plan cards, and completion action footer. Run, plan, chain, and campaign attach now share an explicit responsiveness contract: render paths are provider-free and write-free, JSONL streams are tailed or cached, provider narrative refreshes run in cancellable/coalesced background jobs, stale narrative snapshots survive redraw, and long operations surface a `deadreckoning` ASCII status line in CLI and footer alike.
 - Helm attach (§47): a uniform five-question status spine, flattened voyage tree for campaign -> plan -> run and chain steps, event-driven input loop with input-to-frame latency instrumentation, in-frame chain input/modals, `:` command mode for existing chain verbs, `w` why evidence panel, scrubable turn timeline, chain narrative parity, sectioned help overlays, focused footer hints, and `[ui] motion = full|reduced|off` effects. This moves the prior flattened-campaign-tree and in-frame-input items from thin to shipped; the attach daemon, ratzilla web mirror, cross-machine attach, and provider pty embedding remain V1 candidates.
 - Contract (§48): `.deadreckon/acceptance.yaml` remains the durable done-contract schema, but `acceptance` and `start` now compile it into a read model with stable per-check summaries, behavior/falsifiability labels, deterministic lint findings, and goal↔contract divergence. The compiler prompt sees the run goal, demands behavioral/falsifiable checks, bans source-scan-only contracts and `--if-present`-only build/test gates, and the Course plan/card/JSON carry compiled checks plus divergence.
+- Unified execution teams (§17.1): guided `start` selects provider and model as
+  one team decision, supports per-role and individual full-plan implementor
+  overrides, and persists exact choices through preview, launch, recovery and
+  replay.
+- Durable stall prevention (§58): Job admission rejects unsealable placeholder
+  contracts; cumulative active-attempt wall caps include controller work and
+  restart gaps; owned process trees are reconciled before terminal status; Git
+  pipe handling and SwiftPM artifact filtering remove 2 known local stalls.
 - Descriptor-driven provider activity ingest for Codex, Claude Code, Gemini JSON/JSONL, OpenCode file-mode logs, GitHub Copilot CLI session-state JSONL, and Pi session JSONL, normalized into `agent` / `thinking` / `tool` / `result` / `todo` / `tokens` rows without rewriting provider-owned logs.
 - Descriptor import hardening: `deadreckon import` accepts legacy aliases and provider descriptor ids, discovers CLI transcripts through descriptor `[ingest]`, selects concrete sessions by cwd or `--session`, writes `import.json`, refuses ambiguous/changed imports with `try:` lines, and normalizes trace/provenance rows for Codex, Claude Code, Gemini, OpenCode file-mode, GitHub Copilot CLI, Pi, and Cursor SQLite.
 - Acceptance progress: strict Jobs reconstruct final per-check rows only after
@@ -3442,10 +3512,13 @@ With no operator `acceptance.yaml`, a Polyglot-detected contract answers
 "done" with zero questions (source `detected`, DefaultGate action — the gate
 compiles the same detected default at run time). An unknown tree asks exactly
 one question — "How will you know it worked?" — whose one-line answer
-compiles through the existing def-done flow (source `asked`); Enter accepts
-the default gate. `--yes` skips the question and proceeds with the caveat on
-the label; non-TTY without `--yes` keeps the def-done refusal, aligned with
-46.6. The old four-choice done menu is gone.
+compiles through the existing def-done flow (source `asked`). Pressing Enter
+asks the agent to draft practical criteria from the launch goal. `--yes` can
+approve resolved criteria but cannot invent them: an unknown tree refuses
+before Job creation and prints a `def-done` recovery command. The same strict
+admission check rejects a contract whose only required check proves that the
+pre-created working directory exists. Non-TTY execution without a contract
+also refuses. The old four-choice done menu is gone.
 
 ### 46.9 Dispatch, replay, JSON parity
 
@@ -3617,10 +3690,10 @@ build/test gate. The anti-self-attestation rule stays in force.
 
 The deterministic falsifiability lint is the floor. It flags contracts with no
 behavioral checks, source-scan-only substantive gates, `--if-present`-only
-build/test checks, and other unfalsifiable substantive checks. A bounded critic
-pass can run after a provider draft; it receives the goal, compiled contract,
-and lint findings, then can request at most one automatic redraft. If the critic
-is unavailable, the lint floor still surfaces.
+build/test checks, and other unfalsifiable substantive checks. One critic pass
+can run after a provider draft. It receives the goal, compiled contract and lint
+findings, then can request at most one automatic redraft. If the critic is
+unavailable, the lint floor still surfaces.
 
 `start` reconciles the run goal against the compiled contract before launch.
 The deterministic reconciliation splits the goal into clauses and reports
@@ -3636,6 +3709,37 @@ from §46 now records compiled checks and divergence in its contract section;
 the Course card lists `done 1`, `done 2`, etc., flags drift, and adds `d` as
 the done-review action. `start --json` includes the same checks and divergence
 in preview and launch envelopes.
+
+### 48.1 Current contract-authoring limits
+
+The authoring loop is count-bounded but not time-bounded. A launch can make up
+to 3 serial provider calls: draft, critic and one redraft. These requests have
+no cancellation token or shared deadline. The CLI wait line reports elapsed
+time but does not enforce a timeout. A local CLI provider therefore waits on
+the child process until it exits and may use network-backed tools while its
+filesystem view remains read-only. The durable Job wall cap starts later and
+does not bound this pre-launch work.
+
+The launch directory is both the contract write root and the workspace shown to
+the authoring provider. `--from` does not change that inspection root. A launch
+from a sparse directory can therefore produce plausible but wrong package,
+target or evidence names for the real source.
+
+An automatic redraft receives the original request and the critic's reduced
+verdict. It does not receive the first generated YAML, Markdown or helper files
+as the candidate to repair. Each read-only request also starts without a
+resumable provider session. The critic parser accepts only `pass` and `redraft`;
+a provider verdict such as `reject` falls back to deterministic lint and drops
+the provider's returned detail. The provider transport supports output schemas,
+but these acceptance requests do not set one.
+
+After the calls return, DeadReckon parses and compiles the candidate, checks its
+check count, writes the project files and shows the contract for review. Strict
+Job admission separately rejects empty, optional-only and directory-exists-only
+contracts. These checks limit false acceptance, but they do not make authoring
+fast or source-aware. The Soundings [goal](goals/2026-08-02-0016-deadreckon-soundings-goal.md)
+and [rider](goals/2026-08-02-0016-deadreckon-soundings-rider.md) define that
+unshipped correction.
 
 Deferred Contract work stays out of the stable slice: first-class browser/HTTP
 check kinds, a standalone `deadreckon contract` report verb, multi-round critic
@@ -4180,6 +4284,12 @@ reachable only from the characterization binary used by tests.
 | Installed `deadreckon supervisor` user service | launchd or systemd starts `supervisor serve`, which scans supported nonterminal Jobs | Uses the same shape-specific classifiers and receipt validators as detached one-shot supervision | Conditional restart-at-login posture; live active-service and reboot acceptance remain |
 | Public `extend` or a follow-up selected by guided `start` | Freezes the completed parent state, promoted-artifact tree and verified receipt, then writes a Single Job before child work | Revalidates the frozen parent inputs before continuation evidence, then uses the normal two-key child receipt | Durable parent-bound continuation; launch-time `--dest` is refused and delivery remains a later `finish` |
 
+The Graph row applies only after current dispatch accepts the source posture.
+Guided `review` and `full-plan` do not support `--from`, `--fresh` or
+`--allow-dirty`. Today the setup path can still preview one of those flags before
+the final dispatcher rejects it. That late refusal creates no Job. Soundings is
+the planned source-aware Graph correction, not part of this execution boundary.
+
 Persisted durability and supervised durability are different claims. Every run
 continues to write state, ledgers, snapshots, and evidence. A Watchkeeper Job
 also has a renewable fenced owner, typed terminal reason, detached process
@@ -4244,11 +4354,13 @@ mutable mapping is navigation evidence, never completion authority.
 
 1. save and sync the resolved `launch-plan.json`;
 2. copy or materialize `acceptance.yaml`;
-3. hash the goal, contract, effective policy, launch plan, deliverable source
+3. validate that the contract has required checks and is not the unknown-tree
+   directory-exists placeholder;
+4. hash the goal, contract, effective policy, launch plan, deliverable source
    tree, and source revision into `authority.json`;
-4. save `job.json`;
-5. append `created`, `contract_approved`, and `queued`;
-6. only then spawn the detached supervisor.
+5. save `job.json`;
+6. append `created`, `contract_approved`, and `queued`;
+7. only then spawn the detached supervisor.
 
 The effective-policy digest includes the requested sandbox selector and
 tool-capability policy, not only spend, wall-time, retry, and semantic-judge
@@ -4299,6 +4411,20 @@ Capstan's process helper starts the worker in its own process group and writes
 terminates the process group with bounded escalation. Supervisor exit is only
 a wake-up: terminal classification comes from persisted run state, the
 deterministic marker, semantic judgment, and final receipt.
+
+The approved Job wall cap covers cumulative active-attempt time, not only time
+reported by the provider. The supervisor rebuilds elapsed time from the
+append-only `AttemptStarted` and `AttemptStopped` history. An attempt left open
+across supervisor or machine restart keeps consuming the same allowance. The
+supervisor checks the boundary before an attempt, while a child runs, after it
+exits and during controller-side Git, evidence, gate and receipt work.
+
+When the cap expires, the supervisor reconciles the outer worker, gate
+evaluator, Campaign subprocess, merge-repair groups and tracked Docker
+execution before recording `wall_cap`. If it cannot prove that all owned work
+stopped, it records `LostContainment` instead of claiming clean budget
+exhaustion. This closes the durable-run stall where completed provider work
+could leave the Job waiting indefinitely in local post-processing.
 
 The recovery policy is intentionally fail-closed:
 
@@ -4400,6 +4526,9 @@ trusted result. Workspace paths are classified as deliverable,
 evidence-only, lifecycle metadata, or disposable runtime output. Trusted
 copies preserve regular files, executable mode, symlinks, and raw symlink
 targets without following links; special filesystem entries fail closed.
+Rust `target`, JavaScript `node_modules`, and SwiftPM `.build` directories are
+disposable runtime output. DeadReckon omits them from source copies, snapshots,
+provider checkpoints, result capture and evidence inventories.
 Provider-created commits and index state are discarded, then DeadReckon stages
 only deliverable paths and creates its own hook-free commit through a captured
 Git control context outside the provider's authority.
@@ -4418,6 +4547,11 @@ staging operation can refresh the worktree and inventories both current
 workspace-guard paths and every path in the approved base tree. The mixed reset
 also uses `--no-refresh`, so a racy timestamp cannot invoke an external clean,
 smudge or process filter before the refusal.
+
+Trusted Git commands that stream path input, including `check-attr --stdin`,
+write stdin while collecting stdout and stderr. This keeps all pipes moving and
+prevents large workspaces from deadlocking the supervisor during filter
+inspection.
 
 The real macOS public-command end-to-end test runs the approved shell check
 under Seatbelt. It proves protected-path denial, inherited `GATE_*` scrubbing,
@@ -4574,10 +4708,14 @@ detached-parent survival, typed spawn failure, the shared Job resolver, guided
 Graph and Campaign identity,
 same-ID root mapping repair, guarded launch recovery, persisted Campaign
 sub-plan recovery and reserved identities, aggregate root-planner spend/wall
-enforcement, terminal budget recovery after sidecar loss, cancellation races,
+enforcement, cumulative active-attempt wall enforcement across restarts,
+active process-tree cleanup, strict contract admission, terminal budget
+recovery after sidecar loss, cancellation races,
 worst-of roll-up refusal, one- and multi-round Graph/Campaign semantic parent
 repair, candidate-ready crash adoption, repair-lineage mutation and symlink
-refusal, parent receipt crash recovery, service rendering, fault boundaries,
+refusal, parent receipt crash recovery, provider-result persistence before
+local post-processing, large bidirectional Git input, SwiftPM `.build`
+exclusion, execution-team/model recovery, service rendering, fault boundaries,
 and promotion enforcement.
 
 `examples/watchkeeper-dogfood/` contains an operator-triggered public-command
@@ -4665,4 +4803,4 @@ open live claims.
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-08-02 for unified execution-team selection (§17), honest Contract authoring and Graph-source limits (§17, §46, §48 and §58), strict durable contract admission, cumulative active-attempt wall enforcement, process reconciliation, early provider-result persistence, concurrent Git pipe draining and SwiftPM artifact exclusion (§9, §22 and §58). Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
