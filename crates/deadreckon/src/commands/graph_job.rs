@@ -71,6 +71,19 @@ pub(crate) struct DriverSpec {
     pub(crate) child_provider_overrides: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    #[serde(default)]
+    pub(crate) planner_model: Option<String>,
+    #[serde(default)]
+    pub(crate) child_model: Option<String>,
+    #[serde(default)]
+    pub(crate) child_model_overrides: Vec<String>,
+    #[serde(default)]
+    pub(crate) coder_model: Option<String>,
+    #[serde(default)]
+    pub(crate) reviewer_model: Option<String>,
+    /// Pre-execution-team jobs stored one model for every role. New jobs keep
+    /// this only as a backward-compatible fallback.
+    #[serde(default)]
     pub(crate) model: Option<String>,
     pub(crate) source_init_git: bool,
 }
@@ -6123,11 +6136,21 @@ async fn drive_plan(
             child_provider: driver.child_provider_overrides,
             coder_provider: driver.coder_provider,
             reviewer_provider: driver.reviewer_provider,
-            planner_model: execution.planner_model,
-            model: driver.model,
-            child_model: execution.child_models,
-            coder_model: execution.coder_model,
-            reviewer_model: execution.reviewer_model,
+            planner_model: driver.planner_model.or(execution.planner_model),
+            model: driver.child_model.or(driver.model.clone()),
+            child_model: if driver.child_model_overrides.is_empty() {
+                execution.child_models
+            } else {
+                driver.child_model_overrides
+            },
+            coder_model: driver
+                .coder_model
+                .or(execution.coder_model)
+                .or_else(|| driver.model.clone()),
+            reviewer_model: driver
+                .reviewer_model
+                .or(execution.reviewer_model)
+                .or(driver.model),
             init_git: driver.source_init_git,
             acceptance: Some(commands::job::job_acceptance_path(
                 paths,
@@ -6226,8 +6249,8 @@ async fn drive_campaign(
         n: driver.child_count,
         planner_provider: driver.planner_provider,
         provider: driver.child_provider,
-        planner_model: None,
-        model: driver.model,
+        planner_model: driver.planner_model,
+        model: driver.child_model.or(driver.model),
         max_spend: Some(job.policy.max_spend_usd),
         max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
         deadline: job.policy.deadline,
@@ -11167,11 +11190,38 @@ mod tests {
             child_provider_overrides: vec!["1=reviewer".to_string()],
             coder_provider: None,
             reviewer_provider: None,
-            model: Some("model".to_string()),
+            planner_model: Some("planner-model".to_string()),
+            child_model: Some("model".to_string()),
+            child_model_overrides: vec!["1=review-model".to_string()],
+            coder_model: None,
+            reviewer_model: None,
+            model: None,
             source_init_git: false,
         };
         embed_driver_spec(&mut plan, &spec).expect("embed");
         assert_eq!(driver_spec(&plan).expect("read"), spec);
+    }
+
+    #[test]
+    fn pre_execution_team_driver_deserializes_with_legacy_model_fallback() {
+        let driver: DriverSpec = serde_json::from_value(serde_json::json!({
+            "kind": "full_plan",
+            "child_count": 3,
+            "apply": "at-end",
+            "planner_provider": "planner",
+            "child_provider": "worker",
+            "child_provider_overrides": [],
+            "coder_provider": null,
+            "reviewer_provider": null,
+            "model": "legacy-model",
+            "source_init_git": false
+        }))
+        .expect("legacy driver");
+
+        assert_eq!(driver.model.as_deref(), Some("legacy-model"));
+        assert_eq!(driver.planner_model, None);
+        assert_eq!(driver.child_model, None);
+        assert!(driver.child_model_overrides.is_empty());
     }
 
     #[test]
@@ -11190,6 +11240,11 @@ mod tests {
             child_provider_overrides: Vec::new(),
             coder_provider: None,
             reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
             model: None,
             source_init_git: false,
         };
@@ -11337,6 +11392,11 @@ mod tests {
             child_provider_overrides: Vec::new(),
             coder_provider: None,
             reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
             model: None,
             source_init_git: false,
         };

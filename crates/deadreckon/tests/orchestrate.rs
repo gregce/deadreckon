@@ -847,7 +847,7 @@ fn start_adopts_single_detected_subscription_provider_inline() {
 }
 
 #[test]
-fn start_with_two_detected_providers_still_prompts() {
+fn start_with_two_detected_providers_prompts_for_execution_team() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -873,7 +873,7 @@ fn start_with_two_detected_providers_still_prompts() {
     );
 
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(text.contains("Choose provider"), "{text}");
+    assert!(text.contains("Choose execution team"), "{text}");
     assert!(text.contains("cli:codex"), "{text}");
     assert!(text.contains("cli:claude-code"), "{text}");
     assert!(
@@ -1102,7 +1102,7 @@ fn pty_start_picker_choose_full_plan_preview() {
 }
 
 #[test]
-fn pty_start_single_detected_provider_preview_without_config_write() {
+fn pty_start_single_detected_provider_prompts_for_model_without_config_write() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -1120,22 +1120,19 @@ fn pty_start_single_detected_provider_preview_without_config_write() {
     let output = deadreckon_pty(
         &paths,
         &repo,
-        &["1"],
+        &["1", "1"],
         &["start", "build the app", "--mode", "run", "--preview"],
         "provider[[:space:]]*: cli:codex",
         Some(&bin),
     );
 
     let text = format!("{}{}", stdout(&output), stderr(&output));
-    assert!(!text.contains("Choose provider"), "{text}");
-    assert!(text.contains("cli:codex (detected)"), "{text}");
-    assert!(
-        text.contains("deadreckon config provider cli:codex"),
-        "{text}"
-    );
+    assert!(text.contains("Choose execution team"), "{text}");
+    assert!(text.contains("Codex CLI · provider default"), "{text}");
+    assert!(text.contains("cli:codex / provider default"), "{text}");
     assert!(
         !paths.config_path().exists(),
-        "inline detected provider adoption should not write config"
+        "interactive execution-team selection should not write config"
     );
 }
 

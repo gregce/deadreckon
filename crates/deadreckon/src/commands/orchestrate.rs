@@ -687,7 +687,12 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
         child_provider_overrides: args.plan.child_provider.clone(),
         coder_provider: args.plan.coder_provider.clone(),
         reviewer_provider: args.plan.reviewer_provider.clone(),
-        model: args.plan.model.clone(),
+        planner_model: args.plan.planner_model.clone(),
+        child_model: args.plan.model.clone(),
+        child_model_overrides: args.plan.child_model.clone(),
+        coder_model: args.plan.coder_model.clone(),
+        reviewer_model: args.plan.reviewer_model.clone(),
+        model: None,
         source_init_git: args.plan.init_git,
     };
     let accepted_launch_plan = args.accepted_launch_plan.clone();
@@ -702,8 +707,21 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
     launch_plan.pieces = args.seed_pieces;
     launch_plan.providers = commands::course::CourseProviders {
         planner: args.plan.planner_provider.clone(),
+        default_child: args.plan.provider.clone(),
         coder: args.plan.coder_provider.clone(),
         reviewer: args.plan.reviewer_provider.clone(),
+        planner_model: args.plan.planner_model.clone(),
+        default_child_model: args.plan.model.clone(),
+        coder_model: args.plan.coder_model.clone(),
+        reviewer_model: args.plan.reviewer_model.clone(),
+        children: commands::plan::parse_child_provider_overrides(
+            &args.plan.child_provider,
+            args.plan.n,
+        )?,
+        child_models: commands::plan::parse_child_model_overrides(
+            &args.plan.child_model,
+            args.plan.n,
+        )?,
     };
     launch_plan.budget.ceiling_usd = Some(max_spend_usd);
     launch_plan.budget.wall_seconds = Some(max_wall_seconds);
@@ -884,6 +902,11 @@ mod tests {
             child_provider_overrides: Vec::new(),
             coder_provider: Some("coder".to_string()),
             reviewer_provider: Some("reviewer".to_string()),
+            planner_model: Some("planner-model".to_string()),
+            child_model: None,
+            child_model_overrides: vec!["1=review-model".to_string()],
+            coder_model: Some("coder-model".to_string()),
+            reviewer_model: Some("reviewer-model".to_string()),
             model: None,
             source_init_git: false,
         };

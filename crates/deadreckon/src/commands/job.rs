@@ -2217,6 +2217,11 @@ mod tests {
             child_provider_overrides: Vec::new(),
             coder_provider: None,
             reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
             model: None,
             source_init_git: false,
         });
@@ -2333,6 +2338,11 @@ mod tests {
             child_provider_overrides: Vec::new(),
             coder_provider: None,
             reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
             model: None,
             source_init_git: false,
         });

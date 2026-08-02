@@ -870,7 +870,7 @@ async fn providers_list_command(
         };
         print_provider_list_row(result, descriptor, active.as_deref(), full);
         if models {
-            print_provider_models(descriptor);
+            print_provider_models(descriptor, provider_user_home(&paths).as_path());
         }
     }
     for warning in &warnings {
@@ -1017,13 +1017,20 @@ fn print_provider_list_row(
     }
 }
 
-fn print_provider_models(descriptor: &deadreckon_providers::registry::ProviderDescriptor) {
-    if descriptor.model_catalog.is_empty() {
+fn print_provider_models(
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    user_home: &Path,
+) {
+    let catalog = deadreckon_providers::resolve_model_catalog(descriptor, user_home);
+    if catalog.models.is_empty() {
         println!("    {}", ui_muted("models: none"));
         return;
     }
-    println!("    {}", ui_muted("models:"));
-    for model in &descriptor.model_catalog {
+    println!(
+        "    {}",
+        ui_muted(format!("models ({}):", catalog.source.label()))
+    );
+    for model in &catalog.models {
         let aliases = if model.aliases.is_empty() {
             "-".to_string()
         } else {
@@ -1290,6 +1297,7 @@ pub(crate) fn models_command(provider: Option<&str>, all: bool, json: bool) -> R
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     let defaults = config_defaults(&paths)?;
     let configured_model = configured_default_model(&paths)?;
+    let user_home = provider_user_home(&paths);
     let descriptors: Vec<&deadreckon_providers::registry::ProviderDescriptor> = match provider {
         Some(name) => {
             let Some(descriptor) = registry.get(name) else {
@@ -1316,7 +1324,23 @@ pub(crate) fn models_command(provider: Option<&str>, all: bool, json: bool) -> R
     if json {
         let providers = descriptors
             .iter()
-            .map(|descriptor| models_provider_json(descriptor, &defaults, &configured_model))
+            .map(|descriptor| {
+                let mut catalog =
+                    deadreckon_providers::resolve_model_catalog(descriptor, &user_home);
+                include_configured_model(
+                    &mut catalog.models,
+                    descriptor,
+                    &defaults,
+                    &configured_model,
+                );
+                models_provider_json(
+                    descriptor,
+                    &catalog.models,
+                    catalog.source.label(),
+                    &defaults,
+                    &configured_model,
+                )
+            })
             .collect::<Vec<_>>();
         let value = match provider {
             Some(_) => providers
@@ -1330,13 +1354,24 @@ pub(crate) fn models_command(provider: Option<&str>, all: bool, json: bool) -> R
     }
 
     for descriptor in &descriptors {
+        let mut catalog = deadreckon_providers::resolve_model_catalog(descriptor, &user_home);
+        include_configured_model(
+            &mut catalog.models,
+            descriptor,
+            &defaults,
+            &configured_model,
+        );
         println!(
             "{} {}",
             ui_heading(&descriptor.id),
-            ui_muted(&descriptor.display_name)
+            ui_muted(format!(
+                "{} · {}",
+                descriptor.display_name,
+                catalog.source.label()
+            ))
         );
-        let rows = descriptor
-            .model_catalog
+        let rows = catalog
+            .models
             .iter()
             .map(|entry| {
                 vec![
@@ -1364,6 +1399,10 @@ pub(crate) fn models_command(provider: Option<&str>, all: bool, json: bool) -> R
         ui_command("deadreckon run \"goal\" --model <id>")
     );
     Ok(())
+}
+
+fn provider_user_home(paths: &DeadreckonPaths) -> PathBuf {
+    std::env::home_dir().unwrap_or_else(|| paths.home().to_path_buf())
 }
 
 fn configured_default_model(paths: &DeadreckonPaths) -> Result<Option<String>> {
@@ -1398,7 +1437,40 @@ fn model_is_configured_default(
     configured_model: &Option<String>,
 ) -> bool {
     let provider_is_default = defaults.provider.as_deref() == Some(descriptor.id.as_str());
-    provider_is_default && configured_model.as_deref() == Some(entry.id.as_str())
+    provider_is_default
+        && configured_model.as_deref().is_some_and(|configured| {
+            configured == entry.id || entry.aliases.iter().any(|alias| alias == configured)
+        })
+}
+
+fn include_configured_model(
+    models: &mut Vec<deadreckon_providers::ModelEntry>,
+    descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    defaults: &ConfigDefaults,
+    configured_model: &Option<String>,
+) {
+    if defaults.provider.as_deref() != Some(descriptor.id.as_str()) {
+        return;
+    }
+    let Some(configured) = configured_model.as_deref() else {
+        return;
+    };
+    if models.iter().any(|entry| {
+        entry.id == configured || entry.aliases.iter().any(|alias| alias == configured)
+    }) {
+        return;
+    }
+    models.insert(
+        0,
+        deadreckon_providers::ModelEntry {
+            id: configured.to_string(),
+            context_window: None,
+            input_per_million: None,
+            output_per_million: None,
+            aliases: Vec::new(),
+            recommended: false,
+        },
+    );
 }
 
 fn model_cost_label(entry: &deadreckon_providers::ModelEntry) -> String {
@@ -1435,16 +1507,19 @@ fn model_notes_label(
 
 fn models_provider_json(
     descriptor: &deadreckon_providers::registry::ProviderDescriptor,
+    models: &[deadreckon_providers::ModelEntry],
+    source: &str,
     defaults: &ConfigDefaults,
     configured_model: &Option<String>,
 ) -> serde_json::Value {
     serde_json::json!({
         "provider": descriptor.id,
         "display_name": descriptor.display_name,
+        "source": source,
         "configured_default": configured_model
             .as_deref()
             .filter(|_| defaults.provider.as_deref() == Some(descriptor.id.as_str())),
-        "models": descriptor.model_catalog.iter().map(|entry| serde_json::json!({
+        "models": models.iter().map(|entry| serde_json::json!({
             "id": entry.id,
             "recommended": entry.recommended,
             "context_window": entry.context_window,
