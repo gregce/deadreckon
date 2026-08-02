@@ -895,7 +895,14 @@ pub(crate) async fn run_command_with_launch_plan(
         .as_ref()
         .filter(|_| codebase.mode == CodebaseMode::Copy)
     {
-        copy_source_to_working(source_path, &state.working_dir)?;
+        let capture_policy = freeze_workspace_capture_policy(source_path)?;
+        let hydration =
+            copy_source_to_working_with_policy(source_path, &state.working_dir, &capture_policy)?;
+        write_workspace_capture_policy(&state.run_root, &capture_policy)?;
+        write_capture_manifest(
+            &state.run_root.join(SOURCE_HYDRATION_MANIFEST_JSON),
+            &hydration,
+        )?;
         deadreckon_core::write_codebase_record(&state.working_dir, &codebase)?;
     }
     commands::acceptance::copy_acceptance_into_run(&state, &acceptance_source)?;
@@ -903,6 +910,10 @@ pub(crate) async fn run_command_with_launch_plan(
     {
         commands::lifecycle::prepare_durable_continuation(&paths, &state, &continuation)?;
     }
+    // Freeze ignore, tracked-file, ecosystem-output, and capture-budget policy
+    // before the first implementation provider can mutate the workspace. Copy
+    // mode already persisted the source repository's policy above.
+    deadreckon_core::ensure_workspace_capture_policy(&state)?;
     maybe_infer_contract(
         &paths,
         &state,

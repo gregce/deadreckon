@@ -3,10 +3,13 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::artifact_policy::{WorkspacePathClass, classify_workspace_path};
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::git::{run_git, run_git_with_input};
 use crate::paths::{DeadreckonPaths, sanitize_slug, workspace_scope};
+use crate::workspace_capture::{
+    CaptureProjection, CapturePurpose, WorkspaceCaptureManifest, WorkspaceCapturePolicy,
+    capture_workspace, freeze_workspace_capture_policy, materialize_capture_plan,
+};
 
 pub const CODEBASE_RECORD_VERSION: u32 = 1;
 pub const CODEBASE_RECORD_PATH: &str = ".deadreckon/codebase.json";
@@ -277,150 +280,30 @@ pub fn create_worktree(record: &CodebaseRecord) -> Result<()> {
 }
 
 pub fn copy_source_to_working(source: &Path, working_dir: &Path) -> Result<()> {
+    let policy = freeze_workspace_capture_policy(source)?;
+    copy_source_to_working_with_policy(source, working_dir, &policy).map(|_| ())
+}
+
+pub fn copy_source_to_working_with_policy(
+    source: &Path,
+    working_dir: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<WorkspaceCaptureManifest> {
     if !source.exists() {
         return Err(DeadreckonError::NotFound(format!(
             "source {}",
             source.display()
         )));
     }
-    for entry in ignore::WalkBuilder::new(source)
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .follow_links(false)
-        .build()
-        .filter_map(std::result::Result::ok)
-    {
-        let path = entry.path();
-        if path == source || ignored_copy_path(source, path) {
-            continue;
-        }
-        let relative = path.strip_prefix(source).unwrap_or(path);
-        let dest = working_dir.join(relative);
-        let metadata = std::fs::symlink_metadata(path).with_path(path)?;
-        let file_type = metadata.file_type();
-        if file_type.is_dir() {
-            ensure_copy_directory(&dest)?;
-        } else if file_type.is_file() {
-            copy_source_file(path, &dest, &metadata)?;
-        } else if file_type.is_symlink() {
-            copy_source_symlink(path, &dest, &file_type)?;
-        } else {
-            return Err(DeadreckonError::InvalidInput(format!(
-                "unsupported filesystem entry while copying source {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_copy_directory(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
-        Ok(_) => {
-            remove_copy_destination(path)?;
-            std::fs::create_dir(path).with_path(path)
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(path).with_path(path)
-        }
-        Err(source) => Err(DeadreckonError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn copy_source_file(source: &Path, destination: &Path, metadata: &std::fs::Metadata) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        ensure_copy_directory(parent)?;
-    }
-    remove_copy_destination_if_present(destination)?;
-    std::fs::copy(source, destination).with_path(source)?;
-    // `fs::copy` does not promise identical metadata behavior on every
-    // platform. Reapplying the supported permission representation preserves
-    // executable mode on Unix.
-    std::fs::set_permissions(destination, metadata.permissions()).with_path(destination)
-}
-
-fn copy_source_symlink(
-    source: &Path,
-    destination: &Path,
-    file_type: &std::fs::FileType,
-) -> Result<()> {
-    if let Some(parent) = destination.parent() {
-        ensure_copy_directory(parent)?;
-    }
-    remove_copy_destination_if_present(destination)?;
-    let target = std::fs::read_link(source).with_path(source)?;
-    create_source_symlink(source, &target, destination, file_type)
-}
-
-#[cfg(unix)]
-fn create_source_symlink(
-    _source: &Path,
-    target: &Path,
-    destination: &Path,
-    _file_type: &std::fs::FileType,
-) -> Result<()> {
-    std::os::unix::fs::symlink(target, destination).with_path(destination)
-}
-
-#[cfg(windows)]
-fn create_source_symlink(
-    source: &Path,
-    target: &Path,
-    destination: &Path,
-    file_type: &std::fs::FileType,
-) -> Result<()> {
-    use std::os::windows::fs::FileTypeExt;
-
-    if file_type.is_symlink_dir() {
-        std::os::windows::fs::symlink_dir(target, destination).with_path(destination)
-    } else if file_type.is_symlink_file() {
-        std::os::windows::fs::symlink_file(target, destination).with_path(destination)
-    } else {
-        Err(DeadreckonError::InvalidInput(format!(
-            "unsupported symbolic link while copying source {}",
-            source.display()
-        )))
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_source_symlink(
-    source: &Path,
-    _target: &Path,
-    _destination: &Path,
-    _file_type: &std::fs::FileType,
-) -> Result<()> {
-    Err(DeadreckonError::InvalidInput(format!(
-        "symbolic links are unsupported while copying source {}",
-        source.display()
-    )))
-}
-
-fn remove_copy_destination_if_present(path: &Path) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => remove_copy_destination(path),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DeadreckonError::Io {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn remove_copy_destination(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path).with_path(path)?;
-    if metadata.file_type().is_dir() {
-        std::fs::remove_dir_all(path).with_path(path)
-    } else {
-        std::fs::remove_file(path).with_path(path)
-    }
+    let plan = capture_workspace(
+        source,
+        policy,
+        CaptureProjection::Source,
+        CapturePurpose::SourceHydration,
+    )?;
+    plan.require_complete("source hydration")?;
+    materialize_capture_plan(&plan, working_dir)?;
+    Ok(plan.manifest)
 }
 
 pub fn preview_git_state(path: &Path) -> Result<Option<PreviewGitState>> {
@@ -700,12 +583,6 @@ fn apply_dirty_diff(git_root: &Path, worktree_path: &Path, staged: bool) -> Resu
     }
 }
 
-fn ignored_copy_path(source: &Path, path: &Path) -> bool {
-    path.strip_prefix(source).ok().is_some_and(|relative| {
-        classify_workspace_path(relative) == WorkspacePathClass::RuntimeOnly
-    })
-}
-
 fn required_path<'a>(value: Option<&'a PathBuf>, field: &str) -> Result<&'a Path> {
     value
         .map(PathBuf::as_path)
@@ -828,7 +705,7 @@ mod trusted_record_tests {
         assert!(
             error
                 .to_string()
-                .contains("unsupported filesystem entry while copying source"),
+                .contains("provider.sock (unsupported entry)"),
             "{error}"
         );
         assert!(!working.join("provider.sock").exists());
