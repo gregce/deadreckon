@@ -1465,11 +1465,30 @@ fn filter_capture_entry(context: &TraversalContext, entry: &ignore::DirEntry) ->
         record_pruned(context, relative, CaptureOmissionReason::GeneratedOutput);
         return false;
     }
-    if frozen_ignored(&context.ignores, entry.path(), is_dir) {
+    if frozen_ignored(&context.ignores, entry.path(), is_dir)
+        && !ignore_protected_capture_path(context.projection, relative)
+    {
         record_pruned(context, relative, CaptureOmissionReason::FrozenIgnore);
         return false;
     }
     true
+}
+
+fn ignore_protected_capture_path(projection: CaptureProjection, relative: &Path) -> bool {
+    match (projection, classify_workspace_path(relative)) {
+        // Undo must retain DeadReckon's small workspace-side lifecycle record
+        // even when a repository or enclosing Git checkout ignores
+        // `.deadreckon/`. Otherwise restore clears the record and loses the
+        // codebase lineage needed by later lifecycle commands.
+        (CaptureProjection::Recoverable, WorkspacePathClass::LifecycleMetadata) => true,
+        // The semantic read-only guard must also see protected evidence and
+        // lifecycle paths; an ignore rule is not authority to mutate them.
+        (
+            CaptureProjection::WorkspaceGuard,
+            WorkspacePathClass::EvidenceOnly | WorkspacePathClass::LifecycleMetadata,
+        ) => true,
+        _ => false,
+    }
 }
 
 fn projection_boundary_allows(
@@ -2019,6 +2038,51 @@ mod tests {
                 .any(|omission| omission.reason == CaptureOmissionReason::ByteBudget)
         );
         assert!(plan.require_complete("fixture snapshot").is_err());
+    }
+
+    #[test]
+    fn ignored_lifecycle_metadata_remains_recoverable_but_not_deliverable() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path();
+        fs::create_dir_all(root.join(".deadreckon/docs")).expect("lifecycle docs");
+        fs::write(root.join(".gitignore"), ".deadreckon/\n").expect("ignore");
+        fs::write(root.join(".deadreckon/codebase.json"), "{}\n").expect("codebase");
+        fs::write(root.join(".deadreckon/docs/RUN-NARRATIVE.md"), "# Run\n").expect("narrative");
+        let policy = freeze_workspace_capture_policy(root).expect("freeze");
+
+        let recoverable = capture_workspace(
+            root,
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::TurnSnapshot,
+        )
+        .expect("recoverable");
+        assert!(
+            recoverable
+                .entries
+                .iter()
+                .any(|entry| { entry.relative == Path::new(".deadreckon/codebase.json") })
+        );
+        assert!(
+            recoverable
+                .entries
+                .iter()
+                .any(|entry| { entry.relative == Path::new(".deadreckon/docs/RUN-NARRATIVE.md") })
+        );
+
+        let deliverable = capture_workspace(
+            root,
+            &policy,
+            CaptureProjection::Deliverable,
+            CapturePurpose::DeliverableIndex,
+        )
+        .expect("deliverable");
+        assert!(
+            deliverable
+                .entries
+                .iter()
+                .all(|entry| !entry.relative.starts_with(".deadreckon"))
+        );
     }
 
     #[test]
