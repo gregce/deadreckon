@@ -29,16 +29,17 @@ use super::commands::plan::{
     implementation_plan_warnings, orchestration_dependency_rows, orchestration_parallelism_lines,
     orchestration_provider_role_rows, orchestration_role_table_lines,
 };
+use super::commands::start::StartLaunchDecision;
 use super::commands::start::{
     GoalShape, GoalShapeRecommendation, GoalShapeSource, StartDoneAction, StartDoneCriteriaSource,
     StartLaunchInput, StartPromptEligibility, StartPrompter, StartProviderSource,
     StartSelectedMode, StartSelectionSource, StartSourceMode, add_start_history_actions,
     apply_goal_shape_recommendation, ladder_goal_shape_recommendation, maybe_prompt_start_mode,
     prompt_start_done_criteria, prompt_start_existing_done_criteria,
-    resolve_start_orchestration_options, start_done_materialization_request, start_launch_decision,
-    start_launch_preview_facts, start_provider_role_summary,
+    prompt_start_primary_execution, resolve_start_orchestration_options,
+    start_done_materialization_request, start_launch_decision, start_launch_preview_facts,
+    start_provider_role_summary,
 };
-use super::commands::start::{StartLaunchDecision, prompt_start_model};
 use super::tui::panes::footer::footer_for_state;
 use super::tui::{
     AttachActionNotice, AttachHelpMode, AttachPanel, AttachPanelCounts, AttachPanelRows,
@@ -2392,9 +2393,13 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         model: None,
         children: None,
         planner_provider: None,
+        planner_model: None,
         child_provider: Vec::new(),
+        child_model: Vec::new(),
         coder_provider: None,
+        coder_model: None,
         reviewer_provider: None,
+        reviewer_model: None,
         preview: true,
         review_done: false,
         yes: false,
@@ -3259,8 +3264,16 @@ fn start_full_plan_picker_collects_child_count_and_role_providers() {
     decision.provider_route = Some("smoke".to_string());
     decision.provider_label = "smoke (configured)".to_string();
     let args = start_args_for_test("build a realtime 3d game");
-    let mut prompter = ScriptedStartPrompter::new(&["n:5", "route:smoke", "route:smoke", "typed"]);
-    prompter.inputs.push_back("1=smoke".to_string());
+    let mut prompter = ScriptedStartPrompter::new(&[
+        "customize",
+        "n:5",
+        "execution:0",
+        "execution:0",
+        "customize",
+        "index:1",
+        "execution:0",
+    ]);
+    prompter.confirms.push_back(false);
 
     resolve_start_orchestration_options(
         &mut decision,
@@ -3276,18 +3289,68 @@ fn start_full_plan_picker_collects_child_count_and_role_providers() {
     assert_eq!(decision.child_provider_route.as_deref(), Some("smoke"));
     assert_eq!(decision.child_provider_overrides, vec!["1=smoke"]);
     assert_eq!(
+        decision.child_model_overrides,
+        vec!["1=local-scripted-smoke"]
+    );
+    assert_eq!(
         prompter.prompt_titles,
         vec![
-            "Choose child count",
-            "Choose planner provider",
-            "Choose default child provider",
-            "Choose child provider overrides",
-            "child provider overrides: "
+            "Configure execution team",
+            "Choose implementor count",
+            "Choose planner provider and model",
+            "Choose implementor provider and model",
+            "Customize individual implementors",
+            "Choose implementor",
+            "Choose implementor 2 provider and model",
+            "Customize another implementor?"
         ]
     );
     assert_eq!(
         start_provider_role_summary(&decision).as_deref(),
-        Some("children=5, planner=smoke, child=smoke, overrides=1=smoke")
+        Some(
+            "implementors=5, planner=smoke/local-scripted-smoke, implementor=smoke/local-scripted-smoke, overrides=1=smoke, model-overrides=1=local-scripted-smoke"
+        )
+    );
+}
+
+#[test]
+fn start_full_plan_uniform_team_is_one_selection() {
+    let temp = test_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path());
+    let defaults = ConfigDefaults::default();
+    let mut decision = start_launch_decision(StartLaunchInput {
+        goal: "build a realtime 3d game",
+        requested_mode: CliStartMode::FullPlan,
+        stdin_is_tty: true,
+    });
+    decision.provider_source = StartProviderSource::Configured;
+    decision.provider_route = Some("smoke".to_string());
+    decision.provider_label = "smoke (configured)".to_string();
+    let args = start_args_for_test("build a realtime 3d game");
+    let mut prompter = ScriptedStartPrompter::new(&["team:0"]);
+
+    resolve_start_orchestration_options(
+        &mut decision,
+        &args,
+        &paths,
+        &defaults,
+        Some(&mut prompter),
+    )
+    .expect("orchestration options");
+
+    assert_eq!(
+        prompter.prompt_titles,
+        vec!["Configure execution team".to_string()]
+    );
+    assert_eq!(decision.planner_provider_route.as_deref(), Some("smoke"));
+    assert_eq!(decision.child_provider_route.as_deref(), Some("smoke"));
+    assert_eq!(
+        decision.planner_model.as_deref(),
+        Some("local-scripted-smoke")
+    );
+    assert_eq!(
+        decision.child_model.as_deref(),
+        Some("local-scripted-smoke")
     );
 }
 
@@ -7824,54 +7887,34 @@ fn model_picker_decision() -> StartLaunchDecision {
 }
 
 #[test]
-fn start_with_model_flag_skips_the_picker() {
+fn start_execution_picker_combines_provider_and_model() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
     let mut decision = model_picker_decision();
-    decision.model = Some("opus".to_string());
-    let mut prompter = ScriptedStartPrompter::new(&[]);
+    let defaults = ConfigDefaults::default();
+    let mut prompter = ScriptedStartPrompter::new(&["execution:3"]);
 
-    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("no prompt");
+    prompt_start_primary_execution(&mut decision, &paths, &defaults, &mut prompter)
+        .expect("prompt");
 
-    assert!(prompter.prompt_titles.is_empty());
-    assert_eq!(decision.model.as_deref(), Some("opus"));
-}
-
-#[test]
-fn start_model_picker_appears_after_provider_and_stores_choice() {
-    let temp = tempfile::TempDir::new().expect("tempdir");
-    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
-    let mut decision = model_picker_decision();
-    let mut prompter = ScriptedStartPrompter::new(&["sonnet"]);
-
-    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("prompt");
-
-    assert_eq!(prompter.prompt_titles, vec!["Choose model".to_string()]);
+    assert_eq!(
+        prompter.prompt_titles,
+        vec!["Choose execution team".to_string()]
+    );
+    assert_eq!(decision.provider_route.as_deref(), Some("cli:claude-code"));
     assert_eq!(decision.model.as_deref(), Some("sonnet"));
 }
 
 #[test]
-fn start_model_picker_provider_default_means_no_override() {
+fn start_execution_picker_provider_default_means_no_override() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
     let mut decision = model_picker_decision();
-    let mut prompter = ScriptedStartPrompter::new(&["provider default"]);
+    let defaults = ConfigDefaults::default();
+    let mut prompter = ScriptedStartPrompter::new(&["execution:0"]);
 
-    prompt_start_model(&mut decision, &paths, "cli:claude-code", &mut prompter).expect("prompt");
+    prompt_start_primary_execution(&mut decision, &paths, &defaults, &mut prompter)
+        .expect("prompt");
 
-    assert_eq!(decision.model, None);
-}
-
-#[test]
-fn start_model_picker_skips_catalogless_providers() {
-    let temp = tempfile::TempDir::new().expect("tempdir");
-    let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
-    let mut decision = model_picker_decision();
-    decision.provider_route = Some("smoke".to_string());
-    let mut prompter = ScriptedStartPrompter::new(&[]);
-
-    prompt_start_model(&mut decision, &paths, "smoke", &mut prompter).expect("no prompt");
-
-    assert!(prompter.prompt_titles.is_empty());
     assert_eq!(decision.model, None);
 }

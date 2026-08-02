@@ -169,13 +169,17 @@ Modes:
   full-plan plans, forks, and merges multi-agent work.
 
 Interactive:
-  In a TTY, start uses selection prompts for mode, provider, done criteria,
-  source mode, and final confirmation when flags do not decide them.
-  Review/full-plan starts also ask for role providers and full-plan child count.
+  In a TTY, start chooses a provider and model together as one execution team.
+  Review/full-plan can apply that pair to every role with one selection, or
+  customize the planner, implementors, reviewer, and individual children.
+  Model choices come from the selected provider's own catalog or discovery.
+  Start also prompts for mode, done criteria, source mode, and confirmation
+  when flags do not decide them.
   Done-criteria prompts show what will be enforced and offer view/check/update
   paths before launch.
   Scripts can use --plain, --quiet, --json, --yes, or explicit --mode flags to
-  keep start deterministic and non-prompting.";
+  keep start deterministic and non-prompting. Use --planner-model,
+  --child-model IDX=MODEL, --coder-model, and --reviewer-model for exact roles.";
 
 const ORCHESTRATE_HELP: &str = "\
 Power-user multi-agent launcher. `deadreckon start --mode review` and
@@ -748,16 +752,28 @@ pub(crate) enum Commands {
         children: Option<u8>,
         #[arg(long, help = "Planner provider route for full-plan start")]
         planner_provider: Option<String>,
+        #[arg(long, help = "Planner model for full-plan start")]
+        planner_model: Option<String>,
         #[arg(
             long,
             value_name = "IDX=PROVIDER",
             help = "Per-child provider route override for full-plan start"
         )]
         child_provider: Vec<String>,
+        #[arg(
+            long,
+            value_name = "IDX=MODEL",
+            help = "Per-child model override for full-plan start"
+        )]
+        child_model: Vec<String>,
         #[arg(long, help = "Coder provider route for review start")]
         coder_provider: Option<String>,
+        #[arg(long, help = "Coder model for review start")]
+        coder_model: Option<String>,
         #[arg(long, help = "Reviewer provider route for review start")]
         reviewer_provider: Option<String>,
+        #[arg(long, help = "Reviewer model for review start")]
+        reviewer_model: Option<String>,
         #[arg(long, help = "Show the resolved launch preview without starting work")]
         preview: bool,
         #[arg(long, help = "Review the compiled done contract before launch")]
@@ -2831,9 +2847,13 @@ pub(crate) struct StartCommandArgs {
     pub(crate) model: Option<String>,
     pub(crate) children: Option<u8>,
     pub(crate) planner_provider: Option<String>,
+    pub(crate) planner_model: Option<String>,
     pub(crate) child_provider: Vec<String>,
+    pub(crate) child_model: Vec<String>,
     pub(crate) coder_provider: Option<String>,
+    pub(crate) coder_model: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) preview: bool,
     pub(crate) review_done: bool,
     pub(crate) yes: bool,

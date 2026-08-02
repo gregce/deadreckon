@@ -138,9 +138,23 @@ pub(crate) struct CourseProviders {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) planner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_child: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) coder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) planner_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default_child_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) coder_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewer_model: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) children: BTreeMap<u32, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) child_models: BTreeMap<u32, String>,
 }
 
 /// The money and wall-clock envelope the course must fit inside.
@@ -1600,11 +1614,53 @@ pub(crate) fn launch_plan_from_decision(
     plan.n = decision.child_count;
     plan.providers = CourseProviders {
         planner: decision.planner_provider_route.clone(),
+        default_child: matches!(
+            decision.selected_mode,
+            StartSelectedMode::FullPlan | StartSelectedMode::Campaign
+        )
+        .then(|| {
+            decision
+                .child_provider_route
+                .clone()
+                .or_else(|| decision.provider_route.clone())
+        })
+        .flatten(),
         coder: decision
             .coder_provider_route
             .clone()
             .or_else(|| decision.provider_route.clone()),
         reviewer: decision.reviewer_provider_route.clone(),
+        planner_model: decision.planner_model.clone(),
+        default_child_model: matches!(
+            decision.selected_mode,
+            StartSelectedMode::FullPlan | StartSelectedMode::Campaign
+        )
+        .then(|| {
+            decision
+                .child_model
+                .clone()
+                .or_else(|| decision.model.clone())
+        })
+        .flatten(),
+        coder_model: decision.coder_model.clone().or_else(|| {
+            matches!(
+                decision.selected_mode,
+                StartSelectedMode::Run | StartSelectedMode::Extend
+            )
+            .then(|| decision.model.clone())
+            .flatten()
+        }),
+        reviewer_model: decision.reviewer_model.clone(),
+        children: commands::plan::parse_child_provider_overrides(
+            &decision.child_provider_overrides,
+            decision.child_count.unwrap_or(0),
+        )
+        .unwrap_or_default(),
+        child_models: commands::plan::parse_child_model_overrides(
+            &decision.child_model_overrides,
+            decision.child_count.unwrap_or(0),
+        )
+        .unwrap_or_default(),
     };
     plan.budget = CourseBudget {
         ceiling_usd,
@@ -1754,15 +1810,29 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
             max_wall_seconds: None,
             sandbox: None,
             planner_provider: plan.providers.planner.clone(),
-            provider: plan.providers.coder.clone(),
-            child_provider: Vec::new(),
+            provider: plan
+                .providers
+                .default_child
+                .clone()
+                .or_else(|| plan.providers.coder.clone()),
+            child_provider: plan
+                .providers
+                .children
+                .iter()
+                .map(|(index, provider)| format!("{index}={provider}"))
+                .collect(),
             coder_provider: None,
             reviewer_provider: None,
-            planner_model: None,
-            model: None,
-            child_model: Vec::new(),
-            coder_model: None,
-            reviewer_model: None,
+            planner_model: plan.providers.planner_model.clone(),
+            model: plan.providers.default_child_model.clone(),
+            child_model: plan
+                .providers
+                .child_models
+                .iter()
+                .map(|(index, model)| format!("{index}={model}"))
+                .collect(),
+            coder_model: plan.providers.coder_model.clone(),
+            reviewer_model: plan.providers.reviewer_model.clone(),
             init_git: false,
             acceptance: None,
             skip_acceptance_prompt: true,
@@ -1928,8 +1998,10 @@ mod tests {
         ];
         plan.providers = CourseProviders {
             planner: Some("cli:claude-code".to_string()),
+            default_child: Some("cli:claude-code".to_string()),
             coder: Some("cli:claude-code".to_string()),
             reviewer: Some("cli:codex".to_string()),
+            ..CourseProviders::default()
         };
         plan.budget = CourseBudget {
             ceiling_usd: Some(12.0),

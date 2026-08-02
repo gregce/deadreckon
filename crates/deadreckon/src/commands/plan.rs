@@ -312,6 +312,15 @@ fn resolve_role_model(
     role_flag.or(generic).or(configured).cloned()
 }
 
+fn configured_model_for_provider<'a>(
+    provider: Option<&String>,
+    defaults: &'a ConfigDefaults,
+) -> Option<&'a String> {
+    (provider.map(String::as_str) == defaults.provider.as_deref())
+        .then_some(defaults.model.as_ref())
+        .flatten()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_plan_providers(
     paths: &DeadreckonPaths,
@@ -358,23 +367,26 @@ pub(crate) fn resolve_plan_providers(
         )?,
         PlanMode::FullPlan => None,
     };
-    let configured_model = defaults.model.as_ref();
     Ok(PlanProviders {
         planner_model: planner.as_ref().and(resolve_role_model(
             models.planner_model.as_ref(),
             models.model.as_ref(),
-            configured_model,
+            configured_model_for_provider(planner.as_ref(), defaults),
         )),
-        default_child_model: resolve_role_model(None, models.model.as_ref(), configured_model),
+        default_child_model: resolve_role_model(
+            None,
+            models.model.as_ref(),
+            configured_model_for_provider(default_child.as_ref(), defaults),
+        ),
         coder_model: coder.as_ref().and(resolve_role_model(
             models.coder_model.as_ref(),
             models.model.as_ref(),
-            configured_model,
+            configured_model_for_provider(coder.as_ref(), defaults),
         )),
         reviewer_model: reviewer.as_ref().and(resolve_role_model(
             models.reviewer_model.as_ref(),
             models.model.as_ref(),
-            configured_model,
+            configured_model_for_provider(reviewer.as_ref(), defaults),
         )),
         child_models: models.child_models,
         planner,
@@ -6500,7 +6512,8 @@ mod seed_graph_tests {
 
 #[cfg(test)]
 mod model_routing_tests {
-    use super::{child_argv, child_model_for_task};
+    use super::{child_argv, child_model_for_task, configured_model_for_provider};
+    use crate::ConfigDefaults;
     use deadreckon_core::plan::{Plan, PlanProviders, PlanTask, PlanTaskStatus, TaskAttempt};
 
     fn task(index: u32) -> PlanTask {
@@ -6849,6 +6862,26 @@ mod model_routing_tests {
             argv.windows(2)
                 .any(|w| w[0] == "--narrator-model" && w[1] == "haiku"),
             "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn configured_model_is_scoped_to_its_configured_provider() {
+        let defaults = ConfigDefaults {
+            provider: Some("cli:codex".to_string()),
+            model: Some("gpt-configured".to_string()),
+            ..ConfigDefaults::default()
+        };
+        let codex = "cli:codex".to_string();
+        let claude = "cli:claude-code".to_string();
+
+        assert_eq!(
+            configured_model_for_provider(Some(&codex), &defaults).map(String::as_str),
+            Some("gpt-configured")
+        );
+        assert_eq!(
+            configured_model_for_provider(Some(&claude), &defaults),
+            None
         );
     }
 }

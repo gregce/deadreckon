@@ -13,6 +13,7 @@ mod codex_events;
 mod config;
 mod error;
 mod http;
+mod model_catalog;
 mod router;
 mod smoke;
 mod types;
@@ -28,6 +29,7 @@ pub use config::{default_config_path, read_config};
 pub use deadreckon_sandbox::WorkspaceAccess;
 pub use error::{ProviderError, Result};
 pub use http::ProviderAdapter;
+pub use model_catalog::{ModelCatalogSource, ResolvedModelCatalog, resolve_model_catalog};
 pub use narrator::{
     NarratorBackend, NarratorCandidate, narrator_route_available, select_narrator_backend,
     select_narrator_route,
