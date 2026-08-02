@@ -2599,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn status_json_distinguishes_job_state_from_source_paths() {
+    fn status_json_distinguishes_job_state_from_approved_source_path() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let source = temp.path().join("source");
@@ -2613,7 +2613,12 @@ mod tests {
             status_paths["job"],
             json!(paths.job_dir(job.job_id.as_ref()))
         );
-        assert_eq!(status_paths["source"], json!(source));
+        assert_eq!(status_paths["source"], json!(job.source_cwd));
+        assert_eq!(
+            status_paths["source"],
+            json!(paths.job_dir(job.job_id.as_ref()).join("approved-source"))
+        );
+        assert_ne!(status_paths["source"], json!(source));
         assert_ne!(status_paths["job"], status_paths["source"]);
     }
 
