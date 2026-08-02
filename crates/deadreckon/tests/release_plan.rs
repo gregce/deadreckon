@@ -872,6 +872,32 @@ fn release_workflow_verification_matches_release_trust_contract() {
 }
 
 #[test]
+fn release_verification_mirrors_working_ci_test_prerequisites() {
+    let workflow = release_workflow();
+    let verify_job = workflow
+        .split_once("  release-verify:")
+        .and_then(|(_, tail)| tail.split_once("\n  build-evaluator-sidecars:"))
+        .map(|(job, _)| job)
+        .expect("release-verify job");
+
+    assert!(
+        verify_job.contains("sudo apt-get install -y -qq bubblewrap expect"),
+        "release verification must install the same sandbox and prompt prerequisites as CI:\n{verify_job}"
+    );
+
+    let characterization_build = verify_job
+        .find("cargo build -p deadreckon --features internal-characterization --bin deadreckon-characterization --locked")
+        .expect("release verification must build the gated characterization binary");
+    let workspace_tests = verify_job
+        .find("cargo test --workspace --locked --no-fail-fast")
+        .expect("release verification must run workspace tests");
+    assert!(
+        characterization_build < workspace_tests,
+        "the characterization binary must exist before workspace tests spawn it:\n{verify_job}"
+    );
+}
+
+#[test]
 fn release_workflow_permissions_are_lane_scoped() {
     let workflow = release_workflow();
     let top_permissions = workflow
