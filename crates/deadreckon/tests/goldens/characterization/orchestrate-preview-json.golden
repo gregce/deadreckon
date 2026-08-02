@@ -1,6 +1,14 @@
 status: 0
 --- stdout ---
 {
+  "done_authoring": {
+    "inspect_root": "<TMP>/repo",
+    "needed": false,
+    "posture": "structured_text",
+    "provider": null,
+    "wall_seconds": "<DURATION>",
+    "write_root": "<TMP>/repo/.deadreckon"
+  },
   "done_contract": {
     "checks": null,
     "divergence": null
@@ -21,7 +29,16 @@ status: 0
   "requires_confirmation": false,
   "selected_mode": "full-plan",
   "selection_source": "explicit_flag",
-  "source_mode": "missing",
+  "source": {
+    "allow_dirty": false,
+    "contract_write_root": "<TMP>/repo",
+    "inspection_root": "<TMP>/repo",
+    "label": "worktree from <TMP>/repo",
+    "mode": "worktree",
+    "provenance": "current-clean-worktree",
+    "requested_from": null
+  },
+  "source_mode": "worktree",
   "try_lines": [
     "deadreckon def-done \"what should count as done\" && deadreckon start \"characterize orchestration\""
   ],
@@ -49,7 +66,7 @@ status: 0
       ],
       [
         "workspace",
-        "missing"
+        "worktree from <TMP>/repo"
       ],
       [
         "override",
