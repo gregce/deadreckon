@@ -26,7 +26,7 @@ const SUPERVISOR_LAUNCH_STDOUT: &str = "supervisor.out";
 const SUPERVISOR_LAUNCH_STDERR: &str = "supervisor.err";
 pub(crate) const DURABLE_SCOPE_ROOT_SIGNAL: &str = "watchkeeper_scope_root";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DurableSourceMode {
     Worktree,
@@ -177,11 +177,25 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     let job_id = JobId(Uuid::new_v4().simple().to_string());
     let job_dir = request.paths.job_dir(job_id.as_ref());
     let pending_job_directory = PendingJobDirectory::create(&job_dir)?;
+    if matches!(request.source.mode, DurableSourceMode::Copy) {
+        let requested = request.source.from.as_deref().unwrap_or(request.source_cwd);
+        let requested = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            request.source_cwd.join(requested)
+        };
+        request.source.from = Some(requested.canonicalize().map_err(|error| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "copy source cannot be resolved: {} ({error})",
+                    requested.display()
+                ),
+                "deadreckon start \"<goal>\" --from <existing-dir>",
+            ))
+        })?);
+    }
     let authority_source_cwd = authority_source_cwd(&request.source, request.source_cwd, &job_dir)?;
     let scope_root = effective_scope_root(request.source_cwd)?;
-    if matches!(request.source.mode, DurableSourceMode::Copy) {
-        request.source.from = Some(authority_source_cwd.clone());
-    }
 
     let mut signals = request
         .launch_plan
@@ -1131,11 +1145,36 @@ fn authority_source_cwd(
         }
         DurableSourceMode::Copy => {
             let source = source.from.as_deref().unwrap_or(requested_cwd);
-            Ok(if source.is_absolute() {
+            let source = if source.is_absolute() {
                 source.to_path_buf()
             } else {
                 requested_cwd.join(source)
-            })
+            };
+            if !source.is_dir() {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!("copy source is not a directory: {}", source.display()),
+                    "deadreckon start \"<goal>\" --from <existing-dir>",
+                )));
+            }
+            let expected =
+                deadreckon_core::flight::build_deliverable_file_index(&source)?.tree_hash();
+            let approved_source = job_dir.join("approved-source");
+            let staging = job_dir.join("approved-source-preparing");
+            deadreckon_core::copy_deliverable_tree(&source, &staging)?;
+            let copied =
+                deadreckon_core::flight::build_deliverable_file_index(&staging)?.tree_hash();
+            let source_after =
+                deadreckon_core::flight::build_deliverable_file_index(&source)?.tree_hash();
+            if copied != expected || source_after != expected {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "approved source copy changed while it was being frozen",
+                    "rerun the same deadreckon start command after source writes stop",
+                )));
+            }
+            fs::rename(&staging, &approved_source)?;
+            #[cfg(unix)]
+            fs::File::open(job_dir)?.sync_all()?;
+            Ok(approved_source)
         }
         DurableSourceMode::Worktree | DurableSourceMode::InitGit => Ok(requested_cwd.to_path_buf()),
     }
@@ -1660,6 +1699,49 @@ mod tests {
         }
     }
 
+    fn copy_job_fixture() -> (TempDir, DeadreckonPaths, PathBuf, Job) {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch_source = temp.path().join("launch");
+        let copy_source = launch_source.join("fixtures/source");
+        fs::create_dir_all(&copy_source).expect("copy source");
+        fs::write(copy_source.join("README.md"), "copy").expect("copy file");
+        fs::write(copy_source.join("fixture-proof.txt"), "approved fixture\n").expect("copy proof");
+        fs::write(
+            copy_source.join("Makefile"),
+            "test:\n\t@test -f fixture-proof.txt\n",
+        )
+        .expect("copy test contract");
+        let mut request = request(&paths, &launch_source, None);
+        request.launch_plan.shape = commands::course::CourseShape::Plan;
+        request.shape = JobShape::Graph;
+        request.driver = Some(commands::graph_job::DriverSpec {
+            kind: commands::graph_job::DriverKind::FullPlan,
+            child_count: Some(2),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            planner_provider: Some("smoke".to_string()),
+            child_provider: Some("smoke".to_string()),
+            child_provider_overrides: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
+            model: None,
+            source_init_git: true,
+        });
+        request.source = DurableSource {
+            mode: DurableSourceMode::Copy,
+            from: Some(PathBuf::from("fixtures/source")),
+            allow_dirty: false,
+        };
+        let job = create_job(request).expect("create copy job");
+        let copy_source = copy_source.canonicalize().expect("canonical copy source");
+        (temp, paths, copy_source, job)
+    }
+
     #[test]
     fn wall_cap_conversion_never_rewrites_an_invalid_or_fractional_approval() {
         assert_eq!(checked_job_wall_seconds(90.0).expect("whole cap"), 90);
@@ -2128,27 +2210,18 @@ mod tests {
 
     #[test]
     fn copy_source_is_normalized_once_before_the_launch_plan_is_frozen() {
-        let temp = TempDir::new().expect("tempdir");
-        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-        let launch_source = temp.path().join("launch");
-        let copy_source = launch_source.join("fixtures/source");
-        fs::create_dir_all(&copy_source).expect("copy source");
-        fs::write(copy_source.join("README.md"), "copy").expect("copy file");
-        fs::write(copy_source.join("fixture-proof.txt"), "approved fixture\n").expect("copy proof");
-        fs::write(
-            copy_source.join("Makefile"),
-            "test:\n\t@test -f fixture-proof.txt\n",
-        )
-        .expect("copy test contract");
-        let mut request = request(&paths, &launch_source, None);
-        request.source = DurableSource {
-            mode: DurableSourceMode::Copy,
-            from: Some(PathBuf::from("fixtures/source")),
-            allow_dirty: false,
-        };
-
-        let job = create_job(request).expect("create copy job");
-        assert_eq!(job.source_cwd, copy_source);
+        let (_temp, paths, copy_source, job) = copy_job_fixture();
+        let approved_source = paths.job_dir(job.job_id.as_ref()).join("approved-source");
+        assert_eq!(job.source_cwd, approved_source);
+        assert_ne!(job.source_cwd, copy_source);
+        assert_eq!(
+            deadreckon_core::flight::build_deliverable_file_index(&job.source_cwd)
+                .expect("approved source index")
+                .tree_hash(),
+            deadreckon_core::flight::build_deliverable_file_index(&copy_source)
+                .expect("operator source index")
+                .tree_hash()
+        );
         let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
             .expect("launch plan");
         let frozen_source: DurableSource = serde_json::from_value(
@@ -2158,9 +2231,143 @@ mod tests {
                 .expect("source signal"),
         )
         .expect("source");
+        assert_eq!(frozen_source.from.as_deref(), Some(copy_source.as_path()));
+    }
+
+    #[test]
+    fn full_plan_from_creates_graph_job_with_copy_source() {
+        let (_temp, paths, operator_source, job) = copy_job_fixture();
+        let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+            .expect("launch plan");
+        let source: DurableSource = serde_json::from_value(
+            plan.signals
+                .get("watchkeeper_source")
+                .cloned()
+                .expect("source signal"),
+        )
+        .expect("source projection");
+
+        assert_eq!(job.shape, JobShape::Graph);
+        assert_eq!(source.mode, DurableSourceMode::Copy);
+        assert_eq!(source.from.as_deref(), Some(operator_source.as_path()));
+        assert_ne!(job.source_cwd, operator_source);
+        assert!(
+            job.source_cwd
+                .starts_with(paths.job_dir(job.job_id.as_ref())),
+            "approved source must be controller-owned: {}",
+            job.source_cwd.display()
+        );
+        assert!(job.source_cwd.join("README.md").is_file());
+    }
+
+    #[test]
+    fn graph_copy_never_modifies_the_operator_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
+        fs::write(
+            source.join("Makefile"),
+            "test:\n\t@test -f fixture-proof.txt\n",
+        )
+        .expect("makefile");
+        let before = deadreckon_core::flight::build_deliverable_file_index(&source)
+            .expect("source before")
+            .tree_hash();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let _job = create_job(request(&paths, &source, None)).expect("create copy job");
+        let after = deadreckon_core::flight::build_deliverable_file_index(&source)
+            .expect("source after")
+            .tree_hash();
+
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn graph_execution_survives_original_source_mutation_or_removal() {
+        let (_temp, paths, source, job) = copy_job_fixture();
+        fs::write(source.join("README.md"), "mutated after approval")
+            .expect("mutate original source");
+        fs::remove_dir_all(&source).expect("remove original source");
+
+        assert!(job.source_cwd.is_dir());
         assert_eq!(
-            frozen_source.from.as_deref(),
-            Some(job.source_cwd.as_path())
+            fs::read_to_string(job.source_cwd.join("README.md")).expect("approved readme"),
+            "copy"
+        );
+        super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect("approved source must not depend on the original path");
+    }
+
+    #[test]
+    fn graph_authority_and_preview_bind_the_same_source_digest() {
+        let (_temp, paths, source, job) = copy_job_fixture();
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+        let source_digest = deadreckon_core::flight::build_deliverable_file_index(&source)
+            .expect("operator source")
+            .tree_hash();
+        let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+            .expect("launch plan");
+        let projected: DurableSource = serde_json::from_value(
+            plan.signals
+                .get("watchkeeper_source")
+                .cloned()
+                .expect("source projection"),
+        )
+        .expect("source projection json");
+
+        assert_eq!(authority.source_tree_sha256, source_digest);
+        assert_eq!(projected.mode, DurableSourceMode::Copy);
+        assert_eq!(projected.from.as_deref(), Some(source.as_path()));
+    }
+
+    #[test]
+    fn accepted_contract_is_frozen_with_the_resolved_source_job() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let launch = temp.path().join("launch");
+        let source = temp.path().join("cloudwing");
+        fs::create_dir_all(launch.join(".deadreckon")).expect("acceptance directory");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("README.md"), "Cloudwing\n").expect("source readme");
+        let contract = launch.join(".deadreckon/acceptance.yaml");
+        let contract_body = concat!(
+            "name: Cloudwing continuation\n",
+            "checks:\n",
+            "  - kind: file_exists\n",
+            "    path: \"{working_dir}/README.md\"\n",
+        );
+        fs::write(&contract, contract_body).expect("accepted contract");
+        let mut request = request(&paths, &launch, Some(&contract));
+        request.source = DurableSource {
+            mode: DurableSourceMode::Copy,
+            from: Some(source.clone()),
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create resolved-source job");
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(paths.job_authority(job.job_id.as_ref())).expect("authority"),
+        )
+        .expect("authority json");
+
+        assert_eq!(
+            fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref()))
+                .expect("frozen contract"),
+            contract_body
+        );
+        assert_eq!(
+            authority.source_tree_sha256,
+            deadreckon_core::flight::build_deliverable_file_index(&source)
+                .expect("resolved source")
+                .tree_hash()
+        );
+        assert!(
+            job.source_cwd
+                .starts_with(paths.job_dir(job.job_id.as_ref()))
         );
     }
 

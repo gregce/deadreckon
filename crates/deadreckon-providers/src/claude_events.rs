@@ -25,6 +25,7 @@ pub(crate) struct ClaudeCapabilities {
     /// `--json-schema` structured output. The probe is forward-ready; wiring it
     /// into the driver is a follow-up slice (Semaphore only records the bit).
     pub json_schema: bool,
+    pub schema_only_posture: bool,
 }
 
 impl ClaudeCapabilities {
@@ -33,6 +34,7 @@ impl ClaudeCapabilities {
             stream_json: false,
             resume: false,
             json_schema: false,
+            schema_only_posture: false,
         }
     }
 }
@@ -45,6 +47,15 @@ pub(crate) fn parse_claude_capabilities(help: &str) -> ClaudeCapabilities {
         stream_json: help.contains("--output-format") && help.contains("stream-json"),
         resume: help.contains("--resume"),
         json_schema: help.contains("--json-schema"),
+        schema_only_posture: [
+            "--safe-mode",
+            "--tools",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "--setting-sources",
+        ]
+        .iter()
+        .all(|flag| help.contains(flag)),
     }
 }
 
@@ -100,6 +111,8 @@ enum ClaudeStreamEvent {
         #[serde(default)]
         result: Option<String>,
         #[serde(default)]
+        structured_output: Option<Value>,
+        #[serde(default)]
         usage: Option<Value>,
         #[serde(default)]
         total_cost_usd: Option<f64>,
@@ -128,6 +141,7 @@ pub(crate) fn parse_claude_line(line: &str) -> Option<Vec<CliStreamEvent>> {
         ClaudeStreamEvent::User => vec![CliStreamEvent::Recognized],
         ClaudeStreamEvent::Result {
             result,
+            structured_output,
             usage,
             total_cost_usd,
             session_id,
@@ -142,7 +156,9 @@ pub(crate) fn parse_claude_line(line: &str) -> Option<Vec<CliStreamEvent>> {
                 output_tokens: claude_usage_field(usage.as_ref(), "output_tokens"),
                 cost_usd: total_cost_usd,
             }));
-            if let Some(text) = result {
+            if let Some(value) = structured_output {
+                events.push(CliStreamEvent::Answer(value.to_string()));
+            } else if let Some(text) = result {
                 events.push(CliStreamEvent::Answer(text));
             }
             if is_error == Some(true) {

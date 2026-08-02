@@ -69,6 +69,13 @@ impl GenericCliProvider {
     }
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        if request.output_schema.is_some() {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: "provider descriptor cannot prove schema-only structured-text posture"
+                    .to_string(),
+            });
+        }
         match self.contract.as_ref() {
             Some(contract) => self.run_contract(request, contract).await,
             None => self.run_contractless(request).await,

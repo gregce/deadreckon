@@ -72,6 +72,20 @@ impl CliClaudeCodeProvider {
                 "--verbose".to_string(),
             ]);
         }
+        if let Some(schema) = request.output_schema.as_ref() {
+            args.extend([
+                "--safe-mode".to_string(),
+                "--tools".to_string(),
+                String::new(),
+                "--strict-mcp-config".to_string(),
+                "--mcp-config".to_string(),
+                "{}".to_string(),
+                "--setting-sources".to_string(),
+                String::new(),
+                "--json-schema".to_string(),
+                schema.to_string(),
+            ]);
+        }
         if let Some(id) = resume_id {
             args.extend(["--resume".to_string(), id.to_string()]);
         }
@@ -126,6 +140,12 @@ impl CliClaudeCodeProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let caps = self.capabilities_for_request(request).await;
+        if request.output_schema.is_some() && !(caps.json_schema && caps.schema_only_posture) {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: "installed Claude Code cannot prove schema-only structured-text posture; update Claude Code or select a capable provider".to_string(),
+            });
+        }
         let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
             .then(|| request.session_dir.clone())
             .flatten();
@@ -225,14 +245,6 @@ impl CliClaudeCodeProvider {
                 "resume target vanished; retried once with a fresh conversation",
             );
         }
-        if request.output_schema.is_some() {
-            add_caveat(
-                &mut trace,
-                "provider.output_schema.unsupported",
-                "cli:claude-code structured output is not wired in Semaphore; proceeded unconstrained",
-            );
-        }
-
         Ok(ProviderResponse {
             provider: self.name.clone(),
             model: self.model.clone(),

@@ -1,8 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 use serde_json::json;
+use tokio::sync::{Mutex, OnceCell};
 use which::which;
 
 use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
@@ -11,11 +14,12 @@ use crate::cli_contract::{
     flight_rows_from, session_not_found, write_schema_file,
 };
 use crate::codex_events::{
-    CodexCapabilities, parse_codex_capabilities, parse_codex_line, probe_codex_capabilities,
+    CodexCapabilities, STRUCTURED_TEXT_DISABLED_FEATURES, parse_codex_capabilities,
+    parse_codex_capabilities_with_features, parse_codex_line, probe_codex_capabilities,
 };
 use crate::{
-    Provider, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest, ProviderResponse,
-    ProviderUsage, Result, SpendEstimate,
+    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
+    ProviderResponse, ProviderUsage, Result, SpendEstimate,
 };
 
 #[derive(Clone)]
@@ -30,6 +34,29 @@ pub struct CliCodexProvider {
 struct CodexAttempt {
     output: CliOutput,
     args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct CodexBinaryVersion {
+    binary: String,
+    version: String,
+}
+
+fn codex_probe_cache()
+-> &'static Mutex<HashMap<CodexBinaryVersion, Arc<OnceCell<CodexCapabilities>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CodexBinaryVersion, Arc<OnceCell<CodexCapabilities>>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct RemoveFileOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl CliCodexProvider {
@@ -55,11 +82,22 @@ impl CliCodexProvider {
         last_message: Option<&Path>,
         schema: Option<&Path>,
     ) -> Vec<String> {
-        let mut args = vec![
-            "--ask-for-approval".to_string(),
-            "never".to_string(),
-            "exec".to_string(),
-        ];
+        let structured_text_only = request.output_schema.is_some();
+        let mut args = vec!["--ask-for-approval".to_string(), "never".to_string()];
+        if structured_text_only {
+            for feature in STRUCTURED_TEXT_DISABLED_FEATURES {
+                args.extend(["--disable".to_string(), (*feature).to_string()]);
+            }
+        }
+        args.push("exec".to_string());
+        if structured_text_only {
+            args.extend([
+                "--ephemeral".to_string(),
+                "--ignore-user-config".to_string(),
+                "--ignore-rules".to_string(),
+                "--strict-config".to_string(),
+            ]);
+        }
         if let Some(id) = resume_id {
             args.push("resume".to_string());
             args.push(id.to_string());
@@ -123,14 +161,36 @@ impl CliCodexProvider {
         Ok(CodexAttempt { output, args })
     }
 
-    async fn capabilities_for_request(&self, request: &ProviderRequest) -> CodexCapabilities {
+    async fn capabilities_for_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<CodexCapabilities> {
         if request.workspace_access == WorkspaceAccess::ReadWrite {
-            return probe_codex_capabilities(&self.binary);
+            return Ok(probe_codex_capabilities(&self.binary));
         }
-        run_cli(
+        if request.output_schema.is_none() {
+            return Ok(run_cli(
+                &self.name,
+                &self.binary,
+                &["exec".to_string(), "--help".to_string()],
+                request.cwd.clone(),
+                request.sandbox_backend,
+                None,
+                request.cancellation_token.clone(),
+                WorkspaceAccess::ReadOnly,
+                true,
+            )
+            .await
+            .ok()
+            .filter(|output| output.status_code == Some(0))
+            .map(|output| parse_codex_capabilities(&output.stdout))
+            .unwrap_or_else(CodexCapabilities::none));
+        }
+
+        let version_output = run_cli(
             &self.name,
             &self.binary,
-            &["exec".to_string(), "--help".to_string()],
+            &["--version".to_string()],
             request.cwd.clone(),
             request.sandbox_backend,
             None,
@@ -138,15 +198,83 @@ impl CliCodexProvider {
             WorkspaceAccess::ReadOnly,
             true,
         )
-        .await
-        .ok()
-        .filter(|output| output.status_code == Some(0))
-        .map(|output| parse_codex_capabilities(&output.stdout))
-        .unwrap_or_else(CodexCapabilities::none)
+        .await?;
+        if version_output.status_code != Some(0) {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: "schema-only request could not prove the Codex binary version".to_string(),
+            });
+        }
+        let key = CodexBinaryVersion {
+            binary: self.binary.clone(),
+            version: format!("{}{}", version_output.stdout, version_output.stderr)
+                .trim()
+                .to_string(),
+        };
+        let cell = {
+            let mut cache = codex_probe_cache().lock().await;
+            cache
+                .entry(key)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let capabilities = cell
+            .get_or_try_init(|| async {
+                let help = run_cli(
+                    &self.name,
+                    &self.binary,
+                    &["exec".to_string(), "--help".to_string()],
+                    request.cwd.clone(),
+                    request.sandbox_backend,
+                    None,
+                    request.cancellation_token.clone(),
+                    WorkspaceAccess::ReadOnly,
+                    true,
+                )
+                .await;
+                let features = run_cli(
+                    &self.name,
+                    &self.binary,
+                    &["features".to_string(), "list".to_string()],
+                    request.cwd.clone(),
+                    request.sandbox_backend,
+                    None,
+                    request.cancellation_token.clone(),
+                    WorkspaceAccess::ReadOnly,
+                    true,
+                )
+                .await;
+                match (help, features) {
+                    (Ok(help), Ok(features))
+                        if help.status_code == Some(0) && features.status_code == Some(0) =>
+                    {
+                        Ok(parse_codex_capabilities_with_features(
+                            &help.stdout,
+                            &features.stdout,
+                        ))
+                    }
+                    (help, features) => Err(ProviderError::Cli {
+                        provider: self.name.clone(),
+                        detail: format!(
+                            "schema-only Codex capability probe failed: exec help: {}; feature list: {}",
+                            probe_failure(help),
+                            probe_failure(features)
+                        ),
+                    }),
+                }
+            })
+            .await?;
+        Ok(*capabilities)
     }
 
     pub(crate) async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let caps = self.capabilities_for_request(request).await;
+        let caps = self.capabilities_for_request(request).await?;
+        if request.output_schema.is_some() && !supports_schema_only_posture(caps) {
+            return Err(ProviderError::Cli {
+                provider: self.name.clone(),
+                detail: "installed Codex cannot prove schema-only structured-text posture; update Codex or select a capable provider".to_string(),
+            });
+        }
         let session_dir = (request.workspace_access == WorkspaceAccess::ReadWrite)
             .then(|| request.session_dir.clone())
             .flatten();
@@ -171,14 +299,23 @@ impl CliCodexProvider {
         }
 
         // A fresh read-only request deliberately has no resumable worker
-        // session. Its isolated cwd is still a safe place to stage the
-        // read-only schema before the provider sandbox starts.
-        let schema_dir = session_dir.as_deref().or(request.cwd.as_deref());
-        let schema_file = match (&request.output_schema, caps.output_schema, schema_dir) {
-            (Some(schema), true, Some(dir)) => Some(write_schema_file(dir, schema).await?),
+        // session. Stage its controller-owned schema beside the temporary
+        // output file, never inside the inspected operator source.
+        let fallback_schema_dir = std::env::temp_dir();
+        let schema_dir = session_dir
+            .as_deref()
+            .or_else(|| {
+                request
+                    .output_path
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+            })
+            .unwrap_or(fallback_schema_dir.as_path());
+        let schema_file = match (&request.output_schema, caps.output_schema) {
+            (Some(schema), true) => Some(write_schema_file(schema_dir, schema).await?),
             _ => None,
         };
-        let schema_caveat = request.output_schema.is_some() && !caps.output_schema;
+        let _schema_cleanup = RemoveFileOnDrop(schema_file.clone());
 
         let attempt = self
             .run_attempt(
@@ -282,14 +419,6 @@ impl CliCodexProvider {
                 "resume target vanished; retried once with a fresh conversation",
             );
         }
-        if schema_caveat {
-            add_caveat(
-                &mut trace,
-                "provider.output_schema.unsupported",
-                "binary predates --output-schema; proceeded unconstrained (try: codex --version)",
-            );
-        }
-
         Ok(ProviderResponse {
             provider: self.name.clone(),
             model: self.model.clone(),
@@ -298,6 +427,26 @@ impl CliCodexProvider {
             spend,
             trace,
         })
+    }
+}
+
+fn supports_schema_only_posture(caps: CodexCapabilities) -> bool {
+    caps.output_schema
+        && caps.ephemeral
+        && caps.ignore_user_config
+        && caps.ignore_rules
+        && caps.strict_config
+        && caps.disable_features
+        && caps.structured_text_features
+}
+
+fn probe_failure(result: Result<CliOutput>) -> String {
+    match result {
+        Ok(output) => format!(
+            "exit {:?}: {}{}",
+            output.status_code, output.stdout, output.stderr
+        ),
+        Err(error) => error.to_string(),
     }
 }
 
@@ -422,7 +571,7 @@ impl WithWallTime for SpendEstimate {
 
 #[cfg(test)]
 mod tests {
-    use super::read_only_safe_extra_args;
+    use super::*;
 
     #[test]
     fn read_only_codex_strips_configured_sandbox_bypasses() {
@@ -434,5 +583,143 @@ mod tests {
             "--json".to_string(),
         ]);
         assert_eq!(safe, vec!["--json"]);
+    }
+
+    fn schema_only_capabilities() -> CodexCapabilities {
+        CodexCapabilities {
+            json: true,
+            output_last_message: true,
+            output_schema: true,
+            resume: true,
+            ephemeral: true,
+            ignore_user_config: true,
+            ignore_rules: true,
+            strict_config: true,
+            disable_features: true,
+            structured_text_features: true,
+        }
+    }
+
+    #[test]
+    fn codex_done_authoring_is_ephemeral_and_disables_tool_surfaces() {
+        let provider = CliCodexProvider::new(
+            "cli:codex",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some("codex".to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let mut request = ProviderRequest::enforceably_read_only("return json", 100, ".");
+        request.output_schema = Some(json!({"type": "object"}));
+        let args = provider.build_args(
+            &request,
+            &schema_only_capabilities(),
+            None,
+            None,
+            Some(Path::new("schema.json")),
+        );
+
+        for required in [
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--output-schema",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "{args:?}");
+        }
+        for feature in STRUCTURED_TEXT_DISABLED_FEATURES {
+            assert!(
+                args.windows(2).any(|pair| pair == ["--disable", *feature]),
+                "{args:?}"
+            );
+        }
+        assert!(!args.iter().any(|arg| arg == "resume"), "{args:?}");
+    }
+
+    #[test]
+    fn structured_text_posture_never_silently_degrades_to_tools() {
+        let mut capabilities = schema_only_capabilities();
+        capabilities.structured_text_features = false;
+        assert!(!supports_schema_only_posture(capabilities));
+        capabilities.structured_text_features = true;
+        capabilities.output_schema = false;
+        assert!(!supports_schema_only_posture(capabilities));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_capabilities_are_probed_once_per_binary_version() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("fake-codex");
+        let count = temp.path().join("probes.log");
+        let features = STRUCTURED_TEXT_DISABLED_FEATURES
+            .iter()
+            .map(|feature| format!("{feature} stable true"))
+            .collect::<Vec<_>>()
+            .join("\\n");
+        let script = format!(
+            "#!/bin/sh\n\
+if printf '%s\\n' \"$*\" | grep -q -- '--version'; then echo 'codex-cli test-1'; exit 0; fi\n\
+if [ \"$*\" = 'exec --help' ]; then\n\
+  echo help >> '{count}'\n\
+  printf '%s\\n' 'resume --json --output-last-message --output-schema --ephemeral --ignore-user-config --ignore-rules --strict-config --disable'\n\
+  exit 0\n\
+fi\n\
+if [ \"$*\" = 'features list' ]; then\n\
+  echo features >> '{count}'\n\
+  printf '%b\\n' '{features}'\n\
+  exit 0\n\
+fi\n\
+printf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"schema-only\"}}'\n\
+printf '%s\\n' '{{\"type\":\"item.completed\",\"item\":{{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":\"{{\\\"ok\\\":true}}\"}}}}'\n\
+printf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+            count = count.display(),
+        );
+        std::fs::write(&binary, script).expect("fake codex");
+        let mut permissions = std::fs::metadata(&binary).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("chmod");
+        let provider = CliCodexProvider::new(
+            "cli:codex",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some(binary.display().to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let mut request = ProviderRequest::enforceably_read_only("json", 100, temp.path());
+        request.sandbox_backend = None;
+        request.output_schema = Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ok"],
+            "properties": {"ok": {"type": "boolean"}}
+        }));
+
+        provider.run(&request).await.expect("first request");
+        provider.run(&request).await.expect("second request");
+        assert_eq!(
+            std::fs::read_to_string(count)
+                .expect("probe count")
+                .lines()
+                .count(),
+            2
+        );
     }
 }

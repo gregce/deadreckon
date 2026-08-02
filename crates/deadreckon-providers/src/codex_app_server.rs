@@ -1336,6 +1336,20 @@ impl CliCodexServerProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
+        if request.output_schema.is_some() {
+            // App-server threads expose approval-mediated tools and durable
+            // sessions. Schema-only requests must instead use Codex's
+            // ephemeral, capability-probed exec route.
+            return self
+                .run_fallback(
+                    request,
+                    json!({
+                        "route": self.name,
+                        "reason": "schema-only request requires ephemeral Codex exec"
+                    }),
+                )
+                .await;
+        }
         let cwd = request
             .cwd
             .clone()
