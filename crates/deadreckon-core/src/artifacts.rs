@@ -16,9 +16,10 @@ use crate::error::{DeadreckonError, IoContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
 use crate::workspace_capture::{
-    CaptureProjection, CapturePurpose, WorkspaceCapturePolicy, capture_workspace,
-    ensure_workspace_capture_policy, freeze_workspace_capture_policy, materialize_capture_plan,
-    read_capture_manifest, write_capture_manifest,
+    CaptureProjection, CapturePurpose, WORKSPACE_BLOBS_DIR, WorkspaceCapturePolicy,
+    capture_workspace, ensure_workspace_capture_policy, freeze_workspace_capture_policy,
+    materialize_capture_plan, materialize_capture_plan_with_blob_store, read_capture_manifest,
+    write_capture_manifest,
 };
 
 pub const SNAPSHOT_CAPTURE_MANIFESTS_DIR: &str = "snapshot-manifests";
@@ -99,13 +100,18 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
         fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
     }
     let policy = ensure_workspace_capture_policy(state)?;
-    let capture = capture_workspace(
+    let mut capture = capture_workspace(
         &state.working_dir,
         &policy,
         CaptureProjection::Recoverable,
         CapturePurpose::TurnSnapshot,
     )?;
-    materialize_capture_plan(&capture, &snapshot_dir)?;
+    let materialization = materialize_capture_plan_with_blob_store(
+        &capture,
+        &snapshot_dir,
+        &state.run_root.join(WORKSPACE_BLOBS_DIR),
+    )?;
+    capture.manifest.materialization = Some(materialization);
     write_capture_manifest(
         &snapshot_capture_manifest_path(state, turn),
         &capture.manifest,
@@ -828,6 +834,60 @@ mod tests {
             fs::read_to_string(state.working_dir.join("answer.txt")).expect("original remains"),
             "large enough"
         );
+    }
+
+    #[test]
+    fn subsequent_snapshots_reuse_content_addressed_blobs() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "deduplicate snapshots".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(state.working_dir.join("answer.txt"), "stable answer\n").expect("answer");
+
+        snapshot_working(&state, 1).expect("first snapshot");
+        snapshot_working(&state, 2).expect("second snapshot");
+        let first = read_capture_manifest(&super::snapshot_capture_manifest_path(&state, 1))
+            .expect("first manifest")
+            .materialization
+            .expect("first materialization");
+        let second = read_capture_manifest(&super::snapshot_capture_manifest_path(&state, 2))
+            .expect("second manifest")
+            .materialization
+            .expect("second materialization");
+        assert!(first.new_blobs > 0);
+        assert_eq!(second.new_blobs, 0);
+        assert_eq!(second.reused_blobs, second.regular_files);
+        assert_eq!(
+            fs::read_to_string(state.run_root.join("snapshots/turn-2/answer.txt"))
+                .expect("snapshot answer"),
+            "stable answer\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let first_inode = fs::metadata(state.run_root.join("snapshots/turn-1/answer.txt"))
+                .expect("first metadata")
+                .ino();
+            let second_inode = fs::metadata(state.run_root.join("snapshots/turn-2/answer.txt"))
+                .expect("second metadata")
+                .ino();
+            assert_eq!(first_inode, second_inode);
+        }
     }
 
     #[test]
