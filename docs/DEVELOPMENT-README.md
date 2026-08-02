@@ -27,6 +27,10 @@ next: deadreckon run "describe the coding task"
 
 Runtime state defaults to `/Users/gdc/.deadreckon/`. Set `DEADRECKON_HOME` for tests or isolated local runs.
 
+See [Workspace capture and generated output](WORKSPACE-CAPTURE.md) for the
+frozen ignore/tracked-file policy, bounded snapshot behaviour, evidence layout,
+and the focused operator acceptance commands.
+
 Normal runs use the configured provider router, sandbox, spend cap, and wall-clock cap at `/Users/gdc/.deadreckon/config.toml`.
 In a git repo, the default working mode is a new `git worktree` on a `dr/...`
 branch under `/Users/gdc/.deadreckon/worktrees/`; the launch checkout is left
