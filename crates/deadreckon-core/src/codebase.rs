@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_policy::{WorkspacePathClass, classify_workspace_path};
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::git::{run_git, run_git_with_input};
 use crate::paths::{DeadreckonPaths, sanitize_slug, workspace_scope};
@@ -700,13 +701,9 @@ fn apply_dirty_diff(git_root: &Path, worktree_path: &Path, staged: bool) -> Resu
 }
 
 fn ignored_copy_path(source: &Path, path: &Path) -> bool {
-    path.strip_prefix(source)
-        .ok()
-        .and_then(|relative| relative.components().next())
-        .is_some_and(|component| {
-            let name = component.as_os_str().to_string_lossy();
-            name == ".git" || name == "target" || name == "node_modules"
-        })
+    path.strip_prefix(source).ok().is_some_and(|relative| {
+        classify_workspace_path(relative) == WorkspacePathClass::RuntimeOnly
+    })
 }
 
 fn required_path<'a>(value: Option<&'a PathBuf>, field: &str) -> Result<&'a Path> {
@@ -777,6 +774,7 @@ mod trusted_record_tests {
         let working = temp.path().join("working");
         std::fs::create_dir_all(source.join("bin")).expect("source bin");
         std::fs::create_dir_all(source.join("target")).expect("ignored target");
+        std::fs::create_dir_all(source.join(".build/debug")).expect("ignored Swift build");
         std::fs::write(source.join("bin/tool"), "#!/bin/sh\nexit 0\n").expect("tool");
         std::fs::set_permissions(
             source.join("bin/tool"),
@@ -785,6 +783,8 @@ mod trusted_record_tests {
         .expect("tool mode");
         symlink("../missing-outside-secret", source.join("outside-link")).expect("source link");
         std::fs::write(source.join("target/ignored"), "ignored\n").expect("ignored file");
+        std::fs::write(source.join(".build/debug/App"), "ignored\n")
+            .expect("ignored Swift build artifact");
 
         copy_source_to_working(&source, &working).expect("copy source");
 
@@ -808,6 +808,7 @@ mod trusted_record_tests {
             0o751
         );
         assert!(!working.join("target").exists());
+        assert!(!working.join(".build").exists());
     }
 
     #[cfg(unix)]

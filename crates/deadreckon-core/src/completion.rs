@@ -3,9 +3,8 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
@@ -1019,26 +1018,24 @@ fn verify_authority_inputs(
         job_id,
     )?;
     validate_strict_contract(&contract_path, job_id)
+        .map_err(|error| completion_error(job_id, &error.to_string()))
 }
 
-fn validate_strict_contract(contract_path: &Path, job_id: &str) -> Result<()> {
+/// Apply the same minimum contract-strength rules at Job admission and receipt
+/// sealing. A durable Job must never start with a contract that its own strict
+/// completion path can only reject later.
+pub fn validate_strict_contract(contract_path: &Path, job_id: &str) -> Result<()> {
     let raw = fs::read_to_string(contract_path).with_path(contract_path)?;
     let checks = acceptance_checks_from_yaml(&raw)?;
     if checks.is_empty() {
-        return Err(completion_error(
-            job_id,
-            "the approved deterministic contract contains no checks",
-        ));
+        return Err(strict_contract_error(job_id, "contains no checks"));
     }
     let required = checks
         .iter()
         .filter(|check| check_is_required(check))
         .collect::<Vec<_>>();
     if required.is_empty() {
-        return Err(completion_error(
-            job_id,
-            "the approved deterministic contract contains no required checks",
-        ));
+        return Err(strict_contract_error(job_id, "contains no required checks"));
     }
     if required.iter().all(|check| {
         matches!(
@@ -1046,12 +1043,18 @@ fn validate_strict_contract(contract_path: &Path, job_id: &str) -> Result<()> {
             AcceptanceCheck::FileExists { path, .. } if path.trim() == "{working_dir}"
         )
     }) {
-        return Err(completion_error(
+        return Err(strict_contract_error(
             job_id,
-            "the approved deterministic contract only proves that its pre-created working directory exists",
+            "only proves that its pre-created working directory exists",
         ));
     }
     Ok(())
+}
+
+fn strict_contract_error(job_id: &str, detail: &str) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!(
+        "approved deterministic contract for Job {job_id} is not sealable: it {detail}"
+    ))
 }
 
 fn check_is_required(check: &AcceptanceCheck) -> bool {
@@ -1483,34 +1486,8 @@ fn refuse_filtered_result_entries(git_root: &Path, index_path: &Path) -> Result<
         git_root,
         &["check-attr", "--cached", "-z", "--stdin", "filter"],
     );
-    check
-        .env("GIT_INDEX_FILE", index_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = check.spawn().map_err(|source| DeadreckonError::Io {
-        path: git_root.to_path_buf(),
-        source,
-    })?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| {
-            DeadreckonError::InvalidInput(
-                "Git filter-attribute inventory has no input pipe".to_string(),
-            )
-        })?
-        .write_all(&output.stdout)
-        .map_err(|source| DeadreckonError::Io {
-            path: git_root.to_path_buf(),
-            source,
-        })?;
-    let output = child
-        .wait_with_output()
-        .map_err(|source| DeadreckonError::Io {
-            path: git_root.to_path_buf(),
-            source,
-        })?;
+    check.env("GIT_INDEX_FILE", index_path);
+    let output = crate::git::run_git_command_with_input(git_root, &mut check, &output.stdout)?;
     require_git_success(git_root, &output, "inspect signed result filter attributes")?;
 
     let fields = output

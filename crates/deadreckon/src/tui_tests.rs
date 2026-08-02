@@ -3355,8 +3355,9 @@ fn start_full_plan_uniform_team_is_one_selection() {
 }
 
 #[test]
-fn start_fake_prompter_done_default_uses_default_gate() {
-    // C-P8: Enter (empty answer) at the one question accepts the default gate.
+fn start_fake_prompter_empty_done_drafts_from_goal() {
+    // C-P8: Enter still keeps this to one question, but an unknown project
+    // must receive a real goal-derived contract before a durable launch.
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: "build the app",
         requested_mode: CliStartMode::Auto,
@@ -3369,10 +3370,17 @@ fn start_fake_prompter_done_default_uses_default_gate() {
 
     assert_eq!(
         decision.done_criteria_source,
-        StartDoneCriteriaSource::DefaultGate
+        StartDoneCriteriaSource::Asked
     );
-    assert_eq!(decision.done_action, StartDoneAction::DefaultGate);
-    assert!(decision.done_criteria_label.contains("default"));
+    assert_eq!(
+        start_done_materialization_request(&decision),
+        Some((
+            "Draft practical acceptance checks that independently prove this goal: build the app"
+                .to_string(),
+            false,
+        ))
+    );
+    assert!(decision.done_criteria_label.contains("goal-derived"));
 }
 
 #[test]
@@ -3440,9 +3448,9 @@ fn detected_contract_asks_zero_questions() {
 }
 
 #[test]
-fn yes_flag_skips_question_and_carries_caveat() {
-    // C-P8: --yes never asks; an unknown tree proceeds with the caveat on
-    // the label (the gate surfaces it later — never a silent green).
+fn yes_flag_skips_question_but_refuses_unknown_contract() {
+    // `--yes` never asks, but it cannot self-approve a directory-exists
+    // fallback which strict completion would reject after the work is done.
     let temp = tempfile::tempdir().expect("tempdir");
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: "build the app",
@@ -3459,15 +3467,18 @@ fn yes_flag_skips_question_and_carries_caveat() {
     )
     .expect("resolve");
 
-    assert!(decision.recovery.is_none(), "yes proceeds, never refuses");
+    assert!(decision.recovery.is_some(), "{decision:#?}");
     assert_eq!(
         decision.done_criteria_source,
-        StartDoneCriteriaSource::DefaultGate
+        StartDoneCriteriaSource::Missing
     );
+    assert_eq!(decision.done_action, StartDoneAction::Missing);
     assert!(
-        decision.done_criteria_label.contains("caveat"),
-        "{}",
-        decision.done_criteria_label
+        decision
+            .try_lines
+            .iter()
+            .any(|line| line.contains("deadreckon def-done")),
+        "{decision:#?}"
     );
 
     // Without --yes the non-TTY refusal is unchanged (aligned with the

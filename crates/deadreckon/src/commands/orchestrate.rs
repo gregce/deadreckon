@@ -875,6 +875,12 @@ mod tests {
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("README.md"), "durable graph").expect("source file");
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: graph fixture\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/README.md'\n    must_pass: true\n",
+        )
+        .expect("contract");
         let mut launch = commands::course::trivial_operator_plan(
             "finish the graph task",
             commands::course::CourseShape::Plan,
@@ -917,7 +923,7 @@ mod tests {
             &source,
             launch,
             driver.clone(),
-            None,
+            Some(&contract),
             commands::job::DurableSource {
                 mode: commands::job::DurableSourceMode::Copy,
                 from: Some(source.clone()),

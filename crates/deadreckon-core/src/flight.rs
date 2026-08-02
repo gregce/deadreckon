@@ -14,9 +14,10 @@ use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
 use crate::artifact_policy::{
-    WorkspacePathClass, classify_workspace_path, is_deliverable_workspace_path,
+    WorkspacePathClass, classify_workspace_path, is_checkpointable_workspace_path,
+    is_deliverable_workspace_path,
 };
-use crate::artifacts::copy_tree;
+use crate::artifacts::{copy_recoverable_tree, copy_tree};
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line, atomic_write_json};
@@ -545,7 +546,7 @@ pub fn capture_delta_checkpoint(
     }
 
     if request.full_anchor {
-        copy_tree(&state.working_dir, &tmp_dir.join("anchor"))?;
+        copy_recoverable_tree(&state.working_dir, &tmp_dir.join("anchor"))?;
     }
 
     let manifest = CheckpointManifest {
@@ -760,13 +761,7 @@ where
 
 fn ignored_working_entry(path: &Path, root: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    relative.components().any(|component| {
-        let value = component.as_os_str().to_string_lossy();
-        matches!(
-            value.as_ref(),
-            ".git" | ".deadreckon" | "target" | "node_modules"
-        )
-    })
+    !relative.as_os_str().is_empty() && !is_checkpointable_workspace_path(relative)
 }
 
 fn copy_checkpoint_file(working_dir: &Path, checkpoint_tmp: &Path, relative: &Path) -> Result<()> {
@@ -1017,12 +1012,14 @@ mod tests {
     fn deliverable_index_excludes_provider_evidence_but_raw_flight_index_keeps_it() {
         let (_temp, state) = fixture();
         fs::create_dir_all(state.working_dir.join(".specstory/history")).expect("private");
+        fs::create_dir_all(state.working_dir.join(".build/debug")).expect("Swift build output");
         fs::create_dir_all(state.working_dir.join("src")).expect("source");
         fs::write(
             state.working_dir.join(".specstory/history/session.md"),
             "private\n",
         )
         .expect("private");
+        fs::write(state.working_dir.join(".build/debug/App"), "binary\n").expect("build artifact");
         fs::write(state.working_dir.join("src/lib.rs"), "source\n").expect("source");
 
         let raw = build_working_file_index(&state.working_dir).expect("raw");
@@ -1038,6 +1035,12 @@ mod tests {
                 .contains_key(Path::new(".specstory/history/session.md"))
         );
         assert!(deliverable.files.contains_key(Path::new("src/lib.rs")));
+        assert!(!raw.files.contains_key(Path::new(".build/debug/App")));
+        assert!(
+            !deliverable
+                .files
+                .contains_key(Path::new(".build/debug/App"))
+        );
     }
 
     #[test]
@@ -1049,6 +1052,7 @@ mod tests {
             ".git/objects",
             "target/debug",
             "web/node_modules/pkg",
+            ".build/debug",
         ] {
             fs::create_dir_all(temp.path().join(directory)).expect("directory");
         }
@@ -1059,6 +1063,7 @@ mod tests {
             ".git/objects/private",
             "target/debug/output",
             "web/node_modules/pkg/index.js",
+            ".build/debug/App",
         ] {
             fs::write(temp.path().join(file), "before\n").expect("file");
         }
@@ -1086,6 +1091,7 @@ mod tests {
                 .files
                 .contains_key(Path::new("web/node_modules/pkg/index.js"))
         );
+        assert!(!before.files.contains_key(Path::new(".build/debug/App")));
         assert_ne!(before.tree_hash(), after.tree_hash());
     }
 
@@ -1197,10 +1203,17 @@ mod tests {
         fs::write(state.working_dir.join("a.txt"), "one").expect("write");
         snapshot_working(&state, 0).expect("snapshot");
         let before = build_working_file_index(&state.working_dir).expect("before");
+        fs::create_dir_all(state.working_dir.join(".build/debug")).expect("build directory");
+        fs::write(state.working_dir.join(".build/debug/App"), "binary").expect("build artifact");
         fs::write(state.working_dir.join("a.txt"), "anchor").expect("write");
         let after_anchor = build_working_file_index(&state.working_dir).expect("anchor");
         capture_delta_checkpoint(&state, &before, &after_anchor, request("cp-000020", true))
             .expect("cp anchor");
+        assert!(
+            !checkpoint_dir(&state, "cp-000020")
+                .join("anchor/.build")
+                .exists()
+        );
         fs::write(state.working_dir.join("a.txt"), "after").expect("write");
         let after = build_working_file_index(&state.working_dir).expect("after");
         capture_delta_checkpoint(&state, &after_anchor, &after, request("cp-000021", false))
@@ -1209,6 +1222,7 @@ mod tests {
         let out = state.run_root.join("preview-anchor");
         materialize_checkpoint(&state, "cp-000021", &out).expect("materialize");
         assert_eq!(fs::read_to_string(out.join("a.txt")).expect("a"), "after");
+        assert!(!out.join(".build").exists());
     }
 
     #[test]

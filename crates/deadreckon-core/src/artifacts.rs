@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use walkdir::WalkDir;
 
-use crate::artifact_policy::{is_deliverable_workspace_path, is_promotable_workspace_path};
+use crate::artifact_policy::{
+    is_deliverable_workspace_path, is_promotable_workspace_path, is_recoverable_workspace_path,
+};
 use crate::error::{DeadreckonError, IoContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
@@ -91,7 +93,7 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
     if snapshot_dir.exists() {
         fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
     }
-    copy_tree(&state.working_dir, &snapshot_dir)?;
+    copy_recoverable_tree(&state.working_dir, &snapshot_dir)?;
     Ok(snapshot_dir)
 }
 
@@ -268,23 +270,50 @@ fn text_delta(relative: &Path, old: &str, new: &str) -> (usize, usize, Option<St
 }
 
 pub fn inventory_files(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(inventory_files_with_filter(root, |_| true))
+}
+
+/// Inventory workspace files needed for recovery while pruning disposable
+/// build and dependency trees before traversal.
+pub fn inventory_recoverable_files(root: &Path) -> Result<Vec<PathBuf>> {
+    Ok(inventory_files_with_filter(
+        root,
+        is_recoverable_workspace_path,
+    ))
+}
+
+fn inventory_files_with_filter(root: &Path, include: fn(&Path) -> bool) -> Vec<PathBuf> {
     if !root.exists() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut files = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| {
+            entry
+                .path()
+                .strip_prefix(root)
+                .ok()
+                .is_none_or(|relative| relative.as_os_str().is_empty() || include(relative))
+        })
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
     {
         files.push(entry.path().to_path_buf());
     }
     files.sort();
-    Ok(files)
+    files
 }
 
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     copy_tree_with_filter(from, to, |_| true)
+}
+
+/// Copy the state needed to restore a workspace while omitting disposable
+/// build/dependency output. Git control, lifecycle metadata and provider
+/// evidence remain recoverable.
+pub fn copy_recoverable_tree(from: &Path, to: &Path) -> Result<()> {
+    copy_classified_tree(from, to, is_recoverable_workspace_path)
 }
 
 pub fn copy_deliverable_tree(from: &Path, to: &Path) -> Result<()> {
@@ -553,7 +582,8 @@ mod tests {
 
     use super::{
         copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree, diff_snapshots,
-        diff_working_trees, inventory_files, restore_snapshot, snapshot_diff, snapshot_working,
+        diff_working_trees, inventory_files, inventory_recoverable_files, restore_snapshot,
+        snapshot_diff, snapshot_working,
     };
 
     #[test]
@@ -618,8 +648,18 @@ mod tests {
         )
         .expect("run");
 
+        fs::create_dir_all(state.working_dir.join(".build/debug")).expect("build output");
+        fs::write(state.working_dir.join(".build/debug/app"), "binary").expect("build artifact");
+        fs::write(
+            state.working_dir.join(".git"),
+            "gitdir: /trusted/worktree\n",
+        )
+        .expect("git control");
         fs::write(state.working_dir.join("file.txt"), "one").expect("write");
         snapshot_working(&state, 1).expect("snapshot");
+        let snapshot = state.run_root.join("snapshots/turn-1");
+        assert!(!snapshot.join(".build").exists());
+        assert!(snapshot.join(".git").is_file());
         fs::write(state.working_dir.join("file.txt"), "two").expect("mutate");
         restore_snapshot(&state, 1).expect("restore");
 
@@ -631,6 +671,20 @@ mod tests {
             inventory
                 .iter()
                 .any(|path| path.ends_with(".deadreckon/docs/RUN-NARRATIVE.md"))
+        );
+        assert!(!state.working_dir.join(".build").exists());
+        assert_eq!(
+            fs::read_to_string(state.working_dir.join(".git")).expect("restored Git control"),
+            "gitdir: /trusted/worktree\n"
+        );
+        fs::create_dir_all(state.working_dir.join(".build/debug")).expect("rebuilt output");
+        fs::write(state.working_dir.join(".build/debug/app"), "rebuilt").expect("rebuilt artifact");
+        let recoverable = inventory_recoverable_files(&state.working_dir).expect("recoverable");
+        assert!(recoverable.iter().any(|path| path.ends_with("file.txt")));
+        assert!(
+            recoverable
+                .iter()
+                .all(|path| !path.ends_with(".build/debug/app"))
         );
     }
 

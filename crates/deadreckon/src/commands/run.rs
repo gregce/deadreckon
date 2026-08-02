@@ -1440,6 +1440,12 @@ mod durable_direct_tests {
         let source = temp.path().join("source");
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("README.md"), "durable direct run").expect("source file");
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: direct fixture\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/README.md'\n    must_pass: true\n",
+        )
+        .expect("contract");
         let mut plan = commands::course::trivial_operator_plan(
             "finish the direct task",
             commands::course::CourseShape::Single,
@@ -1465,7 +1471,7 @@ mod durable_direct_tests {
             &paths,
             &source,
             plan,
-            None,
+            Some(&contract),
             commands::job::DurableSource {
                 mode: commands::job::DurableSourceMode::Copy,
                 from: Some(source.clone()),

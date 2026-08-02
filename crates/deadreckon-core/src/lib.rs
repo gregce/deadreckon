@@ -40,14 +40,15 @@ pub mod update_cache;
 
 pub use artifact_policy::{
     WorkspacePathClass, classify_workspace_path, delivery_git_exclude_pathspecs,
-    evidence_only_roots, is_deliverable_workspace_path, is_promotable_workspace_path,
-    runtime_output_root,
+    evidence_only_roots, is_checkpointable_workspace_path, is_deliverable_workspace_path,
+    is_promotable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
 };
 pub use artifacts::{
     DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, append_provenance, append_spend,
-    append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree,
-    diff_snapshots, diff_working_trees, inventory_files, remove_artifact_path, restore_snapshot,
-    snapshot_diff, snapshot_working,
+    append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
+    copy_recoverable_tree, copy_tree, diff_snapshots, diff_working_trees, inventory_files,
+    inventory_recoverable_files, remove_artifact_path, restore_snapshot, snapshot_diff,
+    snapshot_working,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -70,6 +71,7 @@ pub use codebase::{
 };
 pub use completion::{
     SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
+    validate_strict_contract,
 };
 pub use delivery::{
     GitDeliveryTarget, JobOperationLock, ValidatedAppliedGitDeliveryReceipt,
