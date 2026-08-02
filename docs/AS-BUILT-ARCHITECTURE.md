@@ -1531,15 +1531,17 @@ in the launch plan, durable driver and recovery/replay inputs; a model chosen
 for one provider does not leak to another provider. Legacy global `--model`
 continues to work.
 
-Within guided setup, DeadReckon resolves the provider and role options before
-the done contract, then resolves the source mode. Provider resolution uses
-configured defaults first and probes installed subscription CLIs only when no
-default route is configured. A TTY choice is launch-local and does not rewrite
-config. Non-TTY callers get concrete `try:` lines for `init`, `detect`,
-`config provider`, or `providers list --all`. Existing project criteria use the
-same `def-done` and `.deadreckon/acceptance.yaml` contract as direct runs.
-Source resolution keeps the direct-run safety posture: git worktree by default,
-explicit copy or fresh modes, and explicit dirty-worktree consent.
+Within guided setup, DeadReckon resolves and validates the source exactly once
+before provider discovery, role selection, done-contract authoring, writes or
+final confirmation. Preview and dispatch consume that same ephemeral resolved
+value. Provider resolution then uses configured defaults first and probes
+installed subscription CLIs only when no default route is configured. A TTY
+choice is launch-local and does not rewrite config. Non-TTY callers get
+concrete `try:` lines for `init`, `detect`, `config provider`, or `providers
+list --all`. Existing project criteria use the same `def-done` and
+`.deadreckon/acceptance.yaml` contract as direct runs. Source resolution keeps
+the direct-run safety posture: git worktree by default, explicit copy or fresh
+modes, and explicit dirty-worktree consent.
 
 History-aware `start` scans the current project scope for the newest completed, promoted, non-in-place run. When one exists, the TTY launch picker adds a "Follow up" choice that dispatches through `extend`; preview and JSON output also include exact commands for `deadreckon extend <run-id> "<goal>"`, `deadreckon start "<goal>" --mode review --yes`, and `deadreckon start "<goal>" --mode full-plan --yes`. This keeps scripted `start` deterministic while making it obvious how to continue prior work or launch a new orchestration pass.
 
@@ -1555,14 +1557,14 @@ users who already know the path they want.
 
 Prompt eligibility is deliberately narrow: `--json`, `--plain`, `--quiet`, `--yes`, and non-TTY execution never start the picker and never block on stdin. Those paths preserve deterministic JSON/recovery output and scriptable launch behavior. `--preview` may ask TTY users for selections, but it remains state-free; provider config is not written by a provider selection, and done-contract files are only generated for an actual launch after final confirmation.
 
-There is one current ordering defect. For `review` and `full-plan`, `start`
-can resolve and preview `--from`, then materialize or review a contract, before
-the advanced Graph dispatcher rejects source flags as run-only. The rejection
-creates no Job, but it arrives after the expensive contract work. Contract
-authoring also writes to and inspects the launch directory, not the `--from`
-source. The Soundings [goal](goals/2026-08-02-0016-deadreckon-soundings-goal.md)
-and [rider](goals/2026-08-02-0016-deadreckon-soundings-rider.md) specify the
-planned correction. They do not describe shipped behavior.
+`review` and `full-plan` now accept `--from`. The approved source is copied
+into the Job before queueing, including dirty and untracked deliverables but
+excluding Git and rebuildable/runtime output. Graph children work from that
+controller-owned copy and never from the mutable operator path. When a done
+contract must be authored, its files remain owned by the launch project while
+the provider sees a bounded, redacted dossier of the resolved source. The
+plain/card/JSON preview, frozen authority and Graph driver all report the same
+source decision. §59 records the full Soundings boundary.
 
 The CLI defaults are honest: `--sandbox` defaults to `auto`, `--max-spend` defaults to `$10` (with a confirmation gate above `$50`), `--provider` defaults to the highest-credentialed entry per the fallback chain, `--skill` defaults to `default-coding`.
 
@@ -3444,6 +3446,14 @@ audit of what the decision saw:
 All five are pure, total, and provider-free; degraded inputs yield defaults,
 never errors.
 
+Source selection precedes this planning work. `start` canonicalizes one
+`ResolvedStartSource` before a classifier or authoring provider can run. The
+decision holds the durable source mode, requested provenance, inspection root,
+contract-writer root and dirty-source posture. Unsupported or unreadable
+source inputs therefore refuse before provider spend or filesystem mutation.
+Course preview, contract authoring, Job authority and dispatch receive this
+same value rather than resolving paths independently.
+
 ### 46.3 The deterministic ladder
 
 `ladder_decision` resolves a shape from ordered rules; the first match
@@ -3519,6 +3529,12 @@ before Job creation and prints a `def-done` recovery command. The same strict
 admission check rejects a contract whose only required check proves that the
 pre-created working directory exists. Non-TTY execution without a contract
 also refuses. The old four-choice done menu is gone.
+
+For a source-copy launch, that agent does not inspect the empty destination.
+It receives a deterministic, bounded dossier from the resolved source, while
+the generated YAML, Markdown and helpers are written under the launch
+project's `.deadreckon/` directory. Generated checks must use
+`{working_dir}`; an absolute reference to the operator source is rejected.
 
 ### 46.9 Dispatch, replay, JSON parity
 
@@ -3710,36 +3726,45 @@ the Course card lists `done 1`, `done 2`, etc., flags drift, and adds `d` as
 the done-review action. `start --json` includes the same checks and divergence
 in preview and launch envelopes.
 
-### 48.1 Current contract-authoring limits
+### 48.1 Source-true, bounded contract authoring
 
-The authoring loop is count-bounded but not time-bounded. A launch can make up
-to 3 serial provider calls: draft, critic and one redraft. These requests have
-no cancellation token or shared deadline. The CLI wait line reports elapsed
-time but does not enforce a timeout. A local CLI provider therefore waits on
-the child process until it exits and may use network-backed tools while its
-filesystem view remains read-only. The durable Job wall cap starts later and
-does not bound this pre-launch work.
+Soundings keeps the persisted acceptance schema unchanged but tightens the
+pre-launch controller. Guided authoring receives explicit writer and inspection
+roots. Existing contracts are discovered at the writer root. New artifacts are
+written there, while a deterministic dossier describes the resolved source.
+The dossier has stable ordering and hard per-file/total caps; it exposes useful
+manifest, source and test names while excluding `.git`, SpecStory history,
+secrets, symlinks, runtime state and rebuildable output. Swift packages expose
+their real product, target and test names, so a Cloudwing source cannot be
+silently rewritten as an invented FlappyBird package.
 
-The launch directory is both the contract write root and the workspace shown to
-the authoring provider. `--from` does not change that inspection root. A launch
-from a sparse directory can therefore produce plausible but wrong package,
-target or evidence names for the real source.
+Draft, critic and optional redraft use exact JSON output schemas and a
+request-scoped structured-text-only posture. Codex runs ephemerally with tool,
+MCP, web and user-rule/config surfaces disabled; Claude uses its equivalent
+schema-only flags. API requests carry strict response formats and no tools. An
+adapter that cannot enforce the posture fails closed. Capability probes are
+cached for the binary/version process lifetime. `doc_provider` remains the
+preferred authoring route.
 
-An automatic redraft receives the original request and the critic's reduced
-verdict. It does not receive the first generated YAML, Markdown or helper files
-as the candidate to repair. Each read-only request also starts without a
-resumable provider session. The critic parser accepts only `pass` and `redraft`;
-a provider verdict such as `reject` falls back to deterministic lint and drops
-the provider's returned detail. The provider transport supports output schemas,
-but these acceptance requests do not set one.
+The whole authoring sequence shares one wall deadline. The default is 120
+seconds, configurable as `defaults.done_contract_max_wall_seconds` and clamped
+to 30–600 seconds. The initial draft receives at most 60 seconds, the critic at
+most 20, and redraft receives only the remaining time up to 60 seconds. Startup,
+capability probing, provider work and cleanup all consume the same budget.
+Cancellation first terminates and reaps the provider's full owned process group
+and removes temporary schema, PID and partial-output files. The wait surface
+reports stage, provider/model and cumulative elapsed/limit; it is not the
+timeout mechanism.
 
-After the calls return, DeadReckon parses and compiles the candidate, checks its
-check count, writes the project files and shows the contract for review. Strict
-Job admission separately rejects empty, optional-only and directory-exists-only
-contracts. These checks limit false acceptance, but they do not make authoring
-fast or source-aware. The Soundings [goal](goals/2026-08-02-0016-deadreckon-soundings-goal.md)
-and [rider](goals/2026-08-02-0016-deadreckon-soundings-rider.md) define that
-unshipped correction.
+The deterministic lint remains the floor. A provider cannot override a
+deterministic `redraft`. Critic timeout can expose a lint-clean candidate only
+for explicit human review; strict/non-interactive admission refuses. Redraft
+receives the complete prior YAML, Markdown, helper bodies, dossier, lint and
+normalized verdict. `reject` is an alias for `redraft` and retains its arrays.
+There is still at most one critic and one redraft. A timed-out or invalid weak
+candidate is never written as approved. A valid generated contract already on
+disk is ordinary project state and is reused on retry without another provider
+call.
 
 Deferred Contract work stays out of the stable slice: first-class browser/HTTP
 check kinds, a standalone `deadreckon contract` report verb, multi-round critic
@@ -4284,11 +4309,15 @@ reachable only from the characterization binary used by tests.
 | Installed `deadreckon supervisor` user service | launchd or systemd starts `supervisor serve`, which scans supported nonterminal Jobs | Uses the same shape-specific classifiers and receipt validators as detached one-shot supervision | Conditional restart-at-login posture; live active-service and reboot acceptance remain |
 | Public `extend` or a follow-up selected by guided `start` | Freezes the completed parent state, promoted-artifact tree and verified receipt, then writes a Single Job before child work | Revalidates the frozen parent inputs before continuation evidence, then uses the normal two-key child receipt | Durable parent-bound continuation; launch-time `--dest` is refused and delivery remains a later `finish` |
 
-The Graph row applies only after current dispatch accepts the source posture.
-Guided `review` and `full-plan` do not support `--from`, `--fresh` or
-`--allow-dirty`. Today the setup path can still preview one of those flags before
-the final dispatcher rejects it. That late refusal creates no Job. Soundings is
-the planned source-aware Graph correction, not part of this execution boundary.
+The Graph row includes source-copy admission. Guided `review` and `full-plan`
+accept `--from <dir>` after validating it before provider work. Job creation
+hashes the deliverable source, copies it into a preparing directory below the
+Job root, re-hashes both sides, atomically publishes `approved-source`, and only
+then queues the Job. The launch plan retains the canonical external path as
+provenance, while `Job.source_cwd` and every Graph child use the controller-owned
+copy. Source mutation or removal after admission cannot redirect execution.
+Campaign source replacement remains out of scope, and source flags unsupported
+by a selected shape still refuse before authoring or writes.
 
 Persisted durability and supervised durability are different claims. Every run
 continues to write state, ledgers, snapshots, and evidence. A Watchkeeper Job
@@ -4801,6 +4830,89 @@ execution remain foreground and untrusted. The operator script in
 `docs/WATCHKEEPER-OPERATOR-ACCEPTANCE.md` separates tests available now from
 open live claims.
 
+## 59. Soundings: Source-True, Bounded Launch Admission
+
+Soundings closes the gap between the project named by `start --from` and the
+project that preflight, done-contract authoring and Graph execution actually
+used. It adds no Job, launch-plan, PipelineState or acceptance-file schema. The
+new state is an ephemeral controller decision plus Job-owned approved bytes.
+
+### 59.1 One source decision before intelligence or mutation
+
+After launch shape selection, `start` validates source compatibility and builds
+one `ResolvedStartSource`: durable mode, requested provenance, canonical
+inspection root, contract-writer root and dirty posture. This happens before
+service mutation, provider classification/selection, contract authoring, file
+writes or final confirmation. A second incompatible resolution is an error.
+Preview, plain/card/JSON output, acceptance, Job authority and dispatch consume
+the same object.
+
+An authoring-needed preview names the source and its ownership plainly:
+inspection root, writer root, structured provider/model route, cumulative
+authoring limit, and `approved copy from <canonical source>`. An unsupported or
+missing source refuses at this boundary and reaches no provider or contract
+writer.
+
+### 59.2 Approved Graph copies
+
+`review` and `full-plan` support `--from`. The controller canonicalizes the
+operator path, indexes deliverables, copies tracked and untracked deliverable
+bytes into a Job-local preparing directory, indexes the copy and re-indexes the
+source, and refuses any digest disagreement. A successful copy is atomically
+renamed to `<job>/approved-source` and synced before the Job is queued. Git
+metadata and disposable/runtime output are excluded by the canonical artifact
+policy. The authority binds the approved tree digest; the launch plan keeps the
+external path only as provenance; the Graph driver initializes Git and launches
+children inside the approved copy. The original tree is never modified and can
+change or disappear after admission without redirecting the Job.
+
+### 59.3 Separate contract ownership from source inspection
+
+`AcceptanceAuthoringContext` makes the two roots explicit. The launch project
+owns `.deadreckon/acceptance.yaml`, `.deadreckon/acceptance.md` and helper
+scripts. The resolved source supplies facts through a deterministic dossier.
+The dossier is sorted, capped and visibly truncated; excludes credentials,
+history, Git/runtime/build trees and symlinks; and extracts ecosystem manifests
+such as SwiftPM product, target and test names. Generated YAML and helpers must
+remain portable through `{working_dir}` and cannot embed the original absolute
+source path. Direct `def-done` keeps its existing behavior by supplying the
+same path for both roots.
+
+### 59.4 Structured authoring under one deadline
+
+Draft and critic calls carry exact output schemas. CLI adapters must prove a
+structured-text-only posture; Codex authoring is ephemeral and disables tool,
+web, MCP and user-rule/config surfaces, while Claude uses its corresponding
+safe/schema flags. Tool-free API routes use strict response formats. Unsupported
+adapters fail closed. Immutable capability probes are cached per binary/version.
+
+Draft, critic and optional redraft share a 120-second default deadline. Draft
+gets at most 60 seconds, critic 20, and redraft only the remaining time up to
+60. The config key `defaults.done_contract_max_wall_seconds` is clamped to
+30–600 seconds. Timeout or cancellation terminates and reaps the whole provider
+process group and removes temporary files before returning. Initial failure
+writes nothing. Critic/redraft failure cannot approve a weak candidate; only a
+lint-clean draft may proceed to explicit human review. Redraft receives the full
+prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
+`redraft`; one critic and one redraft remain the ceiling.
+
+### 59.5 Compatibility and proof boundary
+
+Clean-current Single and Graph launches retain their established source modes.
+Existing contracts require zero authoring calls and remain reusable after an
+unrelated later refusal. Campaign `--from`, remote sources, persisted authoring
+sessions, new acceptance check kinds and live-provider latency claims are not
+part of Soundings. The durable contract, contained deterministic gate,
+independent semantic judge and signed receipt from §58 remain the completion
+authority.
+
+Hermetic depth tests reproduce the empty-destination plus dirty/untracked
+Cloudwing source, prove the contract sees Cloudwing facts, launch a Graph Job,
+compare preview/authority/approved-copy digests, preserve the external source,
+bound hung stages, reap descendants and retain legacy clean launch behavior.
+The operator-facing reproduction and timeout/retry checks are in
+`docs/SOUNDINGS-OPERATOR-ACCEPTANCE.md`.
+
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-08-02 for unified execution-team selection (§17), honest Contract authoring and Graph-source limits (§17, §46, §48 and §58), strict durable contract admission, cumulative active-attempt wall enforcement, process reconciliation, early provider-result persistence, concurrent Git pipe draining and SwiftPM artifact exclusion (§9, §22 and §58). Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-08-02 for Soundings source-true, bounded launch admission (§17, §46, §48, §58 and §59), unified execution-team selection (§17), strict durable contract admission, cumulative active-attempt wall enforcement, process reconciliation, early provider-result persistence, concurrent Git pipe draining and SwiftPM artifact exclusion (§9, §22 and §58). Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
