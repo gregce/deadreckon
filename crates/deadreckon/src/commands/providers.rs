@@ -517,9 +517,20 @@ pub(crate) fn reconcile_receipt_for_current_binary(
 }
 
 fn same_binary(left: &Path, right: &Path) -> bool {
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+    if left == right
+        || matches!(
+            (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
+    {
+        return true;
+    }
+    match (
+        deadreckon_core::flight::sha256_file(left),
+        deadreckon_core::flight::sha256_file(right),
+    ) {
         (Ok(left), Ok(right)) => left == right,
-        _ => left == right,
+        _ => false,
     }
 }
 
@@ -1286,6 +1297,19 @@ mod tests {
         assert!(error.contains("receipt belongs to"), "{error}");
         assert_eq!(unchanged.binary_path, other);
         assert_eq!(unchanged.channel_version, "9.9.9");
+    }
+
+    #[test]
+    fn identical_binary_copies_share_one_install_identity() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let first = temp.path().join("first-deadreckon");
+        let second = temp.path().join("second-deadreckon");
+        std::fs::write(&first, b"same executable bytes").expect("first");
+        std::fs::write(&second, b"same executable bytes").expect("second");
+
+        assert!(same_binary(&first, &second));
+        std::fs::write(&second, b"different executable bytes").expect("different second");
+        assert!(!same_binary(&first, &second));
     }
 }
 
