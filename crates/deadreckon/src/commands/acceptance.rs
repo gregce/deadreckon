@@ -262,6 +262,7 @@ fn critic_output_schema() -> Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_done_authoring_stage(
     router: &ProviderRouter,
     cwd: &Path,

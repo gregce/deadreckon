@@ -2315,21 +2315,18 @@ fn resolve_start_setup(
     prompter: Option<&mut dyn StartPrompter>,
     stdin_is_tty: bool,
 ) -> Result<()> {
-    match prompter {
-        Some(prompter) => {
-            resolve_start_source_setup(decision, args, Some(&mut *prompter), stdin_is_tty)?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_provider_and_done_setup(decision, args, Some(prompter))
+    if let Some(prompter) = prompter {
+        resolve_start_source_setup(decision, args, Some(&mut *prompter), stdin_is_tty)?;
+        if decision.recovery.is_some() {
+            return Ok(());
         }
-        None => {
-            resolve_start_source_setup(decision, args, None, stdin_is_tty)?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_provider_and_done_setup(decision, args, None)
+        resolve_start_provider_and_done_setup(decision, args, Some(prompter))
+    } else {
+        resolve_start_source_setup(decision, args, None, stdin_is_tty)?;
+        if decision.recovery.is_some() {
+            return Ok(());
         }
+        resolve_start_provider_and_done_setup(decision, args, None)
     }
 }
 
@@ -2341,7 +2338,7 @@ fn resolve_start_source_setup(
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
-    validate_start_source_compatibility(decision, args, &cwd)?;
+    validate_start_source_compatibility(decision, args, &cwd);
     if decision.recovery.is_some() {
         return Ok(());
     }
@@ -2385,49 +2382,46 @@ fn resolve_start_provider_and_done_setup(
             )
         },
     );
-    match prompter {
-        Some(prompter) => {
-            resolve_start_provider(decision, args, &paths, &defaults, Some(&mut *prompter))?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_orchestration_options(
-                decision,
-                args,
-                &paths,
-                &defaults,
-                Some(&mut *prompter),
-            )?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_done_criteria_with_roots(
-                decision,
-                &write_root,
-                &inspect_root,
-                Some(prompter),
-                args.yes,
-                !args.json && !args.quiet,
-            )
+    if let Some(prompter) = prompter {
+        resolve_start_provider(decision, args, &paths, &defaults, Some(&mut *prompter))?;
+        if decision.recovery.is_some() {
+            return Ok(());
         }
-        None => {
-            resolve_start_provider(decision, args, &paths, &defaults, None)?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_orchestration_options(decision, args, &paths, &defaults, None)?;
-            if decision.recovery.is_some() {
-                return Ok(());
-            }
-            resolve_start_done_criteria_with_roots(
-                decision,
-                &write_root,
-                &inspect_root,
-                None,
-                args.yes,
-                !args.json && !args.quiet,
-            )
+        resolve_start_orchestration_options(
+            decision,
+            args,
+            &paths,
+            &defaults,
+            Some(&mut *prompter),
+        )?;
+        if decision.recovery.is_some() {
+            return Ok(());
         }
+        resolve_start_done_criteria_with_roots(
+            decision,
+            &write_root,
+            &inspect_root,
+            Some(prompter),
+            args.yes,
+            !args.json && !args.quiet,
+        )
+    } else {
+        resolve_start_provider(decision, args, &paths, &defaults, None)?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
+        resolve_start_orchestration_options(decision, args, &paths, &defaults, None)?;
+        if decision.recovery.is_some() {
+            return Ok(());
+        }
+        resolve_start_done_criteria_with_roots(
+            decision,
+            &write_root,
+            &inspect_root,
+            None,
+            args.yes,
+            !args.json && !args.quiet,
+        )
     }
 }
 
@@ -2435,7 +2429,7 @@ fn validate_start_source_compatibility(
     decision: &mut StartLaunchDecision,
     args: &StartCommandArgs,
     cwd: &Path,
-) -> Result<()> {
+) {
     if start_source_flags_present(args)
         && matches!(
             decision.selected_mode,
@@ -2454,7 +2448,7 @@ fn validate_start_source_compatibility(
                 decision.selected_mode.label()
             )],
         );
-        return Ok(());
+        return;
     }
     if args.allow_dirty
         && args.from.is_none()
@@ -2474,7 +2468,6 @@ fn validate_start_source_compatibility(
             )],
         );
     }
-    Ok(())
 }
 
 fn resolve_start_provider(
@@ -3769,7 +3762,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         )
         .await;
         apply_goal_shape_recommendation(&mut decision, recommendation.clone());
-        validate_start_source_compatibility(&mut decision, &args, &cwd)?;
+        validate_start_source_compatibility(&mut decision, &args, &cwd);
         if decision.recovery.is_none() {
             let scope = workspace_scope(&cwd)?;
             write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
@@ -3783,7 +3776,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             &mut terminal_prompter,
         )?;
         if decision.recovery.is_none() {
-            validate_start_source_compatibility(&mut decision, &args, &cwd)?;
+            validate_start_source_compatibility(&mut decision, &args, &cwd);
         }
         if decision.recovery.is_none() {
             resolve_start_provider_and_done_setup(
