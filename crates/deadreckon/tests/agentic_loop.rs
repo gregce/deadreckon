@@ -770,6 +770,7 @@ printf 'changed notes\n'
     write_cli_config(temp.path(), &fake_codex);
 
     let output = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
+        .current_dir(temp.path())
         .arg("run")
         .arg("--fresh")
         .arg("--yes")
