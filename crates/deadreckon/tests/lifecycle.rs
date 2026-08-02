@@ -1959,15 +1959,19 @@ async fn done_plain_english_uses_configured_provider() {
     fs::create_dir_all(&workspace).expect("workspace");
     fs::write(workspace.join("README.md"), "done app").expect("readme");
     let response = json!({
-        "acceptance_yaml": "name: done\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
-        "acceptance_md": "# Done Criteria\n\nREADME must exist."
+        "acceptance_yaml": "name: done\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'done app'\"\n    cwd: \"{working_dir}\"\n",
+        "acceptance_md": "# Done Criteria\n\nREADME must contain the expected application marker.",
+        "files": {}
     })
     .to_string();
-    let server = MockServer::start(vec![FixtureResponse {
-        content: response,
-        prompt_tokens: 20,
-        completion_tokens: 20,
-    }])
+    let server = MockServer::start(vec![
+        FixtureResponse {
+            content: response,
+            prompt_tokens: 20,
+            completion_tokens: 20,
+        },
+        acceptance_critic_pass_response(),
+    ])
     .await;
     write_config(paths.home(), &server.base_url());
 
@@ -2119,15 +2123,19 @@ async fn acceptance_draft_uses_configured_provider() {
     fs::create_dir_all(&workspace).expect("workspace");
     fs::write(workspace.join("README.md"), "draft app").expect("readme");
     let response = json!({
-        "acceptance_yaml": "name: drafted\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
-        "acceptance_md": "# Acceptance\n\nREADME must exist."
+        "acceptance_yaml": "name: drafted\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'draft app'\"\n    cwd: \"{working_dir}\"\n",
+        "acceptance_md": "# Acceptance\n\nREADME must contain the expected draft marker.",
+        "files": {}
     })
     .to_string();
-    let server = MockServer::start(vec![FixtureResponse {
-        content: response,
-        prompt_tokens: 20,
-        completion_tokens: 20,
-    }])
+    let server = MockServer::start(vec![
+        FixtureResponse {
+            content: response,
+            prompt_tokens: 20,
+            completion_tokens: 20,
+        },
+        acceptance_critic_pass_response(),
+    ])
     .await;
     write_config(paths.home(), &server.base_url());
 
@@ -2217,15 +2225,18 @@ async fn acceptance_add_plain_english_uses_provider_files() {
         "acceptance_yaml": "name: english\nchecks:\n  - kind: shell\n    command: \"node .deadreckon/acceptance/gallery-check.mjs\"\n    cwd: \"{working_dir}\"\n",
         "acceptance_md": "# Acceptance\n\nUsers can add and browse artwork.",
         "files": {
-            ".deadreckon/acceptance/gallery-check.mjs": "console.log('gallery ok')"
+            ".deadreckon/acceptance/gallery-check.mjs": "import fs from 'node:fs';\nif (fs.readFileSync('README.md', 'utf8').trim() !== 'gallery') process.exit(1);\nconsole.log('gallery ok');\n"
         }
     })
     .to_string();
-    let server = MockServer::start(vec![FixtureResponse {
-        content: response,
-        prompt_tokens: 20,
-        completion_tokens: 20,
-    }])
+    let server = MockServer::start(vec![
+        FixtureResponse {
+            content: response,
+            prompt_tokens: 20,
+            completion_tokens: 20,
+        },
+        acceptance_critic_pass_response(),
+    ])
     .await;
     write_config(paths.home(), &server.base_url());
 
@@ -3494,6 +3505,20 @@ struct FixtureResponse {
     content: String,
     prompt_tokens: u64,
     completion_tokens: u64,
+}
+
+fn acceptance_critic_pass_response() -> FixtureResponse {
+    FixtureResponse {
+        content: json!({
+            "stub_would_pass": false,
+            "uncovered_goal_clauses": [],
+            "weak_check_indices": [],
+            "verdict": "pass"
+        })
+        .to_string(),
+        prompt_tokens: 20,
+        completion_tokens: 20,
+    }
 }
 
 struct MockServer {
