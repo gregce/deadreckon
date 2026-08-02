@@ -778,11 +778,15 @@ fn start_with_no_provider_refuses_with_try_line() {
     let repo = clean_git_repo(&temp);
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let service = characterization_service(&paths);
+    let path = format!(
+        "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+        service.manager_bin().display()
+    );
 
     let output = service
         .deadreckon()
         .current_dir(&repo)
-        .env("PATH", service.manager_bin())
+        .env("PATH", path)
         .args(["start", "build the app", "--plain"])
         .output()
         .expect("start missing provider");
@@ -961,7 +965,7 @@ fn start_non_git_tty_can_choose_init_git_copy_or_fresh() {
     let output = deadreckon_pty(
         &paths,
         &source,
-        &["1", "1", "1", "3"],
+        &["3", "1", "1", "1"],
         &["start", "build the app", "--preview"],
         "workspace.*fresh",
         None,
@@ -1602,10 +1606,11 @@ fn start_preview_json_has_next_actions_and_try_lines_without_ansi() {
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     let empty_bin = temp.path().join("empty-bin");
     fs::create_dir_all(&empty_bin).expect("empty bin");
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", empty_bin.display());
 
     let output = deadreckon(&paths)
         .current_dir(&repo)
-        .env("PATH", &empty_bin)
+        .env("PATH", path)
         .args(["start", "json recovery", "--preview", "--json"])
         .output()
         .expect("start json preview");
