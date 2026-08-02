@@ -148,42 +148,46 @@ gate and refuses manual dispatches that are not official stable release tags.
 The release workflows require `id-token: write` for GitHub artifact
 attestations and npm provenance.
 
-## Stable v0.1.0 operator checklist
+## Stable operator checklist
 
-Everything the operator does once, in order, before cutting `v0.1.0`:
+Everything the operator confirms before every stable release:
 
-1. Create the `gregce/homebrew-tap` repository (public, empty is fine) and
-   add a `HOMEBREW_TAP_TOKEN` repo secret with `repo` scope so the publish
-   job can push the formula.
-2. npm publishing is DEFERRED for v0.1.0 (no npmjs token yet) — the lane is
-   consciously narrowed via `npmPublishingDeferred` in
-   `release/trust/release-trust.mjs`. To re-widen for 0.1.1: configure npm
-   trusted publishing for the six packages (`deadreckon` plus the five
-   platform packages) or add an `NPM_TOKEN` secret, then flip the flag.
-3. Windows Authenticode signing is DEFERRED for v0.1.0 (no certificate yet)
-   — narrowed via `windowsSigningDeferred` in the same policy; the Windows
-   zip ships unsigned (expect a SmartScreen prompt). To re-widen: add
-   `WINDOWS_CERT_PFX` and `WINDOWS_CERT_PWD` secrets and flip the flag.
-4. Bump `npm/deadreckon/package.json` to `0.1.0` (final, no `-rc.N`) and
-   bump the workspace version in `Cargo.toml` to match the tag.
-5. Confirm `CHANGELOG.md` has the `## 0.1.0` section (it does; refresh the
-   highlights if later rcs shipped more).
-6. `make build`, then run `release/preflight-real.sh` and commit the
-   refreshed `release/known-good-providers.json`.
-7. Run the Windows smoke checklist below on the signed zip and record the
+1. Work from a clean revision whose branch CI and release-plan workflow pass.
+2. Confirm the `gregce/homebrew-tap` repository is reachable and
+   `HOMEBREW_TAP_TOKEN` still has push rights.
+3. Configure npm trusted publishing for all six packages (`deadreckon` plus
+   the five platform packages) and set the repository variable
+   `NPM_TRUSTED_PUBLISHING=true`, or provide the `NPM_TOKEN` fallback.
+4. Confirm `WINDOWS_CERT_PFX` and `WINDOWS_CERT_PWD` contain the current
+   Authenticode certificate. Stable preflight fails before building artifacts
+   when either Windows or npm trust material is unavailable.
+5. Set the Rust workspace, the wrapper in `npm/deadreckon/package.json` and all
+   npm optional dependency pins to the exact stable version, update
+   `Cargo.lock`, and confirm `CHANGELOG.md` has the matching release section.
+6. Run `make build`, then `release/preflight-real.sh`, and commit the refreshed
+   `release/known-good-providers.json`. The recorded `deadreckon_version` must
+   equal the stable tag version.
+7. Run the focused checks and the complete verification suite, then validate
+   the exact stable ref through `release/trust/release-trust.mjs`.
+8. Rehearse the release through an RC and verify its archives, installers,
+   checksums, manifest, archive-member inventory, SBOM, signing/notarization
+   evidence and attestations.
+9. Run the Windows smoke checklist below on the signed zip and record the
    result under route `windows-smoke`.
-8. `node release/trust/release-trust.mjs validate --ref refs/tags/v0.1.0
-   --repo gregce/deadreckon` must pass clean locally.
-9. Tag `v0.1.0` and push the tag. Tags are operator actions — never let
-   automation create them.
+10. Create and push the stable tag only after the operator explicitly approves
+    that exact tag. Automation never invents or advances a release tag.
 
 ## Operator Release Flow
 
 1. Confirm the target tag is valid:
    - stable: `vX.Y.Z`;
    - RC: `vX.Y.Z-rc.N`.
-2. Confirm `Cargo.toml` workspace version and `npm/deadreckon/package.json`
-   match the tag base version.
+2. Confirm version agreement:
+   - for an RC, `Cargo.toml` and `Cargo.lock` carry the full prerelease version
+     (`X.Y.Z-rc.N`), while the unpublished npm wrapper and its five pins carry
+     the future stable base version (`X.Y.Z`);
+   - for stable, the Rust workspace, lockfile, npm wrapper and all five pins
+     carry exactly `X.Y.Z`.
 3. For stable releases, confirm `CHANGELOG.md` has a section for `X.Y.Z`.
 4. Confirm Apple, Homebrew, and npm trust material are configured.
 5. Confirm Windows Authenticode signing secrets are configured for stable tags.
