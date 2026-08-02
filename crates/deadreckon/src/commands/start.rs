@@ -3333,6 +3333,20 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
     replay_args.coder_model = decision.coder_model.clone();
     replay_args.reviewer_provider = decision.reviewer_provider_route.clone();
     replay_args.reviewer_model = decision.reviewer_model.clone();
+    if plan.shape == commands::course::CourseShape::Single {
+        // A Single launch plan stores its execution provider in the historical
+        // `coder` slot. It is already projected into the primary provider/model
+        // above; retaining the role-specific fields would make setup mistake a
+        // Single replay for review orchestration.
+        replay_args.planner_provider = None;
+        replay_args.planner_model = None;
+        replay_args.child_provider.clear();
+        replay_args.child_model.clear();
+        replay_args.coder_provider = None;
+        replay_args.coder_model = None;
+        replay_args.reviewer_provider = None;
+        replay_args.reviewer_model = None;
+    }
     // Replays never prompt for setup; the plan is the decision. The accept
     // matrix still applies at dispatch (campaign guardrails included).
     resolve_start_setup(&mut decision, &replay_args, None, false)?;
