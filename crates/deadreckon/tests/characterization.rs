@@ -403,7 +403,11 @@ fn characterization_deadreckon(paths: &DeadreckonPaths) -> Command {
         .env("DEADRECKON_HOME", paths.home())
         .env("NO_COLOR", "1")
         .env("COLUMNS", "120")
-        .env("RUST_BACKTRACE", "0");
+        .env("RUST_BACKTRACE", "0")
+        // The characterization binary launches nested Cargo smoke checks.
+        // Keep those checks inside the fixed test workspace even when the
+        // outer verifier uses a shared target directory for its own build.
+        .env_remove("CARGO_TARGET_DIR");
     command
 }
 
