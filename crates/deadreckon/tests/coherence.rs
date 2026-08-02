@@ -484,7 +484,14 @@ fn start_mode_values_parse_and_reject_unknown_modes() {
             "missing mode {mode}:\n{start_help}"
         );
     }
-    assert!(start_help.contains("selection prompts"), "{start_help}");
+    assert!(
+        start_help.contains("chooses a provider and model together as one execution team"),
+        "{start_help}"
+    );
+    assert!(
+        start_help.contains("selected provider's own catalog or discovery"),
+        "{start_help}"
+    );
     assert!(start_help.contains("--plain"), "{start_help}");
     assert!(start_help.contains("--json"), "{start_help}");
 
@@ -605,12 +612,12 @@ fn start_as_built_documents_guided_front_door() {
         "Guided first use",
         "`deadreckon start \"<goal>\"`",
         "ephemeral launch decision",
-        "No `PipelineState` schema",
-        "provider setup, done contract, source mode, history, and run-vs-orchestrate/campaign mode",
-        "dispatches to the existing `run`, `extend`, and `orchestrate` handlers",
+        "path adds no fields to `PipelineState`",
+        "launch shape, execution team, done contract, source mode and final confirmation",
+        "dispatches to the durable Single, Graph or Campaign",
+        "Provider-specific model choices come from the registry",
         "History-aware `start`",
-        "keep/view/check/update/cancel",
-        "previews remain state-free",
+        "Previews remain state-free",
     ] {
         assert!(
             as_built.contains(required),
