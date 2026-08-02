@@ -98,9 +98,7 @@ provenance:
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.lock",
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.toml",
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/implementation-notes.html",
-    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/src/main.rs",
-    "<BUILD_ARTIFACT>",
-    "<BUILD_ARTIFACT>"
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/src/main.rs"
   ]
 }
 {
