@@ -2261,6 +2261,29 @@ mod tests {
     }
 
     #[test]
+    fn graph_copy_freezes_untracked_deliverables_before_queue() {
+        let (_temp, paths, operator_source, job) = copy_job_fixture();
+
+        // The fixture is deliberately not a Git repository: every source file
+        // is therefore an untracked deliverable, and all must be frozen before
+        // the queued Job becomes visible to a supervisor.
+        for relative in ["README.md", "Makefile", "fixture-proof.txt"] {
+            assert!(operator_source.join(relative).is_file());
+            assert!(
+                job.source_cwd.join(relative).is_file(),
+                "missing {relative}"
+            );
+        }
+        let events =
+            fs::read_to_string(paths.job_events(job.job_id.as_ref())).expect("job event history");
+        assert!(events.contains("\"queued\""), "{events}");
+        assert!(
+            job.source_cwd
+                .starts_with(paths.job_dir(job.job_id.as_ref()))
+        );
+    }
+
+    #[test]
     fn graph_copy_never_modifies_the_operator_source() {
         let temp = TempDir::new().expect("tempdir");
         let source = temp.path().join("source");

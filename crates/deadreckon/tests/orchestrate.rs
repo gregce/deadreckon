@@ -1302,6 +1302,12 @@ fn full_plan_from_preview_contract_authority_and_driver_agree() {
     assert_full_plan_from_preview_contract_authority_and_driver_agree();
 }
 
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn flappy_reproduction_returns_graph_job_id_after_accepting_done_contract() {
+    assert_full_plan_from_preview_contract_authority_and_driver_agree();
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
     let temp = repo_tempdir();
@@ -1349,14 +1355,22 @@ fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
             "--from",
             source.to_str().expect("utf8 source"),
             "--yes",
-            "--quiet",
             "--plain",
         ])
         .output()
         .expect("full-plan copy launch");
     assert_success(&launched);
+    let launched_stdout = stdout(&launched);
 
     let root = only_job_root(&paths);
+    let job_id = root
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("job id");
+    assert!(
+        launched_stdout.contains(&job_id[..8]),
+        "launch must return the created Job ID: {launched_stdout}"
+    );
     let job: Value =
         serde_json::from_slice(&fs::read(root.join("job.json")).expect("job")).expect("job json");
     let approved = PathBuf::from(job["source_cwd"].as_str().expect("source cwd"));
@@ -1404,6 +1418,55 @@ fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
     assert_eq!(
         plan["signals"]["watchkeeper_driver"]["source_init_git"], true,
         "Graph children must initialize Git inside the approved copy"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn single_and_clean_graph_launches_keep_existing_behavior() {
+    fn launch_shape(mode: &str, expected_shape: &str) -> (Value, Value) {
+        let temp = repo_tempdir();
+        let repo = clean_git_repo(&temp);
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        write_start_ready_setup(&paths, &repo);
+        let service = characterization_service(&paths);
+        let output = service
+            .deadreckon()
+            .current_dir(&repo)
+            .args([
+                "start",
+                "preserve the established launch path",
+                "--mode",
+                mode,
+                "--yes",
+                "--quiet",
+                "--plain",
+            ])
+            .output()
+            .expect("launch");
+        assert_success(&output);
+        let root = only_job_root(&paths);
+        let job: Value = serde_json::from_slice(&fs::read(root.join("job.json")).expect("job"))
+            .expect("job json");
+        let plan = read_launch_plan(&root);
+        assert_eq!(job["shape"], expected_shape, "{job}");
+        (job, plan)
+    }
+
+    let (_single, single_plan) = launch_shape("run", "single");
+    assert_eq!(
+        single_plan["signals"]["watchkeeper_source"]["mode"],
+        "worktree"
+    );
+
+    let (_graph, graph_plan) = launch_shape("full-plan", "graph");
+    assert_eq!(
+        graph_plan["signals"]["watchkeeper_source"]["mode"],
+        "worktree"
+    );
+    assert_eq!(
+        graph_plan["signals"]["watchkeeper_driver"]["kind"],
+        "full_plan"
     );
 }
 

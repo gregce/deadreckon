@@ -2882,6 +2882,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn done_authoring_latency_matrix_enforces_120_second_default() {
+        let immediate = DoneAuthoringBudget::from_config(None);
+        assert_eq!(immediate.total, Duration::from_secs(120));
+        assert!(
+            immediate
+                .allocation(DoneAuthoringStage::Draft)
+                .expect("draft allocation")
+                <= Duration::from_secs(60)
+        );
+        assert!(
+            immediate
+                .allocation(DoneAuthoringStage::Critic)
+                .expect("critic allocation")
+                <= Duration::from_secs(20)
+        );
+        assert!(
+            immediate
+                .allocation(DoneAuthoringStage::Redraft)
+                .expect("redraft allocation")
+                <= Duration::from_secs(60)
+        );
+
+        // A critic/redraft path shares the original deadline. Advancing the
+        // request clock can only shrink later allocations; it cannot grant a
+        // fresh stage budget or extend the 120-second admission window.
+        let near_deadline = DoneAuthoringBudget {
+            started: Instant::now() - Duration::from_secs(119),
+            deadline: Instant::now() + Duration::from_secs(1),
+            total: Duration::from_secs(120),
+        };
+        assert!(
+            near_deadline
+                .allocation(DoneAuthoringStage::Critic)
+                .expect("critic remainder")
+                <= Duration::from_secs(1)
+        );
+        assert!(
+            near_deadline
+                .allocation(DoneAuthoringStage::Redraft)
+                .expect("redraft remainder")
+                <= Duration::from_secs(1)
+        );
+    }
+
     #[tokio::test]
     async fn never_returning_done_draft_stops_within_cumulative_budget() {
         let token = CancellationToken::new();
