@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used)]
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ fn crash_after_private_release_adopts_or_recovers_without_duplicating_the_attemp
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    write_smoke_acceptance(&workspace);
     let service = SupervisorServiceFixture::configured_with_env(
         &paths,
         &[
@@ -136,6 +138,7 @@ fn assert_pre_release_crash_recovers(failpoint: &str) {
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    write_smoke_acceptance(&workspace);
     let service = SupervisorServiceFixture::configured_with_env(
         &paths,
         &[
@@ -283,6 +286,15 @@ fn wait_for_failed_supervisor_exit(paths: &DeadreckonPaths, job_id: &str) {
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn write_smoke_acceptance(workspace: &Path) {
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("acceptance directory");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: restart boundary smoke\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/Cargo.toml\"\n",
+    )
+    .expect("acceptance contract");
 }
 
 fn expected_last_event(failpoint: &str) -> JobEventKind {

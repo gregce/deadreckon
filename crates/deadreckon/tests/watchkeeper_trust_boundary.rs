@@ -23,6 +23,15 @@ mod common;
 
 use common::SupervisorServiceFixture;
 
+fn write_smoke_acceptance(workspace: &Path) {
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("acceptance directory");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: trust boundary smoke\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/Cargo.toml\"\n",
+    )
+    .expect("acceptance contract");
+}
+
 #[cfg(unix)]
 #[test]
 fn guarded_exec_does_not_run_when_parent_pipe_closes_before_identity_is_durable() {
@@ -73,6 +82,12 @@ fn strict_public_start_refuses_none_despite_poisoned_legacy_gate_environment() {
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    write_smoke_acceptance(&workspace);
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: strict durable Job cannot use an uncontained deterministic gate\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/Cargo.toml\"\n",
+    )
+    .expect("goal-specific acceptance contract");
     fs::create_dir_all(paths.home()).expect("home");
     fs::write(
         paths.config_path(),
@@ -572,6 +587,7 @@ fn public_smoke_job_can_never_issue_a_trusted_completion_receipt() {
     let workspace = temp.path().join("workspace");
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
     fs::create_dir_all(&workspace).expect("workspace");
+    write_smoke_acceptance(&workspace);
     let service = SupervisorServiceFixture::configured(&paths);
 
     let launch = service
