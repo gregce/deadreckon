@@ -41,7 +41,7 @@ status: 0
       ],
       [
         "roles",
-        "children=3, planner=smoke, child=smoke"
+        "implementors=3, planner=smoke/provider default, implementor=smoke/provider default"
       ],
       [
         "done",
