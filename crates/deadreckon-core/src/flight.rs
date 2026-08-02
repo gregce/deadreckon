@@ -9,9 +9,10 @@ use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line, atomic_write_json};
 use crate::workspace_capture::{
-    CaptureEntryKind, CaptureProjection, CapturePurpose, WorkspaceCaptureManifest,
-    WorkspaceCapturePolicy, capture_workspace, ensure_workspace_capture_policy,
-    freeze_workspace_capture_policy, materialize_capture_plan,
+    CaptureEntryKind, CaptureMaterialization, CaptureProjection, CapturePurpose,
+    WORKSPACE_BLOBS_DIR, WorkspaceCaptureManifest, WorkspaceCapturePolicy, capture_workspace,
+    ensure_workspace_capture_policy, freeze_workspace_capture_policy,
+    materialize_capture_entry_with_blob_store, materialize_capture_plan_with_blob_store,
 };
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{FlightEvent, LedgerItem};
@@ -501,10 +502,11 @@ pub fn capture_delta_checkpoint(
     fs::create_dir_all(&tmp_dir).with_path(&tmp_dir)?;
 
     let mut files = Vec::new();
+    let mut delta_materialization = CaptureMaterialization::default();
     for (relative, after_fingerprint) in &after.files {
         match before.files.get(relative) {
             None => {
-                copy_checkpoint_file(&state.working_dir, &tmp_dir, relative)?;
+                delta_materialization.add(&copy_checkpoint_file(state, &tmp_dir, relative)?);
                 files.push(CheckpointFileChange {
                     path: relative.clone(),
                     change: CheckpointChangeKind::Created,
@@ -514,7 +516,7 @@ pub fn capture_delta_checkpoint(
                 });
             }
             Some(before_fingerprint) if before_fingerprint.hash != after_fingerprint.hash => {
-                copy_checkpoint_file(&state.working_dir, &tmp_dir, relative)?;
+                delta_materialization.add(&copy_checkpoint_file(state, &tmp_dir, relative)?);
                 files.push(CheckpointFileChange {
                     path: relative.clone(),
                     change: CheckpointChangeKind::Modified,
@@ -547,16 +549,25 @@ pub fn capture_delta_checkpoint(
 
     let capture = if request.full_anchor {
         let policy = ensure_workspace_capture_policy(state)?;
-        let anchor = capture_workspace(
+        let mut anchor = capture_workspace(
             &state.working_dir,
             &policy,
             CaptureProjection::Recoverable,
             CapturePurpose::FlightCheckpoint,
         )?;
-        materialize_capture_plan(&anchor, &tmp_dir.join("anchor"))?;
+        let mut materialization = materialize_capture_plan_with_blob_store(
+            &anchor,
+            &tmp_dir.join("anchor"),
+            &state.run_root.join(WORKSPACE_BLOBS_DIR),
+        )?;
+        materialization.add(&delta_materialization);
+        anchor.manifest.materialization = Some(materialization);
         Some(anchor.manifest)
     } else {
-        after.capture.clone()
+        after.capture.clone().map(|mut capture| {
+            capture.materialization = Some(delta_materialization);
+            capture
+        })
     };
 
     let manifest = CheckpointManifest {
@@ -797,10 +808,32 @@ where
         .collect()
 }
 
-fn copy_checkpoint_file(working_dir: &Path, checkpoint_tmp: &Path, relative: &Path) -> Result<()> {
-    let source = working_dir.join(relative);
-    let dest = checkpoint_tmp.join("files").join(relative);
-    copy_artifact_path(&source, &dest)
+fn copy_checkpoint_file(
+    state: &PipelineState,
+    checkpoint_tmp: &Path,
+    relative: &Path,
+) -> Result<CaptureMaterialization> {
+    let source = state.working_dir.join(relative);
+    let metadata = fs::symlink_metadata(&source).with_path(&source)?;
+    let (kind, size) = if metadata.file_type().is_file() {
+        (CaptureEntryKind::RegularFile, metadata.len())
+    } else if metadata.file_type().is_symlink() {
+        let target = fs::read_link(&source).with_path(&source)?;
+        (CaptureEntryKind::SymbolicLink, path_identity_len(&target))
+    } else {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "unsupported checkpoint entry at {}",
+            source.display()
+        )));
+    };
+    materialize_capture_entry_with_blob_store(
+        &source,
+        kind,
+        size,
+        checkpoint_tmp,
+        &PathBuf::from("files").join(relative),
+        &state.run_root.join(WORKSPACE_BLOBS_DIR),
+    )
 }
 
 fn apply_checkpoint_delta(

@@ -188,11 +188,12 @@ pub use state::{
     RunStatus, create_owned_run, create_run, list_runs, load_run, save_state,
 };
 pub use workspace_capture::{
-    CaptureBudgets, CaptureEntry, CaptureEntryKind, CaptureOmission, CaptureOmissionReason,
-    CaptureProjection, CapturePurpose, EncodedWorkspacePath, GeneratedOutputRoot,
-    GeneratedOutputSource, GitHydrationState, SOURCE_HYDRATION_MANIFEST_JSON,
-    WorkspaceCaptureManifest, WorkspaceCapturePlan, WorkspaceCapturePolicy, capture_workspace,
-    ensure_workspace_capture_policy, freeze_workspace_capture_policy, materialize_capture_plan,
-    read_capture_manifest, read_workspace_capture_policy, workspace_capture_policy_path,
-    write_capture_manifest, write_workspace_capture_policy,
+    CaptureBudgets, CaptureEntry, CaptureEntryKind, CaptureMaterialization, CaptureOmission,
+    CaptureOmissionReason, CaptureProjection, CapturePurpose, EncodedWorkspacePath,
+    GeneratedOutputRoot, GeneratedOutputSource, GitHydrationState, SOURCE_HYDRATION_MANIFEST_JSON,
+    WORKSPACE_BLOBS_DIR, WorkspaceCaptureManifest, WorkspaceCapturePlan, WorkspaceCapturePolicy,
+    capture_workspace, ensure_workspace_capture_policy, freeze_workspace_capture_policy,
+    materialize_capture_entry_with_blob_store, materialize_capture_plan,
+    materialize_capture_plan_with_blob_store, read_capture_manifest, read_workspace_capture_policy,
+    workspace_capture_policy_path, write_capture_manifest, write_workspace_capture_policy,
 };

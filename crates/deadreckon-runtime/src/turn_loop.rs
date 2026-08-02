@@ -28,7 +28,7 @@ use crate::error::IoContext;
 use crate::flight::{ProviderFlightRecorder, ProviderFlightRecorderHandle};
 use crate::polish::{PolishConfig, polish_run_docs};
 use deadreckon_core::artifact_policy::{
-    delivery_git_exclude_pathspecs, evidence_only_roots, is_deliverable_workspace_path,
+    WorkspacePathClass, classify_workspace_path, evidence_only_roots, is_deliverable_workspace_path,
 };
 use deadreckon_core::artifacts::{
     ProvenanceRecord, append_provenance, append_spend, append_trace,
@@ -4551,9 +4551,7 @@ fn commit_worktree_turn_inner(
     trusted_git_status(&control, &["update-ref", &branch_ref, &trusted_head])?;
     trusted_git_status(&control, &["symbolic-ref", "HEAD", &branch_ref])?;
     sanitize_evidence_only_paths(state, turn, base_sha, &control)?;
-    let mut add_args = vec!["add", "-A", "--", "."];
-    add_args.extend_from_slice(delivery_git_exclude_pathspecs());
-    trusted_git_status(&control, &add_args)?;
+    stage_trusted_delivery_paths(state, &control)?;
     refuse_gitlinks(&control)?;
     if trusted_git_quiet(&control, &["diff", "--cached", "--quiet"])? {
         verify_evidence_only_paths_clean(base_sha, &control)?;
@@ -4579,6 +4577,70 @@ fn commit_worktree_turn_inner(
         ],
     )?;
     verify_evidence_only_paths_clean(base_sha, &control)
+}
+
+fn stage_trusted_delivery_paths(state: &PipelineState, control: &TrustedGitControl) -> Result<()> {
+    let policy = deadreckon_core::ensure_workspace_capture_policy(state)?;
+    let capture = deadreckon_core::capture_workspace(
+        &state.working_dir,
+        &policy,
+        deadreckon_core::CaptureProjection::Deliverable,
+        deadreckon_core::CapturePurpose::DeliverableIndex,
+    )?;
+    capture.require_complete("trusted Git delivery staging")?;
+    let mut paths = capture
+        .entries
+        .into_iter()
+        .map(|entry| entry.relative)
+        .collect::<BTreeSet<_>>();
+
+    // A deleted tracked path is absent from the filesystem capture. Read it
+    // from the trusted index rebuilt above, then apply the same delivery
+    // boundary before passing exact literal pathspecs to `git add`.
+    let indexed = trusted_git_output(control, &["ls-files", "-z", "--cached", "--"])?;
+    if !indexed.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted Git index inventory failed: {}{}",
+            String::from_utf8_lossy(&indexed.stdout),
+            String::from_utf8_lossy(&indexed.stderr)
+        )));
+    }
+    paths.extend(
+        nul_separated_paths(&indexed.stdout)?
+            .into_iter()
+            .filter(|path| trusted_delivery_path(path)),
+    );
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let path_vec = paths.into_iter().collect::<Vec<_>>();
+    let input = git_path_input(path_vec.iter())?;
+    let output = trusted_git_output_with_input(
+        control,
+        &[
+            "--literal-pathspecs",
+            "add",
+            "-A",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ],
+        &input,
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(DeadreckonError::InvalidInput(format!(
+            "trusted Git delivery staging failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+fn trusted_delivery_path(path: &Path) -> bool {
+    is_deliverable_workspace_path(path)
+        || (classify_workspace_path(path) == WorkspacePathClass::RuntimeOnly
+            && deadreckon_core::runtime_output_root(path).is_some())
 }
 
 fn read_turn_codebase_record(state: &PipelineState) -> Result<CodebaseRecord> {
@@ -7671,6 +7733,8 @@ storage = "jsonl"
             "pub fn value() -> u8 { 1 }\n",
         )
         .expect("source");
+        std::fs::write(source_repository.join(".gitignore"), ".agent-cache/\n")
+            .expect("original ignore policy");
         std::fs::write(
             source_repository.join(".specstory/history/base.md"),
             "operator-owned base\n",
@@ -7769,6 +7833,15 @@ storage = "jsonl"
         );
         super::append_provenance_for_files(&state, 1, "cli-turn-1", "codex", raw_changed)
             .expect("raw provenance");
+        std::fs::write(repository.join(".gitignore"), "").expect("provider ignore rewrite");
+        std::fs::write(
+            repository.join("src/added.rs"),
+            "pub const ADDED: u8 = 1;\n",
+        )
+        .expect("untracked source deliverable");
+        std::fs::create_dir_all(repository.join(".agent-cache")).expect("ignored cache");
+        std::fs::write(repository.join(".agent-cache/provider.bin"), "generated\n")
+            .expect("ignored generated file");
         snapshot_working(&state, 1).expect("raw after snapshot");
         assert_eq!(
             std::fs::read_to_string(
@@ -7790,6 +7863,18 @@ storage = "jsonl"
         );
 
         commit_worktree_turn(&state, 1, "cli_subagent").expect("sanitized first turn");
+        let first_turn_paths = test_git(
+            &repository,
+            &["diff", "--name-only", &format!("{base_sha}..HEAD")],
+        );
+        assert!(first_turn_paths.lines().any(|path| path == ".gitignore"));
+        assert!(first_turn_paths.lines().any(|path| path == "src/added.rs"));
+        assert!(
+            first_turn_paths
+                .lines()
+                .all(|path| !path.starts_with(".agent-cache/")),
+            "rewriting .gitignore must not admit generated files hidden by the frozen policy"
+        );
         assert_eq!(
             std::fs::read_to_string(
                 state

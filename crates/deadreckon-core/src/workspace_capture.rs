@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::artifact_policy::{
     WorkspacePathClass, classify_workspace_path, is_checkpointable_workspace_path,
@@ -30,6 +31,7 @@ use crate::state::{PipelineState, atomic_write_json};
 
 pub const WORKSPACE_CAPTURE_POLICY_JSON: &str = "workspace-capture-policy.json";
 pub const SOURCE_HYDRATION_MANIFEST_JSON: &str = "source-hydration-manifest.json";
+pub const WORKSPACE_BLOBS_DIR: &str = "workspace-blobs";
 pub const WORKSPACE_CAPTURE_POLICY_VERSION: u32 = 1;
 pub const WORKSPACE_CAPTURE_MANIFEST_VERSION: u32 = 1;
 
@@ -238,6 +240,19 @@ pub struct WorkspaceCaptureManifest {
     pub omissions_truncated: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitHydrationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<CaptureMaterialization>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMaterialization {
+    pub regular_files: u64,
+    pub symbolic_links: u64,
+    pub materialized_bytes: u64,
+    pub new_blobs: u64,
+    pub reused_blobs: u64,
+    pub hardlinks: u64,
+    pub copy_fallbacks: u64,
 }
 
 impl WorkspaceCaptureManifest {
@@ -682,6 +697,7 @@ pub fn capture_workspace(
                 index_sha256,
                 tracked_files: tracked.len() as u64,
             }),
+            materialization: None,
         },
     })
 }
@@ -703,22 +719,189 @@ pub fn read_capture_manifest(path: &Path) -> Result<WorkspaceCaptureManifest> {
 pub fn materialize_capture_plan(plan: &WorkspaceCapturePlan, destination: &Path) -> Result<()> {
     ensure_materialization_root(destination)?;
     for entry in &plan.entries {
-        let target = destination.join(&entry.relative);
-        ensure_materialization_parent(destination, &entry.relative)?;
-        remove_materialization_target(&target)?;
-        match entry.kind {
-            CaptureEntryKind::RegularFile => {
+        materialize_capture_entry(entry, destination, None)?;
+    }
+    Ok(())
+}
+
+/// Materialize a capture through a run-scoped whole-file content store.
+///
+/// Blob keys bind content and permission identity. Snapshot leaves hard-link
+/// to the immutable evidence blob when the filesystem permits it, falling
+/// back to an ordinary copy across device or platform boundaries.
+pub fn materialize_capture_plan_with_blob_store(
+    plan: &WorkspaceCapturePlan,
+    destination: &Path,
+    blob_root: &Path,
+) -> Result<CaptureMaterialization> {
+    ensure_materialization_root(destination)?;
+    ensure_materialization_root(blob_root)?;
+    let mut stats = CaptureMaterialization::default();
+    for entry in &plan.entries {
+        let entry_stats = materialize_capture_entry(entry, destination, Some(blob_root))?;
+        stats.add(&entry_stats);
+    }
+    Ok(stats)
+}
+
+/// Materialize one already-admitted leaf through the same content store.
+///
+/// Checkpoint deltas use this after their bounded working index has admitted
+/// the exact path.
+pub fn materialize_capture_entry_with_blob_store(
+    source: &Path,
+    kind: CaptureEntryKind,
+    size: u64,
+    destination_root: &Path,
+    relative: &Path,
+    blob_root: &Path,
+) -> Result<CaptureMaterialization> {
+    ensure_materialization_root(destination_root)?;
+    ensure_materialization_root(blob_root)?;
+    materialize_capture_entry(
+        &CaptureEntry {
+            relative: relative.to_path_buf(),
+            source: source.to_path_buf(),
+            kind,
+            size,
+            tracked: false,
+        },
+        destination_root,
+        Some(blob_root),
+    )
+}
+
+impl CaptureMaterialization {
+    pub fn add(&mut self, other: &Self) {
+        self.regular_files = self.regular_files.saturating_add(other.regular_files);
+        self.symbolic_links = self.symbolic_links.saturating_add(other.symbolic_links);
+        self.materialized_bytes = self
+            .materialized_bytes
+            .saturating_add(other.materialized_bytes);
+        self.new_blobs = self.new_blobs.saturating_add(other.new_blobs);
+        self.reused_blobs = self.reused_blobs.saturating_add(other.reused_blobs);
+        self.hardlinks = self.hardlinks.saturating_add(other.hardlinks);
+        self.copy_fallbacks = self.copy_fallbacks.saturating_add(other.copy_fallbacks);
+    }
+}
+
+fn materialize_capture_entry(
+    entry: &CaptureEntry,
+    destination: &Path,
+    blob_root: Option<&Path>,
+) -> Result<CaptureMaterialization> {
+    let target = destination.join(&entry.relative);
+    ensure_materialization_parent(destination, &entry.relative)?;
+    remove_materialization_target(&target)?;
+    let mut stats = CaptureMaterialization::default();
+    match entry.kind {
+        CaptureEntryKind::RegularFile => {
+            stats.regular_files = 1;
+            stats.materialized_bytes = entry.size;
+            if let Some(blob_root) = blob_root {
+                materialize_regular_file_from_blob(entry, &target, blob_root, &mut stats)?;
+            } else {
                 let metadata = fs::symlink_metadata(&entry.source).with_path(&entry.source)?;
                 fs::copy(&entry.source, &target).with_path(&entry.source)?;
                 fs::set_permissions(&target, metadata.permissions()).with_path(&target)?;
             }
-            CaptureEntryKind::SymbolicLink => {
-                let link_target = fs::read_link(&entry.source).with_path(&entry.source)?;
-                create_materialized_symlink(&entry.source, &link_target, &target)?;
-            }
+        }
+        CaptureEntryKind::SymbolicLink => {
+            stats.symbolic_links = 1;
+            stats.materialized_bytes = entry.size;
+            let link_target = fs::read_link(&entry.source).with_path(&entry.source)?;
+            create_materialized_symlink(&entry.source, &link_target, &target)?;
         }
     }
+    Ok(stats)
+}
+
+fn materialize_regular_file_from_blob(
+    entry: &CaptureEntry,
+    target: &Path,
+    blob_root: &Path,
+    stats: &mut CaptureMaterialization,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(&entry.source).with_path(&entry.source)?;
+    let permission_key = permission_identity(&metadata);
+    let blob_dir = blob_root.join("sha256").join(permission_key);
+    fs::create_dir_all(&blob_dir).with_path(&blob_dir)?;
+    let mut source = fs::File::open(&entry.source).with_path(&entry.source)?;
+    let mut temp = NamedTempFile::new_in(&blob_dir).with_path(&blob_dir)?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).with_path(&entry.source)?;
+        if read == 0 {
+            break;
+        }
+        temp.write_all(&buffer[..read]).with_path(temp.path())?;
+        hasher.update(&buffer[..read]);
+        copied = copied.saturating_add(read as u64);
+    }
+    if copied != entry.size {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "workspace file changed size during capture: {} (planned {}, copied {})",
+            entry.relative.display(),
+            entry.size,
+            copied
+        )));
+    }
+    fs::set_permissions(temp.path(), metadata.permissions()).with_path(temp.path())?;
+    temp.as_file_mut().sync_all().with_path(temp.path())?;
+    let digest = hex_encode(hasher.finalize().as_slice());
+    let blob = blob_dir.join(digest);
+    let reused = if blob.is_file() {
+        let blob_metadata = fs::symlink_metadata(&blob).with_path(&blob)?;
+        if blob_metadata.len() != copied {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "workspace blob store collision or corruption at {}",
+                blob.display()
+            )));
+        }
+        true
+    } else {
+        match temp.persist_noclobber(&blob) {
+            Ok(_) => false,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(error) => {
+                return Err(DeadreckonError::Io {
+                    path: blob,
+                    source: error.error,
+                });
+            }
+        }
+    };
+    if reused {
+        stats.reused_blobs = 1;
+    } else {
+        stats.new_blobs = 1;
+    }
+    if fs::hard_link(&blob, target).is_ok() {
+        stats.hardlinks = 1;
+    } else {
+        fs::copy(&blob, target).with_path(&blob)?;
+        fs::set_permissions(target, metadata.permissions()).with_path(target)?;
+        stats.copy_fallbacks = 1;
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn permission_identity(metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    format!("mode-{:04o}", metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn permission_identity(metadata: &fs::Metadata) -> String {
+    if metadata.permissions().readonly() {
+        "readonly".to_string()
+    } else {
+        "writable".to_string()
+    }
 }
 
 fn ensure_materialization_root(path: &Path) -> Result<()> {
@@ -819,11 +1002,12 @@ fn discover_policy_inputs(root: &Path) -> PolicyDiscovery {
     let root_owned = root.to_path_buf();
     let mut builder = WalkBuilder::new(root);
     builder
+        // Discovery must see the ignore files and ecosystem markers it is
+        // freezing. Applying live ignore rules here could hide those inputs
+        // before they become trusted policy (and parent-directory ignores are
+        // especially inappropriate for an explicitly selected source root).
+        .standard_filters(false)
         .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
         .follow_links(false)
         .filter_entry(move |entry| {
             let relative = entry
@@ -1021,22 +1205,49 @@ fn discover_output_roots(
             _ => {}
         }
     }
-    if markers
+    let bazel_roots = markers
         .iter()
-        .any(|marker| marker.file_name().is_some_and(|name| name == "Cargo.toml"))
-    {
-        match cargo_metadata_target_directory(root) {
+        .filter(|marker| {
+            marker.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some("MODULE.bazel" | "WORKSPACE" | "WORKSPACE.bazel")
+                )
+            })
+        })
+        .filter_map(|marker| marker.parent())
+        .collect::<BTreeSet<_>>();
+    for bazel_root in bazel_roots {
+        if let Ok(Some(path)) = bazel_output_path(&root.join(bazel_root))
+            && let Some(relative) =
+                output_path_relative_to_root(root, &root.join(bazel_root), &path)
+        {
+            roots.insert(relative, GeneratedOutputSource::Bazel);
+        }
+    }
+    let cargo_roots = markers
+        .iter()
+        .filter(|marker| {
+            marker
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name == "Cargo.toml")
+        })
+        .filter_map(|marker| marker.parent())
+        .collect::<BTreeSet<_>>();
+    for cargo_root in cargo_roots {
+        let project_root = root.join(cargo_root);
+        match cargo_metadata_target_directory(&project_root) {
             Ok(Some(path)) => {
-                if let Ok(relative) = path.strip_prefix(root)
-                    && !relative.as_os_str().is_empty()
-                {
-                    roots.insert(relative.to_path_buf(), GeneratedOutputSource::CargoMetadata);
+                if let Some(relative) = output_path_relative_to_root(root, &project_root, &path) {
+                    roots.insert(relative, GeneratedOutputSource::CargoMetadata);
                 }
             }
             Ok(None) => {}
-            Err(error) => {
-                warnings.push(format!("cargo metadata output discovery skipped: {error}"))
-            }
+            Err(error) => warnings.push(format!(
+                "cargo metadata output discovery skipped for {}: {error}",
+                project_root.display()
+            )),
         }
     }
     roots
@@ -1046,6 +1257,38 @@ fn discover_output_roots(
             source,
         })
         .collect()
+}
+
+fn output_path_relative_to_root(root: &Path, project_root: &Path, path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let relative = absolute.strip_prefix(root).ok().or_else(|| {
+        let canonical_root = root.canonicalize().ok()?;
+        absolute.strip_prefix(canonical_root).ok()
+    })?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
+fn bazel_output_path(root: &Path) -> Result<Option<PathBuf>> {
+    let Some(raw) = bounded_command_stdout(
+        root,
+        "bazel",
+        &["info", "output_path"],
+        Duration::from_millis(ECOSYSTEM_QUERY_MILLIS),
+        MAX_ECOSYSTEM_QUERY_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let value = String::from_utf8_lossy(&raw).trim().to_string();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(PathBuf::from(value)))
+    }
 }
 
 fn cargo_metadata_target_directory(root: &Path) -> Result<Option<PathBuf>> {
@@ -1687,7 +1930,8 @@ mod tests {
 
     use super::{
         CaptureBudgets, CaptureOmissionReason, CaptureProjection, CapturePurpose,
-        EncodedWorkspacePath, capture_workspace, freeze_workspace_capture_policy,
+        EncodedWorkspacePath, GeneratedOutputSource, capture_workspace,
+        freeze_workspace_capture_policy,
     };
     use crate::git::run_git;
 
@@ -1775,6 +2019,99 @@ mod tests {
                 .any(|omission| omission.reason == CaptureOmissionReason::ByteBudget)
         );
         assert!(plan.require_complete("fixture snapshot").is_err());
+    }
+
+    #[test]
+    fn suspicious_generated_subtree_is_manifested_without_hiding_tracked_files() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        fs::create_dir_all(root.join("generated-cache")).expect("generated cache");
+        for index in 0..4 {
+            fs::write(
+                root.join(format!("generated-cache/{index}.o")),
+                vec![index as u8; 8],
+            )
+            .expect("generated object");
+        }
+        git(root, &["add", "generated-cache/0.o"]);
+        let mut policy = freeze_workspace_capture_policy(root).expect("freeze");
+        policy.budgets.suspicious_files = 3;
+        policy.budgets.suspicious_bytes = 3;
+        policy.budgets.suspicious_generated_percent = 75;
+
+        let plan = capture_workspace(
+            root,
+            &policy,
+            CaptureProjection::Deliverable,
+            CapturePurpose::DeliverableIndex,
+        )
+        .expect("capture");
+
+        assert!(plan.manifest.partial);
+        assert!(
+            plan.entries.iter().any(|entry| {
+                entry.relative == Path::new("generated-cache/0.o") && entry.tracked
+            })
+        );
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| { entry.tracked || !entry.relative.starts_with("generated-cache") })
+        );
+        assert!(plan.manifest.omissions.iter().any(|omission| {
+            omission.path == Path::new("generated-cache")
+                && omission.reason == CaptureOmissionReason::SuspiciousGeneratedSubtree
+                && omission.file_count == 4
+        }));
+    }
+
+    #[test]
+    fn ecosystem_policy_uses_configured_cargo_target_directory() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::create_dir_all(root.join(".cargo")).expect("cargo config");
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"capture-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("manifest");
+        fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").expect("source");
+        fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"custom-target\"\n",
+        )
+        .expect("cargo target config");
+
+        let direct = super::cargo_metadata_target_directory(root).expect("direct cargo metadata");
+        assert!(
+            direct.is_some_and(|path| path.ends_with("custom-target")),
+            "unexpected direct Cargo target"
+        );
+        let discovery = super::discover_policy_inputs(root);
+        assert!(
+            discovery
+                .markers
+                .iter()
+                .any(|marker| marker == Path::new("Cargo.toml")),
+            "markers={:?}",
+            discovery.markers
+        );
+        let policy = freeze_workspace_capture_policy(root).expect("policy");
+
+        assert!(
+            policy.output_roots.iter().any(|output| {
+                output.source == GeneratedOutputSource::CargoMetadata
+                    && output
+                        .path
+                        .to_path_buf()
+                        .is_ok_and(|path| path == Path::new("custom-target"))
+            }),
+            "outputs={:?} warnings={:?}",
+            policy.output_roots,
+            policy.warnings
+        );
     }
 
     #[test]
