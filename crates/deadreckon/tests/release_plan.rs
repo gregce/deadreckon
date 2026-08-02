@@ -323,16 +323,16 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         stable.get("publish_homebrew").and_then(JsonValue::as_bool)
     );
     assert_eq!(
-        Some(false),
+        Some(true),
         stable.get("publish_npm").and_then(JsonValue::as_bool),
-        "npm publishing is consciously deferred until an npmjs token exists"
+        "stable official releases publish the complete npm package family"
     );
     assert_eq!(
-        Some(false),
+        Some(true),
         stable
             .get("requires_windows_signing")
             .and_then(JsonValue::as_bool),
-        "Windows Authenticode is consciously deferred until a certificate exists"
+        "stable official releases require Authenticode-signed Windows artifacts"
     );
     assert_eq!(
         Some(true),
@@ -369,20 +369,13 @@ fn official_release_requires_trust_material() {
         "APPLE_TEAM_ID",
         "APPLE_APP_PWD",
         "HOMEBREW_TAP_TOKEN",
-    ] {
-        assert!(
-            stderr.contains(required),
-            "{required} missing from {stderr}"
-        );
-    }
-    for deferred in [
         "npm trusted publishing or NPM_TOKEN",
         "WINDOWS_CERT_PFX",
         "WINDOWS_CERT_PWD",
     ] {
         assert!(
-            !stderr.contains(deferred),
-            "{deferred} should be deferred from the narrowed v0.1.0 lane: {stderr}"
+            stderr.contains(required),
+            "{required} missing from {stderr}"
         );
     }
 }
@@ -1478,7 +1471,7 @@ fn release_runbook_contains_stable_operator_checklist() {
     let doc =
         fs::read_to_string(workspace_root().join("docs/RELEASE.md")).expect("read docs/RELEASE.md");
     assert!(
-        doc.contains("Stable v0.1.0 operator checklist"),
+        doc.contains("Stable operator checklist"),
         "docs/RELEASE.md needs the stable operator checklist section"
     );
     for item in [

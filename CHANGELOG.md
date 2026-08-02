@@ -85,6 +85,14 @@ unmanaged binary or service.
   judge is unavailable; it is never silently accepted from deterministic checks
   alone.
 
+### Release trust
+
+- The temporary v0.1.0 npm and Windows exceptions are removed. An official
+  stable release now fails preflight unless npm trusted publishing (or the token
+  fallback) and Windows Authenticode credentials are present. Platform packages
+  publish before the npm wrapper with provenance, and an unsigned stable Windows
+  archive cannot reach the public release.
+
 ## Soundings (stable) — 2026-08-02
 
 Implementation, compatibility hardening and depth-test span:

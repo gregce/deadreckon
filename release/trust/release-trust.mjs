@@ -117,12 +117,6 @@ function classifyRelease(localArgs = args) {
   const official_repo = repo === officialRepo;
   const releaseLane = lane === "stable" || lane === "rc";
   const officialRelease = official_repo && releaseLane;
-  // v0.1.0 lane narrowing (operator decision, 2026-06-10): npm publishing
-  // waits on an npmjs automation token; Windows Authenticode waits on a
-  // code-signing certificate. Flip these to false to re-widen — the
-  // preflight gates and publish jobs resume automatically.
-  const npmPublishingDeferred = true;
-  const windowsSigningDeferred = true;
   return {
     schema_version: 1,
     lane,
@@ -136,13 +130,13 @@ function classifyRelease(localArgs = args) {
     publishes: officialRelease,
     publish_github_release: officialRelease,
     publish_homebrew: official_repo && lane === "stable",
-    publish_npm: official_repo && lane === "stable" && !npmPublishingDeferred,
+    publish_npm: official_repo && lane === "stable",
     release_notes_mode: lane === "rc" ? "prerelease" : lane === "stable" ? "stable" : "none",
     requires_macos_signing: officialRelease,
-    requires_windows_signing: official_repo && lane === "stable" && !windowsSigningDeferred,
+    requires_windows_signing: official_repo && lane === "stable",
     requires_attestation: officialRelease,
     requires_homebrew_token: official_repo && lane === "stable",
-    requires_npm_provenance: official_repo && lane === "stable" && !npmPublishingDeferred,
+    requires_npm_provenance: official_repo && lane === "stable",
   };
 }
 
