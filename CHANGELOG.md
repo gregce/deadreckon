@@ -78,6 +78,45 @@ Compatibility: `plan.json` gains execution-policy fields, all defaulted, so
 files written by earlier versions load with their previous behaviour and no
 migration step runs.
 
+## Soundings (stable) — 2026-08-02
+
+Implementation, compatibility hardening and depth-test span:
+`c00e4ba..00fa040`.
+
+- `start` now resolves and validates one canonical source before provider
+  discovery, done-contract authoring, writes or final confirmation. Preview,
+  plain/card/JSON output, acceptance, Job authority and dispatch consume that
+  same decision, so unsupported input refuses before spend or mutation.
+- Guided `review` and `full-plan` accept `--from`. Job admission freezes tracked
+  and untracked deliverables into a digest-checked controller-owned approved
+  copy before queueing. Graph children work from that copy; the operator source
+  is unchanged and can later move or disappear without redirecting execution.
+- Guided contract authoring separates the launch-project writer root from the
+  resolved-source inspection root. A deterministic capped/redacted dossier
+  supplies real manifest, source and test facts while excluding Git, secrets,
+  SpecStory history, symlinks, runtime state and rebuildable output. Generated
+  checks remain portable through `{working_dir}`.
+- Draft, critic and optional redraft use exact output schemas and a
+  structured-text-only provider posture. Codex authoring is ephemeral with
+  tool/web/MCP/user-config surfaces disabled; Claude and API routes use their
+  equivalent strict posture; unsupported adapters fail closed. Capability
+  probes are cached per binary/version.
+- Authoring now has one cumulative 120-second default wall budget (configurable
+  from 30 to 600 seconds): draft gets at most 60 seconds, critic 20, and redraft
+  only the remainder up to 60. Timeout/cancellation reaps the provider's whole
+  process group and removes temporary/partial files. A weak timed-out candidate
+  cannot be approved; a valid written contract is reused on retry.
+- Redraft receives the complete prior YAML, Markdown, helpers, dossier, lint and
+  critic verdict. `reject` normalizes to `redraft` without losing findings, and
+  the deterministic lint floor cannot be overruled.
+
+The reproduced failure spent about 14 minutes authoring against the wrong empty
+destination before a late `--from` refusal. Soundings moves that refusal ahead
+of provider work and caps any real authoring sequence at 120 seconds by default.
+The hermetic dirty/untracked Cloudwing preview-to-Graph reproduction returned a
+Job ID in 2.76 seconds on the development machine; this is correctness evidence,
+not a live-provider performance claim.
+
 ## Watchkeeper one durable Job and two-key completion 2026-07-28
 
 Initial implementation and clean-evidence commit span: `fdf7601..761b001`.
