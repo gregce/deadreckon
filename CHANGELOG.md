@@ -2,81 +2,88 @@
 
 ## Unreleased
 
-### Supervisor readiness and binary reconciliation
+Nothing yet.
 
-- launchd readiness accepts both the boolean values emitted by older macOS
-  releases and the textual `enabled` / `disabled` values emitted by current
-  releases, so a healthy managed supervisor is no longer rejected after
-  installation;
-- `doctor` inventories the running executable, PATH-selected copies, known
-  install locations, the install receipt, and the last supervisor checkpoint,
-  including versions, channels, hashes, roles, and channel-native update
-  commands in JSON;
-- `doctor --repair` refreshes stale metadata for the binary actually executing
-  the command and reconciles a DeadReckon-managed supervisor service. It
-  refuses to claim another binary's receipt or overwrite an unmanaged service;
-- service discovery captures `XDG_CONFIG_HOME` once, avoiding cross-test and
-  cross-thread path drift;
-- Linux bubblewrap setup now creates its private `/tmp` before reconstructing
-  absolute workspace paths, treats absent CLI state roots as optional mounts,
-  does not attempt impossible masks beneath read-only parents, and mounts the
-  standard Linux dynamic-loader roots read-only so approved executables remain
-  runnable. Approved `PATH` entries and explicitly named runtime homes are
-  mounted read-only, and tool shells preserve that PATH instead of replacing
-  it through login-shell startup. Linux zombie processes no longer masquerade
-  as live lease owners, and guarded helpers preserve the internal restart-test
-  boot identity only long enough to validate their durable record. Linux CI
-  installs bubblewrap so these operational paths remain exercised.
+## 0.8.0 — The watch keeps — 2026-08-02
 
-Seven slices collapsing six named orchestration shapes onto the one graph
-executor that was already underneath them. (Chart)
+Seventy-nine commits since 0.7.0 turn DeadReckon from a foreground harness that
+could preserve a run into a durable local executor that owns the whole approved
+goal. A Job can now outlive its launching terminal, recover bounded work, prove
+both the checks and the meaning of the result, and leave one operator-readable
+receipt.
 
-**The classifier draws the work instead of naming it.** A keyword matcher used
-to read the goal before any classifier ran: "audit", "harden", or "validate"
-latched a coder/reviewer pass — roughly double the spend — and then
-short-circuited the signal ladder and the provider classifier entirely, so a
-word in the goal could pick your execution shape with no visible decision.
-`deadreckon start "audit the payment module and harden it"` reported `path:
-review orchestration`; it now reports `path: run`. The planner's own vocabulary
-was three words (`single | plan | campaign`) with no way to express a
-dependency, so the one shape DeadReckon runs sequentially was unreachable no
-matter how the prompt was tuned. It now returns nodes, edges, an apply mode,
-and optional subplans, is told the execution model and the measured budget
-arithmetic rather than "use campaign sparingly", and the graph it draws becomes
-the plan — plan creation no longer asks a second planner for a child graph the
-first one already decided.
+**Goals become durable before work starts.** Guided and ordinary Single, Graph,
+Campaign, supported chain, stored-plan and continuation launches converge on
+one Job scheduler. A fenced supervisor leases queued Jobs, recovers abandoned
+attempts without changing their identity, enforces cumulative time, spend and
+retry limits, and records distinct blocked, cancelled, budget-exhausted and
+failed outcomes. `start` returns the Job ID and lifecycle commands instead of
+making the launching terminal the source of truth. (Watchkeeper)
 
-**A failed node retries instead of pausing the plan.** Healing already existed
-inside a run and at merge; it stopped at the graph. A node that missed its done
-contract ended the run with `paused plan <id>` and `Recommended: deadreckon
-attach` — advice for an operator who walked away. A node now gets two more
-attempts, each resuming the previous attempt's working tree and seeded with the
-gate's actual complaint, before the failure policy decides whether the rest of
-the graph continues. A circuit breaker halts a plan whose nodes are failing in a
-row, and every attempt is recorded with its run, reason, and spend.
+**Completion needs two independent keys.** Deterministic compiled checks must
+pass before a contained, read-only semantic judge can assess the approved goal,
+contract, result and evidence. The judge can achieve, revise or request review;
+it cannot waive a failed check. HMAC-bound receipts cover policy, source,
+result, evaluator identity and judgment, while protected helper paths and
+adversarial tests fail closed against marker forgery or control-state tampering.
 
-**Ordered work reaches the front door.** `start` could not reach `chain` at all,
-so nothing launched from the front door landed incrementally. A plan can now
-apply each node as its gate passes — chain's execution model, with chain's
-guards kept whole — and the deterministic ladder recognises a goal that spells
-out an order, so this works with no provider call.
+**Workspace evidence is bounded instead of copied blindly.** Snapshot,
+checkpoint and Git staging share a frozen ignore-aware capture policy. Tracked
+files always win; Cargo, SwiftPM and other configured build roots become compact
+manifests; suspicious generated subtrees and oversized files are reported but
+not copied; hard file, byte and traversal budgets guarantee a partial result
+instead of a hang. Content-addressed materialization deduplicates repeated
+evidence, and Git filter input/output is drained concurrently, closing the
+SwiftPM `.build` deadlock that first exposed this class of failure.
 
-**A node can be a project.** A plan node may carry its own graph, executed and
-reconciled before its dependents run. Unlike `campaign`, which hardcodes a
-parallel sub-shape for every sub-goal, a subplan carries its own apply mode: the
-parent can be parallel while a sub-project is sequential.
+**The front door uses the source it names.** `start` resolves one canonical
+source before provider discovery, done-contract authoring or writes. Guided
+`review` and `full-plan --from <dir>` freeze tracked and untracked deliverables
+into a digest-checked Job-owned approved copy, and every Graph child works from
+that copy rather than the mutable operator path. Contract files remain in the
+launch project while a capped, redacted dossier describes the real source.
+(Soundings)
 
-**One inventory, one undo.** A chain existed, `deadreckon status <chain-id>`
-resolved it, and `deadreckon list` did not show it — the only way to find one
-was to already know it existed and type a second command with different columns
-and a different date format. Chains now sort in with runs and plans in the same
-vocabulary, and `list --json` carries them. `deadreckon undo` takes a positional
-id like every sibling verb and unwinds a chain's last applied step as readily as
-it restores a run's snapshot.
+**Done authoring is structured and time-bounded.** Draft, independent critic and
+optional redraft use exact schemas and a structured-text-only provider posture
+under one 120-second default wall budget. Cancellation reaps the whole provider
+process tree and removes partial files. Redraft receives the complete previous
+YAML, Markdown, helpers and findings; deterministic lint remains the floor; a
+valid written contract is reused safely on retry.
 
-Compatibility: `plan.json` gains execution-policy fields, all defaulted, so
-files written by earlier versions load with their previous behaviour and no
-migration step runs.
+**Execution teams are one coherent choice.** Guided setup resolves provider and
+model per orchestration role, can apply one provider/model uniformly, and
+freezes planner, implementor, reviewer and child choices for recovery. Provider
+catalogs remain scoped to the selected CLI so a model from one provider cannot
+leak into another.
+
+**Plans express the work they will actually run.** The classifier emits nodes,
+dependencies, apply mode and optional subplans instead of naming one of several
+overlapping orchestration products. Failed nodes retry from their prior working
+tree with the gate complaint and bounded remaining budget. Ordered nodes can
+land as they pass, nested nodes can own subgraphs, chains appear in the common
+inventory, and `undo` accepts the same positional identity vocabulary.
+
+**Installation conflicts are repairable.** Current macOS launchd enablement
+values are accepted, Linux bubblewrap preserves approved toolchain and loader
+paths, and `doctor` inventories the running binary, PATH selection, managed
+service, receipt and checkpoint. `doctor --repair` can reconcile the active
+shell installation and a DeadReckon-managed supervisor without claiming an
+unmanaged binary or service.
+
+### Behavior and compatibility
+
+- Durable supported launches detach under one Job ID; explicit in-place and
+  uncontained execution, historical conductor-only policies and preview remain
+  labelled compatibility paths and cannot earn trusted Job receipts.
+- Job status reports the immutable approved source as execution truth and keeps
+  the original external path only as launch provenance.
+- Existing persisted runs remain readable. New `plan.json` execution-policy
+  fields are defaulted, and Soundings adds no Job, launch-plan, pipeline-state
+  or acceptance-file schema migration.
+- Strict unattended completion now becomes `NEEDS REVIEW` when the semantic
+  judge is unavailable; it is never silently accepted from deterministic checks
+  alone.
 
 ## Soundings (stable) — 2026-08-02
 
