@@ -631,28 +631,23 @@ function createZipArchiveOnWindows(archive, sourceDir) {
   if (files.length === 0) {
     throw new Error(`nothing to add to Windows ZIP from ${sourceDir}`);
   }
-  const manifest = `${archive}.entries.json`;
-  const entries = files.sort().map((source) => ({
-    source: path.resolve(source),
-    name: path.relative(sourceDir, source).split(path.sep).join("/"),
-  }));
-  fs.writeFileSync(manifest, `${JSON.stringify(entries)}\n`);
   const script = [
     "$ErrorActionPreference='Stop'",
     "Add-Type -AssemblyName System.IO.Compression",
     "Add-Type -AssemblyName System.IO.Compression.FileSystem",
-    `$items=@(Get-Content -LiteralPath '${escapePowerShell(manifest)}' -Raw | ConvertFrom-Json)`,
+    `$root=[System.IO.Path]::GetFullPath('${escapePowerShell(sourceDir)}')`,
+    "if (!$root.EndsWith([System.IO.Path]::DirectorySeparatorChar.ToString())) { $root += [System.IO.Path]::DirectorySeparatorChar }",
+    "$items=@(Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName)",
+    "if ($items.Count -eq 0) { throw 'nothing to add to Windows ZIP' }",
     `$zip=[System.IO.Compression.ZipFile]::Open('${escapePowerShell(archive)}',[System.IO.Compression.ZipArchiveMode]::Create)`,
     "$timestamp=[DateTimeOffset]::Parse('1980-01-02T00:00:00Z')",
-    "try { foreach ($item in $items) { $entry=$zip.CreateEntry([string]$item.name,[System.IO.Compression.CompressionLevel]::Optimal); $entry.LastWriteTime=$timestamp; $source=[System.IO.File]::OpenRead([string]$item.source); $target=$entry.Open(); try { $source.CopyTo($target) } finally { $target.Dispose(); $source.Dispose() } } } finally { $zip.Dispose() }",
+    "try { foreach ($item in $items) { $name=$item.FullName.Substring($root.Length).Replace([char]92,[char]47); $entry=$zip.CreateEntry($name,[System.IO.Compression.CompressionLevel]::Optimal); $entry.LastWriteTime=$timestamp; $source=$item.OpenRead(); $target=$entry.Open(); try { $source.CopyTo($target) } finally { $target.Dispose(); $source.Dispose() } } } finally { $zip.Dispose() }",
   ].join("; ");
   try {
     run("powershell", ["-NoProfile", "-Command", script]);
   } catch (error) {
     fs.rmSync(archive, { force: true });
     throw error;
-  } finally {
-    fs.rmSync(manifest, { force: true });
   }
 }
 
