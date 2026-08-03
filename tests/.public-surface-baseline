@@ -173,6 +173,7 @@ crate: deadreckon-core
   exec::read_supervised_process
   exec::read_supervised_process_record
   exec::remove_supervised_process_record_if_matches
+  exec::remove_supervised_process_record_if_same
   exec::SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
   exec::spawn_grouped
   exec::SupervisedProcess
