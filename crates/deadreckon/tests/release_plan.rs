@@ -1155,15 +1155,17 @@ fn evaluator_sidecar_tool_assembles_and_manifests_static_linux_helpers() {
     for helper in ["deadreckon", "dr-gate", "dr-capture"] {
         fs::write(payload.join(helper), format!("{helper} native")).expect("native helper");
     }
-    write_fake_static_elf(
+    write_fake_static_elf_sized(
         &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
         0xb7,
         false,
+        2 * 1024 * 1024,
     );
-    write_fake_static_elf(
+    write_fake_static_elf_sized(
         &sidecars.join("dr-gate-evaluator-x86_64-unknown-linux-musl"),
         0x3e,
         false,
+        3 * 1024 * 1024,
     );
 
     let archive = distrib.join(format!("deadreckon-{target}.tar.xz"));
@@ -1775,7 +1777,11 @@ fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
 }
 
 fn write_fake_static_elf(path: &Path, machine: u16, with_interp: bool) {
-    let mut bytes = vec![0_u8; 64 + 56];
+    write_fake_static_elf_sized(path, machine, with_interp, 64 + 56);
+}
+
+fn write_fake_static_elf_sized(path: &Path, machine: u16, with_interp: bool, size: usize) {
+    let mut bytes = vec![0_u8; size.max(64 + 56)];
     bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
     bytes[4] = 2; // ELFCLASS64
     bytes[5] = 1; // little endian
