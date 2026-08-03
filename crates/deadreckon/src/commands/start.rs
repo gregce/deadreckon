@@ -3030,6 +3030,35 @@ pub(crate) fn start_done_materialization_request(
     }
 }
 
+fn start_done_authoring_selection(
+    decision: &StartLaunchDecision,
+) -> (Option<String>, Option<String>) {
+    let (provider, role_model) = match decision.selected_mode {
+        StartSelectedMode::FullPlan | StartSelectedMode::Campaign => (
+            decision
+                .planner_provider_route
+                .as_deref()
+                .or(decision.provider_route.as_deref()),
+            decision.planner_model.as_deref(),
+        ),
+        StartSelectedMode::Review => (
+            decision
+                .coder_provider_route
+                .as_deref()
+                .or(decision.provider_route.as_deref()),
+            decision.coder_model.as_deref(),
+        ),
+        StartSelectedMode::Run | StartSelectedMode::Extend => (
+            decision.provider_route.as_deref(),
+            decision.model.as_deref(),
+        ),
+    };
+    let model = provider
+        .and_then(|provider| start_role_model(decision, provider, role_model))
+        .map(str::to_string);
+    (provider.map(str::to_string), model)
+}
+
 async fn materialize_start_done_criteria(
     decision: &mut StartLaunchDecision,
     mut prompter: Option<&mut dyn StartPrompter>,
@@ -3044,6 +3073,7 @@ async fn materialize_start_done_criteria(
             )
         },
     );
+    let (authoring_provider, authoring_model) = start_done_authoring_selection(decision);
     loop {
         let Some((request, overwrite_existing)) = start_done_materialization_request(decision)
         else {
@@ -3059,8 +3089,8 @@ async fn materialize_start_done_criteria(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
                 vec![request],
-                None,
-                None,
+                authoring_provider.clone(),
+                authoring_model.clone(),
                 overwrite_existing,
             )
             .await?;
@@ -3069,8 +3099,8 @@ async fn materialize_start_done_criteria(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
                 vec![request],
-                None,
-                None,
+                authoring_provider.clone(),
+                authoring_model.clone(),
                 overwrite_existing,
             )
             .await?;
@@ -3144,6 +3174,7 @@ fn start_launch_preview_rows(
         && let Some(source) = decision.resolved_source.as_ref()
     {
         let defaults = config_defaults(paths)?;
+        let (authoring_provider, authoring_model) = start_done_authoring_selection(decision);
         rows.push((
             "done inspect".to_string(),
             source.inspection_root.display().to_string(),
@@ -3158,8 +3189,13 @@ fn start_launch_preview_rows(
         ));
         rows.push((
             "done provider".to_string(),
-            commands::acceptance::done_authoring_route_label(paths, &defaults)
-                .unwrap_or_else(|| "unavailable (structured text required)".to_string()),
+            commands::acceptance::done_authoring_route_label(
+                paths,
+                &defaults,
+                authoring_provider.as_deref(),
+                authoring_model.as_deref(),
+            )
+            .unwrap_or_else(|| "unavailable (structured text required)".to_string()),
         ));
         rows.push((
             "done limit".to_string(),
@@ -3248,11 +3284,17 @@ fn start_done_authoring_json(
         return Ok(serde_json::Value::Null);
     };
     let defaults = config_defaults(paths)?;
+    let (authoring_provider, authoring_model) = start_done_authoring_selection(decision);
     Ok(json!({
         "needed": start_done_materialization_request(decision).is_some(),
         "inspect_root": &source.inspection_root,
         "write_root": source.contract_write_root.join(".deadreckon"),
-        "provider": commands::acceptance::done_authoring_route_label(paths, &defaults),
+        "provider": commands::acceptance::done_authoring_route_label(
+            paths,
+            &defaults,
+            authoring_provider.as_deref(),
+            authoring_model.as_deref(),
+        ),
         "wall_seconds": commands::acceptance::done_authoring_wall_seconds(&defaults),
         "posture": "structured_text",
     }))
@@ -4534,6 +4576,85 @@ id = "custom-small"
         assert_eq!(
             plan.providers.child_models.get(&1).map(String::as_str),
             Some("sonnet")
+        );
+    }
+
+    #[test]
+    fn done_authoring_preview_uses_the_selected_planner_not_the_doc_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        fs::create_dir_all(paths.home()).expect("home");
+        fs::write(
+            paths.config_path(),
+            r#"
+default_provider = "cli:codex"
+
+[defaults]
+provider = "cli:codex"
+doc_provider = "cli:claude-code"
+"#,
+        )
+        .expect("config");
+
+        let mut decision = decision(StartSelectedMode::FullPlan);
+        decision.provider_route = Some("cli:codex".to_string());
+        decision.model = Some("worker-model".to_string());
+        decision.planner_provider_route = Some("cli:codex".to_string());
+        decision.planner_model = Some("selected-planner-model".to_string());
+        decision.done_action = StartDoneAction::ManualText {
+            text: "the app launches".to_string(),
+            overwrite_existing: false,
+        };
+        decision.resolved_source = Some(ResolvedStartSource {
+            mode: commands::job::DurableSourceMode::Worktree,
+            requested_from: None,
+            inspection_root: temp.path().to_path_buf(),
+            contract_write_root: temp.path().to_path_buf(),
+            allow_dirty: false,
+            provenance: StartSourceProvenance::CurrentCleanWorktree,
+        });
+
+        let authoring = start_done_authoring_json(&decision, &paths).expect("authoring preview");
+        assert_eq!(
+            authoring["provider"],
+            "cli:codex / selected-planner-model (structured text)"
+        );
+    }
+
+    #[test]
+    fn done_authoring_selection_follows_the_lead_role_for_each_launch_shape() {
+        let mut full_plan = decision(StartSelectedMode::FullPlan);
+        full_plan.provider_route = Some("cli:codex".to_string());
+        full_plan.model = Some("worker-model".to_string());
+        full_plan.planner_provider_route = Some("cli:claude-code".to_string());
+        full_plan.planner_model = Some("planner-model".to_string());
+        assert_eq!(
+            start_done_authoring_selection(&full_plan),
+            (
+                Some("cli:claude-code".to_string()),
+                Some("planner-model".to_string())
+            )
+        );
+
+        let mut review = decision(StartSelectedMode::Review);
+        review.provider_route = Some("cli:codex".to_string());
+        review.model = Some("primary-model".to_string());
+        review.coder_provider_route = Some("cli:claude-code".to_string());
+        review.coder_model = Some("coder-model".to_string());
+        assert_eq!(
+            start_done_authoring_selection(&review),
+            (
+                Some("cli:claude-code".to_string()),
+                Some("coder-model".to_string())
+            )
+        );
+
+        let mut run = decision(StartSelectedMode::Run);
+        run.provider_route = Some("cli:codex".to_string());
+        run.model = Some("run-model".to_string());
+        assert_eq!(
+            start_done_authoring_selection(&run),
+            (Some("cli:codex".to_string()), Some("run-model".to_string()))
         );
     }
 }

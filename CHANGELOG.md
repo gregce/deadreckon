@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Make `start` done-contract authoring follow the launch's selected planner or
+  lead execution provider/model, and show that same route in previews.
 - Fix Claude Code done-contract authoring by supplying a valid isolated empty
   MCP configuration, and point authoring failures at the effective
   `defaults.doc_provider` setting.

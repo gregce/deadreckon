@@ -1093,11 +1093,16 @@ pub(crate) fn done_authoring_wall_seconds(defaults: &ConfigDefaults) -> f64 {
 pub(crate) fn done_authoring_route_label(
     paths: &DeadreckonPaths,
     defaults: &ConfigDefaults,
+    explicit_provider: Option<&str>,
+    explicit_model: Option<&str>,
 ) -> Option<String> {
-    let provider = select_done_authoring_provider(None, defaults)?;
-    let router =
-        ProviderRouter::from_config_path_with_model(&paths.config_path(), Some(&provider), None)
-            .ok()?;
+    let provider = select_done_authoring_provider(explicit_provider.map(str::to_string), defaults)?;
+    let router = ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        Some(&provider),
+        explicit_model,
+    )
+    .ok()?;
     router
         .selected_route_info()
         .map(|route| format!("{} / {} (structured text)", route.name, route.model))
