@@ -642,6 +642,50 @@ fn preflight_real_script_refuses_under_ci_env() {
 }
 
 #[test]
+fn preflight_real_proves_execution_routes_against_a_frozen_falsifiable_contract() {
+    let script = fs::read_to_string(workspace_root().join("release/preflight-real.sh"))
+        .expect("release/preflight-real.sh");
+    for required in [
+        "write_fixture_contract",
+        "commit_fixture_contract",
+        "deadreckon_bin\" def-done show",
+        "deadreckon_bin\" def-done check",
+        "preflight contract passed before provider work",
+        "output=$(sh purpose.sh); test",
+        "wait_for_verified_job",
+        "deadreckon_bin\" run \"$goal\"",
+        "deadreckon_bin\" finish \"$job_id\"",
+        "verified receipt delivered",
+        "wait_for_provider_pid",
+        "assert_job_cancelled",
+        "assert_process_reaped",
+        "--escalate",
+        "cancel/reap",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing {required} from {script}"
+        );
+    }
+    assert!(
+        !script.contains("deadreckon_bin\" def-done \\\n"),
+        "real execution-route proof must not depend on a separate LLM-authored fixture contract"
+    );
+    assert!(
+        !script.contains("python3 -c"),
+        "the hardened macOS gate sandbox must not depend on xcrun-backed Python discovery"
+    );
+    assert!(
+        !script.contains("deadreckon_bin\" start"),
+        "an isolated provider preflight must not claim the machine-restart service used by ordinary start"
+    );
+    assert!(
+        !script.contains("deadreckon_bin\" resume"),
+        "public resume is retired for Job-owned runs; recovery belongs to supervisor acceptance"
+    );
+}
+
+#[test]
 fn known_good_providers_schema_round_trips() {
     let fixture = serde_json::json!({
         "schema_version": 1,

@@ -3370,9 +3370,13 @@ the inner installer's embedded-sum verification for tar.xz is a
 V1-CANDIDATES upgrade path, with `release/install.sh`'s SHA256SUMS
 die-on-mismatch as the shipped integrity story (pinned).
 `release/preflight-real.sh` (POSIX sh, refuses under CI) is the
-operator-run stable-cut proof: per route, a real start to completion,
-signed `turn-acceptance.json`, `apply`, then kill/resume — recording
-binary versions in `release/known-good-providers.json` (schema_version 1).
+operator-run stable-cut proof: per route, a durable real-provider run reaches
+verified completion, leaves a signed `turn-acceptance.json`, and delivers via
+`finish`; a second run is cancelled while its identity-bound provider process
+is live, and the harness proves that process was reaped. It records binary
+versions in `release/known-good-providers.json` (schema_version 1). Durable
+service crash/restart recovery is kept in the Watchkeeper operator suite rather
+than conflated with operator cancellation.
 `docs/RELEASE.md` holds the one-time "Stable v0.1.0 operator checklist"
 (tap repo + token, npm trusted publishing, Windows Authenticode or a
 consciously narrowed lane, version bumps, preflight, Windows smoke, tag).
