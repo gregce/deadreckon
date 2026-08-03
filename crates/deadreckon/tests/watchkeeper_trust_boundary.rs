@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use deadreckon_core::{DeadreckonPaths, GATE_CONTAINED_ENV, GATE_SANDBOX_BACKEND_ENV, JobView};
 #[cfg(unix)]
 use deadreckon_core::{
-    SupervisedProcessPhase, gate_key_path, load_run, read_supervised_process,
-    read_supervised_process_record, validate_acceptance_marker,
+    SupervisedProcessPhase, SupervisedProcessRecord, gate_key_path, load_run,
+    read_supervised_process, read_supervised_process_record, validate_acceptance_marker,
     validate_sandbox_boundary_observation,
 };
 use deadreckon_protocol::{JobAuthority, JobEventKind, JobOutcome};
@@ -386,14 +386,13 @@ checks:
         .as_str()
         .expect("dispatched Job ID");
     let state = wait_for_run(&paths, job_id, Duration::from_secs(20));
-    wait_for_job_path(
-        &paths,
-        job_id,
-        &state.working_dir.join("gate-ready"),
-        Duration::from_secs(30),
-    );
-    let record_path = wait_for_gate_record(&state.run_root, Duration::from_secs(10));
-    let record = read_supervised_process_record(&record_path).expect("guarded evaluator record");
+    // `Running` is the durable guarded-process readiness boundary: the
+    // release token was validated, the evaluator owns its process group, and
+    // repository-controlled code may execute. A workspace sentinel is
+    // downstream of that boundary and can be delayed independently by host
+    // executable validation, so it is not authoritative cancellation proof.
+    let (record_path, record) =
+        wait_for_gate_record(&paths, job_id, &state.run_root, Duration::from_secs(60));
     assert_eq!(record.phase, SupervisedProcessPhase::Running);
     assert_eq!(record.process.pgid, Some(record.process.pid));
     assert_eq!(record.owner_launch_id.as_deref().map(str::len), Some(36));
@@ -522,9 +521,8 @@ checks:
         &state.working_dir.join("gate-ready"),
         Duration::from_secs(30),
     );
-    let first_record_path = wait_for_gate_record(&state.run_root, Duration::from_secs(10));
-    let first_record =
-        read_supervised_process_record(&first_record_path).expect("first evaluator record");
+    let (first_record_path, first_record) =
+        wait_for_gate_record(&paths, job_id, &state.run_root, Duration::from_secs(10));
     let outer = read_supervised_process(&paths.job_dir(job_id).join("supervised-child.json"))
         .expect("outer supervised launcher");
     signal_pid(outer.pid, nix::sys::signal::Signal::SIGKILL);
@@ -763,7 +761,12 @@ checks:
         Duration::from_secs(60),
     );
     let container = wait_for_docker_container(&fixture.job_id, Duration::from_secs(20));
-    let record_path = wait_for_gate_record(&fixture.state.run_root, Duration::from_secs(10));
+    let (record_path, _) = wait_for_gate_record(
+        &fixture.paths,
+        &fixture.job_id,
+        &fixture.state.run_root,
+        Duration::from_secs(10),
+    );
 
     let cancelled = public_deadreckon()
         .current_dir(&fixture.workspace)
@@ -903,24 +906,7 @@ struct LiveDockerFixture {
 #[cfg(unix)]
 impl LiveDockerFixture {
     fn diagnostics(&self) -> String {
-        let job_dir = self.paths.job_dir(&self.job_id);
-        [
-            ("events", self.paths.job_events(&self.job_id)),
-            ("launcher stdout", job_dir.join("supervisor.out")),
-            ("launcher stderr", job_dir.join("supervisor.err")),
-            ("worker stdout", job_dir.join("supervisor-stdout.log")),
-            ("worker stderr", job_dir.join("supervisor-stderr.log")),
-        ]
-        .into_iter()
-        .map(|(label, path)| {
-            format!(
-                "== {label}: {} ==\n{}",
-                path.display(),
-                fs::read_to_string(&path).unwrap_or_else(|error| format!("<unreadable: {error}>"))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        watchkeeper_job_diagnostics(&self.paths, &self.job_id)
     }
 }
 
@@ -1176,47 +1162,132 @@ fn wait_for_job_path(paths: &DeadreckonPaths, job_id: &str, path: &Path, timeout
         {
             let state = load_run(paths, job_id).ok();
             panic!(
-                "{} was not created before Job terminal {:?}; state: {state:#?}; supervisor stderr: {}",
+                "{} was not created before Job terminal {:?}; state: {state:#?}\n{}",
                 path.display(),
                 view.projection.outcome,
-                fs::read_to_string(paths.job_dir(job_id).join("supervisor.err"))
-                    .unwrap_or_default()
+                watchkeeper_job_diagnostics(paths, job_id),
             );
         }
         assert!(
             Instant::now() < deadline,
-            "{} was not created",
-            path.display()
+            "{} was not created\n{}",
+            path.display(),
+            watchkeeper_job_diagnostics(paths, job_id),
         );
         thread::sleep(Duration::from_millis(25));
     }
 }
 
 #[cfg(unix)]
-fn wait_for_gate_record(run_root: &Path, timeout: Duration) -> std::path::PathBuf {
+fn wait_for_gate_record(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    run_root: &Path,
+    progress_timeout: Duration,
+) -> (std::path::PathBuf, SupervisedProcessRecord) {
     let directory = run_root.join("child-pids");
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    // There are two meaningful readiness stages after run creation: observe a
+    // durable prepared record, then observe its running transition. Give each
+    // stage the same bounded no-progress window while retaining a hard cap.
+    let hard_deadline = started + progress_timeout.saturating_mul(2);
+    let mut progress_deadline = started + progress_timeout;
+    let mut last_observation = Vec::new();
     loop {
+        let mut observation = Vec::new();
         if let Ok(entries) = fs::read_dir(&directory) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if entry
+                if !entry
                     .file_name()
                     .to_string_lossy()
                     .starts_with("dr-gate-evaluate-")
-                    && read_supervised_process_record(&path)
-                        .is_ok_and(|record| record.phase == SupervisedProcessPhase::Running)
                 {
-                    return path;
+                    continue;
+                }
+                match read_supervised_process_record(&path) {
+                    Ok(record) => {
+                        observation.push(format!(
+                            "{}: {:?} pid={} pgid={:?}",
+                            path.display(),
+                            record.phase,
+                            record.process.pid,
+                            record.process.pgid
+                        ));
+                        if record.phase == SupervisedProcessPhase::Running {
+                            return (path, record);
+                        }
+                    }
+                    Err(error) => {
+                        observation.push(format!("{}: unreadable: {error}", path.display()));
+                    }
                 }
             }
         }
+        observation.sort();
+        if observation != last_observation {
+            last_observation = observation;
+            progress_deadline = (Instant::now() + progress_timeout).min(hard_deadline);
+        }
+        if let Ok(view) = JobView::load(paths, job_id)
+            && view.projection.is_terminal()
+        {
+            panic!(
+                "guarded evaluator did not reach Running before Job terminal {:?}\nobserved records:\n{}\n{}",
+                view.projection.outcome,
+                format_observed_gate_records(&last_observation),
+                watchkeeper_job_diagnostics(paths, job_id),
+            );
+        }
+        let now = Instant::now();
         assert!(
-            Instant::now() < deadline,
-            "guarded evaluator record was not created"
+            now < progress_deadline && now < hard_deadline,
+            "guarded evaluator did not reach Running after {:.2?}; no-progress limit {:.2?}, hard limit {:.2?}\nobserved records:\n{}\n{}",
+            started.elapsed(),
+            progress_timeout,
+            progress_timeout.saturating_mul(2),
+            format_observed_gate_records(&last_observation),
+            watchkeeper_job_diagnostics(paths, job_id),
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(unix)]
+fn format_observed_gate_records(observed: &[String]) -> String {
+    if observed.is_empty() {
+        "<none>".to_string()
+    } else {
+        observed.join("\n")
+    }
+}
+
+#[cfg(unix)]
+fn watchkeeper_job_diagnostics(paths: &DeadreckonPaths, job_id: &str) -> String {
+    let job_dir = paths.job_dir(job_id);
+    let mut sections = vec![format!(
+        "== projection ==\n{:#?}",
+        JobView::load(paths, job_id)
+    )];
+    sections.push(format!("== run state ==\n{:#?}", load_run(paths, job_id)));
+    sections.extend(
+        [
+            ("events", paths.job_events(job_id)),
+            ("launcher stdout", job_dir.join("supervisor.out")),
+            ("launcher stderr", job_dir.join("supervisor.err")),
+            ("worker stdout", job_dir.join("supervisor-stdout.log")),
+            ("worker stderr", job_dir.join("supervisor-stderr.log")),
+        ]
+        .into_iter()
+        .map(|(label, path)| {
+            format!(
+                "== {label}: {} ==\n{}",
+                path.display(),
+                fs::read_to_string(&path).unwrap_or_else(|error| format!("<unreadable: {error}>"))
+            )
+        }),
+    );
+    sections.join("\n")
 }
 
 #[cfg(target_os = "macos")]
