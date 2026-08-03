@@ -20,6 +20,10 @@ use deadreckon_sandbox::{
 };
 
 use crate::cli_codex::CliCodexProvider;
+use crate::cli_common::{
+    configure_process_group, reconcile_process_group, remove_current_process_record,
+    signal_process_group, write_current_process_record,
+};
 use crate::cli_contract::ProviderSession;
 use crate::cli_contract::add_caveat;
 use crate::types::CapabilityPosture;
@@ -708,6 +712,7 @@ pub(crate) struct CodexAppServer {
     cwd: PathBuf,
     thread_id: Option<String>,
     pid_file: Option<PathBuf>,
+    process_record: Option<deadreckon_core::SupervisedProcessRecord>,
 }
 
 struct AppServerLaunch {
@@ -738,43 +743,60 @@ impl CodexAppServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        configure_process_group(&mut command);
         let mut child = command.spawn().map_err(|source| ProviderError::Cli {
             provider: spec.provider.clone(),
             detail: format!("could not start codex app-server: {source}"),
         })?;
         let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| ProviderError::Cli {
-            provider: spec.provider.clone(),
-            detail: "codex app-server stdin was unavailable".to_string(),
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| ProviderError::Cli {
-            provider: spec.provider.clone(),
-            detail: "codex app-server stdout was unavailable".to_string(),
-        })?;
-        if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
-            if let Some(parent) = pid_file.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|source| ProviderError::Io {
-                        path: parent.display().to_string(),
-                        source,
-                    })?;
-            }
-            tokio::fs::write(pid_file, format!("{pid}\n"))
-                .await
-                .map_err(|source| ProviderError::Io {
-                    path: pid_file.display().to_string(),
-                    source,
-                })?;
-        }
+        let process_record = match (pid, spec.pid_file.as_ref()) {
+            (Some(pid), Some(pid_file)) => match write_current_process_record(pid_file, pid) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    signal_process_group(pid, true);
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(error);
+                }
+            },
+            _ => None,
+        };
+        let Some(stdin) = child.stdin.take() else {
+            stop_app_server_child(
+                &mut child,
+                spec.pid_file.as_deref(),
+                process_record.as_ref(),
+            )
+            .await;
+            return Err(ProviderError::Cli {
+                provider: spec.provider.clone(),
+                detail: "codex app-server stdin was unavailable".to_string(),
+            });
+        };
+        let Some(stdout) = child.stdout.take() else {
+            stop_app_server_child(
+                &mut child,
+                spec.pid_file.as_deref(),
+                process_record.as_ref(),
+            )
+            .await;
+            return Err(ProviderError::Cli {
+                provider: spec.provider.clone(),
+                detail: "codex app-server stdout was unavailable".to_string(),
+            });
+        };
         let mut server = Self {
             child,
             rpc: RpcClient::new(spec.provider, BufReader::new(stdout), stdin),
             cwd: spec.cwd,
             thread_id: None,
             pid_file: spec.pid_file,
+            process_record,
         };
-        server.initialize().await?;
+        if let Err(error) = server.initialize().await {
+            server.kill_child().await;
+            return Err(error);
+        }
         Ok(server)
     }
 
@@ -998,11 +1020,12 @@ impl CodexAppServer {
     }
 
     async fn kill_child(&mut self) {
-        let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
-        if let Some(pid_file) = self.pid_file.as_ref() {
-            let _ = tokio::fs::remove_file(pid_file).await;
-        }
+        stop_app_server_child(
+            &mut self.child,
+            self.pid_file.as_deref(),
+            self.process_record.as_ref(),
+        )
+        .await;
     }
 
     async fn read_turn(
@@ -1276,10 +1299,44 @@ fn update_active_turn(session_dir: Option<&Path>, turn_id: Option<&str>) -> Resu
 
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
-        if let Some(pid_file) = self.pid_file.as_ref() {
-            let _ = std::fs::remove_file(pid_file);
+        if let Some(pid) = self.child.id() {
+            signal_process_group(pid, true);
         }
+        let _ = self.child.start_kill();
+        // Drop cannot synchronously reap the direct child or prove the group
+        // empty. Preserve the record for durable reconciliation instead of
+        // erasing the only authority that can safely finish cleanup.
+    }
+}
+
+async fn stop_app_server_child(
+    child: &mut Child,
+    pid_file: Option<&Path>,
+    record: Option<&deadreckon_core::SupervisedProcessRecord>,
+) {
+    let pid = record
+        .map(|record| record.process.pid)
+        .or_else(|| child.id());
+    if let Some(pid) = pid {
+        signal_process_group(pid, false);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        signal_process_group(pid, true);
+    }
+    let _ = child.start_kill();
+    let direct_reaped = matches!(
+        tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+        Ok(Ok(_))
+    );
+    let group_reconciled = if let Some(pid) = pid {
+        reconcile_process_group(pid).await.is_ok()
+    } else {
+        false
+    };
+    if direct_reaped
+        && group_reconciled
+        && let (Some(pid_file), Some(record)) = (pid_file, record)
+    {
+        let _ = remove_current_process_record(pid_file, record);
     }
 }
 
@@ -1817,9 +1874,16 @@ mod tests {
             panic!("server should start")
         };
         let pid = server.pid().expect("pid");
+        let record = deadreckon_core::read_supervised_process_record(&pid_file)
+            .expect("identity-bound app-server record");
+        assert_eq!(record.process.pid, pid);
         assert_eq!(
-            std::fs::read_to_string(&pid_file).expect("pid file").trim(),
-            pid.to_string()
+            record.process.pgid,
+            if cfg!(unix) { Some(pid) } else { None }
+        );
+        assert_eq!(
+            record.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Current
         );
         assert!(deadreckon_core::pid_is_alive(pid));
 
@@ -1831,18 +1895,28 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(!deadreckon_core::pid_is_alive(pid));
-        assert!(!pid_file.exists());
+        let stopped = deadreckon_core::read_supervised_process_record(&pid_file)
+            .expect("drop preserves authority for reconciliation");
+        assert_eq!(
+            stopped.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Exited
+        );
+        assert!(
+            deadreckon_core::remove_supervised_process_record_if_same(&pid_file, &stopped)
+                .expect("test cleanup")
+        );
     }
 
     #[tokio::test]
     async fn handshake_failure_degrades_route_with_trace() {
         let temp = TempDir::new().expect("tempdir");
+        let pid_file = temp.path().join("child-pids/codex-app-server.pid");
         let started = start_server_or_degrade(CodexAppServerSpec {
             provider: "cli:codex-server".to_string(),
             binary: fixture().display().to_string(),
             extra_args: vec!["handshake-failure".to_string()],
             cwd: temp.path().to_path_buf(),
-            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            pid_file: Some(pid_file.clone()),
             sandbox_backend: None,
             workspace_access: WorkspaceAccess::ReadWrite,
         })
@@ -1856,6 +1930,10 @@ mod tests {
                 .as_str()
                 .expect("message")
                 .contains("initialize")
+        );
+        assert!(
+            !pid_file.exists(),
+            "a reaped initialize failure must compare-remove its authority"
         );
     }
 

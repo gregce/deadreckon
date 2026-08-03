@@ -279,9 +279,13 @@ mod tests {
         while !pid_file.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let process =
-            deadreckon_core::read_supervised_process(&pid_file).expect("supervised process");
-        assert_eq!(process.pgid, Some(process.pid));
+        let record = deadreckon_core::read_supervised_process_record(&pid_file)
+            .expect("identity-bound supervised process");
+        assert_eq!(record.process.pgid, Some(record.process.pid));
+        assert_eq!(
+            record.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Current
+        );
         handle.await.expect("join").expect("run");
         assert!(!pid_file.exists());
     }

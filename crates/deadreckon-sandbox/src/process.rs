@@ -42,6 +42,10 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         let digest = deadreckon_core::flight::sha256_text(&token);
         (token, digest)
     });
+    // Every persisted process identity must own a fresh group on Unix. This
+    // lets a restarted controller reconcile the provider and all descendants
+    // from the identity-bound sidecar instead of trusting a raw PID.
+    let supervise_process_group = spec.cleanup_process_group || spec.pid_file.is_some();
     let mut process =
         if let (Some(guard), Some((_, digest))) = (guarded.as_ref(), guarded_release.as_ref()) {
             let pid_file = spec.pid_file.as_ref().ok_or_else(|| {
@@ -105,17 +109,14 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     // A guarded helper must remain in the worker's existing group until its
     // identity is durable. It creates the fresh group itself only after the
     // private release capability is validated.
-    configure_process_tree(
-        &mut process,
-        spec.cleanup_process_group && guarded.is_none(),
-    );
+    configure_process_tree(&mut process, supervise_process_group && guarded.is_none());
     let mut child = process.spawn()?;
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = tokio::spawn(read_pipe(stdout));
     let stderr_task = tokio::spawn(read_pipe(stderr));
-    let mut guarded_identity = None;
+    let mut process_record_identity = None;
     if let (Some(pid), Some(pid_file), Some(guard), Some((token, digest))) = (
         pid,
         spec.pid_file.as_ref(),
@@ -143,12 +144,12 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             reconcile_optional_docker(docker_execution.as_ref())?;
             return Err(error.into());
         }
-        guarded_identity = Some((guard.launch_id.clone(), pid));
+        process_record_identity = Some((guard.launch_id.clone(), pid));
         let Some(mut release) = child.stdin.take() else {
             signal_process(pid, true, false);
             let _ = child.wait().await;
             reconcile_optional_docker(docker_execution.as_ref())?;
-            remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+            remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(SandboxError::Io(std::io::Error::other(
                 "guarded sandbox helper did not expose its release pipe",
             )));
@@ -164,24 +165,33 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             let _ = child.wait().await;
             let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
             docker_cleanup?;
-            remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+            remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(error.into());
         }
     } else if let (Some(pid), Some(pid_file)) = (pid, spec.pid_file.as_ref()) {
-        if spec.cleanup_process_group {
-            deadreckon_core::write_supervised_process(
-                pid_file,
-                deadreckon_core::SupervisedProcess {
-                    pid,
-                    pgid: Some(pid),
-                },
-            )?;
-        } else {
-            if let Some(parent) = pid_file.parent() {
-                tokio::fs::create_dir_all(parent).await?;
+        let record = match deadreckon_core::SupervisedProcessRecord::running(
+            deadreckon_core::SupervisedProcess {
+                pid,
+                pgid: if cfg!(unix) { Some(pid) } else { None },
+            },
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                signal_process(pid, true, supervise_process_group);
+                let _ = child.wait().await;
+                cleanup_residual_process_tree(pid).await?;
+                reconcile_optional_docker(docker_execution.as_ref())?;
+                return Err(error.into());
             }
-            tokio::fs::write(pid_file, format!("{pid}\n")).await?;
+        };
+        if let Err(error) = deadreckon_core::write_supervised_process_record(pid_file, &record) {
+            signal_process(pid, true, supervise_process_group);
+            let _ = child.wait().await;
+            cleanup_residual_process_tree(pid).await?;
+            reconcile_optional_docker(docker_execution.as_ref())?;
+            return Err(error.into());
         }
+        process_record_identity = Some((record.launch_id, pid));
     }
     let stdin_task = if guarded.is_none() {
         spec.stdin.take().and_then(|bytes| {
@@ -206,7 +216,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
                         signal_process(pid, false, true);
                         signal_process(pid, false, false);
                     } else {
-                        signal_process(pid, false, spec.cleanup_process_group);
+                        signal_process(pid, false, supervise_process_group);
                     }
                     sleep(Duration::from_secs(2)).await;
                     if child.try_wait()?.is_none() {
@@ -214,13 +224,13 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
                             signal_process(pid, true, true);
                             signal_process(pid, true, false);
                         } else {
-                            signal_process(pid, true, spec.cleanup_process_group);
+                            signal_process(pid, true, supervise_process_group);
                         }
                     }
                 }
                 let _ = child.wait().await;
                 let process_cleanup = if let Some(pid) =
-                    pid.filter(|_| spec.cleanup_process_group)
+                    pid.filter(|_| supervise_process_group)
                 {
                     cleanup_residual_process_tree(pid).await
                 } else {
@@ -229,7 +239,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
                 let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
                 process_cleanup?;
                 docker_cleanup?;
-                remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+                remove_pid_file(&spec, process_record_identity.as_ref()).await?;
                 return Err(SandboxError::Cancelled);
             }
             status = child.wait() => status
@@ -240,7 +250,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     // A check can exit its direct shell while leaving background descendants
     // alive. Clean the process group before consuming output or returning
     // control to a caller that may subsequently read a signing key.
-    let process_cleanup = if let Some(pid) = pid.filter(|_| spec.cleanup_process_group) {
+    let process_cleanup = if let Some(pid) = pid.filter(|_| supervise_process_group) {
         cleanup_residual_process_tree(pid).await
     } else {
         Ok(())
@@ -260,7 +270,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
             .await
             .unwrap_or_else(|err| Err(std::io::Error::other(format!("stdin join error: {err}"))))?;
     }
-    remove_pid_file(&spec, guarded_identity.as_ref()).await?;
+    remove_pid_file(&spec, process_record_identity.as_ref()).await?;
     Ok(SandboxRunOutput {
         backend: command.backend,
         pid,
@@ -338,18 +348,25 @@ fn validate_guarded_launch(spec: &SandboxSpec) -> Result<Option<GuardedLaunchSpe
 
 async fn remove_pid_file(
     spec: &SandboxSpec,
-    guarded_identity: Option<&(String, u32)>,
+    process_record_identity: Option<&(String, u32)>,
 ) -> Result<()> {
     let Some(path) = spec.pid_file.as_ref() else {
         return Ok(());
     };
-    if let Some((launch_id, pid)) = guarded_identity {
-        deadreckon_core::remove_supervised_process_record_if_matches(path, launch_id, *pid)?;
-    } else {
-        match tokio::fs::remove_file(path).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    if let Some((launch_id, pid)) = process_record_identity {
+        let removed =
+            deadreckon_core::remove_supervised_process_record_if_matches(path, launch_id, *pid)?;
+        if !removed {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(SandboxError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "supervised process identity changed before cleanup",
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     Ok(())
