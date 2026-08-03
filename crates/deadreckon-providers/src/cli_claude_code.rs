@@ -18,6 +18,8 @@ use crate::{
     ProviderResponse, ProviderUsage, Result, SpendEstimate,
 };
 
+const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
 #[derive(Clone)]
 pub struct CliClaudeCodeProvider {
     name: String,
@@ -79,7 +81,7 @@ impl CliClaudeCodeProvider {
                 String::new(),
                 "--strict-mcp-config".to_string(),
                 "--mcp-config".to_string(),
-                "{}".to_string(),
+                EMPTY_MCP_CONFIG.to_string(),
                 "--setting-sources".to_string(),
                 String::new(),
                 "--json-schema".to_string(),
@@ -332,7 +334,7 @@ impl WithWallTime for SpendEstimate {
 
 #[cfg(test)]
 mod tests {
-    use super::CliClaudeCodeProvider;
+    use super::{CliClaudeCodeProvider, EMPTY_MCP_CONFIG};
     use crate::claude_events::ClaudeCapabilities;
     use crate::{ProviderEntry, ProviderRequest};
     use deadreckon_sandbox::WorkspaceAccess;
@@ -382,5 +384,41 @@ mod tests {
             args.iter()
                 .any(|arg| arg == "--dangerously-skip-permissions")
         );
+    }
+
+    #[test]
+    fn schema_only_claude_uses_valid_empty_mcp_config() {
+        let args = provider().build_args(
+            &ProviderRequest {
+                workspace_access: WorkspaceAccess::ReadOnly,
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"],
+                    "additionalProperties": false
+                })),
+                ..ProviderRequest::default()
+            },
+            &ClaudeCapabilities {
+                stream_json: true,
+                resume: true,
+                json_schema: true,
+                schema_only_posture: true,
+            },
+            None,
+        );
+
+        let config_index = args
+            .iter()
+            .position(|arg| arg == "--mcp-config")
+            .expect("schema-only posture must supply an isolated MCP config");
+        assert_eq!(
+            args.get(config_index + 1).map(String::as_str),
+            Some(EMPTY_MCP_CONFIG)
+        );
+
+        let config: serde_json::Value =
+            serde_json::from_str(EMPTY_MCP_CONFIG).expect("empty MCP config must be valid JSON");
+        assert!(config["mcpServers"].is_object());
     }
 }
