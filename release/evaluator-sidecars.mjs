@@ -498,38 +498,89 @@ function oneTargetArchive(dir, target) {
 function listArchive(archive) {
   const result = archive.endsWith(".zip")
     ? process.platform === "win32"
-      ? spawnSync("tar", ["-tf", archive], { encoding: "utf8" })
+      ? listZipArchiveOnWindows(archive)
       : spawnSync("unzip", ["-Z1", archive], { encoding: "utf8" })
     : spawnSync("tar", ["-tf", archive], { encoding: "utf8" });
-  if (result.status !== 0) {
-    throw new Error(`could not list ${archive}: ${result.stderr}`);
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ?? result.stderr?.toString("utf8") ?? "unknown error";
+    throw new Error(`could not list ${archive}: ${detail}`);
   }
   return result.stdout.split(/\r?\n/).filter(Boolean);
 }
 
 function extractArchive(archive, destination) {
-  if (archive.endsWith(".zip") && process.platform !== "win32") {
-    run("unzip", ["-q", archive, "-d", destination]);
+  if (archive.endsWith(".zip")) {
+    if (process.platform === "win32") {
+      extractZipArchiveOnWindows(archive, destination);
+    } else {
+      run("unzip", ["-q", archive, "-d", destination]);
+    }
   } else {
     run("tar", ["-xf", archive, "-C", destination]);
   }
 }
 
 function extractArchiveMember(archive, member) {
+  if (archive.endsWith(".zip") && process.platform === "win32") {
+    return extractZipArchiveMemberOnWindows(archive, member);
+  }
   const options = {
     encoding: "buffer",
     maxBuffer: MAX_ARCHIVE_MEMBER_BYTES,
   };
   const result = archive.endsWith(".zip")
-    ? process.platform === "win32"
-      ? spawnSync("tar", ["-xOf", archive, member], options)
-      : spawnSync("unzip", ["-p", archive, member], options)
+    ? spawnSync("unzip", ["-p", archive, member], options)
     : spawnSync("tar", ["-xOf", archive, member], options);
   if (result.error || result.status !== 0) {
     const detail = result.error?.message ?? result.stderr?.toString("utf8") ?? "unknown error";
     throw new Error(`could not extract ${member} from ${archive}: ${detail}`);
   }
   return result.stdout;
+}
+
+function listZipArchiveOnWindows(archive) {
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `$zip=[System.IO.Compression.ZipFile]::OpenRead('${escapePowerShell(archive)}')`,
+    "try { foreach ($entry in $zip.Entries) { [Console]::Out.WriteLine($entry.FullName) } } finally { $zip.Dispose() }",
+  ].join("; ");
+  return spawnSync("powershell", ["-NoProfile", "-Command", script], {
+    encoding: "utf8",
+    maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
+function extractZipArchiveOnWindows(archive, destination) {
+  run("powershell", [
+    "-NoProfile",
+    "-Command",
+    `$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath '${escapePowerShell(archive)}' -DestinationPath '${escapePowerShell(destination)}' -Force`,
+  ]);
+}
+
+function extractZipArchiveMemberOnWindows(archive, member) {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "deadreckon-zip-member-"));
+  const output = path.join(temp, "member.bin");
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `$zip=[System.IO.Compression.ZipFile]::OpenRead('${escapePowerShell(archive)}')`,
+    `try { $matches=@($zip.Entries | Where-Object { $_.FullName -ceq '${escapePowerShell(member)}' }); if ($matches.Count -ne 1) { throw 'expected exactly one archive member ${escapePowerShell(member)}' }; [System.IO.Compression.ZipFileExtensions]::ExtractToFile($matches[0], '${escapePowerShell(output)}', $true) } finally { $zip.Dispose() }`,
+  ].join("; ");
+  try {
+    run("powershell", ["-NoProfile", "-Command", script]);
+    const size = fs.statSync(output).size;
+    if (size > MAX_ARCHIVE_MEMBER_BYTES) {
+      throw new Error(
+        `archive member ${member} is ${size} bytes, exceeding the ${MAX_ARCHIVE_MEMBER_BYTES}-byte inventory limit`,
+      );
+    }
+    return fs.readFileSync(output);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
 }
 
 function repackArchive(archive, sourceDir) {
@@ -620,9 +671,10 @@ function requireHostTarget(target) {
 
 function run(program, programArgs, options = {}) {
   const result = spawnSync(program, programArgs, { encoding: "utf8", ...options });
-  if (result.status !== 0) {
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ? `\nerror:\n${result.error.message}` : "";
     throw new Error(
-      `${program} ${programArgs.join(" ")} failed\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`,
+      `${program} ${programArgs.join(" ")} failed${detail}\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`,
     );
   }
 }
