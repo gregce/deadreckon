@@ -1528,8 +1528,12 @@ individual full-plan implementor overrides. Full-plan also asks for 2 to 6
 implementors. Provider-specific model choices come from the registry and its
 cached model catalog when available. The exact role routes and models persist
 in the launch plan, durable driver and recovery/replay inputs; a model chosen
-for one provider does not leak to another provider. Legacy global `--model`
-continues to work.
+for one provider does not leak to another provider. When `start` must author a
+done contract, it uses the selected planner for full-plan and Campaign, the
+selected implementor for review, and the primary provider for a Single or
+extension. The preview names that same authoring route. Direct `def-done` keeps
+the separately configurable `[defaults].doc_provider` preference. Legacy
+global `--model` continues to work.
 
 Within guided setup, DeadReckon resolves and validates the source exactly once
 before provider discovery, role selection, done-contract authoring, writes or
