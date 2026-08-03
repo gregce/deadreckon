@@ -1507,12 +1507,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let path = temp.path().join(name);
-        let mut file = fs::File::create(&path).expect("script");
-        file.write_all(content.as_bytes()).expect("script body");
-        let mut permissions = file.metadata().expect("metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("permissions");
-        drop(file);
+        let staging = temp.path().join(format!(".{name}.ready"));
+        {
+            let mut file = fs::File::create(&staging).expect("script");
+            file.write_all(content.as_bytes()).expect("script body");
+            let mut permissions = file.metadata().expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            file.set_permissions(permissions).expect("permissions");
+            file.sync_all().expect("sync script");
+        }
+        // Publish only after the writable handle is closed. Executing an inode
+        // that still has a writer can intermittently fail with ETXTBSY on
+        // Linux CI, even when the script contents are otherwise complete.
+        fs::rename(staging, &path).expect("publish script");
         path
     }
 
