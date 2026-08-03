@@ -11,12 +11,13 @@ pushing the Homebrew tap remain operator actions.
 | --- | --- | --- |
 | Branch or PR | non-tag push or pull request | Runs `dist plan --output-format=json` and static release-policy checks only. No private secrets are required and nothing publishes. |
 | RC | `vX.Y.Z-rc.N` | Builds release artifacts, requires official-repo macOS signing/notarization, generates `SHA256SUMS`, `release-manifest.json`, `release.spdx.json`, and GitHub attestations, then publishes a GitHub prerelease. It does not publish npm or Homebrew stable channels. |
-| Stable | `vX.Y.Z` | Requires tag/version/changelog agreement, full verify, official-repo trust material, release artifacts, checksums, manifest, SBOM, GitHub attestations, npm provenance, and Homebrew integrity. |
+| Stable | `vX.Y.Z` | Requires tag/version/changelog agreement, full verify, enabled official-repo trust material, release artifacts, checksums, manifest, SBOM, GitHub attestations, and Homebrew integrity. npm publication and Windows Authenticode may be explicitly deferred by the checked-in release policy. |
 
-Stable Windows artifacts require Authenticode signing. If the Windows signing
-secrets are absent, the stable release fails before any unsigned Windows artifact
-can upload. RC and dry-run builds may still exercise the Windows target without
-stable publication.
+Windows artifacts require Authenticode signing whenever
+`windowsSigningDeferred` is false. The initial `v0.8.0` lane deliberately keeps
+that flag true until a certificate is configured, so its Windows archive is
+unsigned but remains covered by checksums and GitHub attestations. This is an
+explicit release-scope decision, not a missing-secret fallback.
 
 ## Official Artifact Contract
 
@@ -28,14 +29,15 @@ Every official RC or stable release must produce:
   `dr-gate-evaluator-aarch64-unknown-linux-musl` and
   `dr-gate-evaluator-x86_64-unknown-linux-musl`;
 - the Homebrew formula artifact;
-- npm wrapper and platform packages when the lane is stable;
+- npm wrapper and platform packages when npm publication is enabled for the
+  stable lane;
 - `SHA256SUMS`;
 - `release-manifest.json`;
 - `release-archive-members.json`, which records every final archive member and
   the common evaluator-sidecar digests;
 - `release.spdx.json`;
 - GitHub artifact attestations;
-- npm provenance for published npm packages;
+- npm provenance whenever npm packages are published;
 - release notes or runbook commands that show verification steps.
 
 `cargo-dist` plans and builds artifacts but never creates or updates the GitHub
@@ -80,7 +82,8 @@ Forks, PRs, and branch dry-runs do not require these secrets.
 
 ## Required Windows Secrets
 
-Official stable releases fail if Windows signing material is absent.
+Official stable releases fail if Windows signing is enabled and signing
+material is absent. Windows Authenticode is explicitly deferred for `v0.8.0`.
 
 | Secret | Purpose |
 | --- | --- |
@@ -137,7 +140,7 @@ Homebrew stable publication requires `HOMEBREW_TAP_TOKEN`, a token with push
 rights to `gregce/homebrew-tap`. The workflow verifies that the generated formula
 checksum matches `SHA256SUMS` before committing the formula.
 
-npm stable publication prefers npm trusted publishing. Configure trusted
+When enabled, npm stable publication prefers npm trusted publishing. Configure trusted
 publishing in npm for `deadreckon` and each platform package, then set the
 repository variable `NPM_TRUSTED_PUBLISHING=true`. If trusted publishing is not
 available yet, set `NPM_TOKEN`; the workflow still publishes every package with
@@ -150,32 +153,32 @@ attestations and npm provenance.
 
 ## Stable operator checklist
 
-Everything the operator confirms before every stable release:
+Everything the operator confirms before the narrowed `v0.8.0` stable release:
 
 1. Work from a clean revision whose branch CI and release-plan workflow pass.
 2. Confirm the `gregce/homebrew-tap` repository is reachable and
    `HOMEBREW_TAP_TOKEN` still has push rights.
-3. Configure npm trusted publishing for all six packages (`deadreckon` plus
-   the five platform packages) and set the repository variable
-   `NPM_TRUSTED_PUBLISHING=true`, or provide the `NPM_TOKEN` fallback.
-4. Confirm `WINDOWS_CERT_PFX` and `WINDOWS_CERT_PWD` contain the current
-   Authenticode certificate. Stable preflight fails before building artifacts
-   when either Windows or npm trust material is unavailable.
-5. Set the Rust workspace, the wrapper in `npm/deadreckon/package.json` and all
+3. Confirm the checked-in release policy still deliberately defers npm
+   publication and Windows Authenticode. The Windows archive will be unsigned
+   but checksummed and attested; no npm package is published by this tag.
+4. Set the Rust workspace, the wrapper in `npm/deadreckon/package.json` and all
    npm optional dependency pins to the exact stable version, update
    `Cargo.lock`, and confirm `CHANGELOG.md` has the matching release section.
-6. Run `make build`, then `release/preflight-real.sh`, and commit the refreshed
+5. Run `make build`, then `release/preflight-real.sh`, and commit the refreshed
    `release/known-good-providers.json`. The recorded `deadreckon_version` must
    equal the stable tag version.
-7. Run the focused checks and the complete verification suite, then validate
+6. Run the focused checks and the complete verification suite, then validate
    the exact stable ref through `release/trust/release-trust.mjs`.
-8. Rehearse the release through an RC and verify its archives, installers,
+7. Rehearse the release through an RC and verify its archives, installers,
    checksums, manifest, archive-member inventory, SBOM, signing/notarization
    evidence and attestations.
-9. Run the Windows smoke checklist below on the signed zip and record the
-   result under route `windows-smoke`.
-10. Create and push the stable tag only after the operator explicitly approves
-    that exact tag. Automation never invents or advances a release tag.
+8. Create and push the stable tag only after the operator explicitly approves
+   that exact tag. Automation never invents or advances a release tag.
+
+To widen a later release, configure npm trusted publishing (or `NPM_TOKEN`) and
+the two Windows signing secrets, then set `npmPublishingDeferred` and
+`windowsSigningDeferred` to false in `release/trust/release-trust.mjs`. The
+existing fail-closed preflight and publication jobs become mandatory again.
 
 ## Operator Release Flow
 
@@ -189,9 +192,10 @@ Everything the operator confirms before every stable release:
    - for stable, the Rust workspace, lockfile, npm wrapper and all five pins
      carry exactly `X.Y.Z`.
 3. For stable releases, confirm `CHANGELOG.md` has a section for `X.Y.Z`.
-4. Confirm Apple, Homebrew, and npm trust material are configured.
-5. Confirm Windows Authenticode signing secrets are configured for stable tags.
-6. Run focused local checks:
+4. Confirm Apple and Homebrew trust material are configured. Confirm npm and
+   Windows are either enabled with their trust material or explicitly deferred
+   by the checked-in policy.
+5. Run focused local checks:
 
    ```sh
    cargo test -p deadreckon --test release_plan
@@ -200,13 +204,13 @@ Everything the operator confirms before every stable release:
    git diff --check
    ```
 
-7. If `cargo-dist` is installed locally, also run:
+6. If `cargo-dist` is installed locally, also run:
 
    ```sh
    dist plan --output-format=json
    ```
 
-8. For a stable cut, run the real-provider proof harness (operator-only;
+7. For a stable cut, run the real-provider proof harness (operator-only;
    it refuses under CI and burns a few real provider turns per route —
    expect a small spend):
 
@@ -219,16 +223,16 @@ Everything the operator confirms before every stable release:
    On success it records the probed binary versions in
    `release/known-good-providers.json` (schema_version 1); commit that file
    so the release notes can reference known-good CLI versions.
-9. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
+8. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
    `SHA256SUMS`, `release-manifest.json`, `release-archive-members.json`,
    `release.spdx.json`, macOS signing evidence, and attestations. Confirm every
    archive contains exactly one host-native `deadreckon`, `dr-gate`, and
    `dr-capture`, plus exactly one copy of each static evaluator sidecar.
-10. After the RC rehearsal is clean, create and push the stable tag.
+9. After the RC rehearsal is clean, create and push the stable tag.
 
-The first real release remains an operator action.
+Every release tag remains an operator action.
 
-### Windows smoke (operator checklist, stable cut)
+### Windows smoke (operator checklist, when Authenticode is enabled)
 
 On a Windows machine or VM, before announcing a stable release:
 
