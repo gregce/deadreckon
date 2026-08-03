@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-Nothing yet.
+- Fix Claude Code done-contract authoring by supplying a valid isolated empty
+  MCP configuration, and point authoring failures at the effective
+  `defaults.doc_provider` setting.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 

@@ -6,6 +6,8 @@ const PROJECT_ACCEPTANCE_DIR: &str = ".deadreckon";
 const PROJECT_ACCEPTANCE_YAML: &str = "acceptance.yaml";
 const PROJECT_ACCEPTANCE_MD: &str = "acceptance.md";
 const PROJECT_ACCEPTANCE_HELPERS: &str = "acceptance";
+const DONE_AUTHORING_PROVIDER_RECOVERY: &str =
+    "deadreckon config set defaults.doc_provider cli:codex";
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcceptanceSource {
@@ -327,7 +329,7 @@ async fn run_done_authoring_stage(
                 "done criteria {} provider failed via {route_label}: {error}",
                 stage.label()
             ),
-            "deadreckon config provider <compatible-doc-provider>",
+            DONE_AUTHORING_PROVIDER_RECOVERY,
         ))),
         None => Err(done_authoring_timeout_error(
             stage,
@@ -1001,7 +1003,7 @@ async fn acceptance_agent_command_with_review_policy(
     } else {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done contract critic is unavailable for a strict launch",
-            "deadreckon config provider <compatible-doc-provider>",
+            DONE_AUTHORING_PROVIDER_RECOVERY,
         )));
     };
     if let Some(verdict) = critic
@@ -1648,7 +1650,7 @@ fn parse_schema_constrained_acceptance_response(content: &str) -> Result<Accepta
     if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done criteria provider result did not match the exact acceptance schema",
-            "deadreckon config provider <compatible-doc-provider>",
+            DONE_AUTHORING_PROVIDER_RECOVERY,
         )));
     }
     if object
@@ -1663,7 +1665,7 @@ fn parse_schema_constrained_acceptance_response(content: &str) -> Result<Accepta
     {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done criteria provider result used invalid acceptance field types",
-            "deadreckon config provider <compatible-doc-provider>",
+            DONE_AUTHORING_PROVIDER_RECOVERY,
         )));
     }
     acceptance_json_payload(&value)?.ok_or_else(|| {
@@ -2085,7 +2087,7 @@ async fn run_contract_critic(
     let provider = parse_critic_verdict(&response.content).ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             "done contract critic returned invalid structured output",
-            "deadreckon config provider <compatible-doc-provider>",
+            DONE_AUTHORING_PROVIDER_RECOVERY,
         ))
     })?;
     Ok(apply_critic_floor(
@@ -2864,6 +2866,14 @@ mod tests {
         assert_eq!(
             select_done_authoring_provider(Some("openai".to_string()), &defaults).as_deref(),
             Some("openai")
+        );
+    }
+
+    #[test]
+    fn done_authoring_recovery_updates_the_provider_it_selects() {
+        assert_eq!(
+            DONE_AUTHORING_PROVIDER_RECOVERY,
+            "deadreckon config set defaults.doc_provider cli:codex"
         );
     }
 
