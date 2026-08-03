@@ -19,6 +19,8 @@ const JOB_ID_LABEL: &str = "io.deadreckon.job-id";
 const LAUNCH_ID_LABEL: &str = "io.deadreckon.launch-id";
 const ATTEMPT_LABEL: &str = "io.deadreckon.attempt";
 const OWNER_LAUNCH_ID_LABEL: &str = "io.deadreckon.owner-launch-id";
+#[cfg(all(test, unix))]
+const TEST_DOCKER_SCRIPT_EXTENSION: &str = "deadreckon-test-sh";
 
 pub const DOCKER_EXECUTION_RECORD_SCHEMA_VERSION: u32 = 1;
 
@@ -687,6 +689,17 @@ fn write_execution_record(path: &Path, record: &DockerExecutionRecord) -> Result
 }
 
 fn trusted_docker(wrapper: &Path) -> Command {
+    #[cfg(all(test, unix))]
+    if wrapper.extension() == Some(OsStr::new(TEST_DOCKER_SCRIPT_EXTENSION)) {
+        // Unit tests exercise reconciliation through freshly generated shell
+        // fixtures. Invoke those fixtures through the stable system shell so
+        // Linux never has to exec a just-published script inode (which can
+        // intermittently fail with ETXTBSY on hosted CI filesystems).
+        let mut command = Command::new("/bin/sh");
+        command.arg(wrapper).env_clear();
+        return command;
+    }
+
     let mut command = Command::new(wrapper);
     command.env_clear();
     command
@@ -1506,7 +1519,8 @@ mod tests {
     fn executable_script(temp: &TempDir, name: &str, content: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let path = temp.path().join(name);
+        let name = format!("{name}.{TEST_DOCKER_SCRIPT_EXTENSION}");
+        let path = temp.path().join(&name);
         let staging = temp.path().join(format!(".{name}.ready"));
         {
             let mut file = fs::File::create(&staging).expect("script");
@@ -1516,18 +1530,16 @@ mod tests {
             file.set_permissions(permissions).expect("permissions");
             file.sync_all().expect("sync script");
         }
-        // Publish only after the writable handle is closed. Executing an inode
-        // that still has a writer can intermittently fail with ETXTBSY on
-        // Linux CI, even when the script contents are otherwise complete.
+        // Publish only after the writable handle is closed so the test
+        // interpreter can never observe a partially written fixture.
         fs::rename(staging, &path).expect("publish script");
         path
     }
 
     #[cfg(unix)]
     fn replace_executable_script(fixture: &ReconciliationFixture, content: &str) {
-        // Replacing an executable inode in place can race Linux exec and
-        // produce ETXTBSY under parallel CI. Build a complete executable on a
-        // fresh inode, close it, then atomically publish it over the fixture.
+        // Build a complete fixture on a fresh inode, close it, then atomically
+        // publish it so concurrent command opens see one complete version.
         let replacement = executable_script(&fixture._temp, "docker-replacement", content);
         fs::rename(replacement, &fixture.docker).expect("replace Docker script");
     }
