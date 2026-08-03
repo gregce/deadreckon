@@ -372,7 +372,83 @@ function verifyManifest(localArgs = args) {
       throw new Error(`SHA256SUMS mismatch for ${name}`);
     }
   }
+  const checksummedTrustTargets = new Set();
+  for (const entry of entries) {
+    if (artifactKind(entry.relative) !== "trust-status") {
+      continue;
+    }
+    if (!checksumMap.has(entry.name)) {
+      throw new Error(`trust status ${entry.name} is missing from SHA256SUMS`);
+    }
+    const value = JSON.parse(fs.readFileSync(path.join(dir, entry.relative), "utf8"));
+    if (value.target) {
+      checksummedTrustTargets.add(value.target);
+    }
+  }
+  const trust = readTrustStatus(dir);
+  for (const target of trust.keys()) {
+    if (!checksummedTrustTargets.has(target)) {
+      throw new Error(`trust status for target ${target} is not checksummed`);
+    }
+  }
+  verifyArtifactTrustStatus(manifest, trust);
   writeJson({ ok: true, artifacts: manifest.artifacts.length });
+}
+
+function verifyArtifactTrustStatus(manifest, trust) {
+  for (const artifact of manifest.artifacts) {
+    const target = releaseTargetForName(artifact.name);
+    if (artifact.target !== target) {
+      throw new Error(
+        `release-manifest target mismatch for ${artifact.name}: manifest ${displayValue(artifact.target)}, expected ${displayValue(target)}`,
+      );
+    }
+    if (target === null) {
+      continue;
+    }
+    const targetTrust = trust.get(target) ?? null;
+    const signingRequired =
+      (target.endsWith("apple-darwin") && manifest.policies?.macos_signing_required === true) ||
+      (target.endsWith("windows-msvc") && manifest.policies?.windows_signing_required === true);
+    if (signingRequired && targetTrust === null) {
+      throw new Error(
+        `release-manifest target ${target} requires signing but has no checksummed trust status`,
+      );
+    }
+    const expected = {
+      signed: Boolean(targetTrust?.signed),
+      notarized: Boolean(targetTrust?.notarized),
+      signature_kind: targetTrust?.signature_kind ?? null,
+    };
+    if (signingRequired) {
+      if (expected.signed !== true) {
+        throw new Error(
+          `release signing policy for target ${target} requires trust field signed=true`,
+        );
+      }
+      if (target.endsWith("apple-darwin") && expected.notarized !== true) {
+        throw new Error(
+          `release signing policy for target ${target} requires trust field notarized=true`,
+        );
+      }
+      if (expected.signature_kind === null) {
+        throw new Error(
+          `release signing policy for target ${target} requires trust field signature_kind`,
+        );
+      }
+    }
+    for (const field of ["signed", "notarized", "signature_kind"]) {
+      if (artifact[field] !== expected[field]) {
+        throw new Error(
+          `release-manifest trust mismatch for target ${target}, artifact ${artifact.name}, field ${field}: manifest ${displayValue(artifact[field])}, checksummed trust ${displayValue(expected[field])}`,
+        );
+      }
+    }
+  }
+}
+
+function displayValue(value) {
+  return value === undefined ? "<missing>" : JSON.stringify(value);
 }
 
 // The cargo-dist shell installer resolves binaries through the archive's
@@ -447,7 +523,7 @@ function verifyHomebrew(localArgs = args) {
 
 function artifactRecord(dir, entry, lane, trust) {
   const absolute = path.join(dir, entry.relative);
-  const target = TARGETS.find((candidate) => entry.name.includes(candidate)) ?? null;
+  const target = releaseTargetForName(entry.name);
   const targetTrust = target ? trust.get(target) : null;
   return {
     name: entry.name,
@@ -463,10 +539,14 @@ function artifactRecord(dir, entry, lane, trust) {
   };
 }
 
+function releaseTargetForName(name) {
+  return TARGETS.find((candidate) => name.includes(candidate)) ?? null;
+}
+
 function artifactKind(file) {
   if (file === "SHA256SUMS" || file.endsWith("/SHA256SUMS")) return "checksums";
   if (file.endsWith(".spdx.json")) return "sbom";
-  if (file.startsWith("trust/") || file.includes("/trust/")) return "trust-status";
+  if (isTrustStatusAsset(path.basename(file), file)) return "trust-status";
   if (file.endsWith(".rb")) return "homebrew-formula";
   if (file.endsWith(".sh") || file.endsWith(".ps1")) return "installer";
   if (file.endsWith(".zip") || file.endsWith(".tar.xz") || file.endsWith(".tar.gz") || file.endsWith(".tgz")) {
@@ -478,20 +558,53 @@ function artifactKind(file) {
 
 function readTrustStatus(dir) {
   const result = new Map();
-  const trustDir = path.join(dir, "trust");
-  if (!fs.existsSync(trustDir)) {
-    return result;
-  }
-  for (const file of fs.readdirSync(trustDir)) {
-    if (!file.endsWith(".json")) {
-      continue;
+  const origins = new Map();
+  walk(dir, (file) => {
+    const relative = path.relative(dir, file).replaceAll(path.sep, "/");
+    const name = path.basename(file);
+    if (!isTrustStatusAsset(name, relative)) {
+      return;
     }
-    const value = JSON.parse(fs.readFileSync(path.join(trustDir, file), "utf8"));
-    if (value.target) {
+    const contents = fs.readFileSync(file, "utf8");
+    const value = JSON.parse(contents);
+    if (!value.target) {
+      return;
+    }
+    const namedTarget = trustStatusTargetFromName(name);
+    if (namedTarget !== null && value.target !== namedTarget) {
+      throw new Error(
+        `trust status ${relative} names target ${value.target}, expected ${namedTarget}`,
+      );
+    }
+    const digest = crypto.createHash("sha256").update(contents).digest("hex");
+    const existing = origins.get(value.target);
+    if (existing !== undefined && existing.digest !== digest) {
+      throw new Error(
+        `conflicting trust status for target ${value.target}: ${existing.relative} vs ${relative}`,
+      );
+    }
+    if (existing === undefined) {
+      origins.set(value.target, { digest, relative });
       result.set(value.target, value);
     }
-  }
+  });
   return result;
+}
+
+function trustStatusTargetFromName(name) {
+  for (const target of TARGETS) {
+    if (name === `macos-${target}.json` || name === `windows-${target}.json`) {
+      return target;
+    }
+  }
+  return null;
+}
+
+function isTrustStatusAsset(name, relative) {
+  const nestedTrustStatus =
+    (relative.startsWith("trust/") || relative.includes("/trust/")) && name.endsWith(".json");
+  const flatPublicTrustStatus = relative === name && trustStatusTargetFromName(name) !== null;
+  return nestedTrustStatus || flatPublicTrustStatus;
 }
 
 // The shapes the publish step uploads. Anything else under the artifact
@@ -499,8 +612,8 @@ function readTrustStatus(dir) {
 // build intermediate, not a release asset — listing those in SHA256SUMS or
 // the manifest would reference files users can never download.
 function isReleaseAsset(name, relative) {
-  if (relative.startsWith("trust/") || relative.includes("/trust/")) {
-    return name.endsWith(".json");
+  if (isTrustStatusAsset(name, relative)) {
+    return true;
   }
   return (
     name.endsWith(".tar.xz") ||
