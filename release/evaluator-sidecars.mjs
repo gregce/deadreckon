@@ -609,12 +609,7 @@ function repackArchive(archive, sourceDir) {
   }
   if (suffix === ".zip") {
     if (process.platform === "win32") {
-      const literal = entries.map((entry) => `'${escapePowerShell(path.join(sourceDir, entry))}'`).join(",");
-      run("powershell", [
-        "-NoProfile",
-        "-Command",
-        `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath @(${literal}) -DestinationPath '${escapePowerShell(staged)}' -CompressionLevel Optimal -Force`,
-      ]);
+      createZipArchiveOnWindows(staged, sourceDir);
     } else {
       run("zip", ["-X", "-q", "-r", staged, ...entries], { cwd: sourceDir });
     }
@@ -626,6 +621,36 @@ function repackArchive(archive, sourceDir) {
   }
   fs.copyFileSync(staged, archive);
   fs.unlinkSync(staged);
+}
+
+function createZipArchiveOnWindows(archive, sourceDir) {
+  const files = [];
+  walk(sourceDir, (file) => files.push(file));
+  if (files.length === 0) {
+    throw new Error(`nothing to add to Windows ZIP from ${sourceDir}`);
+  }
+  const manifest = `${archive}.entries.json`;
+  const entries = files.sort().map((source) => ({
+    source: path.resolve(source),
+    name: path.relative(sourceDir, source).split(path.sep).join("/"),
+  }));
+  fs.writeFileSync(manifest, `${JSON.stringify(entries)}\n`);
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+    `$items=@(Get-Content -LiteralPath '${escapePowerShell(manifest)}' -Raw | ConvertFrom-Json)`,
+    `$zip=[System.IO.Compression.ZipFile]::Open('${escapePowerShell(archive)}',[System.IO.Compression.ZipArchiveMode]::Create)`,
+    "$timestamp=[DateTimeOffset]::Parse('1980-01-02T00:00:00Z')",
+    "try { foreach ($item in $items) { $entry=$zip.CreateEntry([string]$item.name,[System.IO.Compression.CompressionLevel]::Optimal); $entry.LastWriteTime=$timestamp; $source=[System.IO.File]::OpenRead([string]$item.source); $target=$entry.Open(); try { $source.CopyTo($target) } finally { $target.Dispose(); $source.Dispose() } } } finally { $zip.Dispose() }",
+  ].join("; ");
+  try {
+    run("powershell", ["-NoProfile", "-Command", script]);
+  } catch (error) {
+    fs.rmSync(archive, { force: true });
+    throw error;
+  } finally {
+    fs.rmSync(manifest, { force: true });
+  }
 }
 
 function archiveSuffix(archive) {

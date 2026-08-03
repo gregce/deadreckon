@@ -11,7 +11,7 @@ const TOOL = path.join(ROOT, "release", "evaluator-sidecars.mjs");
 const TARGET = "x86_64-pc-windows-msvc";
 
 test(
-  "Windows assembles and inventories a cargo-dist ZIP without relying on tar",
+  "Windows assembles epoch-timestamped sidecars without relying on tar",
   { skip: process.platform !== "win32" },
   () => {
     const temp = fs.mkdtempSync(path.join(os.tmpdir(), "deadreckon-windows-zip-smoke-"));
@@ -26,16 +26,18 @@ test(
       for (const helper of ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"]) {
         fs.writeFileSync(path.join(payload, helper), `${helper} native helper`);
       }
-      writeFakeStaticElf(
-        path.join(sidecars, "dr-gate-evaluator-aarch64-unknown-linux-musl"),
-        0xb7,
-        2 * 1024 * 1024,
+      const armEvaluator = path.join(
+        sidecars,
+        "dr-gate-evaluator-aarch64-unknown-linux-musl",
       );
-      writeFakeStaticElf(
-        path.join(sidecars, "dr-gate-evaluator-x86_64-unknown-linux-musl"),
-        0x3e,
-        3 * 1024 * 1024,
+      const intelEvaluator = path.join(
+        sidecars,
+        "dr-gate-evaluator-x86_64-unknown-linux-musl",
       );
+      writeFakeStaticElf(armEvaluator, 0xb7, 2 * 1024 * 1024);
+      writeFakeStaticElf(intelEvaluator, 0x3e, 3 * 1024 * 1024);
+      fs.utimesSync(armEvaluator, 0, 0);
+      fs.utimesSync(intelEvaluator, 0, 0);
 
       const archive = path.join(distrib, `deadreckon-${TARGET}.zip`);
       run("powershell", [
@@ -69,6 +71,23 @@ test(
           "dr-gate-evaluator-x86_64-unknown-linux-musl",
           "dr-gate.exe",
         ].sort(),
+      );
+      const timestamps = run("powershell", [
+        "-NoProfile",
+        "-Command",
+        [
+          "$ErrorActionPreference='Stop'",
+          "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+          `$zip=[System.IO.Compression.ZipFile]::OpenRead('${escapePowerShell(archive)}')`,
+          "try { foreach ($entry in $zip.Entries) { [Console]::Out.WriteLine($entry.LastWriteTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:sszzz')) } } finally { $zip.Dispose() }",
+        ].join("; "),
+      ])
+        .stdout.trim()
+        .split(/\r?\n/);
+      assert.ok(timestamps.length >= 5, timestamps);
+      assert.ok(
+        timestamps.every((timestamp) => timestamp === "1980-01-02T00:00:00+00:00"),
+        timestamps,
       );
 
       run(process.execPath, [

@@ -1467,8 +1467,11 @@ fn evaluator_sidecar_tool_uses_dotnet_zip_apis_on_windows() {
         "listZipArchiveOnWindows(archive)",
         "extractZipArchiveOnWindows(archive, destination)",
         "extractZipArchiveMemberOnWindows(archive, member)",
+        "createZipArchiveOnWindows(staged, sourceDir)",
         "System.IO.Compression.ZipFile",
         "System.IO.Compression.ZipFileExtensions",
+        "ZipArchiveMode]::Create",
+        "$entry.LastWriteTime=$timestamp",
         "Expand-Archive -LiteralPath",
     ] {
         assert!(tool.contains(required), "missing {required} from {tool}");
@@ -1476,6 +1479,10 @@ fn evaluator_sidecar_tool_uses_dotnet_zip_apis_on_windows() {
     assert!(
         !tool.contains("process.platform === \"win32\"\n      ? spawnSync(\"tar\""),
         "Windows ZIP handling must not depend on whichever tar Git Bash places first on PATH"
+    );
+    assert!(
+        !tool.contains("Compress-Archive -LiteralPath"),
+        "Windows ZIP repacking must tolerate reproducible pre-1980 source timestamps"
     );
 }
 
