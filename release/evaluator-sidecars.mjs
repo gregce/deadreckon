@@ -556,6 +556,7 @@ function listZipArchiveOnWindows(archive) {
   const script = [
     "$ErrorActionPreference='Stop'",
     "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)",
+    "Add-Type -AssemblyName System.IO.Compression",
     "Add-Type -AssemblyName System.IO.Compression.FileSystem",
     `$zip=[System.IO.Compression.ZipFile]::OpenRead('${escapePowerShell(archive)}')`,
     "try { foreach ($entry in $zip.Entries) { [Console]::Out.WriteLine($entry.FullName) } } finally { $zip.Dispose() }",
@@ -579,6 +580,7 @@ function extractZipArchiveMemberOnWindows(archive, member) {
   const output = path.join(temp, "member.bin");
   const script = [
     "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression",
     "Add-Type -AssemblyName System.IO.Compression.FileSystem",
     `$zip=[System.IO.Compression.ZipFile]::OpenRead('${escapePowerShell(archive)}')`,
     `try { $matches=@($zip.Entries | Where-Object { $_.FullName -ceq '${escapePowerShell(member)}' }); if ($matches.Count -ne 1) { throw 'expected exactly one archive member ${escapePowerShell(member)}' }; [System.IO.Compression.ZipFileExtensions]::ExtractToFile($matches[0], '${escapePowerShell(output)}', $true) } finally { $zip.Dispose() }`,
@@ -637,6 +639,7 @@ function createZipArchiveOnWindows(archive, sourceDir) {
   fs.writeFileSync(manifest, `${JSON.stringify(entries)}\n`);
   const script = [
     "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.IO.Compression",
     "Add-Type -AssemblyName System.IO.Compression.FileSystem",
     `$items=@(Get-Content -LiteralPath '${escapePowerShell(manifest)}' -Raw | ConvertFrom-Json)`,
     `$zip=[System.IO.Compression.ZipFile]::Open('${escapePowerShell(archive)}',[System.IO.Compression.ZipArchiveMode]::Create)`,

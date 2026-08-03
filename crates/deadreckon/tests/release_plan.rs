@@ -1468,6 +1468,7 @@ fn evaluator_sidecar_tool_uses_dotnet_zip_apis_on_windows() {
         "extractZipArchiveOnWindows(archive, destination)",
         "extractZipArchiveMemberOnWindows(archive, member)",
         "createZipArchiveOnWindows(staged, sourceDir)",
+        "Add-Type -AssemblyName System.IO.Compression",
         "System.IO.Compression.ZipFile",
         "System.IO.Compression.ZipFileExtensions",
         "ZipArchiveMode]::Create",
