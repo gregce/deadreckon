@@ -1355,10 +1355,10 @@ fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
         let archive = if target.ends_with("windows-msvc") {
             let archive = distrib.join(format!("deadreckon-{target}.zip"));
             let output = Command::new("zip")
-                .args(["-X", "-q", "-r"])
+                .args(["-X", "-q"])
                 .arg(&archive)
-                .arg(&payload_name)
-                .current_dir(&payloads)
+                .args(["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"])
+                .current_dir(&payload)
                 .output()
                 .expect("create Windows zip");
             assert!(

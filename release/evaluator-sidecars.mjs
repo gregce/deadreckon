@@ -235,9 +235,16 @@ function archiveInventory(archive, target) {
   const listed = listArchive(archive);
   assertSafeArchiveMembers(archive, listed);
   const payloadName = `deadreckon-${target}`;
+  const wrappedPrefix = `${payloadName}/`;
+  const wrapped = hostHelpers(target).every((name) => listed.includes(`${wrappedPrefix}${name}`));
+  const flat = hostHelpers(target).every((name) => listed.includes(name));
+  if (wrapped === flat || (flat && !target.endsWith("windows-msvc"))) {
+    throw new Error(`${path.basename(archive)} has an unsupported or ambiguous payload layout`);
+  }
+  const payloadPrefix = wrapped ? wrappedPrefix : "";
   const requiredNames = [...hostHelpers(target), ...EVALUATORS.map((entry) => entry.name)];
   for (const name of requiredNames) {
-    const expectedPath = `${payloadName}/${name}`;
+    const expectedPath = `${payloadPrefix}${name}`;
     const occurrences = listed.filter((entry) => entry === expectedPath);
     if (occurrences.length !== 1) {
       throw new Error(`${path.basename(archive)} must contain exactly one ${expectedPath}`);
@@ -462,14 +469,21 @@ function assertHostHelpers(payload, target) {
 
 function payloadDirectory(extractDir, target) {
   const expected = path.join(extractDir, `deadreckon-${target}`);
-  if (!fs.existsSync(expected) || !fs.statSync(expected).isDirectory()) {
-    throw new Error(`archive must contain top-level directory deadreckon-${target}`);
+  const topLevel = fs
+    .readdirSync(extractDir, { withFileTypes: true })
+    .filter((entry) => entry.name !== ".DS_Store");
+  if (fs.existsSync(expected) && fs.statSync(expected).isDirectory()) {
+    if (topLevel.length !== 1 || topLevel[0].name !== `deadreckon-${target}`) {
+      throw new Error(`archive must contain only top-level directory deadreckon-${target}`);
+    }
+    return expected;
   }
-  const topLevel = fs.readdirSync(extractDir).filter((name) => name !== ".DS_Store");
-  if (topLevel.length !== 1 || topLevel[0] !== `deadreckon-${target}`) {
-    throw new Error(`archive must contain only top-level directory deadreckon-${target}`);
+  if (target.endsWith("windows-msvc") && topLevel.length > 0 && topLevel.every((entry) => entry.isFile())) {
+    return extractDir;
   }
-  return expected;
+  throw new Error(
+    `archive must contain wrapped deadreckon-${target} payload or a flat Windows payload`,
+  );
 }
 
 function oneTargetArchive(dir, target) {
