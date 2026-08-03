@@ -32,6 +32,30 @@ fn dist_plan_lists_all_five_targets() {
 }
 
 #[test]
+fn dist_plan_packages_only_production_binaries() {
+    let dist = dist_config();
+    let binaries = dist
+        .get("binaries")
+        .and_then(Value::as_table)
+        .expect("binaries table");
+    let expected = ["deadreckon", "dr-capture", "dr-gate"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+
+    for target in DIST_TARGETS {
+        let actual = string_array(binaries, target)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            expected, actual,
+            "{target} must package the three production binaries and exclude the internal characterization harness"
+        );
+    }
+    assert_dist_plan_json_if_installed();
+}
+
+#[test]
 fn dist_plan_pins_linux_glibc_2_28() {
     let dist = dist_config();
     let glibc = dist
