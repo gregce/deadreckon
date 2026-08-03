@@ -41,7 +41,7 @@ test(
       run("powershell", [
         "-NoProfile",
         "-Command",
-        `$ErrorActionPreference='Stop'; Compress-Archive -LiteralPath '${escapePowerShell(payload)}' -DestinationPath '${escapePowerShell(archive)}' -CompressionLevel Optimal -Force`,
+        `$ErrorActionPreference='Stop'; Compress-Archive -Path '${escapePowerShell(path.join(payload, "*"))}' -DestinationPath '${escapePowerShell(archive)}' -CompressionLevel Optimal -Force`,
       ]);
       fs.writeFileSync(
         `${archive}.sha256`,
