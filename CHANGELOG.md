@@ -2,7 +2,15 @@
 
 ## Unreleased
 
-## Doctor False Negative — 2026-08-03
+- Release trust generation now discovers signing records in the nested CI
+  artifact layout, and public flat-download verification independently checks
+  manifest signing claims against checksummed trust evidence. Conflicting,
+  missing, or inaccurate signing metadata fails closed.
+- Watchkeeper cancellation acceptance now waits on the authoritative guarded
+  process transition instead of a downstream workspace sentinel, with bounded
+  progress deadlines and complete timeout diagnostics under host load.
+
+### Doctor False Negative
 
 - Fixed `deadreckon doctor` false negative for CLI providers without an
   explicit binary override (notably `cli:pi`), where the doctor hardcoded
