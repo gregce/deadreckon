@@ -767,7 +767,7 @@ fn release_manifest_covers_artifacts_and_checksums() {
     .expect("archive member manifest");
     fs::write(
         distrib.join("trust/macos-aarch64-apple-darwin.json"),
-        r#"{"target":"aarch64-apple-darwin","signed":true,"notarized":true}"#,
+        r#"{"target":"aarch64-apple-darwin","signed":true,"signature_kind":"Developer ID Application","notarized":true}"#,
     )
     .expect("mac trust");
 
@@ -836,6 +836,16 @@ fn release_manifest_covers_artifacts_and_checksums() {
                 && artifact.get("notarized").and_then(JsonValue::as_bool) == Some(true)),
         "{manifest:#?}"
     );
+    let unsigned_linux = artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.get("name").and_then(JsonValue::as_str)
+                == Some("deadreckon-x86_64-unknown-linux-gnu.tar.xz")
+        })
+        .expect("unsigned Linux archive");
+    assert_eq!(Some(false), unsigned_linux["signed"].as_bool());
+    assert_eq!(Some(false), unsigned_linux["notarized"].as_bool());
+    assert!(unsigned_linux["signature_kind"].is_null());
     assert!(
         artifacts
             .iter()
@@ -854,6 +864,303 @@ fn release_manifest_covers_artifacts_and_checksums() {
             artifact.get("name").and_then(JsonValue::as_str) == Some("release-archive-members.json")
         }),
         "{manifest:#?}"
+    );
+}
+
+#[test]
+fn nested_ci_trust_status_survives_flat_public_verification() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let nested_distrib = distrib.join("target/distrib");
+    let payload_name = "deadreckon-aarch64-apple-darwin";
+    let payload = temp.path().join("payload").join(payload_name);
+    fs::create_dir_all(&payload).expect("payload");
+    fs::create_dir_all(nested_distrib.join("trust")).expect("nested trust");
+    fs::write(payload.join("deadreckon"), "native binary").expect("binary");
+    let archive = nested_distrib.join(format!("{payload_name}.tar.xz"));
+    let output = Command::new("tar")
+        .args(["-cJf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(temp.path().join("payload"))
+        .arg(payload_name)
+        .output()
+        .expect("tar");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let trust_name = "macos-aarch64-apple-darwin.json";
+    let trust = r#"{
+  "target": "aarch64-apple-darwin",
+  "signed": true,
+  "signature_kind": "Developer ID Application",
+  "notarized": true
+}
+"#;
+    fs::write(nested_distrib.join("trust").join(trust_name), trust).expect("nested trust status");
+    let windows_trust_name = "windows-x86_64-pc-windows-msvc.json";
+    let windows_trust = r#"{"target":"x86_64-pc-windows-msvc","signed":true,"notarized":false}"#;
+    fs::write(
+        nested_distrib.join("trust").join(windows_trust_name),
+        windows_trust,
+    )
+    .expect("nested Windows trust status");
+    let duplicate_trust = distrib.join("dist-global/target/distrib/trust");
+    fs::create_dir_all(&duplicate_trust).expect("duplicate trust directory");
+    fs::write(duplicate_trust.join(trust_name), trust).expect("identical duplicate trust status");
+
+    assert_release_trust_success([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--out",
+        distrib.join("SHA256SUMS").to_str().expect("checksums path"),
+    ]);
+    assert_release_trust_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--ref",
+        "refs/tags/v0.8.0",
+        "--repo",
+        "gregce/deadreckon",
+        "--commit",
+        "abc123",
+        "--out",
+        distrib
+            .join("release-manifest.json")
+            .to_str()
+            .expect("manifest path"),
+    ]);
+
+    let manifest = read_json(&distrib.join("release-manifest.json"));
+    let archive_record = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts")
+        .iter()
+        .find(|artifact| artifact["name"] == format!("{payload_name}.tar.xz"))
+        .expect("macOS archive record");
+    assert_eq!(Some(true), archive_record["signed"].as_bool());
+    assert_eq!(Some(true), archive_record["notarized"].as_bool());
+    assert_eq!(
+        Some("Developer ID Application"),
+        archive_record["signature_kind"].as_str()
+    );
+    assert!(
+        manifest["artifacts"]
+            .as_array()
+            .expect("artifacts")
+            .iter()
+            .any(|artifact| {
+                artifact["name"] == windows_trust_name && artifact["kind"] == "trust-status"
+            }),
+        "{manifest:#?}"
+    );
+
+    let public = temp.path().join("public-v0.8.0");
+    fs::create_dir_all(&public).expect("public download");
+    fs::copy(&archive, public.join(format!("{payload_name}.tar.xz"))).expect("flatten archive");
+    fs::copy(
+        nested_distrib.join("trust").join(trust_name),
+        public.join(trust_name),
+    )
+    .expect("flatten trust status");
+    fs::copy(
+        nested_distrib.join("trust").join(windows_trust_name),
+        public.join(windows_trust_name),
+    )
+    .expect("flatten Windows trust status");
+    fs::copy(distrib.join("SHA256SUMS"), public.join("SHA256SUMS")).expect("flatten checksums");
+    fs::copy(
+        distrib.join("release-manifest.json"),
+        public.join("release-manifest.json"),
+    )
+    .expect("flatten manifest");
+
+    assert_release_trust_success([
+        "verify-manifest",
+        "--dir",
+        public.to_str().expect("public path"),
+        "--manifest",
+        public
+            .join("release-manifest.json")
+            .to_str()
+            .expect("public manifest"),
+        "--checksums",
+        public
+            .join("SHA256SUMS")
+            .to_str()
+            .expect("public checksums"),
+    ]);
+
+    let correct_manifest =
+        fs::read(public.join("release-manifest.json")).expect("correct manifest");
+    for (field, false_value) in [
+        ("signed", JsonValue::Bool(false)),
+        ("notarized", JsonValue::Bool(false)),
+        ("signature_kind", JsonValue::Null),
+    ] {
+        let mut false_manifest: JsonValue =
+            serde_json::from_slice(&correct_manifest).expect("parse correct manifest");
+        let false_archive = false_manifest["artifacts"]
+            .as_array_mut()
+            .expect("artifacts")
+            .iter_mut()
+            .find(|artifact| artifact["name"] == format!("{payload_name}.tar.xz"))
+            .expect("macOS archive record");
+        false_archive[field] = false_value;
+        fs::write(
+            public.join("release-manifest.json"),
+            serde_json::to_vec_pretty(&false_manifest).expect("encode false manifest"),
+        )
+        .expect("write false manifest");
+
+        let output = release_trust([
+            "verify-manifest",
+            "--dir",
+            public.to_str().expect("public path"),
+            "--manifest",
+            public
+                .join("release-manifest.json")
+                .to_str()
+                .expect("public manifest"),
+            "--checksums",
+            public
+                .join("SHA256SUMS")
+                .to_str()
+                .expect("public checksums"),
+        ]);
+        assert!(!output.status.success(), "false {field} must fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("target aarch64-apple-darwin"), "{stderr}");
+        assert!(stderr.contains(&format!("field {field}")), "{stderr}");
+        assert!(stderr.contains("checksummed trust"), "{stderr}");
+    }
+    fs::write(public.join("release-manifest.json"), correct_manifest).expect("restore manifest");
+}
+
+#[test]
+fn release_manifest_rejects_conflicting_duplicate_target_trust() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let first = distrib.join("target/distrib/trust");
+    let second = distrib.join("dist-global/target/distrib/trust");
+    fs::create_dir_all(&first).expect("first trust directory");
+    fs::create_dir_all(&second).expect("second trust directory");
+    let name = "macos-aarch64-apple-darwin.json";
+    fs::write(
+        first.join(name),
+        r#"{"target":"aarch64-apple-darwin","signed":true,"notarized":true}"#,
+    )
+    .expect("first trust status");
+    fs::write(
+        second.join(name),
+        r#"{"target":"aarch64-apple-darwin","signed":true,"notarized":false}"#,
+    )
+    .expect("conflicting trust status");
+
+    let output = release_trust([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--ref",
+        "refs/tags/v0.8.0",
+        "--repo",
+        "gregce/deadreckon",
+        "--commit",
+        "abc123",
+        "--out",
+        distrib
+            .join("release-manifest.json")
+            .to_str()
+            .expect("manifest path"),
+    ]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting trust status for target aarch64-apple-darwin"),
+        "{stderr}"
+    );
+    assert!(!distrib.join("release-manifest.json").exists());
+}
+
+#[test]
+fn verify_manifest_requires_trust_when_target_policy_requires_signing() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let payload_name = "deadreckon-aarch64-apple-darwin";
+    let payload = temp.path().join("payload").join(payload_name);
+    fs::create_dir_all(&distrib).expect("distrib");
+    fs::create_dir_all(&payload).expect("payload");
+    fs::write(payload.join("deadreckon"), "native binary").expect("binary");
+    let archive = distrib.join(format!("{payload_name}.tar.xz"));
+    let output = Command::new("tar")
+        .args(["-cJf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(temp.path().join("payload"))
+        .arg(payload_name)
+        .output()
+        .expect("tar");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sums = distrib.join("SHA256SUMS");
+    let manifest_path = distrib.join("release-manifest.json");
+    assert_release_trust_success([
+        "checksums",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--out",
+        sums.to_str().expect("checksums path"),
+    ]);
+    assert_release_trust_success([
+        "manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--ref",
+        "refs/tags/v0.8.0",
+        "--repo",
+        "gregce/deadreckon",
+        "--commit",
+        "abc123",
+        "--out",
+        manifest_path.to_str().expect("manifest path"),
+    ]);
+
+    let manifest = read_json(&manifest_path);
+    let archive_record = manifest["artifacts"]
+        .as_array()
+        .expect("artifacts")
+        .iter()
+        .find(|artifact| artifact["name"] == format!("{payload_name}.tar.xz"))
+        .expect("macOS archive record");
+    assert_eq!(Some(false), archive_record["signed"].as_bool());
+    assert_eq!(Some(false), archive_record["notarized"].as_bool());
+    assert!(archive_record["signature_kind"].is_null());
+
+    let output = release_trust([
+        "verify-manifest",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--manifest",
+        manifest_path.to_str().expect("manifest path"),
+        "--checksums",
+        sums.to_str().expect("checksums path"),
+    ]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "target aarch64-apple-darwin requires signing but has no checksummed trust status"
+        ),
+        "{stderr}"
     );
 }
 
@@ -1788,7 +2095,7 @@ fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
         "--ref",
         "refs/tags/v9.9.9-rc.1",
         "--repo",
-        "gregce/deadreckon",
+        "someone/deadreckon",
         "--commit",
         "0000000000000000000000000000000000000000",
         "--out",
@@ -1837,7 +2144,7 @@ fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
         "--ref",
         "refs/tags/v9.9.9-rc.1",
         "--repo",
-        "gregce/deadreckon",
+        "someone/deadreckon",
         "--commit",
         "0000000000000000000000000000000000000000",
         "--out",

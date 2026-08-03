@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Release trust generation now discovers signing records in the nested CI
+  artifact layout, and public flat-download verification independently checks
+  manifest signing claims against checksummed trust evidence. Conflicting,
+  missing, or inaccurate signing metadata fails closed.
 ## 0.8.0 — The watch keeps — 2026-08-02
 
 Seventy-nine commits since 0.7.0 turn DeadReckon from a foreground harness that
