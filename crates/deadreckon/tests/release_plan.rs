@@ -1460,6 +1460,26 @@ fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
 }
 
 #[test]
+fn evaluator_sidecar_tool_uses_dotnet_zip_apis_on_windows() {
+    let tool = fs::read_to_string(workspace_root().join("release/evaluator-sidecars.mjs"))
+        .expect("evaluator sidecar tool");
+    for required in [
+        "listZipArchiveOnWindows(archive)",
+        "extractZipArchiveOnWindows(archive, destination)",
+        "extractZipArchiveMemberOnWindows(archive, member)",
+        "System.IO.Compression.ZipFile",
+        "System.IO.Compression.ZipFileExtensions",
+        "Expand-Archive -LiteralPath",
+    ] {
+        assert!(tool.contains(required), "missing {required} from {tool}");
+    }
+    assert!(
+        !tool.contains("process.platform === \"win32\"\n      ? spawnSync(\"tar\""),
+        "Windows ZIP handling must not depend on whichever tar Git Bash places first on PATH"
+    );
+}
+
+#[test]
 fn generated_installers_are_patched_for_native_helpers_and_both_evaluators() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let shell = temp.path().join("deadreckon-installer.sh");

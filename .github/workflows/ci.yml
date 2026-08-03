@@ -37,3 +37,17 @@ jobs:
       - name: Fresh release binary size
         shell: bash
         run: make size-check
+
+  release-zip-smoke:
+    name: release ZIP smoke (windows)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Assemble and verify the Windows release ZIP
+        shell: pwsh
+        run: node --test release/evaluator-sidecars.test.mjs
