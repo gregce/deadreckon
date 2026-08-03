@@ -211,8 +211,9 @@ existing fail-closed preflight and publication jobs become mandatory again.
    ```
 
 7. For a stable cut, run the real-provider proof harness (operator-only;
-   it refuses under CI and burns a few real provider turns per route —
-   expect a small spend):
+   it refuses under CI and consumes a few real provider turns per route).
+   Subscription CLI routes record no metered DeadReckon spend, but still use
+   provider quota and wall-clock time:
 
    ```sh
    make build
@@ -220,7 +221,9 @@ existing fail-closed preflight and publication jobs become mandatory again.
    release/preflight-real.sh cli:gemini # extend by argument
    ```
 
-   On success it records the probed binary versions in
+   For each route the harness proves one verified delivery and one
+   identity-bound cancellation with no surviving provider process. On success
+   it records the probed binary versions in
    `release/known-good-providers.json` (schema_version 1); commit that file
    so the release notes can reference known-good CLI versions.
 8. Create and push an RC tag first. Review the GitHub Actions run, artifacts,

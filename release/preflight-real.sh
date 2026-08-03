@@ -1,10 +1,10 @@
 #!/bin/sh
 # Real-provider proof harness for a stable cut. Operator-run only: each
-# route burns a few real provider turns (expect a small spend per route).
+# route consumes a few real provider turns (subscription quota for CLI routes).
 #
 # Per route: a sandboxed DEADRECKON_HOME and a throwaway git repo, then
-#   start -> run completes -> signed gate marker present -> apply succeeds
-#   -> a second run is killed mid-turn and resumed to completion.
+#   durable run -> verified receipt -> signed gate marker -> finish succeeds
+#   -> a second run is cancelled mid-turn and its provider tree is reaped.
 # On success the probed binary versions land in
 # release/known-good-providers.json (schema_version 1).
 #
@@ -14,7 +14,7 @@
 set -eu
 
 if [ -n "${CI:-}" ]; then
-  echo "preflight-real.sh proves real providers and spends real money;" >&2
+  echo "preflight-real.sh proves real providers and consumes real provider quota;" >&2
   echo "it refuses to run under CI (CI=${CI} is set). Run it yourself." >&2
   exit 1
 fi
@@ -22,8 +22,9 @@ fi
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 deadreckon_bin=${DEADRECKON_BIN:-"$repo_root/target/release/deadreckon"}
 known_good="$repo_root/release/known-good-providers.json"
-goal="add a comment header to README.md naming this file's purpose"
+goal="make purpose.sh print exactly: DeadReckon provider preflight fixture"
 operator=${USER:-unknown}
+job_timeout_seconds=${PREFLIGHT_JOB_TIMEOUT_SECONDS:-900}
 
 if [ ! -x "$deadreckon_bin" ]; then
   echo "no release binary at $deadreckon_bin — run 'make build' first," >&2
@@ -70,20 +71,144 @@ fresh_repo() {
     git config user.email preflight@deadreckon.local
     git config user.name "deadreckon preflight"
     printf '# preflight fixture\n' > README.md
-    git add README.md
+    printf '#!/bin/sh\nprintf "%%s\\n" "unfinished preflight fixture"\n' > purpose.sh
+    chmod +x purpose.sh
+    git add README.md purpose.sh
     git commit -qm "fixture"
   )
   echo "$dir"
 }
 
-latest_run_id() {
-  # state.json lives at <home>/runstate/<task>/runs/<run_id>/state.json
-  find "$1/runstate" -name state.json 2>/dev/null \
-    | while IFS= read -r state; do
-        dir=$(dirname "$state")
-        printf '%s %s\n' "$(stat -f %m "$state" 2>/dev/null || stat -c %Y "$state")" "$(basename "$dir")"
+write_fixture_contract() {
+  dir=$1
+  mkdir -p "$dir/.deadreckon"
+  cat > "$dir/.deadreckon/acceptance.yaml" <<'EOF'
+name: real provider preflight
+checks:
+  - kind: shell
+    command: >-
+      output=$(sh purpose.sh); test "$output" = "DeadReckon provider preflight fixture"
+    cwd: "{working_dir}"
+EOF
+  cat > "$dir/.deadreckon/acceptance.md" <<'EOF'
+# Real provider preflight done criteria
+
+Running `purpose.sh` must print exactly:
+
+`DeadReckon provider preflight fixture`
+
+The executable check runs the delivered script and compares its observed output
+with that exact expected value.
+EOF
+}
+
+commit_fixture_contract() {
+  repo=$1
+  home=$2
+  write_fixture_contract "$repo"
+  (
+    cd "$repo"
+    DEADRECKON_HOME="$home" "$deadreckon_bin" def-done show >/dev/null
+    if DEADRECKON_HOME="$home" "$deadreckon_bin" def-done check >/dev/null 2>&1; then
+      echo "    FAIL: preflight contract passed before provider work" >&2
+      exit 1
+    fi
+    git add -A
+    git commit -qm "done criteria"
+  )
+}
+
+latest_job_id() {
+  find "$1/jobs" -name job.json 2>/dev/null \
+    | while IFS= read -r job; do
+        printf '%s %s\n' "$(stat -f %m "$job" 2>/dev/null || stat -c %Y "$job")" "$(basename "$(dirname "$job")")"
       done \
     | sort -rn | head -n1 | cut -d' ' -f2
+}
+
+wait_for_verified_job() {
+  home=$1
+  job_id=$2
+  deadline=$(( $(date +%s) + job_timeout_seconds ))
+  projection="$home/jobs/$job_id/projection.json"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    phase=$(sed -n 's/^[[:space:]]*"phase": "\([^"]*\)".*$/\1/p' "$projection" 2>/dev/null | head -n1)
+    if [ "$phase" = "terminal" ]; then
+      outcome=$(sed -n 's/^[[:space:]]*"outcome": "\([^"]*\)".*$/\1/p' "$projection" | head -n1)
+      if [ "$outcome" = "verified" ]; then
+        return 0
+      fi
+      echo "    FAIL: job $job_id ended with outcome ${outcome:-unknown}" >&2
+      DEADRECKON_HOME="$home" "$deadreckon_bin" status "$job_id" --plain >&2 || true
+      return 1
+    fi
+    sleep 2
+  done
+  echo "    FAIL: job $job_id did not finish within ${job_timeout_seconds}s" >&2
+  DEADRECKON_HOME="$home" "$deadreckon_bin" status "$job_id" --plain >&2 || true
+  return 1
+}
+
+launch_route_job() {
+  repo=$1
+  home=$2
+  route=$3
+  (
+    cd "$repo"
+    DEADRECKON_HOME="$home" "$deadreckon_bin" run "$goal" \
+      --provider "$route" --yes --quiet --plain --no-docs >&2
+  )
+  latest_job_id "$home"
+}
+
+wait_for_provider_pid() {
+  home=$1
+  run_id=$2
+  deadline=$(( $(date +%s) + 60 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    pid_file=$(find "$home/runstate" -path "*/runs/$run_id/child-pids/provider-turn-*.pid" \
+      -type f 2>/dev/null | sort | tail -n1)
+    if [ -n "$pid_file" ]; then
+      pid=$(sed -n 's/.*"pid":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$pid_file" | head -n1)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s\n' "$pid"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  echo "    FAIL: no live identity-bound provider process appeared for run $run_id" >&2
+  return 1
+}
+
+assert_job_cancelled() {
+  home=$1
+  job_id=$2
+  projection="$home/jobs/$job_id/projection.json"
+  deadline=$(( $(date +%s) + 30 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    phase=$(sed -n 's/^[[:space:]]*"phase": "\([^"]*\)".*$/\1/p' "$projection" | head -n1)
+    outcome=$(sed -n 's/^[[:space:]]*"outcome": "\([^"]*\)".*$/\1/p' "$projection" | head -n1)
+    if [ "$phase" = "terminal" ] && [ "$outcome" = "cancelled" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "    FAIL: cancelled Job $job_id recorded ${phase:-unknown}/${outcome:-unknown}" >&2
+  DEADRECKON_HOME="$home" "$deadreckon_bin" status "$job_id" --plain >&2 || true
+  return 1
+}
+
+assert_process_reaped() {
+  pid=$1
+  deadline=$(( $(date +%s) + 10 ))
+  while kill -0 "$pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "    FAIL: cancelled provider process $pid is still alive" >&2
+    return 1
+  fi
 }
 
 results=""
@@ -101,18 +226,16 @@ for route in $routes; do
   mkdir -p "$home"
   repo=$(fresh_repo "${route#cli:}")
 
-  echo "    start: full run to completion"
-  (
-    cd "$repo"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" def-done \
-      "README.md gains a comment header naming the file's purpose"
-    git add -A && git commit -qm "done criteria"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" start "$goal" \
-      --mode run --provider "$route" --yes --plain
-  )
+  echo "    run: durable execution to completion"
+  commit_fixture_contract "$repo" "$home"
+  job_id=$(launch_route_job "$repo" "$home" "$route")
+  [ -n "$job_id" ] || { echo "    FAIL: no Job recorded for $route" >&2; exit 1; }
+  wait_for_verified_job "$home" "$job_id"
 
-  run_id=$(latest_run_id "$home")
-  [ -n "$run_id" ] || { echo "    FAIL: no run recorded for $route" >&2; exit 1; }
+  # A durable single-leaf Job deliberately reuses its Job id for the child
+  # Run. Avoid a newest-by-mtime guess once this isolated home contains the
+  # second cancellation fixture.
+  run_id=$job_id
 
   marker=$(find "$home/runstate" -path "*/$run_id/*" -name turn-acceptance.json | head -n1)
   [ -n "$marker" ] || { echo "    FAIL: no turn-acceptance.json for $run_id" >&2; exit 1; }
@@ -122,32 +245,25 @@ for route in $routes; do
 
   (
     cd "$repo"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" apply "$run_id" --plain --no-confirm
+    DEADRECKON_HOME="$home" "$deadreckon_bin" finish "$job_id" --no-confirm --cleanup
   )
-  echo "    apply: succeeded"
+  [ "$(sh "$repo/purpose.sh")" = "DeadReckon provider preflight fixture" ] \
+    || { echo "    FAIL: finished result was not delivered" >&2; exit 1; }
+  echo "    finish: verified receipt delivered"
 
-  echo "    kill/resume: interrupt a second run mid-turn"
-  repo2=$(fresh_repo "${route#cli:}-resume")
-  (
-    cd "$repo2"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" def-done \
-      "README.md gains a comment header naming the file's purpose"
-    git add -A && git commit -qm "done criteria"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" start "$goal" \
-      --mode run --provider "$route" --yes --plain
-  ) &
-  bg_pid=$!
-  sleep 20
-  resume_id=$(latest_run_id "$home")
-  DEADRECKON_HOME="$home" "$deadreckon_bin" kill "$resume_id" --plain || true
-  wait "$bg_pid" 2>/dev/null || true
-  (
-    cd "$repo2"
-    DEADRECKON_HOME="$home" "$deadreckon_bin" resume "$resume_id" --plain
-  )
-  echo "    kill/resume: resumed to completion"
+  echo "    cancel: interrupt a second run and reap its provider tree"
+  repo2=$(fresh_repo "${route#cli:}-cancel")
+  commit_fixture_contract "$repo2" "$home"
+  cancel_job_id=$(launch_route_job "$repo2" "$home" "$route")
+  [ -n "$cancel_job_id" ] || { echo "    FAIL: no cancellation Job recorded for $route" >&2; exit 1; }
+  cancel_run_id=$cancel_job_id
+  provider_pid=$(wait_for_provider_pid "$home" "$cancel_run_id")
+  DEADRECKON_HOME="$home" "$deadreckon_bin" kill "$cancel_job_id" --plain --escalate
+  assert_job_cancelled "$home" "$cancel_job_id"
+  assert_process_reaped "$provider_pid"
+  echo "    cancel: Job terminal and provider process reaped"
 
-  entry=$(printf '{"route":"%s","binary_version":"%s","proof":"start -> real turns -> gate signed -> apply -> kill/resume","run_id":"%s","operator":"%s"}' \
+  entry=$(printf '{"route":"%s","binary_version":"%s","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"%s","operator":"%s"}' \
     "$route" "$binary_version" "$run_id" "$operator")
   if [ -n "$results" ]; then
     results="$results,
