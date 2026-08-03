@@ -117,6 +117,12 @@ function classifyRelease(localArgs = args) {
   const official_repo = repo === officialRepo;
   const releaseLane = lane === "stable" || lane === "rc";
   const officialRelease = official_repo && releaseLane;
+  // v0.8.0 lane narrowing (operator decision, 2026-08-02): publish the
+  // checksummed/attested GitHub payload and Homebrew formula now. npm waits on
+  // trusted-publisher setup; Windows Authenticode waits on a certificate. Flip
+  // either flag to false only after its corresponding trust material exists.
+  const npmPublishingDeferred = true;
+  const windowsSigningDeferred = true;
   return {
     schema_version: 1,
     lane,
@@ -130,13 +136,13 @@ function classifyRelease(localArgs = args) {
     publishes: officialRelease,
     publish_github_release: officialRelease,
     publish_homebrew: official_repo && lane === "stable",
-    publish_npm: official_repo && lane === "stable",
+    publish_npm: official_repo && lane === "stable" && !npmPublishingDeferred,
     release_notes_mode: lane === "rc" ? "prerelease" : lane === "stable" ? "stable" : "none",
     requires_macos_signing: officialRelease,
-    requires_windows_signing: official_repo && lane === "stable",
+    requires_windows_signing: official_repo && lane === "stable" && !windowsSigningDeferred,
     requires_attestation: officialRelease,
     requires_homebrew_token: official_repo && lane === "stable",
-    requires_npm_provenance: official_repo && lane === "stable",
+    requires_npm_provenance: official_repo && lane === "stable" && !npmPublishingDeferred,
   };
 }
 

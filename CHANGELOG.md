@@ -2,12 +2,6 @@
 
 ## Unreleased
 
-- Make `start` done-contract authoring follow the launch's selected planner or
-  lead execution provider/model, and show that same route in previews.
-- Fix Claude Code done-contract authoring by supplying a valid isolated empty
-  MCP configuration, and point authoring failures at the effective
-  `defaults.doc_provider` setting.
-
 ## 0.8.0 — The watch keeps — 2026-08-02
 
 Seventy-nine commits since 0.7.0 turn DeadReckon from a foreground harness that
@@ -88,14 +82,19 @@ unmanaged binary or service.
 - Strict unattended completion now becomes `NEEDS REVIEW` when the semantic
   judge is unavailable; it is never silently accepted from deterministic checks
   alone.
+- `start` done-contract authoring follows the launch's selected planner or lead
+  execution provider/model and shows that same route in previews.
+- Claude Code done-contract authoring receives a valid isolated empty MCP
+  configuration, and direct authoring failures identify the effective
+  `defaults.doc_provider` setting.
 
 ### Release trust
 
-- The temporary v0.1.0 npm and Windows exceptions are removed. An official
-  stable release now fails preflight unless npm trusted publishing (or the token
-  fallback) and Windows Authenticode credentials are present. Platform packages
-  publish before the npm wrapper with provenance, and an unsigned stable Windows
-  archive cannot reach the public release.
+- The initial `0.8.0` stable publication is deliberately narrowed to GitHub and
+  Homebrew while npm trusted publishing and Windows Authenticode credentials
+  are deferred. The Windows archive remains covered by checksums and GitHub
+  attestations; the checked-in fail-closed npm and signing paths can be enabled
+  for a later release once their trust material exists.
 
 ## Soundings (stable) — 2026-08-02
 

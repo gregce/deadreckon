@@ -542,10 +542,20 @@ jobs:
           gh attestation verify <artifact> --repo gregce/deadreckon
           ```
 
-          macOS artifacts are Developer ID signed and notarized. Stable Windows
-          artifacts are Authenticode signed. The release manifest records signing,
+          macOS artifacts are Developer ID signed and notarized. Every artifact
+          is checksummed and attested. The release manifest records signing,
           notarization, checksum, package-manager, and attestation policy status.
           EOF
+          if [ "${{ needs.release-policy.outputs.requires_windows_signing }}" = "true" ]; then
+            printf '\nWindows artifacts are Authenticode signed.\n' >> "$notes"
+          else
+            printf '\nWindows Authenticode signing is deferred for this release; the Windows archive remains checksummed and attested.\n' >> "$notes"
+          fi
+          if [ "${{ needs.release-policy.outputs.publish_npm }}" = "true" ]; then
+            printf '\nThe npm package family is published with provenance.\n' >> "$notes"
+          else
+            printf '\nnpm publication is deferred for this release.\n' >> "$notes"
+          fi
           prerelease=()
           if [ "${{ needs.release-policy.outputs.lane }}" = "rc" ]; then
             prerelease=(--prerelease)

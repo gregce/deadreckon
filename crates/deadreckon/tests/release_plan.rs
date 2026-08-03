@@ -323,16 +323,16 @@ fn release_lane_classifies_branch_rc_and_stable_tags() {
         stable.get("publish_homebrew").and_then(JsonValue::as_bool)
     );
     assert_eq!(
-        Some(true),
+        Some(false),
         stable.get("publish_npm").and_then(JsonValue::as_bool),
-        "stable official releases publish the complete npm package family"
+        "npm publishing is consciously deferred until trusted publishing is configured"
     );
     assert_eq!(
-        Some(true),
+        Some(false),
         stable
             .get("requires_windows_signing")
             .and_then(JsonValue::as_bool),
-        "stable official releases require Authenticode-signed Windows artifacts"
+        "Windows Authenticode is consciously deferred until a certificate exists"
     );
     assert_eq!(
         Some(true),
@@ -369,13 +369,20 @@ fn official_release_requires_trust_material() {
         "APPLE_TEAM_ID",
         "APPLE_APP_PWD",
         "HOMEBREW_TAP_TOKEN",
+    ] {
+        assert!(
+            stderr.contains(required),
+            "{required} missing from {stderr}"
+        );
+    }
+    for deferred in [
         "npm trusted publishing or NPM_TOKEN",
         "WINDOWS_CERT_PFX",
         "WINDOWS_CERT_PWD",
     ] {
         assert!(
-            stderr.contains(required),
-            "{required} missing from {stderr}"
+            !stderr.contains(deferred),
+            "{deferred} should be deferred from the narrowed v0.8.0 lane: {stderr}"
         );
     }
 }
