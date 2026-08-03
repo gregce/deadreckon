@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## Doctor False Negative — 2026-08-03
+
+- Fixed `deadreckon doctor` false negative for CLI providers without an
+  explicit binary override (notably `cli:pi`), where the doctor hardcoded
+  a `"codex"` fallback instead of consulting the provider registry's
+  `default_binary` field. The doctor now resolves the correct binary for
+  every CLI provider through descriptor data.
+- The resolution chain is fixed order: config `binary` override → registry
+  `default_binary` → provider name. No keyword matching survives; the old
+  `contains("claude")` / `"codex"` branch is deleted.
+- Depth tests in `crates/deadreckon/tests/doctor_providers.rs` pin every
+  built-in CLI provider to its descriptor's binary (found and missing), the
+  codex non-regression case, and a descriptor-less custom provider name.
+
 ## 0.8.0 — The watch keeps — 2026-08-02
 
 Seventy-nine commits since 0.7.0 turn DeadReckon from a foreground harness that
