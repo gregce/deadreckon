@@ -5,7 +5,7 @@ status: 0
     "inspect_root": "<TMP>/repo",
     "needed": false,
     "posture": "structured_text",
-    "provider": null,
+    "provider": "smoke / local-scripted-smoke (structured text)",
     "wall_seconds": "<DURATION>",
     "write_root": "<TMP>/repo/.deadreckon"
   },
