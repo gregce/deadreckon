@@ -27,6 +27,11 @@ const EVALUATORS = [
   },
 ];
 
+// Release binaries are substantially larger than Node's 1 MiB spawnSync
+// default. Keep extraction bounded, but high enough for optimized host and
+// evaluator binaries so archive inventory cannot fail with an opaque ENOBUFS.
+const MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024;
+
 const command = process.argv[2];
 const args = parseArgs(process.argv.slice(3));
 
@@ -511,13 +516,18 @@ function extractArchive(archive, destination) {
 }
 
 function extractArchiveMember(archive, member) {
+  const options = {
+    encoding: "buffer",
+    maxBuffer: MAX_ARCHIVE_MEMBER_BYTES,
+  };
   const result = archive.endsWith(".zip")
     ? process.platform === "win32"
-      ? spawnSync("tar", ["-xOf", archive, member], { encoding: "buffer" })
-      : spawnSync("unzip", ["-p", archive, member], { encoding: "buffer" })
-    : spawnSync("tar", ["-xOf", archive, member], { encoding: "buffer" });
-  if (result.status !== 0) {
-    throw new Error(`could not extract ${member} from ${archive}: ${result.stderr}`);
+      ? spawnSync("tar", ["-xOf", archive, member], options)
+      : spawnSync("unzip", ["-p", archive, member], options)
+    : spawnSync("tar", ["-xOf", archive, member], options);
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message ?? result.stderr?.toString("utf8") ?? "unknown error";
+    throw new Error(`could not extract ${member} from ${archive}: ${detail}`);
   }
   return result.stdout;
 }
