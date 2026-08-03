@@ -106,8 +106,8 @@ pub use exec::{
     SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase, SupervisedProcessRecord,
     TerminationOutcome, TruncationPolicy, boot_identity, process_start_identity,
     read_supervised_process, read_supervised_process_record,
-    remove_supervised_process_record_if_matches, spawn_grouped, write_supervised_process,
-    write_supervised_process_record,
+    remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
+    spawn_grouped, write_supervised_process, write_supervised_process_record,
 };
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceContainment,

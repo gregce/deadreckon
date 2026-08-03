@@ -1042,11 +1042,7 @@ fn reconcile_guarded_process_record(
             ))));
         }
     }
-    let removed = deadreckon_core::remove_supervised_process_record_if_matches(
-        path,
-        &record.launch_id,
-        record.process.pid,
-    )?;
+    let removed = deadreckon_core::remove_supervised_process_record_if_same(path, record)?;
     if !removed && path.exists() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "evaluator identity changed while reconciling {}",
@@ -2997,6 +2993,62 @@ mod tests {
 
         let status = child.wait().expect("reap evaluator");
         assert!(!status.success());
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_provider_record_stops_the_owned_process_group_before_removal() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let grandchild_path = temp.path().join("provider-grandchild.pid");
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "sleep 60 & child=$!; echo $child > '{}'; wait",
+                grandchild_path.display()
+            ),
+        ]);
+        let (mut child, _terminator) =
+            deadreckon_core::spawn_grouped(command).expect("grouped provider fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !grandchild_path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grandchild = fs::read_to_string(&grandchild_path)
+            .expect("grandchild pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric grandchild pid");
+        let pid = child.id();
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("provider-turn-1.pid");
+        let record =
+            deadreckon_core::SupervisedProcessRecord::running(deadreckon_core::SupervisedProcess {
+                pid,
+                pgid: Some(pid),
+            })
+            .expect("provider process identity");
+        deadreckon_core::write_supervised_process_record(&path, &record).expect("record");
+
+        reconcile_run_supervised_processes(&state, Duration::ZERO, false)
+            .expect("reconcile provider group");
+
+        let status = child.wait().expect("reap provider");
+        assert!(!status.success());
+        for _ in 0..40 {
+            if !deadreckon_core::pid_is_alive(grandchild) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            !deadreckon_core::pid_is_alive(grandchild),
+            "provider grandchild survived identity-bound cancellation"
+        );
         assert!(!path.exists());
     }
 

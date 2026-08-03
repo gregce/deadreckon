@@ -114,15 +114,10 @@ fn terminate_unix(target: i32, grace: Duration, label: &str) -> TerminationOutco
         }
     }
 
-    match kill(target, Some(Signal::SIGTERM)) {
-        Ok(()) => {}
-        Err(Errno::ESRCH) => return TerminationOutcome::AlreadyDead,
-        Err(error) => {
-            return TerminationOutcome::Failed(format!(
-                "failed to send SIGTERM to {label} {}: {error}",
-                target.as_raw().unsigned_abs()
-            ));
-        }
+    match send_initial_term_with_eperm_retry(target, label, kill) {
+        InitialTermOutcome::Sent => {}
+        InitialTermOutcome::AlreadyDead => return TerminationOutcome::AlreadyDead,
+        InitialTermOutcome::Failed(reason) => return TerminationOutcome::Failed(reason),
     }
 
     let deadline = std::time::Instant::now() + grace;
@@ -157,6 +152,49 @@ fn terminate_unix(target: i32, grace: Duration, label: &str) -> TerminationOutco
 }
 
 #[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InitialTermOutcome {
+    Sent,
+    AlreadyDead,
+    Failed(String),
+}
+
+#[cfg(unix)]
+fn send_initial_term_with_eperm_retry(
+    target: nix::unistd::Pid,
+    label: &str,
+    mut signal: impl FnMut(
+        nix::unistd::Pid,
+        Option<nix::sys::signal::Signal>,
+    ) -> Result<(), nix::errno::Errno>,
+) -> InitialTermOutcome {
+    use nix::errno::Errno;
+    use nix::sys::signal::Signal;
+
+    // macOS may expose a freshly spawned, identity-bound executable while it
+    // is still in an uninterruptible exec/code-signing transition. During
+    // that narrow window killpg returns EPERM even for the owning user, then
+    // succeeds once exec completes. Retry only EPERM for a hard bound; a
+    // genuinely foreign or protected process still fails closed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match signal(target, Some(Signal::SIGTERM)) {
+            Ok(()) => return InitialTermOutcome::Sent,
+            Err(Errno::ESRCH) => return InitialTermOutcome::AlreadyDead,
+            Err(Errno::EPERM) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return InitialTermOutcome::Failed(format!(
+                    "failed to send SIGTERM to {label} {}: {error}",
+                    target.as_raw().unsigned_abs()
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn poll_interval(deadline: std::time::Instant) -> Duration {
     deadline
         .saturating_duration_since(std::time::Instant::now())
@@ -165,7 +203,9 @@ fn poll_interval(deadline: std::time::Instant) -> Duration {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{TerminationOutcome, spawn_grouped};
+    use super::{
+        InitialTermOutcome, TerminationOutcome, send_initial_term_with_eperm_retry, spawn_grouped,
+    };
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::{Pid, getpgid};
@@ -258,6 +298,27 @@ mod tests {
             terminator.terminate(Duration::from_millis(10)),
             TerminationOutcome::AlreadyDead
         );
+    }
+
+    #[test]
+    fn initial_group_signal_retries_transient_permission_denial() {
+        let mut attempts = 0;
+        let outcome = send_initial_term_with_eperm_retry(
+            Pid::from_raw(-123),
+            "process group",
+            |_target, signal| {
+                assert_eq!(signal, Some(nix::sys::signal::Signal::SIGTERM));
+                attempts += 1;
+                if attempts == 1 {
+                    Err(Errno::EPERM)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(outcome, InitialTermOutcome::Sent);
+        assert_eq!(attempts, 2);
     }
 
     fn wait_for(mut condition: impl FnMut() -> bool, timeout: Duration) {

@@ -144,11 +144,12 @@ pub(crate) async fn run_cli_with_options(
     if let Some(cwd) = options.cwd {
         command.current_dir(cwd);
     }
-    if cancellation_token.is_some() {
+    let supervise_process_group = cancellation_token.is_some() || pid_file.is_some();
+    if supervise_process_group {
         command.kill_on_drop(true);
         configure_process_group(&mut command);
     }
-    let child = command
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -157,22 +158,19 @@ pub(crate) async fn run_cli_with_options(
             detail: source.to_string(),
         })?;
     let pid = child.id();
-    if let (Some(pid), Some(pid_file)) = (pid, pid_file.as_ref()) {
-        if let Some(parent) = pid_file.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|source| ProviderError::Io {
-                    path: parent.display().to_string(),
-                    source,
-                })?;
-        }
-        tokio::fs::write(pid_file, format!("{pid}\n"))
-            .await
-            .map_err(|source| ProviderError::Io {
-                path: pid_file.display().to_string(),
-                source,
-            })?;
-    }
+    let process_record = match (pid, pid_file.as_ref()) {
+        (Some(pid), Some(pid_file)) => match write_current_process_record(pid_file, pid) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                signal_process_group(pid, true);
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                reconcile_process_group(pid).await?;
+                return Err(error);
+            }
+        },
+        _ => None,
+    };
     let wait = child.wait_with_output();
     tokio::pin!(wait);
     let output = if let Some(token) = cancellation_token {
@@ -186,8 +184,13 @@ pub(crate) async fn run_cli_with_options(
                 // wait_with_output drains both pipes and reaps the direct
                 // child after the whole process group has been signalled.
                 let _ = wait.await;
-                if let Some(pid_file) = pid_file.as_ref() {
-                    let _ = tokio::fs::remove_file(pid_file).await;
+                if let Some(pid) = pid {
+                    reconcile_process_group(pid).await?;
+                }
+                if let (Some(pid_file), Some(record)) =
+                    (pid_file.as_ref(), process_record.as_ref())
+                {
+                    remove_current_process_record(pid_file, record)?;
                 }
                 return Err(ProviderError::Cli {
                     provider: provider.to_string(),
@@ -203,8 +206,11 @@ pub(crate) async fn run_cli_with_options(
         provider: provider.to_string(),
         detail: source.to_string(),
     })?;
-    if let Some(pid_file) = pid_file.as_ref() {
-        let _ = tokio::fs::remove_file(pid_file).await;
+    if let Some(pid) = pid.filter(|_| supervise_process_group) {
+        reconcile_process_group(pid).await?;
+    }
+    if let (Some(pid_file), Some(record)) = (pid_file.as_ref(), process_record.as_ref()) {
+        remove_current_process_record(pid_file, record)?;
     }
     Ok(CliOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -217,17 +223,17 @@ pub(crate) async fn run_cli_with_options(
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt as _;
 
     command.as_std_mut().process_group(0);
 }
 
 #[cfg(not(unix))]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn signal_process_group(pid: u32, force: bool) {
+pub(crate) fn signal_process_group(pid: u32, force: bool) {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
@@ -242,7 +248,90 @@ fn signal_process_group(pid: u32, force: bool) {
 }
 
 #[cfg(not(unix))]
-fn signal_process_group(_pid: u32, _force: bool) {}
+pub(crate) fn signal_process_group(_pid: u32, _force: bool) {}
+
+pub(crate) fn write_current_process_record(
+    path: &Path,
+    pid: u32,
+) -> Result<deadreckon_core::SupervisedProcessRecord> {
+    let record =
+        deadreckon_core::SupervisedProcessRecord::running(deadreckon_core::SupervisedProcess {
+            pid,
+            pgid: if cfg!(unix) { Some(pid) } else { None },
+        })
+        .map_err(|source| ProviderError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    deadreckon_core::write_supervised_process_record(path, &record).map_err(|source| {
+        ProviderError::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    Ok(record)
+}
+
+pub(crate) fn remove_current_process_record(
+    path: &Path,
+    record: &deadreckon_core::SupervisedProcessRecord,
+) -> Result<()> {
+    let removed = deadreckon_core::remove_supervised_process_record_if_same(path, record).map_err(
+        |source| ProviderError::Io {
+            path: path.display().to_string(),
+            source,
+        },
+    )?;
+    if !removed {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(ProviderError::Io {
+                    path: path.display().to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "supervised process identity changed before cleanup",
+                    ),
+                });
+            }
+            Err(source) => {
+                return Err(ProviderError::Io {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_process_group(pid: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use deadreckon_core::ChildTerminator as _;
+
+        let pgid = i32::try_from(pid).map_err(|_| ProviderError::Cli {
+            provider: "provider-process".to_string(),
+            detail: format!("process group id {pid} exceeds i32"),
+        })?;
+        let outcome = tokio::task::spawn_blocking(move || {
+            deadreckon_core::ProcessGroupTerminator::new(pgid)
+                .terminate(std::time::Duration::from_millis(250))
+        })
+        .await
+        .map_err(|error| ProviderError::Cli {
+            provider: "provider-process".to_string(),
+            detail: format!("process-group reconciliation task failed: {error}"),
+        })?;
+        if let deadreckon_core::TerminationOutcome::Failed(detail) = outcome {
+            return Err(ProviderError::Cli {
+                provider: "provider-process".to_string(),
+                detail: format!("could not reconcile provider process group {pid}: {detail}"),
+            });
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct ResolvedCliBinary {
@@ -453,6 +542,14 @@ mod tests {
             result = &mut completion => panic!("provider exited before cancellation: {result:?}"),
             () = grandchild_started => {}
         }
+        let record =
+            deadreckon_core::read_supervised_process_record(&temp.path().join("provider.pid"))
+                .expect("identity-bound provider record");
+        assert_eq!(
+            record.identity(),
+            deadreckon_core::SupervisedProcessIdentity::Current
+        );
+        assert_eq!(record.process.pgid, Some(record.process.pid));
         let grandchild = std::fs::read_to_string(&grandchild_file)
             .expect("grandchild pid")
             .trim()

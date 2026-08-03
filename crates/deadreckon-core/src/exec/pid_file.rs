@@ -99,6 +99,42 @@ impl SupervisedProcessRecord {
         })
     }
 
+    /// Capture a running, process-group-owned child with a fresh launch
+    /// identity suitable for crash recovery and compare-and-remove cleanup.
+    ///
+    /// Unguarded provider children do not cross a release pipe, but retaining
+    /// the existing record schema keeps every child-pid sidecar on the same
+    /// fail-closed reconciliation path. The release digest is therefore the
+    /// digest of a fresh per-launch nonce and is used only as durable identity
+    /// metadata for this kind of record.
+    pub fn running(process: SupervisedProcess) -> io::Result<Self> {
+        if process.pid == 0 || !running_process_group_is_valid(process) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "running process identity is incomplete",
+            ));
+        }
+        let process_start_identity = process_start_identity(process.pid).ok_or_else(|| {
+            io::Error::other(format!(
+                "could not establish start identity for running process {}",
+                process.pid
+            ))
+        })?;
+        let launch_id = Uuid::new_v4().to_string();
+        let nonce = Uuid::new_v4().to_string();
+        Ok(Self {
+            schema_version: SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION,
+            process,
+            launch_id,
+            attempt: 1,
+            owner_launch_id: None,
+            release_token_sha256: crate::flight::sha256_text(&nonce),
+            boot_id: boot_identity(),
+            process_start_identity,
+            phase: SupervisedProcessPhase::Running,
+        })
+    }
+
     pub fn identity(&self) -> SupervisedProcessIdentity {
         if self.schema_version != SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
             || self.boot_id.trim().is_empty()
@@ -159,6 +195,31 @@ pub fn remove_supervised_process_record_if_matches(
     if record.launch_id != launch_id || record.process.pid != pid {
         return Ok(false);
     }
+    remove_record_file(path)
+}
+
+/// Remove only the exact record a caller previously wrote or validated.
+///
+/// Cleanup must not re-probe a process after it has been signalled: the PID can
+/// disappear between the liveness check and the process-start query, making an
+/// already-dead child look unverifiable. Exact durable-record comparison closes
+/// the replacement race without depending on live process state.
+pub fn remove_supervised_process_record_if_same(
+    path: &Path,
+    expected: &SupervisedProcessRecord,
+) -> io::Result<bool> {
+    let record = match read_supervised_process_record(path) {
+        Ok(record) => record,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if record != *expected {
+        return Ok(false);
+    }
+    remove_record_file(path)
+}
+
+fn remove_record_file(path: &Path) -> io::Result<bool> {
     match fs::remove_file(path) {
         Ok(()) => {
             sync_parent(path)?;
@@ -302,6 +363,17 @@ fn phase_process_group_is_valid(record: &SupervisedProcessRecord) -> bool {
     }
 }
 
+fn running_process_group_is_valid(process: SupervisedProcess) -> bool {
+    #[cfg(unix)]
+    {
+        process.pgid == Some(process.pid)
+    }
+    #[cfg(not(unix))]
+    {
+        process.pgid.is_none()
+    }
+}
+
 fn write_atomic_synced(path: &Path, encoded: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
@@ -360,8 +432,8 @@ mod tests {
     use super::{
         SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase,
         SupervisedProcessRecord, read_supervised_process, read_supervised_process_record,
-        remove_supervised_process_record_if_matches, write_supervised_process,
-        write_supervised_process_record,
+        remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
+        write_supervised_process, write_supervised_process_record,
     };
 
     #[test]
@@ -447,6 +519,56 @@ mod tests {
                 .expect("matched cleanup")
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn running_record_captures_current_identity_and_compare_removes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("provider.json");
+        let pid = std::process::id();
+        let record = SupervisedProcessRecord::running(SupervisedProcess {
+            pid,
+            pgid: if cfg!(unix) { Some(pid) } else { None },
+        })
+        .expect("running record");
+
+        write_supervised_process_record(&path, &record).expect("write record");
+        let parsed = read_supervised_process_record(&path).expect("read record");
+        assert_eq!(parsed, record);
+        assert_eq!(parsed.phase, SupervisedProcessPhase::Running);
+        assert_eq!(parsed.identity(), SupervisedProcessIdentity::Current);
+        assert!(
+            !remove_supervised_process_record_if_matches(&path, "another-launch", pid)
+                .expect("mismatched cleanup")
+        );
+        assert!(path.exists());
+        assert!(
+            remove_supervised_process_record_if_matches(&path, &record.launch_id, pid)
+                .expect("matched cleanup")
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn replaced_pid_identity_is_refused_and_preserved_by_exact_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("provider.json");
+        let pid = std::process::id();
+        let record = SupervisedProcessRecord::running(SupervisedProcess {
+            pid,
+            pgid: if cfg!(unix) { Some(pid) } else { None },
+        })
+        .expect("running record");
+        let mut replacement = record.clone();
+        replacement.process_start_identity = "different-process-start".to_string();
+        write_supervised_process_record(&path, &replacement).expect("write replacement record");
+
+        assert_eq!(replacement.identity(), SupervisedProcessIdentity::Reused);
+        assert!(
+            !remove_supervised_process_record_if_same(&path, &record)
+                .expect("replacement cleanup must fail closed")
+        );
+        assert!(path.exists(), "replacement identity evidence must remain");
     }
 
     #[test]
