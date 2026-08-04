@@ -146,6 +146,7 @@ pub(crate) async fn doc_command(args: DocCommandArgs) -> Result<()> {
                     no_llm: false,
                     force,
                     max_wall_seconds: None,
+                    phase_deadline: None,
                     cancellation_token: None,
                 },
             ),
