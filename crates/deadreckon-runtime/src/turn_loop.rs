@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -51,7 +53,10 @@ use deadreckon_core::error::{DeadreckonError, Result};
 use deadreckon_core::events::{emit_event, event_preview, tool_args_json};
 use deadreckon_core::flight::FlightSessionStatus;
 use deadreckon_core::gate::{acceptance_spec_path_for_run_root, validate_acceptance_marker};
-use deadreckon_core::git::{run_git, run_git_with_input};
+use deadreckon_core::git::{
+    BoundedGitOutcome, GitCommandBoundary, GitCommandDeadline, run_git, run_git_bounded,
+    run_git_with_input, run_git_with_input_bounded,
+};
 use deadreckon_core::paths::DeadreckonPaths;
 use deadreckon_core::promotion::promote_completed_run;
 use deadreckon_core::state::{
@@ -467,8 +472,19 @@ async fn run_turn_loop_inner(
             config.event_sender.as_ref(),
             RunEventKind::TurnStarted { turn },
         )?;
-        let head_result = capture_trusted_turn_head(state, turn);
-        persist_work_boundary(state, &work_clock, head_result)?;
+        let head_result =
+            capture_trusted_turn_head_bounded(state, turn, provider_phase_deadline, &run_token);
+        if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+            state,
+            turn,
+            "pre-provider trusted Git capture",
+            PhaseId(40),
+            config.event_sender.as_ref(),
+            &work_clock,
+            head_result,
+        )? {
+            return Ok(outcome);
+        }
         let snapshot_result = snapshot_working(state, turn.saturating_sub(1));
         persist_work_boundary(state, &work_clock, snapshot_result)?;
         let selected_route = router.selected_route_info();
@@ -880,8 +896,24 @@ async fn run_turn_loop_inner(
                 raw_changed,
             );
             persist_work_boundary(state, &work_clock, provenance_result)?;
-            let commit_result = commit_worktree_turn(state, turn, "cli_subagent");
-            persist_work_boundary(state, &work_clock, commit_result)?;
+            let commit_result = commit_worktree_turn_bounded(
+                state,
+                turn,
+                "cli_subagent",
+                provider_phase_deadline,
+                &run_token,
+            );
+            if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+                state,
+                turn,
+                "post-provider trusted Git commit",
+                PhaseId(40),
+                config.event_sender.as_ref(),
+                &work_clock,
+                commit_result,
+            )? {
+                return Ok(outcome);
+            }
             if changed.is_empty() {
                 classify_cli_no_deliverable_changes(state, &history, turn);
                 state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
@@ -966,9 +998,19 @@ async fn run_turn_loop_inner(
             )? {
                 return Ok(RunLoopOutcome::PausedAtCap);
             }
-            let commit_result = commit_finalized_turn(state, turn);
-            let commit_result = persist_work_boundary(state, &work_clock, commit_result);
-            verification_result(state, &work_clock, commit_result)?;
+            let commit_result =
+                commit_finalized_turn_bounded(state, turn, provider_phase_deadline, &run_token);
+            if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+                state,
+                turn,
+                "finalized turn trusted Git commit",
+                PhaseId(50),
+                config.event_sender.as_ref(),
+                &work_clock,
+                commit_result,
+            )? {
+                return Ok(outcome);
+            }
             if pause_verification_if_work_expired(
                 state,
                 config.event_sender.as_ref(),
@@ -1244,6 +1286,7 @@ async fn run_turn_loop_inner(
                             state,
                             turn,
                             "bash tool phase",
+                            PhaseId(40),
                             Some(&path),
                             &detail,
                             &work_clock,
@@ -1265,6 +1308,7 @@ async fn run_turn_loop_inner(
                             state,
                             turn,
                             "bash tool phase",
+                            PhaseId(40),
                             RuntimePhaseInterruption::WorkExpired,
                             &cleanup,
                             &work_clock,
@@ -1277,6 +1321,7 @@ async fn run_turn_loop_inner(
                             state,
                             turn,
                             "bash tool phase",
+                            PhaseId(40),
                             RuntimePhaseInterruption::Cancelled,
                             &cleanup,
                             &work_clock,
@@ -1318,9 +1363,25 @@ async fn run_turn_loop_inner(
                     raw_changed,
                 );
                 persist_work_boundary(state, &work_clock, provenance_result)?;
-                let commit_result =
-                    commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"));
-                persist_work_boundary(state, &work_clock, commit_result)?;
+                let commit_label = format!("bash {tool_call_id}");
+                let commit_result = commit_worktree_turn_bounded(
+                    state,
+                    turn,
+                    &commit_label,
+                    provider_phase_deadline,
+                    &run_token,
+                );
+                if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+                    state,
+                    turn,
+                    "post-tool trusted Git commit",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    commit_result,
+                )? {
+                    return Ok(outcome);
+                }
                 let docs_result = append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
@@ -1447,9 +1508,25 @@ async fn run_turn_loop_inner(
                     changed.clone(),
                 );
                 persist_work_boundary(state, &work_clock, provenance_result)?;
-                let commit_result =
-                    commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"));
-                persist_work_boundary(state, &work_clock, commit_result)?;
+                let commit_label = format!("write_file {tool_call_id}");
+                let commit_result = commit_worktree_turn_bounded(
+                    state,
+                    turn,
+                    &commit_label,
+                    provider_phase_deadline,
+                    &run_token,
+                );
+                if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+                    state,
+                    turn,
+                    "post-tool trusted Git commit",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    commit_result,
+                )? {
+                    return Ok(outcome);
+                }
                 let docs_result = append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
@@ -1563,9 +1640,19 @@ async fn run_turn_loop_inner(
                 )? {
                     return Ok(RunLoopOutcome::PausedAtCap);
                 }
-                let commit_result = commit_finalized_turn(state, turn);
-                let commit_result = persist_work_boundary(state, &work_clock, commit_result);
-                verification_result(state, &work_clock, commit_result)?;
+                let commit_result =
+                    commit_finalized_turn_bounded(state, turn, provider_phase_deadline, &run_token);
+                if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
+                    state,
+                    turn,
+                    "finalized turn trusted Git commit",
+                    PhaseId(50),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    commit_result,
+                )? {
+                    return Ok(outcome);
+                }
                 if pause_verification_if_work_expired(
                     state,
                     config.event_sender.as_ref(),
@@ -2058,6 +2145,7 @@ fn record_runtime_phase_interruption(
     state: &mut PipelineState,
     turn: u32,
     phase: &str,
+    phase_id: PhaseId,
     interruption: RuntimePhaseInterruption,
     cleanup: &ProviderCleanup,
     work_clock: &RunWorkClock,
@@ -2086,6 +2174,7 @@ fn record_runtime_phase_interruption(
             state,
             turn,
             phase,
+            phase_id,
             Some(path.as_path()),
             detail,
             work_clock,
@@ -2097,6 +2186,7 @@ fn record_runtime_lost_containment(
     state: &mut PipelineState,
     turn: u32,
     phase: &str,
+    phase_id: PhaseId,
     authority: Option<&Path>,
     detail: &str,
     work_clock: &RunWorkClock,
@@ -2123,9 +2213,70 @@ fn record_runtime_lost_containment(
     )?;
     state.pause_reason = None;
     state.failure_reason = Some(reason);
-    state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
+    state.set_phase_status(phase_id, PhaseStatus::Failed)?;
     work_clock.save(state)?;
     Ok(RunLoopOutcome::Failed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_trusted_git_phase<T>(
+    state: &mut PipelineState,
+    turn: u32,
+    phase: &str,
+    phase_id: PhaseId,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    work_clock: &RunWorkClock,
+    result: Result<TrustedGitPhaseOutcome<T>>,
+) -> Result<ControlFlow<RunLoopOutcome, T>> {
+    let phase_outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            work_clock.save(state)?;
+            return Err(error);
+        }
+    };
+    let terminal = match phase_outcome {
+        TrustedGitPhaseOutcome::Completed(value) => {
+            work_clock.save(state)?;
+            return Ok(ControlFlow::Continue(value));
+        }
+        TrustedGitPhaseOutcome::WorkExpired { cleanup } => record_runtime_phase_interruption(
+            state,
+            turn,
+            phase,
+            phase_id,
+            RuntimePhaseInterruption::WorkExpired,
+            &cleanup,
+            work_clock,
+        )?,
+        TrustedGitPhaseOutcome::Cancelled { cleanup } => record_runtime_phase_interruption(
+            state,
+            turn,
+            phase,
+            phase_id,
+            RuntimePhaseInterruption::Cancelled,
+            &cleanup,
+            work_clock,
+        )?,
+        TrustedGitPhaseOutcome::LostContainment {
+            boundary,
+            authority,
+            detail,
+        } => {
+            let detail = format!("{detail}; controller boundary: {boundary:?}");
+            record_runtime_lost_containment(
+                state,
+                turn,
+                phase,
+                phase_id,
+                authority.as_deref(),
+                &detail,
+                work_clock,
+            )?
+        }
+    };
+    emit_run_completed(state, sender, terminal.clone())?;
+    Ok(ControlFlow::Break(terminal))
 }
 
 fn record_provider_interruption(
@@ -4921,6 +5072,7 @@ async fn acceptance_gate_passed_or_record_failure(
                 state,
                 turn,
                 "deterministic gate",
+                PhaseId(50),
                 Some(&path),
                 &detail,
                 work_clock,
@@ -4932,6 +5084,7 @@ async fn acceptance_gate_passed_or_record_failure(
                 state,
                 turn,
                 "deterministic gate",
+                PhaseId(50),
                 RuntimePhaseInterruption::WorkExpired,
                 &cleanup,
                 work_clock,
@@ -4949,6 +5102,7 @@ async fn acceptance_gate_passed_or_record_failure(
                 state,
                 turn,
                 "deterministic gate",
+                PhaseId(50),
                 RuntimePhaseInterruption::Cancelled,
                 &cleanup,
                 work_clock,
@@ -5051,16 +5205,137 @@ struct TrustedGitControl {
     expected_control: Vec<u8>,
     git_dir: PathBuf,
     common_dir: PathBuf,
+    phase: Option<TrustedGitPhase>,
 }
 
+#[derive(Clone, Debug)]
+struct TrustedGitPhase {
+    deadline: ProviderPhaseDeadline,
+    cancellation: CancellationToken,
+    authority_dir: PathBuf,
+    interruption: Arc<Mutex<Option<TrustedGitInterruption>>>,
+}
+
+#[derive(Clone, Debug)]
+enum TrustedGitInterruption {
+    WorkExpired {
+        cleanup: ProviderCleanup,
+    },
+    Cancelled {
+        cleanup: ProviderCleanup,
+    },
+    LostContainment {
+        boundary: GitCommandBoundary,
+        authority: Option<PathBuf>,
+        detail: String,
+    },
+}
+
+#[derive(Debug)]
+enum TrustedGitPhaseOutcome<T> {
+    Completed(T),
+    WorkExpired {
+        cleanup: ProviderCleanup,
+    },
+    Cancelled {
+        cleanup: ProviderCleanup,
+    },
+    LostContainment {
+        boundary: GitCommandBoundary,
+        authority: Option<PathBuf>,
+        detail: String,
+    },
+}
+
+impl TrustedGitPhase {
+    fn new(
+        state: &PipelineState,
+        deadline: ProviderPhaseDeadline,
+        cancellation: &CancellationToken,
+    ) -> Self {
+        Self {
+            deadline,
+            cancellation: cancellation.clone(),
+            authority_dir: state.run_root.join("child-pids"),
+            interruption: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn record(&self, interruption: TrustedGitInterruption) -> Result<()> {
+        let mut current = self.interruption.lock().map_err(|_| {
+            DeadreckonError::InvalidInput(
+                "trusted Git phase interruption record was poisoned".to_string(),
+            )
+        })?;
+        if current.is_none() {
+            *current = Some(interruption);
+        }
+        Ok(())
+    }
+
+    fn finish<T>(&self, result: Result<T>) -> Result<TrustedGitPhaseOutcome<T>> {
+        let interruption = self
+            .interruption
+            .lock()
+            .map_err(|_| {
+                DeadreckonError::InvalidInput(
+                    "trusted Git phase interruption record was poisoned".to_string(),
+                )
+            })?
+            .take();
+        match (result, interruption) {
+            (Ok(value), None) => Ok(TrustedGitPhaseOutcome::Completed(value)),
+            (Err(error), None) => Err(error),
+            (_, Some(TrustedGitInterruption::WorkExpired { cleanup })) => {
+                Ok(TrustedGitPhaseOutcome::WorkExpired { cleanup })
+            }
+            (_, Some(TrustedGitInterruption::Cancelled { cleanup })) => {
+                Ok(TrustedGitPhaseOutcome::Cancelled { cleanup })
+            }
+            (
+                _,
+                Some(TrustedGitInterruption::LostContainment {
+                    boundary,
+                    authority,
+                    detail,
+                }),
+            ) => Ok(TrustedGitPhaseOutcome::LostContainment {
+                boundary,
+                authority,
+                detail,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
 fn capture_trusted_turn_head(state: &PipelineState, turn: u32) -> Result<()> {
+    capture_trusted_turn_head_inner(state, turn, None)
+}
+
+fn capture_trusted_turn_head_bounded(
+    state: &PipelineState,
+    turn: u32,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<TrustedGitPhaseOutcome<()>> {
+    let phase = TrustedGitPhase::new(state, deadline, cancellation);
+    let result = capture_trusted_turn_head_inner(state, turn, Some(phase.clone()));
+    phase.finish(result)
+}
+
+fn capture_trusted_turn_head_inner(
+    state: &PipelineState,
+    turn: u32,
+    phase: Option<TrustedGitPhase>,
+) -> Result<()> {
     capture_trusted_lifecycle_metadata(state, turn)?;
     let record = read_turn_codebase_record(state)?;
     write_trusted_codebase_record(&state.run_root, &record)?;
     if record.mode != CodebaseMode::Worktree {
         return Ok(());
     }
-    let control = capture_trusted_git_control(state, turn, &record)?;
+    let control = capture_trusted_git_control(state, turn, &record, phase)?;
     let head = trusted_git_stdout(&control, &["rev-parse", "HEAD"])?;
     let path = trusted_turn_head_path(state, turn);
     let parent = path.parent().ok_or_else(|| {
@@ -5083,6 +5358,7 @@ fn capture_trusted_git_control(
     state: &PipelineState,
     turn: u32,
     record: &CodebaseRecord,
+    phase: Option<TrustedGitPhase>,
 ) -> Result<TrustedGitControl> {
     let snapshot = trusted_git_control_snapshot_path(state, turn);
     let captured = snapshot.with_extension("captured");
@@ -5143,6 +5419,7 @@ fn capture_trusted_git_control(
         expected_control,
         git_dir,
         common_dir,
+        phase,
     };
     restore_and_verify_git_control(&control)?;
     Ok(control)
@@ -5152,6 +5429,7 @@ fn load_trusted_git_control(
     state: &PipelineState,
     turn: u32,
     record: &CodebaseRecord,
+    phase: Option<TrustedGitPhase>,
 ) -> Result<TrustedGitControl> {
     let snapshot = trusted_git_control_snapshot_path(state, turn);
     let captured = snapshot.with_extension("captured");
@@ -5182,6 +5460,7 @@ fn load_trusted_git_control(
         expected_control,
         git_dir,
         common_dir,
+        phase,
     };
     restore_and_verify_git_control(&control)?;
     Ok(control)
@@ -5523,16 +5802,42 @@ fn capture_trusted_lifecycle_metadata(state: &PipelineState, turn: u32) -> Resul
     std::fs::write(&captured, b"trusted lifecycle snapshot\n").with_path(captured)
 }
 
+#[cfg(test)]
 fn commit_worktree_turn(state: &PipelineState, turn: u32, label: &str) -> Result<()> {
-    commit_worktree_turn_inner(state, turn, label, true)
+    commit_worktree_turn_inner(state, turn, label, true, None)
+}
+
+fn commit_worktree_turn_bounded(
+    state: &PipelineState,
+    turn: u32,
+    label: &str,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<TrustedGitPhaseOutcome<()>> {
+    let phase = TrustedGitPhase::new(state, deadline, cancellation);
+    let result = commit_worktree_turn_inner(state, turn, label, true, Some(phase.clone()));
+    phase.finish(result)
 }
 
 /// Commit DeadReckon's final generated documents through the same trusted Git
 /// boundary as provider edits. The coding sanitizer already restored the
 /// pre-provider lifecycle snapshot; retaining it here preserves trusted turn
 /// records written by DeadReckon after that point.
+#[cfg(test)]
 fn commit_finalized_turn(state: &PipelineState, turn: u32) -> Result<()> {
-    commit_worktree_turn_inner(state, turn, "finalize_docs", false)
+    commit_worktree_turn_inner(state, turn, "finalize_docs", false, None)
+}
+
+fn commit_finalized_turn_bounded(
+    state: &PipelineState,
+    turn: u32,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<TrustedGitPhaseOutcome<()>> {
+    let phase = TrustedGitPhase::new(state, deadline, cancellation);
+    let result =
+        commit_worktree_turn_inner(state, turn, "finalize_docs", false, Some(phase.clone()));
+    phase.finish(result)
 }
 
 fn commit_worktree_turn_inner(
@@ -5540,6 +5845,7 @@ fn commit_worktree_turn_inner(
     turn: u32,
     label: &str,
     restore_lifecycle: bool,
+    phase: Option<TrustedGitPhase>,
 ) -> Result<()> {
     if restore_lifecycle {
         restore_lifecycle_metadata(state, turn)?;
@@ -5552,7 +5858,7 @@ fn commit_worktree_turn_inner(
     // Git. Every Git command below repeats this restoration and also receives
     // an explicit trusted --git-dir, so a provider-created `.git` redirect is
     // evidence, never authority.
-    let control = load_trusted_git_control(state, turn, &record)?;
+    let control = load_trusted_git_control(state, turn, &record, phase)?;
     let base_sha = record.base_sha.as_deref().ok_or_else(|| {
         DeadreckonError::InvalidInput(
             "worktree codebase record is missing base_sha; refusing to commit an unbounded result"
@@ -6096,7 +6402,19 @@ fn trusted_git_output(control: &TrustedGitControl, args: &[&str]) -> Result<std:
     routed.push(git_dir_arg.as_str());
     routed.push(work_tree_arg.as_str());
     routed.extend_from_slice(args);
-    let output = run_git(&control.workspace, &routed)?;
+    let output = if let Some(phase) = &control.phase {
+        let cancellation_requested = || phase.cancellation.is_cancelled();
+        let deadline = GitCommandDeadline::new(
+            phase.deadline.work_expires_at.into_std(),
+            phase.deadline.cleanup_budget,
+            &cancellation_requested,
+        )
+        .with_authority_dir(&phase.authority_dir);
+        let outcome = run_git_bounded(&control.workspace, &routed, deadline)?;
+        finish_bounded_trusted_git(phase, outcome)?
+    } else {
+        run_git(&control.workspace, &routed)?
+    };
     restore_and_verify_git_control(control)?;
     Ok(output)
 }
@@ -6125,9 +6443,54 @@ fn trusted_git_output_with_input(
     routed.push(git_dir_arg.as_str());
     routed.push(work_tree_arg.as_str());
     routed.extend_from_slice(args);
-    let output = run_git_with_input(&control.workspace, &routed, input)?;
+    let output = if let Some(phase) = &control.phase {
+        let cancellation_requested = || phase.cancellation.is_cancelled();
+        let deadline = GitCommandDeadline::new(
+            phase.deadline.work_expires_at.into_std(),
+            phase.deadline.cleanup_budget,
+            &cancellation_requested,
+        )
+        .with_authority_dir(&phase.authority_dir);
+        let outcome = run_git_with_input_bounded(&control.workspace, &routed, input, deadline)?;
+        finish_bounded_trusted_git(phase, outcome)?
+    } else {
+        run_git_with_input(&control.workspace, &routed, input)?
+    };
     restore_and_verify_git_control(control)?;
     Ok(output)
+}
+
+fn finish_bounded_trusted_git(
+    phase: &TrustedGitPhase,
+    outcome: BoundedGitOutcome,
+) -> Result<std::process::Output> {
+    let interruption = match outcome {
+        BoundedGitOutcome::Completed(output) => return Ok(output),
+        BoundedGitOutcome::WorkExpired => TrustedGitInterruption::WorkExpired {
+            cleanup: ProviderCleanup::Proven,
+        },
+        BoundedGitOutcome::Cancelled => TrustedGitInterruption::Cancelled {
+            cleanup: ProviderCleanup::Proven,
+        },
+        BoundedGitOutcome::SupervisionFailed { detail } => {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "trusted Git subprocess supervision failed after cleanup was proven: {detail}"
+            )));
+        }
+        BoundedGitOutcome::CleanupIncomplete {
+            boundary,
+            authority,
+            detail,
+        } => TrustedGitInterruption::LostContainment {
+            boundary,
+            authority: authority.record_path,
+            detail,
+        },
+    };
+    phase.record(interruption)?;
+    Err(DeadreckonError::InvalidInput(
+        "trusted Git subprocess crossed its controller boundary".to_string(),
+    ))
 }
 
 fn trusted_git_quiet(control: &TrustedGitControl, args: &[&str]) -> Result<bool> {
@@ -6460,11 +6823,13 @@ mod tests {
     use std::time::Duration;
 
     use deadreckon_providers::{
-        ProviderCleanup, ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter,
+        ProviderCleanup, ProviderConfigFile, ProviderEntry, ProviderKind, ProviderPhaseDeadline,
+        ProviderRouter,
     };
     use deadreckon_sandbox::{SandboxBackend, SandboxSpec, WorkspaceAccess};
     use serde_json::{Value, json};
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     use crate::seam::{SeamOutcome, SeamRunCtx, read_seams_config};
 
@@ -6488,9 +6853,10 @@ mod tests {
     use super::{
         GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
         ProviderInterruption, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunWorkClock,
-        SandboxedPhaseOutcome, SemanticCompletionDisposition, append_provider_approval_traces,
-        append_tool_refusal, bash_policy_refusal, begin_verification, build_cli_subagent_prompt,
-        build_prompt, capture_trusted_turn_head, changed_files_since_snapshot,
+        SandboxedPhaseOutcome, SemanticCompletionDisposition, TrustedGitPhaseOutcome,
+        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
+        begin_verification, build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
+        capture_trusted_turn_head_bounded, changed_files_since_snapshot,
         classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
         complete_verification, deliverable_changed_files, ensure_sandbox_toml,
         event_sink_must_stop, fail_verification, implementation_notes_ready_or_request_followup,
@@ -9255,6 +9621,36 @@ storage = "jsonl"
             !sentinel.exists(),
             "sanitisation must not execute the configured clean command"
         );
+
+        let token = CancellationToken::new();
+        let expired = capture_trusted_turn_head_bounded(
+            &state,
+            4,
+            ProviderPhaseDeadline::new(tokio::time::Instant::now(), Duration::from_millis(100)),
+            &token,
+        )
+        .expect("typed trusted Git work boundary");
+        assert!(matches!(
+            expired,
+            TrustedGitPhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::Proven
+            }
+        ));
+
+        token.cancel();
+        let cancelled = capture_trusted_turn_head_bounded(
+            &state,
+            4,
+            ProviderPhaseDeadline::from_now(Duration::from_secs(1), Duration::from_millis(100)),
+            &token,
+        )
+        .expect("typed trusted Git cancellation boundary");
+        assert!(matches!(
+            cancelled,
+            TrustedGitPhaseOutcome::Cancelled {
+                cleanup: ProviderCleanup::Proven
+            }
+        ));
     }
 
     #[test]
@@ -9509,8 +9905,8 @@ storage = "jsonl"
         let head = test_git(&worktree, &["rev-parse", "HEAD"]);
 
         let record = read_turn_codebase_record(&state).expect("trusted routing");
-        let control =
-            load_trusted_git_control(&state, 1, &record).expect("trusted Git control snapshot");
+        let control = load_trusted_git_control(&state, 1, &record, None)
+            .expect("trusted Git control snapshot");
         let prohibited =
             non_deliverable_history_paths(&control, &base_sha, &head).expect("history inventory");
 
