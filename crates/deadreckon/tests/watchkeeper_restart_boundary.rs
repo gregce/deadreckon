@@ -6,7 +6,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use deadreckon_core::{DeadreckonPaths, JobView, load_job_lease, pid_is_alive, read_job_history};
+use deadreckon_core::{
+    ChildTerminator, DeadreckonPaths, JobView, ProcessGroupTerminator, TerminationOutcome,
+    load_job_lease, pid_is_alive, read_job_history, read_supervised_process,
+};
 use deadreckon_protocol::{JobEventKind, JobId, JobOutcome};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -78,6 +81,7 @@ fn crash_after_private_release_adopts_or_recovers_without_duplicating_the_attemp
     let job_id = envelope["dispatched"]["ids"][0].as_str().expect("job id");
     wait_for_event(&paths, job_id, JobEventKind::ChildLinked);
     wait_for_failed_supervisor_exit(&paths, job_id);
+    simulate_machine_reboot(&paths, job_id);
 
     let recovery = Command::new(env!("CARGO_BIN_EXE_deadreckon"))
         .current_dir(&workspace)
@@ -94,13 +98,15 @@ fn crash_after_private_release_adopts_or_recovers_without_duplicating_the_attemp
     );
 
     let view = JobView::load(&paths, job_id).expect("recovered Job view");
+    let history = read_job_history(&paths.job_events(job_id)).expect("job history");
     assert!(view.projection.is_terminal(), "{view:?}");
     assert_eq!(
-        view.projection.attempt_count, 1,
-        "a supervisor crash after release must not duplicate the logical attempt"
+        view.projection.attempt_count,
+        1,
+        "a supervisor crash after release must not duplicate the logical attempt\nview: {view:#?}\nevents: {:#?}",
+        history.events()
     );
     assert_ne!(view.projection.outcome, Some(JobOutcome::Verified));
-    let history = read_job_history(&paths.job_events(job_id)).expect("job history");
     assert_eq!(
         history
             .events()
@@ -131,6 +137,56 @@ fn crash_after_private_release_adopts_or_recovers_without_duplicating_the_attemp
             }),
         "recovery left a stale private release acknowledgement"
     );
+}
+
+#[cfg(unix)]
+fn simulate_machine_reboot(paths: &DeadreckonPaths, job_id: &str) {
+    let child_path = paths.job_dir(job_id).join("supervised-child.json");
+    let child = read_supervised_process(&child_path).expect("acknowledged child metadata");
+    let pgid = child.pgid.expect("acknowledged child process group");
+    assert_eq!(
+        pgid, child.pid,
+        "the reboot fixture will only terminate an isolated child-owned process group"
+    );
+    assert!(
+        pgid > 1,
+        "refusing to terminate unsafe process group {pgid}"
+    );
+
+    let terminator = ProcessGroupTerminator::new(i32::try_from(pgid).expect("process group id"));
+    let outcome = terminator.terminate(Duration::from_millis(250));
+    assert!(
+        !matches!(outcome, TerminationOutcome::Failed(_)),
+        "could not stop pre-reboot child process group {pgid}: {outcome:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_group_is_alive(pgid) {
+        assert!(
+            Instant::now() < deadline,
+            "pre-reboot child process group {pgid} remained alive after termination"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !process_group_is_alive(pgid),
+        "changed-boot recovery began while pre-reboot child process group {pgid} was alive"
+    );
+}
+
+#[cfg(unix)]
+fn process_group_is_alive(pgid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let target = Pid::from_raw(-i32::try_from(pgid).expect("process group id"));
+    match kill(target, None) {
+        Ok(()) => true,
+        Err(Errno::ESRCH) => false,
+        Err(Errno::EPERM) => true,
+        Err(error) => panic!("inspect pre-reboot process group {pgid}: {error}"),
+    }
 }
 
 fn assert_pre_release_crash_recovers(failpoint: &str) {
