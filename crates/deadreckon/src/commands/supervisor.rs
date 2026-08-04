@@ -376,7 +376,7 @@ enum ChildMonitorOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActivePolicyBoundary {
+pub(crate) enum ActivePolicyBoundary {
     Deadline,
     WallCap,
 }
@@ -391,10 +391,10 @@ impl ActivePolicyBoundary {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct JobWorkAllowance {
-    remaining: Duration,
-    cutoff: chrono::DateTime<Utc>,
-    boundary: ActivePolicyBoundary,
+pub(crate) struct JobWorkAllowance {
+    pub(crate) remaining: Duration,
+    pub(crate) cutoff: chrono::DateTime<Utc>,
+    pub(crate) boundary: ActivePolicyBoundary,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2415,7 +2415,11 @@ fn effective_wall_seconds_at(work_cutoff: chrono::DateTime<Utc>, plan: &LaunchPl
         .signed_duration_since(Utc::now())
         .to_std()
         .unwrap_or(Duration::ZERO);
-    let remaining_seconds = whole_work_seconds(remaining).unwrap_or(0);
+    // The CLI surface accepts only whole seconds. Round the child-local
+    // allowance up so a fractional remainder remains usable; the
+    // authenticated supervisor cutoff is still the exact outer authority and
+    // prevents this compatibility rounding from extending Job work.
+    let remaining_seconds = rounded_up_work_seconds(remaining).unwrap_or(0);
     let effective = plan
         .budget
         .wall_seconds
@@ -2423,22 +2427,22 @@ fn effective_wall_seconds_at(work_cutoff: chrono::DateTime<Utc>, plan: &LaunchPl
             plan_cap.min(remaining_seconds)
         });
     if effective == 0 {
-        // Keep the guarded launcher alive until the fixed outer boundary when
-        // only a fractional second remains. The supervisor will then classify
-        // the attempt as policy exhaustion instead of a provider spawn error.
-        if !remaining.is_zero() {
-            std::thread::sleep(remaining);
-        }
         return Err(CliError::Core(DeadreckonError::InvalidInput(
-            "less than one whole second remained before the approved Job work cutoff".to_string(),
+            "the approved Job work cutoff elapsed before the child command was built".to_string(),
         )));
     }
     Ok(effective)
 }
 
-fn whole_work_seconds(remaining: Duration) -> Option<u64> {
-    let seconds = remaining.as_secs();
-    (seconds > 0).then_some(seconds)
+fn rounded_up_work_seconds(remaining: Duration) -> Option<u64> {
+    if remaining.is_zero() {
+        return None;
+    }
+    Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() > 0)),
+    )
 }
 
 fn child_metadata_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
@@ -5706,59 +5710,39 @@ fn finish_if_less_than_one_work_second(
     if allowance.remaining.as_secs() > 0 {
         return Ok(false);
     }
-    match allowance.boundary {
-        ActivePolicyBoundary::Deadline => {
-            if !allowance.remaining.is_zero() {
-                std::thread::sleep(allowance.remaining);
-            }
-            finish_deadline_reached(paths, token, job, None)
+    // A sub-second remainder is still approved work time. Never manufacture a
+    // WallCap event merely because the child CLI accepts only whole seconds.
+    // When an attempt is active, let controller time consume the fractional
+    // tail; before an attempt starts, return it to the guarded-launch path so
+    // the attempt can establish the active interval first.
+    if allowance.boundary == ActivePolicyBoundary::WallCap
+        && !attempt_is_active(paths, token.job_id.as_ref())?
+    {
+        return Ok(false);
+    }
+
+    loop {
+        // Cancellation intentionally wins races with either policy boundary;
+        // the absolute deadline in turn wins a tie with the wall cap.
+        if finish_reached_terminal_boundary(paths, token, job, None)? {
+            return Ok(true);
         }
-        ActivePolicyBoundary::WallCap => {
-            let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
-            let view = JobView::load(paths, token.job_id.as_ref())?;
-            if view.projection.is_terminal() {
-                return Ok(true);
-            }
-            if let Err(error) = reconcile_job_processes_for_policy_boundary(
-                paths,
-                &view.job,
-                Some(cleanup_deadline),
-            ) {
-                block_for_lost_containment(
-                    paths,
-                    token,
-                    &format!(
-                        "less than one executable wall-budget second remained, but not every supervised process could be proven stopped: {error}"
-                    ),
-                )?;
-                return Ok(true);
-            }
-            let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
-            if attempt_active {
-                append_attempt_stopped(
-                    paths,
-                    token,
-                    StopReason::WallCap,
-                    json!({
-                        "reason": "less than one whole second remained in the approved cumulative wall budget",
-                        "max_wall_seconds": job.policy.max_wall_seconds,
-                        "remaining_wall_seconds": allowance.remaining.as_secs_f64(),
-                    }),
-                )?;
-            }
-            append_terminal_event(
-                paths,
-                token,
-                JobEventKind::BudgetExhausted,
-                StopReason::WallCap,
-                json!({
-                    "reason": "less than one whole second remained in the approved cumulative wall budget; no further provider process was launched",
-                    "max_wall_seconds": job.policy.max_wall_seconds,
-                    "remaining_wall_seconds": allowance.remaining.as_secs_f64(),
-                }),
-            )?;
-            Ok(true)
+        let Some(current) = current_job_work_allowance(paths, job, Utc::now())? else {
+            return Ok(true);
+        };
+        if current.remaining.as_secs() > 0 {
+            return Ok(false);
         }
+        if current.remaining.is_zero() {
+            // `finish_reached_terminal_boundary` samples the clock itself, so
+            // a zero allowance without a typed terminal boundary indicates a
+            // corrupt or internally inconsistent history.
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "Job work allowance reached zero without a classifiable terminal boundary"
+                    .to_string(),
+            )));
+        }
+        std::thread::sleep(current.remaining.min(POLICY_CLEANUP_POLL_INTERVAL));
     }
 }
 
@@ -5774,6 +5758,18 @@ pub(crate) fn remaining_job_work_duration(
     Ok(remaining_job_work_allowance(paths, job, now)?
         .map(|allowance| allowance.remaining)
         .unwrap_or(Duration::ZERO))
+}
+
+/// Return the exact current Job work cutoff together with the policy
+/// dimension that limits it. This is read-only: callers may carry the
+/// authenticated boundary into a child phase, but only the supervisor records
+/// lifecycle truth when that boundary is reached.
+pub(crate) fn current_job_work_allowance(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<JobWorkAllowance>> {
+    remaining_job_work_allowance(paths, job, now)
 }
 
 fn remaining_job_work_allowance(
@@ -8328,7 +8324,7 @@ mod tests {
     }
 
     #[test]
-    fn remaining_job_work_uses_the_earliest_wall_or_absolute_deadline() {
+    fn current_job_work_allowance_preserves_typed_boundary_identity_and_deadline_ties() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut job) = fixture(&temp, 1);
         job.policy.max_wall_seconds = 20;
@@ -8350,34 +8346,93 @@ mod tests {
         )
         .expect("attempt history");
 
-        assert_eq!(
-            remaining_job_work_duration(&paths, &job, now).expect("remaining wall"),
-            Duration::from_secs(15)
-        );
+        let wall = current_job_work_allowance(&paths, &job, now)
+            .expect("remaining wall")
+            .expect("wall allowance");
+        assert_eq!(wall.remaining, Duration::from_secs(15));
+        assert_eq!(wall.cutoff, now + chrono::TimeDelta::seconds(15));
+        assert_eq!(wall.boundary, ActivePolicyBoundary::WallCap);
+
         job.policy.deadline = Some(now + chrono::TimeDelta::seconds(7));
-        assert_eq!(
-            remaining_job_work_duration(&paths, &job, now).expect("remaining cutoff"),
-            Duration::from_secs(7)
-        );
+        let deadline = current_job_work_allowance(&paths, &job, now)
+            .expect("remaining deadline")
+            .expect("deadline allowance");
+        assert_eq!(deadline.remaining, Duration::from_secs(7));
+        assert_eq!(deadline.cutoff, now + chrono::TimeDelta::seconds(7));
+        assert_eq!(deadline.boundary, ActivePolicyBoundary::Deadline);
+
+        // At an exact tie, the calendar deadline is the typed limiting
+        // boundary so terminal classification remains deterministic.
+        job.policy.deadline = Some(now + chrono::TimeDelta::seconds(15));
+        let tie = current_job_work_allowance(&paths, &job, now)
+            .expect("tied allowance")
+            .expect("tied boundary");
+        assert_eq!(tie.remaining, Duration::from_secs(15));
+        assert_eq!(tie.boundary, ActivePolicyBoundary::Deadline);
+
         job.policy.deadline = Some(now);
+        let elapsed = current_job_work_allowance(&paths, &job, now)
+            .expect("elapsed cutoff")
+            .expect("elapsed allowance");
+        assert_eq!(elapsed.remaining, Duration::ZERO);
+        assert_eq!(elapsed.boundary, ActivePolicyBoundary::Deadline);
+    }
+
+    #[test]
+    fn child_wall_allowance_rounds_up_under_the_exact_outer_cutoff() {
         assert_eq!(
-            remaining_job_work_duration(&paths, &job, now).expect("elapsed cutoff"),
-            Duration::ZERO
+            rounded_up_work_seconds(Duration::ZERO),
+            None,
+            "an elapsed cutoff has no child allowance"
+        );
+        assert_eq!(
+            rounded_up_work_seconds(Duration::from_millis(999)),
+            Some(1),
+            "the authenticated exact cutoff safely contains the rounded CLI allowance"
+        );
+        assert_eq!(
+            rounded_up_work_seconds(Duration::from_millis(1_999)),
+            Some(2),
+            "a fractional approved second must not be discarded"
         );
     }
 
     #[test]
-    fn child_wall_allowance_floors_and_refuses_fractional_seconds() {
-        assert_eq!(
-            whole_work_seconds(Duration::from_millis(999)),
-            None,
-            "a provider must not launch without one complete second"
+    fn fractional_active_wall_remainder_is_consumed_before_wall_cap_is_recorded() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 1);
+        job.policy.max_wall_seconds = 1;
+        fs::write(
+            paths.job_json(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&job).expect("job json"),
+        )
+        .expect("wall-limited job");
+        let token = claim_started_attempt(&paths, &job, 1);
+        thread::sleep(Duration::from_millis(150));
+        let allowance = current_job_work_allowance(&paths, &job, Utc::now())
+            .expect("fractional allowance")
+            .expect("active allowance");
+        assert!(allowance.remaining < Duration::from_secs(1));
+        assert!(!allowance.remaining.is_zero());
+        assert_eq!(allowance.boundary, ActivePolicyBoundary::WallCap);
+
+        let waited_from = Instant::now();
+        assert!(
+            finish_if_less_than_one_work_second(&paths, &token, &job, allowance)
+                .expect("fractional tail reaches wall cap")
         );
-        assert_eq!(
-            whole_work_seconds(Duration::from_millis(1_999)),
-            Some(1),
-            "the child allowance must never round beyond the fixed cutoff"
+        assert!(
+            waited_from.elapsed()
+                >= allowance
+                    .remaining
+                    .saturating_sub(Duration::from_millis(30)),
+            "the supervisor terminalized before consuming the approved fractional tail"
         );
+        let active_wall = active_attempt_wall(&paths, job.job_id.as_ref(), Utc::now())
+            .expect("terminal active wall");
+        assert!(active_wall >= Duration::from_secs(1));
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("wall-cap view");
+        assert_eq!(view.projection.stop_reason, Some(StopReason::WallCap));
     }
 
     #[test]
