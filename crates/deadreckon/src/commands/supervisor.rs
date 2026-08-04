@@ -354,6 +354,7 @@ struct GuardedLaunchRecovery {
     launch_id: String,
     release_token_sha256: String,
     attempt_started: bool,
+    release_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1186,6 +1187,9 @@ async fn supervise_one_job(
             Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement) => {
                 match recoverable_unlinked_guarded_launch(paths, job_id, &initial.projection) {
                     Ok(None) => guarded_recovery = None,
+                    Ok(Some(recovery)) if recovery.release_acknowledged => {
+                        guarded_recovery = Some(recovery);
+                    }
                     Ok(Some(_)) => {
                         append_terminal_event(
                             paths,
@@ -1223,10 +1227,14 @@ async fn supervise_one_job(
             }
         }
     }
+    let mut acknowledged_relaunch_is_safe = false;
     if let Some(child) = stored_child {
         // A PID observed after a reboot may belong to an unrelated process.
         // Boot identity is stronger evidence than PID reuse, so never adopt it.
         if !reboot_reclaim && child_identity_is_current(&child) {
+            // The acknowledged child is still the one live execution of this
+            // attempt. Adoption, rather than relaunch, owns its completion.
+            guarded_recovery = None;
             append_control_event(
                 paths,
                 &token,
@@ -1317,19 +1325,24 @@ async fn supervise_one_job(
             )? {
                 return Ok(());
             }
+            acknowledged_relaunch_is_safe = guarded_recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.release_acknowledged);
             remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
-            match reconcile_child_exit(
-                paths,
-                &initial.job,
-                &token,
-                recovery_exit,
-                initial.projection.attempt_count.max(1),
-                max_attempts,
-            )
-            .await?
-            {
-                ChildReconciliation::Retry => resuming_advanced = true,
-                ChildReconciliation::Finished => return Ok(()),
+            if !acknowledged_relaunch_is_safe {
+                match reconcile_child_exit(
+                    paths,
+                    &initial.job,
+                    &token,
+                    recovery_exit,
+                    initial.projection.attempt_count.max(1),
+                    max_attempts,
+                )
+                .await?
+                {
+                    ChildReconciliation::Retry => resuming_advanced = true,
+                    ChildReconciliation::Finished => return Ok(()),
+                }
             }
         }
     }
@@ -1352,6 +1365,25 @@ async fn supervise_one_job(
     }
     if finish_reached_policy_boundary(paths, &token, &initial.job, None)? {
         return Ok(());
+    }
+    if reboot_reclaim
+        && guarded_recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.release_acknowledged)
+    {
+        // A real boot change proves the acknowledged process cannot still be
+        // running. Test boot overrides exercise the same path only after the
+        // persisted process authorities above have been reconciled.
+        acknowledged_relaunch_is_safe = true;
+    }
+    if guarded_recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.release_acknowledged)
+        && !acknowledged_relaunch_is_safe
+    {
+        // A same-boot acknowledgement without adoptable or reconciled child
+        // metadata is not authority to duplicate a possibly live process.
+        guarded_recovery = None;
     }
 
     // A strict leaf persists its combined receipt before the supervisor writes
@@ -2056,9 +2088,13 @@ fn build_job_driver_command(
     work_cutoff: chrono::DateTime<Utc>,
 ) -> Result<Command> {
     let command = match job.shape {
-        JobShape::Single if attempt == 1 => {
-            build_leaf_command_at(paths, job, launch, executable, work_cutoff)?
-        }
+        JobShape::Single if attempt == 1 => match load_run(paths, job.job_id.as_ref()) {
+            Ok(_) => build_leaf_resume_command_at(paths, job, executable, work_cutoff),
+            Err(DeadreckonError::NotFound(_)) => {
+                build_leaf_command_at(paths, job, launch, executable, work_cutoff)?
+            }
+            Err(error) => return Err(CliError::Core(error)),
+        },
         JobShape::Single => build_leaf_resume_command_at(paths, job, executable, work_cutoff),
         JobShape::Graph | JobShape::LegacyCampaign => {
             build_advanced_command_at(paths, job, executable, work_cutoff)
@@ -2809,7 +2845,13 @@ fn recoverable_unlinked_guarded_launch(
                     "guarded launch release acknowledgement failed validation".to_string(),
                 )));
             }
-            return Ok(None);
+            return Ok(Some(GuardedLaunchRecovery {
+                attempt,
+                launch_id: launch_id.to_string(),
+                release_token_sha256: release_token_sha256.to_string(),
+                attempt_started,
+                release_acknowledged: true,
+            }));
         }
 
         let invalidated = history.events()[index + 1..].iter().any(|event| {
@@ -2834,6 +2876,7 @@ fn recoverable_unlinked_guarded_launch(
             launch_id: launch_id.to_string(),
             release_token_sha256: release_token_sha256.to_string(),
             attempt_started,
+            release_acknowledged: false,
         }));
     }
     Ok(None)
@@ -11897,6 +11940,32 @@ mod tests {
     }
 
     #[test]
+    fn acknowledged_first_attempt_resumes_persisted_state_instead_of_starting_over() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        executing_attempt(&paths, &job);
+        let launch = load_launch_inputs(&paths, &job).expect("launch");
+        let command = build_job_driver_command(
+            &paths,
+            &job,
+            &launch,
+            Path::new("/opt/deadreckon"),
+            1,
+            Utc::now() + chrono::TimeDelta::seconds(30),
+        )
+        .expect("acknowledged attempt resume command");
+
+        assert_eq!(
+            command.get_args().map(OsString::from).collect::<Vec<_>>(),
+            vec![
+                OsString::from("supervisor"),
+                OsString::from("resume"),
+                OsString::from(job.job_id.as_ref()),
+            ]
+        );
+    }
+
+    #[test]
     fn interrupted_leaf_with_a_dead_child_schedules_a_bounded_resume() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = fixture(&temp, 2);
@@ -12411,11 +12480,13 @@ mod tests {
             },
         )
         .expect("real ack fixture");
-        assert!(
+        let acknowledged =
             recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
                 .expect("acknowledged launch")
-                .is_none()
-        );
+                .expect("validated acknowledgement remains recoverable");
+        assert!(acknowledged.release_acknowledged);
+        assert!(acknowledged.attempt_started);
+        assert_eq!(acknowledged.attempt, 1);
     }
 
     #[test]
@@ -12506,12 +12577,13 @@ mod tests {
             stored_child.is_some(),
             "released child must remain adoptable"
         );
-        assert!(
+        let acknowledged =
             recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
                 .expect("validated acknowledgement")
-                .is_none(),
-            "a valid acknowledgement forbids relaunching the logical attempt"
-        );
+                .expect("acknowledged launch remains recoverable");
+        assert!(acknowledged.release_acknowledged);
+        assert!(acknowledged.attempt_started);
+        assert_eq!(acknowledged.attempt, 1);
         heartbeat.finish(Ok(())).expect("stop heartbeat");
     }
 
@@ -12588,8 +12660,8 @@ mod tests {
 
         assert_eq!(disposition, UnlinkedLaunchDisposition::PolicyTerminal);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "guarded recovery waited for its 30-second settle timeout"
+            started.elapsed() < Duration::from_secs(5),
+            "guarded recovery exceeded the exact work cutoff plus its ordinary process-termination grace instead of entering bounded cleanup promptly"
         );
         let _ = process.wait();
         assert!(!pid_is_alive(child_pid), "guarded child survived cutoff");

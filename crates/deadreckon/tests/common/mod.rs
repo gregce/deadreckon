@@ -10,6 +10,9 @@ use deadreckon_core::DeadreckonPaths;
 use serde_json::Value;
 use tempfile::TempDir;
 
+const SUPERVISOR_INSTANCE_SCHEMA: u64 = 3;
+const SUPERVISOR_STATUS_SCHEMA: u64 = 3;
+
 /// A hermetic per-user service environment for public `start` integration
 /// tests.  Both configured and unconfigured fixtures redirect HOME, the
 /// systemd user-config root, PATH, and DEADRECKON_HOME into temporary assets;
@@ -19,7 +22,7 @@ use tempfile::TempDir;
 /// runs the real long-lived supervisor directly.  The fake service manager is
 /// observational only: it reports the manually spawned process as
 /// loaded/enabled (launchd) or active/enabled (systemd).  This gives `start`
-/// the same unit + manager + live-v2-checkpoint evidence it requires in
+/// the same unit + manager + live-v3-checkpoint evidence it requires in
 /// production without asking the host manager to mutate anything.
 pub struct SupervisorServiceFixture {
     _assets: TempDir,
@@ -100,7 +103,7 @@ impl SupervisorServiceFixture {
             .collect::<Vec<_>>();
         let mut fixture = Self {
             _assets: assets,
-            binary: binary.to_path_buf(),
+            binary: fs::canonicalize(binary).expect("canonical isolated supervisor binary"),
             deadreckon_home: paths.home().to_path_buf(),
             user_home,
             xdg_config_home,
@@ -194,6 +197,7 @@ impl SupervisorServiceFixture {
 
         let checkpoint = self.deadreckon_home.join("supervisor/instance.json");
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last_checkpoint = None;
         loop {
             if let Some(service) = self.service.as_mut()
                 && let Some(status) = service.try_wait().expect("poll isolated supervisor")
@@ -202,15 +206,22 @@ impl SupervisorServiceFixture {
             }
             if let Ok(bytes) = fs::read(&checkpoint)
                 && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-                && value["schema_version"].as_u64() == Some(2)
-                && value["pid"].as_u64() == Some(u64::from(expected_pid))
             {
-                break;
+                let ready = value["schema_version"].as_u64() == Some(SUPERVISOR_INSTANCE_SCHEMA)
+                    && value["pid"].as_u64() == Some(u64::from(expected_pid));
+                last_checkpoint = Some(value);
+                if ready {
+                    break;
+                }
             }
             assert!(
                 Instant::now() < deadline,
-                "isolated supervisor did not publish a live v2 checkpoint at {}",
-                checkpoint.display()
+                "isolated supervisor did not publish a live v{SUPERVISOR_INSTANCE_SCHEMA} checkpoint at {}; last observed checkpoint: {}",
+                checkpoint.display(),
+                last_checkpoint
+                    .as_ref()
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "absent or invalid".to_string())
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -222,7 +233,10 @@ impl SupervisorServiceFixture {
             .expect("query isolated supervisor status");
         assert_success_with_labels(&status);
         let report: Value = serde_json::from_slice(&status.stdout).expect("supervisor status JSON");
-        assert_eq!(report["schema_version"], 2, "{report}");
+        assert_eq!(
+            report["schema_version"], SUPERVISOR_STATUS_SCHEMA,
+            "{report}"
+        );
         assert_eq!(report["installed"], "current", "{report}");
         assert_eq!(report["checkpoint"]["pid"], expected_pid, "{report}");
         #[cfg(target_os = "macos")]
