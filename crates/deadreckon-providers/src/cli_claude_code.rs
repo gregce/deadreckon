@@ -170,20 +170,19 @@ impl CliClaudeCodeProvider {
                 .insert(self.binary.clone(), capabilities);
             return Ok(capabilities);
         }
-        Ok(run_cli(
+        Ok(run_cli_capability_probe(
             &self.name,
             &self.binary,
             &["--help".to_string()],
             request.cwd.clone(),
             request.sandbox_backend,
-            None,
+            request.pid_file.clone(),
             request.cancellation_token.clone(),
             WorkspaceAccess::ReadOnly,
             false,
+            probe_timeout,
         )
-        .await
-        .ok()
-        .filter(|output| output.status_code == Some(0))
+        .await?
         .map(|output| parse_claude_capabilities(&output.stdout))
         .unwrap_or_else(ClaudeCapabilities::none))
     }

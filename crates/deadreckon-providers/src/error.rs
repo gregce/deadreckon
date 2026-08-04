@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use deadreckon_core::is_retryable_io_kind;
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,16 @@ pub enum ProviderError {
     },
     #[error("CLI provider error for {provider}: {detail}")]
     Cli { provider: String, detail: String },
+    #[error("provider request cancelled for {provider}: {detail}")]
+    Cancelled { provider: String, detail: String },
+    #[error(
+        "provider cleanup incomplete for {provider}: {detail}; process authority: {authority:?}"
+    )]
+    CleanupIncomplete {
+        provider: String,
+        authority: Option<PathBuf>,
+        detail: String,
+    },
     #[error("invalid provider configuration: {0}")]
     InvalidConfig(String),
     #[error("invalid strict output schema for {provider} at {path}: {detail}")]
@@ -65,6 +77,7 @@ impl ProviderError {
                 .iter()
                 .any(|marker| lower.contains(marker))
             }
+            ProviderError::Cancelled { .. } | ProviderError::CleanupIncomplete { .. } => false,
             ProviderError::InvalidConfig(_) => false,
             ProviderError::InvalidOutputSchema { .. } => false,
         }
@@ -73,6 +86,17 @@ impl ProviderError {
     /// Unrecoverable — the watchdog should escalate, not retry.
     pub fn is_fatal(&self) -> bool {
         !self.is_retryable()
+    }
+
+    /// Cancellation and incomplete cleanup are control-flow boundaries, not
+    /// provider quality failures. A router must never start a fallback route
+    /// after either outcome because doing so would cross the caller's deadline
+    /// or overlap a new process with retained authority from the old one.
+    pub fn stops_routing(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::Cancelled { .. } | ProviderError::CleanupIncomplete { .. }
+        )
     }
 }
 
@@ -125,9 +149,38 @@ mod tests {
                 path: "$.files".to_string(),
                 detail: "dynamic object keys are unsupported".to_string(),
             },
+            ProviderError::Cancelled {
+                provider: "cli:codex".to_string(),
+                detail: "operator cancelled".to_string(),
+            },
+            ProviderError::CleanupIncomplete {
+                provider: "cli:codex".to_string(),
+                authority: Some(PathBuf::from("provider.pid")),
+                detail: "cleanup deadline elapsed".to_string(),
+            },
         ] {
             assert!(!err.is_retryable());
             assert!(err.is_fatal());
         }
+    }
+
+    #[test]
+    fn cancellation_and_cleanup_stop_fallback_routing() {
+        assert!(
+            ProviderError::Cancelled {
+                provider: "cli:test".to_string(),
+                detail: "cancelled".to_string(),
+            }
+            .stops_routing()
+        );
+        assert!(
+            ProviderError::CleanupIncomplete {
+                provider: "cli:test".to_string(),
+                authority: Some(PathBuf::from("provider.pid")),
+                detail: "retained".to_string(),
+            }
+            .stops_routing()
+        );
+        assert!(!ProviderError::NoRoute("failed".to_string()).stops_routing());
     }
 }

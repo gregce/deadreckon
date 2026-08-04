@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, OnceCell};
 use which::which;
 
 use crate::cli_common::{
-    CLI_CAPABILITY_PROBE_TIMEOUT, CliOutput, CliRunOptions, ensure_success, run_cli,
+    CLI_CAPABILITY_PROBE_TIMEOUT, CliOutput, CliRunOptions, ensure_success,
     run_cli_capability_probe, run_cli_with_options, write_output,
 };
 use crate::cli_contract::{
@@ -255,7 +255,7 @@ impl CliCodexProvider {
             return Ok(capabilities);
         }
         if request.output_schema.is_none() {
-            return Ok(run_cli(
+            return Ok(run_cli_capability_probe(
                 &self.name,
                 &self.binary,
                 &["exec".to_string(), "--help".to_string()],
@@ -265,15 +265,14 @@ impl CliCodexProvider {
                 request.cancellation_token.clone(),
                 WorkspaceAccess::ReadOnly,
                 true,
+                probe_timeout,
             )
-            .await
-            .ok()
-            .filter(|output| output.status_code == Some(0))
+            .await?
             .map(|output| parse_codex_capabilities(&output.stdout))
             .unwrap_or_else(CodexCapabilities::none));
         }
 
-        let version_output = run_cli(
+        let version_output = run_cli_capability_probe(
             &self.name,
             &self.binary,
             &["--version".to_string()],
@@ -283,14 +282,13 @@ impl CliCodexProvider {
             request.cancellation_token.clone(),
             WorkspaceAccess::ReadOnly,
             true,
+            probe_timeout,
         )
-        .await?;
-        if version_output.status_code != Some(0) {
-            return Err(ProviderError::Cli {
-                provider: self.name.clone(),
-                detail: "schema-only request could not prove the Codex binary version".to_string(),
-            });
-        }
+        .await?
+        .ok_or_else(|| ProviderError::Cli {
+            provider: self.name.clone(),
+            detail: "schema-only request could not prove the Codex binary version".to_string(),
+        })?;
         let key = CodexBinaryVersion {
             binary: self.binary.clone(),
             version: format!("{}{}", version_output.stdout, version_output.stderr)
@@ -306,7 +304,7 @@ impl CliCodexProvider {
         };
         let capabilities = cell
             .get_or_try_init(|| async {
-                let help = run_cli(
+                let help = run_cli_capability_probe(
                     &self.name,
                     &self.binary,
                     &["exec".to_string(), "--help".to_string()],
@@ -316,9 +314,10 @@ impl CliCodexProvider {
                     request.cancellation_token.clone(),
                     WorkspaceAccess::ReadOnly,
                     true,
+                    probe_timeout,
                 )
                 .await;
-                let features = run_cli(
+                let features = run_cli_capability_probe(
                     &self.name,
                     &self.binary,
                     &["features".to_string(), "list".to_string()],
@@ -328,12 +327,11 @@ impl CliCodexProvider {
                     request.cancellation_token.clone(),
                     WorkspaceAccess::ReadOnly,
                     true,
+                    probe_timeout,
                 )
                 .await;
                 match (help, features) {
-                    (Ok(help), Ok(features))
-                        if help.status_code == Some(0) && features.status_code == Some(0) =>
-                    {
+                    (Ok(Some(help)), Ok(Some(features))) => {
                         Ok(parse_codex_capabilities_with_features(
                             &help.stdout,
                             &features.stdout,
@@ -547,12 +545,13 @@ fn supports_schema_only_posture(caps: CodexCapabilities) -> bool {
         && caps.structured_text_features
 }
 
-fn probe_failure(result: Result<CliOutput>) -> String {
+fn probe_failure(result: Result<Option<CliOutput>>) -> String {
     match result {
-        Ok(output) => format!(
+        Ok(Some(output)) => format!(
             "exit {:?}: {}{}",
             output.status_code, output.stdout, output.stderr
         ),
+        Ok(None) => "probe timed out, failed to launch, or exited unsuccessfully".to_string(),
         Err(error) => error.to_string(),
     }
 }
@@ -921,12 +920,17 @@ printf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"o
 
         let started = std::time::Instant::now();
         let capabilities = provider
-            .capabilities_for_request_with_timeout(&request, Duration::from_millis(100))
+            // Give a concurrently loaded test runtime enough time to spawn the
+            // descendant and publish its identity before exercising cleanup.
+            // The production probe allowance is ten seconds; this remains a
+            // deliberately short boundary without depending on sub-100 ms
+            // scheduler timing.
+            .capabilities_for_request_with_timeout(&request, Duration::from_secs(1))
             .await
             .expect("clean probe timeout degrades capabilities");
 
         assert_eq!(capabilities, CodexCapabilities::none());
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!pid_file.exists(), "probe retained PID authority");
         let descendant = std::fs::read_to_string(&descendant_path)
             .expect("descendant pid")

@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -16,6 +15,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ProviderRequest;
+use crate::cli_common::{CLI_CAPABILITY_PROBE_TIMEOUT, run_cli_capability_probe};
 use crate::error::ProviderError;
 use crate::registry::{ContractDialect, ContractSection};
 
@@ -153,18 +154,20 @@ pub(crate) fn evaluate_contract_probe(
 /// Probe `binary --help` once per binary/expectation pair. Failure to execute
 /// or a missing marker disables the contract with a caveat, never an error.
 #[allow(dead_code)] // Generic driver wiring lands in Pennant P4.
-pub(crate) fn probe_descriptor_contract(
+pub(crate) async fn probe_descriptor_contract(
+    provider: &str,
     binary: &str,
     contract: &ProviderContract,
-) -> ContractProbe {
+    request: &ProviderRequest,
+) -> crate::Result<ContractProbe> {
     let expected = contract
         .descriptor()
         .and_then(|section| section.probe_substring.as_deref());
     let Some(expected) = expected else {
-        return ContractProbe {
+        return Ok(ContractProbe {
             active: true,
             caveat: None,
-        };
+        });
     };
     static CACHE: OnceLock<ContractProbeCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -172,24 +175,26 @@ pub(crate) fn probe_descriptor_contract(
     if let Ok(guard) = cache.lock()
         && let Some(found) = guard.get(&key)
     {
-        return evaluate_contract_probe(binary, contract, found.as_deref());
+        return Ok(evaluate_contract_probe(binary, contract, found.as_deref()));
     }
-    let help = Command::new(binary)
-        .arg("--help")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )
-        });
+    let help = run_cli_capability_probe(
+        provider,
+        binary,
+        &["--help".to_string()],
+        request.cwd.clone(),
+        request.sandbox_backend,
+        request.pid_file.clone(),
+        request.cancellation_token.clone(),
+        request.workspace_access,
+        false,
+        CLI_CAPABILITY_PROBE_TIMEOUT,
+    )
+    .await?
+    .map(|output| format!("{}\n{}", output.stdout, output.stderr));
     if let Ok(mut guard) = cache.lock() {
         guard.insert(key, help.clone());
     }
-    evaluate_contract_probe(binary, contract, help.as_deref())
+    Ok(evaluate_contract_probe(binary, contract, help.as_deref()))
 }
 
 /// Token usage lifted from a provider's terminal event.

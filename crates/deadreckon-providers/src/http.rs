@@ -154,10 +154,9 @@ impl ProviderAdapter {
         let response = if let Some(token) = request.cancellation_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
-                    return Err(ProviderError::Http {
+                    return Err(ProviderError::Cancelled {
                         provider: self.name.clone(),
                         detail: "request cancelled".to_string(),
-                        retryable: false,
                     });
                 }
                 response = request_future => response
@@ -173,7 +172,21 @@ impl ProviderAdapter {
             retryable: true,
         })?;
         let status = response.status();
-        let body = response.text().await.map_err(|err| ProviderError::Http {
+        let body_future = response.text();
+        let body = if let Some(token) = request.cancellation_token.as_ref() {
+            tokio::select! {
+                () = token.cancelled() => {
+                    return Err(ProviderError::Cancelled {
+                        provider: self.name.clone(),
+                        detail: "request cancelled while reading response body".to_string(),
+                    });
+                }
+                body = body_future => body
+            }
+        } else {
+            body_future.await
+        }
+        .map_err(|err| ProviderError::Http {
             provider: self.name.clone(),
             detail: err.to_string(),
             retryable: true,

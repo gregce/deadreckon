@@ -243,6 +243,9 @@ impl ProviderRouter {
             match route.complete(request).await {
                 Ok(response) => return Ok(response),
                 Err(err) => {
+                    if err.stops_routing() {
+                        return Err(err);
+                    }
                     failures.push(format!("{}: {err}", route.name()));
                     last_error = Some(err);
                 }
@@ -334,5 +337,94 @@ fn build_provider(
                 descriptor.clone(),
             )?))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct CountingProvider {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        terminal: bool,
+    }
+
+    impl Provider for CountingProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::ScriptedSmoke
+        }
+
+        fn model(&self) -> &str {
+            "test"
+        }
+
+        fn has_credential(&self) -> bool {
+            true
+        }
+
+        fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate {
+            SpendEstimate {
+                provider: self.name.to_string(),
+                model: "test".to_string(),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: 0.0,
+                subscription: false,
+                wall_time_seconds: None,
+            }
+        }
+
+        fn complete<'a>(&'a self, _request: &'a ProviderRequest) -> crate::ProviderFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if self.terminal {
+                    Err(ProviderError::Cancelled {
+                        provider: self.name.to_string(),
+                        detail: "deadline cancelled the route".to_string(),
+                    })
+                } else {
+                    Err(ProviderError::NoRoute("fallback attempted".to_string()))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_never_launches_fallback_route() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let router = ProviderRouter {
+            routes: vec![
+                Box::new(CountingProvider {
+                    name: "first",
+                    calls: first_calls.clone(),
+                    terminal: true,
+                }),
+                Box::new(CountingProvider {
+                    name: "fallback",
+                    calls: fallback_calls.clone(),
+                    terminal: false,
+                }),
+            ],
+            context_windows: BTreeMap::new(),
+            context_window_sources: BTreeMap::new(),
+        };
+
+        let error = router
+            .complete(&ProviderRequest::default())
+            .await
+            .expect_err("cancelled route");
+
+        assert!(matches!(error, ProviderError::Cancelled { .. }));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
     }
 }

@@ -145,7 +145,7 @@ impl GenericCliProvider {
         request: &ProviderRequest,
         contract: &ProviderContract,
     ) -> Result<ProviderResponse> {
-        let probe = probe_descriptor_contract(&self.binary, contract);
+        let probe = probe_descriptor_contract(&self.name, &self.binary, contract, request).await?;
         let Some(section) = contract.descriptor() else {
             return Err(ProviderError::InvalidConfig(format!(
                 "{} generic driver received a bespoke contract",

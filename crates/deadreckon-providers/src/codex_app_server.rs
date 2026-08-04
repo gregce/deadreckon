@@ -28,8 +28,8 @@ use crate::cli_contract::ProviderSession;
 use crate::cli_contract::add_caveat;
 use crate::types::CapabilityPosture;
 use crate::{
-    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+    Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderProcessLifetime,
+    ProviderRequest, ProviderResponse, ProviderUsage, Result, SpendEstimate,
 };
 
 const KNOWN_NOTIFICATIONS: &[&str] = &[
@@ -40,6 +40,7 @@ const KNOWN_NOTIFICATIONS: &[&str] = &[
     "item/agentMessage/delta",
     "thread/tokenUsage/updated",
 ];
+const APP_SERVER_DIRECT_REAP_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RpcNotification {
@@ -767,7 +768,7 @@ impl CodexAppServer {
                 spec.pid_file.as_deref(),
                 process_record.as_ref(),
             )
-            .await;
+            .await?;
             return Err(ProviderError::Cli {
                 provider: spec.provider.clone(),
                 detail: "codex app-server stdin was unavailable".to_string(),
@@ -779,7 +780,7 @@ impl CodexAppServer {
                 spec.pid_file.as_deref(),
                 process_record.as_ref(),
             )
-            .await;
+            .await?;
             return Err(ProviderError::Cli {
                 provider: spec.provider.clone(),
                 detail: "codex app-server stdout was unavailable".to_string(),
@@ -794,7 +795,7 @@ impl CodexAppServer {
             process_record,
         };
         if let Err(error) = server.initialize().await {
-            server.kill_child().await;
+            server.kill_child().await?;
             return Err(error);
         }
         Ok(server)
@@ -942,13 +943,14 @@ impl CodexAppServer {
             tokio::select! {
                 biased;
                 () = token.cancelled() => {
-                    let interrupted = self
+                    let _interrupted = self
                         .interrupt_turn(thread_id, &turn_id, &mut approval_session)
                         .await;
-                    if interrupted.is_err() {
-                        self.kill_child().await;
-                    }
-                    Err(ProviderError::Cli {
+                    // A turn deadline is terminal for this provider phase.
+                    // Interrupting model work is not OS-process cleanup: stop
+                    // and reap the reusable server before resolving.
+                    self.kill_child().await?;
+                    Err(ProviderError::Cancelled {
                         provider: ROUTE.to_string(),
                         detail: "request cancelled after app-server interrupt".to_string(),
                     })
@@ -1019,13 +1021,13 @@ impl CodexAppServer {
         })?
     }
 
-    async fn kill_child(&mut self) {
+    async fn kill_child(&mut self) -> Result<()> {
         stop_app_server_child(
             &mut self.child,
             self.pid_file.as_deref(),
             self.process_record.as_ref(),
         )
-        .await;
+        .await
     }
 
     async fn read_turn(
@@ -1313,7 +1315,7 @@ async fn stop_app_server_child(
     child: &mut Child,
     pid_file: Option<&Path>,
     record: Option<&deadreckon_core::SupervisedProcessRecord>,
-) {
+) -> Result<()> {
     let pid = record
         .map(|record| record.process.pid)
         .or_else(|| child.id());
@@ -1324,20 +1326,38 @@ async fn stop_app_server_child(
     }
     let _ = child.start_kill();
     let direct_reaped = matches!(
-        tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+        tokio::time::timeout(APP_SERVER_DIRECT_REAP_TIMEOUT, child.wait()).await,
         Ok(Ok(_))
     );
-    let group_reconciled = if let Some(pid) = pid {
-        reconcile_process_group(pid).await.is_ok()
-    } else {
-        false
-    };
-    if direct_reaped
-        && group_reconciled
-        && let (Some(pid_file), Some(record)) = (pid_file, record)
-    {
-        let _ = remove_current_process_record(pid_file, record);
+    if !direct_reaped {
+        return Err(ProviderError::CleanupIncomplete {
+            provider: "cli:codex-server".to_string(),
+            authority: pid_file.map(Path::to_path_buf),
+            detail: format!(
+                "app-server direct child was not reaped within {:.0}s",
+                APP_SERVER_DIRECT_REAP_TIMEOUT.as_secs_f64()
+            ),
+        });
     }
+    if let Some(pid) = pid
+        && let Err(error) = reconcile_process_group(pid).await
+    {
+        return Err(ProviderError::CleanupIncomplete {
+            provider: "cli:codex-server".to_string(),
+            authority: pid_file.map(Path::to_path_buf),
+            detail: format!("app-server process group was not reconciled: {error}"),
+        });
+    }
+    if let (Some(pid_file), Some(record)) = (pid_file, record) {
+        remove_current_process_record(pid_file, record).map_err(|error| {
+            ProviderError::CleanupIncomplete {
+                provider: "cli:codex-server".to_string(),
+                authority: Some(pid_file.to_path_buf()),
+                detail: format!("app-server PID authority could not be removed: {error}"),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) enum ServerStart {
@@ -1393,16 +1413,22 @@ impl CliCodexServerProvider {
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
         let started = Instant::now();
-        if request.output_schema.is_some() {
+        if request.output_schema.is_some() || request.workspace_access == WorkspaceAccess::ReadOnly
+        {
             // App-server threads expose approval-mediated tools and durable
-            // sessions. Schema-only requests must instead use Codex's
-            // ephemeral, capability-probed exec route.
+            // sessions. Schema-only and one-shot read-only requests must use
+            // Codex's ephemeral, capability-probed exec route so a planner or
+            // health check can prove its request-scoped PID authority removed.
             return self
                 .run_fallback(
                     request,
                     json!({
                         "route": self.name,
-                        "reason": "schema-only request requires ephemeral Codex exec"
+                        "reason": if request.output_schema.is_some() {
+                            "schema-only request requires ephemeral Codex exec"
+                        } else {
+                            "read-only request requires ephemeral Codex exec"
+                        }
                     }),
                 )
                 .await;
@@ -1485,10 +1511,28 @@ impl CliCodexServerProvider {
                     .as_ref()
                     .is_some_and(CancellationToken::is_cancelled) =>
             {
+                if let Some(server) = server_slot.as_mut() {
+                    server.kill_child().await?;
+                }
+                server_slot.take();
+                return Err(if error.stops_routing() {
+                    error
+                } else {
+                    ProviderError::Cancelled {
+                        provider: self.name.clone(),
+                        detail: format!("request cancelled while app-server was active: {error}"),
+                    }
+                });
+            }
+            Err(error) if error.stops_routing() => {
+                server_slot.take();
                 return Err(error);
             }
             Err(error) => {
                 self.degraded.store(true, Ordering::Release);
+                if let Some(server) = server_slot.as_mut() {
+                    server.kill_child().await?;
+                }
                 server_slot.take();
                 drop(server_slot);
                 return self
@@ -1602,6 +1646,15 @@ impl Provider for CliCodexServerProvider {
             cost_usd: 0.0,
             subscription: true,
             wall_time_seconds: None,
+        }
+    }
+
+    fn process_lifetime(&self, request: &ProviderRequest) -> ProviderProcessLifetime {
+        if request.workspace_access == WorkspaceAccess::ReadWrite && request.output_schema.is_none()
+        {
+            ProviderProcessLifetime::RouterSession
+        } else {
+            ProviderProcessLifetime::Invocation
         }
     }
 
@@ -1865,7 +1918,7 @@ mod tests {
             binary: fixture().display().to_string(),
             extra_args: vec!["normal".to_string()],
             cwd: temp.path().to_path_buf(),
-            pid_file: Some(pid_file.clone()),
+            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
             sandbox_backend: None,
             workspace_access: WorkspaceAccess::ReadWrite,
         })
@@ -2440,12 +2493,13 @@ mod tests {
     async fn kill_sends_interrupt_before_process_kill() {
         let temp = TempDir::new().expect("tempdir");
         let log = temp.path().join("rpc.log");
+        let pid_file = temp.path().join("child-pids/codex-app-server.pid");
         let ServerStart::Ready(mut server) = start_server_or_degrade(CodexAppServerSpec {
             provider: "cli:codex-server".to_string(),
             binary: fixture().display().to_string(),
             extra_args: vec!["wait-for-interrupt".to_string(), log.display().to_string()],
             cwd: temp.path().to_path_buf(),
-            pid_file: Some(temp.path().join("child-pids/codex-app-server.pid")),
+            pid_file: Some(pid_file.clone()),
             sandbox_backend: None,
             workspace_access: WorkspaceAccess::ReadWrite,
         })
@@ -2489,16 +2543,11 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).expect("rpc log");
         assert!(calls.contains("turn/interrupt"), "{calls}");
-        assert!(deadreckon_core::pid_is_alive(pid));
-
-        drop(server);
-        for _ in 0..40 {
-            if !deadreckon_core::pid_is_alive(pid) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
         assert!(!deadreckon_core::pid_is_alive(pid));
+        assert!(
+            !pid_file.exists(),
+            "cancelled server retained PID authority"
+        );
     }
 
     #[tokio::test]

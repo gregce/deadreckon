@@ -13,8 +13,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use deadreckon_core::gate::{AcceptanceCheck, AcceptanceSpec};
-use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderRouter};
-use tokio_util::sync::CancellationToken;
+use deadreckon_providers::{
+    ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
+    ProviderRouter, complete_provider_phase,
+};
 
 /// A model's proposed contract for an unknown tree. The model proposes; it does
 /// not decide — approval and arming happen elsewhere.
@@ -172,12 +174,6 @@ pub(crate) fn parse_proposed_contract(content: &str) -> Option<ProposedContract>
 
 use crate::commands;
 
-#[derive(Debug, PartialEq, Eq)]
-enum InferredContractWait<T> {
-    Completed(T),
-    TimedOut { cleanup_proven: bool },
-}
-
 fn infer_contract_timeout(kind: Option<&ProviderKind>) -> Duration {
     let seconds = if kind.is_some_and(provider_kind_uses_cli_process) {
         INFER_CONTRACT_CLI_WALL_SECONDS
@@ -192,26 +188,6 @@ fn provider_kind_uses_cli_process(kind: &ProviderKind) -> bool {
         || matches!(kind, ProviderKind::Generic(id) if id.starts_with("cli:"))
 }
 
-async fn await_inferred_contract<F, T>(
-    future: F,
-    token: &CancellationToken,
-    allocation: Duration,
-    cleanup_grace: Duration,
-) -> InferredContractWait<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    tokio::pin!(future);
-    tokio::select! {
-        output = &mut future => InferredContractWait::Completed(output),
-        () = tokio::time::sleep(allocation) => {
-            token.cancel();
-            let cleanup_proven = tokio::time::timeout(cleanup_grace, &mut future).await.is_ok();
-            InferredContractWait::TimedOut { cleanup_proven }
-        }
-    }
-}
-
 /// Call the cheap-model router with the redacted prompt; `None` on
 /// no-provider/timeout/parse-failure/low-confidence — inference never fails a
 /// run. As with the root planner, timeout cancellation gets a separate bounded
@@ -223,7 +199,6 @@ pub(crate) async fn propose_contract(
 ) -> Option<ProposedContract> {
     let router = ProviderRouter::from_config_path(config_path, Some(provider)).ok()?;
     let route_kind = router.selected_route_info().map(|route| route.kind);
-    let token = CancellationToken::new();
     let pid_file = std::env::temp_dir().join(format!(
         "deadreckon-infer-contract-{}.pid",
         uuid::Uuid::new_v4().simple()
@@ -231,29 +206,40 @@ pub(crate) async fn propose_contract(
     let mut request =
         ProviderRequest::enforceably_read_only(infer_prompt(working_dir), 512, working_dir);
     request.pid_file = Some(pid_file.clone());
-    request.cancellation_token = Some(token.clone());
-    let response = match await_inferred_contract(
-        router.complete(&request),
-        &token,
+    let deadline = ProviderPhaseDeadline::from_now(
         infer_contract_timeout(route_kind.as_ref()),
         Duration::from_secs(INFER_CONTRACT_CLEANUP_GRACE_SECONDS),
-    )
-    .await
-    {
-        InferredContractWait::Completed(response) if !pid_file.exists() => response.ok()?,
-        InferredContractWait::Completed(_) => return None,
-        InferredContractWait::TimedOut { cleanup_proven }
-            if cleanup_proven && !pid_file.exists() =>
-        {
+    );
+    let response = match complete_provider_phase(&router, &mut request, deadline).await {
+        ProviderPhaseOutcome::Completed(Ok(response)) => response,
+        ProviderPhaseOutcome::Completed(Err(error)) => {
+            report_inference_provider_failure(&error.to_string());
             return None;
         }
-        InferredContractWait::TimedOut { .. } => return None,
+        ProviderPhaseOutcome::WorkExpired { cleanup }
+        | ProviderPhaseOutcome::Cancelled { cleanup } => {
+            report_inference_cleanup(&cleanup);
+            return None;
+        }
     };
     let proposal = parse_proposed_contract(&response.content)?;
     if proposal.confidence < MIN_CONFIDENCE {
         return None;
     }
     Some(proposal)
+}
+
+fn report_inference_provider_failure(detail: &str) {
+    eprintln!("warning: inferred-contract provider unavailable: {detail}");
+}
+
+fn report_inference_cleanup(cleanup: &ProviderCleanup) {
+    if let ProviderCleanup::RetainedAuthority { path, detail } = cleanup {
+        eprintln!(
+            "warning: inferred-contract provider cleanup was not proven ({detail}); process authority remains at {}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -309,27 +295,6 @@ mod tests {
                 .as_secs(),
             300
         );
-    }
-
-    #[tokio::test]
-    async fn inferred_contract_timeout_cancels_then_bounds_cleanup() {
-        let token = CancellationToken::new();
-        let started = std::time::Instant::now();
-        let outcome = await_inferred_contract(
-            std::future::pending::<()>(),
-            &token,
-            Duration::from_millis(10),
-            Duration::from_millis(10),
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            InferredContractWait::TimedOut {
-                cleanup_proven: false
-            }
-        );
-        assert!(token.is_cancelled());
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

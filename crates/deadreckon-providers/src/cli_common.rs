@@ -4,10 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use deadreckon_core::HeadTailBuffer;
 use deadreckon_sandbox::{
     SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, run as run_sandbox,
 };
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::registry::ProviderRegistry;
@@ -15,6 +19,10 @@ use crate::{ProviderError, Result};
 
 pub(crate) const CLI_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+// Leave two seconds inside the oldest 10-second phase cleanup budget for the
+// caller to classify and persist retained authority after this inner proof.
+const CLI_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(8);
+const CLI_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct CliOutput {
@@ -81,7 +89,7 @@ pub(crate) async fn run_cli_capability_probe(
         .as_ref()
         .is_some_and(CancellationToken::is_cancelled)
     {
-        return Err(ProviderError::Cli {
+        return Err(ProviderError::Cancelled {
             provider: provider.to_string(),
             detail: "request cancelled before capability probe".to_string(),
         });
@@ -136,15 +144,12 @@ pub(crate) async fn run_cli_capability_probe(
                 .await
                 .is_err()
             {
-                return Err(ProviderError::Cli {
+                return Err(ProviderError::CleanupIncomplete {
                     provider: provider.to_string(),
+                    authority: pid_file.clone(),
                     detail: format!(
-                        "capability probe cleanup exceeded the bounded {}s safety window{}",
-                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs(),
-                        pid_file.as_ref().map_or_else(String::new, |path| format!(
-                            "; process authority remains at {}",
-                            path.display()
-                        ))
+                        "capability probe cleanup exceeded the bounded {}s safety window",
+                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs()
                     ),
                 });
             }
@@ -157,20 +162,17 @@ pub(crate) async fn run_cli_capability_probe(
                 .await
                 .is_err()
             {
-                return Err(ProviderError::Cli {
+                return Err(ProviderError::CleanupIncomplete {
                     provider: provider.to_string(),
+                    authority: pid_file.clone(),
                     detail: format!(
-                        "cancelled capability probe cleanup exceeded the bounded {}s safety window{}",
-                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs(),
-                        pid_file.as_ref().map_or_else(String::new, |path| format!(
-                            "; process authority remains at {}",
-                            path.display()
-                        ))
+                        "cancelled capability probe cleanup exceeded the bounded {}s safety window",
+                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs()
                     ),
                 });
             }
             prove_capability_probe_cleanup(provider, pid_file.as_deref())?;
-            Err(ProviderError::Cli {
+            Err(ProviderError::Cancelled {
                 provider: provider.to_string(),
                 detail: "request cancelled during capability probe".to_string(),
             })
@@ -182,19 +184,33 @@ fn prove_capability_probe_cleanup(provider: &str, pid_file: Option<&Path>) -> Re
     let Some(pid_file) = pid_file else {
         return Ok(());
     };
-    match std::fs::symlink_metadata(pid_file) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(ProviderError::Cli {
+    match pid_authority_absent(pid_file) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ProviderError::CleanupIncomplete {
             provider: provider.to_string(),
+            authority: Some(pid_file.to_path_buf()),
             detail: format!(
                 "capability probe returned without proving process cleanup; process authority remains at {}",
                 pid_file.display()
             ),
         }),
-        Err(source) => Err(ProviderError::Io {
-            path: pid_file.display().to_string(),
-            source,
+        Err(source) => Err(ProviderError::CleanupIncomplete {
+            provider: provider.to_string(),
+            authority: Some(pid_file.to_path_buf()),
+            detail: format!("could not inspect capability-probe PID authority: {source}"),
         }),
+    }
+}
+
+/// Only a confirmed `NotFound` means process authority is absent. Following a
+/// symlink with `Path::exists` would incorrectly treat dangling authority as
+/// clean, while swallowing other metadata errors would turn an inspection
+/// failure into false cleanup proof.
+fn pid_authority_absent(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -231,6 +247,8 @@ pub(crate) async fn run_cli_with_options(
         });
     }
     if let Some(backend) = options.sandbox_backend {
+        let sandbox_pid_file = options.pid_file.clone();
+        let sandbox_cancellation = options.cancellation_token.clone();
         let cwd = options
             .cwd
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
@@ -282,9 +300,43 @@ pub(crate) async fn run_cli_with_options(
             guarded_launch: None,
         })
         .await
-        .map_err(|source| ProviderError::Cli {
-            provider: provider.to_string(),
-            detail: source.to_string(),
+        .map_err(|source| {
+            if let Some(pid_file) = sandbox_pid_file.as_deref() {
+                match pid_authority_absent(pid_file) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return ProviderError::CleanupIncomplete {
+                            provider: provider.to_string(),
+                            authority: sandbox_pid_file.clone(),
+                            detail: format!(
+                                "sandboxed provider returned with retained authority: {source}"
+                            ),
+                        };
+                    }
+                    Err(error) => {
+                        return ProviderError::CleanupIncomplete {
+                            provider: provider.to_string(),
+                            authority: sandbox_pid_file.clone(),
+                            detail: format!(
+                                "sandboxed provider returned and PID authority could not be inspected: {error}; original error: {source}"
+                            ),
+                        };
+                    }
+                }
+            }
+            if sandbox_cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return ProviderError::Cancelled {
+                    provider: provider.to_string(),
+                    detail: source.to_string(),
+                };
+            }
+            ProviderError::Cli {
+                provider: provider.to_string(),
+                detail: source.to_string(),
+            }
         })?;
         return Ok(CliOutput {
             stdout: output.stdout,
@@ -321,64 +373,266 @@ pub(crate) async fn run_cli_with_options(
         (Some(pid), Some(pid_file)) => match write_current_process_record(pid_file, pid) {
             Ok(record) => Some(record),
             Err(error) => {
-                signal_process_group(pid, true);
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                reconcile_process_group(pid).await?;
+                let cleanup_deadline = Instant::now() + CLI_PROCESS_CLEANUP_TIMEOUT;
+                stop_and_reap_cli_child(&mut child, Some(pid), cleanup_deadline)
+                    .await
+                    .map_err(|detail| {
+                        cleanup_incomplete(provider, Some(pid_file.as_ref()), detail)
+                    })?;
+                remove_partial_process_authority(pid_file).map_err(|detail| {
+                    cleanup_incomplete(provider, Some(pid_file.as_ref()), detail)
+                })?;
                 return Err(error);
             }
         },
         _ => None,
     };
-    let wait = child.wait_with_output();
-    tokio::pin!(wait);
-    let output = if let Some(token) = cancellation_token {
+    let Some(stdout) = child.stdout.take() else {
+        return finish_missing_cli_pipe(
+            provider,
+            &mut child,
+            pid,
+            pid_file.as_deref(),
+            process_record.as_ref(),
+            "stdout",
+        )
+        .await;
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return finish_missing_cli_pipe(
+            provider,
+            &mut child,
+            pid,
+            pid_file.as_deref(),
+            process_record.as_ref(),
+            "stderr",
+        )
+        .await;
+    };
+    let output_drains = CliOutputDrains::new(stdout, stderr);
+
+    let boundary = if let Some(token) = cancellation_token.as_ref() {
         tokio::select! {
-            _ = token.cancelled() => {
-                if let Some(pid) = pid {
-                    signal_process_group(pid, false);
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    signal_process_group(pid, true);
-                }
-                // wait_with_output drains both pipes and reaps the direct
-                // child after the whole process group has been signalled.
-                let _ = wait.await;
-                if let Some(pid) = pid {
-                    reconcile_process_group(pid).await?;
-                }
-                if let (Some(pid_file), Some(record)) =
-                    (pid_file.as_ref(), process_record.as_ref())
-                {
-                    remove_current_process_record(pid_file, record)?;
-                }
-                return Err(ProviderError::Cli {
-                    provider: provider.to_string(),
-                    detail: "request cancelled".to_string(),
-                });
-            }
-            output = &mut wait => output
+            biased;
+            () = token.cancelled() => CliWaitBoundary::Cancelled,
+            output = child.wait() => CliWaitBoundary::Completed(output),
         }
     } else {
-        wait.await
+        CliWaitBoundary::Completed(child.wait().await)
+    };
+
+    match boundary {
+        CliWaitBoundary::Cancelled => {
+            let cleanup_deadline = Instant::now() + CLI_PROCESS_CLEANUP_TIMEOUT;
+            let process_cleanup = stop_and_reap_cli_child(&mut child, pid, cleanup_deadline).await;
+            let output_cleanup = output_drains.finish_before(cleanup_deadline).await;
+            if let Err(detail) = process_cleanup.and(output_cleanup.map(|_| ())) {
+                return Err(cleanup_incomplete(provider, pid_file.as_deref(), detail));
+            }
+            remove_cli_process_authority(provider, pid_file.as_deref(), process_record.as_ref())?;
+            Err(ProviderError::Cancelled {
+                provider: provider.to_string(),
+                detail: "request cancelled".to_string(),
+            })
+        }
+        CliWaitBoundary::Completed(Err(source)) => {
+            let cleanup_deadline = Instant::now() + CLI_PROCESS_CLEANUP_TIMEOUT;
+            let process_cleanup = stop_and_reap_cli_child(&mut child, pid, cleanup_deadline).await;
+            let output_cleanup = output_drains.finish_before(cleanup_deadline).await;
+            if let Err(detail) = process_cleanup.and(output_cleanup.map(|_| ())) {
+                return Err(cleanup_incomplete(provider, pid_file.as_deref(), detail));
+            }
+            remove_cli_process_authority(provider, pid_file.as_deref(), process_record.as_ref())?;
+            Err(ProviderError::Cli {
+                provider: provider.to_string(),
+                detail: source.to_string(),
+            })
+        }
+        CliWaitBoundary::Completed(Ok(status)) => {
+            let cleanup_deadline = Instant::now() + CLI_PROCESS_CLEANUP_TIMEOUT;
+            if let Some(pid) = pid.filter(|_| supervise_process_group) {
+                reconcile_cli_process_group_before(pid, cleanup_deadline)
+                    .await
+                    .map_err(|detail| cleanup_incomplete(provider, pid_file.as_deref(), detail))?;
+            }
+            let (stdout, stderr) = output_drains
+                .finish_before(cleanup_deadline)
+                .await
+                .map_err(|detail| cleanup_incomplete(provider, pid_file.as_deref(), detail))?;
+            remove_cli_process_authority(provider, pid_file.as_deref(), process_record.as_ref())?;
+            Ok(CliOutput {
+                stdout,
+                stderr,
+                status_code: status.code(),
+                pid,
+                sandbox_backend: None,
+                sandbox_warning: None,
+            })
+        }
     }
-    .map_err(|source| ProviderError::Cli {
+}
+
+enum CliWaitBoundary {
+    Completed(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+}
+
+struct CliOutputDrains {
+    stdout: JoinHandle<String>,
+    stderr: JoinHandle<String>,
+}
+
+impl CliOutputDrains {
+    fn new(stdout: tokio::process::ChildStdout, stderr: tokio::process::ChildStderr) -> Self {
+        Self {
+            stdout: tokio::spawn(drain_bounded_cli_output(stdout)),
+            stderr: tokio::spawn(drain_bounded_cli_output(stderr)),
+        }
+    }
+
+    async fn finish_before(
+        mut self,
+        deadline: Instant,
+    ) -> std::result::Result<(String, String), String> {
+        let (stdout, stderr) = tokio::join!(
+            tokio::time::timeout_at(deadline, &mut self.stdout),
+            tokio::time::timeout_at(deadline, &mut self.stderr),
+        );
+        match (stdout, stderr) {
+            (Ok(Ok(stdout)), Ok(Ok(stderr))) => Ok((stdout, stderr)),
+            (stdout, stderr) => {
+                self.stdout.abort();
+                self.stderr.abort();
+                Err(format!(
+                    "provider output drains did not both resolve before the cleanup deadline (stdout: {}; stderr: {})",
+                    output_drain_status(&stdout),
+                    output_drain_status(&stderr)
+                ))
+            }
+        }
+    }
+}
+
+fn output_drain_status(
+    status: &std::result::Result<
+        std::result::Result<String, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> String {
+    match status {
+        Ok(Ok(_)) => "completed".to_string(),
+        Ok(Err(error)) => format!("task failed: {error}"),
+        Err(_) => "timed out".to_string(),
+    }
+}
+
+async fn drain_bounded_cli_output<R>(mut reader: R) -> String
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut output = HeadTailBuffer::new(CLI_OUTPUT_LIMIT_BYTES);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => output.push(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    output.render(None)
+}
+
+async fn stop_and_reap_cli_child(
+    child: &mut Child,
+    pid: Option<u32>,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    if let Some(pid) = pid {
+        signal_process_group(pid, false);
+        tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(250))).await;
+        signal_process_group(pid, true);
+    }
+    let _ = child.start_kill();
+    let direct_reaped = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!("provider direct-child reap failed: {error}")),
+        Err(_) => Err(format!(
+            "provider direct child was not reaped within {:.0}s",
+            CLI_PROCESS_CLEANUP_TIMEOUT.as_secs_f64()
+        )),
+    };
+    let group_reconciled = if let Some(pid) = pid {
+        reconcile_cli_process_group_before(pid, deadline).await
+    } else {
+        Ok(())
+    };
+    match (direct_reaped, group_reconciled) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(direct), Ok(())) => Err(direct),
+        (Ok(()), Err(group)) => Err(group),
+        (Err(direct), Err(group)) => Err(format!("{direct}; {group}")),
+    }
+}
+
+async fn reconcile_cli_process_group_before(
+    pid: u32,
+    deadline: Instant,
+) -> std::result::Result<(), String> {
+    match tokio::time::timeout_at(deadline, reconcile_process_group(pid)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("provider process-group cleanup failed: {error}")),
+        Err(_) => Err("provider process-group cleanup exceeded its deadline".to_string()),
+    }
+}
+
+fn remove_cli_process_authority(
+    provider: &str,
+    pid_file: Option<&Path>,
+    process_record: Option<&deadreckon_core::SupervisedProcessRecord>,
+) -> Result<()> {
+    if let (Some(pid_file), Some(record)) = (pid_file, process_record) {
+        remove_current_process_record(pid_file, record)
+            .map_err(|error| cleanup_incomplete(provider, Some(pid_file), error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn remove_partial_process_authority(path: &Path) -> std::result::Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "partially written process authority could not be removed: {error}"
+        )),
+    }
+}
+
+async fn finish_missing_cli_pipe(
+    provider: &str,
+    child: &mut Child,
+    pid: Option<u32>,
+    pid_file: Option<&Path>,
+    process_record: Option<&deadreckon_core::SupervisedProcessRecord>,
+    pipe: &str,
+) -> Result<CliOutput> {
+    let cleanup_deadline = Instant::now() + CLI_PROCESS_CLEANUP_TIMEOUT;
+    stop_and_reap_cli_child(child, pid, cleanup_deadline)
+        .await
+        .map_err(|detail| cleanup_incomplete(provider, pid_file, detail))?;
+    remove_cli_process_authority(provider, pid_file, process_record)?;
+    Err(ProviderError::Cli {
         provider: provider.to_string(),
-        detail: source.to_string(),
-    })?;
-    if let Some(pid) = pid.filter(|_| supervise_process_group) {
-        reconcile_process_group(pid).await?;
-    }
-    if let (Some(pid_file), Some(record)) = (pid_file.as_ref(), process_record.as_ref()) {
-        remove_current_process_record(pid_file, record)?;
-    }
-    Ok(CliOutput {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        status_code: output.status.code(),
-        pid,
-        sandbox_backend: None,
-        sandbox_warning: None,
+        detail: format!("provider {pipe} pipe was unavailable"),
     })
+}
+
+fn cleanup_incomplete(provider: &str, pid_file: Option<&Path>, detail: String) -> ProviderError {
+    ProviderError::CleanupIncomplete {
+        provider: provider.to_string(),
+        authority: pid_file.map(Path::to_path_buf),
+        detail,
+    }
 }
 
 #[cfg(unix)]
@@ -622,7 +876,11 @@ pub(crate) fn ensure_success(provider: &str, output: &CliOutput) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliRunOptions, cli_provider_write_allowlist, run_cli_with_options};
+    use std::time::Duration;
+
+    use super::{
+        CliRunOptions, cli_provider_write_allowlist, pid_authority_absent, run_cli_with_options,
+    };
     use deadreckon_sandbox::WorkspaceAccess;
     use tokio_util::sync::CancellationToken;
 
@@ -631,6 +889,22 @@ mod tests {
         let paths = cli_provider_write_allowlist("cli:codex");
         assert!(paths.iter().any(|path| path.ends_with(".codex")));
         assert!(!paths.iter().any(|path| path.ends_with(".claude")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_pid_authority_is_retained_not_mistaken_for_absence() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let authority = temp.path().join("provider.pid");
+        symlink(temp.path().join("missing-record"), &authority).expect("dangling authority");
+
+        assert!(matches!(pid_authority_absent(&authority), Ok(false)));
+        assert!(matches!(
+            pid_authority_absent(&temp.path().join("actually-absent")),
+            Ok(true)
+        ));
     }
 
     #[tokio::test]
@@ -674,7 +948,7 @@ mod tests {
         let args = vec![
             "-c".to_string(),
             format!(
-                "sleep 30 & child=$!; echo $child > '{}'; wait",
+                "(trap '' TERM; while :; do printf 'child-stdout-flood-0123456789abcdef\\n'; printf 'child-stderr-flood-0123456789abcdef\\n' >&2; done) & child=$!; echo $child > '{}'; wait",
                 grandchild_file.display()
             ),
         ];
@@ -732,5 +1006,106 @@ mod tests {
             }
         }
         assert!(!temp.path().join("provider.pid").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_cli_bounds_escaped_pipe_holder_and_retains_authority() {
+        struct EscapedProcessGuard {
+            pid_path: std::path::PathBuf,
+            authority: std::path::PathBuf,
+        }
+
+        impl Drop for EscapedProcessGuard {
+            fn drop(&mut self) {
+                if let Ok(raw) = std::fs::read_to_string(&self.pid_path)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                    && deadreckon_core::pid_is_alive(pid)
+                {
+                    let _ = deadreckon_core::terminate_pid(pid, true);
+                }
+                let _ = std::fs::remove_file(&self.authority);
+            }
+        }
+
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let escaped_pid = temp.path().join("escaped.pid");
+        let authority = temp.path().join("provider.pid");
+        let _guard = EscapedProcessGuard {
+            pid_path: escaped_pid.clone(),
+            authority: authority.clone(),
+        };
+        let python_program = concat!(
+            "import os,signal,sys; ",
+            "os.setsid(); ",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); ",
+            "f=open(sys.argv[1], \"w\"); f.write(str(os.getpid())); f.close(); ",
+            "payload=b\"escaped-output-flood-0123456789abcdef\\n\"; ",
+            "exec(\"while True:\\n os.write(1,payload)\\n os.write(2,payload)\")"
+        );
+        let args = vec![
+            "-c".to_string(),
+            format!(
+                "\"{}\" -c '{}' \"{}\" & trap '' TERM; while :; do printf 'parent-output-flood-0123456789abcdef\\n'; done",
+                python.display(),
+                python_program,
+                escaped_pid.display()
+            ),
+        ];
+        let token = CancellationToken::new();
+        let completion = run_cli_with_options(
+            "cli:test",
+            "sh",
+            &args,
+            CliRunOptions {
+                cwd: Some(temp.path().to_path_buf()),
+                sandbox_backend: None,
+                pid_file: Some(authority.clone()),
+                cancellation_token: Some(token.clone()),
+                extra_read_allowlist: Vec::new(),
+                extra_write_allowlist: Vec::new(),
+                extra_write_denylist: Vec::new(),
+                workspace_access: WorkspaceAccess::ReadWrite,
+                inner_read_only_enforced: false,
+            },
+        );
+        tokio::pin!(completion);
+        let escaped_started = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while !escaped_pid.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut completion => panic!("provider exited before cancellation: {result:?}"),
+            () = escaped_started => {}
+        }
+        assert!(escaped_pid.exists(), "escaped pipe holder did not start");
+
+        let cancelled_at = tokio::time::Instant::now();
+        token.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(10), &mut completion)
+            .await
+            .expect("cancellation remained bounded")
+            .expect_err("escaped pipe holder must prevent cleanup proof");
+
+        assert!(matches!(
+            error,
+            crate::ProviderError::CleanupIncomplete {
+                authority: Some(ref retained),
+                ..
+            } if retained == &authority
+        ));
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(10),
+            "escaped pipe holder extended cleanup beyond its bound"
+        );
+        assert!(
+            std::fs::symlink_metadata(&authority).is_ok(),
+            "unproved cleanup removed process authority"
+        );
     }
 }
