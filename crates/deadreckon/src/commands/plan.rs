@@ -858,26 +858,67 @@ enum RootPlannerWait<T> {
 
 fn root_planner_allocation_at(
     job_deadline: Option<DateTime<Utc>>,
+    job_wall_remaining: Option<std::time::Duration>,
     now: DateTime<Utc>,
 ) -> Option<std::time::Duration> {
-    let remaining = match job_deadline {
-        Some(deadline) => deadline.signed_duration_since(now).to_std().ok()?,
-        None => ROOT_PLANNER_WALL_TIMEOUT,
-    };
-    (!remaining.is_zero()).then_some(remaining.min(ROOT_PLANNER_WALL_TIMEOUT))
+    let remaining = root_planner_remaining_at(job_deadline, job_wall_remaining, now);
+    (remaining.as_secs() > 0).then_some(remaining.min(ROOT_PLANNER_WALL_TIMEOUT))
+}
+
+fn root_planner_remaining_at(
+    job_deadline: Option<DateTime<Utc>>,
+    job_wall_remaining: Option<std::time::Duration>,
+    now: DateTime<Utc>,
+) -> std::time::Duration {
+    let deadline_remaining = job_deadline.map(|deadline| {
+        deadline
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+    });
+    match (deadline_remaining, job_wall_remaining) {
+        (Some(deadline), Some(wall)) => deadline.min(wall),
+        (Some(deadline), None) => deadline,
+        (None, Some(wall)) => wall,
+        (None, None) => ROOT_PLANNER_WALL_TIMEOUT,
+    }
 }
 
 fn current_root_planner_allocation(paths: &DeadreckonPaths) -> Result<std::time::Duration> {
-    let job_deadline = commands::graph_job::current_parent_job_id()
+    let now = Utc::now();
+    let job = commands::graph_job::current_parent_job_id()
         .map(|job_id| deadreckon_core::load_job(paths, job_id))
-        .transpose()?
-        .and_then(|job| job.policy.deadline);
-    root_planner_allocation_at(job_deadline, Utc::now()).ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            "the approved Job deadline elapsed before the root planner could start",
-            "choose a later --deadline and start a new Job",
-        ))
-    })
+        .transpose()?;
+    let supervisor_cutoff = std::env::var(commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV)
+        .ok()
+        .and_then(|value| value.parse::<DateTime<Utc>>().ok());
+    let job_deadline = match (
+        job.as_ref().and_then(|job| job.policy.deadline),
+        supervisor_cutoff,
+    ) {
+        (Some(job), Some(supervisor)) => Some(job.min(supervisor)),
+        (Some(job), None) => Some(job),
+        (None, Some(supervisor)) => Some(supervisor),
+        (None, None) => None,
+    };
+    let job_wall_remaining = job
+        .as_ref()
+        .map(|job| commands::supervisor::remaining_job_work_duration(paths, job, now))
+        .transpose()?;
+    if let Some(allocation) = root_planner_allocation_at(job_deadline, job_wall_remaining, now) {
+        return Ok(allocation);
+    }
+    let fractional_remainder = root_planner_remaining_at(job_deadline, job_wall_remaining, now);
+    if !fractional_remainder.is_zero() {
+        // Do not start a provider turn that cannot receive one whole second.
+        // Waiting out this fractional tail lets the outer supervisor record
+        // the durable policy boundary instead of a misleading provider error.
+        std::thread::sleep(fractional_remainder);
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        "less than one whole second remained before the approved Job work cutoff; the root planner was not launched",
+        "raise --max-wall-seconds or choose a later --deadline and start a new Job",
+    )))
 }
 
 fn root_planner_pid_file(paths: &DeadreckonPaths) -> PathBuf {
@@ -5904,21 +5945,42 @@ mod tests {
             .with_timezone(&Utc);
 
         assert_eq!(
-            root_planner_allocation_at(None, now),
+            root_planner_allocation_at(None, None, now),
             Some(std::time::Duration::from_secs(10 * 60))
         );
         assert_eq!(
-            root_planner_allocation_at(Some(now + chrono::Duration::seconds(90)), now),
+            root_planner_allocation_at(Some(now + chrono::Duration::seconds(90)), None, now),
             Some(std::time::Duration::from_secs(90))
         );
         assert_eq!(
-            root_planner_allocation_at(Some(now + chrono::Duration::minutes(20)), now),
+            root_planner_allocation_at(Some(now + chrono::Duration::minutes(20)), None, now),
             Some(std::time::Duration::from_secs(10 * 60))
         );
-        assert_eq!(root_planner_allocation_at(Some(now), now), None);
         assert_eq!(
-            root_planner_allocation_at(Some(now - chrono::Duration::seconds(1)), now),
+            root_planner_allocation_at(
+                Some(now + chrono::Duration::minutes(20)),
+                Some(std::time::Duration::from_secs(45)),
+                now,
+            ),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert_eq!(root_planner_allocation_at(Some(now), None, now), None);
+        assert_eq!(
+            root_planner_allocation_at(Some(now - chrono::Duration::seconds(1)), None, now),
             None
+        );
+        assert_eq!(
+            root_planner_allocation_at(None, Some(std::time::Duration::ZERO), now),
+            None
+        );
+        assert_eq!(
+            root_planner_allocation_at(None, Some(std::time::Duration::from_millis(999)), now,),
+            None,
+            "a provider turn must not start with only a fractional second"
+        );
+        assert_eq!(
+            root_planner_allocation_at(None, Some(std::time::Duration::from_millis(1_999)), now,),
+            Some(std::time::Duration::from_millis(1_999)),
         );
     }
 

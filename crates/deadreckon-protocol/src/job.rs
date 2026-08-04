@@ -262,12 +262,13 @@ pub enum StopReason {
     FatalProvider,
     FatalGate,
     LostContainment,
+    SupervisorFailure,
     CorruptHistory,
     LegacyUnknown,
 }
 
 impl StopReason {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Verified,
         Self::SemanticRevise,
         Self::SemanticUncertain,
@@ -283,6 +284,7 @@ impl StopReason {
         Self::FatalProvider,
         Self::FatalGate,
         Self::LostContainment,
+        Self::SupervisorFailure,
         Self::CorruptHistory,
         Self::LegacyUnknown,
     ];
@@ -316,6 +318,7 @@ impl JobOutcome {
                 StopReason::TransientProvider
                     | StopReason::FatalProvider
                     | StopReason::FatalGate
+                    | StopReason::SupervisorFailure
                     | StopReason::CorruptHistory
                     | StopReason::LegacyUnknown
             ),
