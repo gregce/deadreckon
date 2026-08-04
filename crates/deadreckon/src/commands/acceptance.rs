@@ -134,14 +134,11 @@ pub(crate) struct CriticVerdict {
 // Authoring can contain three independent provider turns. Subscription CLIs
 // may spend a minute cold-starting or compacting before they emit progress, so
 // the legacy 120-second total rejected healthy work. Keep one cumulative hard
-// deadline, but give every possible provider stage the same realistic CLI
-// allowance plus headroom for validation and operator-facing transitions.
+// deadline. Draft, critic, and redraft all consume from that one boundary;
+// no stage receives a fresh clock or an artificial slice of time.
 const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 1_200.0;
 const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 1_200.0;
 const MAX_DONE_AUTHORING_WALL_SECONDS: f64 = 3_600.0;
-const DONE_AUTHORING_DRAFT_WALL_SECONDS: u64 = 300;
-const DONE_AUTHORING_CRITIC_WALL_SECONDS: u64 = 300;
-const DONE_AUTHORING_REDRAFT_WALL_SECONDS: u64 = 300;
 const DONE_AUTHORING_CLEANUP_GRACE_SECONDS: u64 = 30;
 
 #[derive(Clone, Copy, Debug)]
@@ -162,14 +159,38 @@ impl DoneAuthoringStage {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct DoneAuthoringBudget {
+pub(crate) struct DoneAuthoringBudget {
     started: Instant,
     deadline: Instant,
     total: Duration,
+    consumed_before: Duration,
 }
 
 impl DoneAuthoringBudget {
-    fn from_config(configured_seconds: Option<f64>) -> Self {
+    pub(crate) fn from_config(configured_seconds: Option<f64>) -> Self {
+        Self::from_config_and_deadline(configured_seconds, None)
+    }
+
+    pub(crate) fn from_config_and_deadline(
+        configured_seconds: Option<f64>,
+        absolute_deadline: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self::from_config_deadline_and_consumed(
+            configured_seconds,
+            absolute_deadline,
+            Duration::ZERO,
+        )
+    }
+
+    /// Resume the admission budget after an operator prompt without charging
+    /// that human wait as provider work. Automated course-planning time still
+    /// consumes the same cumulative allowance, while an explicit calendar
+    /// deadline continues to advance normally.
+    pub(crate) fn from_config_deadline_and_consumed(
+        configured_seconds: Option<f64>,
+        absolute_deadline: Option<DateTime<Utc>>,
+        consumed_before: Duration,
+    ) -> Self {
         let seconds = configured_seconds
             .filter(|value| value.is_finite())
             .unwrap_or(DEFAULT_DONE_AUTHORING_WALL_SECONDS)
@@ -177,7 +198,24 @@ impl DoneAuthoringBudget {
                 MIN_DONE_AUTHORING_WALL_SECONDS,
                 MAX_DONE_AUTHORING_WALL_SECONDS,
             );
-        Self::new(Duration::from_secs_f64(seconds))
+        let configured = Duration::from_secs_f64(seconds);
+        let configured_remaining = configured.saturating_sub(consumed_before);
+        let calendar = absolute_deadline.map(|deadline| {
+            deadline
+                .signed_duration_since(Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+        });
+        let remaining = calendar.map_or(configured_remaining, |value| {
+            configured_remaining.min(value)
+        });
+        let started = Instant::now();
+        Self {
+            started,
+            deadline: started + remaining,
+            total: consumed_before.saturating_add(remaining),
+            consumed_before,
+        }
     }
 
     fn new(total: Duration) -> Self {
@@ -186,37 +224,35 @@ impl DoneAuthoringBudget {
             started,
             deadline: started + total,
             total,
+            consumed_before: Duration::ZERO,
         }
     }
 
-    fn allocation(self, stage: DoneAuthoringStage) -> Option<Duration> {
-        let remaining = self.deadline.checked_duration_since(Instant::now())?;
-        let stage_cap = match stage {
-            DoneAuthoringStage::Draft => Duration::from_secs(DONE_AUTHORING_DRAFT_WALL_SECONDS),
-            DoneAuthoringStage::Critic => Duration::from_secs(DONE_AUTHORING_CRITIC_WALL_SECONDS),
-            DoneAuthoringStage::Redraft => Duration::from_secs(DONE_AUTHORING_REDRAFT_WALL_SECONDS),
-        };
-        let later_stage_reserve = match stage {
-            DoneAuthoringStage::Draft => Duration::from_secs(
-                DONE_AUTHORING_CRITIC_WALL_SECONDS + DONE_AUTHORING_REDRAFT_WALL_SECONDS,
-            ),
-            DoneAuthoringStage::Critic => Duration::from_secs(DONE_AUTHORING_REDRAFT_WALL_SECONDS),
-            DoneAuthoringStage::Redraft => Duration::ZERO,
-        };
-        Some(remaining.checked_sub(later_stage_reserve)?.min(stage_cap))
+    fn allocation(self, _stage: DoneAuthoringStage) -> Option<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
     }
 
     fn elapsed(self) -> Duration {
-        self.started.elapsed()
+        self.consumed_before.saturating_add(self.started.elapsed())
+    }
+
+    pub(crate) fn work_expires_at(self) -> Instant {
+        self.deadline
+    }
+
+    pub(crate) fn total(self) -> Duration {
+        self.total
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 enum DoneAuthoringStageWait<T> {
     Completed(T),
     TimedOut { cleanup_proven: bool },
 }
 
+#[cfg(test)]
 async fn await_done_authoring_stage<F, T>(
     future: F,
     token: &CancellationToken,
@@ -329,23 +365,24 @@ async fn run_done_authoring_stage(
     request.pid_file = Some(pid_file.clone());
     request.cancellation_token = Some(token.clone());
 
-    // CLI adapters reap the process group before resolving. A transport that
-    // ignores cancellation is dropped after a bounded cleanup grace rather
-    // than extending the authoring deadline indefinitely.
     let cleanup_grace = Duration::from_secs(DONE_AUTHORING_CLEANUP_GRACE_SECONDS);
     let wait_label = format!("{wait_label} [{} · {route_label}]", stage.label());
+    let deadline = ProviderPhaseDeadline::new(
+        tokio::time::Instant::from_std(budget.deadline),
+        cleanup_grace,
+    );
     let response = with_cli_wait_status_limit(
         &wait_label,
         budget.total,
-        await_done_authoring_stage(router.complete(&request), &token, allocation, cleanup_grace),
+        complete_provider_phase(router, &mut request, deadline),
     )
     .await;
     match response {
-        DoneAuthoringStageWait::Completed(Ok(response)) => {
+        ProviderPhaseOutcome::Completed(Ok(response)) => {
             remove_done_authoring_outputs(&output_files);
             Ok(response)
         }
-        DoneAuthoringStageWait::Completed(Err(error)) => {
+        ProviderPhaseOutcome::Completed(Err(error)) => {
             remove_done_authoring_outputs(&output_files);
             Err(CliError::Core(deadreckon_core::user_error(
                 &format!(
@@ -355,8 +392,12 @@ async fn run_done_authoring_stage(
                 done_authoring_provider_recovery(&error),
             )))
         }
-        DoneAuthoringStageWait::TimedOut { cleanup_proven } => {
-            let cleanup_proven = cleanup_proven && !pid_file.exists();
+        ProviderPhaseOutcome::WorkExpired { cleanup }
+        | ProviderPhaseOutcome::Cancelled { cleanup } => {
+            let cleanup_proven = matches!(
+                cleanup,
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+            ) && !pid_file.exists();
             if cleanup_proven {
                 remove_done_authoring_outputs(&output_files);
             }
@@ -958,7 +999,7 @@ pub(crate) async fn acceptance_agent_command_with_context(
     force: bool,
 ) -> Result<()> {
     acceptance_agent_command_with_review_policy(
-        context, mode, request, provider, model, force, false,
+        context, mode, request, provider, model, force, false, None,
     )
     .await
 }
@@ -972,7 +1013,51 @@ pub(crate) async fn acceptance_agent_command_with_explicit_review(
     force: bool,
 ) -> Result<()> {
     acceptance_agent_command_with_review_policy(
-        context, mode, request, provider, model, force, true,
+        context, mode, request, provider, model, force, true, None,
+    )
+    .await
+}
+
+pub(crate) async fn acceptance_agent_command_with_context_and_budget(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+    budget: DoneAuthoringBudget,
+) -> Result<()> {
+    acceptance_agent_command_with_review_policy(
+        context,
+        mode,
+        request,
+        provider,
+        model,
+        force,
+        false,
+        Some(budget),
+    )
+    .await
+}
+
+pub(crate) async fn acceptance_agent_command_with_explicit_review_and_budget(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+    budget: DoneAuthoringBudget,
+) -> Result<()> {
+    acceptance_agent_command_with_review_policy(
+        context,
+        mode,
+        request,
+        provider,
+        model,
+        force,
+        true,
+        Some(budget),
     )
     .await
 }
@@ -986,6 +1071,7 @@ async fn acceptance_agent_command_with_review_policy(
     model: Option<String>,
     force: bool,
     explicit_human_review: bool,
+    authoring_budget: Option<DoneAuthoringBudget>,
 ) -> Result<()> {
     let yaml_path = project_acceptance_yaml(context.write_root);
     let md_path = project_acceptance_md(context.write_root);
@@ -1006,8 +1092,9 @@ async fn acceptance_agent_command_with_review_policy(
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
-    let authoring_budget =
-        DoneAuthoringBudget::from_config(defaults.done_contract_max_wall_seconds);
+    let authoring_budget = authoring_budget.unwrap_or_else(|| {
+        DoneAuthoringBudget::from_config(defaults.done_contract_max_wall_seconds)
+    });
     let selected_provider = select_done_authoring_provider(provider, &defaults);
     let router = ProviderRouter::from_config_path_with_model(
         &paths.config_path(),
@@ -1146,17 +1233,6 @@ fn select_done_authoring_provider(
     explicit
         .or_else(|| defaults.doc_provider.clone())
         .or_else(|| defaults.provider.clone())
-}
-
-pub(crate) fn done_authoring_wall_seconds(defaults: &ConfigDefaults) -> f64 {
-    defaults
-        .done_contract_max_wall_seconds
-        .filter(|value| value.is_finite())
-        .unwrap_or(DEFAULT_DONE_AUTHORING_WALL_SECONDS)
-        .clamp(
-            MIN_DONE_AUTHORING_WALL_SECONDS,
-            MAX_DONE_AUTHORING_WALL_SECONDS,
-        )
 }
 
 pub(crate) fn done_authoring_route_label(
@@ -3172,45 +3248,36 @@ mod tests {
     }
 
     #[test]
-    fn done_authoring_latency_matrix_gives_each_provider_phase_realistic_room() {
+    fn done_authoring_stages_share_the_full_remaining_admission_window() {
         let immediate = DoneAuthoringBudget::from_config(None);
         assert_eq!(immediate.total, Duration::from_secs(1_200));
-        assert_eq!(
-            immediate
-                .allocation(DoneAuthoringStage::Draft)
-                .expect("draft allocation")
-                .as_secs(),
-            300
-        );
-        assert_eq!(
-            immediate
-                .allocation(DoneAuthoringStage::Critic)
-                .expect("critic allocation")
-                .as_secs(),
-            300
-        );
-        assert_eq!(
-            immediate
-                .allocation(DoneAuthoringStage::Redraft)
-                .expect("redraft allocation")
-                .as_secs(),
-            300
-        );
+        for stage in [
+            DoneAuthoringStage::Draft,
+            DoneAuthoringStage::Critic,
+            DoneAuthoringStage::Redraft,
+        ] {
+            let allocation = immediate.allocation(stage).expect("stage allocation");
+            assert!(
+                (Duration::from_secs(1_199)..=Duration::from_secs(1_200)).contains(&allocation),
+                "{stage:?} must inherit the cumulative remainder, got {allocation:?}"
+            );
+        }
 
         // A critic/redraft path shares the original deadline. Advancing the
         // request clock can only shrink later allocations; it cannot grant a
-        // fresh stage budget or extend the 1,200-second admission window. Once
-        // the reserved redraft time is gone, critic admission fails closed.
+        // fresh stage budget or extend the 1,200-second admission window.
         let near_deadline = DoneAuthoringBudget {
             started: Instant::now() - Duration::from_secs(1_199),
             deadline: Instant::now() + Duration::from_secs(1),
             total: Duration::from_secs(1_200),
+            consumed_before: Duration::ZERO,
         };
         assert!(
             near_deadline
                 .allocation(DoneAuthoringStage::Critic)
-                .is_none(),
-            "critic must not consume the redraft reserve"
+                .expect("critic remainder")
+                <= Duration::from_secs(1),
+            "critic must receive only the admission remainder"
         );
         assert!(
             near_deadline
@@ -3221,36 +3288,76 @@ mod tests {
     }
 
     #[test]
-    fn done_authoring_contract_stage_reservations_shrink_the_current_stage_only() {
+    fn done_authoring_never_resets_or_reserves_stage_local_time() {
         let draft_budget = DoneAuthoringBudget {
             started: Instant::now() - Duration::from_secs(370),
             deadline: Instant::now() + Duration::from_secs(830),
             total: Duration::from_secs(1_200),
+            consumed_before: Duration::ZERO,
         };
         let draft = draft_budget
             .allocation(DoneAuthoringStage::Draft)
             .expect("draft has time above the critic and redraft reserve");
         assert!(
-            (Duration::from_secs(229)..=Duration::from_secs(230)).contains(&draft),
-            "draft must leave 300s critic + 300s redraft reserve, got {draft:?}"
+            (Duration::from_secs(829)..=Duration::from_secs(830)).contains(&draft),
+            "draft must inherit the full admission remainder, got {draft:?}"
         );
 
         let critic_budget = DoneAuthoringBudget {
             started: Instant::now() - Duration::from_secs(850),
             deadline: Instant::now() + Duration::from_secs(350),
             total: Duration::from_secs(1_200),
+            consumed_before: Duration::ZERO,
         };
         let critic = critic_budget
             .allocation(DoneAuthoringStage::Critic)
             .expect("critic has time above the redraft reserve");
         assert!(
-            (Duration::from_secs(49)..=Duration::from_secs(50)).contains(&critic),
-            "critic must leave the 300s redraft reserve, got {critic:?}"
+            (Duration::from_secs(349)..=Duration::from_secs(350)).contains(&critic),
+            "critic must inherit the full admission remainder, got {critic:?}"
         );
         let redraft = critic_budget
             .allocation(DoneAuthoringStage::Redraft)
             .expect("redraft may consume its own reserved stage budget");
-        assert_eq!(redraft.as_secs(), 300);
+        assert!((Duration::from_secs(349)..=Duration::from_secs(350)).contains(&redraft));
+    }
+
+    #[test]
+    fn done_authoring_is_clamped_by_the_explicit_start_deadline() {
+        let budget = DoneAuthoringBudget::from_config_and_deadline(
+            Some(3_600.0),
+            Some(Utc::now() + chrono::Duration::seconds(90)),
+        );
+        assert!(
+            (Duration::from_secs(89)..=Duration::from_secs(90)).contains(&budget.total()),
+            "explicit job deadline must bound admission, got {:?}",
+            budget.total()
+        );
+        let draft = budget
+            .allocation(DoneAuthoringStage::Draft)
+            .expect("draft remainder");
+        let redraft = budget
+            .allocation(DoneAuthoringStage::Redraft)
+            .expect("redraft remainder");
+        assert!(draft <= budget.total());
+        assert!(redraft <= draft);
+    }
+
+    #[test]
+    fn operator_prompt_time_does_not_consume_the_provider_work_budget() {
+        let consumed = Duration::from_secs(125);
+        let resumed =
+            DoneAuthoringBudget::from_config_deadline_and_consumed(Some(1_200.0), None, consumed);
+        let allocation = resumed
+            .allocation(DoneAuthoringStage::Draft)
+            .expect("resumed authoring remainder");
+
+        assert_eq!(resumed.total(), Duration::from_secs(1_200));
+        assert!(
+            (Duration::from_secs(1_074)..=Duration::from_secs(1_075)).contains(&allocation),
+            "only prior automated work should be charged, got {allocation:?}"
+        );
+        assert!(resumed.elapsed() >= consumed);
     }
 
     #[tokio::test]

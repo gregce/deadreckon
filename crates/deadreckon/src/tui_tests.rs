@@ -7509,14 +7509,14 @@ fn chain_wall_clock_cap_pauses_chain() {
 }
 
 #[test]
-fn chain_per_step_wall_cap_is_remaining_over_remaining_steps() {
+fn chain_step_inherits_the_full_remaining_wall_window() {
     let mut chain = chain_fixture();
     chain.steps[0].status = ChainStepStatus::Pending;
     chain.steps[1].status = ChainStepStatus::Pending;
     chain.max_wall_seconds = Some(12.0);
     chain.total_wall_seconds = 2.0;
 
-    assert_eq!(per_step_wall_cap(&chain, 0), Some(5.0));
+    assert_eq!(per_step_wall_cap(&chain, 0), Some(10.0));
 }
 
 #[test]
