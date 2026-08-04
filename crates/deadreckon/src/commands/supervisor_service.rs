@@ -2657,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn running_service_accepts_a_legacy_same_boot_macos_checkpoint() {
+    fn running_service_accepts_legacy_macos_checkpoint_when_source_is_also_legacy() {
         let context = context(ServicePlatform::Launchd);
         let runtime = ServiceManagerRuntime {
             loaded: Some(true),
@@ -2701,6 +2701,51 @@ mod tests {
             },
         )
         .expect_err("different boot seconds must fail closed");
+        assert!(error.to_string().contains("does not match current boot"));
+    }
+
+    #[test]
+    fn running_service_requires_restart_when_macos_upgrades_to_boot_session_uuid() {
+        let context = context(ServicePlatform::Launchd);
+        let runtime = ServiceManagerRuntime {
+            loaded: Some(true),
+            enabled: Some("enabled".to_string()),
+            active: None,
+        };
+        let current = "macos:session=ed3715ba-ef94-4fd9-b66b-f7797cc62415";
+
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime.clone(),
+            Some(checkpoint(&context, 9, "current-session", current)),
+            BootIdentityObservation {
+                current_boot_id: current.to_string(),
+                source: BootIdentitySource::MacosSysctl,
+                test_override: false,
+            },
+        )
+        .expect("same boot-session UUID");
+        validate_supervisor_service_live_evidence(&report)
+            .expect("session UUID is valid live evidence");
+
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime,
+            Some(checkpoint(
+                &context,
+                9,
+                "legacy-time-checkpoint",
+                "macos:sec=1785530788",
+            )),
+            BootIdentityObservation {
+                current_boot_id: current.to_string(),
+                source: BootIdentitySource::MacosSysctl,
+                test_override: false,
+            },
+        )
+        .expect_err("legacy time identity cannot prove the current UUID session");
         assert!(error.to_string().contains("does not match current boot"));
     }
 

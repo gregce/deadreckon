@@ -4449,12 +4449,16 @@ phase transitions. The supervisor heartbeats every two seconds and uses a
 60-second inactivity lease so host load or sleep does not reclaim a healthy
 owner. The operator-approved Job wall and absolute deadline remain unchanged.
 
-On macOS, boot identity canonicalizes `kern.boottime` to its seconds field.
-Legacy checkpoints containing the same boot second but a different volatile
-microsecond rendering remain valid; a different second, malformed identity,
-PID reuse, or process-start mismatch still fails closed. Service start and
-repair allow 30 seconds for a fresh successor checkpoint, and an already-linked
-guarded child has 30 seconds to publish its durable release acknowledgement.
+On macOS, boot identity uses the read-only kernel `kern.bootsessionuuid`. Unlike
+the wall-clock-derived `kern.boottime`, the session UUID does not move when the
+system clock is corrected during a boot. Legacy time-based checkpoints remain
+comparable with other legacy checkpoints after canonicalizing away volatile
+microseconds, but never with a session UUID: the one-time format upgrade fails
+closed and service repair starts a successor that republishes every authority
+record with the UUID. A different UUID, malformed identity, PID reuse, or
+process-start mismatch also fails closed. Service start and repair allow 30
+seconds for a fresh successor checkpoint, and an already-linked guarded child
+has 30 seconds to publish its durable release acknowledgement.
 
 Capstan's process helper starts the worker in its own process group and writes
 `supervised-child.json`. Cancellation records `cancel_requested` first, then

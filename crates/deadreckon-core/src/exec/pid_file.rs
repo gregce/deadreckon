@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -250,31 +251,55 @@ pub fn read_supervised_process(path: &Path) -> io::Result<SupervisedProcess> {
 /// Return one stable representation for a boot identity written by older or
 /// current DeadReckon versions.
 ///
-/// macOS `kern.boottime` includes a microsecond field whose rendering is not a
-/// reliable reboot boundary. The seconds field is the durable machine-boot
-/// identity. Opaque identities (Linux UUIDs, platform fallbacks, and explicit
-/// test identities) remain byte-for-byte unchanged.
+/// Current macOS identities use the kernel's boot-session UUID. Older
+/// `kern.boottime` identities retain their canonical seconds-only form so
+/// existing persisted records can still be read and compared with each other.
+/// Opaque identities (Linux UUIDs, platform fallbacks, and explicit test
+/// identities) remain byte-for-byte unchanged.
 pub fn normalize_boot_identity(identity: &str) -> String {
+    if let Some(session) = macos_boot_session_uuid(identity) {
+        return format!("macos:session={session}");
+    }
     macos_boot_seconds(identity)
         .map(|seconds| format!("macos:sec={seconds}"))
         .unwrap_or_else(|| identity.to_string())
 }
 
-/// Compare boot identities without turning a legacy macOS rendering change
-/// into a false reboot.
+/// Compare boot identities without weakening a reboot boundary.
 ///
-/// Both the legacy `macos:{ sec = ..., usec = ... } ...` form and the current
-/// `macos:sec=...` form are accepted. Unrecognized values compare exactly, so
-/// malformed or cross-platform identities never gain a permissive fallback.
+/// Current macOS boot-session UUIDs compare as UUIDs. Both legacy
+/// `macos:{ sec = ..., usec = ... } ...` and `macos:sec=...` forms remain
+/// comparable with each other, but never with a UUID: that one-time upgrade
+/// boundary deliberately requires the supervisor to restart and publish fresh
+/// authority. Malformed macOS identities fail closed. Other platform and test
+/// identities compare exactly.
 pub fn boot_identities_match(left: &str, right: &str) -> bool {
     if left.trim().is_empty() || right.trim().is_empty() {
         return false;
     }
-    match (macos_boot_seconds(left), macos_boot_seconds(right)) {
-        (Some(left), Some(right)) => left == right,
-        (None, None) => left == right,
-        (Some(_), None) | (None, Some(_)) => false,
+    match (
+        macos_boot_session_uuid(left),
+        macos_boot_session_uuid(right),
+    ) {
+        (Some(left), Some(right)) => return left == right,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
     }
+    match (macos_boot_seconds(left), macos_boot_seconds(right)) {
+        (Some(left), Some(right)) => return left == right,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+    if left.trim().starts_with("macos:") || right.trim().starts_with("macos:") {
+        return false;
+    }
+    left == right
+}
+
+fn macos_boot_session_uuid(identity: &str) -> Option<Uuid> {
+    let payload = identity.trim().strip_prefix("macos:session=")?;
+    let session = Uuid::parse_str(payload.trim()).ok()?;
+    (!session.is_nil()).then_some(session)
 }
 
 fn macos_boot_seconds(identity: &str) -> Option<u64> {
@@ -315,20 +340,41 @@ pub fn boot_identity() -> String {
         }
     }
     #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("/usr/sbin/sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-        && output.status.success()
     {
-        let value = String::from_utf8_lossy(&output.stdout);
-        let value = value.trim();
-        if !value.is_empty() {
-            return normalize_boot_identity(&format!("macos:{value}"));
+        if let Some(value) = macos_sysctl_value("kern.bootsessionuuid") {
+            let identity = normalize_boot_identity(&format!("macos:session={value}"));
+            if macos_boot_session_uuid(&identity).is_some() {
+                return identity;
+            }
+        }
+        // This is a compatibility fallback for a macOS kernel that does not
+        // expose a valid boot-session UUID. Modern supported macOS releases
+        // take the stable UUID path above; boottime is not preferred because
+        // wall-clock correction can change its rendered value mid-boot.
+        if let Some(value) = macos_sysctl_value("kern.boottime") {
+            let identity = normalize_boot_identity(&format!("macos:{value}"));
+            if macos_boot_seconds(&identity).is_some() {
+                return identity;
+            }
         }
     }
     // Unknown is deliberately stable. A random per-process value would look
     // like a reboot and could reclaim a live process identity.
     "unknown-boot".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sysctl_value(name: &str) -> Option<String> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 pub fn process_start_identity(pid: u32) -> Option<String> {
@@ -483,6 +529,8 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::boot_identity;
     use super::{
         SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase,
         SupervisedProcessRecord, boot_identities_match, normalize_boot_identity,
@@ -511,6 +559,35 @@ mod tests {
     }
 
     #[test]
+    fn macos_boot_session_uuid_survives_wall_clock_boot_time_drift() {
+        let upper = "macos:session=ED3715BA-EF94-4FD9-B66B-F7797CC62415";
+        let lower = "macos:session=ed3715ba-ef94-4fd9-b66b-f7797cc62415";
+        let shifted_before = "macos:{ sec = 1785530788, usec = 930989 } Fri Jul 31 16:46:28 2026";
+        let shifted_after = "macos:{ sec = 1785530789, usec = 271787 } Fri Jul 31 16:46:29 2026";
+
+        assert_eq!(normalize_boot_identity(upper), lower);
+        assert!(boot_identities_match(upper, lower));
+        assert!(!boot_identities_match(shifted_before, shifted_after));
+        assert!(!boot_identities_match(upper, shifted_before));
+    }
+
+    #[test]
+    fn macos_boot_session_uuid_rejects_other_sessions_and_malformed_values() {
+        assert!(!boot_identities_match(
+            "macos:session=ed3715ba-ef94-4fd9-b66b-f7797cc62415",
+            "macos:session=43c26244-5102-44b7-a4f7-e88b39edc921"
+        ));
+        assert!(!boot_identities_match(
+            "macos:session=not-a-uuid",
+            "macos:session=not-a-uuid"
+        ));
+        assert!(!boot_identities_match(
+            "macos:session=00000000-0000-0000-0000-000000000000",
+            "macos:session=00000000-0000-0000-0000-000000000000"
+        ));
+    }
+
+    #[test]
     fn malformed_and_opaque_boot_identities_remain_fail_closed() {
         assert!(boot_identities_match("linux-boot-a", "linux-boot-a"));
         assert!(!boot_identities_match("linux-boot-a", "linux-boot-b"));
@@ -523,6 +600,23 @@ mod tests {
             "macos:sec=not-a-number",
             "macos:sec=1785530788"
         ));
+        assert!(!boot_identities_match(
+            "macos:sec=not-a-number",
+            "macos:sec=not-a-number"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn current_macos_boot_identity_uses_the_kernel_boot_session_uuid() {
+        let first = boot_identity();
+        let second = boot_identity();
+        let session = first
+            .strip_prefix("macos:session=")
+            .expect("modern macOS must expose a boot-session UUID");
+
+        uuid::Uuid::parse_str(session).expect("canonical boot-session UUID");
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -662,25 +756,27 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn legacy_macos_pid_record_matches_the_current_boot_by_seconds() {
+    fn current_macos_pid_record_uses_session_uuid_and_legacy_requires_restart() {
         let pid = std::process::id();
         let mut record = SupervisedProcessRecord::running(SupervisedProcess {
             pid,
             pgid: Some(pid),
         })
         .expect("running record");
-        let seconds = record
+        let session = record
             .boot_id
-            .strip_prefix("macos:sec=")
-            .expect("current macOS boot identity must be canonical")
-            .parse::<u64>()
-            .expect("boot seconds");
+            .strip_prefix("macos:session=")
+            .expect("current macOS boot identity must use the boot-session UUID")
+            .to_string();
 
-        record.boot_id =
-            format!("macos:{{ sec = {seconds}, usec = 1 }} legacy checkpoint rendering");
+        record.boot_id = format!("macos:session={}", session.to_ascii_uppercase());
         assert_eq!(record.identity(), SupervisedProcessIdentity::Current);
 
-        record.boot_id = format!("macos:sec={}", seconds.saturating_add(1));
+        record.boot_id =
+            "macos:{ sec = 1785530788, usec = 1 } legacy checkpoint rendering".to_string();
+        assert_eq!(record.identity(), SupervisedProcessIdentity::DifferentBoot);
+
+        record.boot_id = "macos:session=43c26244-5102-44b7-a4f7-e88b39edc921".to_string();
         assert_eq!(record.identity(), SupervisedProcessIdentity::DifferentBoot);
     }
 

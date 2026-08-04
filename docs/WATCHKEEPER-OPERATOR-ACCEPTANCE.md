@@ -173,9 +173,10 @@ Accept when:
   route that just failed;
 - [ ] the guided recovery keeps the already selected source, mode, provider
   and model;
-- [ ] `supervisor status` accepts a live legacy macOS checkpoint when only the
-  `kern.boottime` microseconds differ, while a different boot second still
-  fails closed;
+- [ ] `supervisor status` uses the same `kern.bootsessionuuid` across repeated
+  probes even when `kern.boottime` changes, accepts legacy time checkpoints
+  only against another same-second legacy identity, and requires one supervised
+  restart when upgrading a legacy checkpoint to the UUID format;
 - [ ] rebuilding or replacing the supervisor executable at the same path makes
   the old live process fail readiness by bundle build identity or executable
   SHA-256; guided start repairs the service and proves a fresh checkpoint
