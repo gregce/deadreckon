@@ -45,7 +45,8 @@ Expected signals:
   canonical source path;
 - when authoring is needed, it names the source as the inspection root, this
   launch project as the writer root, the structured provider/model route and a
-  `900s` total limit;
+  `1200s` total limit (or the smaller remainder before an explicit launch
+  deadline);
 - it does not say that `--from` is unsupported;
 - preview creates no Job.
 
@@ -122,19 +123,21 @@ cargo test -j 1 -p deadreckon-providers --lib \
   -- --exact --nocapture
 
 cargo test -j 1 -p deadreckon --bin deadreckon \
-  commands::acceptance::tests::done_authoring_latency_matrix_gives_each_provider_phase_realistic_room \
+  commands::acceptance::tests::done_authoring_stages_share_the_full_remaining_admission_window \
   -- --exact --nocapture
 
 cargo test -j 1 -p deadreckon --bin deadreckon \
-  commands::acceptance::tests::done_authoring_contract_stage_reservations_shrink_the_current_stage_only \
+  commands::acceptance::tests::done_authoring_never_resets_or_reserves_stage_local_time \
   -- --exact --nocapture
 ```
 
 Expected signals: all three commands report `1 passed; 0 failed`. The first starts a
 provider plus grandchild, cancels it, waits for both to disappear and removes
-the PID file. The other two pin the 900-second cumulative default, 300-second
-draft ceiling, 120-second critic ceiling, 300-second redraft ceiling and the
-critic/redraft reservations that earlier stages cannot consume.
+the PID file. The other two pin the 1,200-second cumulative default and prove
+that draft, critic and redraft each inherit only the automated-work time remaining
+before the same admission cutoff. Operator prompt time is not charged as provider
+work, while an explicit calendar deadline continues to advance. No stage receives
+a fresh clock or an artificial slice.
 
 ## 5. Prove retry reuses a valid written contract
 

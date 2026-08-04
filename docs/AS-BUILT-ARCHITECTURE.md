@@ -3756,11 +3756,13 @@ preferred authoring route.
 
 The whole authoring sequence shares one wall deadline. The default is 1,200
 seconds, configurable as `defaults.done_contract_max_wall_seconds` and clamped
-to 1,200–3,600 seconds. The initial draft receives at most 300 seconds while
-reserving 300 seconds for the critic and 300 for an optional redraft. The critic
-must preserve the redraft reservation, and redraft receives only its remaining
-time up to 300 seconds. Startup, capability probing and active provider work
-consume that cumulative budget. Cancellation then receives one bounded
+to 1,200–3,600 seconds. Guided `start` also clamps it to an earlier explicit Job
+deadline and gives goal-shape planning, draft, critic and optional redraft the
+same cumulative automated-work allowance. Each phase may use whatever provider
+time remains when it starts; there are no phase-local ceilings or reserved
+slices, and no retry resets the clock. Operator prompts pause this active-work
+allowance; an explicit calendar deadline does not. Capability probing and active
+provider work consume the allowance. Cancellation then receives one bounded
 30-second grace to terminate and reap the provider's full owned process group;
 unproven cleanup blocks admission and retains the PID evidence. The wait surface
 reports stage, provider/model and cumulative elapsed/limit; it is not the
@@ -4467,6 +4469,14 @@ across supervisor or machine restart keeps consuming the same allowance. The
 supervisor checks the boundary before an attempt, while a child runs, after it
 exits and during controller-side Git, evidence, gate and receipt work.
 
+Plan and nested-Plan Run durations may still be summed as aggregate
+`worker-seconds` for cost and throughput evidence. That number is not elapsed
+Job wall time: independent children can overlap. It is never compared with the
+wall policy. Child launch, merge repair, semantic judging and sealing instead
+inherit the supervisor's one exact remaining cutoff, including its typed
+`deadline` versus `wall_cap` identity. Cleanup has a separate 30-second bound
+and cannot authorize more work.
+
 When the cap expires, the supervisor reconciles the outer worker, gate
 evaluator, Campaign subprocess, merge-repair groups and tracked Docker
 execution before recording `wall_cap`. If it cannot prove that all owned work
@@ -4955,10 +4965,12 @@ web, MCP and user-rule/config surfaces, while Claude uses its corresponding
 safe/schema flags. Tool-free API routes use strict response formats. Unsupported
 adapters fail closed. Immutable capability probes are cached per binary/version.
 
-Draft, critic and optional redraft share a 1,200-second default deadline. Draft
-gets at most 300 seconds while reserving 300 seconds for critic and 300 for
-redraft; critic likewise preserves the redraft reservation. Redraft gets only
-the remaining time up to 300 seconds. The config key
+Goal-shape planning, draft, critic and optional redraft share a 1,200-second
+default automated admission-work allowance during guided start. Every automated
+phase inherits the same cumulative remainder; there are no reserved stage slices
+or fresh retry clocks. Operator prompts pause this active-work allowance rather
+than silently spending provider time. An explicit calendar deadline continues
+to advance through prompts and can shorten the window. The config key
 `defaults.done_contract_max_wall_seconds` is clamped to 1,200–3,600 seconds, so
 legacy 120-second defaults are lifted automatically.
 Timeout or cancellation terminates and reaps the whole provider
@@ -4968,12 +4980,12 @@ lint-clean draft may proceed to explicit human review. Redraft receives the full
 prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
 `redraft`; one critic and one redraft remain the ceiling.
 
-The earlier shape-planning turn is separately bounded at 300 seconds for CLI
-providers and 120 seconds for HTTP providers. A timeout explicitly cancels the
-provider and allows up to 30 seconds to prove cleanup before deterministic
-fallback. Done-authoring cleanup receives 30 seconds outside active model
-work. If either boundary cannot prove cleanup, DeadReckon retains its PID
-authority and reports the unresolved process instead of deleting the evidence.
+Standalone shape planning retains a route safety limit, but guided start uses
+the shared admission cutoff. Expiry explicitly cancels the provider and allows
+up to 30 seconds to prove cleanup before deterministic fallback. Cleanup is
+outside active model work and never extends the Job cutoff. If cleanup cannot
+be proven, DeadReckon retains its PID authority and reports the unresolved
+process instead of deleting the evidence.
 
 ### 59.5 Compatibility and proof boundary
 

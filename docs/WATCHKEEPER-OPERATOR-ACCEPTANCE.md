@@ -139,15 +139,15 @@ deliberately interrupted or the provider is made unavailable, verify that the
 recovery prompt offers retry, revise and stop without asking for the source,
 launch shape, provider or model again.
 
-The timing boundary for this drill is one 20-minute contract-authoring clock:
-draft may use five minutes only while leaving five minutes for critic and five
-for an optional redraft; critic must preserve the redraft reservation. Provider
-cleanup gets a separate 30-second proof window but cannot authorize fallback or
-extend the Job's approved wall/deadline. Goal-shape planning is independently
-bounded at five minutes for a CLI provider or two minutes for an HTTP provider,
-followed by the same fail-closed cleanup proof. The interactive compatibility
-`--infer-contract` provider call uses those same route-aware phase limits and
-cancels through the same bounded cleanup shape.
+The timing boundary for this drill is one 20-minute automated admission-work
+clock shared by goal-shape planning, draft, critic and an optional redraft. Each
+automated phase receives only the current remainder; operator prompts pause this
+work clock, while an explicit calendar deadline does not. No phase gets a fresh
+clock, a reserved slice or an extension. An earlier explicit Job deadline wins.
+Provider cleanup gets a
+separate 30-second proof window but cannot authorize fallback or extend the
+approved work cutoff. Standalone compatibility commands retain bounded route
+safety limits and cancel through the same cleanup shape.
 
 Accept when:
 
@@ -184,8 +184,10 @@ Accept when:
   proven;
 - [ ] unresolved goal-shape provider cleanup stops before a Job ID is created;
   deterministic shape fallback occurs only after the provider tree is reaped;
-- [ ] contract stages share one 20-minute admission deadline and preserve the
-  critic/redraft reservations rather than starting a fresh clock per stage;
+- [ ] goal-shape planning and all contract stages share one 20-minute automated
+  admission-work allowance and inherit only its remainder rather than starting a
+  fresh clock or dividing it into phase-local shares; operator prompt time does
+  not consume the allowance;
 - [ ] an absolute deadline that elapses during admission creates no queued Job
   and tells the operator to choose a later deadline;
 - [ ] after suspending and waking the host beyond one lease heartbeat window,
@@ -240,6 +242,13 @@ promotion, root planning, child scheduling and recovery, verify this matrix:
   promotion boundary includes the time already consumed;
 - [ ] run wall accounting is monotonic and controller-measured; provider or
   judge timing evidence is not added to it a second time.
+- [ ] Plan, Chain and Campaign children inherit the owning Job's remaining
+  work window; parallel child durations are never summed to manufacture a
+  false wall-cap exhaustion.
+- [ ] the same fixed cutoff is inherited by deterministic gates, semantic
+  judging, merge repair, catalog/policy/hook seams, Git work, receipt sealing
+  and promotion; a calendar deadline remains typed as `deadline` rather than
+  being rewritten as `wall_cap`.
 
 ## Safety and prerequisites
 
