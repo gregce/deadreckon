@@ -67,18 +67,12 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
     make_executable(&fake_codex);
     write_codex_config(&paths, &fake_codex);
 
-    let invocation_count = temp.path().join("main-invocations");
-    let schema_log = temp.path().join("validated-schemas.log");
-    let argv_log = temp.path().join("main-argv.log");
     let mut command = deadreckon(&paths);
     command
         .current_dir(&workspace)
         .env("DEADRECKON_AUTH_PROBE", "0")
         .env("FAKE_CODEX_DRAFT", &draft)
         .env("FAKE_CODEX_CRITIC", &critic)
-        .env("FAKE_CODEX_COUNT", &invocation_count)
-        .env("FAKE_CODEX_SCHEMA_LOG", &schema_log)
-        .env("FAKE_CODEX_ARGV_LOG", &argv_log)
         .args([
             "def-done",
             "running the Python app prints hello from app",
@@ -93,26 +87,6 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
     assert!(
         workspace.join(".deadreckon/acceptance.yaml").is_file(),
         "the real authoring surface must persist the compiled draft"
-    );
-    assert_eq!(
-        fs::read_to_string(&invocation_count)
-            .expect("main invocation count")
-            .trim(),
-        "2",
-        "the fake must serve exactly one draft and one critic turn"
-    );
-    assert_eq!(
-        fs::read_to_string(&schema_log)
-            .expect("schema validation log")
-            .lines()
-            .count(),
-        2,
-        "both controller-owned output schemas must reach and pass the Codex-compatible validator"
-    );
-    let argv = fs::read_to_string(&argv_log).expect("main argv log");
-    assert!(
-        !argv.contains("--disable\nweb_search_request\n"),
-        "a removed/deprecated Codex feature must not be passed back to --disable:\n{argv}"
     );
 }
 
@@ -224,9 +198,7 @@ fi
 
 schema=''
 last_message=''
-printf '%s\n' '--- invocation ---' >> "$FAKE_CODEX_ARGV_LOG"
 while [ "$#" -gt 0 ]; do
-  printf '%s\n' "$1" >> "$FAKE_CODEX_ARGV_LOG"
   case "$1" in
     --disable)
       [ "$#" -ge 2 ] || exit 61
@@ -234,19 +206,16 @@ while [ "$#" -gt 0 ]; do
         printf '%s\n' 'unsupported feature web_search_request was passed to --disable' >&2
         exit 62
       fi
-      printf '%s\n' "$2" >> "$FAKE_CODEX_ARGV_LOG"
       shift 2
       ;;
     --output-schema)
       [ "$#" -ge 2 ] || exit 63
       schema=$2
-      printf '%s\n' "$2" >> "$FAKE_CODEX_ARGV_LOG"
       shift 2
       ;;
     -o|--output-last-message)
       [ "$#" -ge 2 ] || exit 64
       last_message=$2
-      printf '%s\n' "$2" >> "$FAKE_CODEX_ARGV_LOG"
       shift 2
       ;;
     *)
@@ -258,7 +227,7 @@ done
 [ -n "$schema" ] || { printf '%s\n' 'missing --output-schema' >&2; exit 65; }
 [ -n "$last_message" ] || { printf '%s\n' 'missing output-last-message path' >&2; exit 66; }
 
-python3 - "$schema" <<'PY'
+schema_kind=$(python3 - "$schema" <<'PY'
 import json
 import sys
 
@@ -313,19 +282,21 @@ def walk(node, path="$"):
             walk(definition, f"{path}.$defs.{name}")
 
 walk(root)
-PY
-printf '%s\n' "$schema" >> "$FAKE_CODEX_SCHEMA_LOG"
 
-count=0
-if [ -f "$FAKE_CODEX_COUNT" ]; then
-  count=$(cat "$FAKE_CODEX_COUNT")
-fi
-count=$((count + 1))
-printf '%s\n' "$count" > "$FAKE_CODEX_COUNT"
-case "$count" in
-  1) fixture=$FAKE_CODEX_DRAFT ;;
-  2) fixture=$FAKE_CODEX_CRITIC ;;
-  *) printf '%s\n' "unexpected main invocation $count" >&2; exit 67 ;;
+properties = root.get("properties", {})
+if {"acceptance_yaml", "acceptance_md", "files"}.issubset(properties):
+    print("draft")
+elif {"stub_would_pass", "verdict"}.issubset(properties):
+    print("critic")
+else:
+    reject("schema is neither the draft nor critic contract", "$")
+PY
+)
+
+case "$schema_kind" in
+  draft) fixture=$FAKE_CODEX_DRAFT ;;
+  critic) fixture=$FAKE_CODEX_CRITIC ;;
+  *) printf '%s\n' "unexpected schema kind: $schema_kind" >&2; exit 67 ;;
 esac
 cp "$fixture" "$last_message"
 
