@@ -121,7 +121,7 @@ struct SemanticModelResponse {
     decision: SemanticDecision,
     summary: String,
     goal_coverage: Vec<GoalCoverage>,
-    #[serde(default)]
+    #[serde(rename = "blocking_missing")]
     missing: Vec<String>,
 }
 
@@ -872,7 +872,13 @@ fn semantic_provider_request(
         prompt: format!(
             "You are an independent completion judge. Assess meaning only; deterministic checks \
              have already passed and you may not override them. Use only the evidence packet. \
-             Return JSON matching the supplied schema. Every evidence citation must be one of \
+             Return JSON matching the supplied schema. `blocking_missing` means only an omission \
+             that prevents the approved goal from being achieved. If `decision` is `achieved`, \
+             `blocking_missing` MUST be empty, every `goal_coverage.status` MUST be `met`, and \
+             every coverage item MUST cite evidence. Put cosmetic issues and other non-blocking \
+             observations in `summary`, never in `blocking_missing`. If any blocking omission \
+             exists, use `revise` when another implementation turn could fix it or `uncertain` \
+             when the supplied evidence cannot decide it. Every evidence citation must be one of \
              approved-goal, approved-contract, source-diff, deterministic-gate, authority, \
              implementation-notes.\n\nEVIDENCE PACK:\n{evidence_json}"
         ),
@@ -1086,13 +1092,22 @@ fn semantic_output_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "summary", "goal_coverage", "missing"],
+        "required": ["decision", "summary", "goal_coverage", "blocking_missing"],
         "properties": {
-            "decision": { "type": "string", "enum": ["achieved", "revise", "uncertain"] },
-            "summary": { "type": "string", "maxLength": MAX_SUMMARY_CHARS },
+            "decision": {
+                "type": "string",
+                "enum": ["achieved", "revise", "uncertain"],
+                "description": "Use achieved only when every approved claim is met and blocking_missing is empty."
+            },
+            "summary": {
+                "type": "string",
+                "maxLength": MAX_SUMMARY_CHARS,
+                "description": "Evidence-backed assessment. Non-blocking or cosmetic observations belong here."
+            },
             "goal_coverage": {
                 "type": "array",
                 "maxItems": MAX_FINDINGS,
+                "description": "Coverage of approved goal and contract claims. Achieved requires every item to be met with evidence.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1104,7 +1119,12 @@ fn semantic_output_schema() -> Value {
                     }
                 }
             },
-            "missing": { "type": "array", "maxItems": MAX_FINDINGS, "items": { "type": "string" } }
+            "blocking_missing": {
+                "type": "array",
+                "maxItems": MAX_FINDINGS,
+                "description": "Only omissions that prevent goal achievement. Must be empty when decision is achieved.",
+                "items": { "type": "string" }
+            }
         }
     })
 }
@@ -1161,6 +1181,12 @@ mod tests {
         assert_eq!(
             request.cwd.as_deref(),
             Some(std::path::Path::new("/tmp/empty-judge-workspace"))
+        );
+        assert!(request.prompt.contains("`blocking_missing` MUST be empty"));
+        assert!(
+            request
+                .prompt
+                .contains("cosmetic issues and other non-blocking observations")
         );
     }
 
@@ -1461,10 +1487,18 @@ mod tests {
 
     #[test]
     fn semantic_schema_has_three_decisions() {
+        let schema = semantic_output_schema();
         assert_eq!(
-            semantic_output_schema()["properties"]["decision"]["enum"],
+            schema["properties"]["decision"]["enum"],
             serde_json::json!(["achieved", "revise", "uncertain"])
         );
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["decision", "summary", "goal_coverage", "blocking_missing"])
+        );
+        assert!(schema["properties"].get("missing").is_none());
+        deadreckon_providers::validate_openai_strict_output_schema("semantic-test", &schema)
+            .expect("semantic schema must remain valid for strict Codex/OpenAI output");
     }
 
     #[test]
@@ -1835,7 +1869,7 @@ mod tests {
                 provider: "judge".to_string(),
                 model: "judge-model".to_string(),
                 content: format!(
-                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":{goal_coverage},"missing":[]}}"#
+                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":{goal_coverage},"blocking_missing":[]}}"#
                 ),
                 usage: ProviderUsage {
                     input_tokens: 2,
@@ -1875,7 +1909,7 @@ mod tests {
                 provider: "judge".to_string(),
                 model: "judge-model".to_string(),
                 content: format!(
-                    r#"{{"decision":"achieved","summary":"bounded","goal_coverage":{goal_coverage},"missing":{missing}}}"#
+                    r#"{{"decision":"achieved","summary":"bounded","goal_coverage":{goal_coverage},"blocking_missing":{missing}}}"#
                 ),
                 usage: ProviderUsage {
                     input_tokens: 2,
@@ -1933,7 +1967,7 @@ mod tests {
                 provider: "judge".to_string(),
                 model: "judge-model".to_string(),
                 content: format!(
-                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":[{{"claim":"goal","status":"unclear","evidence":[]}}],"missing":["goal"]}}"#
+                    r#"{{"decision":"{decision}","summary":"bounded","goal_coverage":[{{"claim":"goal","status":"unclear","evidence":[]}}],"blocking_missing":["goal"]}}"#
                 ),
                 usage: ProviderUsage {
                     input_tokens: 2,

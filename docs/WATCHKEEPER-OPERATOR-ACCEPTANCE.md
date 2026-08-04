@@ -226,6 +226,10 @@ Accept when:
 - [ ] semantic judge cancellation reaps its complete process group and removes
   its identity record. If that cannot be proved, leaf, graph and campaign Jobs
   stop as `Blocked/LostContainment`, never `NEEDS_REVIEW` or `fatal_provider`.
+- [ ] a semantic judge that finds only a cosmetic, non-blocking observation
+  keeps it in `summary`, returns `achieved` with empty `blocking_missing`, and
+  seals normally; a genuinely blocking item requires `revise` or `uncertain`,
+  while any still-contradictory response fails closed as `NEEDS_REVIEW`.
 
 Exercise the timing assertions at every phase boundary, not only provider
 mutation. For admission drafting, goal-shape planning, provider turns, tool

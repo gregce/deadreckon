@@ -507,7 +507,7 @@ HTML
 
 case "$prompt" in
   *"You are an independent completion judge"*)
-    printf '%s\n' '{"decision":"uncertain","summary":"The fixture leaves semantic completion for operator review.","goal_coverage":[{"claim":"repair trust lineage","status":"unclear","evidence":["authority"]}],"missing":["trusted repair ownership evidence"]}'
+    printf '%s\n' '{"decision":"uncertain","summary":"The fixture leaves semantic completion for operator review.","goal_coverage":[{"claim":"repair trust lineage","status":"unclear","evidence":["authority"]}],"blocking_missing":["trusted repair ownership evidence"]}'
     ;;
   *"read-only planning agent"*"Force final durable Campaign"*)
     printf '%s\n' '{"tasks":[{"subject":"Build campaign lane zero","goal":"campaign-lane-zero","active_form":"Building lane zero","depends_on":[]},{"subject":"Build campaign lane one","goal":"campaign-lane-one","active_form":"Building lane one","depends_on":[]}]}'
