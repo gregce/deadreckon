@@ -512,7 +512,7 @@ pub fn spend_summary(state: &PipelineState) -> Result<SpendSummary> {
             })?;
         // Only the run loop's own turns count toward run spend. The live
         // narrator writes kind="narrator" rows to the same ledger; those must
-        // not inflate tokens/turns/wall or overwrite the running total.
+        // not inflate provider tokens/turns or overwrite the running total.
         if record.kind != "loop" {
             continue;
         }
@@ -527,9 +527,10 @@ pub fn spend_summary(state: &PipelineState) -> Result<SpendSummary> {
         summary.any_subscription_turn |= record.subscription;
         summary.any_estimated_turn |= record.estimated;
     }
-    if summary.wall_seconds == 0.0 {
-        summary.wall_seconds = state.total_wall_seconds;
-    }
+    // Lifecycle wall time is controller-measured across every run phase.
+    // Spend rows remain provider evidence and therefore cannot be summed into
+    // an authoritative active-run duration.
+    summary.wall_seconds = state.total_wall_seconds;
     if summary.total_usd == 0.0 {
         summary.total_usd = state.total_spend_usd;
     }
@@ -694,11 +695,13 @@ pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use deadreckon_protocol::SpendRecord;
     use tempfile::TempDir;
 
     use super::{
-        PhaseId, PhaseStatus, RunOptions, RunStatus, create_run, load_current_pointer, load_run,
-        save_state,
+        PhaseId, PhaseStatus, RunOptions, RunStatus, append_json_line, create_run,
+        load_current_pointer, load_run, save_state, spend_summary,
     };
     use crate::DeadreckonError;
     use crate::paths::{DeadreckonPaths, task_key};
@@ -774,6 +777,53 @@ mod tests {
             reloaded.active_phase().map(|phase| phase.status),
             Some(PhaseStatus::Executing)
         );
+    }
+
+    #[test]
+    fn spend_summary_uses_authoritative_run_wall_clock() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "authoritative wall clock".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: Some("test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("create run");
+        state.total_wall_seconds = 12.0;
+        append_json_line(
+            &state.run_root.join("spend.jsonl"),
+            &SpendRecord {
+                timestamp: Utc::now(),
+                turn: 1,
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                cost_usd: 0.0,
+                total_cost_usd: 0.0,
+                cap_usd: Some(1.0),
+                subscription: false,
+                estimated: false,
+                wall_time_seconds: Some(2.0),
+                wall_time_cap_seconds: Some(60.0),
+                kind: "loop".to_string(),
+            },
+        )
+        .expect("spend row");
+
+        let summary = spend_summary(&state).expect("summary");
+
+        assert_eq!(summary.wall_seconds, 12.0);
+        assert_eq!(summary.turns, 1);
     }
 
     #[test]
