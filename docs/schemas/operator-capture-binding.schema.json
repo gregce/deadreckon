@@ -295,6 +295,7 @@
         "fatal_provider",
         "fatal_gate",
         "lost_containment",
+        "supervisor_failure",
         "corrupt_history",
         "legacy_unknown"
       ]

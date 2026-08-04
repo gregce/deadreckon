@@ -1090,6 +1090,13 @@ mod tests {
                 JobOutcome::NeedsReview,
                 StopReason::SemanticUnavailable,
             ),
+            (
+                "supervisor-failure",
+                JobEventKind::Failed,
+                Some(StopReason::SupervisorFailure),
+                JobOutcome::Failed,
+                StopReason::SupervisorFailure,
+            ),
         ];
 
         let mut terminal_classifications = std::collections::HashSet::new();
@@ -1134,6 +1141,11 @@ mod tests {
                 "lost-containment-is-not-failed",
                 JobEventKind::Failed,
                 StopReason::LostContainment,
+            ),
+            (
+                "supervisor-failure-is-not-blocked",
+                JobEventKind::Blocked,
+                StopReason::SupervisorFailure,
             ),
             (
                 "deadline-is-not-budget",

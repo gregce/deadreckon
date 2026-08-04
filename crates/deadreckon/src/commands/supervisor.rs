@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use deadreckon_protocol::{
     CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobId, JobShape, RunId,
     SemanticDecision, SemanticJudgment, StopReason,
 };
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -45,6 +47,10 @@ const MAX_CONCURRENT_RECOVERY_JOBS: usize = 4;
 // seconds was short enough for host sleep or load to reclaim a healthy owner;
 // exact boot/PID fencing still permits immediate reboot recovery.
 const LEASE_TTL: Duration = Duration::from_secs(60);
+// A transient renewal error is not itself proof that authority was lost. Keep
+// retrying while the last durable lease still has ample headroom, then stop
+// work before another owner could legitimately reclaim it.
+const LEASE_RENEWAL_SAFETY_MARGIN: Duration = Duration::from_secs(10);
 const CHILD_METADATA_FILE: &str = "supervised-child.json";
 const CHILD_RELEASE_ACK_PREFIX: &str = "supervised-release-";
 const SUPERVISOR_STDOUT_FILE: &str = "supervisor.out";
@@ -59,6 +65,7 @@ const SUPERVISOR_FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
 const TRUSTED_DRIVER_ATTEMPT_ENV: &str = "DEADRECKON_SUPERVISOR_ATTEMPT";
 const TRUSTED_DRIVER_LAUNCH_ID_ENV: &str = "DEADRECKON_SUPERVISOR_LAUNCH_ID";
 const TRUSTED_DRIVER_RELEASE_DIGEST_ENV: &str = "DEADRECKON_SUPERVISOR_RELEASE_TOKEN_SHA256";
+pub(crate) const TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV: &str = "DEADRECKON_SUPERVISOR_WORK_CUTOFF";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,14 +77,65 @@ pub(crate) struct GuardedDriverAuthority {
     pub(crate) release_token_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisionTaskFailureClass {
+    Unexpected,
+    LeaseAuthorityLost,
+}
+
+#[derive(Debug)]
+struct SupervisionTaskFailure {
+    class: SupervisionTaskFailureClass,
+    error: CliError,
+}
+
+impl SupervisionTaskFailure {
+    fn unexpected(error: CliError) -> Self {
+        Self {
+            class: SupervisionTaskFailureClass::Unexpected,
+            error,
+        }
+    }
+
+    fn lease_authority_lost(error: CliError) -> Self {
+        Self {
+            class: SupervisionTaskFailureClass::LeaseAuthorityLost,
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisionTaskFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for SupervisionTaskFailure {}
+
+type SupervisionTaskResult<T> = std::result::Result<T, SupervisionTaskFailure>;
+
+fn heartbeat_failure_is_retryable(
+    error: &DeadreckonError,
+    authority_expires_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    error.is_retryable()
+        && authority_expires_at
+            .signed_duration_since(now)
+            .to_std()
+            .is_ok_and(|remaining| remaining > LEASE_RENEWAL_SAFETY_MARGIN)
+}
+
 /// Keeps fenced ownership alive for the entire claimed operation, including
 /// synchronous source hashing and asynchronous parent verification. Child
-/// monitoring also heartbeats defensively, but it starts too late to protect
-/// pre-attempt authority validation.
+/// monitoring observes this worker's health; one owner performs every renewal
+/// so concurrent writes cannot regress the lease timestamp.
 struct LeaseHeartbeatGuard {
     stop: Option<std::sync::mpsc::Sender<()>>,
     handle:
         Option<std::thread::JoinHandle<std::result::Result<(), deadreckon_core::DeadreckonError>>>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LeaseHeartbeatGuard {
@@ -88,6 +146,9 @@ impl LeaseHeartbeatGuard {
         ttl: Duration,
     ) -> Result<Self> {
         let (stop, stopped) = std::sync::mpsc::channel();
+        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let thread_failure = std::sync::Arc::clone(&failure);
+        let mut authority_expires_at = load_job_lease(&paths, &token.job_id)?.expires_at;
         let thread_name = format!(
             "dr-lease-{}",
             &token.job_id.as_ref()[..token.job_id.as_ref().len().min(8)]
@@ -101,7 +162,23 @@ impl LeaseHeartbeatGuard {
                             return Ok(());
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            heartbeat_job_lease(&paths, &token, Utc::now(), ttl)?;
+                            let now = Utc::now();
+                            match heartbeat_job_lease(&paths, &token, now, ttl) {
+                                Ok(lease) => authority_expires_at = lease.expires_at,
+                                Err(error) => {
+                                    if heartbeat_failure_is_retryable(
+                                        &error,
+                                        authority_expires_at,
+                                        now,
+                                    ) {
+                                        continue;
+                                    }
+                                    if let Ok(mut observed) = thread_failure.lock() {
+                                        *observed = Some(error.to_string());
+                                    }
+                                    return Err(error);
+                                }
+                            }
                         }
                     }
                 }
@@ -109,7 +186,22 @@ impl LeaseHeartbeatGuard {
         Ok(Self {
             stop: Some(stop),
             handle: Some(handle),
+            failure,
         })
+    }
+
+    fn check(&self) -> Result<()> {
+        let failure = self.failure.lock().map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "lease heartbeat health lock was poisoned".to_string(),
+            ))
+        })?;
+        match failure.as_deref() {
+            Some(error) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "lease heartbeat failed; active Job authority is no longer proven: {error}"
+            )))),
+            None => Ok(()),
+        }
     }
 
     fn stop_inner(&mut self) -> Result<()> {
@@ -127,10 +219,20 @@ impl LeaseHeartbeatGuard {
         }
     }
 
-    #[cfg(test)]
-    fn finish(mut self, operation: Result<()>) -> Result<()> {
+    fn finish(mut self, operation: Result<()>) -> SupervisionTaskResult<()> {
         let heartbeat = self.stop_inner();
-        operation.and(heartbeat)
+        match (operation, heartbeat) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(operation), Ok(())) => Err(SupervisionTaskFailure::unexpected(operation)),
+            (Ok(()), Err(heartbeat)) => {
+                Err(SupervisionTaskFailure::lease_authority_lost(heartbeat))
+            }
+            (Err(operation), Err(heartbeat)) => Err(SupervisionTaskFailure::lease_authority_lost(
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Job supervision failed ({operation}); lease heartbeat also failed ({heartbeat})"
+                ))),
+            )),
+        }
     }
 }
 
@@ -158,10 +260,12 @@ struct PreparedChildLaunch {
     launch_id: String,
     release_token: String,
     release_token_sha256: String,
+    work_cutoff: chrono::DateTime<Utc>,
+    work_boundary: ActivePolicyBoundary,
 }
 
 impl PreparedChildLaunch {
-    fn new(attempt: u32) -> Self {
+    fn with_allowance(attempt: u32, allowance: JobWorkAllowance) -> Self {
         let launch_id = Uuid::new_v4().to_string();
         let release_token = format!("{}:{}", launch_id, Uuid::new_v4());
         let release_token_sha256 = deadreckon_core::flight::sha256_text(&release_token);
@@ -170,7 +274,22 @@ impl PreparedChildLaunch {
             launch_id,
             release_token,
             release_token_sha256,
+            work_cutoff: allowance.cutoff,
+            work_boundary: allowance.boundary,
         }
+    }
+
+    #[cfg(test)]
+    fn new(attempt: u32) -> Self {
+        let now = Utc::now();
+        Self::with_allowance(
+            attempt,
+            JobWorkAllowance {
+                remaining: Duration::from_secs(60),
+                cutoff: now + chrono::Duration::seconds(60),
+                boundary: ActivePolicyBoundary::WallCap,
+            },
+        )
     }
 }
 
@@ -241,6 +360,7 @@ struct GuardedLaunchRecovery {
 enum UnlinkedLaunchDisposition {
     Relaunch,
     RecheckAcknowledgement,
+    PolicyTerminal,
 }
 
 #[derive(Debug)]
@@ -255,10 +375,26 @@ enum ChildMonitorOutcome {
     PolicyTerminal,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivePolicyBoundary {
     Deadline,
     WallCap,
+}
+
+impl ActivePolicyBoundary {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::WallCap => "wall_cap",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobWorkAllowance {
+    remaining: Duration,
+    cutoff: chrono::DateTime<Utc>,
+    boundary: ActivePolicyBoundary,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -300,7 +436,7 @@ pub(crate) async fn supervisor_serve_command(
     };
 
     if let Some(job_id) = requested_job_id {
-        return supervise_one_job(&paths, &instance, &job_id).await;
+        return guarded_supervise_job_task(&paths, &instance, &job_id).await;
     }
 
     if once {
@@ -314,9 +450,15 @@ pub(crate) async fn supervisor_serve_command(
     loop {
         scan.tick().await;
         while let Some(joined) = tasks.try_join_next() {
-            let job_id = joined_supervision_result(joined)?;
+            let (job_id, error) = joined_supervision_result(joined)?;
             active_job_ids.remove(&job_id);
+            if let Some(error) = error {
+                eprintln!("supervisor isolated Job {job_id} after its task failed: {error}");
+            }
         }
+        // Spawned futures catch their own unwind and always return their Job
+        // id, so one panic cannot leave a permanent active-set tombstone.
+        debug_assert_eq!(active_job_ids.len(), tasks.len());
         for job_id in eligible_job_ids(&paths)? {
             if tasks.len() >= MAX_CONCURRENT_RECOVERY_JOBS {
                 break;
@@ -326,6 +468,55 @@ pub(crate) async fn supervisor_serve_command(
             }
         }
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+async fn guarded_supervise_job_task(
+    paths: &DeadreckonPaths,
+    instance: &SupervisorInstance,
+    job_id: &str,
+) -> Result<()> {
+    match AssertUnwindSafe(supervise_job_task(paths, instance, job_id))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => {
+            let failure = SupervisionTaskFailure::unexpected(CliError::Core(
+                DeadreckonError::InvalidInput(format!(
+                    "supervisor Job task panicked: {}",
+                    panic_message(payload.as_ref())
+                )),
+            ));
+            match classify_supervision_task_failure(paths, instance, job_id, &failure) {
+                Ok(()) => Ok(()),
+                Err(classification) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Job {job_id} supervision panicked ({failure}); its failure could not be durably classified ({classification})"
+                )))),
+            }
+        }
+    }
+}
+
+async fn catch_bounded_job_task<Work>(job_id: String, work: Work) -> (String, Result<()>)
+where
+    Work: Future<Output = Result<()>>,
+{
+    let result = match AssertUnwindSafe(work).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "supervisor Job task panicked: {}",
+            panic_message(payload.as_ref())
+        )))),
+    };
+    (job_id, result)
 }
 
 async fn supervise_job_batch(
@@ -338,7 +529,7 @@ async fn supervise_job_batch(
     run_bounded_job_batch(job_ids, move |job_id| {
         let paths = paths.clone();
         let instance = instance.clone();
-        async move { supervise_one_job(&paths, &instance, &job_id).await }
+        async move { guarded_supervise_job_task(&paths, &instance, &job_id).await }
     })
     .await
 }
@@ -350,18 +541,27 @@ where
 {
     let mut pending = job_ids.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
+    let mut first_error = None;
     loop {
         while tasks.len() < MAX_CONCURRENT_RECOVERY_JOBS {
             let Some(job_id) = pending.next() else {
                 break;
             };
             let work = start(job_id.clone());
-            tasks.spawn(async move { (job_id, work.await) });
+            tasks.spawn(catch_bounded_job_task(job_id, work));
         }
         let Some(joined) = tasks.join_next().await else {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         };
-        joined_supervision_result(joined)?;
+        match joined_supervision_result(joined) {
+            Ok((_job_id, Some(error))) => {
+                first_error.get_or_insert(error);
+            }
+            Ok((_job_id, None)) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
     }
 }
 
@@ -371,26 +571,109 @@ fn spawn_supervision_task(
     instance: SupervisorInstance,
     job_id: String,
 ) {
-    tasks.spawn(async move {
-        let result = supervise_one_job(&paths, &instance, &job_id).await;
-        (job_id, result)
-    });
+    let task_job_id = job_id.clone();
+    let work = async move { guarded_supervise_job_task(&paths, &instance, &task_job_id).await };
+    tasks.spawn(catch_bounded_job_task(job_id, work));
 }
 
 fn joined_supervision_result(
     joined: std::result::Result<(String, Result<()>), tokio::task::JoinError>,
-) -> Result<String> {
+) -> Result<(String, Option<CliError>)> {
     let (job_id, result) = joined.map_err(|error| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
             "supervisor Job task did not finish cleanly: {error}"
         )))
     })?;
     match result {
-        Ok(()) => {}
-        Err(error) if live_lease_refusal(&error) => {}
-        Err(error) => return Err(error),
+        Ok(()) => Ok((job_id, None)),
+        Err(error) if live_lease_refusal(&error) => Ok((job_id, None)),
+        Err(error) => Ok((job_id, Some(error))),
     }
-    Ok(job_id)
+}
+
+async fn supervise_job_task(
+    paths: &DeadreckonPaths,
+    instance: &SupervisorInstance,
+    job_id: &str,
+) -> Result<()> {
+    match supervise_one_job(paths, instance, job_id).await {
+        Ok(()) => Ok(()),
+        Err(failure) if live_lease_refusal(&failure.error) => Ok(()),
+        Err(failure) => {
+            match classify_supervision_task_failure(paths, instance, job_id, &failure) {
+                Ok(()) => Ok(()),
+                Err(classification) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "Job {job_id} supervision failed ({failure}); its failure could not be durably classified ({classification})"
+                )))),
+            }
+        }
+    }
+}
+
+fn classify_supervision_task_failure(
+    paths: &DeadreckonPaths,
+    instance: &SupervisorInstance,
+    job_id: &str,
+    failure: &SupervisionTaskFailure,
+) -> Result<()> {
+    let view = JobView::load(paths, job_id)?;
+    if view.projection.is_terminal() {
+        return Ok(());
+    }
+    let lease = load_job_lease(paths, &view.job.job_id)?;
+    if lease.owner_id != instance.owner.owner_id
+        || !boot_identities_match(&lease.boot_id, &instance.owner.boot_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "the failed task no longer owns the Job lease; refusing an unfenced classification"
+                .to_string(),
+        )));
+    }
+    let token = LeaseToken::from(&lease);
+    let cleanup = reconcile_job_processes_for_policy_boundary(
+        paths,
+        &view.job,
+        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+    );
+
+    if failure.class == SupervisionTaskFailureClass::LeaseAuthorityLost || cleanup.is_err() {
+        let reason = match cleanup {
+            Ok(()) => {
+                format!("supervisor lost proof of its Job lease and stopped active work: {failure}")
+            }
+            Err(cleanup_error) => format!(
+                "supervisor task failed and process-tree cleanup could not be proven: {failure}; cleanup: {cleanup_error}"
+            ),
+        };
+        return block_for_lost_containment(paths, &token, &reason);
+    }
+
+    if finish_reached_terminal_boundary_after_cleanup(paths, &token, &view.job, None)? {
+        return Ok(());
+    }
+
+    if attempt_is_active(paths, job_id)? {
+        append_attempt_stopped(
+            paths,
+            &token,
+            StopReason::SupervisorFailure,
+            json!({
+                "reason": "supervisor isolated an unhandled per-Job task failure",
+                "error": failure.to_string(),
+            }),
+        )?;
+    }
+    append_terminal_event(
+        paths,
+        &token,
+        JobEventKind::Failed,
+        StopReason::SupervisorFailure,
+        json!({
+            "reason": "supervisor isolated an unhandled per-Job task failure",
+            "error": failure.to_string(),
+        }),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn supervisor_launch_command(
@@ -450,6 +733,20 @@ pub(crate) fn supervisor_launch_command(
                 .to_string(),
         )));
     }
+    let (prepared_work_cutoff, work_boundary) =
+        prepared_launch_work_allowance(&paths, job_id, attempt, &launch_id, release_token_sha256)?;
+    let work_cutoff = if work_boundary == ActivePolicyBoundary::WallCap {
+        // The durable preparation precedes AttemptStarted by a few writes.
+        // Derive the exact cumulative wall cutoff once from the now-durable
+        // attempt history. This does not reset the allowance: completed and
+        // active intervals are both subtracted before the fixed timestamp is
+        // handed to every descendant.
+        remaining_job_work_allowance(&paths, &job, Utc::now())?
+            .map(|allowance| allowance.cutoff)
+            .unwrap_or(prepared_work_cutoff)
+    } else {
+        prepared_work_cutoff
+    };
 
     let release_ack = SupervisorReleaseAck {
         launch_protocol: GUARDED_LAUNCH_PROTOCOL.to_string(),
@@ -467,7 +764,8 @@ pub(crate) fn supervisor_launch_command(
 
     let launch = load_launch_inputs(&paths, &job)?;
     let executable = std::env::current_exe()?;
-    let mut command = build_job_driver_command(&paths, &job, &launch, &executable, attempt)?;
+    let mut command =
+        build_job_driver_command(&paths, &job, &launch, &executable, attempt, work_cutoff)?;
     apply_durable_scope_root(&mut command, &launch.plan);
     apply_guarded_driver_metadata(&mut command, &release_ack, release_token_sha256);
     command
@@ -737,31 +1035,44 @@ async fn supervise_one_job(
     paths: &DeadreckonPaths,
     instance: &SupervisorInstance,
     job_id: &str,
-) -> Result<()> {
-    let initial = JobView::load(paths, job_id)?;
-    if initial.projection.is_terminal() {
-        return Ok(());
-    }
-    if !matches!(
-        initial.job.shape,
-        JobShape::Single | JobShape::Graph | JobShape::LegacyCampaign
-    ) {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "supervisor cannot execute unsupported {:?} job {job_id}",
-            initial.job.shape
-        ))));
-    }
+) -> SupervisionTaskResult<()> {
+    let setup: Result<_> = (|| {
+        let initial = JobView::load(paths, job_id)?;
+        if initial.projection.is_terminal() {
+            return Ok(None);
+        }
+        if !matches!(
+            initial.job.shape,
+            JobShape::Single | JobShape::Graph | JobShape::LegacyCampaign
+        ) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "supervisor cannot execute unsupported {:?} job {job_id}",
+                initial.job.shape
+            ))));
+        }
 
-    let claim = claim_job_lease(
-        paths,
-        &initial.job.job_id,
-        &instance.owner,
-        Utc::now(),
-        LEASE_TTL,
-    )?;
-    let token = claim.token();
-    let _heartbeat =
-        LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)?;
+        let claim = claim_job_lease(
+            paths,
+            &initial.job.job_id,
+            &instance.owner,
+            Utc::now(),
+            LEASE_TTL,
+        )?;
+        let token = claim.token();
+        let heartbeat = LeaseHeartbeatGuard::start(
+            paths.clone(),
+            token.clone(),
+            HEARTBEAT_INTERVAL,
+            LEASE_TTL,
+        )?;
+        Ok(Some((initial, claim, token, heartbeat)))
+    })();
+    let Some((initial, claim, token, heartbeat)) =
+        setup.map_err(SupervisionTaskFailure::unexpected)?
+    else {
+        return Ok(());
+    };
+    let operation: Result<()> = async {
     let reboot_reclaim = matches!(
         claim.disposition,
         LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
@@ -863,7 +1174,14 @@ async fn supervise_one_job(
         }
     };
     if let Some(recovery) = guarded_recovery.as_ref() {
-        match prepare_unlinked_launch_recovery(paths, job_id, &mut stored_child, recovery) {
+        match prepare_unlinked_launch_recovery(
+            paths,
+            &initial.job,
+            &token,
+            &heartbeat,
+            &mut stored_child,
+            recovery,
+        ) {
             Ok(UnlinkedLaunchDisposition::Relaunch) => {}
             Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement) => {
                 match recoverable_unlinked_guarded_launch(paths, job_id, &initial.projection) {
@@ -892,6 +1210,7 @@ async fn supervise_one_job(
                     }
                 }
             }
+            Ok(UnlinkedLaunchDisposition::PolicyTerminal) => return Ok(()),
             Err(error) => {
                 append_terminal_event(
                     paths,
@@ -920,6 +1239,7 @@ async fn supervise_one_job(
                 paths,
                 &token,
                 &initial.job,
+                &heartbeat,
                 MonitoredChild::Adopted(child.process.pid),
             )
             .await?
@@ -927,14 +1247,25 @@ async fn supervise_one_job(
                 ChildMonitorOutcome::Exited(exit) => exit,
                 ChildMonitorOutcome::PolicyTerminal => return Ok(()),
             };
+            if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
+                return Ok(());
+            }
+            let reconciliation_grace =
+                remaining_reconciliation_grace(paths, &initial.job)?;
             if let Err(error) = reconcile_attempt_processes(
                 paths,
                 job_id,
                 Some(&child),
-                Duration::from_secs(2),
+                reconciliation_grace,
                 false,
             ) {
+                if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
+                    return Ok(());
+                }
                 block_for_lost_containment(paths, &token, &error.to_string())?;
+                return Ok(());
+            }
+            if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
                 return Ok(());
             }
             let attempt = initial.projection.attempt_count.max(1);
@@ -947,14 +1278,43 @@ async fn supervise_one_job(
             }
         }
         if !resuming_advanced {
+            let recovery_exit = ChildExit {
+                status: None,
+                adopted: true,
+            };
+            if finish_reached_policy_boundary(
+                paths,
+                &token,
+                &initial.job,
+                Some(&recovery_exit),
+            )? {
+                return Ok(());
+            }
+            let reconciliation_grace = remaining_reconciliation_grace(paths, &initial.job)?;
             if let Err(error) = reconcile_attempt_processes(
                 paths,
                 job_id,
                 (!reboot_reclaim).then_some(&child),
-                Duration::from_secs(2),
+                reconciliation_grace,
                 reboot_reclaim,
             ) {
+                if finish_reached_policy_boundary(
+                    paths,
+                    &token,
+                    &initial.job,
+                    Some(&recovery_exit),
+                )? {
+                    return Ok(());
+                }
                 block_for_lost_containment(paths, &token, &error.to_string())?;
+                return Ok(());
+            }
+            if finish_reached_policy_boundary(
+                paths,
+                &token,
+                &initial.job,
+                Some(&recovery_exit),
+            )? {
                 return Ok(());
             }
             remove_child_control_files(paths, job_id, child.launch_id.as_deref())?;
@@ -962,10 +1322,7 @@ async fn supervise_one_job(
                 paths,
                 &initial.job,
                 &token,
-                ChildExit {
-                    status: None,
-                    adopted: true,
-                },
+                recovery_exit,
                 initial.projection.attempt_count.max(1),
                 max_attempts,
             )
@@ -976,10 +1333,24 @@ async fn supervise_one_job(
             }
         }
     }
-    if let Err(error) =
-        reconcile_attempt_processes(paths, job_id, None, Duration::from_secs(2), reboot_reclaim)
-    {
+    if finish_reached_policy_boundary(paths, &token, &initial.job, None)? {
+        return Ok(());
+    }
+    let reconciliation_grace = remaining_reconciliation_grace(paths, &initial.job)?;
+    if let Err(error) = reconcile_attempt_processes(
+        paths,
+        job_id,
+        None,
+        reconciliation_grace,
+        reboot_reclaim,
+    ) {
+        if finish_reached_policy_boundary(paths, &token, &initial.job, None)? {
+            return Ok(());
+        }
         block_for_lost_containment(paths, &token, &error.to_string())?;
+        return Ok(());
+    }
+    if finish_reached_policy_boundary(paths, &token, &initial.job, None)? {
         return Ok(());
     }
 
@@ -1105,11 +1476,13 @@ async fn supervise_one_job(
             return Ok(());
         }
     };
+    heartbeat.check()?;
     let first_attempt = guarded_recovery.as_ref().map_or_else(
         || initial.projection.attempt_count.saturating_add(1),
         |recovery| recovery.attempt,
     );
     for attempt in first_attempt..=max_attempts {
+        heartbeat.check()?;
         if finish_cancel_requested(paths, &token, None)? {
             return Ok(());
         }
@@ -1119,10 +1492,22 @@ async fn supervise_one_job(
         if finish_wall_cap_reached(paths, &token, &initial.job, None)? {
             return Ok(());
         }
+        let Some(work_allowance) = remaining_job_work_allowance(paths, &initial.job, Utc::now())?
+        else {
+            return Ok(());
+        };
+        if finish_if_less_than_one_work_second(
+            paths,
+            &token,
+            &initial.job,
+            work_allowance,
+        )? {
+            return Ok(());
+        }
         let attempt_already_started = guarded_recovery
             .as_ref()
             .is_some_and(|recovery| recovery.attempt == attempt && recovery.attempt_started);
-        let prepared = PreparedChildLaunch::new(attempt);
+        let prepared = PreparedChildLaunch::with_allowance(attempt, work_allowance);
         append_control_event(
             paths,
             &token,
@@ -1155,6 +1540,19 @@ async fn supervise_one_job(
         if finish_wall_cap_reached(paths, &token, &initial.job, None)? {
             return Ok(());
         }
+        let Some(work_allowance) = remaining_job_work_allowance(paths, &initial.job, Utc::now())?
+        else {
+            return Ok(());
+        };
+        if finish_if_less_than_one_work_second(
+            paths,
+            &token,
+            &initial.job,
+            work_allowance,
+        )? {
+            return Ok(());
+        }
+        heartbeat.check()?;
         match spawn_job_driver(paths, &initial.job, &instance.executable, &prepared) {
             Ok(mut guarded) => {
                 append_control_event(
@@ -1174,6 +1572,7 @@ async fn supervise_one_job(
                     paths,
                     &token,
                     &initial.job,
+                    &heartbeat,
                     MonitoredChild::Owned(guarded.child),
                 )
                 .await?
@@ -1181,14 +1580,25 @@ async fn supervise_one_job(
                     ChildMonitorOutcome::Exited(exit) => exit,
                     ChildMonitorOutcome::PolicyTerminal => return Ok(()),
                 };
+                if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
+                    return Ok(());
+                }
+                let reconciliation_grace =
+                    remaining_reconciliation_grace(paths, &initial.job)?;
                 if let Err(error) = reconcile_attempt_processes(
                     paths,
                     job_id,
                     Some(&guarded.metadata),
-                    Duration::from_secs(2),
+                    reconciliation_grace,
                     false,
                 ) {
+                    if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
+                        return Ok(());
+                    }
                     block_for_lost_containment(paths, &token, &error.to_string())?;
+                    return Ok(());
+                }
+                if finish_reached_policy_boundary(paths, &token, &initial.job, Some(&exit))? {
                     return Ok(());
                 }
                 remove_child_control_files(paths, job_id, launch_id.as_deref())?;
@@ -1221,15 +1631,12 @@ async fn supervise_one_job(
                 match reconcile_child_exit(paths, &initial.job, &token, exit, attempt, max_attempts)
                     .await?
                 {
-                    ChildReconciliation::Retry => {
-                        heartbeat_job_lease(paths, &token, Utc::now(), LEASE_TTL)?;
-                        continue;
-                    }
+                    ChildReconciliation::Retry => continue,
                     ChildReconciliation::Finished => return Ok(()),
                 }
             }
             Err(error) => {
-                if finish_cancel_requested(paths, &token, None)? {
+                if finish_reached_terminal_boundary(paths, &token, &initial.job, None)? {
                     return Ok(());
                 }
                 append_attempt_stopped(
@@ -1238,6 +1645,9 @@ async fn supervise_one_job(
                     StopReason::FatalProvider,
                     json!({ "attempt": attempt, "spawn_error": error.to_string() }),
                 )?;
+                if finish_reached_terminal_boundary(paths, &token, &initial.job, None)? {
+                    return Ok(());
+                }
                 if attempt < max_attempts {
                     append_control_event(
                         paths,
@@ -1246,7 +1656,6 @@ async fn supervise_one_job(
                         format!("retry-scheduled:{}:{attempt}", token.epoch),
                         json!({ "after_attempt": attempt, "reason": "spawn_failed" }),
                     )?;
-                    heartbeat_job_lease(paths, &token, Utc::now(), LEASE_TTL)?;
                     continue;
                 }
                 append_terminal_event(
@@ -1263,7 +1672,11 @@ async fn supervise_one_job(
             }
         }
     }
+    #[allow(unreachable_code)]
     Ok(())
+    }
+    .await;
+    heartbeat.finish(operation)
 }
 
 fn advanced_artifact_recoverable(paths: &DeadreckonPaths, job: &Job) -> bool {
@@ -1393,7 +1806,6 @@ fn schedule_advanced_recovery(
             "reason": "resume_persisted_advanced_artifact"
         }),
     )?;
-    heartbeat_job_lease(paths, token, Utc::now(), LEASE_TTL)?;
     Ok(())
 }
 
@@ -1641,12 +2053,15 @@ fn build_job_driver_command(
     launch: &LaunchInputs,
     executable: &Path,
     attempt: u32,
+    work_cutoff: chrono::DateTime<Utc>,
 ) -> Result<Command> {
     let command = match job.shape {
-        JobShape::Single if attempt == 1 => build_leaf_command(paths, job, launch, executable),
-        JobShape::Single => build_leaf_resume_command(paths, job, executable),
+        JobShape::Single if attempt == 1 => {
+            build_leaf_command_at(paths, job, launch, executable, work_cutoff)?
+        }
+        JobShape::Single => build_leaf_resume_command_at(paths, job, executable, work_cutoff),
         JobShape::Graph | JobShape::LegacyCampaign => {
-            build_advanced_command(paths, job, executable)
+            build_advanced_command_at(paths, job, executable, work_cutoff)
         }
         JobShape::LegacyChain => {
             return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -1679,18 +2094,44 @@ fn apply_durable_scope_root(command: &mut Command, plan: &LaunchPlan) {
     }
 }
 
+#[cfg(test)]
+fn test_work_cutoff() -> chrono::DateTime<Utc> {
+    Utc::now() + chrono::Duration::hours(1)
+}
+
+#[cfg(test)]
 fn build_leaf_resume_command(paths: &DeadreckonPaths, job: &Job, executable: &Path) -> Command {
+    build_leaf_resume_command_at(paths, job, executable, test_work_cutoff())
+}
+
+#[cfg(test)]
+fn build_advanced_command(paths: &DeadreckonPaths, job: &Job, executable: &Path) -> Command {
+    build_advanced_command_at(paths, job, executable, test_work_cutoff())
+}
+
+fn build_leaf_resume_command_at(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    executable: &Path,
+    work_cutoff: chrono::DateTime<Utc>,
+) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("supervisor")
         .arg("resume")
         .arg(job.job_id.as_ref())
         .env("DEADRECKON_HOME", paths.home())
-        .env(TRUSTED_SUPERVISOR_JOB_ID_ENV, job.job_id.as_ref());
+        .env(TRUSTED_SUPERVISOR_JOB_ID_ENV, job.job_id.as_ref())
+        .env(TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV, work_cutoff.to_rfc3339());
     command
 }
 
-fn build_advanced_command(paths: &DeadreckonPaths, job: &Job, executable: &Path) -> Command {
+fn build_advanced_command_at(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    executable: &Path,
+    work_cutoff: chrono::DateTime<Utc>,
+) -> Command {
     let mut command = Command::new(executable);
     command
         .arg("supervisor")
@@ -1698,6 +2139,7 @@ fn build_advanced_command(paths: &DeadreckonPaths, job: &Job, executable: &Path)
         .arg(job.job_id.as_ref())
         .env("DEADRECKON_HOME", paths.home())
         .env(TRUSTED_SUPERVISOR_JOB_ID_ENV, job.job_id.as_ref())
+        .env(TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV, work_cutoff.to_rfc3339())
         .env(
             TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV,
             paths.job_launch_plan(job.job_id.as_ref()),
@@ -1732,7 +2174,63 @@ fn child_launch_prepared_detail(job: &Job, prepared: &PreparedChildLaunch) -> Va
         "release_token_sha256".to_string(),
         json!(prepared.release_token_sha256),
     );
+    detail.insert("work_cutoff".to_string(), json!(prepared.work_cutoff));
+    detail.insert(
+        "work_boundary".to_string(),
+        json!(prepared.work_boundary.as_str()),
+    );
     Value::Object(detail)
+}
+
+fn prepared_launch_work_allowance(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    attempt: u32,
+    launch_id: &str,
+    release_token_sha256: &str,
+) -> Result<(chrono::DateTime<Utc>, ActivePolicyBoundary)> {
+    let history = read_job_history(&paths.job_events(job_id))?;
+    history
+        .events()
+        .iter()
+        .rev()
+        .find(|event| {
+            event.kind == JobEventKind::ChildLaunchPrepared
+                && launch_detail_matches(&event.detail, attempt, launch_id, release_token_sha256)
+        })
+        .map(|event| {
+            let cutoff = event
+                .detail
+                .get("work_cutoff")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "guarded launch is missing its durable Job work cutoff".to_string(),
+                    ))
+                })?
+                .parse::<chrono::DateTime<Utc>>()
+                .map_err(|error| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "guarded launch has an invalid durable Job work cutoff: {error}"
+                    )))
+                })?;
+            let boundary = match event.detail.get("work_boundary").and_then(Value::as_str) {
+                Some("deadline") => ActivePolicyBoundary::Deadline,
+                Some("wall_cap") => ActivePolicyBoundary::WallCap,
+                _ => {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "guarded launch has an invalid durable Job work boundary".to_string(),
+                    )));
+                }
+            };
+            Ok((cutoff, boundary))
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "guarded launch has no matching durable work allowance".to_string(),
+            ))
+        })
 }
 
 fn child_link_detail(
@@ -1774,12 +2272,23 @@ fn child_link_detail(
     Value::Object(detail)
 }
 
+#[cfg(test)]
 fn build_leaf_command(
     paths: &DeadreckonPaths,
     job: &Job,
     launch: &LaunchInputs,
     executable: &Path,
-) -> Command {
+) -> Result<Command> {
+    build_leaf_command_at(paths, job, launch, executable, test_work_cutoff())
+}
+
+fn build_leaf_command_at(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    launch: &LaunchInputs,
+    executable: &Path,
+    work_cutoff: chrono::DateTime<Utc>,
+) -> Result<Command> {
     let mut command = Command::new(executable);
     command
         .arg("run")
@@ -1799,9 +2308,10 @@ fn build_leaf_command(
         .arg("--max-spend")
         .arg(effective_spend(job, &launch.plan).to_string())
         .arg("--max-wall-seconds")
-        .arg(effective_wall_seconds(job, &launch.plan).to_string())
+        .arg(effective_wall_seconds_at(work_cutoff, &launch.plan)?.to_string())
         .env("DEADRECKON_HOME", paths.home())
         .env(TRUSTED_SUPERVISOR_JOB_ID_ENV, job.job_id.as_ref())
+        .env(TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV, work_cutoff.to_rfc3339())
         .env(
             TRUSTED_SUPERVISOR_LAUNCH_PLAN_ENV,
             paths.job_launch_plan(job.job_id.as_ref()),
@@ -1884,7 +2394,7 @@ fn build_leaf_command(
             command.arg("--narrator-model").arg(model);
         }
     }
-    command
+    Ok(command)
 }
 
 fn effective_spend(job: &Job, plan: &LaunchPlan) -> f64 {
@@ -1895,12 +2405,40 @@ fn effective_spend(job: &Job, plan: &LaunchPlan) -> f64 {
         })
 }
 
-fn effective_wall_seconds(job: &Job, plan: &LaunchPlan) -> u64 {
-    plan.budget
+fn effective_wall_seconds_at(work_cutoff: chrono::DateTime<Utc>, plan: &LaunchPlan) -> Result<u64> {
+    if plan.budget.wall_seconds == Some(0) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "the frozen launch plan has a zero-second wall budget".to_string(),
+        )));
+    }
+    let remaining = work_cutoff
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let remaining_seconds = whole_work_seconds(remaining).unwrap_or(0);
+    let effective = plan
+        .budget
         .wall_seconds
-        .map_or(job.policy.max_wall_seconds, |plan_cap| {
-            plan_cap.min(job.policy.max_wall_seconds)
-        })
+        .map_or(remaining_seconds, |plan_cap| {
+            plan_cap.min(remaining_seconds)
+        });
+    if effective == 0 {
+        // Keep the guarded launcher alive until the fixed outer boundary when
+        // only a fractional second remains. The supervisor will then classify
+        // the attempt as policy exhaustion instead of a provider spawn error.
+        if !remaining.is_zero() {
+            std::thread::sleep(remaining);
+        }
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "less than one whole second remained before the approved Job work cutoff".to_string(),
+        )));
+    }
+    Ok(effective)
+}
+
+fn whole_work_seconds(remaining: Duration) -> Option<u64> {
+    let seconds = remaining.as_secs();
+    (seconds > 0).then_some(seconds)
 }
 
 fn child_metadata_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
@@ -2299,10 +2837,13 @@ fn recoverable_unlinked_guarded_launch(
 
 fn prepare_unlinked_launch_recovery(
     paths: &DeadreckonPaths,
-    job_id: &str,
+    job: &Job,
+    token: &LeaseToken,
+    heartbeat: &LeaseHeartbeatGuard,
     metadata: &mut Option<SupervisorChildMetadata>,
     recovery: &GuardedLaunchRecovery,
 ) -> Result<UnlinkedLaunchDisposition> {
+    let job_id = job.job_id.as_ref();
     let Some(child) = metadata.as_ref() else {
         return Ok(UnlinkedLaunchDisposition::Relaunch);
     };
@@ -2317,21 +2858,57 @@ fn prepare_unlinked_launch_recovery(
     }
     if matches_prepared {
         let acknowledgement = child_release_ack_path(paths, job_id, recovery.launch_id.as_str());
-        let deadline = Instant::now() + GUARDED_CHILD_SETTLE_TIMEOUT;
+        let settle_deadline = Instant::now() + GUARDED_CHILD_SETTLE_TIMEOUT;
         loop {
+            if finish_reached_terminal_boundary(paths, token, job, None)? {
+                return Ok(UnlinkedLaunchDisposition::PolicyTerminal);
+            }
+            if let Err(error) = heartbeat.check() {
+                let cleanup = reconcile_job_processes_for_policy_boundary(
+                    paths,
+                    job,
+                    Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+                );
+                let reason = match cleanup {
+                    Ok(()) => format!(
+                        "lease heartbeat failed while guarded-launch recovery was settling; the supervised process tree was stopped before authority was released: {error}"
+                    ),
+                    Err(cleanup_error) => format!(
+                        "lease heartbeat failed while guarded-launch recovery was settling and process-tree cleanup could not be proven: {error}; cleanup: {cleanup_error}"
+                    ),
+                };
+                block_for_lost_containment(paths, token, &reason)?;
+                return Ok(UnlinkedLaunchDisposition::PolicyTerminal);
+            }
             if acknowledgement.is_file() {
                 return Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement);
             }
             if !child_process_may_still_be_live(child) {
                 break;
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= settle_deadline {
                 return Err(CliError::Core(DeadreckonError::InvalidInput(
                     "linked guarded child remained alive without a durable release acknowledgement"
                         .to_string(),
                 )));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            let remaining_job_work = remaining_job_work_duration(paths, job, Utc::now())?;
+            if remaining_job_work.is_zero() {
+                if finish_reached_terminal_boundary(paths, token, job, None)? {
+                    return Ok(UnlinkedLaunchDisposition::PolicyTerminal);
+                }
+                return Err(CliError::Core(DeadreckonError::InvalidInput(
+                    "guarded-launch recovery reached a zero Job work allowance without a classifiable policy boundary"
+                        .to_string(),
+                )));
+            }
+            let settle_remaining = settle_deadline.saturating_duration_since(now);
+            std::thread::sleep(
+                POLICY_CLEANUP_POLL_INTERVAL
+                    .min(settle_remaining)
+                    .min(remaining_job_work),
+            );
         }
         if acknowledgement.is_file() {
             return Ok(UnlinkedLaunchDisposition::RecheckAcknowledgement);
@@ -2355,132 +2932,264 @@ fn finish_owned_child_policy_boundary(
     boundary: ActivePolicyBoundary,
 ) -> Result<bool> {
     let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
-    let cleanup_paths = paths.clone();
-    let cleanup_token = token.clone();
-    let cleanup_job = job.clone();
-    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
-    let cleanup = std::thread::Builder::new()
-        .name(format!(
-            "dr-policy-cleanup-{}",
-            &token.job_id.as_ref()[..token.job_id.as_ref().len().min(8)]
-        ))
-        .spawn(move || {
-            let result = match boundary {
-                ActivePolicyBoundary::Deadline => {
-                    finish_deadline_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
-                }
-                ActivePolicyBoundary::WallCap => {
-                    finish_wall_cap_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
-                }
-            };
-            let _ = result_sender.send(result);
-        })?;
-    let mut reaped = false;
-    let mut reap_error = None;
-
-    loop {
-        if !reaped && reap_error.is_none() {
-            match child.try_wait() {
-                Ok(Some(_)) => reaped = true,
-                Ok(None) => {}
-                Err(error) => reap_error = Some(error.to_string()),
-            }
-        }
-
-        match result_receiver.try_recv() {
-            Ok(result) => {
-                cleanup.join().map_err(|_| {
-                    CliError::Core(DeadreckonError::InvalidInput(
-                        "policy cleanup thread panicked".to_string(),
-                    ))
-                })?;
-                let terminalized = match result {
-                    Ok(terminalized) => terminalized,
-                    Err(error) => {
-                        block_for_lost_containment(
-                            paths,
-                            token,
-                            &format!(
-                                "policy cleanup failed before containment was proven: {error}"
-                            ),
-                        )?;
-                        return Ok(true);
-                    }
-                };
-                if !terminalized {
-                    return Ok(false);
-                }
-                let projection = JobView::load(paths, token.job_id.as_ref())?.projection;
-                if projection.stop_reason == Some(StopReason::LostContainment) {
-                    return Ok(true);
-                }
-                if let Some(error) = reap_error.as_deref() {
-                    block_for_lost_containment(
-                        paths,
-                        token,
-                        &format!(
-                            "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
-                        ),
-                    )?;
-                    return Ok(true);
-                }
-                if reaped {
-                    return Ok(true);
-                }
-                while Instant::now() < cleanup_deadline {
-                    match child.try_wait() {
-                        Ok(Some(_)) => return Ok(true),
-                        Ok(None) => std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL),
-                        Err(error) => {
-                            block_for_lost_containment(
-                                paths,
-                                token,
-                                &format!(
-                                    "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
-                                ),
-                            )?;
-                            return Ok(true);
-                        }
-                    }
-                }
-                block_for_lost_containment(
-                    paths,
-                    token,
-                    "policy cleanup reported success, but the owned leader was not reaped within the bounded 30-second window",
-                )?;
-                return Ok(true);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                let _ = cleanup.join();
-                block_for_lost_containment(
-                    paths,
-                    token,
-                    "policy cleanup ended without reporting whether containment was restored",
-                )?;
-                return Ok(true);
-            }
-        }
-
-        if Instant::now() >= cleanup_deadline {
+    // Run cleanup on the owning thread. Rust threads cannot be cancelled
+    // safely; detaching one at the deadline would let stale lease authority
+    // keep mutating lifecycle truth after LostContainment was recorded.
+    let terminalized = match boundary {
+        ActivePolicyBoundary::Deadline => finish_deadline_reached_with_cleanup_deadline(
+            paths,
+            token,
+            job,
+            None,
+            Some(cleanup_deadline),
+        ),
+        ActivePolicyBoundary::WallCap => finish_wall_cap_reached_with_cleanup_deadline(
+            paths,
+            token,
+            job,
+            None,
+            Some(cleanup_deadline),
+        ),
+    };
+    let terminalized = match terminalized {
+        Ok(terminalized) => terminalized,
+        Err(error) => {
+            let _ = stop_and_reap_owned_child(child);
             block_for_lost_containment(
                 paths,
                 token,
-                "policy cleanup exceeded its bounded 30-second termination and reap window",
+                &format!("policy cleanup failed before containment was proven: {error}"),
             )?;
             return Ok(true);
         }
-        std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL);
+    };
+    if !terminalized {
+        return Ok(false);
     }
+
+    let projection = JobView::load(paths, token.job_id.as_ref())?.projection;
+    if projection.stop_reason == Some(StopReason::LostContainment) {
+        return Ok(true);
+    }
+    while Instant::now() < cleanup_deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(true),
+            Ok(None) => std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL),
+            Err(error) => {
+                let _ = stop_and_reap_owned_child(child);
+                block_for_lost_containment(
+                    paths,
+                    token,
+                    &format!(
+                        "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
+                    ),
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+    let final_reap = stop_and_reap_owned_child(child);
+    block_for_lost_containment(
+        paths,
+        token,
+        &format!(
+            "policy cleanup exceeded its bounded 30-second termination and reap window{}",
+            final_reap
+                .err()
+                .map(|error| format!("; final owned-leader stop failed: {error}"))
+                .unwrap_or_default()
+        ),
+    )?;
+    Ok(true)
+}
+
+fn stop_and_reap_owned_child(child: &mut Child) -> std::io::Result<()> {
+    match child.try_wait()? {
+        Some(_) => Ok(()),
+        None => {
+            child.kill()?;
+            child.wait().map(|_| ())
+        }
+    }
+}
+
+fn fail_closed_after_heartbeat(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    child: &mut MonitoredChild,
+    heartbeat_error: &CliError,
+) -> Result<()> {
+    let cleanup = reconcile_job_processes_for_policy_boundary(
+        paths,
+        job,
+        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+    );
+
+    if let MonitoredChild::Owned(child) = child {
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(_) => {}
+        }
+    }
+
+    let reason = match cleanup {
+        Ok(()) => format!(
+            "lease heartbeat failed while Job work was active; the supervised process tree was stopped before authority was released: {heartbeat_error}"
+        ),
+        Err(cleanup_error) => format!(
+            "lease heartbeat failed while Job work was active and process-tree cleanup could not be proven: {heartbeat_error}; cleanup: {cleanup_error}"
+        ),
+    };
+    block_for_lost_containment(paths, token, &reason)
+}
+
+fn finish_reached_policy_boundary(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    if finish_deadline_reached(paths, token, job, exit)? {
+        return Ok(true);
+    }
+    finish_wall_cap_reached(paths, token, job, exit)
+}
+
+fn finish_reached_terminal_boundary(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    if finish_cancel_requested(paths, token, exit)? {
+        return Ok(true);
+    }
+    finish_reached_policy_boundary(paths, token, job, exit)
+}
+
+fn finish_reached_terminal_boundary_after_cleanup(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    if record_cancel_requested_after_cleanup(paths, token, exit)? {
+        return Ok(true);
+    }
+    if record_deadline_reached_after_cleanup(paths, token, job, exit)? {
+        return Ok(true);
+    }
+    record_wall_cap_reached_after_cleanup(paths, token, job, exit)
+}
+
+fn finish_owned_child_cancel_requested(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    child: &mut Child,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    if view.projection.stop_reason != Some(StopReason::CancelRequested) {
+        return Ok(false);
+    }
+
+    let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
+    if let Err(error) =
+        reconcile_job_processes_for_policy_boundary(paths, &view.job, Some(cleanup_deadline))
+    {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "operator cancellation could not prove every supervised process stopped: {error}"
+            ),
+        )?;
+        return Ok(true);
+    }
+    if let Err(error) = reap_owned_child_until(child, cleanup_deadline) {
+        block_for_lost_containment(
+            paths,
+            token,
+            &format!(
+                "operator cancellation stopped the supervised process tree, but its owned leader could not be reaped inside the same cleanup deadline: {error}"
+            ),
+        )?;
+        return Ok(true);
+    }
+    record_cancel_requested_after_cleanup(paths, token, None)
+}
+
+fn reap_owned_child_until(child: &mut Child, deadline: Instant) -> Result<()> {
+    match child.try_wait()? {
+        Some(_) => return Ok(()),
+        None => {
+            if let Err(kill_error) = child.kill() {
+                if child.try_wait()?.is_none() {
+                    return Err(kill_error.into());
+                }
+                return Ok(());
+            }
+        }
+    }
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "owned child did not exit before its cleanup deadline".to_string(),
+            )));
+        };
+        if remaining.is_zero() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "owned child did not exit before its cleanup deadline".to_string(),
+            )));
+        }
+        std::thread::sleep(remaining.min(POLICY_CLEANUP_POLL_INTERVAL));
+    }
+}
+
+fn remaining_reconciliation_grace(paths: &DeadreckonPaths, job: &Job) -> Result<Duration> {
+    let remaining = remaining_job_work_allowance(paths, job, Utc::now())?
+        .map(|allowance| allowance.remaining)
+        .unwrap_or(Duration::ZERO);
+    Ok(remaining.min(Duration::from_secs(2)))
 }
 
 async fn monitor_child(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
     job: &Job,
+    heartbeat: &LeaseHeartbeatGuard,
     mut child: MonitoredChild,
 ) -> Result<ChildMonitorOutcome> {
     loop {
+        let projection = JobView::load(paths, token.job_id.as_ref())?.projection;
+        if projection.stop_reason == Some(StopReason::CancelRequested) {
+            let terminalized = match &mut child {
+                MonitoredChild::Owned(child) => {
+                    finish_owned_child_cancel_requested(paths, token, child)?
+                }
+                MonitoredChild::Adopted(_) => finish_cancel_requested(paths, token, None)?,
+            };
+            if terminalized {
+                return Ok(ChildMonitorOutcome::PolicyTerminal);
+            }
+        }
+        if projection.is_terminal() {
+            return Ok(ChildMonitorOutcome::PolicyTerminal);
+        }
+        if let Err(error) = heartbeat.check() {
+            fail_closed_after_heartbeat(paths, token, job, &mut child, &error)?;
+            return Ok(ChildMonitorOutcome::PolicyTerminal);
+        }
         if job
             .policy
             .deadline
@@ -2552,7 +3261,6 @@ async fn monitor_child(
             .min(HEARTBEAT_INTERVAL);
         let sleep_for = deadline_sleep.min(wall_sleep);
         tokio::time::sleep(sleep_for).await;
-        heartbeat_job_lease(paths, token, Utc::now(), LEASE_TTL)?;
     }
 }
 
@@ -4633,6 +5341,20 @@ fn finish_cancel_requested(
     token: &LeaseToken,
     exit: Option<&ChildExit>,
 ) -> Result<bool> {
+    finish_cancel_requested_with_cleanup_deadline(
+        paths,
+        token,
+        exit,
+        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+    )
+}
+
+fn finish_cancel_requested_with_cleanup_deadline(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    exit: Option<&ChildExit>,
+    cleanup_deadline: Option<Instant>,
+) -> Result<bool> {
     let view = JobView::load(paths, token.job_id.as_ref())?;
     if view.projection.is_terminal() {
         return Ok(true);
@@ -4641,22 +5363,7 @@ fn finish_cancel_requested(
         return Ok(false);
     }
     if let Err(error) =
-        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
-            .and_then(|()| {
-                super::graph_job::reconcile_campaign_sub_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| {
-                super::graph_job::reconcile_merge_repair_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+        reconcile_job_processes_for_policy_boundary(paths, &view.job, cleanup_deadline)
     {
         block_for_lost_containment(
             paths,
@@ -4666,6 +5373,21 @@ fn finish_cancel_requested(
             ),
         )?;
         return Ok(true);
+    }
+    record_cancel_requested_after_cleanup(paths, token, exit)
+}
+
+fn record_cancel_requested_after_cleanup(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    if view.projection.stop_reason != Some(StopReason::CancelRequested) {
+        return Ok(false);
     }
     let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
     if attempt_active {
@@ -4707,6 +5429,22 @@ fn finish_deadline_reached(
     job: &Job,
     exit: Option<&ChildExit>,
 ) -> Result<bool> {
+    finish_deadline_reached_with_cleanup_deadline(
+        paths,
+        token,
+        job,
+        exit,
+        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+    )
+}
+
+fn finish_deadline_reached_with_cleanup_deadline(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+    cleanup_deadline: Option<Instant>,
+) -> Result<bool> {
     let view = JobView::load(paths, token.job_id.as_ref())?;
     if view.projection.is_terminal() {
         return Ok(true);
@@ -4718,22 +5456,7 @@ fn finish_deadline_reached(
         return Ok(false);
     }
     if let Err(error) =
-        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
-            .and_then(|()| {
-                super::graph_job::reconcile_campaign_sub_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| {
-                super::graph_job::reconcile_merge_repair_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+        reconcile_job_processes_for_policy_boundary(paths, &view.job, cleanup_deadline)
     {
         block_for_lost_containment(
             paths,
@@ -4743,6 +5466,25 @@ fn finish_deadline_reached(
             ),
         )?;
         return Ok(true);
+    }
+    record_deadline_reached_after_cleanup(paths, token, job, exit)
+}
+
+fn record_deadline_reached_after_cleanup(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    let Some(deadline) = job.policy.deadline else {
+        return Ok(false);
+    };
+    if deadline > Utc::now() {
+        return Ok(false);
     }
     let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
     if attempt_active {
@@ -4788,6 +5530,22 @@ fn finish_wall_cap_reached(
     job: &Job,
     exit: Option<&ChildExit>,
 ) -> Result<bool> {
+    finish_wall_cap_reached_with_cleanup_deadline(
+        paths,
+        token,
+        job,
+        exit,
+        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
+    )
+}
+
+fn finish_wall_cap_reached_with_cleanup_deadline(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+    cleanup_deadline: Option<Instant>,
+) -> Result<bool> {
     let view = JobView::load(paths, token.job_id.as_ref())?;
     if view.projection.is_terminal() {
         return Ok(true);
@@ -4798,22 +5556,7 @@ fn finish_wall_cap_reached(
         return Ok(false);
     }
     if let Err(error) =
-        reconcile_attempt_processes_from_disk(paths, token.job_id.as_ref(), Duration::from_secs(2))
-            .and_then(|()| {
-                super::graph_job::reconcile_campaign_sub_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| {
-                super::graph_job::reconcile_merge_repair_processes_for_job(
-                    paths,
-                    token.job_id.as_ref(),
-                    Duration::from_secs(2),
-                )
-            })
-            .and_then(|()| super::job::reconcile_job_docker_executions(paths, &view.job))
+        reconcile_job_processes_for_policy_boundary(paths, &view.job, cleanup_deadline)
     {
         block_for_lost_containment(
             paths,
@@ -4824,7 +5567,24 @@ fn finish_wall_cap_reached(
         )?;
         return Ok(true);
     }
+    record_wall_cap_reached_after_cleanup(paths, token, job, exit)
+}
+
+fn record_wall_cap_reached_after_cleanup(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    exit: Option<&ChildExit>,
+) -> Result<bool> {
+    let view = JobView::load(paths, token.job_id.as_ref())?;
+    if view.projection.is_terminal() {
+        return Ok(true);
+    }
+    let wall_cap = Duration::from_secs(job.policy.max_wall_seconds);
     let active_wall = active_attempt_wall(paths, token.job_id.as_ref(), Utc::now())?;
+    if active_wall < wall_cap {
+        return Ok(false);
+    }
     let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
     if attempt_active {
         append_attempt_stopped(
@@ -4855,6 +5615,52 @@ fn finish_wall_cap_reached(
         }),
     )?;
     Ok(true)
+}
+
+fn policy_cleanup_grace(cleanup_deadline: Option<Instant>) -> Result<Duration> {
+    let ordinary_grace = Duration::from_secs(2);
+    let Some(deadline) = cleanup_deadline else {
+        return Ok(ordinary_grace);
+    };
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "policy cleanup exhausted its single bounded cleanup deadline".to_string(),
+            ))
+        })?;
+    if remaining.is_zero() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "policy cleanup exhausted its single bounded cleanup deadline".to_string(),
+        )));
+    }
+    Ok(remaining.min(ordinary_grace))
+}
+
+fn reconcile_job_processes_for_policy_boundary(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    cleanup_deadline: Option<Instant>,
+) -> Result<()> {
+    reconcile_attempt_processes_from_disk(
+        paths,
+        job.job_id.as_ref(),
+        policy_cleanup_grace(cleanup_deadline)?,
+    )?;
+    super::graph_job::reconcile_campaign_sub_processes_for_job(
+        paths,
+        job.job_id.as_ref(),
+        policy_cleanup_grace(cleanup_deadline)?,
+    )?;
+    super::graph_job::reconcile_merge_repair_processes_for_job(
+        paths,
+        job.job_id.as_ref(),
+        policy_cleanup_grace(cleanup_deadline)?,
+    )?;
+    let _ = policy_cleanup_grace(cleanup_deadline)?;
+    super::job::reconcile_job_docker_executions(paths, job)?;
+    let _ = policy_cleanup_grace(cleanup_deadline)?;
+    Ok(())
 }
 
 fn block_for_lost_containment(
@@ -4892,6 +5698,118 @@ fn attempt_is_active(paths: &DeadreckonPaths, job_id: &str) -> Result<bool> {
             _ => None,
         })
         .unwrap_or(false))
+}
+
+fn finish_if_less_than_one_work_second(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    allowance: JobWorkAllowance,
+) -> Result<bool> {
+    if allowance.remaining.as_secs() > 0 {
+        return Ok(false);
+    }
+    match allowance.boundary {
+        ActivePolicyBoundary::Deadline => {
+            if !allowance.remaining.is_zero() {
+                std::thread::sleep(allowance.remaining);
+            }
+            finish_deadline_reached(paths, token, job, None)
+        }
+        ActivePolicyBoundary::WallCap => {
+            let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
+            let view = JobView::load(paths, token.job_id.as_ref())?;
+            if view.projection.is_terminal() {
+                return Ok(true);
+            }
+            if let Err(error) = reconcile_job_processes_for_policy_boundary(
+                paths,
+                &view.job,
+                Some(cleanup_deadline),
+            ) {
+                block_for_lost_containment(
+                    paths,
+                    token,
+                    &format!(
+                        "less than one executable wall-budget second remained, but not every supervised process could be proven stopped: {error}"
+                    ),
+                )?;
+                return Ok(true);
+            }
+            let attempt_active = attempt_is_active(paths, token.job_id.as_ref())?;
+            if attempt_active {
+                append_attempt_stopped(
+                    paths,
+                    token,
+                    StopReason::WallCap,
+                    json!({
+                        "reason": "less than one whole second remained in the approved cumulative wall budget",
+                        "max_wall_seconds": job.policy.max_wall_seconds,
+                        "remaining_wall_seconds": allowance.remaining.as_secs_f64(),
+                    }),
+                )?;
+            }
+            append_terminal_event(
+                paths,
+                token,
+                JobEventKind::BudgetExhausted,
+                StopReason::WallCap,
+                json!({
+                    "reason": "less than one whole second remained in the approved cumulative wall budget; no further provider process was launched",
+                    "max_wall_seconds": job.policy.max_wall_seconds,
+                    "remaining_wall_seconds": allowance.remaining.as_secs_f64(),
+                }),
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// Return the single remaining work allowance shared by every Job phase.
+/// Safety cleanup is intentionally not subtracted here: once this allowance
+/// reaches zero, the supervisor leaves work mode and owns a separate bounded
+/// cleanup window.
+pub(crate) fn remaining_job_work_duration(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    now: chrono::DateTime<Utc>,
+) -> Result<Duration> {
+    Ok(remaining_job_work_allowance(paths, job, now)?
+        .map(|allowance| allowance.remaining)
+        .unwrap_or(Duration::ZERO))
+}
+
+fn remaining_job_work_allowance(
+    paths: &DeadreckonPaths,
+    job: &Job,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<JobWorkAllowance>> {
+    let active_wall = active_attempt_wall(paths, job.job_id.as_ref(), now)?;
+    let wall_remaining =
+        Duration::from_secs(job.policy.max_wall_seconds).saturating_sub(active_wall);
+    let deadline_remaining = job.policy.deadline.map(|deadline| {
+        deadline
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+    });
+    let (remaining, boundary) = match deadline_remaining {
+        Some(deadline) if deadline <= wall_remaining => (deadline, ActivePolicyBoundary::Deadline),
+        _ => (wall_remaining, ActivePolicyBoundary::WallCap),
+    };
+    let cutoff = chrono::Duration::from_std(remaining)
+        .ok()
+        .and_then(|remaining| now.checked_add_signed(remaining))
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "the approved Job work cutoff overflowed the supported clock range".to_string(),
+            ))
+        })?;
+    Ok(Some(JobWorkAllowance {
+        remaining,
+        cutoff,
+        boundary,
+    }))
 }
 
 fn active_attempt_wall(
@@ -5162,6 +6080,76 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn restart_batch_drains_unrelated_jobs_after_one_task_fails() {
+        let later_job_started = Arc::new(Notify::new());
+        let later_for_work = Arc::clone(&later_job_started);
+        let job_ids = (0..=MAX_CONCURRENT_RECOVERY_JOBS)
+            .map(|index| format!("job-{index}"))
+            .collect();
+        let batch = tokio::spawn(run_bounded_job_batch(job_ids, move |job_id| {
+            let later_job_started = Arc::clone(&later_for_work);
+            async move {
+                if job_id == "job-0" {
+                    return Err(CliError::Core(DeadreckonError::InvalidInput(
+                        "synthetic per-Job supervision failure".to_string(),
+                    )));
+                }
+                if job_id == format!("job-{MAX_CONCURRENT_RECOVERY_JOBS}") {
+                    later_job_started.notify_one();
+                }
+                Ok(())
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), later_job_started.notified())
+            .await
+            .expect("a queued unrelated Job should start after the failed task frees its slot");
+        let error = tokio::time::timeout(Duration::from_secs(1), batch)
+            .await
+            .expect("the isolated batch should drain")
+            .expect("batch task should join")
+            .expect_err("the once-mode caller still receives the first isolated error");
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic per-Job supervision failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_batch_retains_job_identity_and_drains_after_one_task_panics() {
+        let later_job_started = Arc::new(Notify::new());
+        let later_for_work = Arc::clone(&later_job_started);
+        let job_ids = (0..=MAX_CONCURRENT_RECOVERY_JOBS)
+            .map(|index| format!("job-{index}"))
+            .collect();
+        let batch = tokio::spawn(run_bounded_job_batch(job_ids, move |job_id| {
+            let later_job_started = Arc::clone(&later_for_work);
+            async move {
+                assert_ne!(job_id, "job-0", "synthetic per-Job panic");
+                if job_id == format!("job-{MAX_CONCURRENT_RECOVERY_JOBS}") {
+                    later_job_started.notify_one();
+                }
+                Ok(())
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), later_job_started.notified())
+            .await
+            .expect("a panic must free its recovery slot for a queued Job");
+        let error = tokio::time::timeout(Duration::from_secs(1), batch)
+            .await
+            .expect("the panic-isolated batch should drain")
+            .expect("batch task should join")
+            .expect_err("the once-mode caller still receives the isolated panic");
+        assert!(
+            error.to_string().contains("synthetic per-Job panic"),
+            "{error}"
+        );
+    }
+
     fn write_admission_contract(source: &Path) -> PathBuf {
         let contract = source.join("acceptance.yaml");
         fs::write(
@@ -5406,6 +6394,231 @@ mod tests {
         let lease = deadreckon_core::load_job_lease(&paths, &job.job_id).expect("lease");
         assert!(lease.heartbeat_at > lease.acquired_at);
         assert!(lease.expires_at > Utc::now());
+    }
+
+    #[test]
+    fn transient_heartbeat_errors_retry_only_with_safe_lease_headroom() {
+        let now = Utc::now();
+        let transient = DeadreckonError::Io {
+            path: PathBuf::from("lease.json"),
+            source: std::io::Error::new(std::io::ErrorKind::TimedOut, "synthetic timeout"),
+        };
+        assert!(heartbeat_failure_is_retryable(
+            &transient,
+            now + chrono::TimeDelta::seconds(11),
+            now,
+        ));
+        assert!(!heartbeat_failure_is_retryable(
+            &transient,
+            now + chrono::TimeDelta::seconds(10),
+            now,
+        ));
+
+        let fatal = DeadreckonError::InvalidInput("fenced lease changed".to_string());
+        assert!(!heartbeat_failure_is_retryable(
+            &fatal,
+            now + chrono::TimeDelta::seconds(60),
+            now,
+        ));
+    }
+
+    #[test]
+    fn unhandled_job_task_failure_is_classified_without_escaping_its_lease() {
+        let temp = TempDir::new().expect("temp");
+        let (paths, job) = fixture(&temp, 1);
+        let instance = instance(PathBuf::from("/opt/deadreckon"));
+        claim_job_lease(&paths, &job.job_id, &instance.owner, Utc::now(), LEASE_TTL)
+            .expect("claim");
+
+        let failure = SupervisionTaskFailure::unexpected(CliError::Core(
+            DeadreckonError::InvalidInput("synthetic scheduler task error".to_string()),
+        ));
+        classify_supervision_task_failure(&paths, &instance, job.job_id.as_ref(), &failure)
+            .expect("failure should become a per-Job terminal fact");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("classified Job");
+        assert!(view.projection.is_terminal());
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Failed)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::SupervisorFailure)
+        );
+        assert!(
+            read_job_history(&paths.job_events(job.job_id.as_ref()))
+                .expect("history")
+                .events()
+                .iter()
+                .any(|event| event
+                    .detail
+                    .to_string()
+                    .contains("synthetic scheduler task error"))
+        );
+    }
+
+    #[test]
+    fn unhandled_failure_preserves_cancel_deadline_wall_terminal_precedence() {
+        for (case, cancel, deadline, expected_outcome, expected_reason) in [
+            (
+                "cancel",
+                true,
+                true,
+                deadreckon_protocol::JobOutcome::Cancelled,
+                StopReason::CancelRequested,
+            ),
+            (
+                "deadline",
+                false,
+                true,
+                deadreckon_protocol::JobOutcome::DeadlineReached,
+                StopReason::Deadline,
+            ),
+            (
+                "wall",
+                false,
+                false,
+                deadreckon_protocol::JobOutcome::BudgetExhausted,
+                StopReason::WallCap,
+            ),
+        ] {
+            let temp = TempDir::new().expect("temp");
+            let (paths, mut job) = fixture(&temp, 1);
+            job.policy.max_wall_seconds = 0;
+            job.policy.deadline = deadline.then(|| Utc::now() - chrono::TimeDelta::milliseconds(1));
+            fs::write(
+                paths.job_json(job.job_id.as_ref()),
+                serde_json::to_vec_pretty(&job).expect("job JSON"),
+            )
+            .expect("policy race fixture");
+            let instance = instance(PathBuf::from("/opt/deadreckon"));
+            let token =
+                claim_job_lease(&paths, &job.job_id, &instance.owner, Utc::now(), LEASE_TTL)
+                    .expect("claim")
+                    .token();
+            if cancel {
+                append_control_event(
+                    &paths,
+                    &token,
+                    JobEventKind::CancelRequested,
+                    format!("policy-precedence-{case}"),
+                    json!({ "stop_reason": StopReason::CancelRequested }),
+                )
+                .expect("cancel request");
+            }
+
+            let failure = SupervisionTaskFailure::unexpected(CliError::Core(
+                DeadreckonError::InvalidInput("synthetic cleanup race".to_string()),
+            ));
+            classify_supervision_task_failure(&paths, &instance, job.job_id.as_ref(), &failure)
+                .expect("policy boundary should win after cleanup");
+
+            let view = JobView::load(&paths, job.job_id.as_ref()).expect("classified Job");
+            assert_eq!(view.projection.outcome, Some(expected_outcome), "{case}");
+            assert_eq!(view.projection.stop_reason, Some(expected_reason), "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn heartbeat_failure_stops_active_process_tree_and_blocks_the_job() {
+        let temp = TempDir::new().expect("temp");
+        let (paths, job) = fixture(&temp, 1);
+        let instance = instance(PathBuf::from("/opt/deadreckon"));
+        let token = claim_job_lease(&paths, &job.job_id, &instance.owner, Utc::now(), LEASE_TTL)
+            .expect("claim")
+            .token();
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::AttemptStarted,
+            "heartbeat-failure-attempt".to_string(),
+            attempt_detail(&job, 1),
+        )
+        .expect("attempt started");
+
+        let (child, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 30");
+            command
+        })
+        .expect("active child");
+        let child_pid = child.id();
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: child_pid,
+                pgid: Some(child_pid),
+            },
+            launch_id: Some(Uuid::new_v4().to_string()),
+            attempt: Some(1),
+            release_token_sha256: Some(deadreckon_core::flight::sha256_text("heartbeat-test")),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start_identity(child_pid),
+        };
+        write_child_metadata(&child_metadata_path(&paths, job.job_id.as_ref()), &metadata)
+            .expect("child metadata");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "heartbeat-failure-child".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("child linked");
+
+        let lease_path = paths.job_lease(job.job_id.as_ref());
+        let valid_lease = fs::read(&lease_path).expect("valid lease");
+        let heartbeat = LeaseHeartbeatGuard::start(
+            paths.clone(),
+            token.clone(),
+            Duration::from_millis(10),
+            LEASE_TTL,
+        )
+        .expect("heartbeat");
+        fs::write(&lease_path, b"not-json\n").expect("corrupt heartbeat target");
+        let failure_deadline = Instant::now() + Duration::from_secs(1);
+        let heartbeat_error = loop {
+            if let Err(error) = heartbeat.check() {
+                break error;
+            }
+            assert!(
+                Instant::now() < failure_deadline,
+                "heartbeat worker did not report its persistence failure"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        fs::write(&lease_path, valid_lease).expect("restore fenced lease for classification");
+
+        assert!(
+            heartbeat_error
+                .to_string()
+                .contains("lease heartbeat failed")
+        );
+        let outcome = monitor_child(
+            &paths,
+            &token,
+            &job,
+            &heartbeat,
+            MonitoredChild::Owned(child),
+        )
+        .await
+        .expect("heartbeat failure should stop and classify active work");
+        assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
+        assert!(
+            !pid_is_alive(child_pid),
+            "active child survived lease failure"
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("blocked Job");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Blocked)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::LostContainment)
+        );
+        assert!(heartbeat.finish(Ok(())).is_err());
     }
 
     fn executing_attempt(paths: &DeadreckonPaths, job: &Job) {
@@ -6859,9 +8072,18 @@ mod tests {
         // in-memory monitor fixture after linking the child so this test has
         // no admission race or arbitrary sleep.
         job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::milliseconds(1));
-        let outcome = monitor_child(&paths, &token, &job, MonitoredChild::Owned(child))
-            .await
-            .expect("deadline stops active child");
+        let heartbeat =
+            LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)
+                .expect("heartbeat");
+        let outcome = monitor_child(
+            &paths,
+            &token,
+            &job,
+            &heartbeat,
+            MonitoredChild::Owned(child),
+        )
+        .await
+        .expect("deadline stops active child");
 
         assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
         assert!(!pid_is_alive(child_pid));
@@ -6885,6 +8107,77 @@ mod tests {
             Some(deadreckon_protocol::JobOutcome::DeadlineReached)
         );
         assert_eq!(view.projection.stop_reason, Some(StopReason::Deadline));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_operator_cancellation_is_observed_and_reaps_the_owned_child() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let (child, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 30");
+            command
+        })
+        .expect("active child");
+        let child_pid = child.id();
+        let metadata = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: child_pid,
+                pgid: Some(child_pid),
+            },
+            launch_id: Some(Uuid::new_v4().to_string()),
+            attempt: Some(1),
+            release_token_sha256: Some(deadreckon_core::flight::sha256_text("cancel-test")),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start_identity(child_pid),
+        };
+        write_child_metadata(&child_metadata_path(&paths, job.job_id.as_ref()), &metadata)
+            .expect("child metadata");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "active-cancel-child".to_string(),
+            child_link_detail(&job, &metadata, false, Some(1)),
+        )
+        .expect("child linked");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::CancelRequested,
+            "active-cancel-request".to_string(),
+            json!({ "stop_reason": StopReason::CancelRequested }),
+        )
+        .expect("cancel request");
+        let heartbeat =
+            LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)
+                .expect("heartbeat");
+
+        let outcome = monitor_child(
+            &paths,
+            &token,
+            &job,
+            &heartbeat,
+            MonitoredChild::Owned(child),
+        )
+        .await
+        .expect("monitor should enforce cancellation");
+
+        assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
+        assert!(!pid_is_alive(child_pid), "cancelled child survived");
+        assert!(!child_metadata_path(&paths, job.job_id.as_ref()).exists());
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("cancelled Job");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Cancelled)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::CancelRequested)
+        );
+        heartbeat.finish(Ok(())).expect("stop heartbeat");
     }
 
     #[cfg(unix)]
@@ -7012,6 +8305,88 @@ mod tests {
             )
             .expect("active wall"),
             Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn remaining_job_work_uses_the_earliest_wall_or_absolute_deadline() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 1);
+        job.policy.max_wall_seconds = 20;
+        let now = Utc::now();
+        let started = now - chrono::TimeDelta::seconds(5);
+        append_job_event(
+            &paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: job.job_id.clone(),
+                sequence: JobEventSequence::new(3).expect("sequence"),
+                event_id: "remaining-work-attempt".to_string(),
+                causation_id: "remaining-work-attempt".to_string(),
+                timestamp: started,
+                lease_epoch: 0,
+                kind: JobEventKind::AttemptStarted,
+                detail: attempt_detail(&job, 1),
+            },
+        )
+        .expect("attempt history");
+
+        assert_eq!(
+            remaining_job_work_duration(&paths, &job, now).expect("remaining wall"),
+            Duration::from_secs(15)
+        );
+        job.policy.deadline = Some(now + chrono::TimeDelta::seconds(7));
+        assert_eq!(
+            remaining_job_work_duration(&paths, &job, now).expect("remaining cutoff"),
+            Duration::from_secs(7)
+        );
+        job.policy.deadline = Some(now);
+        assert_eq!(
+            remaining_job_work_duration(&paths, &job, now).expect("elapsed cutoff"),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn child_wall_allowance_floors_and_refuses_fractional_seconds() {
+        assert_eq!(
+            whole_work_seconds(Duration::from_millis(999)),
+            None,
+            "a provider must not launch without one complete second"
+        );
+        assert_eq!(
+            whole_work_seconds(Duration::from_millis(1_999)),
+            Some(1),
+            "the child allowance must never round beyond the fixed cutoff"
+        );
+    }
+
+    #[test]
+    fn prepared_launch_freezes_the_cumulative_work_cutoff() {
+        let now = Utc::now();
+        let cutoff = now + chrono::TimeDelta::seconds(17);
+        let prepared = PreparedChildLaunch::with_allowance(
+            2,
+            JobWorkAllowance {
+                remaining: Duration::from_secs(17),
+                cutoff,
+                boundary: ActivePolicyBoundary::WallCap,
+            },
+        );
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, job) = fixture(&temp, 2);
+        let detail = child_launch_prepared_detail(&job, &prepared);
+
+        let recorded_cutoff = detail
+            .get("work_cutoff")
+            .and_then(Value::as_str)
+            .expect("recorded work cutoff")
+            .parse::<chrono::DateTime<Utc>>()
+            .expect("RFC 3339 work cutoff");
+        assert_eq!(recorded_cutoff, cutoff);
+        assert_eq!(
+            detail.get("work_boundary").and_then(Value::as_str),
+            Some("wall_cap")
         );
     }
 
@@ -7151,9 +8526,18 @@ mod tests {
         )
         .expect("child linked");
 
-        let outcome = monitor_child(&paths, &token, &job, MonitoredChild::Owned(child))
-            .await
-            .expect("wall cap stops active process tree");
+        let heartbeat =
+            LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)
+                .expect("heartbeat");
+        let outcome = monitor_child(
+            &paths,
+            &token,
+            &job,
+            &heartbeat,
+            MonitoredChild::Owned(child),
+        )
+        .await
+        .expect("wall cap stops active process tree");
 
         assert!(matches!(outcome, ChildMonitorOutcome::PolicyTerminal));
         assert!(!pid_is_alive(child_pid));
@@ -10258,7 +11642,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let (paths, job) = fixture(&temp, 1);
         let launch = load_launch_inputs(&paths, &job).expect("launch");
-        let mut command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let mut command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"))
+            .expect("leaf command");
         apply_durable_scope_root(&mut command, &launch.plan);
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let run_id_position = args
@@ -10300,7 +11685,8 @@ mod tests {
         let mut launch = load_launch_inputs(&paths, &job).expect("launch");
         launch.plan.providers.coder_model = Some("provider-current-model".to_string());
 
-        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"))
+            .expect("leaf command");
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let model = args
             .iter()
@@ -10322,7 +11708,8 @@ mod tests {
             depends_on: Vec::new(),
             subplan: None,
         });
-        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"))
+            .expect("leaf command");
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let model = args
             .iter()
@@ -10359,7 +11746,8 @@ mod tests {
         );
         launch.plan.signals = Value::Object(signals);
 
-        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"))
+            .expect("leaf command");
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         for expected in [
             "--base",
@@ -10402,7 +11790,8 @@ mod tests {
         );
         launch.plan.signals = Value::Object(signals);
 
-        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"));
+        let command = build_leaf_command(&paths, &job, &launch, Path::new("/opt/deadreckon"))
+            .expect("leaf command");
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
         let from = args.iter().position(|arg| arg == "--from").expect("--from");
         assert_eq!(
@@ -11023,10 +12412,15 @@ mod tests {
             .expect("release acknowledgement");
         });
         let mut stored_child = Some(child);
+        let heartbeat =
+            LeaseHeartbeatGuard::start(paths.clone(), token.clone(), HEARTBEAT_INTERVAL, LEASE_TTL)
+                .expect("heartbeat");
         assert_eq!(
             prepare_unlinked_launch_recovery(
                 &paths,
-                job.job_id.as_ref(),
+                &job,
+                &token,
+                &heartbeat,
                 &mut stored_child,
                 &recovery,
             )
@@ -11044,6 +12438,95 @@ mod tests {
                 .is_none(),
             "a valid acknowledgement forbids relaunching the logical attempt"
         );
+        heartbeat.finish(Ok(())).expect("stop heartbeat");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_recovery_settle_is_bounded_by_the_job_cutoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut job) = fixture(&temp, 2);
+        let token = claim_started_attempt(&paths, &job, 1);
+        job.policy.deadline = Some(Utc::now() + chrono::TimeDelta::milliseconds(150));
+        let prepared = PreparedChildLaunch::new(1);
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLaunchPrepared,
+            "prepared-for-bounded-settle".to_string(),
+            child_launch_prepared_detail(&job, &prepared),
+        )
+        .expect("prepared");
+        let (mut process, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 30");
+            command
+        })
+        .expect("guarded child");
+        let child_pid = process.id();
+        let child = SupervisorChildMetadata {
+            process: SupervisedProcess {
+                pid: child_pid,
+                pgid: Some(child_pid),
+            },
+            launch_id: Some(prepared.launch_id.clone()),
+            attempt: Some(1),
+            release_token_sha256: Some(prepared.release_token_sha256.clone()),
+            boot_id: Some(boot_identity()),
+            process_start_identity: process_start_identity(child_pid),
+        };
+        write_child_metadata(&child_metadata_path(&paths, job.job_id.as_ref()), &child)
+            .expect("child metadata");
+        append_control_event(
+            &paths,
+            &token,
+            JobEventKind::ChildLinked,
+            "linked-for-bounded-settle".to_string(),
+            child_link_detail(&job, &child, false, Some(1)),
+        )
+        .expect("linked");
+        let projection = JobView::load(&paths, job.job_id.as_ref())
+            .expect("projection")
+            .projection;
+        let recovery =
+            recoverable_unlinked_guarded_launch(&paths, job.job_id.as_ref(), &projection)
+                .expect("unacknowledged launch")
+                .expect("recoverable launch");
+        let heartbeat = LeaseHeartbeatGuard::start(
+            paths.clone(),
+            token.clone(),
+            Duration::from_millis(25),
+            LEASE_TTL,
+        )
+        .expect("heartbeat");
+        let started = Instant::now();
+        let mut stored_child = Some(child);
+
+        let disposition = prepare_unlinked_launch_recovery(
+            &paths,
+            &job,
+            &token,
+            &heartbeat,
+            &mut stored_child,
+            &recovery,
+        )
+        .expect("cutoff should terminalize guarded recovery");
+
+        assert_eq!(disposition, UnlinkedLaunchDisposition::PolicyTerminal);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "guarded recovery waited for its 30-second settle timeout"
+        );
+        let _ = process.wait();
+        assert!(!pid_is_alive(child_pid), "guarded child survived cutoff");
+        assert!(!child_metadata_path(&paths, job.job_id.as_ref()).exists());
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("deadline Job");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::DeadlineReached)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::Deadline));
+        heartbeat.finish(Ok(())).expect("stop heartbeat");
     }
 
     #[tokio::test]
