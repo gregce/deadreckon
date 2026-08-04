@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.1 — Steadier starts — 2026-08-04
+
 - Release trust generation now discovers signing records in the nested CI
   artifact layout, and public flat-download verification independently checks
   manifest signing claims against checksummed trust evidence. Conflicting,
@@ -13,14 +15,24 @@
   for helper files, validates controller-owned schemas before provider launch,
   and omits retired Codex feature switches instead of replaying deprecated
   configuration into current CLIs.
+- Interactive start keeps the approved source, launch shape, provider, and
+  model when contract authoring fails, then offers retry, revise, or cancel.
+  Recovery guidance now distinguishes controller compatibility, local setup,
+  transient provider failure, and invalid authoring results instead of
+  suggesting the provider that just failed.
 - Start planning and done-contract phases use realistic cumulative CLI
   deadlines: contract authoring defaults to ten minutes with bounded per-stage
-  allocations, while old 120-second configuration is safely lifted.
+  allocations, while old 120-second configuration is safely lifted. Planner
+  cancellation and authoring cleanup now prove that provider processes are
+  reaped before fallback or retry.
 - macOS boot identity now compares the stable boot-second boundary rather than
   volatile `kern.boottime` microseconds. Start/repair readiness waits 30
   seconds for a fresh service instance, healthy lease inactivity allows 60
   seconds, and guarded child handoff allows 30 seconds without extending any
   operator-approved Job wall or deadline.
+- Guided start defers supervisor installation or repair until contract
+  authoring and final launch confirmation are complete, so a rejected draft or
+  cancelled launch does not mutate the user's service state.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 
