@@ -49,6 +49,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CaptureCommand {
+    /// Print the immutable build identity used to reject mixed helper bundles.
+    Protocol,
     Prepare(PrepareArgs),
     Observe(ObserveArgs),
     Attest(AttestArgs),
@@ -375,6 +377,20 @@ struct SubjectCoverage {
 
 fn main() -> AnyResult<()> {
     let cli = Cli::parse();
+    if matches!(&cli.command, CaptureCommand::Protocol) {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        serde_json::to_writer(
+            &mut stdout,
+            &serde_json::json!({
+                "schema_version": 1,
+                "package_version": env!("CARGO_PKG_VERSION"),
+                "bundle_build_id": env!("DEADRECKON_BUNDLE_BUILD_ID"),
+            }),
+        )?;
+        stdout.write_all(b"\n")?;
+        return Ok(());
+    }
     let context = HelperContext::discover()?;
     let value = execute(&context, cli.command)?;
     let stdout = io::stdout();
@@ -386,6 +402,9 @@ fn main() -> AnyResult<()> {
 
 fn execute(context: &HelperContext, command: CaptureCommand) -> AnyResult<Value> {
     match command {
+        CaptureCommand::Protocol => {
+            Err("protocol is handled before helper context discovery".into())
+        }
         CaptureCommand::Prepare(args) => {
             Ok(serde_json::to_value(prepare_binding(context, &args)?)?)
         }

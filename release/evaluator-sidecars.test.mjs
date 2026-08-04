@@ -27,8 +27,7 @@ test(
       fs.mkdirSync(payload, { recursive: true });
 
       for (const helper of ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"]) {
-        const identity = helper === "dr-capture.exe" ? "" : ` ${FAKE_BUNDLE}`;
-        fs.writeFileSync(path.join(payload, helper), `${helper} native helper${identity}`);
+        fs.writeFileSync(path.join(payload, helper), `${helper} native helper ${FAKE_BUNDLE}`);
       }
       const armEvaluator = path.join(
         sidecars,

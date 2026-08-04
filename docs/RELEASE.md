@@ -167,7 +167,10 @@ Everything the operator confirms before a narrowed `v0.8.x` stable release:
    `Cargo.lock`, and confirm `CHANGELOG.md` has the matching release section.
 5. Run `make build`, then `release/preflight-real.sh`, and commit the refreshed
    `release/known-good-providers.json`. The recorded `deadreckon_version` must
-   equal the stable tag version.
+   equal the stable tag version, and its source-derived bundle ID must match
+   the tag checkout. The proof also records the exact hashes of `deadreckon`,
+   `dr-gate`, and `dr-capture`; a same-version rebuild or mixed helper bundle
+   is not accepted as prior evidence.
 6. Run the focused checks and the complete verification suite, then validate
    the exact stable ref through `release/trust/release-trust.mjs`.
 7. Rehearse the release through an RC and verify its archives, installers,
@@ -224,9 +227,11 @@ existing fail-closed preflight and publication jobs become mandatory again.
 
    For each route the harness proves one verified delivery and one
    identity-bound cancellation with no surviving provider process. On success
-   it records the probed binary versions in
-   `release/known-good-providers.json` (schema_version 1); commit that file
-   so the release notes can reference known-good CLI versions.
+   it records the probed binary versions and exact release bundle in
+   `release/known-good-providers.json` (schema_version 2); commit that file so
+   the release notes can reference known-good CLI versions. Stable validation
+   requires successful proofs for both default routes and recomputes the
+   source bundle ID, so a stale proof from an earlier `0.8.1` commit fails.
 8. Create and push an RC tag first. Review the GitHub Actions run, artifacts,
    `SHA256SUMS`, `release-manifest.json`, `release-archive-members.json`,
    `release.spdx.json`, macOS signing evidence, and attestations. Confirm every
