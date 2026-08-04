@@ -507,6 +507,28 @@ pub(crate) async fn classify_goal_shape_for_start(
     sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
 ) -> Result<GoalShapeRecommendation> {
+    classify_goal_shape_for_start_with_budget(
+        paths,
+        cwd,
+        goal,
+        provider,
+        sandbox_backend,
+        plain,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn classify_goal_shape_for_start_with_budget(
+    paths: &DeadreckonPaths,
+    cwd: &Path,
+    goal: &str,
+    provider: Option<&str>,
+    sandbox_backend: deadreckon_sandbox::SandboxBackend,
+    plain: bool,
+    admission_budget: Option<commands::acceptance::DoneAuthoringBudget>,
+) -> Result<GoalShapeRecommendation> {
     let defaults_ceiling = config_defaults(paths).ok().and_then(|d| d.max_spend);
     let signals = commands::course::collect_signal_bundle(paths, cwd, goal, defaults_ceiling);
     let ladder = commands::course::ladder_decision(&signals);
@@ -522,6 +544,7 @@ pub(crate) async fn classify_goal_shape_for_start(
             plain,
             &signals,
             &ladder,
+            admission_budget,
         )
         .await?
     {
@@ -551,6 +574,7 @@ async fn provider_course_plan(
     plain: bool,
     signals: &commands::course::SignalBundle,
     ladder: &commands::course::LadderDecision,
+    admission_budget: Option<commands::acceptance::DoneAuthoringBudget>,
 ) -> Result<Option<commands::course::ResolvedCoursePlan>> {
     let router = match ProviderRouter::from_config_path(&paths.config_path(), Some(provider)) {
         Ok(router) => router,
@@ -578,42 +602,47 @@ async fn provider_course_plan(
     request.output_path = Some(output_path.clone());
     request.cancellation_token = Some(token.clone());
     let route_kind = router.selected_route_info().map(|route| route.kind);
-    let completion =
-        maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request));
-    tokio::pin!(completion);
-    let response = tokio::select! {
-        response = &mut completion => response,
-        () = tokio::time::sleep(course_planner_timeout(route_kind.as_ref())) => {
-            token.cancel();
-            let cleanup = tokio::time::timeout(
-                course_planner_cleanup_timeout(),
-                &mut completion,
-            ).await;
-            require_course_planner_cleanup_proven(
-                cleanup.is_ok(),
-                &pid_file,
-                provider,
-                "timed out",
-            )?;
-            remove_course_planner_outputs(&output_path);
-            eprintln!(
-                "{}",
-                ui_warn(format!(
-                    "course planner timed out via {provider}; using the deterministic course"
-                ))
-            );
-            return Ok(None);
-        }
-    };
-    require_course_planner_cleanup_proven(true, &pid_file, provider, "returned")?;
+    let work_expires_at = admission_budget.map_or_else(
+        || Instant::now() + course_planner_timeout(route_kind.as_ref()),
+        commands::acceptance::DoneAuthoringBudget::work_expires_at,
+    );
+    let deadline = ProviderPhaseDeadline::new(
+        tokio::time::Instant::from_std(work_expires_at),
+        course_planner_cleanup_timeout(),
+    );
+    let response = maybe_with_cli_wait_status(
+        !plain,
+        "plotting the course",
+        complete_provider_phase(&router, &mut request, deadline),
+    )
+    .await;
     remove_course_planner_outputs(&output_path);
     let response = match response {
-        Ok(response) => response,
-        Err(error) => {
+        ProviderPhaseOutcome::Completed(Ok(response)) => response,
+        ProviderPhaseOutcome::Completed(Err(error)) => {
             eprintln!(
                 "{}",
                 ui_warn(format!(
                     "course planner unavailable via {provider}; using the deterministic course: {error}"
+                ))
+            );
+            return Ok(None);
+        }
+        ProviderPhaseOutcome::WorkExpired { cleanup }
+        | ProviderPhaseOutcome::Cancelled { cleanup } => {
+            require_course_planner_cleanup_proven(
+                matches!(
+                    cleanup,
+                    ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+                ),
+                &pid_file,
+                provider,
+                "reached its work boundary",
+            )?;
+            eprintln!(
+                "{}",
+                ui_warn(format!(
+                    "course planner reached the admission deadline via {provider}; using the deterministic course"
                 ))
             );
             return Ok(None);
@@ -3234,6 +3263,7 @@ fn recover_start_done_authoring(
 async fn materialize_start_done_criteria(
     decision: &mut StartLaunchDecision,
     mut prompter: Option<&mut dyn StartPrompter>,
+    admission_budget: Option<commands::acceptance::DoneAuthoringBudget>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let (write_root, inspect_root) = decision.resolved_source.as_ref().map_or_else(
@@ -3257,13 +3287,37 @@ async fn materialize_start_done_criteria(
             goal: Some(&decision.goal),
         };
         let authoring_result = if prompter.is_some() {
-            commands::acceptance::acceptance_agent_command_with_explicit_review(
+            if let Some(budget) = admission_budget {
+                commands::acceptance::acceptance_agent_command_with_explicit_review_and_budget(
+                    context,
+                    commands::acceptance::AcceptanceAgentMode::Draft,
+                    vec![request.clone()],
+                    authoring_provider.clone(),
+                    authoring_model.clone(),
+                    overwrite_existing,
+                    budget,
+                )
+                .await
+            } else {
+                commands::acceptance::acceptance_agent_command_with_explicit_review(
+                    context,
+                    commands::acceptance::AcceptanceAgentMode::Draft,
+                    vec![request.clone()],
+                    authoring_provider.clone(),
+                    authoring_model.clone(),
+                    overwrite_existing,
+                )
+                .await
+            }
+        } else if let Some(budget) = admission_budget {
+            commands::acceptance::acceptance_agent_command_with_context_and_budget(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
                 vec![request.clone()],
                 authoring_provider.clone(),
                 authoring_model.clone(),
                 overwrite_existing,
+                budget,
             )
             .await
         } else {
@@ -3388,7 +3442,12 @@ fn start_launch_preview_rows(
             "done limit".to_string(),
             format!(
                 "{}s total",
-                commands::acceptance::done_authoring_wall_seconds(&defaults)
+                commands::acceptance::DoneAuthoringBudget::from_config_and_deadline(
+                    defaults.done_contract_max_wall_seconds,
+                    args.deadline,
+                )
+                .total()
+                .as_secs()
             ),
         ));
     }
@@ -3466,6 +3525,7 @@ fn start_source_json(decision: &StartLaunchDecision) -> serde_json::Value {
 fn start_done_authoring_json(
     decision: &StartLaunchDecision,
     paths: &DeadreckonPaths,
+    deadline: Option<DateTime<Utc>>,
 ) -> Result<serde_json::Value> {
     let Some(source) = decision.resolved_source.as_ref() else {
         return Ok(serde_json::Value::Null);
@@ -3482,7 +3542,10 @@ fn start_done_authoring_json(
             authoring_provider.as_deref(),
             authoring_model.as_deref(),
         ),
-        "wall_seconds": commands::acceptance::done_authoring_wall_seconds(&defaults),
+        "wall_seconds": commands::acceptance::DoneAuthoringBudget::from_config_and_deadline(
+            defaults.done_contract_max_wall_seconds,
+            deadline,
+        ).total().as_secs_f64(),
         "posture": "structured_text",
     }))
 }
@@ -3685,7 +3748,7 @@ fn emit_start_read_only_result(
             "done_contract": start_done_contract_json(decision),
             "source_mode": decision.source_mode.label(),
             "source": start_source_json(decision),
-            "done_authoring": start_done_authoring_json(decision, paths)?,
+            "done_authoring": start_done_authoring_json(decision, paths, args.deadline)?,
             "goal_shape": &decision.goal_shape,
             "requires_confirmation": decision.requires_confirmation,
             "will_start": false,
@@ -3929,7 +3992,7 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
     let prompter = eligibility
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-    materialize_start_done_criteria(&mut decision, None).await?;
+    materialize_start_done_criteria(&mut decision, None, None).await?;
     require_start_supervisor_service(prompter)?;
     dispatch_start_command(replay_args, &decision, plan)
         .await
@@ -3943,6 +4006,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let stdin_is_tty = io::stdin().is_terminal();
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
+    let defaults = config_defaults(&paths)?;
     let latest_extendable_run = start_latest_extendable_run(&paths, &cwd)?;
     let mut decision = start_launch_decision(StartLaunchInput {
         goal: &args.goal,
@@ -3961,6 +4025,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
     resolve_start_source_setup(&mut decision, &args, source_prompter, stdin_is_tty)?;
+    let mut admission_work_spent = Duration::ZERO;
 
     if decision.recovery.is_none() && start_goal_shape_should_classify(&args, eligibility) {
         let inspection_root = decision
@@ -3968,7 +4033,6 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .as_ref()
             .map(|source| source.inspection_root.as_path())
             .unwrap_or(cwd.as_path());
-        let defaults = config_defaults(&paths)?;
         // A source-bearing auto launch first takes the deterministic ladder.
         // That lets an unsupported Campaign/source combination refuse without
         // ever starting a provider merely to discover that it cannot launch.
@@ -3981,15 +4045,26 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .as_deref()
             .unwrap_or("auto")
             .parse::<deadreckon_sandbox::SandboxBackend>()?;
-        let recommendation = classify_goal_shape_for_start(
+        let course_budget = commands::acceptance::DoneAuthoringBudget::from_config_and_deadline(
+            defaults.done_contract_max_wall_seconds,
+            args.deadline,
+        );
+        let course_started = Instant::now();
+        let recommendation = classify_goal_shape_for_start_with_budget(
             &paths,
             inspection_root,
             &args.goal,
             provider.as_deref(),
             planner_sandbox,
             args.plain,
+            Some(course_budget),
         )
         .await?;
+        // Prompt time between admission phases is not provider work. Carry
+        // only the automated work already consumed into contract authoring;
+        // an explicit calendar deadline is applied again below and therefore
+        // continues to advance while the operator decides.
+        admission_work_spent = course_started.elapsed().min(course_budget.total());
         apply_goal_shape_recommendation(&mut decision, recommendation.clone());
         validate_start_source_compatibility(&mut decision, &args, &cwd);
         if decision.recovery.is_none() {
@@ -4034,7 +4109,13 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let review_prompter: Option<&mut dyn StartPrompter> = eligibility
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-    materialize_start_done_criteria(&mut decision, review_prompter).await?;
+    let authoring_budget =
+        commands::acceptance::DoneAuthoringBudget::from_config_deadline_and_consumed(
+            defaults.done_contract_max_wall_seconds,
+            args.deadline,
+            admission_work_spent,
+        );
+    materialize_start_done_criteria(&mut decision, review_prompter, Some(authoring_budget)).await?;
     if let Some(recovery) = decision.recovery.as_ref() {
         return Err(start_recovery_error(recovery));
     }
@@ -4804,10 +4885,22 @@ doc_provider = "cli:claude-code"
             provenance: StartSourceProvenance::CurrentCleanWorktree,
         });
 
-        let authoring = start_done_authoring_json(&decision, &paths).expect("authoring preview");
+        let authoring =
+            start_done_authoring_json(&decision, &paths, None).expect("authoring preview");
         assert_eq!(
             authoring["provider"],
             "cli:codex / selected-planner-model (structured text)"
+        );
+
+        let deadline = Utc::now() + chrono::Duration::seconds(90);
+        let bounded = start_done_authoring_json(&decision, &paths, Some(deadline))
+            .expect("deadline-bounded authoring preview");
+        let wall = bounded["wall_seconds"]
+            .as_f64()
+            .expect("numeric wall seconds");
+        assert!(
+            (89.0..=90.0).contains(&wall),
+            "preview must expose the earlier explicit deadline: {wall}"
         );
     }
 
@@ -5328,7 +5421,7 @@ mod contract_tests {
         ] {
             let mut d = decision("build a realtime dashboard");
             d.done_action = action;
-            materialize_start_done_criteria(&mut d, Some(&mut prompter))
+            materialize_start_done_criteria(&mut d, Some(&mut prompter), None)
                 .await
                 .expect("materialize");
         }

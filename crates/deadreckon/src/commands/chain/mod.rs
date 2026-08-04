@@ -479,6 +479,60 @@ struct ChainRunOptions {
     skip_acceptance_prompt: bool,
 }
 
+const CHAIN_PLANNER_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+const DRAFT_CHAIN_PLANNER_WORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn chain_planner_phase_deadline(options: &ChainCreateOptions) -> Result<ProviderPhaseDeadline> {
+    let configured_work_budget = if options.draft {
+        DRAFT_CHAIN_PLANNER_WORK_BUDGET
+    } else {
+        let defaults = config_defaults(&options.paths)?;
+        let approved = options
+            .max_wall_seconds
+            .or(defaults.cli_max_wall_seconds)
+            .unwrap_or(36_000.0);
+        std::time::Duration::from_secs(commands::job::checked_job_wall_seconds(approved)?)
+    };
+    let remaining =
+        chain_planner_remaining_at(configured_work_budget, options.deadline, Utc::now());
+    Ok(ProviderPhaseDeadline::new(
+        tokio::time::Instant::now() + remaining,
+        CHAIN_PLANNER_CLEANUP_BUDGET,
+    ))
+}
+
+fn chain_planner_remaining_at(
+    configured_work_budget: std::time::Duration,
+    calendar_deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> std::time::Duration {
+    calendar_deadline.map_or(configured_work_budget, |deadline| {
+        deadline
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+            .min(configured_work_budget)
+    })
+}
+
+fn chain_planner_boundary_error(reason: &str, cleanup: ProviderCleanup) -> CliError {
+    let cleanup_detail = match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => String::new(),
+        ProviderCleanup::RetainedAuthority { path, detail } => format!(
+            "; provider cleanup was not proven and process authority remains at {}: {detail}",
+            path.display()
+        ),
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &format!("chain planner {reason}{cleanup_detail}"),
+        if cleanup_detail.is_empty() {
+            "raise --max-wall-seconds or choose a later --deadline, then retry"
+        } else {
+            "inspect the retained process record, then run deadreckon doctor before retrying"
+        },
+    ))
+}
+
 async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
     let n = options.n.clamp(2, 12);
     if !options.draft {
@@ -525,17 +579,33 @@ async fn chain_plan_command(options: ChainCreateOptions) -> Result<()> {
         options.model.as_deref(),
     )?;
     let prompt = chain_planner_prompt(&options.root_goal, n);
+    let phase_deadline = chain_planner_phase_deadline(&options)?;
+    let planner_pid_file = std::env::temp_dir().join(format!(
+        "deadreckon-chain-planner-{}.pid",
+        Uuid::new_v4().simple()
+    ));
+    let mut request = chain_planner_request(
+        prompt,
+        u32::from(n) * 96,
+        std::env::current_dir()?,
+        &options.sandbox,
+    )?;
+    request.pid_file = Some(planner_pid_file);
     let planner_started = std::time::Instant::now();
     let response = with_cli_wait_status(
         "drafting chain plan",
-        router.complete(&chain_planner_request(
-            prompt,
-            u32::from(n) * 96,
-            std::env::current_dir()?,
-            &options.sandbox,
-        )?),
+        complete_provider_phase(&router, &mut request, phase_deadline),
     )
-    .await
+    .await;
+    let response = match response {
+        ProviderPhaseOutcome::Completed(response) => response.map_err(CliError::from),
+        ProviderPhaseOutcome::WorkExpired { cleanup } => {
+            Err(chain_planner_boundary_error("reached its approved work cutoff", cleanup))
+        }
+        ProviderPhaseOutcome::Cancelled { cleanup } => {
+            Err(chain_planner_boundary_error("was cancelled", cleanup))
+        }
+    }
     .map_err(|err| {
         chain_create_refusal_surface(
             VerdictKind::Blocked,
@@ -4361,22 +4431,10 @@ fn per_step_spend_cap(chain: &Chain, index: usize) -> Option<f64> {
     Some(remaining / pending as f64)
 }
 
-pub(crate) fn per_step_wall_cap(chain: &Chain, index: usize) -> Option<f64> {
+pub(crate) fn per_step_wall_cap(chain: &Chain, _index: usize) -> Option<f64> {
     let max = chain.max_wall_seconds?;
     let remaining = (max - chain.total_wall_seconds).max(0.0);
-    let pending = chain
-        .steps
-        .iter()
-        .skip(index)
-        .filter(|step| {
-            !matches!(
-                step.status,
-                ChainStepStatus::Applied | ChainStepStatus::Skipped
-            )
-        })
-        .count()
-        .max(1);
-    Some(remaining / pending as f64)
+    Some(remaining)
 }
 
 fn chain_spend_cap_hit(chain: &Chain) -> bool {
@@ -4627,6 +4685,54 @@ fn print_chain_paused_footer(paths: &DeadreckonPaths, chain: &Chain) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chain_planner_uses_earliest_approved_cutoff() {
+        let now = DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            chain_planner_remaining_at(
+                std::time::Duration::from_secs(3_600),
+                Some(now + chrono::TimeDelta::seconds(90)),
+                now,
+            ),
+            std::time::Duration::from_secs(90)
+        );
+        assert_eq!(
+            chain_planner_remaining_at(
+                std::time::Duration::from_secs(45),
+                Some(now + chrono::TimeDelta::seconds(90)),
+                now,
+            ),
+            std::time::Duration::from_secs(45)
+        );
+        assert_eq!(
+            chain_planner_remaining_at(
+                std::time::Duration::from_secs(45),
+                Some(now - chrono::TimeDelta::seconds(1)),
+                now,
+            ),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn chain_planner_retains_process_authority_in_boundary_error() {
+        let error = chain_planner_boundary_error(
+            "reached its approved work cutoff",
+            ProviderCleanup::RetainedAuthority {
+                path: PathBuf::from("/tmp/deadreckon-planner.pid"),
+                detail: "cleanup window elapsed".to_string(),
+            },
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("/tmp/deadreckon-planner.pid"));
+        assert!(rendered.contains("cleanup window elapsed"));
+        assert!(rendered.contains("deadreckon doctor"));
+    }
 
     #[test]
     fn chain_planner_request_preserves_explicit_sandbox_selection() {
