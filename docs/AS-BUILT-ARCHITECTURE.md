@@ -4677,16 +4677,22 @@ fresh provider request has no worker session and uses the explicit read-only
 workspace posture. The response schema permits only:
 
 - `achieved`: only when coverage is non-empty, every claim is `met`, every
-  claim cites allowed evidence, and `missing` is empty; persist the judgment
-  after accounting and attempt receipt sealing;
+  claim cites allowed evidence, and model-facing `blocking_missing` is empty;
+  cosmetic and other non-blocking observations belong in `summary`. The
+  persisted protocol judgment retains its compatibility field name `missing`.
+  Persist the judgment after accounting and attempt receipt sealing;
 - `revise`: for a Single Job, add bounded findings and continue within the
   remaining budgets; for Graph and Campaign parents, start a new bounded,
   fenced parent-only repair attempt over the merged result without rerunning
   successful leaves;
 - `uncertain`: stop `NEEDS_REVIEW`.
 
-An unavailable or malformed strict judge also becomes `NEEDS_REVIEW`. The judge
-is never called after deterministic failure and cannot override it. Judge
+The prompt and strict output schema both state that any `blocking_missing` item
+requires `revise` or `uncertain`, eliminating the prior ambiguous affordance in
+which a model could correctly say `achieved` yet place a cosmetic note in
+`missing`. An unavailable, malformed, or still self-contradictory strict judge
+becomes `NEEDS_REVIEW`; DeadReckon does not normalize contradictions into
+acceptance. The judge is never called after deterministic failure and cannot override it. Judge
 tokens, wall time, route, model, and spend enter the normal spend/trace
 evidence as `semantic_judge`. Single, Graph and Campaign paths reconstruct
 their applicable execution/planner usage before judging, pass the remaining

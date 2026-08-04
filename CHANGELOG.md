@@ -49,6 +49,12 @@
   Lost judge containment blocks leaf, graph and campaign Jobs with
   `lost_containment`; it is never accepted as `NEEDS_REVIEW`, a provider fault,
   or a retryable attempt.
+- The semantic judge's model-facing schema now calls completion-blocking gaps
+  `blocking_missing` and states the cross-field invariant explicitly:
+  `achieved` requires an empty blocker list and evidence-backed `met` coverage.
+  Cosmetic observations belong in the summary, preventing a correct
+  achievement decision from becoming `NEEDS_REVIEW` merely because the model
+  reported a non-blocking note in an ambiguously named `missing` field.
 - Schema-constrained Codex calls now precreate their exact last-message file so
   Linux private `/tmp` mounts cannot hide the result, and explicitly deny
   writes to both lexical and canonical schema paths so macOS temporary-file
