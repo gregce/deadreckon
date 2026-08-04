@@ -77,6 +77,80 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
     Ok(Some(run_id))
 }
 
+/// Guided start writes its approved project contract after source-mode
+/// preflight. Return only the controller-owned paths whose bytes are bound by
+/// the immutable launch plan and match both the project and frozen Job copies.
+/// Core worktree admission permits these exact paths without seeding them;
+/// unrelated dirt remains a hard refusal.
+fn trusted_controller_contract_dirty_paths(
+    paths: &DeadreckonPaths,
+    run_id: &str,
+    source_cwd: &Path,
+    acceptance_source: &commands::acceptance::AcceptanceSource,
+    launch_plan: &commands::course::LaunchPlan,
+) -> Result<Vec<PathBuf>> {
+    let expected_frozen = commands::job::job_acceptance_path(paths, run_id);
+    if canonical_or_original(&acceptance_source.path) != canonical_or_original(&expected_frozen) {
+        return Ok(Vec::new());
+    }
+    commands::job::validate_frozen_contract_bundle(paths, run_id, launch_plan)?;
+    let Some(bundle) = commands::job::contract_bundle_from_plan(launch_plan)? else {
+        return Ok(Vec::new());
+    };
+    let Some(git_root) = deadreckon_core::find_git_root(source_cwd)? else {
+        return Ok(Vec::new());
+    };
+    let project_contract_dir = canonical_or_original(&source_cwd.join(".deadreckon"));
+    let frozen_dir = paths.job_dir(run_id);
+    let mut allowed = Vec::with_capacity(bundle.files.len());
+    for file in bundle.files {
+        let relative = Path::new(&file.path);
+        let valid = !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && (relative == Path::new("acceptance.yaml")
+                || relative == Path::new("acceptance.md")
+                || relative.starts_with("acceptance"));
+        if !valid {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "invalid frozen done-contract bundle path: {}",
+                file.path
+            ))));
+        }
+        let project_file = project_contract_dir.join(relative);
+        let frozen_file = frozen_dir.join(relative);
+        let project_metadata = match fs::symlink_metadata(&project_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let frozen_metadata = fs::symlink_metadata(&frozen_file)?;
+        if project_metadata.file_type().is_symlink()
+            || frozen_metadata.file_type().is_symlink()
+            || !project_metadata.file_type().is_file()
+            || !frozen_metadata.file_type().is_file()
+            || project_metadata.len() != file.bytes
+            || frozen_metadata.len() != file.bytes
+            || deadreckon_core::flight::sha256_file(&project_file)? != file.sha256
+            || deadreckon_core::flight::sha256_file(&frozen_file)? != file.sha256
+        {
+            return Ok(Vec::new());
+        }
+        let relative_to_repo = project_file.strip_prefix(&git_root).map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "guided contract bundle is outside its git repository".to_string(),
+            ))
+        })?;
+        allowed.push(relative_to_repo.to_path_buf());
+    }
+    Ok(allowed)
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Direct `deadreckon run`: a trivial operator plan records the decision so
 /// every run root carries `launch-plan.json`, however the launch began.
 pub(crate) async fn run_command(args: RunCommandArgs) -> Result<()> {
@@ -357,6 +431,7 @@ async fn schedule_direct_run(
                 base_ref: args.base.clone(),
                 branch_name: args.branch.clone(),
                 allow_dirty: args.allow_dirty,
+                allowed_dirty_paths: Vec::new(),
             },
         )
         .map_err(|error| run_codebase_refusal_error(error, &args.goal, args.no_hints))?;
@@ -724,6 +799,13 @@ pub(crate) async fn run_command_with_launch_plan(
     )
     .await?;
     let acceptance_preview = commands::acceptance::done_criteria_selection(&acceptance_source)?;
+    let trusted_contract_dirty_paths =
+        match (requested_run_id.as_deref(), acceptance_source.as_ref()) {
+            (Some(run_id), Some(source)) if !allow_dirty => {
+                trusted_controller_contract_dirty_paths(&paths, run_id, &cwd, source, &launch_plan)?
+            }
+            _ => Vec::new(),
+        };
     let sleep_preview = sleep::preview(prevent_sleep_prefs, io::stdin().is_terminal());
     let sandbox = sandbox
         .or(defaults.sandbox.clone())
@@ -777,6 +859,7 @@ pub(crate) async fn run_command_with_launch_plan(
                 base_ref: base,
                 branch_name: branch,
                 allow_dirty,
+                allowed_dirty_paths: trusted_contract_dirty_paths,
             },
         )
         .map_err(|err| run_codebase_refusal_error(err, &goal, effective_no_hints))?,
@@ -1412,9 +1495,242 @@ mod cancel_tests {
 
 #[cfg(test)]
 mod durable_direct_tests {
+    use std::process::Command;
+
     use tempfile::TempDir;
 
     use super::*;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let output = deadreckon_core::git::run_git(repo, args).expect("git command");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn trusted_contract_fixture(
+        temp: &TempDir,
+    ) -> (
+        DeadreckonPaths,
+        PathBuf,
+        String,
+        commands::acceptance::AcceptanceSource,
+        commands::course::LaunchPlan,
+    ) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        fs::write(repo.join("app.py"), "print('unfinished')\n").expect("app");
+        git(&repo, &["add", "app.py"]);
+        git(&repo, &["commit", "-m", "fixture"]);
+
+        let contract =
+            "name: guided\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/app.py'\n";
+        let project_contract = repo.join(".deadreckon/acceptance.yaml");
+        fs::create_dir_all(project_contract.parent().expect("contract parent"))
+            .expect("contract directory");
+        fs::write(&project_contract, contract).expect("project contract");
+        fs::write(repo.join(".deadreckon/acceptance.md"), "# Done\n").expect("notes");
+
+        let run_id = "0123456789abcdef0123456789abcdef".to_string();
+        let frozen = commands::job::job_acceptance_path(&paths, &run_id);
+        fs::create_dir_all(frozen.parent().expect("frozen parent")).expect("job directory");
+        fs::write(&frozen, contract).expect("frozen contract");
+        fs::write(
+            frozen
+                .parent()
+                .expect("frozen parent")
+                .join("acceptance.md"),
+            "# Done\n",
+        )
+        .expect("frozen notes");
+        let source = commands::acceptance::resolve_acceptance_source(&repo, Some(&frozen))
+            .expect("acceptance resolution")
+            .expect("acceptance source");
+        let mut plan = commands::course::trivial_operator_plan(
+            "guided fixture",
+            commands::course::CourseShape::Single,
+            "test",
+        );
+        set_contract_bundle_signal(
+            &mut plan,
+            frozen.parent().expect("frozen parent"),
+            &["acceptance.yaml", "acceptance.md"],
+        );
+        (paths, repo, run_id, source, plan)
+    }
+
+    fn set_contract_bundle_signal(
+        plan: &mut commands::course::LaunchPlan,
+        frozen_dir: &Path,
+        files: &[&str],
+    ) {
+        let mut files = files
+            .iter()
+            .map(|relative| {
+                let path = frozen_dir.join(relative);
+                commands::job::FrozenContractFile {
+                    path: (*relative).to_string(),
+                    sha256: deadreckon_core::flight::sha256_file(&path).expect("bundle digest"),
+                    bytes: fs::metadata(path).expect("bundle metadata").len(),
+                    executable: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        plan.signals[commands::job::DURABLE_CONTRACT_BUNDLE_SIGNAL] =
+            serde_json::to_value(commands::job::FrozenContractBundle {
+                schema_version: 1,
+                files,
+            })
+            .expect("bundle signal");
+    }
+
+    #[test]
+    fn trusted_guided_contract_files_do_not_dirty_the_child_worktree() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, source, plan) = trusted_contract_fixture(&temp);
+        let allowed =
+            trusted_controller_contract_dirty_paths(&paths, &run_id, &repo, &source, &plan)
+                .expect("trusted contract transition");
+        assert_eq!(allowed.len(), 2);
+
+        let record = prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id,
+                task_key: "guided-contract".to_string(),
+                source_path: repo.clone(),
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect("controller-owned contract remains admissible");
+        assert!(!record.dirty_files_seeded);
+        create_worktree(&record).expect("isolated worktree");
+        let worktree = record.worktree_path.expect("worktree path");
+        assert!(worktree.join("app.py").is_file());
+        assert!(!worktree.join(".deadreckon/acceptance.yaml").exists());
+    }
+
+    #[test]
+    fn trusted_guided_contract_rejects_unrelated_dirt_at_worktree_admission() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, source, plan) = trusted_contract_fixture(&temp);
+        let allowed =
+            trusted_controller_contract_dirty_paths(&paths, &run_id, &repo, &source, &plan)
+                .expect("trusted contract transition");
+
+        fs::write(repo.join("unrelated.txt"), "operator change\n").expect("unrelated dirty file");
+        let error = prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id,
+                task_key: "guided-contract".to_string(),
+                source_path: repo,
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect_err("unrelated dirtiness remains rejected");
+        assert!(error.to_string().contains("unrelated.txt"), "{error}");
+    }
+
+    #[test]
+    fn trusted_guided_contract_hydrates_and_executes_frozen_helpers() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, _, mut plan) = trusted_contract_fixture(&temp);
+        let helper = repo.join(".deadreckon/acceptance/check.sh");
+        fs::create_dir_all(helper.parent().expect("helper parent")).expect("helper directory");
+        fs::write(&helper, "#!/bin/sh\nprintf helper-ok\n").expect("helper");
+        let frozen_helper = paths.job_dir(&run_id).join("acceptance/check.sh");
+        fs::create_dir_all(frozen_helper.parent().expect("frozen helper parent"))
+            .expect("frozen helper directory");
+        fs::copy(&helper, &frozen_helper).expect("freeze helper");
+        set_contract_bundle_signal(
+            &mut plan,
+            &paths.job_dir(&run_id),
+            &["acceptance.yaml", "acceptance.md", "acceptance/check.sh"],
+        );
+        let source = commands::acceptance::resolve_acceptance_source(
+            &repo,
+            Some(&commands::job::job_acceptance_path(&paths, &run_id)),
+        )
+        .expect("acceptance resolution")
+        .expect("acceptance source");
+        let allowed =
+            trusted_controller_contract_dirty_paths(&paths, &run_id, &repo, &source, &plan)
+                .expect("trusted helper transition");
+        assert!(
+            allowed
+                .iter()
+                .any(|path| path.ends_with(".deadreckon/acceptance/check.sh"))
+        );
+
+        let record = prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id: run_id.clone(),
+                task_key: "guided-helper".to_string(),
+                source_path: repo.clone(),
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect("helper-backed contract remains admissible");
+        create_worktree(&record).expect("isolated worktree");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "guided fixture".to_string(),
+                cwd: repo,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some(run_id),
+                codebase: Some(record),
+            },
+        )
+        .expect("run state");
+        commands::acceptance::copy_acceptance_into_run(&state, &Some(source))
+            .expect("hydrate frozen bundle");
+        let output = Command::new("sh")
+            .arg(state.working_dir.join(".deadreckon/acceptance/check.sh"))
+            .output()
+            .expect("execute helper");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "helper-ok");
+    }
+
+    #[test]
+    fn trusted_guided_contract_requires_the_frozen_yaml_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, source, plan) = trusted_contract_fixture(&temp);
+        fs::write(
+            repo.join(".deadreckon/acceptance.yaml"),
+            "name: tampered\nchecks: []\n",
+        )
+        .expect("tampered project contract");
+
+        assert!(
+            trusted_controller_contract_dirty_paths(&paths, &run_id, &repo, &source, &plan)
+                .expect("mismatched contract is rejected")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn guided_continuation_preserves_approved_authority_provenance() {

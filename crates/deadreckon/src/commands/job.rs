@@ -22,9 +22,31 @@ use deadreckon_protocol::{
 use sha2::Sha256;
 
 const JOB_ACCEPTANCE_FILE: &str = "acceptance.yaml";
+const JOB_ACCEPTANCE_DOC: &str = "acceptance.md";
+const JOB_ACCEPTANCE_HELPERS: &str = "acceptance";
 const SUPERVISOR_LAUNCH_STDOUT: &str = "supervisor.out";
 const SUPERVISOR_LAUNCH_STDERR: &str = "supervisor.err";
 pub(crate) const DURABLE_SCOPE_ROOT_SIGNAL: &str = "watchkeeper_scope_root";
+pub(crate) const DURABLE_CONTRACT_BUNDLE_SIGNAL: &str = "watchkeeper_contract_bundle";
+const CONTRACT_BUNDLE_MAX_FILES: usize = 64;
+const CONTRACT_BUNDLE_MAX_FILE_BYTES: u64 = 1_048_576;
+const CONTRACT_BUNDLE_MAX_TOTAL_BYTES: u64 = 4_194_304;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FrozenContractFile {
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
+    pub(crate) executable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FrozenContractBundle {
+    pub(crate) schema_version: u32,
+    pub(crate) files: Vec<FrozenContractFile>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,6 +219,13 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     let authority_source_cwd = authority_source_cwd(&request.source, request.source_cwd, &job_dir)?;
     let scope_root = effective_scope_root(request.source_cwd)?;
 
+    let contract_path = job_dir.join(JOB_ACCEPTANCE_FILE);
+    let contract_bundle = freeze_contract_bundle(
+        request.contract_source,
+        &authority_source_cwd,
+        &contract_path,
+    )?;
+
     let mut signals = request
         .launch_plan
         .signals
@@ -211,6 +240,10 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         DURABLE_SCOPE_ROOT_SIGNAL.to_string(),
         serde_json::to_value(&scope_root)?,
     );
+    signals.insert(
+        DURABLE_CONTRACT_BUNDLE_SIGNAL.to_string(),
+        serde_json::to_value(&contract_bundle)?,
+    );
     request.launch_plan.signals = serde_json::Value::Object(signals);
 
     let launch_path = request.paths.job_launch_plan(job_id.as_ref());
@@ -218,12 +251,6 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     sync_file(&launch_path)?;
     let launch_plan_sha256 = deadreckon_core::flight::sha256_file(&launch_path)?;
 
-    let contract_path = job_dir.join(JOB_ACCEPTANCE_FILE);
-    freeze_contract(
-        request.contract_source,
-        &authority_source_cwd,
-        &contract_path,
-    )?;
     deadreckon_core::validate_strict_contract(&contract_path, job_id.as_ref()).map_err(|error| {
         CliError::Core(deadreckon_core::user_error(
             &format!("durable Job cannot start: {error}"),
@@ -1186,11 +1213,42 @@ fn effective_scope_root(requested_cwd: &Path) -> Result<PathBuf> {
     root.canonicalize().map_err(CliError::from)
 }
 
-fn freeze_contract(source: Option<&Path>, source_cwd: &Path, target: &Path) -> Result<()> {
+fn freeze_contract_bundle(
+    source: Option<&Path>,
+    source_cwd: &Path,
+    target: &Path,
+) -> Result<FrozenContractBundle> {
     if let Some(source) = source {
-        fs::copy(source, target)?;
-        sync_file(target)?;
-        return Ok(());
+        freeze_contract_file(source, target)?;
+        let source_dir = source.parent().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "done contract has no parent directory: {}",
+                source.display()
+            )))
+        })?;
+        let target_dir = target.parent().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "frozen done contract has no parent directory: {}",
+                target.display()
+            )))
+        })?;
+        let source_doc = source_dir.join(JOB_ACCEPTANCE_DOC);
+        if path_entry_exists(&source_doc)? {
+            freeze_contract_file(&source_doc, &target_dir.join(JOB_ACCEPTANCE_DOC))?;
+        }
+        let source_helpers = source_dir.join(JOB_ACCEPTANCE_HELPERS);
+        if path_entry_exists(&source_helpers)? {
+            freeze_contract_helper_tree(&source_helpers, &target_dir.join(JOB_ACCEPTANCE_HELPERS))?;
+        }
+        let source_bundle = source_contract_bundle_inventory(source)?;
+        let frozen_bundle = contract_bundle_inventory(target_dir)?;
+        if source_bundle != frozen_bundle {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                "done-contract bundle changed while it was being frozen",
+                "rerun deadreckon start after contract writes stop",
+            )));
+        }
+        return Ok(frozen_bundle);
     }
     let kind = deadreckon_core::acceptance_defaults::detect_project_kind(source_cwd);
     let checks = deadreckon_core::acceptance_defaults::default_checks_for(&kind, source_cwd)
@@ -1216,6 +1274,295 @@ fn freeze_contract(source: Option<&Path>, source_cwd: &Path, target: &Path) -> R
     })?;
     fs::write(target, body)?;
     sync_file(target)?;
+    contract_bundle_inventory(target.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen done contract has no parent directory: {}",
+            target.display()
+        )))
+    })?)
+}
+
+fn freeze_contract_file(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member is not a regular file: {}",
+                source.display()
+            ),
+            "replace symlinks and special files under .deadreckon with regular files",
+        )));
+    }
+    if metadata.len() > CONTRACT_BUNDLE_MAX_FILE_BYTES {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member exceeds {} bytes: {}",
+                CONTRACT_BUNDLE_MAX_FILE_BYTES,
+                source.display()
+            ),
+            "reduce generated acceptance helpers before starting the Job",
+        )));
+    }
+    let source_before = deadreckon_core::flight::sha256_file(source)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source, target)?;
+    sync_file(target)?;
+    let source_after = deadreckon_core::flight::sha256_file(source)?;
+    let target_digest = deadreckon_core::flight::sha256_file(target)?;
+    if source_before != source_after || source_before != target_digest {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle changed while it was being frozen: {}",
+                source.display()
+            ),
+            "rerun deadreckon start after contract writes stop",
+        )));
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn freeze_contract_helper_tree(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract helper root is not a regular directory: {}",
+                source.display()
+            ),
+            "replace symlinks and special files under .deadreckon/acceptance",
+        )));
+    }
+    fs::create_dir_all(target)?;
+    let mut entries = fs::read_dir(source)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "done-contract helper is a symlink: {}",
+                    source_path.display()
+                ),
+                "replace acceptance helper symlinks with regular files",
+            )));
+        }
+        if metadata.file_type().is_dir() {
+            freeze_contract_helper_tree(&source_path, &target_path)?;
+        } else if metadata.file_type().is_file() {
+            freeze_contract_file(&source_path, &target_path)?;
+        } else {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "done-contract helper is not a regular file: {}",
+                    source_path.display()
+                ),
+                "remove special files from .deadreckon/acceptance",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn contract_bundle_inventory(root: &Path) -> Result<FrozenContractBundle> {
+    let mut files = Vec::new();
+    inventory_contract_file(root, Path::new(JOB_ACCEPTANCE_FILE), &mut files)?;
+    let doc = root.join(JOB_ACCEPTANCE_DOC);
+    if path_entry_exists(&doc)? {
+        inventory_contract_file(root, Path::new(JOB_ACCEPTANCE_DOC), &mut files)?;
+    }
+    let helpers = root.join(JOB_ACCEPTANCE_HELPERS);
+    if path_entry_exists(&helpers)? {
+        inventory_contract_helper_tree(root, &helpers, &mut files)?;
+    }
+    finalize_contract_bundle(files)
+}
+
+fn source_contract_bundle_inventory(source: &Path) -> Result<FrozenContractBundle> {
+    let root = source.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "done contract has no parent directory: {}",
+            source.display()
+        )))
+    })?;
+    let mut files = Vec::new();
+    inventory_contract_absolute(source, Path::new(JOB_ACCEPTANCE_FILE), &mut files)?;
+    let doc = root.join(JOB_ACCEPTANCE_DOC);
+    if path_entry_exists(&doc)? {
+        inventory_contract_absolute(&doc, Path::new(JOB_ACCEPTANCE_DOC), &mut files)?;
+    }
+    let helpers = root.join(JOB_ACCEPTANCE_HELPERS);
+    if path_entry_exists(&helpers)? {
+        inventory_contract_helper_tree(root, &helpers, &mut files)?;
+    }
+    finalize_contract_bundle(files)
+}
+
+fn finalize_contract_bundle(mut files: Vec<FrozenContractFile>) -> Result<FrozenContractBundle> {
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    if files.len() > CONTRACT_BUNDLE_MAX_FILES {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle contains {} files; the limit is {}",
+                files.len(),
+                CONTRACT_BUNDLE_MAX_FILES
+            ),
+            "combine or remove generated acceptance helpers before starting the Job",
+        )));
+    }
+    let total = files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.bytes).ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "done-contract bundle byte count overflowed".to_string(),
+            ))
+        })
+    })?;
+    if total > CONTRACT_BUNDLE_MAX_TOTAL_BYTES {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle contains {total} bytes; the limit is {CONTRACT_BUNDLE_MAX_TOTAL_BYTES}"
+            ),
+            "reduce generated acceptance helpers before starting the Job",
+        )));
+    }
+    Ok(FrozenContractBundle {
+        schema_version: 1,
+        files,
+    })
+}
+
+fn inventory_contract_helper_tree(
+    root: &Path,
+    directory: &Path,
+    files: &mut Vec<FrozenContractFile>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen done-contract helper directory is invalid: {}",
+            directory.display()
+        ))));
+    }
+    let mut entries = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "frozen done-contract helper is a symlink: {}",
+                path.display()
+            ))));
+        }
+        if metadata.file_type().is_dir() {
+            inventory_contract_helper_tree(root, &path, files)?;
+        } else if metadata.file_type().is_file() {
+            let relative = path.strip_prefix(root).map_err(|_| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "frozen done-contract helper escaped its bundle".to_string(),
+                ))
+            })?;
+            inventory_contract_file(root, relative, files)?;
+        } else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "frozen done-contract helper is not a regular file: {}",
+                path.display()
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn inventory_contract_file(
+    root: &Path,
+    relative: &Path,
+    files: &mut Vec<FrozenContractFile>,
+) -> Result<()> {
+    let path = root.join(relative);
+    inventory_contract_absolute(&path, relative, files)
+}
+
+fn inventory_contract_absolute(
+    path: &Path,
+    logical_relative: &Path,
+    files: &mut Vec<FrozenContractFile>,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen done-contract member is not a regular file: {}",
+            path.display()
+        ))));
+    }
+    if metadata.len() > CONTRACT_BUNDLE_MAX_FILE_BYTES {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "frozen done-contract member exceeds its byte limit: {}",
+            path.display()
+        ))));
+    }
+    files.push(FrozenContractFile {
+        path: logical_relative.to_string_lossy().replace('\\', "/"),
+        sha256: deadreckon_core::flight::sha256_file(path)?,
+        bytes: metadata.len(),
+        executable: contract_file_executable(&metadata),
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn contract_file_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn contract_file_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+pub(crate) fn contract_bundle_from_plan(
+    plan: &commands::course::LaunchPlan,
+) -> Result<Option<FrozenContractBundle>> {
+    plan.signals
+        .get(DURABLE_CONTRACT_BUNDLE_SIGNAL)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(CliError::from)
+}
+
+pub(crate) fn validate_frozen_contract_bundle(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    plan: &commands::course::LaunchPlan,
+) -> Result<()> {
+    let Some(expected) = contract_bundle_from_plan(plan)? else {
+        return Ok(());
+    };
+    if expected.schema_version != 1 {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "unsupported frozen done-contract bundle schema {} for job {job_id}",
+            expected.schema_version
+        ))));
+    }
+    let actual = contract_bundle_inventory(&paths.job_dir(job_id))?;
+    if actual != expected {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "done-contract bundle changed after job {job_id} was approved"
+        ))));
+    }
     Ok(())
 }
 
@@ -1911,6 +2258,101 @@ mod tests {
             ]
         );
         assert!(history.events().iter().all(|event| event.lease_epoch == 0));
+    }
+
+    #[test]
+    fn durable_job_freezes_and_binds_the_complete_contract_bundle() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        let contract_dir = source.join(".deadreckon");
+        let helper_dir = contract_dir.join("acceptance");
+        fs::create_dir_all(&helper_dir).expect("helper directory");
+        fs::write(source.join("README.md"), "durable\n").expect("source file");
+        let contract = contract_dir.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            concat!(
+                "name: helper-backed fixture\n",
+                "checks:\n",
+                "  - kind: shell\n",
+                "    command: sh .deadreckon/acceptance/check.sh\n",
+                "    cwd: \"{working_dir}\"\n",
+            ),
+        )
+        .expect("contract");
+        fs::write(contract_dir.join("acceptance.md"), "# Done\n").expect("notes");
+        fs::write(helper_dir.join("check.sh"), "#!/bin/sh\nexit 0\n").expect("helper");
+
+        let job = create_job(request(&paths, &source, Some(&contract))).expect("create job");
+        let plan = commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+            .expect("launch plan");
+        let bundle = contract_bundle_from_plan(&plan)
+            .expect("bundle signal")
+            .expect("bound bundle");
+        assert_eq!(
+            bundle
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acceptance.md", "acceptance.yaml", "acceptance/check.sh"]
+        );
+        validate_frozen_contract_bundle(&paths, job.job_id.as_ref(), &plan)
+            .expect("frozen bundle validates");
+        assert_eq!(
+            fs::read_to_string(
+                paths
+                    .job_dir(job.job_id.as_ref())
+                    .join("acceptance/check.sh")
+            )
+            .expect("frozen helper"),
+            "#!/bin/sh\nexit 0\n"
+        );
+
+        fs::write(
+            paths
+                .job_dir(job.job_id.as_ref())
+                .join("acceptance/check.sh"),
+            "#!/bin/sh\nexit 1\n",
+        )
+        .expect("tamper frozen helper");
+        let error = super::super::supervisor::validate_launch_inputs_for_test(&paths, &job)
+            .expect_err("tampered helper must fail before launch");
+        assert!(error.to_string().contains("bundle changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_job_rejects_contract_helper_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        let contract_dir = source.join(".deadreckon");
+        let helper_dir = contract_dir.join("acceptance");
+        fs::create_dir_all(&helper_dir).expect("helper directory");
+        fs::write(source.join("README.md"), "durable\n").expect("source file");
+        let contract = contract_dir.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("contract");
+        fs::write(source.join("outside.sh"), "exit 0\n").expect("outside helper");
+        symlink(source.join("outside.sh"), helper_dir.join("check.sh")).expect("helper symlink");
+
+        let error = create_job(request(&paths, &source, Some(&contract)))
+            .expect_err("helper symlink must fail closed");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .next()
+                    .is_none()
+        );
     }
 
     #[test]

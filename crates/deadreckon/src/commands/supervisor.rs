@@ -1318,6 +1318,7 @@ fn load_launch_inputs(paths: &DeadreckonPaths, job: &Job) -> Result<LaunchInputs
         ))));
     }
     let plan = super::course::load_launch_plan(&plan_path)?;
+    super::job::validate_frozen_contract_bundle(paths, job.job_id.as_ref(), &plan)?;
     let expected_shape = match job.shape {
         JobShape::Single => CourseShape::Single,
         JobShape::Graph => CourseShape::Plan,
@@ -4011,15 +4012,20 @@ fn classify_persisted_attempt(
             append_attempt_stopped(
                 paths,
                 token,
-                StopReason::FatalProvider,
+                StopReason::LegacyUnknown,
                 json!({ "exit": exit_detail, "state_error": error.to_string() }),
             )?;
             append_terminal_event(
                 paths,
                 token,
                 JobEventKind::Failed,
-                StopReason::FatalProvider,
-                json!({ "reason": "child exited without persisted run state" }),
+                StopReason::LegacyUnknown,
+                json!({
+                    "reason": "child exited before run state was persisted",
+                    "supervisor_stderr": paths
+                        .job_dir(job.job_id.as_ref())
+                        .join(SUPERVISOR_STDERR_FILE)
+                }),
             )?;
             return Ok(());
         }
@@ -10060,6 +10066,41 @@ mod tests {
                 .iter()
                 .all(|event| event.kind != JobEventKind::RetryScheduled)
         );
+    }
+
+    #[test]
+    fn missing_run_state_is_not_misreported_as_a_provider_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let exit = ChildExit {
+            status: None,
+            adopted: false,
+        };
+
+        assert!(
+            !maybe_schedule_leaf_retry(&paths, &job, &token, &exit, 1, 3)
+                .expect("missing state cannot be resumed safely")
+        );
+        classify_persisted_attempt(&paths, &job, &token, exit, false)
+            .expect("terminal unknown attempt");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert!(view.projection.is_terminal());
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Failed)
+        );
+        assert_eq!(view.projection.stop_reason, Some(StopReason::LegacyUnknown));
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        let terminal = history.events().last().expect("terminal event");
+        assert_eq!(terminal.kind, JobEventKind::Failed);
+        assert_eq!(
+            terminal.detail.get("reason").and_then(Value::as_str),
+            Some("child exited before run state was persisted")
+        );
+        assert!(terminal.detail.get("supervisor_stderr").is_some());
     }
 
     #[test]

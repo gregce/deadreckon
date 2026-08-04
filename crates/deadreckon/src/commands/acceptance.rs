@@ -1946,10 +1946,14 @@ pub(crate) fn resolve_acceptance_source(
                 "deadreckon def-done \"what should count as done\"",
             )));
         }
+        let companion_doc = path
+            .parent()
+            .map(|parent| parent.join(PROJECT_ACCEPTANCE_MD))
+            .filter(|candidate| candidate.is_file());
         return Ok(Some(AcceptanceSource {
             path,
             source: setup::DoneCriteriaSource::ExplicitPath,
-            companion_doc: None,
+            companion_doc,
         }));
     }
     let project_yaml = project_acceptance_yaml(cwd);

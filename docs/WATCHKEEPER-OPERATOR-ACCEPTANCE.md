@@ -107,11 +107,11 @@ git commit -m fixture
 ```
 
 Then remove the disposable contract files and run interactive `start` with a
-small goal. Choose Codex and `gpt-5.6-sol`, and enter the same one-line done
-criterion. If authoring is deliberately interrupted or the provider is made
-unavailable, verify that the recovery prompt offers retry, revise and stop
-without asking for the source, launch shape, provider or model again. Stop at
-the final launch confirmation if this is only an admission drill.
+small goal. Choose Codex and `gpt-5.6-sol`, enter the same one-line done
+criterion, approve the generated contract and launch the Job. If authoring is
+deliberately interrupted or the provider is made unavailable, verify that the
+recovery prompt offers retry, revise and stop without asking for the source,
+launch shape, provider or model again.
 
 Accept when:
 
@@ -120,6 +120,15 @@ Accept when:
   mismatch, or a dynamic `additionalProperties` map;
 - [ ] the generated contract contains a behavioral shell check and `check`
   passes;
+- [ ] a clean worktree remains admissible after `start` writes the approved
+  `.deadreckon/acceptance.yaml` and `.md`; the supervised child starts, reaches
+  a persisted run state, and does not call those controller files user dirt;
+- [ ] a generated helper under `.deadreckon/acceptance/` is copied into the
+  Job's bounded contract bundle, appears in the launch-plan manifest, reaches
+  the isolated worktree, and executes there;
+- [ ] changing the generated YAML or adding an unfrozen helper/unrelated file
+  still fails closed, and a pre-state child failure points to `supervisor.err`
+  without claiming the provider caused it;
 - [ ] an authoring failure never suggests setting the provider to the same
   route that just failed;
 - [ ] the guided recovery keeps the already selected source, mode, provider

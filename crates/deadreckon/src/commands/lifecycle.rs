@@ -4645,6 +4645,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
             base_ref,
             branch_name: None,
             allow_dirty: false,
+            allowed_dirty_paths: Vec::new(),
         },
     )?;
     codebase.parent_branch = parent_branch.or_else(|| codebase.base_ref.clone());

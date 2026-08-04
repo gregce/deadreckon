@@ -2807,6 +2807,7 @@ fn resolve_start_source_mode(
                     base_ref: None,
                     branch_name: None,
                     allow_dirty: request.allow_dirty,
+                    allowed_dirty_paths: Vec::new(),
                 },
             );
             match first {
@@ -2851,6 +2852,7 @@ fn resolve_start_source_mode(
                                         base_ref: None,
                                         branch_name: None,
                                         allow_dirty: true,
+                                        allowed_dirty_paths: Vec::new(),
                                     },
                                 )?;
                                 decision.source_mode = StartSourceMode::Worktree;
