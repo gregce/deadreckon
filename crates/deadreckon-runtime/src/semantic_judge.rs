@@ -305,6 +305,7 @@ pub async fn run_semantic_judge(
         None,
         SemanticJudgeBudget::default(),
         None,
+        None,
     )
     .await
 }
@@ -324,6 +325,7 @@ pub async fn run_semantic_judge_with_budget(
         sandbox_backend,
         None,
         budget,
+        None,
         cancellation_token,
     )
     .await
@@ -345,6 +347,7 @@ pub async fn run_semantic_judge_against_source(
         sandbox_backend,
         Some(approved_source),
         SemanticJudgeBudget::default(),
+        None,
         None,
     )
     .await
@@ -386,6 +389,35 @@ pub async fn run_semantic_judge_against_source_with_budget_and_cancellation(
         sandbox_backend,
         Some(approved_source),
         budget,
+        None,
+        cancellation_token,
+    )
+    .await
+}
+
+/// Run a composed-result semantic judge under the exact outer Job deadline.
+///
+/// `budget` still supplies spend accounting; `phase_deadline` is authoritative
+/// for work and is never rebuilt from a relative remaining-wall value.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_semantic_judge_against_source_with_deadline_and_cancellation(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    router: &ProviderRouter,
+    sandbox_backend: SandboxBackend,
+    approved_source: &Path,
+    budget: SemanticJudgeBudget,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<SemanticJudgeRun> {
+    run_semantic_judge_with_baseline(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        Some(approved_source),
+        budget,
+        Some(phase_deadline),
         cancellation_token,
     )
     .await
@@ -398,11 +430,15 @@ async fn run_semantic_judge_with_baseline(
     sandbox_backend: SandboxBackend,
     approved_source: Option<&Path>,
     budget: SemanticJudgeBudget,
+    exact_phase_deadline: Option<ProviderPhaseDeadline>,
     external_cancellation: Option<&CancellationToken>,
 ) -> Result<SemanticJudgeRun> {
     let started = Instant::now();
     let selected = router.selected_route_info();
-    let phase_deadline = match semantic_phase_deadline(started, budget.remaining_wall_seconds) {
+    let phase_deadline = match exact_phase_deadline
+        .map(Ok)
+        .unwrap_or_else(|| semantic_phase_deadline(started, budget.remaining_wall_seconds))
+    {
         Ok(deadline) => deadline,
         Err(reason) => {
             return Ok(unavailable_run(
