@@ -517,6 +517,11 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
         ),
         (r"\d{4}-\d{2}-\d{2}T[0-9:.]+Z", "<TIMESTAMP>"),
         (r"wall [0-9]+(?:\.[0-9]+)?s", "wall <DURATION>"),
+        // The renderer pads the card before normalization. Raw durations of
+        // different widths therefore leave different amounts of trailing
+        // whitespace after they become the same placeholder. Pin the public
+        // content while canonicalizing that derived, non-semantic padding.
+        (r"(?m)^(\|[^\n]*wall <DURATION>[^\n|]*?) +\|$", "$1 |"),
         (
             r"attach-characterize-[0-9a-f]{4}",
             "attach-characterize-<SLUG>",
@@ -528,6 +533,19 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
             .into_owned();
     }
     collapse_adjacent_build_artifact_lines(&normalized)
+}
+
+#[test]
+fn duration_normalization_absorbs_frame_padding_derived_from_raw_width() {
+    let temp = fixed_length_tempdir();
+    let short = "|   spend wall 1s       |\n";
+    let long = "|   spend wall 123.45s  |\n";
+
+    assert_eq!(normalize_text(&temp, short), normalize_text(&temp, long));
+    assert_eq!(
+        normalize_text(&temp, short),
+        "|   spend wall <DURATION> |\n"
+    );
 }
 
 /// The number of rustc incremental artifacts varies with the toolchain's
