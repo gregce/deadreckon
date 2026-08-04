@@ -599,7 +599,11 @@ async fn supervise_job_task(
 ) -> Result<()> {
     match supervise_one_job(paths, instance, job_id).await {
         Ok(()) => Ok(()),
-        Err(failure) if live_lease_refusal(&failure.error) => Ok(()),
+        // Preserve a fenced lease refusal through the per-Job task boundary.
+        // Background scanners intentionally discard this expected race in
+        // `joined_supervision_result`, while an explicit `serve --once JOB`
+        // must report that it did not acquire authority.
+        Err(failure) if live_lease_refusal(&failure.error) => Err(failure.error),
         Err(failure) => {
             match classify_supervision_task_failure(paths, instance, job_id, &failure) {
                 Ok(()) => Ok(()),
