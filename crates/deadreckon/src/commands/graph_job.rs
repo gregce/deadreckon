@@ -455,6 +455,125 @@ struct ParentCompletionCancellation {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+const PARENT_COMPLETION_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn parent_completion_phase_deadline(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+) -> Result<ProviderPhaseDeadline> {
+    let now = Utc::now();
+    let work_remaining = commands::supervisor::remaining_job_work_duration(paths, job, now)?;
+    let supervisor_cutoff =
+        match std::env::var(commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV) {
+            Ok(value) => Some(value.parse::<chrono::DateTime<Utc>>().map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "trusted supervisor work cutoff is invalid: {error}"
+                )))
+            })?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "trusted supervisor work cutoff could not be read: {error}"
+                ))));
+            }
+        };
+    let remaining =
+        parent_completion_remaining_at(work_remaining, job.policy.deadline, supervisor_cutoff, now);
+    Ok(ProviderPhaseDeadline::new(
+        tokio::time::Instant::now() + remaining,
+        PARENT_COMPLETION_CLEANUP_BUDGET,
+    ))
+}
+
+fn parent_completion_remaining_at(
+    work_remaining: std::time::Duration,
+    job_deadline: Option<chrono::DateTime<Utc>>,
+    supervisor_cutoff: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> std::time::Duration {
+    let calendar_cutoff = match (job_deadline, supervisor_cutoff) {
+        (Some(job), Some(supervisor)) => Some(job.min(supervisor)),
+        (Some(job), None) => Some(job),
+        (None, Some(supervisor)) => Some(supervisor),
+        (None, None) => None,
+    };
+    let calendar_remaining = calendar_cutoff.map(|cutoff| {
+        cutoff
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+    });
+    calendar_remaining.map_or(work_remaining, |calendar| calendar.min(work_remaining))
+}
+
+enum ParentGateSettlement {
+    Completed(deadreckon_core::Result<()>),
+    Terminal(ParentCompletion),
+}
+
+fn settle_parent_gate_phase(
+    parent: &mut deadreckon_core::PipelineState,
+    context: &str,
+    outcome: deadreckon_runtime::DeterministicGatePhaseOutcome,
+) -> Result<ParentGateSettlement> {
+    match outcome {
+        deadreckon_runtime::DeterministicGatePhaseOutcome::Completed { result, cleanup } => {
+            match cleanup {
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+                    Ok(ParentGateSettlement::Completed(result))
+                }
+                ProviderCleanup::RetainedAuthority { path, detail } => {
+                    let terminal = parent_failed(
+                        parent,
+                        &format!(
+                            "LOST_CONTAINMENT: {context} retained process authority at {}: {detail}",
+                            path.display()
+                        ),
+                        StopReason::LostContainment,
+                    )?;
+                    Ok(ParentGateSettlement::Terminal(terminal))
+                }
+            }
+        }
+        deadreckon_runtime::DeterministicGatePhaseOutcome::WorkExpired { cleanup } => {
+            let terminal = match cleanup {
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+                    parent_budget_exhausted(
+                        parent,
+                        StopReason::WallCap,
+                        &format!("approved Job work cutoff reached during {context}"),
+                    )?
+                }
+                ProviderCleanup::RetainedAuthority { path, detail } => parent_failed(
+                    parent,
+                    &format!(
+                        "LOST_CONTAINMENT: {context} exceeded the Job work cutoff and retained process authority at {}: {detail}",
+                        path.display()
+                    ),
+                    StopReason::LostContainment,
+                )?,
+            };
+            Ok(ParentGateSettlement::Terminal(terminal))
+        }
+        deadreckon_runtime::DeterministicGatePhaseOutcome::Cancelled { cleanup } => {
+            let terminal = match cleanup {
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+                    parent_cancelled(parent, &format!("operator cancelled during {context}"))?
+                }
+                ProviderCleanup::RetainedAuthority { path, detail } => parent_failed(
+                    parent,
+                    &format!(
+                        "LOST_CONTAINMENT: {context} was cancelled and retained process authority at {}: {detail}",
+                        path.display()
+                    ),
+                    StopReason::LostContainment,
+                )?,
+            };
+            Ok(ParentGateSettlement::Terminal(terminal))
+        }
+    }
+}
+
 impl ParentCompletionCancellation {
     fn start(parent: &deadreckon_core::PipelineState) -> Result<Self> {
         let marker_path = deadreckon_core::cancel_marker_path(parent);
@@ -6582,6 +6701,7 @@ pub(crate) async fn complete_merged_plan_parent(
     }
     let mut parent = prepare_parent_result_run(paths, job, authority, &merged)?;
     let cancellation = ParentCompletionCancellation::start(&parent)?;
+    let phase_deadline = parent_completion_phase_deadline(paths, job)?;
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -6610,14 +6730,23 @@ pub(crate) async fn complete_merged_plan_parent(
         }
     } else {
         let launch_owner = parent_gate_launch_owner(paths, job)?;
-        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(
+        let gate = deadreckon_runtime::run_deterministic_gate_work_phase(
             &parent,
             backend,
             Some(&launch_owner),
-            Some(cancellation.token()),
+            cancellation.token(),
+            phase_deadline,
         )
-        .await
-        {
+        .await?;
+        let gate = match settle_parent_gate_phase(
+            &mut parent,
+            "graph deterministic verification",
+            gate,
+        )? {
+            ParentGateSettlement::Completed(result) => result,
+            ParentGateSettlement::Terminal(completion) => return Ok(completion),
+        };
+        if let Err(error) = gate {
             if cancellation.requested() {
                 return parent_cancelled(
                     &mut parent,
@@ -6684,6 +6813,7 @@ pub(crate) async fn complete_merged_plan_parent(
             &marker,
             &judgment,
             &cancellation,
+            phase_deadline,
         );
     }
     if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
@@ -6702,13 +6832,14 @@ pub(crate) async fn complete_merged_plan_parent(
         }
     };
     let semantic =
-        match deadreckon_runtime::run_semantic_judge_against_source_with_budget_and_cancellation(
+        match deadreckon_runtime::run_semantic_judge_against_source_with_deadline_and_cancellation(
             &parent,
             &marker,
             &router,
             backend,
             &job.source_cwd,
             remaining_semantic_budget(job, current_usage),
+            phase_deadline,
             Some(cancellation.token()),
         )
         .await
@@ -6767,6 +6898,7 @@ pub(crate) async fn complete_merged_plan_parent(
             &marker,
             &judgment,
             &cancellation,
+            phase_deadline,
         ),
         deadreckon_runtime::SemanticJudgeResult::Revise(judgment) => request_parent_repair(
             paths,
@@ -6894,6 +7026,7 @@ pub(crate) async fn complete_merged_campaign_parent(
 
     let mut parent = prepare_parent_result_run(paths, job, authority, &merged)?;
     let cancellation = ParentCompletionCancellation::start(&parent)?;
+    let phase_deadline = parent_completion_phase_deadline(paths, job)?;
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -6939,14 +7072,23 @@ pub(crate) async fn complete_merged_campaign_parent(
         }
     } else {
         let launch_owner = parent_gate_launch_owner(paths, job)?;
-        if let Err(error) = deadreckon_runtime::run_deterministic_completion_gate(
+        let gate = deadreckon_runtime::run_deterministic_gate_work_phase(
             &parent,
             backend,
             Some(&launch_owner),
-            Some(cancellation.token()),
+            cancellation.token(),
+            phase_deadline,
         )
-        .await
-        {
+        .await?;
+        let gate = match settle_parent_gate_phase(
+            &mut parent,
+            "campaign deterministic verification",
+            gate,
+        )? {
+            ParentGateSettlement::Completed(result) => result,
+            ParentGateSettlement::Terminal(completion) => return Ok(completion),
+        };
+        if let Err(error) = gate {
             if cancellation.requested() {
                 return parent_cancelled(
                     &mut parent,
@@ -7013,6 +7155,7 @@ pub(crate) async fn complete_merged_campaign_parent(
             &marker,
             &judgment,
             &cancellation,
+            phase_deadline,
         );
     }
     if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
@@ -7031,13 +7174,14 @@ pub(crate) async fn complete_merged_campaign_parent(
         }
     };
     let semantic =
-        match deadreckon_runtime::run_semantic_judge_against_source_with_budget_and_cancellation(
+        match deadreckon_runtime::run_semantic_judge_against_source_with_deadline_and_cancellation(
             &parent,
             &marker,
             &router,
             backend,
             &job.source_cwd,
             remaining_semantic_budget(job, current_usage),
+            phase_deadline,
             Some(cancellation.token()),
         )
         .await
@@ -7096,6 +7240,7 @@ pub(crate) async fn complete_merged_campaign_parent(
             &marker,
             &judgment,
             &cancellation,
+            phase_deadline,
         ),
         deadreckon_runtime::SemanticJudgeResult::Revise(judgment) => request_parent_repair(
             paths,
@@ -8650,6 +8795,7 @@ fn seal_achieved_parent(
     marker: &deadreckon_core::AcceptanceMarker,
     judgment: &deadreckon_protocol::SemanticJudgment,
     cancellation: &ParentCompletionCancellation,
+    phase_deadline: ProviderPhaseDeadline,
 ) -> Result<ParentCompletion> {
     if cancellation.requested() {
         return parent_cancelled(
@@ -8672,6 +8818,13 @@ fn seal_achieved_parent(
             StopReason::SemanticUnavailable,
         );
     }
+    if tokio::time::Instant::now() >= phase_deadline.work_expires_at {
+        return parent_budget_exhausted(
+            parent,
+            StopReason::WallCap,
+            "approved Job work cutoff reached before the verified parent receipt was sealed",
+        );
+    }
     let receipt = match deadreckon_core::seal_completion_receipt(
         paths, parent, authority, marker, judgment,
     ) {
@@ -8692,6 +8845,14 @@ fn seal_achieved_parent(
         return parent_cancelled(
             parent,
             "operator cancelled while the verified parent receipt was being sealed",
+        );
+    }
+    if tokio::time::Instant::now() >= phase_deadline.work_expires_at {
+        remove_if_exists(&paths.job_receipt(job.job_id.as_ref()))?;
+        return parent_budget_exhausted(
+            parent,
+            StopReason::WallCap,
+            "approved Job work cutoff reached while the verified parent receipt was being sealed",
         );
     }
     let receipt = validate_and_promote_parent(paths, parent, &receipt)?;
@@ -10867,6 +11028,46 @@ mod tests {
         assert_eq!(
             semantic_decision_stop_reason(Some(SemanticDecision::Achieved)),
             None
+        );
+    }
+
+    #[test]
+    fn parent_completion_uses_the_earliest_authoritative_cutoff() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+            .expect("fixed time")
+            .with_timezone(&Utc);
+        let work_remaining = std::time::Duration::from_secs(10 * 60);
+
+        assert_eq!(
+            parent_completion_remaining_at(
+                work_remaining,
+                Some(now + chrono::Duration::minutes(20)),
+                Some(now + chrono::Duration::minutes(5)),
+                now,
+            ),
+            std::time::Duration::from_secs(5 * 60)
+        );
+        assert_eq!(
+            parent_completion_remaining_at(
+                work_remaining,
+                Some(now + chrono::Duration::minutes(2)),
+                Some(now + chrono::Duration::minutes(5)),
+                now,
+            ),
+            std::time::Duration::from_secs(2 * 60)
+        );
+        assert_eq!(
+            parent_completion_remaining_at(work_remaining, None, None, now),
+            work_remaining
+        );
+        assert_eq!(
+            parent_completion_remaining_at(
+                work_remaining,
+                None,
+                Some(now - chrono::Duration::seconds(1)),
+                now,
+            ),
+            std::time::Duration::ZERO
         );
     }
 

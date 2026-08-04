@@ -4908,7 +4908,8 @@ enum DeterministicGateDisposition {
     LostContainment,
 }
 
-enum DeterministicGatePhaseOutcome {
+#[derive(Debug)]
+pub enum DeterministicGatePhaseOutcome {
     Completed {
         result: Result<()>,
         cleanup: ProviderCleanup,
@@ -4921,19 +4922,19 @@ enum DeterministicGatePhaseOutcome {
     },
 }
 
-async fn run_deterministic_gate_work_phase(
+pub async fn run_deterministic_gate_work_phase(
     state: &PipelineState,
     sandbox_backend: SandboxBackend,
     launch_owner: Option<&GateLaunchOwner>,
     external_cancellation: &CancellationToken,
-    work_expires_at: tokio::time::Instant,
+    deadline: ProviderPhaseDeadline,
 ) -> Result<DeterministicGatePhaseOutcome> {
     if external_cancellation.is_cancelled() {
         return Ok(DeterministicGatePhaseOutcome::Cancelled {
             cleanup: ProviderCleanup::NotApplicable,
         });
     }
-    if tokio::time::Instant::now() >= work_expires_at {
+    if tokio::time::Instant::now() >= deadline.work_expires_at {
         return Ok(DeterministicGatePhaseOutcome::WorkExpired {
             cleanup: ProviderCleanup::NotApplicable,
         });
@@ -4967,7 +4968,7 @@ async fn run_deterministic_gate_work_phase(
         biased;
         () = external_cancellation.cancelled() => Boundary::Cancelled,
         result = &mut gate => Boundary::Completed(result),
-        () = tokio::time::sleep_until(work_expires_at) => Boundary::WorkExpired,
+        () = tokio::time::sleep_until(deadline.work_expires_at) => Boundary::WorkExpired,
     };
     match boundary {
         Boundary::Completed(result) => Ok(DeterministicGatePhaseOutcome::Completed {
@@ -4976,7 +4977,7 @@ async fn run_deterministic_gate_work_phase(
         }),
         Boundary::WorkExpired => {
             phase_token.cancel();
-            let resolved = tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut gate)
+            let resolved = tokio::time::timeout(deadline.cleanup_budget, &mut gate)
                 .await
                 .is_ok();
             Ok(DeterministicGatePhaseOutcome::WorkExpired {
@@ -4985,7 +4986,7 @@ async fn run_deterministic_gate_work_phase(
         }
         Boundary::Cancelled => {
             phase_token.cancel();
-            let resolved = tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut gate)
+            let resolved = tokio::time::timeout(deadline.cleanup_budget, &mut gate)
                 .await
                 .is_ok();
             Ok(DeterministicGatePhaseOutcome::Cancelled {
@@ -5062,7 +5063,7 @@ async fn acceptance_gate_passed_or_record_failure(
         sandbox_backend,
         launch_owner.as_ref(),
         cancellation_token,
-        work_expires_at,
+        ProviderPhaseDeadline::new(work_expires_at, RUNTIME_PHASE_CLEANUP_BUDGET),
     )
     .await?;
     let gate_result = match gate_phase {
