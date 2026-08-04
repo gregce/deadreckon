@@ -5157,36 +5157,36 @@ async fn semantic_completion_disposition(
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
 
-    let semantic_run = match crate::semantic_judge::run_semantic_judge_against_source_with_deadline_and_cancellation(
-        state,
-        marker,
-        router,
-        config.sandbox_backend,
-        &state.cwd,
-        crate::semantic_judge::SemanticJudgeBudget {
-            remaining_spend_usd: Some(job.policy.max_spend_usd - state.total_spend_usd),
-            // The exact outer phase deadline below owns time. This relative
-            // field remains only for accounting compatibility and must not be
-            // used to construct a new work window.
-            remaining_wall_seconds: None,
-        },
-        phase_deadline,
-        Some(cancellation_token),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            record_needs_review(
-                state,
-                turn,
-                history,
-                &format!("strict semantic judge unavailable: {error}"),
-                work_clock,
-            )?;
-            return Ok(SemanticCompletionDisposition::NeedsReview);
-        }
-    };
+    let semantic_run =
+        match crate::semantic_judge::run_semantic_judge_with_deadline_and_cancellation(
+            state,
+            marker,
+            router,
+            config.sandbox_backend,
+            crate::semantic_judge::SemanticJudgeBudget {
+                remaining_spend_usd: Some(job.policy.max_spend_usd - state.total_spend_usd),
+                // The exact outer phase deadline below owns time. This relative
+                // field remains only for accounting compatibility and must not be
+                // used to construct a new work window.
+                remaining_wall_seconds: None,
+            },
+            phase_deadline,
+            Some(cancellation_token),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                record_needs_review(
+                    state,
+                    turn,
+                    history,
+                    &format!("strict semantic judge unavailable: {error}"),
+                    work_clock,
+                )?;
+                return Ok(SemanticCompletionDisposition::NeedsReview);
+            }
+        };
     work_clock.sync(state);
     record_semantic_judge_accounting(state, turn, config, &semantic_run, work_clock)?;
     if let crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) =
