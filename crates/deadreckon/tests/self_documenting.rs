@@ -457,6 +457,112 @@ async fn polish_failure_does_not_fail_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exhausted_cumulative_polish_budget_skips_provider_and_keeps_templates() {
+    let (_temp, paths, mut state) = fresh_state("cumulative polish fallback");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let server = MockServer::start(vec![FixtureResponse::json(valid_docs_json(
+        &state,
+        &["a.txt"],
+    ))])
+    .await;
+    write_config(paths.home(), &server.base_url(), "docmock");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("docmock")).expect("router");
+    let mut config = polish_config(paths.home(), false, false);
+    config.max_wall_seconds = Some(0.0);
+
+    polish_run_docs(&mut state, &router, &config)
+        .await
+        .expect("exhausted optional polish remains nonfatal");
+
+    assert!(server.journal().is_empty());
+    assert_eq!(
+        read_polish_record(&state).unwrap().unwrap().status,
+        "wall_timeout"
+    );
+    let narrative = fs::read_to_string(narrative_path(&state.working_dir)).expect("narrative");
+    assert!(narrative.contains("cumulative polish fallback"));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn polish_timeout_reaps_hung_cli_descendant_and_keeps_templated_docs() {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let (temp, paths, mut state) = fresh_state("bounded polish cleanup");
+    append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
+    let fake = temp.path().join("hung-codex");
+    let grandchild_pid = temp.path().join("docs-polish-grandchild.pid");
+    fs::write(
+        &fake,
+        format!(
+            r#"#!/bin/sh
+case " $* " in
+  *" exec --help "*) echo 'Usage: codex exec'; exit 0 ;;
+esac
+sleep 30 &
+child=$!
+printf '%s' "$child" > '{}'
+wait
+"#,
+            grandchild_pid.display()
+        ),
+    )
+    .expect("fake codex");
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_cli_doc_config(paths.home(), &fake, "cli:codex", "cli-codex");
+    let router =
+        ProviderRouter::from_config_path(&paths.config_path(), Some("cli:codex")).expect("router");
+    let mut config = polish_config(paths.home(), false, false);
+    config.doc_provider = Some("cli:codex".to_string());
+    config.sandbox_backend = deadreckon_sandbox::SandboxBackend::None;
+    // Leave enough room for Codex's supervised capability probe to complete before
+    // timing out the actual hung provider process.
+    config.max_wall_seconds = Some(2.0);
+
+    let started = std::time::Instant::now();
+    polish_run_docs(&mut state, &router, &config)
+        .await
+        .expect("clean timeout is nonfatal");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "docs polish ignored its wall boundary"
+    );
+    let record = read_polish_record(&state).unwrap().unwrap();
+    assert_eq!(record.status, "wall_timeout", "{:?}", record.error);
+    let narrative = fs::read_to_string(narrative_path(&state.working_dir)).expect("narrative");
+    assert!(narrative.contains("bounded polish cleanup"));
+
+    let child_pid = fs::read_to_string(&grandchild_pid)
+        .expect("grandchild pid")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric pid");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match kill(Pid::from_raw(child_pid), None) {
+            Err(Errno::ESRCH) => break,
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            result => panic!("docs-polish grandchild survived cancellation: {result:?}"),
+        }
+    }
+    let retained_authority = fs::read_dir(state.run_root.join("child-pids"))
+        .expect("child-pids")
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("docs-polish-")
+        });
+    assert!(!retained_authority, "clean timeout retained PID authority");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn polish_json_retry_on_malformed_first_response() {
     let (_temp, paths, mut state) = fresh_state("polish retry");
     append_sample_turn(&state, 1, "write_file", &["a.txt"], "ok");
@@ -1886,6 +1992,8 @@ fn polish_config(home: &Path, no_llm: bool, force: bool) -> PolishConfig {
         commit_docs: true,
         no_llm,
         force,
+        max_wall_seconds: None,
+        cancellation_token: None,
     }
 }
 
@@ -1907,6 +2015,8 @@ fn split_polish_config(home: &Path, force: bool) -> PolishConfig {
         commit_docs: true,
         no_llm: false,
         force,
+        max_wall_seconds: None,
+        cancellation_token: None,
     }
 }
 
@@ -2036,6 +2146,30 @@ api_key = "test"
 input_cost_per_million = 0.0
 output_cost_per_million = 0.0
 "#
+        ),
+    )
+    .expect("config");
+}
+
+fn write_cli_doc_config(home: &Path, binary: &Path, provider: &str, kind: &str) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+fallback = ["{provider}"]
+
+[defaults]
+provider = "{provider}"
+doc_provider = "{provider}"
+doc_skill = "run-narrator"
+
+[providers."{provider}"]
+kind = "{kind}"
+binary = "{}"
+model = "test-model"
+"#,
+            binary.display()
         ),
     )
     .expect("config");

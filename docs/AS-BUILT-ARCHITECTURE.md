@@ -4528,6 +4528,21 @@ the same isolated Job only while its approved attempt policy allows. This is a
 gate correction, not a provider failure; exhaustion remains the explicit
 attempt-limit outcome.
 
+Provider-backed documentation, extension seams and semantic verification each
+use a work clock plus a separate cleanup clock. Documentation shares one
+30-minute ceiling, clipped to the remaining Job wall allowance, and gives an
+individual CLI/HTTP call at most five/two minutes. Seam cleanup receives five
+seconds; documentation cleanup receives 30 seconds and semantic cleanup ten.
+Each CLI process tree has an identity-bound record under `child-pids/`, removed
+only after cleanup is proven. A normal timeout with proven cleanup may use its
+documented fallback. Missing cleanup proof is `LostContainment`: synchronous
+seams abort, event sinks stop dispatching, semantic completion blocks every Job
+shape, and process authority remains available for reconciliation.
+
+Codex structured-output calls separately mount an already-created writable
+last-message file and a readable, explicitly write-denied schema file; this is
+stable across Linux private `/tmp` and macOS canonical temporary paths.
+
 Hermetic tests cover both guarded launch boundaries, same-ID root repair,
 Campaign sub-plan reservation, boot/PID reuse refusal, corrupt nested identity
 refusal, and typed restart classification. Public macOS tests additionally hold

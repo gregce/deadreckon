@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Automatic documentation polish now has one 30-minute cumulative ceiling,
+  clipped to the durable run's remaining wall allowance, with five-minute CLI
+  and two-minute HTTP call allocations. Timeout/cancellation gets a separate
+  30-second process-group cleanup proof; proven failures keep deterministic
+  fallback docs, while unproved cleanup fails closed with retained authority.
+- Seam workers now carry UUID-scoped process authority and process-group
+  cleanup. Their configured timeout is followed by at most five seconds of
+  cleanup proof; unproved cleanup becomes `LostContainment` instead of letting
+  policy, catalog, hook or event-sink work continue under a false fallback.
+- Semantic judging now binds each CLI call to durable process authority and
+  distinguishes a bounded wall/cancellation result from unproved cleanup.
+  Lost judge containment blocks leaf, graph and campaign Jobs with
+  `lost_containment`; it is never accepted as `NEEDS_REVIEW`, a provider fault,
+  or a retryable attempt.
+- Schema-constrained Codex calls now precreate their exact last-message file so
+  Linux private `/tmp` mounts cannot hide the result, and explicitly deny
+  writes to both lexical and canonical schema paths so macOS temporary-file
+  allowances cannot expose controller authority.
 - Admission provider phases now use the resolved provider route rather than a
   configurable alias when choosing latency allowances. Subscription CLI course
   planning and interactive contract inference receive five minutes, HTTP

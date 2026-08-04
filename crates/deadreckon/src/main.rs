@@ -2785,7 +2785,7 @@ async fn provider_router_for_run_with_catalog_seam(
         working_dir: state.working_dir.clone(),
         sandbox_backend: backend,
     };
-    let catalog_override = resolve_catalog_override(&seams, &seam_ctx).await;
+    let catalog_override = resolve_catalog_override(&seams, &seam_ctx).await?;
     ProviderRouter::from_config_path_with_model_and_catalog_override(
         &paths.config_path(),
         provider_override,

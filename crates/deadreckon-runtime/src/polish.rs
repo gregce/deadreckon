@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use deadreckon_providers::{ProviderRequest, ProviderRouter};
+use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
 use deadreckon_sandbox::SandboxBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::error::IoContext;
 use deadreckon_core::codebase::{
@@ -28,6 +30,11 @@ use deadreckon_core::polish_subcalls::{
 };
 use deadreckon_core::state::PipelineState;
 
+const DOC_POLISH_CUMULATIVE_WALL_SECONDS: u64 = 30 * 60;
+const DOC_POLISH_CLI_CALL_WALL_SECONDS: u64 = 5 * 60;
+const DOC_POLISH_HTTP_CALL_WALL_SECONDS: u64 = 2 * 60;
+const DOC_POLISH_CLEANUP_GRACE_SECONDS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct PolishConfig {
     pub home: PathBuf,
@@ -44,6 +51,48 @@ pub struct PolishConfig {
     pub commit_docs: bool,
     pub no_llm: bool,
     pub force: bool,
+    /// Optional outer wall budget remaining when polish begins. `None` uses
+    /// the bounded 30-minute polish default; a durable run passes its smaller
+    /// remaining Job budget here.
+    pub max_wall_seconds: Option<f64>,
+    /// Durable controller cancellation. Every provider attempt gets its own
+    /// child token so a phase timeout can stop just that process tree while an
+    /// outer cancellation can stop the complete polish pass.
+    pub cancellation_token: Option<CancellationToken>,
+}
+
+struct PolishWallBudget {
+    started: Instant,
+    cumulative: Duration,
+}
+
+impl PolishWallBudget {
+    fn new(max_wall_seconds: Option<f64>) -> Self {
+        let requested = max_wall_seconds
+            .filter(|seconds| seconds.is_finite())
+            .map(|seconds| seconds.max(0.0))
+            .unwrap_or(DOC_POLISH_CUMULATIVE_WALL_SECONDS as f64);
+        Self {
+            started: Instant::now(),
+            cumulative: Duration::from_secs_f64(
+                requested.min(DOC_POLISH_CUMULATIVE_WALL_SECONDS as f64),
+            ),
+        }
+    }
+
+    fn allocate(&self, router: &ProviderRouter) -> Option<Duration> {
+        let remaining = self.cumulative.checked_sub(self.started.elapsed())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(remaining.min(polish_call_ceiling(router)))
+    }
+}
+
+enum PolishProviderCompletion {
+    Finished(deadreckon_providers::Result<Box<ProviderResponse>>),
+    WallExpired,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +150,7 @@ pub async fn polish_run_docs(
     router: &ProviderRouter,
     config: &PolishConfig,
 ) -> Result<()> {
+    let mut wall_budget = PolishWallBudget::new(config.max_wall_seconds);
     rewrite_templated_docs(state, &doc_writer_label(config))?;
     if config.no_llm {
         let hash = inputs_hash(state)?;
@@ -142,7 +192,15 @@ pub async fn polish_run_docs(
     if should_use_split_polish(config) {
         match resolve_doc_subskills(&requested_subskills, state, &config.home) {
             Ok(resolved) => {
-                return polish_run_docs_split(state, router, config, &hash, resolved).await;
+                return polish_run_docs_split(
+                    state,
+                    router,
+                    config,
+                    &hash,
+                    resolved,
+                    &mut wall_budget,
+                )
+                .await;
             }
             Err(err) if !config.doc_subskills.is_empty() => {
                 write_polish_record(
@@ -174,7 +232,7 @@ pub async fn polish_run_docs(
         }
     }
 
-    polish_run_docs_legacy(state, router, config, &hash).await
+    polish_run_docs_legacy(state, router, config, &hash, &mut wall_budget).await
 }
 
 fn publish_docs(state: &PipelineState, config: &PolishConfig) -> Result<()> {
@@ -190,6 +248,7 @@ async fn polish_run_docs_legacy(
     router: &ProviderRouter,
     config: &PolishConfig,
     hash: &str,
+    wall_budget: &mut PolishWallBudget,
 ) -> Result<()> {
     let resolved = match resolve_skill(&config.doc_skill, state, &config.home) {
         Ok(skill) => skill,
@@ -228,8 +287,13 @@ async fn polish_run_docs_legacy(
     let mut total_cost = 0.0;
     loop {
         let prompt = polish_prompt(state, &resolved.path, &prompt_suffix)?;
-        let response = match router
-            .complete(&polish_provider_request(
+        let response = match run_polish_provider_call(
+            state,
+            router,
+            config,
+            wall_budget,
+            "legacy",
+            polish_provider_request(
                 prompt,
                 20_000,
                 provider_workspace.path(),
@@ -239,11 +303,12 @@ async fn polish_run_docs_legacy(
                     .join("docs-polish")
                     .join("provider.out"),
                 config.sandbox_backend,
-            ))
-            .await
+            ),
+        )
+        .await?
         {
-            Ok(response) => response,
-            Err(err) => {
+            PolishProviderCompletion::Finished(Ok(response)) => response,
+            PolishProviderCompletion::Finished(Err(err)) => {
                 write_polish_record(
                     state,
                     PolishRecord {
@@ -259,6 +324,60 @@ async fn polish_run_docs_legacy(
                         retries,
                         missing_files: Vec::new(),
                         error: Some(err.to_string()),
+                        subcalls: Vec::new(),
+                        merged_at: None,
+                        diff_coverage: None,
+                    },
+                )?;
+                publish_docs(state, config)?;
+                return Ok(());
+            }
+            PolishProviderCompletion::WallExpired => {
+                write_polish_record(
+                    state,
+                    PolishRecord {
+                        schema_version: 1,
+                        status: "wall_timeout".to_string(),
+                        inputs_hash: hash.to_string(),
+                        provider: config.doc_provider.clone(),
+                        doc_provider_source: config.doc_provider_source.clone(),
+                        skill_path: Some(resolved.path.clone()),
+                        skill_source: Some(skill_source_label(&resolved.source).to_string()),
+                        completed_at: Utc::now().to_rfc3339(),
+                        cost_usd: total_cost,
+                        retries,
+                        missing_files: Vec::new(),
+                        error: Some(
+                            "documentation provider exceeded the bounded polish wall budget"
+                                .to_string(),
+                        ),
+                        subcalls: Vec::new(),
+                        merged_at: None,
+                        diff_coverage: None,
+                    },
+                )?;
+                publish_docs(state, config)?;
+                return Ok(());
+            }
+            PolishProviderCompletion::Cancelled => {
+                write_polish_record(
+                    state,
+                    PolishRecord {
+                        schema_version: 1,
+                        status: "cancelled".to_string(),
+                        inputs_hash: hash.to_string(),
+                        provider: config.doc_provider.clone(),
+                        doc_provider_source: config.doc_provider_source.clone(),
+                        skill_path: Some(resolved.path.clone()),
+                        skill_source: Some(skill_source_label(&resolved.source).to_string()),
+                        completed_at: Utc::now().to_rfc3339(),
+                        cost_usd: total_cost,
+                        retries,
+                        missing_files: Vec::new(),
+                        error: Some(
+                            "documentation polish cancelled by the durable run controller"
+                                .to_string(),
+                        ),
                         subcalls: Vec::new(),
                         merged_at: None,
                         diff_coverage: None,
@@ -368,6 +487,7 @@ async fn polish_run_docs_split(
     config: &PolishConfig,
     hash: &str,
     resolved: Vec<ResolvedDocSubskill>,
+    wall_budget: &mut PolishWallBudget,
 ) -> Result<()> {
     let mut outputs = BTreeMap::new();
     let mut subcalls = Vec::new();
@@ -375,7 +495,8 @@ async fn polish_run_docs_split(
     let mut first_failed_skill = None;
 
     for (name, skill) in &resolved {
-        let result = run_polish_subcall(state, router, config, name, skill, "").await;
+        let result =
+            run_polish_subcall(state, router, config, wall_budget, name, skill, "").await?;
         total_cost += result.record.cost_usd;
         if result.record.status != "ok" && first_failed_skill.is_none() {
             first_failed_skill = Some(name.clone());
@@ -415,11 +536,12 @@ async fn polish_run_docs_split(
             state,
             router,
             config,
+            wall_budget,
             "narrator-phases",
             &phases_skill,
             &suffix,
         )
-        .await;
+        .await?;
         if result.record.status != "ok" && first_failed_skill.is_none() {
             first_failed_skill = Some("narrator-phases".to_string());
         }
@@ -488,14 +610,22 @@ async fn run_polish_subcall(
     state: &PipelineState,
     router: &ProviderRouter,
     config: &PolishConfig,
+    wall_budget: &mut PolishWallBudget,
     name: &str,
     skill: &ResolvedSkill,
     suffix: &str,
-) -> SubcallResult {
+) -> Result<SubcallResult> {
     let provider_workspace = match tempfile::tempdir() {
         Ok(workspace) => workspace,
         Err(error) => {
-            return failed_subcall(name, skill, "workspace_error", 0, None, error.to_string());
+            return Ok(failed_subcall(
+                name,
+                skill,
+                "workspace_error",
+                0,
+                None,
+                error.to_string(),
+            ));
         }
     };
     let mut retries = 0;
@@ -505,18 +635,23 @@ async fn run_polish_subcall(
         let prompt = match polish_prompt(state, &skill.path, &prompt_suffix) {
             Ok(prompt) => prompt,
             Err(err) => {
-                return failed_subcall(
+                return Ok(failed_subcall(
                     name,
                     skill,
                     "prompt_error",
                     retries,
                     Some(started.elapsed().as_millis()),
                     err.to_string(),
-                );
+                ));
             }
         };
-        let response = router
-            .complete(&polish_provider_request(
+        let response = run_polish_provider_call(
+            state,
+            router,
+            config,
+            wall_budget,
+            name,
+            polish_provider_request(
                 prompt,
                 polish_token_budget(config),
                 provider_workspace.path(),
@@ -527,25 +662,46 @@ async fn run_polish_subcall(
                     .join(name)
                     .join("provider.out"),
                 config.sandbox_backend,
-            ))
-            .await;
+            ),
+        )
+        .await?;
         let duration_ms = Some(started.elapsed().as_millis());
         let response = match response {
-            Ok(response) => response,
-            Err(err) => {
-                return failed_subcall(
+            PolishProviderCompletion::Finished(Ok(response)) => response,
+            PolishProviderCompletion::Finished(Err(err)) => {
+                return Ok(failed_subcall(
                     name,
                     skill,
                     "provider_error",
                     retries,
                     duration_ms,
                     err.to_string(),
-                );
+                ));
+            }
+            PolishProviderCompletion::WallExpired => {
+                return Ok(failed_subcall(
+                    name,
+                    skill,
+                    "wall_timeout",
+                    retries,
+                    duration_ms,
+                    "documentation provider exceeded the bounded polish wall budget".to_string(),
+                ));
+            }
+            PolishProviderCompletion::Cancelled => {
+                return Ok(failed_subcall(
+                    name,
+                    skill,
+                    "cancelled",
+                    retries,
+                    duration_ms,
+                    "documentation polish cancelled by the durable run controller".to_string(),
+                ));
             }
         };
         match serde_json::from_str::<Value>(&response.content) {
             Ok(value) => {
-                return SubcallResult {
+                return Ok(SubcallResult {
                     name: name.to_string(),
                     output: Some(value),
                     record: PolishSubcallRecord {
@@ -561,7 +717,7 @@ async fn run_polish_subcall(
                         duration_ms,
                         error: None,
                     },
-                };
+                });
             }
             Err(err) if retries == 0 => {
                 retries += 1;
@@ -571,7 +727,7 @@ async fn run_polish_subcall(
                 );
             }
             Err(err) => {
-                return SubcallResult {
+                return Ok(SubcallResult {
                     name: name.to_string(),
                     output: None,
                     record: PolishSubcallRecord {
@@ -587,7 +743,7 @@ async fn run_polish_subcall(
                         duration_ms,
                         error: Some(err.to_string()),
                     },
-                };
+                });
             }
         }
     }
@@ -620,6 +776,118 @@ fn failed_subcall(
     }
 }
 
+async fn run_polish_provider_call(
+    state: &PipelineState,
+    router: &ProviderRouter,
+    config: &PolishConfig,
+    wall_budget: &PolishWallBudget,
+    call_label: &str,
+    mut request: ProviderRequest,
+) -> Result<PolishProviderCompletion> {
+    if config
+        .cancellation_token
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Ok(PolishProviderCompletion::Cancelled);
+    }
+    let Some(call_budget) = wall_budget.allocate(router) else {
+        return Ok(PolishProviderCompletion::WallExpired);
+    };
+    let process_dir = state.run_root.join("child-pids");
+    fs::create_dir_all(&process_dir).with_path(&process_dir)?;
+    let safe_label = call_label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    let pid_file = process_dir.join(format!("docs-polish-{safe_label}-{}.pid", Uuid::new_v4()));
+    let request_token = CancellationToken::new();
+    request.pid_file = Some(pid_file.clone());
+    request.cancellation_token = Some(request_token.clone());
+    let completion = router.complete(&request);
+    tokio::pin!(completion);
+
+    enum Boundary<T> {
+        Finished(T),
+        WallExpired,
+        Cancelled,
+    }
+
+    let boundary = if let Some(external) = config.cancellation_token.as_ref() {
+        tokio::select! {
+            biased;
+            () = external.cancelled() => Boundary::Cancelled,
+            result = &mut completion => Boundary::Finished(result),
+            () = tokio::time::sleep(call_budget) => Boundary::WallExpired,
+        }
+    } else {
+        tokio::select! {
+            result = &mut completion => Boundary::Finished(result),
+            () = tokio::time::sleep(call_budget) => Boundary::WallExpired,
+        }
+    };
+
+    match boundary {
+        Boundary::Finished(result) => {
+            prove_polish_provider_cleanup(&pid_file)?;
+            Ok(PolishProviderCompletion::Finished(result.map(Box::new)))
+        }
+        Boundary::WallExpired | Boundary::Cancelled => {
+            let wall_expired = matches!(&boundary, Boundary::WallExpired);
+            request_token.cancel();
+            let cleanup = tokio::time::timeout(
+                Duration::from_secs(DOC_POLISH_CLEANUP_GRACE_SECONDS),
+                &mut completion,
+            )
+            .await;
+            if cleanup.is_err() {
+                return Err(DeadreckonError::InvalidInput(format!(
+                    "documentation provider did not finish cleanup within {}s; process authority remains at {}",
+                    DOC_POLISH_CLEANUP_GRACE_SECONDS,
+                    pid_file.display()
+                )));
+            }
+            prove_polish_provider_cleanup(&pid_file)?;
+            Ok(if wall_expired {
+                PolishProviderCompletion::WallExpired
+            } else {
+                PolishProviderCompletion::Cancelled
+            })
+        }
+    }
+}
+
+fn prove_polish_provider_cleanup(pid_file: &Path) -> Result<()> {
+    match fs::symlink_metadata(pid_file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(DeadreckonError::InvalidInput(format!(
+            "documentation provider returned without proving process cleanup; process authority remains at {}",
+            pid_file.display()
+        ))),
+        Err(source) => Err(DeadreckonError::Io {
+            path: pid_file.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn polish_call_ceiling(router: &ProviderRouter) -> Duration {
+    let selected = router.selected_route_info();
+    polish_call_ceiling_for_kind(selected.as_ref().map(|route| &route.kind))
+}
+
+fn polish_call_ceiling_for_kind(kind: Option<&ProviderKind>) -> Duration {
+    let cli = kind.is_some_and(|kind| {
+        matches!(kind, ProviderKind::CliClaudeCode | ProviderKind::CliCodex)
+            || matches!(kind, ProviderKind::Generic(id) if id.starts_with("cli:") || id.starts_with("cli-"))
+    });
+    Duration::from_secs(if cli {
+        DOC_POLISH_CLI_CALL_WALL_SECONDS
+    } else {
+        DOC_POLISH_HTTP_CALL_WALL_SECONDS
+    })
+}
+
 fn polish_provider_request(
     prompt: String,
     max_output_tokens: u32,
@@ -632,7 +900,7 @@ fn polish_provider_request(
         max_output_tokens,
         cwd: Some(isolated_workspace.to_path_buf()),
         output_path: Some(output_path),
-        sandbox_backend: Some(sandbox_backend),
+        sandbox_backend: (sandbox_backend != SandboxBackend::None).then_some(sandbox_backend),
         workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadOnly,
         pid_file: None,
         cancellation_token: None,
@@ -1437,9 +1705,13 @@ fn required_doc_names() -> [&'static str; 3] {
 
 #[cfg(test)]
 mod tests {
+    use deadreckon_providers::ProviderKind;
     use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 
-    use super::{live_narrative_digest, polish_provider_request};
+    use super::{
+        DOC_POLISH_CLI_CALL_WALL_SECONDS, DOC_POLISH_HTTP_CALL_WALL_SECONDS, live_narrative_digest,
+        polish_call_ceiling_for_kind, polish_provider_request,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -1460,6 +1732,23 @@ mod tests {
         assert_ne!(request.cwd.as_deref(), Some(source.path()));
         assert!(request.session_dir.is_none());
         assert!(request.pid_file.is_none());
+    }
+
+    #[test]
+    fn docs_polish_allocates_longer_calls_to_subscription_clis() {
+        assert_eq!(
+            polish_call_ceiling_for_kind(Some(&ProviderKind::CliCodex)).as_secs(),
+            DOC_POLISH_CLI_CALL_WALL_SECONDS
+        );
+        assert_eq!(
+            polish_call_ceiling_for_kind(Some(&ProviderKind::Generic("cli:pi".to_string())))
+                .as_secs(),
+            DOC_POLISH_CLI_CALL_WALL_SECONDS
+        );
+        assert_eq!(
+            polish_call_ceiling_for_kind(Some(&ProviderKind::OpenAi)).as_secs(),
+            DOC_POLISH_HTTP_CALL_WALL_SECONDS
+        );
     }
 
     #[test]

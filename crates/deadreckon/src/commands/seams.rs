@@ -223,6 +223,18 @@ fn classify_validation_outcome(
             vec!["inspect the worker command, timeout, and stderr".to_string()],
             true,
         ),
+        SeamOutcome::LostContainment(reason) => base(
+            "failed",
+            None,
+            Some(format!(
+                "worker lost process containment; runtime would stop this boundary: {reason}"
+            )),
+            vec![
+                "inspect the retained process record and reconcile the worker before retrying"
+                    .to_string(),
+            ],
+            false,
+        ),
         SeamOutcome::Unconfigured => base(
             "failed",
             None,
