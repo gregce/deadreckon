@@ -25,7 +25,8 @@ This resolves the newest release (stable preferred, release candidates included)
 Or build from source:
 
 ```bash
-cargo build --release          # binary at ./target/release/deadreckon
+cargo build --release --workspace --locked
+# coherent bundle at ./target/release/{deadreckon,dr-gate,dr-capture}
 ```
 
 Then the whole tool is five commands:

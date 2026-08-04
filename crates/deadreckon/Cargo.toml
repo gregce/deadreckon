@@ -80,3 +80,6 @@ axum.workspace = true
 deadreckon-core = { workspace = true }
 schemars.workspace = true
 sha2.workspace = true
+
+[build-dependencies]
+sha2.workspace = true

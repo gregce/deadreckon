@@ -12,7 +12,7 @@ VERIFY_LOG_DIR ?= $(ROOT)/target/verify-timings
 help:
 	@printf '%s\n' \
 		'deadreckon make targets:' \
-		'  make build          Build release binary' \
+		'  make build          Build the coherent release binary bundle' \
 		'  make verify         fmt, clippy, public surface, tests, release build and size check' \
 		'  make verify-timed   Run verify phases with per-phase timing logs' \
 		'  make size-check     Build and check the current release binary size' \

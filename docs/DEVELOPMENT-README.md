@@ -12,7 +12,8 @@ Rust agentic CLI harness for unattended long-running coding tasks. The current m
 
 ```bash
 cd /Users/gdc/deadreckon
-cargo build --release
+cargo build --release --workspace --locked
+./target/release/dr-gate protocol
 ./target/release/deadreckon init
 ./target/release/deadreckon run "hello-world in rust"
 ./target/release/deadreckon attach <run-id>

@@ -17,13 +17,13 @@ pub use ids::{JobId, PlanId, RunId, TurnId};
 pub use job::{
     AppliedGitDeliveryReceipt, AuthorityAcceptedBy, CompletionExecutionEvidence,
     CompletionProofKind, CompletionReceipt, CompletionReceiptIssuer, DOCKER_GATE_GUEST_PATH,
-    DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_VERSION,
-    GateBinaryIdentity, GateEvaluatorIdentity, GitDeliveryIntent, GitDeliveryRepositoryIdentity,
-    GitDeliveryStrategy, GoalCoverage, GoalCoverageStatus, JOB_SCHEMA_VERSION, Job, JobAuthority,
-    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobLease, JobOutcome, JobPhase,
-    JobPolicy, JobSchemaVersion, JobShape, JobToolPolicy, SandboxBoundaryObservation,
-    SandboxBoundaryObservationIssuer, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
-    StopReason,
+    DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_MARKER,
+    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, GitDeliveryIntent,
+    GitDeliveryRepositoryIdentity, GitDeliveryStrategy, GoalCoverage, GoalCoverageStatus,
+    JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
+    JobExecutionPolicy, JobLease, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion, JobShape,
+    JobToolPolicy, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
+    SemanticJudgeMode, SemanticJudgment, StopReason,
 };
 pub use ledger::{
     EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,

@@ -121,7 +121,7 @@ records Authenticode status in `release-manifest.json`.
 14. Run a local smoke on a Mac before the first RC:
 
     ```sh
-    cargo build --release -p deadreckon
+    cargo build --release --workspace --locked
     codesign --sign "Developer ID Application" --options runtime --timestamp target/release/deadreckon
     codesign --verify --verbose target/release/deadreckon
     ditto -c -k --keepParent target/release/deadreckon /tmp/deadreckon.zip

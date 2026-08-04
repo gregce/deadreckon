@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- New Jobs now require the controller, `dr-gate`, and cross-platform gate
+  sidecars to carry the same deterministic build-bundle identity as well as a
+  compatible gate protocol. Admission searches the installation for a
+  compatible helper, refuses same-version stale siblings before authority is
+  frozen, and `doctor` reports an incoherent helper bundle as blocking. The
+  gate exposes bounded machine-readable protocol metadata for diagnosis, while
+  already-frozen protocol-v1 Jobs retain their original immutable evaluator.
 - Automatic documentation polish now has one 30-minute cumulative ceiling,
   clipped to the durable run's remaining wall allowance, with five-minute CLI
   and two-minute HTTP call allocations. Timeout/cancellation gets a separate
