@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
+use deadreckon_providers::{
+    ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
+    ProviderResponse, ProviderRouter, complete_provider_phase,
+};
 use deadreckon_sandbox::SandboxBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -55,6 +58,10 @@ pub struct PolishConfig {
     /// the bounded 30-minute polish default; a durable run passes its smaller
     /// remaining Job budget here.
     pub max_wall_seconds: Option<f64>,
+    /// Durable runs pass the exact outer Job boundary. This disables the
+    /// standalone polish ceilings and prevents documentation subcalls from
+    /// rebuilding relative timeouts from a rounded remaining duration.
+    pub phase_deadline: Option<ProviderPhaseDeadline>,
     /// Durable controller cancellation. Every provider attempt gets its own
     /// child token so a phase timeout can stop just that process tree while an
     /// outer cancellation can stop the complete polish pass.
@@ -62,30 +69,48 @@ pub struct PolishConfig {
 }
 
 struct PolishWallBudget {
-    started: Instant,
-    cumulative: Duration,
+    work_expires_at: tokio::time::Instant,
+    cleanup_budget: Duration,
+    standalone_call_ceilings: bool,
 }
 
 impl PolishWallBudget {
-    fn new(max_wall_seconds: Option<f64>) -> Self {
-        let requested = max_wall_seconds
+    fn new(config: &PolishConfig) -> Self {
+        if let Some(deadline) = config.phase_deadline {
+            return Self {
+                work_expires_at: deadline.work_expires_at,
+                cleanup_budget: deadline.cleanup_budget,
+                standalone_call_ceilings: false,
+            };
+        }
+        let requested = config
+            .max_wall_seconds
             .filter(|seconds| seconds.is_finite())
             .map(|seconds| seconds.max(0.0))
             .unwrap_or(DOC_POLISH_CUMULATIVE_WALL_SECONDS as f64);
+        let cumulative =
+            Duration::from_secs_f64(requested.min(DOC_POLISH_CUMULATIVE_WALL_SECONDS as f64));
         Self {
-            started: Instant::now(),
-            cumulative: Duration::from_secs_f64(
-                requested.min(DOC_POLISH_CUMULATIVE_WALL_SECONDS as f64),
-            ),
+            work_expires_at: tokio::time::Instant::now() + cumulative,
+            cleanup_budget: Duration::from_secs(DOC_POLISH_CLEANUP_GRACE_SECONDS),
+            standalone_call_ceilings: true,
         }
     }
 
-    fn allocate(&self, router: &ProviderRouter) -> Option<Duration> {
-        let remaining = self.cumulative.checked_sub(self.started.elapsed())?;
-        if remaining.is_zero() {
+    fn allocate(&self, router: &ProviderRouter) -> Option<ProviderPhaseDeadline> {
+        let now = tokio::time::Instant::now();
+        if now >= self.work_expires_at {
             return None;
         }
-        Some(remaining.min(polish_call_ceiling(router)))
+        let work_expires_at = if self.standalone_call_ceilings {
+            self.work_expires_at.min(now + polish_call_ceiling(router))
+        } else {
+            self.work_expires_at
+        };
+        Some(ProviderPhaseDeadline::new(
+            work_expires_at,
+            self.cleanup_budget,
+        ))
     }
 }
 
@@ -150,7 +175,7 @@ pub async fn polish_run_docs(
     router: &ProviderRouter,
     config: &PolishConfig,
 ) -> Result<()> {
-    let mut wall_budget = PolishWallBudget::new(config.max_wall_seconds);
+    let mut wall_budget = PolishWallBudget::new(config);
     rewrite_templated_docs(state, &doc_writer_label(config))?;
     if config.no_llm {
         let hash = inputs_hash(state)?;
@@ -791,7 +816,7 @@ async fn run_polish_provider_call(
     {
         return Ok(PolishProviderCompletion::Cancelled);
     }
-    let Some(call_budget) = wall_budget.allocate(router) else {
+    let Some(phase_deadline) = wall_budget.allocate(router) else {
         return Ok(PolishProviderCompletion::WallExpired);
     };
     let process_dir = state.run_root.join("child-pids");
@@ -801,73 +826,33 @@ async fn run_polish_provider_call(
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect::<String>();
     let pid_file = process_dir.join(format!("docs-polish-{safe_label}-{}.pid", Uuid::new_v4()));
-    let request_token = CancellationToken::new();
     request.pid_file = Some(pid_file.clone());
-    request.cancellation_token = Some(request_token.clone());
-    let completion = router.complete(&request);
-    tokio::pin!(completion);
-
-    enum Boundary<T> {
-        Finished(T),
-        WallExpired,
-        Cancelled,
-    }
-
-    let boundary = if let Some(external) = config.cancellation_token.as_ref() {
-        tokio::select! {
-            biased;
-            () = external.cancelled() => Boundary::Cancelled,
-            result = &mut completion => Boundary::Finished(result),
-            () = tokio::time::sleep(call_budget) => Boundary::WallExpired,
-        }
-    } else {
-        tokio::select! {
-            result = &mut completion => Boundary::Finished(result),
-            () = tokio::time::sleep(call_budget) => Boundary::WallExpired,
-        }
-    };
-
-    match boundary {
-        Boundary::Finished(result) => {
-            prove_polish_provider_cleanup(&pid_file)?;
+    request.cancellation_token = config.cancellation_token.clone();
+    match complete_provider_phase(router, &mut request, phase_deadline).await {
+        ProviderPhaseOutcome::Completed(result) => {
             Ok(PolishProviderCompletion::Finished(result.map(Box::new)))
         }
-        Boundary::WallExpired | Boundary::Cancelled => {
-            let wall_expired = matches!(&boundary, Boundary::WallExpired);
-            request_token.cancel();
-            let cleanup = tokio::time::timeout(
-                Duration::from_secs(DOC_POLISH_CLEANUP_GRACE_SECONDS),
-                &mut completion,
-            )
-            .await;
-            if cleanup.is_err() {
-                return Err(DeadreckonError::InvalidInput(format!(
-                    "documentation provider did not finish cleanup within {}s; process authority remains at {}",
-                    DOC_POLISH_CLEANUP_GRACE_SECONDS,
-                    pid_file.display()
-                )));
-            }
-            prove_polish_provider_cleanup(&pid_file)?;
-            Ok(if wall_expired {
-                PolishProviderCompletion::WallExpired
-            } else {
-                PolishProviderCompletion::Cancelled
-            })
+        ProviderPhaseOutcome::WorkExpired { cleanup } => {
+            require_polish_provider_cleanup(&pid_file, &cleanup)?;
+            Ok(PolishProviderCompletion::WallExpired)
+        }
+        ProviderPhaseOutcome::Cancelled { cleanup } => {
+            require_polish_provider_cleanup(&pid_file, &cleanup)?;
+            Ok(PolishProviderCompletion::Cancelled)
         }
     }
 }
 
-fn prove_polish_provider_cleanup(pid_file: &Path) -> Result<()> {
-    match fs::symlink_metadata(pid_file) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Ok(_) => Err(DeadreckonError::InvalidInput(format!(
-            "documentation provider returned without proving process cleanup; process authority remains at {}",
-            pid_file.display()
-        ))),
-        Err(source) => Err(DeadreckonError::Io {
-            path: pid_file.to_path_buf(),
-            source,
-        }),
+fn require_polish_provider_cleanup(pid_file: &Path, cleanup: &ProviderCleanup) -> Result<()> {
+    match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => Ok(()),
+        ProviderCleanup::RetainedAuthority { path, detail } => {
+            Err(DeadreckonError::InvalidInput(format!(
+                "LOST_CONTAINMENT: documentation provider retained process authority at {} (expected {}): {detail}",
+                path.display(),
+                pid_file.display()
+            )))
+        }
     }
 }
 
@@ -1705,12 +1690,15 @@ fn required_doc_names() -> [&'static str; 3] {
 
 #[cfg(test)]
 mod tests {
-    use deadreckon_providers::ProviderKind;
+    use std::time::Duration;
+
+    use deadreckon_providers::{ProviderKind, ProviderPhaseDeadline, ProviderRouter};
     use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 
     use super::{
-        DOC_POLISH_CLI_CALL_WALL_SECONDS, DOC_POLISH_HTTP_CALL_WALL_SECONDS, live_narrative_digest,
-        polish_call_ceiling_for_kind, polish_provider_request,
+        DOC_POLISH_CLI_CALL_WALL_SECONDS, DOC_POLISH_HTTP_CALL_WALL_SECONDS, PolishConfig,
+        PolishWallBudget, live_narrative_digest, polish_call_ceiling_for_kind,
+        polish_provider_request,
     };
     use tempfile::TempDir;
 
@@ -1749,6 +1737,37 @@ mod tests {
             polish_call_ceiling_for_kind(Some(&ProviderKind::OpenAi)).as_secs(),
             DOC_POLISH_HTTP_CALL_WALL_SECONDS
         );
+    }
+
+    #[test]
+    fn durable_docs_reuse_the_outer_absolute_deadline_without_call_ceiling() {
+        let temp = TempDir::new().expect("tempdir");
+        let work_expires_at = tokio::time::Instant::now() + Duration::from_secs(10 * 60);
+        let config = PolishConfig {
+            home: temp.path().to_path_buf(),
+            doc_skill: "run-narrator".to_string(),
+            doc_provider: Some("smoke".to_string()),
+            doc_provider_source: Some("test".to_string()),
+            doc_subskills: Vec::new(),
+            token_budget: 0,
+            budget_cap_usd: None,
+            sandbox_backend: SandboxBackend::None,
+            commit_docs: false,
+            no_llm: false,
+            force: false,
+            max_wall_seconds: Some(60.0),
+            phase_deadline: Some(ProviderPhaseDeadline::new(
+                work_expires_at,
+                Duration::from_secs(17),
+            )),
+            cancellation_token: None,
+        };
+        let allocation = PolishWallBudget::new(&config)
+            .allocate(&ProviderRouter::smoke())
+            .expect("durable allocation");
+
+        assert_eq!(allocation.work_expires_at, work_expires_at);
+        assert_eq!(allocation.cleanup_budget, Duration::from_secs(17));
     }
 
     #[test]

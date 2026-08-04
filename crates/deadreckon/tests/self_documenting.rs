@@ -1993,6 +1993,7 @@ fn polish_config(home: &Path, no_llm: bool, force: bool) -> PolishConfig {
         no_llm,
         force,
         max_wall_seconds: None,
+        phase_deadline: None,
         cancellation_token: None,
     }
 }
@@ -2016,6 +2017,7 @@ fn split_polish_config(home: &Path, force: bool) -> PolishConfig {
         no_llm: false,
         force,
         max_wall_seconds: None,
+        phase_deadline: None,
         cancellation_token: None,
     }
 }

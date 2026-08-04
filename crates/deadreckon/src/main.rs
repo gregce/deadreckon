@@ -96,7 +96,8 @@ use deadreckon_providers::registry::{
 };
 use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
-    ProviderKind, ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
+    ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
+    ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate, complete_provider_phase,
     read_config,
 };
 use deadreckon_runtime::{

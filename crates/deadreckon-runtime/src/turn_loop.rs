@@ -976,7 +976,9 @@ async fn run_turn_loop_inner(
             save_history(state, &history)?;
             work_clock.save(state)?;
             begin_verification(state, &work_clock)?;
-            let docs_result = complete_run_docs(state, router, &config, &work_clock).await;
+            let docs_result =
+                complete_run_docs(state, router, &config, &work_clock, provider_phase_deadline)
+                    .await;
             verification_result(state, &work_clock, docs_result)?;
             if should_cancel_run(state, &run_token) {
                 fail_verification(state, &work_clock)?;
@@ -1618,7 +1620,9 @@ async fn run_turn_loop_inner(
                     continue;
                 }
                 begin_verification(state, &work_clock)?;
-                let docs_result = complete_run_docs(state, router, &config, &work_clock).await;
+                let docs_result =
+                    complete_run_docs(state, router, &config, &work_clock, provider_phase_deadline)
+                        .await;
                 verification_result(state, &work_clock, docs_result)?;
                 if should_cancel_run(state, &run_token) {
                     fail_verification(state, &work_clock)?;
@@ -3489,6 +3493,7 @@ async fn complete_run_docs(
     router: &ProviderRouter,
     config: &RunLoopConfig,
     work_clock: &RunWorkClock,
+    phase_deadline: ProviderPhaseDeadline,
 ) -> Result<()> {
     let owned_router = if let (Some(config_path), Some(doc_provider)) = (
         config.docs.config_path.as_ref(),
@@ -3517,6 +3522,7 @@ async fn complete_run_docs(
             no_llm: config.docs.no_docs,
             force: false,
             max_wall_seconds: work_clock.remaining_seconds(config.max_wall_seconds)?,
+            phase_deadline: Some(phase_deadline),
             cancellation_token: config.cancellation_token.clone(),
         },
     )
