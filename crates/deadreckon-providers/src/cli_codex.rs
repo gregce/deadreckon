@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use deadreckon_sandbox::{SandboxBackend, WorkspaceAccess};
 use serde_json::json;
@@ -9,7 +9,8 @@ use tokio::sync::{Mutex, OnceCell};
 use which::which;
 
 use crate::cli_common::{
-    CliOutput, CliRunOptions, ensure_success, run_cli, run_cli_with_options, write_output,
+    CLI_CAPABILITY_PROBE_TIMEOUT, CliOutput, CliRunOptions, ensure_success, run_cli,
+    run_cli_capability_probe, run_cli_with_options, write_output,
 };
 use crate::cli_contract::{
     PROVIDER_ID_CODEX, ParsedStream, ProviderContract, ProviderSession, add_caveat,
@@ -19,7 +20,7 @@ use crate::cli_contract::{
 use crate::codex_events::STRUCTURED_TEXT_DISABLED_FEATURES;
 use crate::codex_events::{
     CodexCapabilities, parse_codex_capabilities, parse_codex_capabilities_with_features,
-    parse_codex_line, probe_codex_capabilities, structured_text_features_to_disable,
+    parse_codex_line, structured_text_features_to_disable,
 };
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
@@ -50,6 +51,11 @@ fn codex_probe_cache()
 -> &'static Mutex<HashMap<CodexBinaryVersion, Arc<OnceCell<CodexCapabilities>>>> {
     static CACHE: OnceLock<Mutex<HashMap<CodexBinaryVersion, Arc<OnceCell<CodexCapabilities>>>>> =
         OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn codex_read_write_probe_cache() -> &'static Mutex<HashMap<String, CodexCapabilities>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, CodexCapabilities>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -209,8 +215,44 @@ impl CliCodexProvider {
         &self,
         request: &ProviderRequest,
     ) -> Result<CodexCapabilities> {
+        self.capabilities_for_request_with_timeout(request, CLI_CAPABILITY_PROBE_TIMEOUT)
+            .await
+    }
+
+    async fn capabilities_for_request_with_timeout(
+        &self,
+        request: &ProviderRequest,
+        probe_timeout: Duration,
+    ) -> Result<CodexCapabilities> {
         if request.workspace_access == WorkspaceAccess::ReadWrite {
-            return Ok(probe_codex_capabilities(&self.binary));
+            if let Some(cached) = codex_read_write_probe_cache()
+                .lock()
+                .await
+                .get(&self.binary)
+                .copied()
+            {
+                return Ok(cached);
+            }
+            let capabilities = run_cli_capability_probe(
+                &self.name,
+                &self.binary,
+                &["exec".to_string(), "--help".to_string()],
+                request.cwd.clone(),
+                request.sandbox_backend,
+                request.pid_file.clone(),
+                request.cancellation_token.clone(),
+                WorkspaceAccess::ReadWrite,
+                true,
+                probe_timeout,
+            )
+            .await?
+            .map(|output| parse_codex_capabilities(&output.stdout))
+            .unwrap_or_else(CodexCapabilities::none);
+            codex_read_write_probe_cache()
+                .lock()
+                .await
+                .insert(self.binary.clone(), capabilities);
+            return Ok(capabilities);
         }
         if request.output_schema.is_none() {
             return Ok(run_cli(
@@ -638,6 +680,24 @@ impl WithWallTime for SpendEstimate {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    struct DescendantGuard(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            let Ok(raw) = std::fs::read_to_string(&self.0) else {
+                return;
+            };
+            let Ok(pid) = raw.trim().parse::<u32>() else {
+                return;
+            };
+            if deadreckon_core::pid_is_alive(pid) {
+                let _ = deadreckon_core::terminate_pid(pid, true);
+            }
+        }
+    }
+
     #[test]
     fn read_only_codex_strips_configured_sandbox_bypasses() {
         let safe = read_only_safe_extra_args(&[
@@ -816,6 +876,66 @@ printf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"o
                 .lines()
                 .count(),
             2
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_write_codex_probe_timeout_reaps_descendant_and_pid_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("hanging-codex-probe");
+        let descendant_path = temp.path().join("descendant.pid");
+        let _descendant_guard = DescendantGuard(descendant_path.clone());
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"$*\" = 'exec --help' ]; then\n  (trap '' TERM; sleep 30) &\n  descendant=$!\n  printf '%s\\n' \"$descendant\" > '{}'\n  trap '' TERM\n  wait\nfi\nexit 1\n",
+                descendant_path.display()
+            ),
+        )
+        .expect("fake codex");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("fake codex permissions");
+        let provider = CliCodexProvider::new(
+            "cli:codex",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some(binary.display().to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let pid_file = temp.path().join("codex-probe.pid");
+        let request = ProviderRequest {
+            cwd: Some(temp.path().to_path_buf()),
+            pid_file: Some(pid_file.clone()),
+            ..ProviderRequest::default()
+        };
+
+        let started = std::time::Instant::now();
+        let capabilities = provider
+            .capabilities_for_request_with_timeout(&request, Duration::from_millis(100))
+            .await
+            .expect("clean probe timeout degrades capabilities");
+
+        assert_eq!(capabilities, CodexCapabilities::none());
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!pid_file.exists(), "probe retained PID authority");
+        let descendant = std::fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        assert!(
+            !deadreckon_core::pid_is_alive(descendant),
+            "Codex capability-probe descendant survived timeout"
         );
     }
 }

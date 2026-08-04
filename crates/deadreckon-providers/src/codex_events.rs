@@ -7,8 +7,6 @@
 //! turn.
 
 use std::collections::HashMap;
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -136,32 +134,6 @@ pub(crate) fn structured_text_features_to_disable(
         .enumerate()
         .filter(move |(index, _)| capabilities.structured_text_disable_mask & (1_u32 << index) != 0)
         .map(|(_, name)| *name)
-}
-
-/// Probe `codex exec --help` once per binary path and cache the result. A
-/// binary that cannot be executed reports [`CodexCapabilities::none`].
-pub(crate) fn probe_codex_capabilities(binary: &str) -> CodexCapabilities {
-    static CACHE: OnceLock<Mutex<HashMap<String, CodexCapabilities>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(found) = guard.get(binary)
-    {
-        return *found;
-    }
-    let caps = Command::new(binary)
-        .args(["exec", "--help"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            parse_codex_capabilities(&text)
-        })
-        .unwrap_or_else(CodexCapabilities::none);
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(binary.to_string(), caps);
-    }
-    caps
 }
 
 // ---------------------------------------------------------------------------
