@@ -14,6 +14,7 @@ mod config;
 mod error;
 mod http;
 mod model_catalog;
+mod output_schema;
 mod router;
 mod smoke;
 mod types;
@@ -34,6 +35,7 @@ pub use narrator::{
     NarratorBackend, NarratorCandidate, narrator_route_available, select_narrator_backend,
     select_narrator_route,
 };
+pub use output_schema::validate_openai_strict_output_schema;
 pub use registry::{ModelCatalogOverride, ModelEntry};
 pub use router::{ModelContextWindowSource, ProviderRouter};
 pub use types::{

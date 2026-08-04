@@ -30,6 +30,11 @@ pub(crate) struct CodexCapabilities {
     pub strict_config: bool,
     pub disable_features: bool,
     pub structured_text_features: bool,
+    /// Bitset into [`STRUCTURED_TEXT_DISABLED_FEATURES`] for lifecycle-active
+    /// tool surfaces. Deprecated or removed features that are already false
+    /// are intentionally omitted from argv instead of provoking strict-config
+    /// diagnostics.
+    pub structured_text_disable_mask: u32,
 }
 
 impl CodexCapabilities {
@@ -47,6 +52,7 @@ impl CodexCapabilities {
             strict_config: false,
             disable_features: false,
             structured_text_features: false,
+            structured_text_disable_mask: 0,
         }
     }
 }
@@ -82,10 +88,30 @@ pub(crate) fn parse_codex_capabilities_with_features(
     help: &str,
     feature_listing: &str,
 ) -> CodexCapabilities {
-    let feature_names = feature_listing
+    let feature_rows = feature_listing
         .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .collect::<std::collections::HashSet<_>>();
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let name = *fields.first()?;
+            let enabled = fields.last()?.parse::<bool>().ok()?;
+            let lifecycle = fields.get(1..fields.len().saturating_sub(1))?.join(" ");
+            Some((name, (lifecycle, enabled)))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut structured_text_disable_mask = 0_u32;
+    let mut structured_text_features = true;
+    for (index, name) in STRUCTURED_TEXT_DISABLED_FEATURES.iter().enumerate() {
+        match feature_rows.get(name) {
+            Some((lifecycle, enabled)) if lifecycle == "removed" || lifecycle == "deprecated" => {
+                // A retired feature is safe only when it is already off. Do
+                // not pass `--disable`: current Codex reports that use as a
+                // configuration error even though the turn may continue.
+                structured_text_features &= !enabled;
+            }
+            Some(_) => structured_text_disable_mask |= 1_u32 << index,
+            None => structured_text_features = false,
+        }
+    }
     CodexCapabilities {
         json: help.contains("--json"),
         output_last_message: help.contains("--output-last-message"),
@@ -97,10 +123,19 @@ pub(crate) fn parse_codex_capabilities_with_features(
         ignore_rules: help.contains("--ignore-rules"),
         strict_config: help.contains("--strict-config"),
         disable_features: help.contains("--disable"),
-        structured_text_features: STRUCTURED_TEXT_DISABLED_FEATURES
-            .iter()
-            .all(|name| feature_names.contains(name)),
+        structured_text_features,
+        structured_text_disable_mask,
     }
+}
+
+pub(crate) fn structured_text_features_to_disable(
+    capabilities: CodexCapabilities,
+) -> impl Iterator<Item = &'static str> {
+    STRUCTURED_TEXT_DISABLED_FEATURES
+        .iter()
+        .enumerate()
+        .filter(move |(index, _)| capabilities.structured_text_disable_mask & (1_u32 << index) != 0)
+        .map(|(_, name)| *name)
 }
 
 /// Probe `codex exec --help` once per binary path and cache the result. A
@@ -323,6 +358,29 @@ Options:
         assert!(!caps.output_last_message);
         assert!(!caps.output_schema);
         assert_eq!(caps, CodexCapabilities::none());
+    }
+
+    #[test]
+    fn deprecated_disabled_features_are_proven_but_not_passed_back() {
+        let help = format!(
+            "{REAL_HELP}\n      --ephemeral\n      --ignore-user-config\n      --ignore-rules\n      --strict-config\n      --disable <FEATURE>\n"
+        );
+        let listing = STRUCTURED_TEXT_DISABLED_FEATURES
+            .iter()
+            .map(|name| {
+                if *name == "web_search_request" {
+                    format!("{name} deprecated false")
+                } else {
+                    format!("{name} stable true")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capabilities = parse_codex_capabilities_with_features(&help, &listing);
+        assert!(capabilities.structured_text_features);
+        let disabled = structured_text_features_to_disable(capabilities).collect::<Vec<_>>();
+        assert!(!disabled.contains(&"web_search_request"));
+        assert!(disabled.contains(&"shell_tool"));
     }
 
     // Recorded from the real `codex exec --json` binary (0.144.1) —

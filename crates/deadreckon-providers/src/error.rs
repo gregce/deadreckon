@@ -31,6 +31,12 @@ pub enum ProviderError {
     Cli { provider: String, detail: String },
     #[error("invalid provider configuration: {0}")]
     InvalidConfig(String),
+    #[error("invalid strict output schema for {provider} at {path}: {detail}")]
+    InvalidOutputSchema {
+        provider: String,
+        path: String,
+        detail: String,
+    },
 }
 
 impl ProviderError {
@@ -60,6 +66,7 @@ impl ProviderError {
                 .any(|marker| lower.contains(marker))
             }
             ProviderError::InvalidConfig(_) => false,
+            ProviderError::InvalidOutputSchema { .. } => false,
         }
     }
 
@@ -113,6 +120,11 @@ mod tests {
             ProviderError::MissingCredential("anthropic".to_string()),
             ProviderError::NoRoute("all failed".to_string()),
             ProviderError::InvalidConfig("bad".to_string()),
+            ProviderError::InvalidOutputSchema {
+                provider: "cli:codex".to_string(),
+                path: "$.files".to_string(),
+                detail: "dynamic object keys are unsupported".to_string(),
+            },
         ] {
             assert!(!err.is_retryable());
             assert!(err.is_fatal());

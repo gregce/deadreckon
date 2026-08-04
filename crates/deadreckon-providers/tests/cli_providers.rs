@@ -1797,7 +1797,7 @@ plugins stable true
 shell_tool stable true
 standalone_web_search stable true
 unified_exec stable true
-web_search_request stable true
+web_search_request deprecated false
 ";
 
 #[allow(clippy::expect_used)]
@@ -2208,7 +2208,26 @@ async fn read_only_codex_judge_without_session_uses_schema_and_clean_answer() {
     fs::create_dir_all(&judge_workspace).expect("judge workspace");
     let schema = serde_json::json!({
         "type": "object",
-        "required": ["decision", "summary", "goal_coverage", "missing"]
+        "additionalProperties": false,
+        "required": ["decision", "summary", "goal_coverage", "missing"],
+        "properties": {
+            "decision": {"type": "string"},
+            "summary": {"type": "string"},
+            "goal_coverage": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["claim", "status", "evidence"],
+                    "properties": {
+                        "claim": {"type": "string"},
+                        "status": {"type": "string"},
+                        "evidence": {"type": "array", "items": {"type": "string"}}
+                    }
+                }
+            },
+            "missing": {"type": "array", "items": {"type": "string"}}
+        }
     });
 
     let judgment = codex_router(&binary)
@@ -2334,7 +2353,12 @@ async fn output_schema_passes_schema_file_to_codex() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-codex");
     write_fake_codex(&binary, CODEX_TURN_JSONL, "{\"action\":\"done\"}");
-    let schema = serde_json::json!({"type":"object","properties":{"action":{"type":"string"}}});
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "properties": {"action": {"type": "string"}}
+    });
     let response = codex_router(&binary)
         .complete(&ProviderRequest {
             prompt: "hi".to_string(),
@@ -2370,7 +2394,12 @@ async fn schema_incapable_provider_fails_closed() {
             cwd: Some(temp.path().to_path_buf()),
             output_path: Some(temp.path().join("turns/turn-1/codex.out")),
             session_dir: Some(temp.path().join("run")),
-            output_schema: Some(serde_json::json!({"type":"object"})),
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": [],
+                "properties": {}
+            })),
             workspace_access: WorkspaceAccess::ReadOnly,
             sandbox_backend: None,
             ..Default::default()

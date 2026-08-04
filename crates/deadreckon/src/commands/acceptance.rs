@@ -232,8 +232,16 @@ fn acceptance_draft_output_schema() -> Value {
             "acceptance_yaml": {"type": "string"},
             "acceptance_md": {"type": "string"},
             "files": {
-                "type": "object",
-                "additionalProperties": {"type": "string"}
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["path", "contents"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "contents": {"type": "string"}
+                    }
+                }
             }
         }
     })
@@ -1510,7 +1518,10 @@ You are helping configure deadreckon acceptance criteria for an unattended codin
 The user writes acceptance in plain English. Convert it into executable checks that dr-gate can run.
 
 Return JSON only, with exactly these keys:
-{{\"acceptance_yaml\":\"...\",\"acceptance_md\":\"...\",\"files\":{{}}}}
+{{\"acceptance_yaml\":\"...\",\"acceptance_md\":\"...\",\"files\":[]}}
+
+When a helper is necessary, add it to files as
+{{\"path\":\".deadreckon/acceptance/name\",\"contents\":\"...\"}}.
 
 The YAML must be valid deadreckon acceptance.yaml. Keep the existing durable schema and use only these check kinds:
 - file_exists with path
@@ -1666,7 +1677,7 @@ fn parse_schema_constrained_acceptance_response(content: &str) -> Result<Accepta
             .get("acceptance_md")
             .and_then(Value::as_str)
             .is_none()
-        || object.get("files").and_then(Value::as_object).is_none()
+        || object.get("files").and_then(Value::as_array).is_none()
     {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done criteria provider result used invalid acceptance field types",
@@ -1699,25 +1710,64 @@ fn acceptance_json_payload(value: &Value) -> Result<Option<AcceptanceDraft>> {
         .map(ToString::to_string)
         .unwrap_or_else(|| acceptance_markdown_from_yaml(yaml));
     acceptance_check_count(yaml)?;
-    let mut files = BTreeMap::new();
-    if let Some(file_map) = object.get("files").and_then(Value::as_object) {
-        for (path, body) in file_map {
-            let Some(body) = body.as_str() else {
-                return Err(CliError::Core(deadreckon_core::user_error(
-                    &format!("acceptance helper {path} must be a string"),
-                    "return files as {\".deadreckon/acceptance/name\": \"contents\"}",
-                )));
-            };
-            let path = PathBuf::from(path);
-            validate_acceptance_helper_path(&path)?;
-            files.insert(path, body.to_string());
-        }
-    }
+    let files = object
+        .get("files")
+        .map(acceptance_helper_files)
+        .transpose()?
+        .unwrap_or_default();
     Ok(Some(AcceptanceDraft {
         yaml: yaml.to_string(),
         markdown,
         files,
     }))
+}
+
+fn acceptance_helper_files(value: &Value) -> Result<BTreeMap<PathBuf, String>> {
+    let entries = value.as_array().ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "done criteria helper files must be a list of path/content records",
+            "return files as [{\"path\":\".deadreckon/acceptance/name\",\"contents\":\"...\"}]",
+        ))
+    })?;
+    let mut files = BTreeMap::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let record = entry.as_object().ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance helper files[{index}] must be an object"),
+                "return each helper with exactly path and contents",
+            ))
+        })?;
+        if record.len() != 2 || !record.contains_key("path") || !record.contains_key("contents") {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance helper files[{index}] must contain exactly path and contents"),
+                "return each helper with exactly path and contents",
+            )));
+        }
+        let path = record.get("path").and_then(Value::as_str).ok_or_else(|| {
+            CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance helper files[{index}].path must be a string"),
+                "return each helper path as a string",
+            ))
+        })?;
+        let contents = record
+            .get("contents")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CliError::Core(deadreckon_core::user_error(
+                    &format!("acceptance helper files[{index}].contents must be a string"),
+                    "return each helper contents as a string",
+                ))
+            })?;
+        let path = PathBuf::from(path);
+        validate_acceptance_helper_path(&path)?;
+        if files.insert(path.clone(), contents.to_string()).is_some() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("acceptance helper path is duplicated: {}", path.display()),
+                "return each helper path once",
+            )));
+        }
+    }
+    Ok(files)
 }
 
 pub(crate) fn strip_code_fence(value: &str) -> String {
@@ -2830,12 +2880,59 @@ mod tests {
                     "acceptance_yaml": {"type": "string"},
                     "acceptance_md": {"type": "string"},
                     "files": {
-                        "type": "object",
-                        "additionalProperties": {"type": "string"}
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["path", "contents"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "contents": {"type": "string"}
+                            }
+                        }
                     }
                 }
             })
         );
+        deadreckon_providers::validate_openai_strict_output_schema(
+            "cli:codex",
+            &acceptance_draft_output_schema(),
+        )
+        .expect("built-in draft schema must remain strict-response compatible");
+    }
+
+    #[test]
+    fn schema_constrained_draft_parses_fixed_helper_records() {
+        let content = json!({
+            "acceptance_yaml": "name: helper\nchecks:\n  - kind: shell\n    command: sh .deadreckon/acceptance/check.sh\n    cwd: \"{working_dir}\"\n",
+            "acceptance_md": "# Helper acceptance\n",
+            "files": [{
+                "path": ".deadreckon/acceptance/check.sh",
+                "contents": "#!/bin/sh\nexit 0\n"
+            }]
+        })
+        .to_string();
+        let draft = parse_schema_constrained_acceptance_response(&content).expect("draft");
+        assert_eq!(
+            draft
+                .files
+                .get(Path::new(".deadreckon/acceptance/check.sh"))
+                .map(String::as_str),
+            Some("#!/bin/sh\nexit 0\n")
+        );
+    }
+
+    #[test]
+    fn schema_constrained_draft_rejects_legacy_dynamic_file_maps() {
+        let content = json!({
+            "acceptance_yaml": "name: helper\nchecks:\n  - kind: cargo_test\n",
+            "acceptance_md": "# Helper acceptance\n",
+            "files": {".deadreckon/acceptance/check.sh": "exit 0"}
+        })
+        .to_string();
+        let error = parse_schema_constrained_acceptance_response(&content)
+            .expect_err("dynamic helper map must be rejected");
+        assert!(error.to_string().contains("invalid acceptance field types"));
     }
 
     #[test]
