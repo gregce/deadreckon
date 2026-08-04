@@ -33,7 +33,9 @@
 - Supervisor installation, status, readiness, and checkpoints now canonicalize
   the running executable once. A managed PATH symlink and its target therefore
   identify the same pinned binary, while a genuinely different executable
-  remains stale and is never silently accepted.
+  remains stale and is never silently accepted. Doctor applies the same
+  identity rule to install receipts, and launchd restart now retries the
+  bounded post-bootout transition while preserving final failure diagnostics.
 - Guided start defers supervisor installation or repair until contract
   authoring and final launch confirmation are complete, so a rejected draft or
   cancelled launch does not mutate the user's service state.
