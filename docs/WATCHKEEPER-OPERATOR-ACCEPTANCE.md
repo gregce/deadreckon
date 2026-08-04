@@ -176,6 +176,10 @@ Accept when:
 - [ ] `supervisor status` accepts a live legacy macOS checkpoint when only the
   `kern.boottime` microseconds differ, while a different boot second still
   fails closed;
+- [ ] rebuilding or replacing the supervisor executable at the same path makes
+  the old live process fail readiness by bundle build identity or executable
+  SHA-256; guided start repairs the service and proves a fresh checkpoint
+  before creating a Job;
 - [ ] no supervised PID record is removed when timeout cleanup cannot be
   proven;
 - [ ] unresolved goal-shape provider cleanup stops before a Job ID is created;
@@ -219,6 +223,23 @@ Accept when:
 - [ ] semantic judge cancellation reaps its complete process group and removes
   its identity record. If that cannot be proved, leaf, graph and campaign Jobs
   stop as `Blocked/LostContainment`, never `NEEDS_REVIEW` or `fatal_provider`.
+
+Exercise the timing assertions at every phase boundary, not only provider
+mutation. For admission drafting, goal-shape planning, provider turns, tool
+execution, documentation, deterministic verification, semantic judging,
+promotion, root planning, child scheduling and recovery, verify this matrix:
+
+- [ ] retries and supervisor restarts reuse the original absolute work cutoff;
+- [ ] a phase does not launch when less than its minimum usable work interval
+  remains, and fractional time is never rounded up into extra authority;
+- [ ] reaching the work cutoff cancels new work immediately, then grants only
+  the separate cleanup window to reap and prove the owned process tree;
+- [ ] proven cleanup produces the phase's typed bounded stop reason, while
+  unproved cleanup produces `Blocked/LostContainment` and retains authority;
+- [ ] state saved after a failed snapshot, Git, documentation, gate or
+  promotion boundary includes the time already consumed;
+- [ ] run wall accounting is monotonic and controller-measured; provider or
+  judge timing evidence is not added to it a second time.
 
 ## Safety and prerequisites
 

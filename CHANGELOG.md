@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Runtime, provider and scheduler phases now consume one monotonic cumulative
+  work allowance across retries and restarts, then use a separate bounded
+  cleanup window that cannot authorize more work. Fractional remaining time is
+  never rounded up, boundary failures persist elapsed time, and unproved
+  process cleanup fails closed with retained authority.
+- Live supervisor readiness now binds the checkpoint to the exact source-bundle
+  build identity and executable SHA-256 as well as the canonical path, boot and
+  process start. Rebuilding or replacing a binary in place therefore triggers
+  a supervised restart instead of allowing an older same-path process to admit
+  new Jobs.
 - Sandbox subprocesses now drain stdout and stderr continuously into bounded
   head/tail captures, so output floods cannot deadlock or exhaust evidence
   memory. Unix cleanup treats only `ESRCH` as proof of process-group absence,
