@@ -4529,6 +4529,16 @@ evaluate` through the sandbox runner under the backend that actually resolves.
 The evaluator receives no `GATE_*` inputs. It runs the approved checks, computes
 tamper facts, writes no proof or Job control files, and returns JSON on stdout.
 
+Shell checks run under `sh -c`, not a login shell, so host profile files cannot
+replace the controller's isolated `HOME`, `TMPDIR` or `PATH`. On macOS the
+disposable gate runtime prepends a controller-written `mktemp` compatibility
+tool: legacy bare and `-t` forms are redirected beneath `TMPDIR`, while other
+forms retain the system tool's behavior. The runtime root is readable and
+writable only as disposable evaluator state; it contains no Job authority or
+signing material and is removed after evaluation. New provider-authored
+contracts are stricter than the compatibility path and must use an explicit
+`${TMPDIR:-/tmp}/...XXXXXX` template.
+
 The sandbox runner scrubs inherited signing and containment inputs. For strict
 Jobs a private release pipe holds the evaluator until its unique, synced
 attempt/launch/boot/process identity exists; the helper then creates the fresh

@@ -2945,13 +2945,14 @@ async fn run_strict_sandbox_boundary_probe(
         paths.home().join("gate-keys"),
         paths.operator_captures_dir(),
     ];
-    let mut write_allowlist = vec![state.working_dir.clone(), runtime.path().to_path_buf()];
+    let mut write_allowlist = vec![state.working_dir.clone()];
     prepare_strict_gate_environment(
         &state.working_dir,
         runtime.path(),
         resolved_backend,
         &mut env,
         &mut read_allowlist,
+        &mut write_allowlist,
     )?;
     for (name, path) in [
         (
@@ -3172,9 +3173,9 @@ async fn run_keyless_gate_evaluation(
             requested_backend,
             &mut env,
             &mut read_allowlist,
+            &mut write_allowlist,
         )?;
         read_allowlist.push(runtime.path().to_path_buf());
-        write_allowlist.push(runtime.path().to_path_buf());
     } else {
         extend_gate_toolchain_reads(&mut read_allowlist);
     }
@@ -3425,13 +3426,20 @@ fn prepare_strict_gate_environment(
     backend: SandboxBackend,
     env: &mut BTreeMap<String, String>,
     read_allowlist: &mut Vec<PathBuf>,
+    write_allowlist: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let isolated_home = runtime_root.join("home");
     let isolated_tmp = runtime_root.join("tmp");
     let isolated_cargo = runtime_root.join("cargo");
     for directory in [&isolated_home, &isolated_tmp, &isolated_cargo] {
         std::fs::create_dir_all(directory).with_path(directory)?;
+        write_allowlist.push(directory.clone());
     }
+    // Seatbelt requires read access to a writable directory's metadata before
+    // tools can create children beneath its allowed subdirectories. Keep only
+    // the disposable root readable; it contains no host state and is deleted
+    // afterward, while tool-bin remains outside the write allowlist.
+    read_allowlist.push(runtime_root.to_path_buf());
 
     for variable in ["HOME", "TMPDIR", "TMP", "TEMP"] {
         let value = if variable == "HOME" {
@@ -3459,6 +3467,27 @@ fn prepare_strict_gate_environment(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| host_home.as_ref().map(|home| home.join(".rustup")));
+
+    #[cfg(target_os = "macos")]
+    let gate_tool_bin = if backend == SandboxBackend::SandboxExec {
+        let bin = runtime_root.join("tool-bin");
+        std::fs::create_dir_all(&bin).with_path(&bin)?;
+        let wrapper = bin.join("mktemp");
+        std::fs::write(
+            &wrapper,
+            b"#!/bin/sh\nset -eu\ncase \"$0\" in\n  */*) root=$(CDPATH= cd -P \"${0%/*}/../tmp\" && pwd -P) ;;\n  *) exit 70 ;;\nesac\ncase \"$#:$*\" in\n  '0:') exec /usr/bin/mktemp \"$root/tmp.XXXXXXXXXX\" ;;\n  '1:-d') exec /usr/bin/mktemp -d \"$root/tmp.XXXXXXXXXX\" ;;\n  2:-t\\ *) exec /usr/bin/mktemp \"$root/$2.XXXXXXXXXX\" ;;\n  3:-d\\ -t\\ *) exec /usr/bin/mktemp -d \"$root/$3.XXXXXXXXXX\" ;;\n  3:-t\\ *\\ -d) exec /usr/bin/mktemp -d \"$root/$2.XXXXXXXXXX\" ;;\nesac\nexec /usr/bin/mktemp \"$@\"\n",
+        )
+        .with_path(&wrapper)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o500))
+            .with_path(&wrapper)?;
+        read_allowlist.push(bin.clone());
+        Some(bin)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    let gate_tool_bin: Option<PathBuf> = None;
 
     let docker = backend == SandboxBackend::Docker;
     let mut path_entries = if docker {
@@ -3489,6 +3518,9 @@ fn prepare_strict_gate_environment(
         }
         entries
     };
+    if let Some(bin) = gate_tool_bin {
+        path_entries.insert(0, bin);
+    }
     if let Some(cargo) = host_cargo.as_ref().filter(|path| path.is_dir()) {
         let bin = cargo.join("bin");
         if !docker {
@@ -5489,6 +5521,74 @@ mod tests {
         assert!(sdk_root.is_absolute());
         assert!(sdk_root.is_dir());
         assert!(read_allowlist.contains(&sdk_root));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn strict_macos_gate_redirects_bare_mktemp_into_its_disposable_runtime() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut env = std::collections::BTreeMap::new();
+        let mut read_allowlist = Vec::new();
+        let mut write_allowlist = vec![workspace.clone()];
+        super::prepare_strict_gate_environment(
+            &workspace,
+            &runtime,
+            SandboxBackend::SandboxExec,
+            &mut env,
+            &mut read_allowlist,
+            &mut write_allowlist,
+        )
+        .expect("strict gate environment");
+        let expected_tmp = runtime
+            .join("tmp")
+            .canonicalize()
+            .expect("canonical gate tmp");
+        let profile_dir = temp.path().join("profile");
+        let output = super::run_sandbox(deadreckon_sandbox::SandboxSpec {
+            backend: SandboxBackend::SandboxExec,
+            docker: None,
+            cwd: workspace.clone(),
+            program: std::ffi::OsString::from("/bin/sh"),
+            args: vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(
+                    "tool=$(command -v mktemp); if printf '#!/bin/sh\\nexit 0\\n' >\"$tool\" 2>\"$EXPECTED_GATE_TMP/attack.err\" || rm -f \"$tool\" 2>\"$EXPECTED_GATE_TMP/attack.err\"; then exit 42; fi; TMPDIR=\"$PWD/hostile-tmp\"; export TMPDIR; mkdir -p \"$TMPDIR\"; created=$(mktemp); case \"$created\" in \"$EXPECTED_GATE_TMP\"/*) ;; *) printf '%s' \"$created\"; exit 41 ;; esac; printf '%s' \"$created\"",
+                ),
+            ],
+            stdin: None,
+            env: {
+                env.insert(
+                    "EXPECTED_GATE_TMP".to_string(),
+                    expected_tmp.to_string_lossy().into_owned(),
+                );
+                env
+            },
+            allow_network: false,
+            pid_file: None,
+            cancellation_token: None,
+            profile_dir: Some(profile_dir.clone()),
+            read_allowlist,
+            write_allowlist,
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
+            network_allowlist: Vec::new(),
+            workspace_access: deadreckon_sandbox::WorkspaceAccess::Disposable,
+            cleanup_process_group: true,
+            guarded_launch: None,
+        })
+        .await
+        .expect("contained mktemp check");
+
+        let profile = std::fs::read_to_string(profile_dir.join("profile.sb"))
+            .expect("captured sandbox profile");
+        assert_eq!(output.status_code, Some(0), "{output:#?}\n{profile}");
+        assert!(
+            Path::new(&output.stdout).starts_with(expected_tmp),
+            "{output:#?}"
+        );
     }
 
     fn base_run_loop_config() -> RunLoopConfig {

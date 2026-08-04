@@ -161,6 +161,14 @@ Accept when:
   supervisor does not reclaim the Job merely because wall clock advanced;
 - [ ] Job wall, spend and absolute deadline values remain the operator-approved
   values; only setup/readiness/inactivity allowances are relaxed.
+- [ ] on macOS, add a required shell check that captures product output with
+  bare `mktemp`; the check completes under Seatbelt and its temporary file is
+  created beneath the disposable gate runtime, not the Darwin user temp root;
+- [ ] a newly generated contract never emits bare `mktemp` or `mktemp -t` and
+  `def-done` rejects a provider draft that does not use an explicit
+  `${TMPDIR:-/tmp}/...XXXXXX` template;
+- [ ] shell checks observe DeadReckon's isolated `HOME`, `TMPDIR` and `PATH`
+  even when the operator's shell startup files assign different values.
 
 ## Safety and prerequisites
 

@@ -59,6 +59,12 @@
   helpers outside the bound bundle remain rejected. A child that exits before
   writing run state is reported as an unknown preflight failure with its
   supervisor log path, never invented as a provider failure.
+- Strict shell checks now preserve DeadReckon's deterministic environment by
+  using a non-login shell. On macOS, a controller-owned compatibility shim
+  keeps legacy bare `mktemp` calls inside the disposable Seatbelt runtime;
+  newly generated contracts must name an explicit `TMPDIR` template. This
+  prevents an otherwise-correct run from failing after implementation because
+  Darwin redirected evaluator output into the denied host temporary directory.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 
