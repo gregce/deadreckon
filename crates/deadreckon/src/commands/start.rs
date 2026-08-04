@@ -506,7 +506,7 @@ pub(crate) async fn classify_goal_shape_for_start(
     provider: Option<&str>,
     sandbox_backend: deadreckon_sandbox::SandboxBackend,
     plain: bool,
-) -> GoalShapeRecommendation {
+) -> Result<GoalShapeRecommendation> {
     let defaults_ceiling = config_defaults(paths).ok().and_then(|d| d.max_spend);
     let signals = commands::course::collect_signal_bundle(paths, cwd, goal, defaults_ceiling);
     let ladder = commands::course::ladder_decision(&signals);
@@ -523,10 +523,10 @@ pub(crate) async fn classify_goal_shape_for_start(
             &signals,
             &ladder,
         )
-        .await
+        .await?
     {
         let (shape, n, pieces, apply, resolution) = resolved;
-        return GoalShapeRecommendation {
+        return Ok(GoalShapeRecommendation {
             schema_version: 1,
             goal: goal.to_string(),
             shape: course_shape_to_goal_shape(shape),
@@ -536,9 +536,9 @@ pub(crate) async fn classify_goal_shape_for_start(
             provider: Some(provider.to_string()),
             pieces,
             apply,
-        };
+        });
     }
-    ladder_goal_shape_recommendation(goal, &ladder)
+    Ok(ladder_goal_shape_recommendation(goal, &ladder))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -551,8 +551,19 @@ async fn provider_course_plan(
     plain: bool,
     signals: &commands::course::SignalBundle,
     ladder: &commands::course::LadderDecision,
-) -> Option<commands::course::ResolvedCoursePlan> {
-    let router = ProviderRouter::from_config_path(&paths.config_path(), Some(provider)).ok()?;
+) -> Result<Option<commands::course::ResolvedCoursePlan>> {
+    let router = match ProviderRouter::from_config_path(&paths.config_path(), Some(provider)) {
+        Ok(router) => router,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                ui_warn(format!(
+                    "course planner unavailable via {provider}; using the deterministic course: {error}"
+                ))
+            );
+            return Ok(None);
+        }
+    };
     let token = CancellationToken::new();
     let attempt_id = Uuid::new_v4().simple().to_string();
     let pid_file = std::env::temp_dir().join(format!("deadreckon-course-{attempt_id}.pid"));
@@ -577,16 +588,12 @@ async fn provider_course_plan(
                 course_planner_cleanup_timeout(),
                 &mut completion,
             ).await;
-            if cleanup.is_err() || pid_file.exists() {
-                eprintln!(
-                    "{}",
-                    ui_warn(format!(
-                        "course planner timed out via {provider}; cleanup was not proven and process authority remains at {}",
-                        pid_file.display()
-                    ))
-                );
-                return None;
-            }
+            require_course_planner_cleanup_proven(
+                cleanup.is_ok(),
+                &pid_file,
+                provider,
+                "timed out",
+            )?;
             remove_course_planner_outputs(&output_path);
             eprintln!(
                 "{}",
@@ -594,9 +601,10 @@ async fn provider_course_plan(
                     "course planner timed out via {provider}; using the deterministic course"
                 ))
             );
-            return None;
+            return Ok(None);
         }
     };
+    require_course_planner_cleanup_proven(true, &pid_file, provider, "returned")?;
     remove_course_planner_outputs(&output_path);
     let response = match response {
         Ok(response) => response,
@@ -607,15 +615,15 @@ async fn provider_course_plan(
                     "course planner unavailable via {provider}; using the deterministic course: {error}"
                 ))
             );
-            return None;
+            return Ok(None);
         }
     };
-    commands::course::resolve_provider_course_plan(
+    Ok(commands::course::resolve_provider_course_plan(
         &response.content,
         signals,
         ladder,
         commands::course::SHAPE_CONFIDENCE_FLOOR_DEFAULT,
-    )
+    ))
 }
 
 fn remove_course_planner_outputs(output_path: &Path) {
@@ -623,14 +631,39 @@ fn remove_course_planner_outputs(output_path: &Path) {
     let _ = fs::remove_file(output_path.with_extension("last.txt"));
 }
 
+fn require_course_planner_cleanup_proven(
+    cleanup_completed: bool,
+    pid_file: &Path,
+    provider: &str,
+    phase: &str,
+) -> Result<()> {
+    if cleanup_completed && !pid_file.exists() {
+        return Ok(());
+    }
+    let authority = if pid_file.exists() {
+        format!("process authority remains at {}", pid_file.display())
+    } else {
+        format!(
+            "the cleanup wait did not resolve, so provider exit cannot be proven (PID checkpoint path: {})",
+            pid_file.display()
+        )
+    };
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "course planner {phase} via {provider}, but provider cleanup was not proven: {authority}"
+        ),
+        "stop the recorded provider process, then rerun deadreckon start",
+    )))
+}
+
 /// The shape planner is a bounded read-only phase, but subscription CLIs can
 /// cold-start or compact for tens of seconds. Give both local and HTTP routes
 /// realistic room, then cancel and prove cleanup before falling back.
 pub(crate) fn course_planner_timeout(provider: &str) -> Duration {
     if provider.starts_with("cli:") {
-        Duration::from_secs(60)
+        Duration::from_secs(120)
     } else {
-        Duration::from_secs(15)
+        Duration::from_secs(30)
     }
 }
 
@@ -3883,8 +3916,8 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
     let prompter = eligibility
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-    require_start_supervisor_service(prompter)?;
     materialize_start_done_criteria(&mut decision, None).await?;
+    require_start_supervisor_service(prompter)?;
     dispatch_start_command(replay_args, &decision, plan)
         .await
         .map(|_| ())
@@ -3943,7 +3976,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             planner_sandbox,
             args.plain,
         )
-        .await;
+        .await?;
         apply_goal_shape_recommendation(&mut decision, recommendation.clone());
         validate_start_source_compatibility(&mut decision, &args, &cwd);
         if decision.recovery.is_none() {
@@ -5119,6 +5152,67 @@ mod start_goal_tests {
             start_goal_plan(Some("ship it"), false),
             StartGoalPlan::Provided(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod course_planner_cleanup_tests {
+    use super::{
+        course_planner_cleanup_timeout, course_planner_timeout,
+        require_course_planner_cleanup_proven,
+    };
+
+    #[test]
+    fn goal_shape_planner_budgets_cover_cli_and_http_cold_starts() {
+        assert_eq!(course_planner_timeout("cli:codex").as_secs(), 120);
+        assert_eq!(course_planner_timeout("openai").as_secs(), 30);
+        assert_eq!(course_planner_cleanup_timeout().as_secs(), 30);
+    }
+
+    #[test]
+    fn unresolved_goal_shape_provider_cleanup_stops_admission_and_retains_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("course-provider.pid");
+        std::fs::write(&pid_file, "4242\n").expect("pid authority");
+
+        let error =
+            require_course_planner_cleanup_proven(true, &pid_file, "cli:fixture", "returned")
+                .expect_err(
+                    "a returned provider with residual authority must stop start admission",
+                );
+        let rendered = error.to_string();
+        assert!(rendered.contains("cleanup was not proven"), "{rendered}");
+        assert!(rendered.contains("rerun deadreckon start"), "{rendered}");
+        assert!(
+            pid_file.exists(),
+            "unresolved process authority must remain for operator cleanup"
+        );
+    }
+
+    #[test]
+    fn cleanup_timeout_stops_admission_even_when_no_pid_checkpoint_was_observed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pid_file = temp.path().join("course-provider.pid");
+
+        let error =
+            require_course_planner_cleanup_proven(false, &pid_file, "cli:fixture", "timed out")
+                .expect_err("an unresolved cleanup wait must stop start admission");
+        let rendered = error.to_string();
+        assert!(rendered.contains("cleanup was not proven"), "{rendered}");
+        assert!(rendered.contains("exit cannot be proven"), "{rendered}");
+        assert!(!rendered.contains("authority remains"), "{rendered}");
+    }
+
+    #[test]
+    fn proven_goal_shape_provider_cleanup_allows_deterministic_fallback() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        require_course_planner_cleanup_proven(
+            true,
+            &temp.path().join("absent.pid"),
+            "cli:fixture",
+            "timed out",
+        )
+        .expect("completed cleanup without residual authority");
     }
 }
 

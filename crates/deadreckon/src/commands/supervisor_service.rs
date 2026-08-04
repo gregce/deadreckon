@@ -9,13 +9,14 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::Duration;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use deadreckon_core::{
-    DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock, boot_identities_match,
-    boot_identity, process_start_identity,
+    ChildTerminator, DeadreckonError, DeadreckonPaths, HeadTailBuffer, LockGuard,
+    TerminationOutcome, acquire_lock, boot_identities_match, boot_identity, process_start_identity,
+    spawn_grouped,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -32,6 +33,10 @@ const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
 const SERVICE_INSTANCE_DIR: &str = "supervisor";
 const SERVICE_INSTANCE_FILE: &str = "instance.json";
 const SERVICE_STATUS_SCHEMA: u32 = 2;
+const SERVICE_MANAGER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICE_MANAGER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const SERVICE_MANAGER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const SERVICE_MANAGER_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 // launchd can report a transient bootstrap failure while completing a
 // successful bootout. Six bounded pauses keep that restart transition below
 // six seconds and well inside the 30-second service readiness timeout.
@@ -1109,7 +1114,11 @@ pub(crate) fn supervisor_service_stop_command() -> Result<()> {
                 ["disable", target.as_str()],
                 "disable the DeadReckon supervisor",
             )?;
-            if command_succeeds("launchctl", ["print", target.as_str()])? {
+            if command_succeeds(
+                "launchctl",
+                ["print", target.as_str()],
+                "inspect whether the DeadReckon supervisor is loaded",
+            )? {
                 run_required(
                     "launchctl",
                     ["bootout", target.as_str()],
@@ -1647,7 +1656,11 @@ fn launchd_start(context: &ServiceContext) -> Result<()> {
         ["enable", target.as_str()],
         "enable the DeadReckon supervisor",
     )?;
-    let restarting = command_succeeds("launchctl", ["print", target.as_str()])?;
+    let restarting = command_succeeds(
+        "launchctl",
+        ["print", target.as_str()],
+        "inspect whether the DeadReckon supervisor is loaded",
+    )?;
     if restarting {
         run_required(
             "launchctl",
@@ -1709,12 +1722,20 @@ fn launchd_domain() -> Result<String> {
     Ok(format!("gui/{uid}"))
 }
 
-fn command_succeeds<I, S>(program: &str, args: I) -> Result<bool>
+fn command_succeeds<I, S>(program: &str, args: I, action: &str) -> Result<bool>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Ok(Command::new(program).args(args).output()?.status.success())
+    Ok(run_service_manager_command(
+        program,
+        args,
+        action,
+        SERVICE_MANAGER_COMMAND_TIMEOUT,
+        SERVICE_MANAGER_TERMINATION_GRACE,
+    )?
+    .status
+    .success())
 }
 
 fn run_required<I, S>(program: &str, args: I, action: &str) -> Result<()>
@@ -1722,14 +1743,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|source| {
-            invalid_input(format!(
-                "could not {action}: {source}; this command requires the per-user service manager"
-            ))
-        })?;
+    let output = run_observational(program, args, action)?;
     if !output.status.success() {
         return Err(command_failure(action, &output));
     }
@@ -1741,11 +1755,177 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new(program).args(args).output().map_err(|source| {
+    run_service_manager_command(
+        program,
+        args,
+        action,
+        SERVICE_MANAGER_COMMAND_TIMEOUT,
+        SERVICE_MANAGER_TERMINATION_GRACE,
+    )
+}
+
+fn run_service_manager_command<I, S>(
+    program: &str,
+    args: I,
+    action: &str,
+    timeout: Duration,
+    termination_grace: Duration,
+) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (mut child, terminator) = spawn_grouped(command).map_err(|source| {
         invalid_input(format!(
             "could not {action}: {source}; this command requires the per-user service manager"
         ))
+    })?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = terminator.terminate(termination_grace);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(invalid_input(format!(
+            "could not {action}: service-manager output pipes were unavailable"
+        )));
+    };
+
+    let deadline = Instant::now() + timeout;
+    std::thread::scope(|scope| {
+        let stdout_reader = scope.spawn(move || read_bounded_service_output(stdout));
+        let stderr_reader = scope.spawn(move || read_bounded_service_output(stderr));
+        let mut timed_out = false;
+        let mut cleanup = None;
+        let mut execution_error = None;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() >= deadline => {
+                    timed_out = true;
+                    let settled = terminate_and_reap_service_child(
+                        &mut child,
+                        terminator.as_ref(),
+                        termination_grace,
+                    );
+                    cleanup = Some(settled.cleanup);
+                    execution_error = settled.error;
+                    break settled.status;
+                }
+                Ok(None) => {
+                    std::thread::sleep(
+                        SERVICE_MANAGER_POLL_INTERVAL
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    );
+                }
+                Err(source) => {
+                    let settled = terminate_and_reap_service_child(
+                        &mut child,
+                        terminator.as_ref(),
+                        termination_grace,
+                    );
+                    cleanup = Some(settled.cleanup);
+                    execution_error = Some(match settled.error {
+                        Some(cleanup_error) => format!(
+                            "failed to poll child: {source}; cleanup also failed: {cleanup_error}"
+                        ),
+                        None => format!("failed to poll child: {source}"),
+                    });
+                    break settled.status;
+                }
+            }
+        };
+
+        // Both reader handles are joined only after the direct child has
+        // either been reaped by `try_wait` or explicitly terminated and
+        // reaped above. Store both results before propagating either error so
+        // no scoped reader is left implicit on an early return.
+        let stdout_result = join_bounded_service_output(stdout_reader, action, "stdout");
+        let stderr_result = join_bounded_service_output(stderr_reader, action, "stderr");
+        if let Some(error) = execution_error {
+            return Err(invalid_input(format!("could not {action}: {error}")));
+        }
+        let stdout = stdout_result?;
+        let stderr = stderr_result?;
+        let status = status.ok_or_else(|| {
+            invalid_input(format!(
+                "could not {action}: child exited without a reapable status"
+            ))
+        })?;
+        let output = Output {
+            status,
+            stdout,
+            stderr,
+        };
+        if timed_out {
+            return Err(command_timeout(action, timeout, &output, cleanup.as_ref()));
+        }
+        Ok(output)
     })
+}
+
+struct ServiceChildSettlement {
+    status: Option<ExitStatus>,
+    cleanup: TerminationOutcome,
+    error: Option<String>,
+}
+
+fn terminate_and_reap_service_child(
+    child: &mut Child,
+    terminator: &dyn ChildTerminator,
+    termination_grace: Duration,
+) -> ServiceChildSettlement {
+    let cleanup = terminator.terminate(termination_grace);
+    let mut errors = Vec::new();
+    if matches!(cleanup, TerminationOutcome::Failed(_))
+        && let Err(source) = child.kill()
+    {
+        errors.push(format!("fallback kill failed: {source}"));
+    }
+    let status = match child.wait() {
+        Ok(status) => Some(status),
+        Err(source) => {
+            errors.push(format!("child reap failed: {source}"));
+            None
+        }
+    };
+    ServiceChildSettlement {
+        status,
+        cleanup,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+fn read_bounded_service_output(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bounded = HeadTailBuffer::new(SERVICE_MANAGER_OUTPUT_LIMIT_BYTES);
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        bounded.push(&chunk[..read]);
+    }
+    Ok(bounded.render(None).into_bytes())
+}
+
+fn join_bounded_service_output(
+    reader: std::thread::ScopedJoinHandle<'_, std::io::Result<Vec<u8>>>,
+    action: &str,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| invalid_input(format!("could not {action}: {stream} reader panicked")))?
+        .map_err(|source| {
+            invalid_input(format!(
+                "could not {action}: failed to capture bounded {stream}: {source}"
+            ))
+        })
 }
 
 fn output_label(output: &Output, fallback: &str) -> String {
@@ -1778,19 +1958,40 @@ fn refuse_unavailable_manager(action: &str, output: &Output) -> Result<()> {
 }
 
 fn command_failure(action: &str, output: &Output) -> CliError {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let detail = if !stderr.trim().is_empty() {
-        stderr.trim()
-    } else if !stdout.trim().is_empty() {
-        stdout.trim()
-    } else {
-        "service manager returned no diagnostic"
-    };
+    let detail = command_output_detail(output);
     invalid_input(format!(
         "could not {action} (exit {}): {detail}",
         output.status
     ))
+}
+
+fn command_timeout(
+    action: &str,
+    timeout: Duration,
+    output: &Output,
+    cleanup: Option<&TerminationOutcome>,
+) -> CliError {
+    let detail = command_output_detail(output);
+    let cleanup = match cleanup {
+        Some(TerminationOutcome::Failed(reason)) => format!("; cleanup warning: {reason}"),
+        _ => String::new(),
+    };
+    invalid_input(format!(
+        "could not {action}: command exceeded {:.3} seconds and was terminated: {detail}{cleanup}",
+        timeout.as_secs_f64()
+    ))
+}
+
+fn command_output_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        "service manager returned no diagnostic".to_string()
+    }
 }
 
 fn write_unit_atomically(path: &Path, contents: &[u8]) -> Result<()> {
@@ -2220,6 +2421,73 @@ mod tests {
         assert_eq!(attempts, 1);
         assert!(delays.is_empty());
         assert!(error.to_string().contains("could not be executed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_manager_command_timeout_returns_promptly_and_reaps_the_child() {
+        use nix::errno::Errno;
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use nix::unistd::Pid;
+
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(SERVICE_MANAGER_COMMAND_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(SERVICE_MANAGER_TERMINATION_GRACE, Duration::from_secs(2));
+        let pid_path = temp.path().join("service-manager-child.pid");
+        let pid_path_text = pid_path.to_str().expect("UTF-8 pid path");
+        let started = Instant::now();
+        let error = run_service_manager_command(
+            "/bin/sh",
+            [
+                "-c",
+                "printf '%s' \"$$\" > \"$1\"; printf 'timeout diagnostic' >&2; exec sleep 60",
+                "deadreckon-service-manager-timeout",
+                pid_path_text,
+            ],
+            "exercise the bounded service manager",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+        )
+        .expect_err("hung service-manager child must time out");
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(error.to_string().contains("command exceeded"));
+        assert!(error.to_string().contains("timeout diagnostic"));
+        let pid = fs::read_to_string(&pid_path)
+            .expect("child pid evidence")
+            .parse::<i32>()
+            .expect("child pid");
+        assert_eq!(
+            waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)),
+            Err(Errno::ECHILD),
+            "the timed-out direct child must already be reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_manager_command_output_is_bounded_with_head_and_tail() {
+        let output = run_service_manager_command(
+            "/bin/sh",
+            [
+                "-c",
+                "printf 'HEAD'; i=0; while [ \"$i\" -lt 10000 ]; do printf '0123456789'; i=$((i + 1)); done; printf 'TAIL'; printf 'stderr tail' >&2",
+            ],
+            "exercise bounded service-manager output",
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .expect("bounded output command");
+
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 bounded stdout");
+        assert!(stdout.starts_with("HEAD"));
+        assert!(stdout.ends_with("TAIL"));
+        assert!(stdout.contains("bytes omitted"));
+        assert!(stdout.len() <= SERVICE_MANAGER_OUTPUT_LIMIT_BYTES + 128);
+        assert_eq!(
+            String::from_utf8(output.stderr).expect("UTF-8 bounded stderr"),
+            "stderr tail"
+        );
     }
 
     #[test]

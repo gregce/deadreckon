@@ -843,6 +843,110 @@ struct PlannerDraftBatch {
     accounting: Option<PlannerAccounting>,
 }
 
+// A root planner is one bounded, read-only provider turn. Ten minutes leaves
+// subscription CLIs room for cold start, compaction, and a substantial graph,
+// while still preventing a stalled planner from consuming an ordinary
+// ten-hour Job allowance before the first Plan artifact exists.
+const ROOT_PLANNER_WALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const ROOT_PLANNER_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+enum RootPlannerWait<T> {
+    Completed(T),
+    TimedOut { cleanup_proven: bool },
+}
+
+fn root_planner_allocation_at(
+    job_deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<std::time::Duration> {
+    let remaining = match job_deadline {
+        Some(deadline) => deadline.signed_duration_since(now).to_std().ok()?,
+        None => ROOT_PLANNER_WALL_TIMEOUT,
+    };
+    (!remaining.is_zero()).then_some(remaining.min(ROOT_PLANNER_WALL_TIMEOUT))
+}
+
+fn current_root_planner_allocation(paths: &DeadreckonPaths) -> Result<std::time::Duration> {
+    let job_deadline = commands::graph_job::current_parent_job_id()
+        .map(|job_id| deadreckon_core::load_job(paths, job_id))
+        .transpose()?
+        .and_then(|job| job.policy.deadline);
+    root_planner_allocation_at(job_deadline, Utc::now()).ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            "the approved Job deadline elapsed before the root planner could start",
+            "choose a later --deadline and start a new Job",
+        ))
+    })
+}
+
+fn root_planner_pid_file(paths: &DeadreckonPaths) -> PathBuf {
+    let name = format!("root-planner-{}.pid", Uuid::new_v4().simple());
+    commands::graph_job::current_parent_job_id().map_or_else(
+        || std::env::temp_dir().join(format!("deadreckon-{name}")),
+        |job_id| paths.job_dir(job_id).join(&name),
+    )
+}
+
+async fn await_root_planner<F, T>(
+    future: F,
+    token: &CancellationToken,
+    allocation: std::time::Duration,
+    cleanup: std::time::Duration,
+) -> RootPlannerWait<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        output = &mut future => RootPlannerWait::Completed(output),
+        () = tokio::time::sleep(allocation) => {
+            token.cancel();
+            let cleanup_proven = tokio::time::timeout(cleanup, &mut future).await.is_ok();
+            RootPlannerWait::TimedOut { cleanup_proven }
+        }
+    }
+}
+
+fn root_planner_timeout_error(
+    allocation: std::time::Duration,
+    pid_file: &Path,
+    cleanup_proven: bool,
+) -> CliError {
+    let cleanup = if cleanup_proven {
+        String::new()
+    } else {
+        format!(
+            "; provider cleanup was not proven and its process authority remains at {}",
+            pid_file.display()
+        )
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "root graph planner timed out after {:.1}s{cleanup}",
+            allocation.as_secs_f64()
+        ),
+        if cleanup_proven {
+            "retry the Job or choose a different planner provider"
+        } else {
+            "inspect the retained process record, then run deadreckon doctor before retrying"
+        },
+    ))
+}
+
+fn prove_root_planner_cleanup(pid_file: &Path) -> Result<()> {
+    if !pid_file.exists() {
+        return Ok(());
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "root graph planner returned, but provider cleanup was not proven; its process authority remains at {}",
+            pid_file.display()
+        ),
+        "inspect the retained process record, then run deadreckon doctor before retrying",
+    )))
+}
+
 async fn provider_plan_drafts(
     paths: &DeadreckonPaths,
     goal: &str,
@@ -854,12 +958,37 @@ async fn provider_plan_drafts(
 ) -> Result<PlannerDraftBatch> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), planner_provider)?;
     let prompt = planner_prompt(goal, n);
-    let request =
+    let allocation = current_root_planner_allocation(paths)?;
+    let token = CancellationToken::new();
+    let pid_file = root_planner_pid_file(paths);
+    let mut request =
         ProviderRequest::enforceably_read_only_with_backend(prompt, 4096, cwd, sandbox_backend);
+    request.pid_file = Some(pid_file.clone());
+    request.cancellation_token = Some(token.clone());
     let started = std::time::Instant::now();
-    let response =
-        maybe_with_cli_wait_status(!plain, "planning child graph", router.complete(&request))
-            .await?;
+    let response = await_root_planner(
+        maybe_with_cli_wait_status(!plain, "planning child graph", router.complete(&request)),
+        &token,
+        allocation,
+        ROOT_PLANNER_CLEANUP_TIMEOUT,
+    )
+    .await;
+    let response = match response {
+        RootPlannerWait::Completed(response) => {
+            // Prove cleanup before interpreting either success or provider
+            // failure. A provider error must not hide a still-live process.
+            prove_root_planner_cleanup(&pid_file)?;
+            response?
+        }
+        RootPlannerWait::TimedOut { cleanup_proven } => {
+            let cleanup_proven = cleanup_proven && !pid_file.exists();
+            return Err(root_planner_timeout_error(
+                allocation,
+                &pid_file,
+                cleanup_proven,
+            ));
+        }
+    };
     let drafts = parse_planner_response(&response.content)?;
     Ok(PlannerDraftBatch {
         drafts,
@@ -5767,6 +5896,104 @@ mod tests {
     use deadreckon_protocol::JobId;
 
     use super::*;
+
+    #[test]
+    fn root_planner_uses_ten_minutes_or_the_remaining_job_deadline() {
+        let now = DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+            .expect("fixed time")
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            root_planner_allocation_at(None, now),
+            Some(std::time::Duration::from_secs(10 * 60))
+        );
+        assert_eq!(
+            root_planner_allocation_at(Some(now + chrono::Duration::seconds(90)), now),
+            Some(std::time::Duration::from_secs(90))
+        );
+        assert_eq!(
+            root_planner_allocation_at(Some(now + chrono::Duration::minutes(20)), now),
+            Some(std::time::Duration::from_secs(10 * 60))
+        );
+        assert_eq!(root_planner_allocation_at(Some(now), now), None);
+        assert_eq!(
+            root_planner_allocation_at(Some(now - chrono::Duration::seconds(1)), now),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn root_planner_timeout_cancels_and_proves_cooperative_cleanup() {
+        let token = CancellationToken::new();
+        let observed = token.clone();
+        let outcome = await_root_planner(
+            async move {
+                observed.cancelled().await;
+                "cancelled"
+            },
+            &token,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(token.is_cancelled());
+        assert_eq!(
+            outcome,
+            RootPlannerWait::TimedOut {
+                cleanup_proven: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn root_planner_timeout_fails_closed_when_cleanup_does_not_finish() {
+        let token = CancellationToken::new();
+        let outcome = await_root_planner(
+            std::future::pending::<()>(),
+            &token,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(token.is_cancelled());
+        assert_eq!(
+            outcome,
+            RootPlannerWait::TimedOut {
+                cleanup_proven: false
+            }
+        );
+    }
+
+    #[test]
+    fn unproven_root_planner_cleanup_names_the_retained_authority() {
+        let record = Path::new("/tmp/deadreckon-root-planner-test.pid");
+        let rendered =
+            root_planner_timeout_error(std::time::Duration::from_secs(600), record, false)
+                .to_string();
+
+        assert!(rendered.contains("root graph planner timed out after 600.0s"));
+        assert!(rendered.contains("cleanup was not proven"));
+        assert!(rendered.contains(&record.display().to_string()));
+    }
+
+    #[test]
+    fn completed_root_planner_must_remove_its_process_authority() {
+        let temp = tempfile::tempdir().expect("temp");
+        let record = temp.path().join("root-planner.pid");
+        std::fs::write(&record, "still authoritative").expect("process record");
+
+        let rendered = prove_root_planner_cleanup(&record)
+            .expect_err("retained process authority must fail closed")
+            .to_string();
+        assert!(rendered.contains("provider cleanup was not proven"));
+        assert!(rendered.contains(&record.display().to_string()));
+        assert!(record.exists(), "authority evidence must be retained");
+
+        std::fs::remove_file(&record).expect("remove test record");
+        prove_root_planner_cleanup(&record).expect("missing authority proves cleanup");
+    }
 
     #[test]
     fn preflight_warning_footer_uses_inspection_guidance_not_primary_action() {

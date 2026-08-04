@@ -403,6 +403,10 @@ pub struct JobLease {
     pub expires_at: DateTime<Utc>,
     pub boot_id: String,
     pub pid: u32,
+    /// Same-boot process identity captured when the lease was acquired. Old
+    /// checkpoints omit it and retain expiry-only recovery semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_identity: Option<String>,
     pub process_group: u32,
     pub child_pid: Option<u32>,
 }

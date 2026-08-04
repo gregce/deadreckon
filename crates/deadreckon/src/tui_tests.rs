@@ -2921,15 +2921,15 @@ fn planner_timeout_gives_cli_routes_room_to_answer() {
     // response. The phase remains bounded and cancellation is reconciled.
     assert_eq!(
         super::commands::start::course_planner_timeout("cli:claude-code").as_secs(),
-        60
+        120
     );
     assert_eq!(
         super::commands::start::course_planner_timeout("cli:codex").as_secs(),
-        60
+        120
     );
     assert_eq!(
         super::commands::start::course_planner_timeout("anthropic").as_secs(),
-        15
+        30
     );
 }
 
