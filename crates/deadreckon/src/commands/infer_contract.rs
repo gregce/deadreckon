@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use deadreckon_core::gate::{AcceptanceCheck, AcceptanceSpec};
-use deadreckon_providers::{ProviderRequest, ProviderRouter};
+use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderRouter};
+use tokio_util::sync::CancellationToken;
 
 /// A model's proposed contract for an unknown tree. The model proposes; it does
 /// not decide — approval and arming happen elsewhere.
@@ -36,6 +37,9 @@ pub(crate) enum InferenceOutcome {
 
 /// Confidence below this is treated as no usable proposal (falls back to caveat).
 const MIN_CONFIDENCE: f32 = 0.3;
+const INFER_CONTRACT_CLI_WALL_SECONDS: u64 = 300;
+const INFER_CONTRACT_HTTP_WALL_SECONDS: u64 = 120;
+const INFER_CONTRACT_CLEANUP_GRACE_SECONDS: u64 = 30;
 
 /// Whether `--infer-contract` may run: opted in, the floor returned `Unknown`,
 /// and the surface allows an interactive human approval. Never under
@@ -168,20 +172,83 @@ pub(crate) fn parse_proposed_contract(content: &str) -> Option<ProposedContract>
 
 use crate::commands;
 
+#[derive(Debug, PartialEq, Eq)]
+enum InferredContractWait<T> {
+    Completed(T),
+    TimedOut { cleanup_proven: bool },
+}
+
+fn infer_contract_timeout(kind: Option<&ProviderKind>) -> Duration {
+    let seconds = if kind.is_some_and(provider_kind_uses_cli_process) {
+        INFER_CONTRACT_CLI_WALL_SECONDS
+    } else {
+        INFER_CONTRACT_HTTP_WALL_SECONDS
+    };
+    Duration::from_secs(seconds)
+}
+
+fn provider_kind_uses_cli_process(kind: &ProviderKind) -> bool {
+    matches!(kind, ProviderKind::CliClaudeCode | ProviderKind::CliCodex)
+        || matches!(kind, ProviderKind::Generic(id) if id.starts_with("cli:"))
+}
+
+async fn await_inferred_contract<F, T>(
+    future: F,
+    token: &CancellationToken,
+    allocation: Duration,
+    cleanup_grace: Duration,
+) -> InferredContractWait<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(future);
+    tokio::select! {
+        output = &mut future => InferredContractWait::Completed(output),
+        () = tokio::time::sleep(allocation) => {
+            token.cancel();
+            let cleanup_proven = tokio::time::timeout(cleanup_grace, &mut future).await.is_ok();
+            InferredContractWait::TimedOut { cleanup_proven }
+        }
+    }
+}
+
 /// Call the cheap-model router with the redacted prompt; `None` on
-/// no-provider/timeout/parse-failure/low-confidence — inference never fails a run.
+/// no-provider/timeout/parse-failure/low-confidence — inference never fails a
+/// run. As with the root planner, timeout cancellation gets a separate bounded
+/// cleanup window and process authority is retained unless exit is proven.
 pub(crate) async fn propose_contract(
     config_path: &Path,
     provider: &str,
     working_dir: &Path,
 ) -> Option<ProposedContract> {
     let router = ProviderRouter::from_config_path(config_path, Some(provider)).ok()?;
-    let request =
+    let route_kind = router.selected_route_info().map(|route| route.kind);
+    let token = CancellationToken::new();
+    let pid_file = std::env::temp_dir().join(format!(
+        "deadreckon-infer-contract-{}.pid",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut request =
         ProviderRequest::enforceably_read_only(infer_prompt(working_dir), 512, working_dir);
-    let response = tokio::time::timeout(Duration::from_secs(8), router.complete(&request))
-        .await
-        .ok()?
-        .ok()?;
+    request.pid_file = Some(pid_file.clone());
+    request.cancellation_token = Some(token.clone());
+    let response = match await_inferred_contract(
+        router.complete(&request),
+        &token,
+        infer_contract_timeout(route_kind.as_ref()),
+        Duration::from_secs(INFER_CONTRACT_CLEANUP_GRACE_SECONDS),
+    )
+    .await
+    {
+        InferredContractWait::Completed(response) if !pid_file.exists() => response.ok()?,
+        InferredContractWait::Completed(_) => return None,
+        InferredContractWait::TimedOut { cleanup_proven }
+            if cleanup_proven && !pid_file.exists() =>
+        {
+            return None;
+        }
+        InferredContractWait::TimedOut { .. } => return None,
+    };
     let proposal = parse_proposed_contract(&response.content)?;
     if proposal.confidence < MIN_CONFIDENCE {
         return None;
@@ -216,6 +283,53 @@ mod tests {
         assert!(!infer_contract_eligible(
             true, true, false, false, false, false
         ));
+    }
+
+    #[test]
+    fn inferred_contract_budgets_follow_the_resolved_provider_route() {
+        assert_eq!(
+            infer_contract_timeout(Some(&ProviderKind::CliCodex)).as_secs(),
+            300
+        );
+        assert_eq!(
+            infer_contract_timeout(Some(&ProviderKind::CliClaudeCode)).as_secs(),
+            300
+        );
+        assert_eq!(
+            infer_contract_timeout(Some(&ProviderKind::OpenAi)).as_secs(),
+            120
+        );
+        assert_eq!(infer_contract_timeout(None).as_secs(), 120);
+    }
+
+    #[test]
+    fn inferred_contract_treats_generic_cli_routes_as_cli_processes() {
+        assert_eq!(
+            infer_contract_timeout(Some(&ProviderKind::Generic("cli:codex-server".to_string())))
+                .as_secs(),
+            300
+        );
+    }
+
+    #[tokio::test]
+    async fn inferred_contract_timeout_cancels_then_bounds_cleanup() {
+        let token = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let outcome = await_inferred_contract(
+            std::future::pending::<()>(),
+            &token,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            InferredContractWait::TimedOut {
+                cleanup_proven: false
+            }
+        );
+        assert!(token.is_cancelled());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
