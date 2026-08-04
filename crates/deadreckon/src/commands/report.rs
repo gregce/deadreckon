@@ -95,6 +95,7 @@ struct JobReport {
     outcome: Option<deadreckon_protocol::JobOutcome>,
     stop_reason: Option<deadreckon_protocol::StopReason>,
     lifecycle: JobLifecycleReport,
+    work_clock: Option<super::job::JobWorkClockProjection>,
     contract: JobContractReport,
     deterministic_checks: Vec<deadreckon_core::AcceptanceCheckResult>,
     semantic: JobSemanticReport,
@@ -147,7 +148,7 @@ struct JobResourceReport {
     semantic_judge_spend_usd: Option<f64>,
     input_tokens: u64,
     output_tokens: u64,
-    recorded_attempt_wall_secs: u64,
+    aggregate_worker_seconds: u64,
     lifecycle_elapsed_secs: Option<u64>,
     max_spend_usd: f64,
     max_wall_seconds: u64,
@@ -199,7 +200,7 @@ fn report_job_command(
     view: &deadreckon_core::JobView,
     args: ReportCommandArgs,
 ) -> Result<()> {
-    let report = build_job_report(paths, view);
+    let report = build_job_report(paths, view)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -240,7 +241,15 @@ fn report_job_command(
     Ok(())
 }
 
-fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> JobReport {
+fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> Result<JobReport> {
+    build_job_report_at(paths, view, chrono::Utc::now())
+}
+
+fn build_job_report_at(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<JobReport> {
     let job_id = view.job.job_id.as_ref();
     let mut missing = MissingEvidenceReport::default();
     let authority_path = paths.job_authority(job_id);
@@ -353,7 +362,7 @@ fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
         .iter()
         .map(|attempt| attempt.spend.output_tokens)
         .sum();
-    let recorded_attempt_wall_secs = supporting.scheduler_wall_secs.unwrap_or_else(|| {
+    let aggregate_worker_seconds = supporting.scheduler_worker_seconds.unwrap_or_else(|| {
         attempts
             .iter()
             .filter_map(|attempt| attempt.wall_secs)
@@ -369,7 +378,9 @@ fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
         .unwrap_or(u64::MAX)
     });
 
-    JobReport {
+    let work_clock = super::job::current_job_work_clock(paths, view, now)?;
+
+    Ok(JobReport {
         id: job_id.to_string(),
         goal: view.job.goal.clone(),
         shape: view.job.shape,
@@ -384,6 +395,7 @@ fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
             created_at: view.job.created_at,
             updated_at: view.projection.updated_at,
         },
+        work_clock,
         contract: JobContractReport {
             path: contract_path,
             approved_sha256: approved_contract_sha256,
@@ -405,7 +417,7 @@ fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
                 .map(|judgment| judgment.spend_usd),
             input_tokens,
             output_tokens,
-            recorded_attempt_wall_secs,
+            aggregate_worker_seconds,
             lifecycle_elapsed_secs,
             max_spend_usd: view.job.policy.max_spend_usd,
             max_wall_seconds: view.job.policy.max_wall_seconds,
@@ -428,13 +440,13 @@ fn build_job_report(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
             receipt,
         },
         missing_evidence: missing,
-    }
+    })
 }
 
 struct SupportingAttemptViews {
     views: Vec<deadreckon_core::RunView>,
     scheduler_spend_usd: Option<f64>,
-    scheduler_wall_secs: Option<u64>,
+    scheduler_worker_seconds: Option<u64>,
 }
 
 fn supporting_attempt_views(
@@ -458,7 +470,7 @@ fn supporting_attempt_views(
                     return SupportingAttemptViews {
                         views,
                         scheduler_spend_usd: None,
-                        scheduler_wall_secs: None,
+                        scheduler_worker_seconds: None,
                     };
                 }
             };
@@ -468,7 +480,7 @@ fn supporting_attempt_views(
                     .map(|task| task.attempts_spend_usd())
                     .sum(),
             );
-            let scheduler_wall_secs = Some(
+            let scheduler_worker_seconds = Some(
                 plan.tasks
                     .iter()
                     .map(|task| task.attempts_wall_seconds())
@@ -512,7 +524,7 @@ fn supporting_attempt_views(
             SupportingAttemptViews {
                 views,
                 scheduler_spend_usd,
-                scheduler_wall_secs,
+                scheduler_worker_seconds,
             }
         }
         deadreckon_protocol::JobShape::LegacyCampaign => {
@@ -522,14 +534,14 @@ fn supporting_attempt_views(
             SupportingAttemptViews {
                 views,
                 scheduler_spend_usd: None,
-                scheduler_wall_secs: None,
+                scheduler_worker_seconds: None,
             }
         }
         deadreckon_protocol::JobShape::Single | deadreckon_protocol::JobShape::LegacyChain => {
             SupportingAttemptViews {
                 views,
                 scheduler_spend_usd: None,
-                scheduler_wall_secs: None,
+                scheduler_worker_seconds: None,
             }
         }
     }
@@ -840,6 +852,15 @@ fn render_job_report_markdown(report: &JobReport) -> String {
         report.lifecycle.lease_epoch,
         report.lifecycle.last_event_sequence,
     ));
+    if let Some(clock) = report.work_clock.as_ref() {
+        out.push_str(&format!(
+            "- active Job elapsed: {:.3}s\n- Job work remaining: {:.3}s\n- Job work cutoff: {}\n- limiting boundary: {}\n",
+            clock.active_elapsed_seconds,
+            clock.remaining_seconds,
+            clock.cutoff.to_rfc3339(),
+            clock.limiting_boundary,
+        ));
+    }
 
     out.push_str("\n## Approved definition of done\n\n");
     out.push_str(&format!(
@@ -935,7 +956,7 @@ fn render_job_report_markdown(report: &JobReport) -> String {
     }
     for attempt in &report.attempts {
         out.push_str(&format!(
-            "- run {}: {}; provider {}; spend ${:.4}; wall {}\n",
+            "- run {}: {}; provider {}; spend ${:.4}; worker time {}\n",
             attempt.run_id,
             run_status_label(attempt.status),
             attempt.provider,
@@ -947,12 +968,12 @@ fn render_job_report_markdown(report: &JobReport) -> String {
         ));
     }
     out.push_str(&format!(
-        "- recorded spend: ${:.4} (limit ${:.4})\n- recorded tokens: {} input, {} output\n- recorded attempt wall: {}s (limit {}s)\n- lifecycle elapsed: {}\n- attempt limit: {}\n",
+        "- recorded spend: ${:.4} (limit ${:.4})\n- recorded tokens: {} input, {} output\n- aggregate worker-seconds: {}s\n- approved Job wall cap: {}s\n- lifecycle age through last event: {}\n- attempt limit: {}\n",
         report.resources.recorded_spend_usd,
         report.resources.max_spend_usd,
         report.resources.input_tokens,
         report.resources.output_tokens,
-        report.resources.recorded_attempt_wall_secs,
+        report.resources.aggregate_worker_seconds,
         report.resources.max_wall_seconds,
         report
             .resources
@@ -1203,6 +1224,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: Some(chrono::Utc::now()),
             },
+            work_clock: None,
             contract: JobContractReport {
                 path: PathBuf::from("/evidence/acceptance.yaml"),
                 approved_sha256: Some("contract-approved".to_string()),
@@ -1235,7 +1257,7 @@ mod tests {
                 semantic_judge_spend_usd: Some(0.02),
                 input_tokens: 120,
                 output_tokens: 45,
-                recorded_attempt_wall_secs: 9,
+                aggregate_worker_seconds: 9,
                 lifecycle_elapsed_secs: Some(10),
                 max_spend_usd: 2.0,
                 max_wall_seconds: 300,
@@ -1297,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_report_loads_plan_task_attempts_and_scheduler_spend() {
+    fn parallel_graph_report_separates_worker_seconds_from_authoritative_job_wall() {
         use deadreckon_core::plan::TaskAttempt;
         use deadreckon_core::{
             Plan, PlanMode, PlanProviders, PlanRole, PlanTask, RunOptions, create_run, save_plan,
@@ -1327,12 +1349,18 @@ mod tests {
         let mut first = PlanTask::new(0, "first", "child task", PlanRole::Coder, None);
         let mut attempt = TaskAttempt::new(1, Some(child.run_id.clone()));
         attempt.status = deadreckon_core::PlanTaskStatus::Completed;
-        attempt.finished_at = Some(attempt.started_at + chrono::Duration::seconds(7));
+        attempt.finished_at = Some(attempt.started_at + chrono::Duration::seconds(70));
         attempt.spend_usd = 0.37;
         first.attempts.push(attempt);
         first.child_run_id = Some(child.run_id.clone());
         first.child_scope = Some(child.scope.clone());
-        let second = PlanTask::new(1, "second", "later task", PlanRole::Reviewer, None);
+        let mut second = PlanTask::new(1, "second", "parallel task", PlanRole::Reviewer, None);
+        let mut second_attempt = TaskAttempt::new(1, None);
+        second_attempt.status = deadreckon_core::PlanTaskStatus::Completed;
+        second_attempt.finished_at =
+            Some(second_attempt.started_at + chrono::Duration::seconds(70));
+        second_attempt.spend_usd = 0.23;
+        second.attempts.push(second_attempt);
         let mut plan = Plan::new(
             "graph goal",
             PlanMode::FullPlan,
@@ -1346,38 +1374,56 @@ mod tests {
         save_plan(&paths, &plan).expect("save plan");
 
         let job_id = JobId(plan.plan_id.clone());
-        let view = deadreckon_core::JobView {
-            job: Job {
+        let now = chrono::Utc::now();
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            scope: child.scope,
+            goal: "graph goal".to_string(),
+            shape: JobShape::Graph,
+            created_at: now - chrono::TimeDelta::seconds(20),
+            source_cwd: cwd.path().to_path_buf(),
+            launch_plan_sha256: "launch".to_string(),
+            authority_sha256: "authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 2.0,
+                max_wall_seconds: 100,
+                max_attempts: 2,
+                deadline: None,
+                semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
+            },
+        };
+        deadreckon_core::write_job(&paths, &job).expect("Job");
+        deadreckon_core::append_job_event(
+            &paths,
+            &deadreckon_protocol::JobEvent {
                 schema_version: JobSchemaVersion::CURRENT,
                 job_id: job_id.clone(),
-                scope: child.scope,
-                goal: "graph goal".to_string(),
-                shape: JobShape::Graph,
-                created_at: chrono::Utc::now(),
-                source_cwd: cwd.path().to_path_buf(),
-                launch_plan_sha256: "launch".to_string(),
-                authority_sha256: "authority".to_string(),
-                policy: JobPolicy {
-                    max_spend_usd: 2.0,
-                    max_wall_seconds: 120,
-                    max_attempts: 2,
-                    deadline: None,
-                    semantic_judge: SemanticJudgeMode::Required,
-                    execution: None,
-                },
+                sequence: deadreckon_protocol::JobEventSequence::new(1).expect("sequence"),
+                event_id: "parallel-job-attempt".to_string(),
+                causation_id: "parallel-job-attempt".to_string(),
+                timestamp: now - chrono::TimeDelta::seconds(20),
+                lease_epoch: 0,
+                kind: deadreckon_protocol::JobEventKind::AttemptStarted,
+                detail: json!({ "attempt": 1 }),
             },
+        )
+        .expect("attempt history");
+        let view = deadreckon_core::JobView {
+            job,
             projection: deadreckon_core::JobProjection {
                 schema_version: JobSchemaVersion::CURRENT,
                 job_id,
                 phase: deadreckon_protocol::JobPhase::Running,
                 outcome: None,
                 stop_reason: None,
-                last_sequence: 5,
+                last_sequence: 1,
                 current_lease_epoch: 1,
                 attempt_count: 1,
                 child_run_ids: Vec::new(),
                 delivery: None,
-                updated_at: Some(chrono::Utc::now()),
+                updated_at: Some(now),
                 caveats: Vec::new(),
             },
             attempts: Vec::new(),
@@ -1390,8 +1436,65 @@ mod tests {
 
         assert_eq!(supporting.views.len(), 1);
         assert_eq!(supporting.views[0].id.run_id, child.run_id);
-        assert_eq!(supporting.scheduler_spend_usd, Some(0.37));
-        assert_eq!(supporting.scheduler_wall_secs, Some(7));
+        assert_eq!(supporting.scheduler_spend_usd, Some(0.60));
+        assert_eq!(supporting.scheduler_worker_seconds, Some(140));
+
+        let report = build_job_report_at(&paths, &view, now).expect("factual Job report");
+        let clock = report.work_clock.as_ref().expect("live work clock");
+        assert_eq!(report.resources.aggregate_worker_seconds, 140);
+        assert_eq!(clock.active_elapsed_seconds, 20.0);
+        assert_eq!(clock.remaining_seconds, 80.0);
+        assert_eq!(clock.cutoff, now + chrono::TimeDelta::seconds(80));
+        assert_eq!(clock.limiting_boundary, "wall_cap");
+
+        let markdown = render_job_report_markdown(&report);
+        assert!(
+            markdown.contains("aggregate worker-seconds: 140s"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("active Job elapsed: 20.000s"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("Job work remaining: 80.000s"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(&format!(
+                "Job work cutoff: {}",
+                (now + chrono::TimeDelta::seconds(80)).to_rfc3339()
+            )),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("limiting boundary: wall_cap"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("approved Job wall cap: 100s"),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("recorded attempt wall"), "{markdown}");
+        assert!(!markdown.contains("140s (limit 100s)"), "{markdown}");
+
+        let json = serde_json::to_value(&report).expect("Job report JSON");
+        assert_eq!(json["resources"]["aggregate_worker_seconds"], json!(140));
+        assert_eq!(json["work_clock"]["active_elapsed_seconds"], json!(20.0));
+        assert_eq!(json["work_clock"]["remaining_seconds"], json!(80.0));
+        assert_eq!(
+            json["work_clock"]["cutoff"],
+            json!(now + chrono::TimeDelta::seconds(80))
+        );
+        assert_eq!(json["work_clock"]["limiting_boundary"], json!("wall_cap"));
+
+        let history_path = paths.job_events(view.job.job_id.as_ref());
+        let mut corrupt = fs::read(&history_path).expect("Job history");
+        corrupt.extend_from_slice(b"{not-json}\n");
+        fs::write(&history_path, corrupt).expect("corrupt Job history");
+        let error = build_job_report_at(&paths, &view, now)
+            .expect_err("report timing must fail closed on corrupt history");
+        assert!(error.to_string().contains("job history corrupt"), "{error}");
     }
 
     #[test]
