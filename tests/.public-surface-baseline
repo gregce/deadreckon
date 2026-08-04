@@ -392,6 +392,7 @@ crate: deadreckon-core
   state::RunStatus
   state::save_state
   workspace_capture::capture_workspace
+  workspace_capture::capture_workspace_strict
   workspace_capture::CaptureBudgets
   workspace_capture::CaptureEntry
   workspace_capture::CaptureEntryKind
@@ -402,7 +403,9 @@ crate: deadreckon-core
   workspace_capture::CapturePurpose
   workspace_capture::EncodedWorkspacePath
   workspace_capture::ensure_workspace_capture_policy
+  workspace_capture::freeze_git_hydration
   workspace_capture::freeze_workspace_capture_policy
+  workspace_capture::FrozenGitHydration
   workspace_capture::GeneratedOutputRoot
   workspace_capture::GeneratedOutputSource
   workspace_capture::GitHydrationState
@@ -411,6 +414,8 @@ crate: deadreckon-core
   workspace_capture::materialize_capture_plan_with_blob_store
   workspace_capture::read_capture_manifest
   workspace_capture::read_workspace_capture_policy
+  workspace_capture::require_frozen_git_hydration
+  workspace_capture::require_workspace_capture_policy
   workspace_capture::SOURCE_HYDRATION_MANIFEST_JSON
   workspace_capture::workspace_capture_policy_path
   workspace_capture::WorkspaceCaptureManifest
@@ -437,6 +442,10 @@ crate: deadreckon-providers
   narrator::select_narrator_backend
   narrator::select_narrator_route
   output_schema::validate_openai_strict_output_schema
+  phase_boundary::complete_provider_phase
+  phase_boundary::ProviderCleanup
+  phase_boundary::ProviderPhaseDeadline
+  phase_boundary::ProviderPhaseOutcome
   registry::ModelCatalogOverride
   registry::ModelEntry
   router::ModelContextWindowSource
@@ -446,6 +455,7 @@ crate: deadreckon-providers
   types::ProviderEntry
   types::ProviderFuture
   types::ProviderKind
+  types::ProviderProcessLifetime
   types::ProviderRequest
   types::ProviderResponse
   types::ProviderRouteInfo
@@ -465,6 +475,7 @@ crate: deadreckon-protocol
   job::DOCKER_GATE_GUEST_PATH
   job::DockerGateIdentity
   job::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION
+  job::GATE_EVALUATOR_PROTOCOL_MARKER
   job::GATE_EVALUATOR_PROTOCOL_VERSION
   job::GateBinaryIdentity
   job::GateEvaluatorIdentity

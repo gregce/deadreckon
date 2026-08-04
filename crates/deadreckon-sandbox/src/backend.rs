@@ -19,6 +19,8 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
     #[error("sandboxed command cancelled")]
     Cancelled,
+    #[error("sandbox cleanup incomplete: {0}")]
+    CleanupIncomplete(String),
 }
 
 impl SandboxError {
@@ -31,6 +33,7 @@ impl SandboxError {
             SandboxError::InvalidDockerExecution(_) => false,
             SandboxError::Io(source) => is_retryable_io_kind(source.kind()),
             SandboxError::Cancelled => false,
+            SandboxError::CleanupIncomplete(_) => false,
         }
     }
 
@@ -43,6 +46,7 @@ impl SandboxError {
             SandboxError::InvalidDockerExecution(_) => true,
             SandboxError::Io(source) => !is_retryable_io_kind(source.kind()),
             SandboxError::Cancelled => true,
+            SandboxError::CleanupIncomplete(_) => true,
         }
     }
 }
@@ -195,4 +199,19 @@ fn backend_candidates(backend: SandboxBackend) -> &'static [&'static str] {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn backend_candidates(_backend: SandboxBackend) -> &'static [&'static str] {
     &[]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SandboxError;
+
+    #[test]
+    fn incomplete_cleanup_is_fatal_and_never_retryable() {
+        let error = SandboxError::CleanupIncomplete(
+            "retained process authority after cleanup deadline".to_string(),
+        );
+
+        assert!(error.is_fatal());
+        assert!(!error.is_retryable());
+    }
 }

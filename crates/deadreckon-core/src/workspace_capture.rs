@@ -23,7 +23,8 @@ use tempfile::NamedTempFile;
 
 use crate::artifact_policy::{
     WorkspacePathClass, classify_workspace_path, is_checkpointable_workspace_path,
-    is_deliverable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
+    is_deliverable_workspace_path, is_promotable_workspace_path, is_recoverable_workspace_path,
+    runtime_output_root,
 };
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::git::run_git;
@@ -34,6 +35,7 @@ pub const SOURCE_HYDRATION_MANIFEST_JSON: &str = "source-hydration-manifest.json
 pub const WORKSPACE_BLOBS_DIR: &str = "workspace-blobs";
 pub const WORKSPACE_CAPTURE_POLICY_VERSION: u32 = 1;
 pub const WORKSPACE_CAPTURE_MANIFEST_VERSION: u32 = 1;
+pub const FROZEN_GIT_HYDRATION_VERSION: u32 = 1;
 
 const DEFAULT_MAX_FILES: u64 = 100_000;
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -55,6 +57,14 @@ pub struct WorkspaceCapturePolicy {
     pub schema_version: u32,
     pub frozen_at: DateTime<Utc>,
     pub ignores: Vec<FrozenIgnoreSource>,
+    /// Controller-owned Git identity captured before provider work begins.
+    ///
+    /// Older version-1 policies predate this explicit record. Compatibility
+    /// captures may use their legacy frozen fields, but strict lifecycle paths
+    /// must require this record rather than silently consulting the live,
+    /// agent-visible Git control plane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_git_hydration: Option<FrozenGitHydration>,
     pub frozen_tracked_paths: Vec<EncodedWorkspacePath>,
     pub output_roots: Vec<GeneratedOutputRoot>,
     pub budgets: CaptureBudgets,
@@ -64,6 +74,22 @@ pub struct WorkspaceCapturePolicy {
     pub frozen_git_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen_git_index_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenGitHydration {
+    pub schema_version: u32,
+    pub frozen_at: DateTime<Utc>,
+    /// True when `root` was a Git worktree at the trusted freeze boundary.
+    /// A false value is still an affirmative controller observation, allowing
+    /// strict capture of plain directories without treating them as a missing
+    /// hydration record.
+    pub repository: bool,
+    pub tracked_paths: Vec<EncodedWorkspacePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +203,7 @@ pub enum CaptureProjection {
     Recoverable,
     Checkpoint,
     Deliverable,
+    Promotable,
     WorkspaceGuard,
 }
 
@@ -188,6 +215,7 @@ pub enum CapturePurpose {
     FlightCheckpoint,
     WorkingInventory,
     DeliverableIndex,
+    PromotionCandidate,
     WorkspaceGuard,
 }
 
@@ -385,25 +413,60 @@ pub fn workspace_capture_policy_path(run_root: &Path) -> PathBuf {
     run_root.join(WORKSPACE_CAPTURE_POLICY_JSON)
 }
 
+/// Capture Git hydration authority while the workspace is still trusted.
+///
+/// This is the only API in this module that reads Git's live HEAD, index, and
+/// tracked-path set for capture classification. Later workspace captures must
+/// consume this frozen record and must not merge information from an
+/// agent-editable `.git` directory or file.
+pub fn freeze_git_hydration(root: &Path) -> Result<FrozenGitHydration> {
+    let frozen_at = Utc::now();
+    let repository = git_repository_detected(root)?;
+    if !repository {
+        return Ok(FrozenGitHydration {
+            schema_version: FROZEN_GIT_HYDRATION_VERSION,
+            frozen_at,
+            repository: false,
+            tracked_paths: Vec::new(),
+            head: None,
+            index_sha256: None,
+        });
+    }
+
+    let tracked_paths = git_tracked_paths(root)?
+        .iter()
+        .map(|path| EncodedWorkspacePath::from_path(path))
+        .collect();
+    let (head, index_sha256) = git_hydration_identity(root);
+    let hydration = FrozenGitHydration {
+        schema_version: FROZEN_GIT_HYDRATION_VERSION,
+        frozen_at,
+        repository: true,
+        tracked_paths,
+        head,
+        index_sha256,
+    };
+    validate_frozen_git_hydration(&hydration)?;
+    Ok(hydration)
+}
+
 pub fn freeze_workspace_capture_policy(root: &Path) -> Result<WorkspaceCapturePolicy> {
+    let frozen_at = Utc::now();
+    let hydration = freeze_git_hydration(root)?;
     let mut discovery = discover_policy_inputs(root);
     freeze_git_exclude_sources(root, &mut discovery);
-    let tracked = git_tracked_paths(root)?;
-    let (git_head, git_index_sha256) = git_hydration_identity(root);
     let output_roots = discover_output_roots(root, &discovery.markers, &mut discovery.warnings);
     Ok(WorkspaceCapturePolicy {
         schema_version: WORKSPACE_CAPTURE_POLICY_VERSION,
-        frozen_at: Utc::now(),
+        frozen_at,
         ignores: discovery.ignores,
-        frozen_tracked_paths: tracked
-            .iter()
-            .map(|path| EncodedWorkspacePath::from_path(path))
-            .collect(),
+        frozen_git_hydration: Some(hydration.clone()),
+        frozen_tracked_paths: hydration.tracked_paths.clone(),
         output_roots,
         budgets: CaptureBudgets::default(),
         warnings: discovery.warnings,
-        frozen_git_head: git_head,
-        frozen_git_index_sha256: git_index_sha256,
+        frozen_git_head: hydration.head.clone(),
+        frozen_git_index_sha256: hydration.index_sha256.clone(),
     })
 }
 
@@ -417,7 +480,7 @@ pub fn write_workspace_capture_policy(
 pub fn read_workspace_capture_policy(run_root: &Path) -> Result<WorkspaceCapturePolicy> {
     let path = workspace_capture_policy_path(run_root);
     let raw = fs::read(&path).with_path(&path)?;
-    let policy: WorkspaceCapturePolicy = serde_json::from_slice(&raw).with_json_path(&path)?;
+    let mut policy: WorkspaceCapturePolicy = serde_json::from_slice(&raw).with_json_path(&path)?;
     if policy.schema_version != WORKSPACE_CAPTURE_POLICY_VERSION {
         return Err(DeadreckonError::InvalidInput(format!(
             "unsupported workspace capture policy version {} at {}",
@@ -425,6 +488,20 @@ pub fn read_workspace_capture_policy(run_root: &Path) -> Result<WorkspaceCapture
             path.display()
         )));
     }
+    if policy.frozen_git_hydration.is_none() {
+        let repository = policy.frozen_git_index_sha256.is_some()
+            || policy.frozen_git_head.is_some()
+            || !policy.frozen_tracked_paths.is_empty();
+        policy.frozen_git_hydration = Some(FrozenGitHydration {
+            schema_version: FROZEN_GIT_HYDRATION_VERSION,
+            frozen_at: policy.frozen_at,
+            repository,
+            tracked_paths: policy.frozen_tracked_paths.clone(),
+            head: policy.frozen_git_head.clone(),
+            index_sha256: policy.frozen_git_index_sha256.clone(),
+        });
+    }
+    require_frozen_git_hydration(&policy)?;
     Ok(policy)
 }
 
@@ -433,9 +510,63 @@ pub fn ensure_workspace_capture_policy(state: &PipelineState) -> Result<Workspac
     if path.is_file() {
         return read_workspace_capture_policy(&state.run_root);
     }
+    if state.turn != 0
+        || !matches!(
+            state.status,
+            crate::state::RunStatus::Pending | crate::state::RunStatus::Planned
+        )
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted workspace capture policy is missing at {}; refusing to reconstruct Git hydration after provider work may have begun",
+            path.display()
+        )));
+    }
     let policy = freeze_workspace_capture_policy(&state.working_dir)?;
     write_workspace_capture_policy(&state.run_root, &policy)?;
     Ok(policy)
+}
+
+/// Read a policy that was durably frozen by the controller before provider
+/// work. Unlike `ensure_workspace_capture_policy`, this never manufactures a
+/// policy from a potentially agent-mutated workspace.
+pub fn require_workspace_capture_policy(state: &PipelineState) -> Result<WorkspaceCapturePolicy> {
+    let path = workspace_capture_policy_path(&state.run_root);
+    if !path.is_file() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "trusted workspace capture policy is missing at {}; strict capture refuses to inspect live Git state",
+            path.display()
+        )));
+    }
+    let policy = read_workspace_capture_policy(&state.run_root)?;
+    require_frozen_git_hydration(&policy)?;
+    Ok(policy)
+}
+
+/// Require the explicit controller-owned Git hydration observation.
+///
+/// A record with `repository = false` is valid: it proves the controller saw
+/// a plain directory at the freeze boundary. Absence is not equivalent; it can
+/// mean an older or late-created policy and therefore fails closed.
+pub fn require_frozen_git_hydration(
+    policy: &WorkspaceCapturePolicy,
+) -> Result<&FrozenGitHydration> {
+    let hydration = policy.frozen_git_hydration.as_ref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "workspace capture policy has no controller-frozen Git hydration record; strict capture refuses to inspect live Git state"
+                .to_string(),
+        )
+    })?;
+    validate_frozen_git_hydration(hydration)?;
+    if policy.frozen_tracked_paths != hydration.tracked_paths
+        || policy.frozen_git_head != hydration.head
+        || policy.frozen_git_index_sha256 != hydration.index_sha256
+    {
+        return Err(DeadreckonError::InvalidInput(
+            "workspace capture policy disagrees with its controller-frozen Git hydration record"
+                .to_string(),
+        ));
+    }
+    Ok(hydration)
 }
 
 pub fn capture_workspace(
@@ -444,11 +575,46 @@ pub fn capture_workspace(
     projection: CaptureProjection,
     purpose: CapturePurpose,
 ) -> Result<WorkspaceCapturePlan> {
+    capture_workspace_inner(root, policy, projection, purpose, false)
+}
+
+/// Capture using only an explicit controller-frozen Git hydration record.
+///
+/// Strict run, snapshot, gate, and promotion paths should use this entrypoint.
+/// The compatibility `capture_workspace` wrapper also never reads live Git,
+/// but permits older policies whose frozen fields predate the explicit record.
+pub fn capture_workspace_strict(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+    projection: CaptureProjection,
+    purpose: CapturePurpose,
+) -> Result<WorkspaceCapturePlan> {
+    capture_workspace_inner(root, policy, projection, purpose, true)
+}
+
+fn capture_workspace_inner(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+    projection: CaptureProjection,
+    purpose: CapturePurpose,
+    require_hydration: bool,
+) -> Result<WorkspaceCapturePlan> {
     let started_at = Utc::now();
     let started = Instant::now();
     let policy_sha256 = policy_sha256(policy)?;
-    let mut tracked = decode_paths(&policy.frozen_tracked_paths)?;
-    tracked.extend(git_tracked_paths(root)?);
+    let explicit_hydration = if require_hydration {
+        Some(require_frozen_git_hydration(policy)?)
+    } else {
+        policy.frozen_git_hydration.as_ref()
+    };
+    if let Some(hydration) = explicit_hydration {
+        validate_frozen_git_hydration(hydration)?;
+    }
+    let tracked = decode_paths(
+        explicit_hydration.map_or(policy.frozen_tracked_paths.as_slice(), |hydration| {
+            hydration.tracked_paths.as_slice()
+        }),
+    )?;
     let tracked_directories = tracked_parent_directories(&tracked);
     let output_roots = decode_output_roots(&policy.output_roots)?;
     let ignores = Arc::new(compile_ignores(root, &policy.ignores)?);
@@ -677,7 +843,24 @@ pub fn capture_workspace(
     let partial = omissions
         .iter()
         .any(|omission| omission.reason.makes_partial());
-    let (head, index_sha256) = git_hydration_identity(root);
+    let (repository, head, index_sha256) = explicit_hydration.map_or_else(
+        || {
+            (
+                !tracked.is_empty()
+                    || policy.frozen_git_head.is_some()
+                    || policy.frozen_git_index_sha256.is_some(),
+                policy.frozen_git_head.clone(),
+                policy.frozen_git_index_sha256.clone(),
+            )
+        },
+        |hydration| {
+            (
+                hydration.repository,
+                hydration.head.clone(),
+                hydration.index_sha256.clone(),
+            )
+        },
+    );
     Ok(WorkspaceCapturePlan {
         entries,
         manifest: WorkspaceCaptureManifest {
@@ -692,7 +875,7 @@ pub fn capture_workspace(
             tracked_files,
             omissions,
             omissions_truncated,
-            git: (!tracked.is_empty() || head.is_some()).then_some(GitHydrationState {
+            git: repository.then_some(GitHydrationState {
                 head,
                 index_sha256,
                 tracked_files: tracked.len() as u64,
@@ -1481,6 +1664,7 @@ fn ignore_protected_capture_path(projection: CaptureProjection, relative: &Path)
         // `.deadreckon/`. Otherwise restore clears the record and loses the
         // codebase lineage needed by later lifecycle commands.
         (CaptureProjection::Recoverable, WorkspacePathClass::LifecycleMetadata) => true,
+        (CaptureProjection::Promotable, WorkspacePathClass::LifecycleMetadata) => true,
         // The semantic read-only guard must also see protected evidence and
         // lifecycle paths; an ignore rule is not authority to mutate them.
         (
@@ -1521,6 +1705,12 @@ fn projection_boundary_allows(
                     && classify_workspace_path(relative) == WorkspacePathClass::RuntimeOnly
                     && runtime_output_root(relative).is_some())
         }
+        CaptureProjection::Promotable => {
+            is_promotable_workspace_path(relative)
+                || (tracked_or_parent
+                    && classify_workspace_path(relative) == WorkspacePathClass::RuntimeOnly
+                    && runtime_output_root(relative).is_some())
+        }
         CaptureProjection::WorkspaceGuard => {
             classify_workspace_path(relative) != WorkspacePathClass::RuntimeOnly
                 || (tracked_or_parent && runtime_output_root(relative).is_some())
@@ -1551,17 +1741,101 @@ fn record_pruned(context: &TraversalContext, relative: &Path, reason: CaptureOmi
     }
 }
 
-fn git_tracked_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    let output = match run_git(root, &["ls-files", "-z", "--cached", "--"]) {
-        Ok(output) if output.status.success() => output,
-        Ok(_) => return Ok(BTreeSet::new()),
-        Err(DeadreckonError::Io { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
+fn validate_frozen_git_hydration(hydration: &FrozenGitHydration) -> Result<()> {
+    if hydration.schema_version != FROZEN_GIT_HYDRATION_VERSION {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "unsupported frozen Git hydration version {}",
+            hydration.schema_version
+        )));
+    }
+    if !hydration.repository {
+        if !hydration.tracked_paths.is_empty()
+            || hydration.head.is_some()
+            || hydration.index_sha256.is_some()
         {
-            return Ok(BTreeSet::new());
+            return Err(DeadreckonError::InvalidInput(
+                "non-repository frozen Git hydration record contains repository state".to_string(),
+            ));
         }
-        Err(error) => return Err(error),
-    };
+        return Ok(());
+    }
+    let index_sha256 = hydration.index_sha256.as_deref().ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "repository frozen Git hydration record has no index identity".to_string(),
+        )
+    })?;
+    if !is_prefixed_sha256(index_sha256) {
+        return Err(DeadreckonError::InvalidInput(
+            "repository frozen Git hydration record has an invalid index identity".to_string(),
+        ));
+    }
+    if hydration
+        .head
+        .as_deref()
+        .is_some_and(|head| !is_hex_digest(head, 40) && !is_hex_digest(head, 64))
+    {
+        return Err(DeadreckonError::InvalidInput(
+            "repository frozen Git hydration record has an invalid HEAD identity".to_string(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for encoded in &hydration.tracked_paths {
+        let path = encoded.to_path_buf()?;
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || is_git_control_path(&path)
+        {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "frozen Git hydration contains an unsafe tracked path: {}",
+                path.display()
+            )));
+        }
+        if !seen.insert(path.clone()) {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "frozen Git hydration contains a duplicate tracked path: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_hex_digest(value: &str, length: usize) -> bool {
+    value.len() == length && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_prefixed_sha256(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|digest| is_hex_digest(digest, 64))
+}
+
+fn git_repository_detected(root: &Path) -> Result<bool> {
+    let output = run_git(root, &["rev-parse", "--is-inside-work-tree"])?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "true");
+    }
+    if fs::symlink_metadata(root.join(".git")).is_ok() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "could not freeze Git hydration for repository control path at {}: {}",
+            root.join(".git").display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(false)
+}
+
+fn git_tracked_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    let output = run_git(root, &["ls-files", "-z", "--cached", "--"])?;
+    if !output.status.success() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "could not freeze Git tracked paths at {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(output
         .stdout
         .split(|byte| *byte == 0)
@@ -1949,7 +2223,7 @@ mod tests {
 
     use super::{
         CaptureBudgets, CaptureOmissionReason, CaptureProjection, CapturePurpose,
-        EncodedWorkspacePath, GeneratedOutputSource, capture_workspace,
+        EncodedWorkspacePath, GeneratedOutputSource, capture_workspace, capture_workspace_strict,
         freeze_workspace_capture_policy,
     };
     use crate::git::run_git;
@@ -2009,6 +2283,78 @@ mod tests {
                 .iter()
                 .any(|entry| entry.relative == Path::new("build/generated.o"))
         );
+    }
+
+    #[test]
+    fn agent_staged_build_output_does_not_change_frozen_hydration() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path();
+        git(root, &["init", "-q"]);
+        fs::write(root.join("app.swift"), "print(\"ready\")\n").expect("source");
+        git(root, &["add", "app.swift"]);
+        let policy = freeze_workspace_capture_policy(root).expect("freeze");
+        let frozen = policy
+            .frozen_git_hydration
+            .as_ref()
+            .expect("explicit hydration")
+            .clone();
+
+        fs::create_dir_all(root.join(".build")).expect("build directory");
+        fs::write(root.join(".build/agent-staged.o"), b"generated").expect("generated");
+        git(root, &["add", "-f", ".build/agent-staged.o"]);
+
+        let plan = capture_workspace_strict(
+            root,
+            &policy,
+            CaptureProjection::Deliverable,
+            CapturePurpose::DeliverableIndex,
+        )
+        .expect("strict capture");
+
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.relative != Path::new(".build/agent-staged.o"))
+        );
+        let captured = plan.manifest.git.expect("Git hydration manifest");
+        assert_eq!(captured.head, frozen.head);
+        assert_eq!(captured.index_sha256, frozen.index_sha256);
+        assert_eq!(captured.tracked_files, frozen.tracked_paths.len() as u64);
+    }
+
+    #[test]
+    fn strict_capture_fails_closed_without_explicit_hydration_record() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("source.txt"), "source\n").expect("source");
+        let mut policy = freeze_workspace_capture_policy(temp.path()).expect("freeze");
+        assert!(
+            policy
+                .frozen_git_hydration
+                .as_ref()
+                .is_some_and(|hydration| !hydration.repository)
+        );
+
+        policy.frozen_git_hydration = None;
+        let error = capture_workspace_strict(
+            temp.path(),
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::TurnSnapshot,
+        )
+        .expect_err("missing hydration must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("controller-frozen Git hydration")
+        );
+
+        capture_workspace(
+            temp.path(),
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::TurnSnapshot,
+        )
+        .expect("legacy compatibility capture");
     }
 
     #[test]

@@ -11,8 +11,9 @@ use crate::state::{PipelineState, append_json_line, atomic_write_json};
 use crate::workspace_capture::{
     CaptureEntryKind, CaptureMaterialization, CaptureProjection, CapturePurpose,
     WORKSPACE_BLOBS_DIR, WorkspaceCaptureManifest, WorkspaceCapturePolicy, capture_workspace,
-    ensure_workspace_capture_policy, freeze_workspace_capture_policy,
+    capture_workspace_strict, freeze_workspace_capture_policy,
     materialize_capture_entry_with_blob_store, materialize_capture_plan_with_blob_store,
+    require_workspace_capture_policy,
 };
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{FlightEvent, LedgerItem};
@@ -355,8 +356,18 @@ pub fn build_working_file_index(root: &Path) -> Result<WorkingFileIndex> {
 }
 
 pub fn build_working_file_index_for_state(state: &PipelineState) -> Result<WorkingFileIndex> {
-    let policy = ensure_workspace_capture_policy(state)?;
-    build_working_file_index_with_policy(&state.working_dir, &policy)
+    let policy = require_workspace_capture_policy(state)?;
+    let capture = capture_workspace_strict(
+        &state.working_dir,
+        &policy,
+        CaptureProjection::Checkpoint,
+        CapturePurpose::FlightCheckpoint,
+    )?;
+    let files = fingerprint_working_capture(&capture)?;
+    Ok(WorkingFileIndex {
+        files,
+        capture: Some(capture.manifest),
+    })
 }
 
 pub fn build_working_file_index_with_policy(
@@ -392,13 +403,14 @@ pub fn build_deliverable_file_index(root: &Path) -> Result<ArtifactFileIndex> {
 }
 
 pub fn build_deliverable_file_index_for_state(state: &PipelineState) -> Result<ArtifactFileIndex> {
-    let policy = ensure_workspace_capture_policy(state)?;
-    build_artifact_file_index(
+    let policy = require_workspace_capture_policy(state)?;
+    let capture = capture_workspace_strict(
         &state.working_dir,
         &policy,
         CaptureProjection::Deliverable,
         CapturePurpose::DeliverableIndex,
-    )
+    )?;
+    artifact_file_index_from_capture(capture)
 }
 
 /// Hash every agent-visible workspace path while excluding only runtime
@@ -420,13 +432,34 @@ pub fn build_workspace_guard_file_index(root: &Path) -> Result<ArtifactFileIndex
 pub fn build_workspace_guard_file_index_for_state(
     state: &PipelineState,
 ) -> Result<ArtifactFileIndex> {
-    let policy = ensure_workspace_capture_policy(state)?;
-    build_artifact_file_index(
-        &state.working_dir,
-        &policy,
+    let policy = require_workspace_capture_policy(state)?;
+    build_workspace_guard_file_index_with_policy(&state.working_dir, &policy)
+}
+
+pub fn build_workspace_guard_file_index_with_policy(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<ArtifactFileIndex> {
+    let capture = capture_workspace_strict(
+        root,
+        policy,
         CaptureProjection::WorkspaceGuard,
         CapturePurpose::WorkspaceGuard,
-    )
+    )?;
+    artifact_file_index_from_capture(capture)
+}
+
+pub fn build_promotable_file_index_with_policy(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+) -> Result<ArtifactFileIndex> {
+    let capture = capture_workspace_strict(
+        root,
+        policy,
+        CaptureProjection::Promotable,
+        CapturePurpose::PromotionCandidate,
+    )?;
+    artifact_file_index_from_capture(capture)
 }
 
 fn build_artifact_file_index(
@@ -436,6 +469,12 @@ fn build_artifact_file_index(
     purpose: CapturePurpose,
 ) -> Result<ArtifactFileIndex> {
     let capture = capture_workspace(root, policy, projection, purpose)?;
+    artifact_file_index_from_capture(capture)
+}
+
+pub(crate) fn artifact_file_index_from_capture(
+    capture: crate::workspace_capture::WorkspaceCapturePlan,
+) -> Result<ArtifactFileIndex> {
     capture.require_complete("verified artifact index")?;
     let mut files = BTreeMap::new();
     for entry in capture.entries {
@@ -548,8 +587,8 @@ pub fn capture_delta_checkpoint(
     }
 
     let capture = if request.full_anchor {
-        let policy = ensure_workspace_capture_policy(state)?;
-        let mut anchor = capture_workspace(
+        let policy = require_workspace_capture_policy(state)?;
+        let mut anchor = capture_workspace_strict(
             &state.working_dir,
             &policy,
             CaptureProjection::Recoverable,
@@ -1149,7 +1188,6 @@ mod tests {
         for directory in [
             ".specstory/history",
             ".deadreckon",
-            ".git/objects",
             "target/debug",
             "web/node_modules/pkg",
             ".build/debug",
@@ -1160,18 +1198,22 @@ mod tests {
             "answer.txt",
             ".specstory/history/session.md",
             ".deadreckon/codebase.json",
-            ".git/objects/private",
             "target/debug/output",
             "web/node_modules/pkg/index.js",
             ".build/debug/App",
         ] {
             fs::write(temp.path().join(file), "before\n").expect("file");
         }
+        let policy = freeze_workspace_capture_policy(temp.path()).expect("policy");
+        fs::create_dir_all(temp.path().join(".git/objects")).expect("Git control");
+        fs::write(temp.path().join(".git/objects/private"), "before\n").expect("Git object");
 
-        let before = build_workspace_guard_file_index(temp.path()).expect("before");
+        let before =
+            build_workspace_guard_file_index_with_policy(temp.path(), &policy).expect("before");
         fs::write(temp.path().join(".specstory/history/session.md"), "after\n")
             .expect("mutate evidence");
-        let after = build_workspace_guard_file_index(temp.path()).expect("after");
+        let after =
+            build_workspace_guard_file_index_with_policy(temp.path(), &policy).expect("after");
 
         assert!(before.files.contains_key(Path::new("answer.txt")));
         assert!(

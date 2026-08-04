@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::artifacts::copy_promotable_tree;
 use crate::codebase::{
     CodebaseMode, CodebaseRecord, read_codebase_record, read_run_codebase_record,
     read_trusted_codebase_record, write_codebase_record,
@@ -17,6 +16,10 @@ use crate::events::emit_event;
 use crate::gate::validate_acceptance_marker;
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, save_state};
+use crate::workspace_capture::{
+    CaptureProjection, CapturePurpose, capture_workspace_strict, materialize_capture_plan,
+    require_workspace_capture_policy,
+};
 use deadreckon_protocol::RunEventKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +31,14 @@ pub struct PromotionManifest {
     pub promoted_at: DateTime<Utc>,
     pub source_working_dir: PathBuf,
     pub provenance_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_tree_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_policy_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_files: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,9 +265,17 @@ fn prepare_candidate(
     candidate: &Path,
 ) -> Result<()> {
     remove_temporary_tree(candidate)?;
-    copy_promotable_tree(source, candidate)?;
+    let policy = require_workspace_capture_policy(state)?;
+    let capture = capture_workspace_strict(
+        source,
+        &policy,
+        CaptureProjection::Promotable,
+        CapturePurpose::PromotionCandidate,
+    )?;
+    capture.require_complete("promotion candidate")?;
+    materialize_capture_plan(&capture, candidate)?;
     write_codebase_record(candidate, codebase)?;
-    write_manifest(state, candidate, source_working_dir.to_path_buf())
+    write_manifest(state, candidate, source_working_dir.to_path_buf(), &policy)
 }
 
 fn publish_candidate(candidate: &Path, library_dir: &Path) -> Result<()> {
@@ -366,7 +385,7 @@ fn validate_manifest(
             source,
         })?;
     let expected_provenance = provenance_hash(&state.run_root.join("provenance.jsonl"))?;
-    if manifest.schema_version != 1
+    if !matches!(manifest.schema_version, 1 | 2)
         || manifest.run_id != state.run_id
         || manifest.scope != state.scope
         || manifest.goal != state.goal
@@ -378,6 +397,21 @@ fn validate_manifest(
             path.display(),
             state.run_id
         )));
+    }
+    if manifest.schema_version == 2 {
+        let policy = require_workspace_capture_policy(state)?;
+        let payload = promotable_payload_identity(library_dir, &policy)?;
+        if manifest.payload_tree_sha256.as_deref() != Some(payload.tree_sha256.as_str())
+            || manifest.capture_policy_sha256.as_deref()
+                != Some(payload.capture_policy_sha256.as_str())
+            || manifest.payload_files != Some(payload.files)
+            || manifest.payload_bytes != Some(payload.bytes)
+        {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "promotion payload at {} does not match its trusted capture manifest",
+                library_dir.display()
+            )));
+        }
     }
     Ok(manifest)
 }
@@ -420,16 +454,22 @@ fn write_manifest(
     state: &PipelineState,
     library_dir: &Path,
     source_working_dir: PathBuf,
+    policy: &crate::WorkspaceCapturePolicy,
 ) -> Result<()> {
     fs::create_dir_all(library_dir).with_path(library_dir)?;
+    let payload = promotable_payload_identity(library_dir, policy)?;
     let manifest = PromotionManifest {
-        schema_version: 1,
+        schema_version: 2,
         run_id: state.run_id.clone(),
         scope: state.scope.clone(),
         goal: state.goal.clone(),
         promoted_at: Utc::now(),
         source_working_dir,
         provenance_hash: provenance_hash(&state.run_root.join("provenance.jsonl"))?,
+        payload_tree_sha256: Some(payload.tree_sha256),
+        capture_policy_sha256: Some(payload.capture_policy_sha256),
+        payload_files: Some(payload.files),
+        payload_bytes: Some(payload.bytes),
     };
     let path = library_dir.join("manifest.json");
     fs::write(
@@ -440,6 +480,42 @@ fn write_manifest(
         })?,
     )
     .with_path(path)
+}
+
+struct PromotablePayloadIdentity {
+    tree_sha256: String,
+    capture_policy_sha256: String,
+    files: u64,
+    bytes: u64,
+}
+
+fn promotable_payload_identity(
+    root: &Path,
+    policy: &crate::WorkspaceCapturePolicy,
+) -> Result<PromotablePayloadIdentity> {
+    let capture = capture_workspace_strict(
+        root,
+        policy,
+        CaptureProjection::Promotable,
+        CapturePurpose::PromotionCandidate,
+    )?;
+    capture.require_complete("promotion payload verification")?;
+    let capture_policy_sha256 = capture.manifest.policy_sha256.clone();
+    let mut index = crate::flight::artifact_file_index_from_capture(capture)?;
+    index.files.remove(Path::new("manifest.json"));
+    index.files.remove(Path::new(".materialized-to"));
+    let files = index.files.len() as u64;
+    let bytes = index
+        .files
+        .values()
+        .map(|fingerprint| fingerprint.size)
+        .sum();
+    Ok(PromotablePayloadIdentity {
+        tree_sha256: index.tree_hash(),
+        capture_policy_sha256,
+        files,
+        bytes,
+    })
 }
 
 fn provenance_hash(path: &Path) -> Result<String> {
@@ -1050,6 +1126,30 @@ mod tests {
 
         assert!(external.join("operator.txt").is_file());
         assert!(owned_working.join("sentinel").is_file());
+    }
+
+    #[test]
+    fn promotion_manifest_binds_the_exact_materialized_payload() {
+        let mut fixture = fixture(CodebaseMode::Fresh);
+        let library =
+            promote_completed_run(&fixture.paths, &mut fixture.state).expect("initial promotion");
+        let manifest: PromotionManifest =
+            serde_json::from_slice(&fs::read(library.join("manifest.json")).expect("manifest"))
+                .expect("manifest json");
+        assert_eq!(manifest.schema_version, 2);
+        assert!(manifest.payload_tree_sha256.is_some());
+        assert!(manifest.capture_policy_sha256.is_some());
+
+        fs::write(library.join("result.txt"), "tampered after publication\n")
+            .expect("tamper payload");
+        let error = recover_promotion(&fixture.paths, &mut fixture.state)
+            .expect_err("payload tamper must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its trusted capture manifest"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -4,7 +4,10 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,10 +22,43 @@ const JOB_ID_LABEL: &str = "io.deadreckon.job-id";
 const LAUNCH_ID_LABEL: &str = "io.deadreckon.launch-id";
 const ATTEMPT_LABEL: &str = "io.deadreckon.attempt";
 const OWNER_LAUNCH_ID_LABEL: &str = "io.deadreckon.owner-launch-id";
+const DOCKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const DOCKER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DOCKER_TERM_GRACE: Duration = Duration::from_secs(2);
+const DOCKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const DOCKER_OUTPUT_CAPTURE_BYTES: usize = 1024 * 1024 + 1;
 #[cfg(all(test, unix))]
 const TEST_DOCKER_SCRIPT_EXTENSION: &str = "deadreckon-test-sh";
 
 pub const DOCKER_EXECUTION_RECORD_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy)]
+struct DockerPhaseDeadline {
+    work_expires_at: Instant,
+    cleanup_expires_at: Option<Instant>,
+}
+
+impl DockerPhaseDeadline {
+    fn from_now(work_budget: Duration) -> Self {
+        Self {
+            work_expires_at: Instant::now() + work_budget,
+            cleanup_expires_at: None,
+        }
+    }
+
+    fn ending_at(deadline: Instant) -> Self {
+        Self {
+            work_expires_at: deadline,
+            cleanup_expires_at: Some(deadline),
+        }
+    }
+
+    fn cleanup_expires_at(&mut self) -> Instant {
+        *self
+            .cleanup_expires_at
+            .get_or_insert_with(|| Instant::now() + DOCKER_CLEANUP_TIMEOUT)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -314,6 +350,15 @@ pub fn reconcile_docker_execution(execution: &DockerExecution) -> Result<()> {
     reconcile_docker_execution_with(&wrapper, &execution.record())
 }
 
+pub(crate) fn reconcile_docker_execution_by(
+    execution: &DockerExecution,
+    deadline: Instant,
+) -> Result<()> {
+    let wrapper = backend_executable(SandboxBackend::Docker)?;
+    let mut deadline = DockerPhaseDeadline::ending_at(deadline);
+    reconcile_docker_execution_with_deadline(&wrapper, &execution.record(), &mut deadline)
+}
+
 pub fn write_docker_execution_record(path: &Path, execution: &DockerExecution) -> Result<()> {
     let record = execution.record();
     record.validate()?;
@@ -425,21 +470,30 @@ fn reconcile_docker_execution_record_value_with(
 }
 
 fn inspect_docker_image_with(wrapper: &Path, image: &OsStr) -> Result<DockerImage> {
+    let mut deadline = DockerPhaseDeadline::from_now(DOCKER_OPERATION_TIMEOUT);
+    inspect_docker_image_before(wrapper, image, &mut deadline)
+}
+
+fn inspect_docker_image_before(
+    wrapper: &Path,
+    image: &OsStr,
+    deadline: &mut DockerPhaseDeadline,
+) -> Result<DockerImage> {
     if image.is_empty() {
         return Err(invalid_docker(
             "Docker image reference must not be empty".to_string(),
         ));
     }
-    let output = trusted_docker(wrapper)
+    let mut command = trusted_docker(wrapper);
+    command
         .args([
             OsStr::new("image"),
             OsStr::new("inspect"),
             OsStr::new("--format"),
             OsStr::new("{{.Id}}\t{{.Os}}\t{{.Architecture}}"),
         ])
-        .arg(image)
-        .output()
-        .map_err(SandboxError::Io)?;
+        .arg(image);
+    let output = run_docker_command(&mut command, deadline, "image inspect")?;
     if !output.status.success() {
         return Err(docker_command_error("image inspect", &output));
     }
@@ -467,15 +521,24 @@ fn reconcile_docker_execution_with(
     wrapper: &Path,
     execution: &DockerExecutionRecord,
 ) -> Result<()> {
+    let mut deadline = DockerPhaseDeadline::from_now(DOCKER_OPERATION_TIMEOUT);
+    reconcile_docker_execution_with_deadline(wrapper, execution, &mut deadline)
+}
+
+fn reconcile_docker_execution_with_deadline(
+    wrapper: &Path,
+    execution: &DockerExecutionRecord,
+    deadline: &mut DockerPhaseDeadline,
+) -> Result<()> {
     execution.validate()?;
     let cid = read_cid_file(execution.cid_file())?;
     let inspected = if let Some(cid) = cid.as_deref() {
-        match inspect_container(wrapper, cid)? {
+        match inspect_container(wrapper, cid, deadline)? {
             Some(container) => Some(container),
-            None => inspect_container(wrapper, execution.container_name())?,
+            None => inspect_container(wrapper, execution.container_name(), deadline)?,
         }
     } else {
-        inspect_container(wrapper, execution.container_name())?
+        inspect_container(wrapper, execution.container_name(), deadline)?
     };
 
     let Some(container) = inspected else {
@@ -484,15 +547,14 @@ fn reconcile_docker_execution_with(
     };
     validate_container(&container, execution, cid.as_deref())?;
 
-    let output = trusted_docker(wrapper)
-        .args(["container", "rm", "-f", &container.id])
-        .output()
-        .map_err(SandboxError::Io)?;
-    if !output.status.success() && inspect_container(wrapper, &container.id)?.is_some() {
+    let mut command = trusted_docker(wrapper);
+    command.args(["container", "rm", "-f", &container.id]);
+    let output = run_docker_command(&mut command, deadline, "container rm -f")?;
+    if !output.status.success() && inspect_container(wrapper, &container.id, deadline)?.is_some() {
         return Err(docker_command_error("container rm -f", &output));
     }
-    if inspect_container(wrapper, &container.id)?.is_some()
-        || inspect_container(wrapper, execution.container_name())?.is_some()
+    if inspect_container(wrapper, &container.id, deadline)?.is_some()
+        || inspect_container(wrapper, execution.container_name(), deadline)?.is_some()
     {
         return Err(invalid_docker(format!(
             "Docker evaluator container {} remained after forced removal",
@@ -520,11 +582,14 @@ struct ContainerConfig {
     labels: BTreeMap<String, String>,
 }
 
-fn inspect_container(wrapper: &Path, identity: &str) -> Result<Option<ContainerInspect>> {
-    let output = trusted_docker(wrapper)
-        .args(["container", "inspect", identity])
-        .output()
-        .map_err(SandboxError::Io)?;
+fn inspect_container(
+    wrapper: &Path,
+    identity: &str,
+    deadline: &mut DockerPhaseDeadline,
+) -> Result<Option<ContainerInspect>> {
+    let mut command = trusted_docker(wrapper);
+    command.args(["container", "inspect", identity]);
+    let output = run_docker_command(&mut command, deadline, "container inspect")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("No such object") || stderr.contains("No such container") {
@@ -686,6 +751,236 @@ fn write_execution_record(path: &Path, record: &DockerExecutionRecord) -> Result
         let _ = fs::remove_file(&temporary);
     }
     write_result
+}
+
+fn run_docker_command(
+    command: &mut Command,
+    deadline: &mut DockerPhaseDeadline,
+    operation: &str,
+) -> Result<Output> {
+    if Instant::now() >= deadline.work_expires_at {
+        return Err(docker_timeout(format!(
+            "Docker {operation} did not start before the shared operation deadline"
+        )));
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_docker_process_group(command);
+    let mut child = command.spawn().map_err(SandboxError::Io)?;
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| SandboxError::Io(std::io::Error::other("Docker stdout was not piped")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| SandboxError::Io(std::io::Error::other("Docker stderr was not piped")))?;
+    let stdout_rx = spawn_docker_pipe_reader(stdout);
+    let stderr_rx = spawn_docker_pipe_reader(stderr);
+
+    let status = match wait_for_docker_child_until(&mut child, deadline.work_expires_at)? {
+        Some(status) => status,
+        None => {
+            let cleanup_expires_at = deadline.cleanup_expires_at();
+            let cleanup = terminate_docker_process(&mut child, pid, cleanup_expires_at);
+            let _ = receive_docker_pipe(stdout_rx, cleanup_expires_at, "stdout");
+            let _ = receive_docker_pipe(stderr_rx, cleanup_expires_at, "stderr");
+            cleanup?;
+            return Err(docker_timeout(format!(
+                "Docker {operation} exceeded the shared operation deadline"
+            )));
+        }
+    };
+
+    if !docker_process_group_is_absent(pid)?
+        && let Err(work_error) = terminate_docker_process_group(pid, deadline.work_expires_at)
+    {
+        let cleanup_expires_at = deadline.cleanup_expires_at();
+        terminate_docker_process(&mut child, pid, cleanup_expires_at)?;
+        return Err(work_error);
+    }
+    let stdout =
+        receive_docker_pipe(stdout_rx, deadline.work_expires_at, "stdout").or_else(|error| {
+            let cleanup_expires_at = deadline.cleanup_expires_at();
+            terminate_docker_process(&mut child, pid, cleanup_expires_at)?;
+            Err(error)
+        })?;
+    let stderr =
+        receive_docker_pipe(stderr_rx, deadline.work_expires_at, "stderr").or_else(|error| {
+            let cleanup_expires_at = deadline.cleanup_expires_at();
+            terminate_docker_process(&mut child, pid, cleanup_expires_at)?;
+            Err(error)
+        })?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_docker_pipe_reader<R>(mut pipe: R) -> mpsc::Receiver<std::io::Result<Vec<u8>>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let _ = thread::spawn(move || {
+        let mut captured = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let result = loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => break Ok(captured),
+                Ok(read) => {
+                    let remaining = DOCKER_OUTPUT_CAPTURE_BYTES.saturating_sub(captured.len());
+                    captured.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_docker_pipe(
+    receiver: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    deadline: Instant,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => docker_timeout(format!(
+                "Docker {stream} pipe remained open at the phase deadline"
+            )),
+            mpsc::RecvTimeoutError::Disconnected => SandboxError::Io(std::io::Error::other(
+                format!("Docker {stream} reader disconnected"),
+            )),
+        })?
+        .map_err(SandboxError::Io)
+}
+
+fn wait_for_docker_child_until(child: &mut Child, deadline: Instant) -> Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait().map_err(SandboxError::Io)? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(DOCKER_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn terminate_docker_process(child: &mut Child, pid: u32, cleanup_deadline: Instant) -> Result<()> {
+    signal_docker_process(pid, false);
+    let term_deadline = cleanup_deadline.min(Instant::now() + DOCKER_TERM_GRACE);
+    let child_exited = wait_for_docker_child_until(child, term_deadline)?.is_some();
+    let group_absent = docker_process_group_is_absent(pid)?;
+    if child_exited && group_absent {
+        return Ok(());
+    }
+
+    signal_docker_process(pid, true);
+    if !child_exited {
+        let _ = child.kill();
+    }
+    let child_exited =
+        child_exited || wait_for_docker_child_until(child, cleanup_deadline)?.is_some();
+    let group_absent = wait_for_docker_process_group_until(pid, cleanup_deadline)?;
+    if child_exited && group_absent {
+        Ok(())
+    } else {
+        Err(docker_cleanup_incomplete(format!(
+            "could not prove Docker subprocess group {pid} exited after forced cleanup; retaining Docker authority"
+        )))
+    }
+}
+
+fn terminate_docker_process_group(pid: u32, work_deadline: Instant) -> Result<()> {
+    signal_docker_process(pid, false);
+    let term_deadline = work_deadline.min(Instant::now() + DOCKER_TERM_GRACE);
+    if wait_for_docker_process_group_until(pid, term_deadline)? {
+        return Ok(());
+    }
+    signal_docker_process(pid, true);
+    if wait_for_docker_process_group_until(pid, work_deadline)? {
+        Ok(())
+    } else {
+        Err(docker_timeout(format!(
+            "Docker subprocess group {pid} outlived the shared operation deadline"
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn configure_docker_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_docker_process_group(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn signal_docker_process(pid: u32, force: bool) {
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    if let Ok(pid) = i32::try_from(pid) {
+        let signal = if force {
+            Signal::SIGKILL
+        } else {
+            Signal::SIGTERM
+        };
+        let _ = kill(Pid::from_raw(-pid), Some(signal));
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_docker_process(_pid: u32, _force: bool) {}
+
+#[cfg(unix)]
+fn docker_process_group_is_absent(pid: u32) -> Result<bool> {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| SandboxError::Io(std::io::Error::other("Docker PID exceeds i32")))?;
+    match kill(Pid::from_raw(-pid), None) {
+        Err(nix::errno::Errno::ESRCH) => Ok(true),
+        Ok(()) => Ok(false),
+        Err(error) => Err(SandboxError::Io(std::io::Error::other(format!(
+            "failed to inspect Docker subprocess group {pid}: {error}"
+        )))),
+    }
+}
+
+#[cfg(not(unix))]
+fn docker_process_group_is_absent(_pid: u32) -> Result<bool> {
+    Ok(true)
+}
+
+fn wait_for_docker_process_group_until(pid: u32, deadline: Instant) -> Result<bool> {
+    loop {
+        if docker_process_group_is_absent(pid)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(DOCKER_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+fn docker_timeout(message: String) -> SandboxError {
+    SandboxError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, message))
+}
+
+fn docker_cleanup_incomplete(message: String) -> SandboxError {
+    SandboxError::CleanupIncomplete(message)
 }
 
 fn trusted_docker(wrapper: &Path) -> Command {
@@ -985,6 +1280,67 @@ mod tests {
         let image = inspect_docker_image_with(&docker, OsStr::new("rust:1")).expect("inspect");
         assert_eq!(image.platform(), DockerPlatform::LinuxArm64);
         assert_eq!(image.id(), format!("sha256:{}", "b".repeat(64)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_command_timeout_force_cleans_a_term_ignoring_process_group() {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let temp = TempDir::new().expect("tempdir");
+        let pid_file = temp.path().join("docker-client.pid");
+        let docker = executable_script(
+            &temp,
+            "docker-timeout",
+            "#!/bin/sh\nprintf '%s\\n' \"$$\" >\"$1\"\ntrap '' TERM\n(trap '' TERM; while :; do sleep 1; done) &\nwhile :; do sleep 1; done\n",
+        );
+        let mut command = trusted_docker(&docker);
+        command.arg(&pid_file);
+        let mut deadline = DockerPhaseDeadline::from_now(Duration::from_millis(50));
+        let started = Instant::now();
+
+        let error =
+            run_docker_command(&mut command, &mut deadline, "timeout probe").expect_err("deadline");
+
+        assert_eq!(
+            match &error {
+                SandboxError::Io(error) => error.kind(),
+                other => panic!("unexpected error: {other}"),
+            },
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(started.elapsed() < Duration::from_secs(4), "{error}");
+        let pid = fs::read_to_string(&pid_file)
+            .expect("client pid")
+            .trim()
+            .parse::<i32>()
+            .expect("numeric pid");
+        assert!(
+            matches!(kill(Pid::from_raw(-pid), None), Err(Errno::ESRCH)),
+            "Docker subprocess group {pid} survived deadline cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_shared_docker_deadline_does_not_spawn_another_subprocess() {
+        let temp = TempDir::new().expect("tempdir");
+        let sentinel = temp.path().join("spawned");
+        let docker = executable_script(
+            &temp,
+            "docker-must-not-start",
+            &format!("#!/bin/sh\n: >'{}'\n", sentinel.display()),
+        );
+        let mut command = trusted_docker(&docker);
+        let mut deadline = DockerPhaseDeadline::from_now(Duration::ZERO);
+
+        let error = run_docker_command(&mut command, &mut deadline, "late probe")
+            .expect_err("expired shared deadline");
+
+        assert!(error.to_string().contains("did not start"), "{error}");
+        assert!(!sentinel.exists(), "expired phase launched new Docker work");
     }
 
     #[cfg(unix)]
