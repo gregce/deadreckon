@@ -2920,16 +2920,25 @@ fn planner_timeout_gives_cli_routes_room_to_answer() {
     // Cold subscription CLIs may compact or initialize before emitting any
     // response. The phase remains bounded and cancellation is reconciled.
     assert_eq!(
-        super::commands::start::course_planner_timeout("cli:claude-code").as_secs(),
-        120
+        super::commands::start::course_planner_timeout(Some(
+            &deadreckon_providers::ProviderKind::CliClaudeCode,
+        ))
+        .as_secs(),
+        300
     );
     assert_eq!(
-        super::commands::start::course_planner_timeout("cli:codex").as_secs(),
-        120
+        super::commands::start::course_planner_timeout(Some(
+            &deadreckon_providers::ProviderKind::CliCodex,
+        ))
+        .as_secs(),
+        300
     );
     assert_eq!(
-        super::commands::start::course_planner_timeout("anthropic").as_secs(),
-        30
+        super::commands::start::course_planner_timeout(Some(
+            &deadreckon_providers::ProviderKind::Anthropic,
+        ))
+        .as_secs(),
+        120
     );
 }
 

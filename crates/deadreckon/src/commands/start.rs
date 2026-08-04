@@ -577,12 +577,13 @@ async fn provider_course_plan(
     request.pid_file = Some(pid_file.clone());
     request.output_path = Some(output_path.clone());
     request.cancellation_token = Some(token.clone());
+    let route_kind = router.selected_route_info().map(|route| route.kind);
     let completion =
         maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request));
     tokio::pin!(completion);
     let response = tokio::select! {
         response = &mut completion => response,
-        () = tokio::time::sleep(course_planner_timeout(provider)) => {
+        () = tokio::time::sleep(course_planner_timeout(route_kind.as_ref())) => {
             token.cancel();
             let cleanup = tokio::time::timeout(
                 course_planner_cleanup_timeout(),
@@ -657,14 +658,20 @@ fn require_course_planner_cleanup_proven(
 }
 
 /// The shape planner is a bounded read-only phase, but subscription CLIs can
-/// cold-start or compact for tens of seconds. Give both local and HTTP routes
-/// realistic room, then cancel and prove cleanup before falling back.
-pub(crate) fn course_planner_timeout(provider: &str) -> Duration {
-    if provider.starts_with("cli:") {
-        Duration::from_secs(120)
+/// cold-start or compact before they emit progress. Classify the resolved
+/// route rather than its configurable name, then cancel and prove cleanup
+/// before falling back.
+pub(crate) fn course_planner_timeout(kind: Option<&ProviderKind>) -> Duration {
+    if kind.is_some_and(provider_kind_uses_cli_process) {
+        Duration::from_secs(300)
     } else {
-        Duration::from_secs(30)
+        Duration::from_secs(120)
     }
+}
+
+fn provider_kind_uses_cli_process(kind: &ProviderKind) -> bool {
+    matches!(kind, ProviderKind::CliClaudeCode | ProviderKind::CliCodex)
+        || matches!(kind, ProviderKind::Generic(id) if id.starts_with("cli:"))
 }
 
 fn course_planner_cleanup_timeout() -> Duration {
@@ -5167,12 +5174,38 @@ mod course_planner_cleanup_tests {
         course_planner_cleanup_timeout, course_planner_timeout,
         require_course_planner_cleanup_proven,
     };
+    use deadreckon_providers::ProviderKind;
 
     #[test]
     fn goal_shape_planner_budgets_cover_cli_and_http_cold_starts() {
-        assert_eq!(course_planner_timeout("cli:codex").as_secs(), 120);
-        assert_eq!(course_planner_timeout("openai").as_secs(), 30);
+        assert_eq!(
+            course_planner_timeout(Some(&ProviderKind::CliCodex)).as_secs(),
+            300
+        );
+        assert_eq!(
+            course_planner_timeout(Some(&ProviderKind::CliClaudeCode)).as_secs(),
+            300
+        );
+        assert_eq!(
+            course_planner_timeout(Some(&ProviderKind::OpenAi)).as_secs(),
+            120
+        );
+        assert_eq!(course_planner_timeout(None).as_secs(), 120);
         assert_eq!(course_planner_cleanup_timeout().as_secs(), 30);
+    }
+
+    #[test]
+    fn goal_shape_planner_uses_resolved_generic_route_kind_not_alias_name() {
+        assert_eq!(
+            course_planner_timeout(Some(&ProviderKind::Generic("cli:codex-server".to_string())))
+                .as_secs(),
+            300
+        );
+        assert_eq!(
+            course_planner_timeout(Some(&ProviderKind::Generic("local-http".to_string())))
+                .as_secs(),
+            120
+        );
     }
 
     #[test]

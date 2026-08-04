@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Admission provider phases now use the resolved provider route rather than a
+  configurable alias when choosing latency allowances. Subscription CLI course
+  planning and interactive contract inference receive five minutes, HTTP
+  routes receive two minutes, and timeout still requires a separate 30-second
+  cleanup proof. Done-contract authoring shares one 20-minute deadline and
+  gives its independent critic the same five-minute allowance as draft and
+  redraft, without starting a new clock between stages.
+
 ## 0.8.1 — Steadier starts — 2026-08-04
 
 - Release trust generation now discovers signing records in the nested CI
