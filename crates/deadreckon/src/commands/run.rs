@@ -77,11 +77,42 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
     Ok(Some(run_id))
 }
 
-/// Guided start writes its approved project contract after source-mode
-/// preflight. Return only the controller-owned paths whose bytes are bound by
-/// the immutable launch plan and match both the project and frozen Job copies.
-/// Core worktree admission permits these exact paths without seeding them;
-/// unrelated dirt remains a hard refusal.
+/// A project done contract is controller input, not an implementation change.
+/// Permit only the exact bounded bundle that `def-done` wrote, without seeding
+/// it into the implementation worktree. The later Job freeze binds these bytes
+/// into immutable authority; unrelated dirt remains a hard refusal.
+pub(crate) fn bounded_project_contract_dirty_paths(
+    source_cwd: &Path,
+    acceptance_source: &commands::acceptance::AcceptanceSource,
+) -> Result<Vec<PathBuf>> {
+    let expected_project = source_cwd.join(".deadreckon/acceptance.yaml");
+    if canonical_or_original(&acceptance_source.path) != canonical_or_original(&expected_project) {
+        return Ok(Vec::new());
+    }
+    let bundle = commands::job::source_contract_bundle_inventory(&acceptance_source.path)?;
+    project_contract_dirty_paths_from_bundle(source_cwd, bundle, None)
+}
+
+pub(crate) fn bounded_existing_project_contract_dirty_paths(
+    source_cwd: &Path,
+    explicit_acceptance: Option<&Path>,
+    allow_dirty: bool,
+) -> Result<Vec<PathBuf>> {
+    if allow_dirty {
+        return Ok(Vec::new());
+    }
+    let source = commands::acceptance::resolve_acceptance_source(source_cwd, explicit_acceptance)?;
+    source
+        .as_ref()
+        .map(|source| bounded_project_contract_dirty_paths(source_cwd, source))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+/// Guided start writes its approved project contract after its first
+/// source-mode preflight. Return only the controller-owned paths whose bytes
+/// are already bound by the immutable launch plan and match both the project
+/// and frozen Job copies.
 fn trusted_controller_contract_dirty_paths(
     paths: &DeadreckonPaths,
     run_id: &str,
@@ -97,11 +128,18 @@ fn trusted_controller_contract_dirty_paths(
     let Some(bundle) = commands::job::contract_bundle_from_plan(launch_plan)? else {
         return Ok(Vec::new());
     };
+    project_contract_dirty_paths_from_bundle(source_cwd, bundle, Some(&paths.job_dir(run_id)))
+}
+
+fn project_contract_dirty_paths_from_bundle(
+    source_cwd: &Path,
+    bundle: commands::job::FrozenContractBundle,
+    frozen_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
     let Some(git_root) = deadreckon_core::find_git_root(source_cwd)? else {
         return Ok(Vec::new());
     };
     let project_contract_dir = canonical_or_original(&source_cwd.join(".deadreckon"));
-    let frozen_dir = paths.job_dir(run_id);
     let mut allowed = Vec::with_capacity(bundle.files.len());
     for file in bundle.files {
         let relative = Path::new(&file.path);
@@ -114,28 +152,31 @@ fn trusted_controller_contract_dirty_paths(
                 || relative.starts_with("acceptance"));
         if !valid {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "invalid frozen done-contract bundle path: {}",
+                "invalid done-contract bundle path: {}",
                 file.path
             ))));
         }
         let project_file = project_contract_dir.join(relative);
-        let frozen_file = frozen_dir.join(relative);
         let project_metadata = match fs::symlink_metadata(&project_file) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        let frozen_metadata = fs::symlink_metadata(&frozen_file)?;
         if project_metadata.file_type().is_symlink()
-            || frozen_metadata.file_type().is_symlink()
             || !project_metadata.file_type().is_file()
-            || !frozen_metadata.file_type().is_file()
-            || project_metadata.len() != file.bytes
-            || frozen_metadata.len() != file.bytes
-            || deadreckon_core::flight::sha256_file(&project_file)? != file.sha256
-            || deadreckon_core::flight::sha256_file(&frozen_file)? != file.sha256
+            || !commands::job::contract_file_matches_inventory(&project_file, &file)?
         {
             return Ok(Vec::new());
+        }
+        if let Some(frozen_dir) = frozen_dir {
+            let frozen_file = frozen_dir.join(relative);
+            let frozen_metadata = fs::symlink_metadata(&frozen_file)?;
+            if frozen_metadata.file_type().is_symlink()
+                || !frozen_metadata.file_type().is_file()
+                || !commands::job::contract_file_matches_inventory(&frozen_file, &file)?
+            {
+                return Ok(Vec::new());
+            }
         }
         let relative_to_repo = project_file.strip_prefix(&git_root).map_err(|_| {
             CliError::Core(DeadreckonError::InvalidInput(
@@ -421,6 +462,11 @@ async fn schedule_direct_run(
     } else {
         authority_source_cwd.clone()
     };
+    let trusted_contract_dirty_paths = bounded_existing_project_contract_dirty_paths(
+        &authority_source_cwd,
+        args.acceptance.as_deref(),
+        args.allow_dirty,
+    )?;
     if matches!(source.mode, commands::job::DurableSourceMode::Worktree) {
         prepare_worktree_record(
             &paths,
@@ -431,7 +477,7 @@ async fn schedule_direct_run(
                 base_ref: args.base.clone(),
                 branch_name: args.branch.clone(),
                 allow_dirty: args.allow_dirty,
-                allowed_dirty_paths: Vec::new(),
+                allowed_dirty_paths: trusted_contract_dirty_paths,
             },
         )
         .map_err(|error| run_codebase_refusal_error(error, &args.goal, args.no_hints))?;
@@ -803,6 +849,9 @@ pub(crate) async fn run_command_with_launch_plan(
         match (requested_run_id.as_deref(), acceptance_source.as_ref()) {
             (Some(run_id), Some(source)) if !allow_dirty => {
                 trusted_controller_contract_dirty_paths(&paths, run_id, &cwd, source, &launch_plan)?
+            }
+            (None, Some(source)) if !allow_dirty => {
+                bounded_project_contract_dirty_paths(&cwd, source)?
             }
             _ => Vec::new(),
         };
@@ -1589,6 +1638,142 @@ mod durable_direct_tests {
                 files,
             })
             .expect("bundle signal");
+    }
+
+    #[test]
+    fn project_contract_bundle_is_the_only_dirty_input_allowed_before_job_freeze() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, _, _) = trusted_contract_fixture(&temp);
+        let helper_dir = repo.join(".deadreckon/acceptance");
+        fs::create_dir_all(&helper_dir).expect("helper directory");
+        fs::write(helper_dir.join("check output ☃.sh"), "#!/bin/sh\nexit 0\n")
+            .expect("helper with a Git-quoted name");
+        let source = commands::acceptance::resolve_acceptance_source(&repo, None)
+            .expect("acceptance resolution")
+            .expect("project contract");
+        let allowed = bounded_project_contract_dirty_paths(&repo, &source)
+            .expect("bounded project contract paths");
+        assert_eq!(
+            allowed,
+            [
+                PathBuf::from(".deadreckon/acceptance.md"),
+                PathBuf::from(".deadreckon/acceptance.yaml"),
+                PathBuf::from(".deadreckon/acceptance/check output ☃.sh"),
+            ]
+        );
+
+        prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id: run_id.clone(),
+                task_key: "pre-freeze-contract".to_string(),
+                source_path: repo.clone(),
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed.clone(),
+            },
+        )
+        .expect("exact project contract remains admissible");
+
+        fs::write(repo.join("unrelated.txt"), "operator work\n").expect("unrelated dirt");
+        let error = prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id,
+                task_key: "pre-freeze-contract".to_string(),
+                source_path: repo,
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect_err("unrelated dirt remains rejected");
+        assert!(error.to_string().contains("unrelated.txt"), "{error}");
+    }
+
+    #[test]
+    fn external_contract_does_not_excuse_project_contract_dirt() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, repo, run_id, _, _) = trusted_contract_fixture(&temp);
+        let external = temp.path().join("external.yaml");
+        fs::write(
+            &external,
+            "name: external\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/app.py'\n",
+        )
+        .expect("external contract");
+
+        let allowed =
+            bounded_existing_project_contract_dirty_paths(&repo, Some(external.as_path()), false)
+                .expect("external contract resolution");
+        assert!(allowed.is_empty());
+        let error = prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id,
+                task_key: "external-contract".to_string(),
+                source_path: repo,
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect_err("an explicit external contract cannot bless project dirt");
+        assert!(error.to_string().contains(".deadreckon"), "{error}");
+    }
+
+    #[test]
+    fn nested_project_contract_maps_to_its_git_relative_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        let project = repo.join("apps/native bird");
+        fs::create_dir_all(&project).expect("nested project");
+        git(&repo, &["init"]);
+        git(&repo, &["config", "user.email", "fixture@example.invalid"]);
+        git(&repo, &["config", "user.name", "Fixture"]);
+        fs::write(project.join("app.py"), "print('unfinished')\n").expect("app");
+        git(&repo, &["add", "apps/native bird/app.py"]);
+        git(&repo, &["commit", "-m", "fixture"]);
+        fs::create_dir_all(project.join(".deadreckon/acceptance")).expect("contract helper root");
+        fs::write(
+            project.join(".deadreckon/acceptance.yaml"),
+            "name: nested\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/app.py'\n",
+        )
+        .expect("contract");
+        fs::write(
+            project.join(".deadreckon/acceptance/check output.sh"),
+            "#!/bin/sh\nexit 0\n",
+        )
+        .expect("helper");
+
+        let source = commands::acceptance::resolve_acceptance_source(&project, None)
+            .expect("acceptance resolution")
+            .expect("project contract");
+        let allowed = bounded_project_contract_dirty_paths(&project, &source)
+            .expect("bounded project contract paths");
+        assert_eq!(
+            allowed,
+            [
+                PathBuf::from("apps/native bird/.deadreckon/acceptance.yaml"),
+                PathBuf::from("apps/native bird/.deadreckon/acceptance/check output.sh"),
+            ]
+        );
+        prepare_worktree_record(
+            &paths,
+            WorktreeOptions {
+                run_id: "fedcba9876543210fedcba9876543210".to_string(),
+                task_key: "nested-contract".to_string(),
+                source_path: project,
+                base_ref: None,
+                branch_name: None,
+                allow_dirty: false,
+                allowed_dirty_paths: allowed,
+            },
+        )
+        .expect("nested exact bundle remains admissible");
     }
 
     #[test]

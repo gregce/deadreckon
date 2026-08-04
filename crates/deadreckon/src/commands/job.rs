@@ -1301,41 +1301,27 @@ fn freeze_contract_bundle(
 }
 
 fn freeze_contract_file(source: &Path, target: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "done-contract bundle member is not a regular file: {}",
-                source.display()
-            ),
-            "replace symlinks and special files under .deadreckon with regular files",
-        )));
-    }
-    if metadata.len() > CONTRACT_BUNDLE_MAX_FILE_BYTES {
-        return Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "done-contract bundle member exceeds {} bytes: {}",
-                CONTRACT_BUNDLE_MAX_FILE_BYTES,
-                source.display()
-            ),
-            "reduce generated acceptance helpers before starting the Job",
-        )));
-    }
-    let source_before = deadreckon_core::flight::sha256_file(source)?;
+    let (bytes, metadata) = read_stable_contract_member(source)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source, target)?;
+    let mut target_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(target)?;
+    target_file.write_all(&bytes)?;
+    target_file.set_permissions(metadata.permissions())?;
+    target_file.sync_all()?;
+    drop(target_file);
     sync_file(target)?;
-    let source_after = deadreckon_core::flight::sha256_file(source)?;
-    let target_digest = deadreckon_core::flight::sha256_file(target)?;
-    if source_before != source_after || source_before != target_digest {
+    let expected = contract_sha256(&bytes);
+    if deadreckon_core::flight::sha256_file(target)? != expected {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!(
-                "done-contract bundle changed while it was being frozen: {}",
-                source.display()
+                "frozen done-contract bundle did not match its captured source: {}",
+                target.display()
             ),
-            "rerun deadreckon start after contract writes stop",
+            "rerun deadreckon start after storage is healthy",
         )));
     }
     Ok(())
@@ -1407,13 +1393,23 @@ fn contract_bundle_inventory(root: &Path) -> Result<FrozenContractBundle> {
     finalize_contract_bundle(files)
 }
 
-fn source_contract_bundle_inventory(source: &Path) -> Result<FrozenContractBundle> {
+pub(crate) fn source_contract_bundle_inventory(source: &Path) -> Result<FrozenContractBundle> {
     let root = source.parent().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
             "done contract has no parent directory: {}",
             source.display()
         )))
     })?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle root is not a regular directory: {}",
+                root.display()
+            ),
+            "replace the .deadreckon symlink or special file with a regular directory",
+        )));
+    }
     let mut files = Vec::new();
     inventory_contract_absolute(source, Path::new(JOB_ACCEPTANCE_FILE), &mut files)?;
     let doc = root.join(JOB_ACCEPTANCE_DOC);
@@ -1516,26 +1512,130 @@ fn inventory_contract_absolute(
     logical_relative: &Path,
     files: &mut Vec<FrozenContractFile>,
 ) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "frozen done-contract member is not a regular file: {}",
-            path.display()
-        ))));
-    }
-    if metadata.len() > CONTRACT_BUNDLE_MAX_FILE_BYTES {
-        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-            "frozen done-contract member exceeds its byte limit: {}",
-            path.display()
-        ))));
-    }
+    let (bytes, metadata) = read_stable_contract_member(path)?;
     files.push(FrozenContractFile {
         path: logical_relative.to_string_lossy().replace('\\', "/"),
-        sha256: deadreckon_core::flight::sha256_file(path)?,
-        bytes: metadata.len(),
+        sha256: contract_sha256(&bytes),
+        bytes: u64::try_from(bytes.len()).map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "done-contract bundle member byte count overflowed".to_string(),
+            ))
+        })?,
         executable: contract_file_executable(&metadata),
     });
     Ok(())
+}
+
+pub(crate) fn contract_file_matches_inventory(
+    path: &Path,
+    expected: &FrozenContractFile,
+) -> Result<bool> {
+    let (bytes, metadata) = read_stable_contract_member(path)?;
+    Ok(u64::try_from(bytes.len()).ok() == Some(expected.bytes)
+        && contract_sha256(&bytes) == expected.sha256
+        && contract_file_executable(&metadata) == expected.executable)
+}
+
+/// Capture a contract member through one no-follow descriptor, with a hard
+/// byte ceiling and identity checks before and after the read. This prevents a
+/// helper from becoming a symlink or growing without bound between inventory,
+/// admission and Job freeze.
+fn read_stable_contract_member(path: &Path) -> Result<(Vec<u8>, fs::Metadata)> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink() || !before.file_type().is_file() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member is not a regular file: {}",
+                path.display()
+            ),
+            "replace symlinks and special files under .deadreckon with regular files",
+        )));
+    }
+    if before.len() > CONTRACT_BUNDLE_MAX_FILE_BYTES {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member exceeds {} bytes: {}",
+                CONTRACT_BUNDLE_MAX_FILE_BYTES,
+                path.display()
+            ),
+            "reduce generated acceptance helpers before starting the Job",
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let opened = file.metadata()?;
+    if !stable_contract_metadata(&before, &opened) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member changed identity while it was opened: {}",
+                path.display()
+            ),
+            "rerun deadreckon start after contract writes stop",
+        )));
+    }
+
+    let limit = CONTRACT_BUNDLE_MAX_FILE_BYTES.saturating_add(1);
+    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
+    (&mut file).take(limit).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CONTRACT_BUNDLE_MAX_FILE_BYTES {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member exceeded {} bytes while it was read: {}",
+                CONTRACT_BUNDLE_MAX_FILE_BYTES,
+                path.display()
+            ),
+            "reduce generated acceptance helpers before starting the Job",
+        )));
+    }
+    let after = file.metadata()?;
+    let post_path = fs::symlink_metadata(path)?;
+    if !stable_contract_metadata(&opened, &after)
+        || !stable_contract_metadata(&after, &post_path)
+        || u64::try_from(bytes.len()).ok() != Some(after.len())
+    {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract bundle member changed while its bytes were captured: {}",
+                path.display()
+            ),
+            "rerun deadreckon start after contract writes stop",
+        )));
+    }
+    Ok((bytes, after))
+}
+
+fn contract_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", <Sha256 as sha2::Digest>::digest(bytes))
+}
+
+#[cfg(unix)]
+fn stable_contract_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn stable_contract_metadata(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type().is_file()
+        && right.file_type().is_file()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
 }
 
 #[cfg(unix)]
@@ -2408,6 +2508,79 @@ mod tests {
                     .expect("jobs")
                     .next()
                     .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_job_rejects_a_symlinked_contract_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        let external_contract_dir = temp.path().join("external-contract");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&external_contract_dir).expect("external contract directory");
+        fs::write(source.join("README.md"), "durable\n").expect("source file");
+        let external_contract = external_contract_dir.join("acceptance.yaml");
+        fs::write(
+            &external_contract,
+            "name: fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("external contract");
+        symlink(&external_contract_dir, source.join(".deadreckon")).expect("symlink contract root");
+
+        let error = create_job(request(
+            &paths,
+            &source,
+            Some(&source.join(".deadreckon/acceptance.yaml")),
+        ))
+        .expect_err("symlinked authority root must fail closed");
+        assert!(
+            error.to_string().contains("bundle root")
+                && error.to_string().contains("regular directory"),
+            "{error}"
+        );
+        assert!(
+            !paths.jobs_dir().exists()
+                || fs::read_dir(paths.jobs_dir())
+                    .expect("jobs")
+                    .next()
+                    .is_none(),
+            "failed admission must roll back its partial Job"
+        );
+    }
+
+    #[test]
+    fn source_contract_inventory_enforces_file_and_count_budgets() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join(".deadreckon");
+        fs::create_dir_all(root.join("acceptance")).expect("helper root");
+        let contract = root.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: fixture\nchecks:\n  - kind: file_exists\n    path: '{working_dir}/README.md'\n",
+        )
+        .expect("contract");
+        let oversized = root.join("acceptance/oversized.bin");
+        let file = fs::File::create(&oversized).expect("oversized helper");
+        file.set_len(CONTRACT_BUNDLE_MAX_FILE_BYTES + 1)
+            .expect("grow helper");
+        let error = source_contract_bundle_inventory(&contract)
+            .expect_err("oversized member must fail closed");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+
+        fs::remove_file(oversized).expect("remove oversized helper");
+        for index in 0..CONTRACT_BUNDLE_MAX_FILES {
+            fs::write(root.join(format!("acceptance/helper-{index:02}")), b"x")
+                .expect("counted helper");
+        }
+        let error = source_contract_bundle_inventory(&contract)
+            .expect_err("the contract plus too many helpers must fail closed");
+        assert!(
+            error.to_string().contains("files") && error.to_string().contains("limit"),
+            "{error}"
         );
     }
 

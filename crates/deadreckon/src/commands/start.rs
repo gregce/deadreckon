@@ -2831,6 +2831,12 @@ fn resolve_start_source_mode(
     let resolved_mode = resolve_mode(&flags, cwd, request.stdin_is_tty)?;
     match resolved_mode {
         ResolvedMode::Worktree { source_path, .. } => {
+            let trusted_contract_dirty_paths =
+                commands::run::bounded_existing_project_contract_dirty_paths(
+                    &source_path,
+                    None,
+                    request.allow_dirty,
+                )?;
             let first = prepare_worktree_record(
                 paths,
                 WorktreeOptions {
@@ -2840,7 +2846,7 @@ fn resolve_start_source_mode(
                     base_ref: None,
                     branch_name: None,
                     allow_dirty: request.allow_dirty,
-                    allowed_dirty_paths: Vec::new(),
+                    allowed_dirty_paths: trusted_contract_dirty_paths,
                 },
             );
             match first {
