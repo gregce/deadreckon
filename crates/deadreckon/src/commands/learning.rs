@@ -4,6 +4,9 @@ use deadreckon_core::learning::{
     PrDryRun, ProposalGenerationReport,
 };
 
+const LEARNING_PROVIDER_WORK_BUDGET: Duration = Duration::from_secs(20 * 60);
+const LEARNING_PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+
 pub(crate) async fn learn_command(command: LearnCommand) -> Result<()> {
     match command {
         LearnCommand::Index {
@@ -340,7 +343,22 @@ async fn learn_propose_command(
     let mut request =
         ProviderRequest::enforceably_read_only(prompt, 8_000, std::env::current_dir()?);
     request.output_path = Some(paths.learning_dir().join("reflection.out"));
-    let response = router.complete(&request).await?;
+    request.pid_file = Some(
+        paths
+            .learning_dir()
+            .join(format!("reflection-{}.pid", Uuid::new_v4().simple())),
+    );
+    let response = learning_provider_response(
+        complete_provider_phase(
+            &router,
+            &mut request,
+            ProviderPhaseDeadline::from_now(
+                LEARNING_PROVIDER_WORK_BUDGET,
+                LEARNING_PROVIDER_CLEANUP_BUDGET,
+            ),
+        )
+        .await,
+    )?;
     let reflection_provider = LearningInsightProvider {
         route: response.provider,
         model: response.model,
@@ -356,6 +374,41 @@ async fn learn_propose_command(
     }
     println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+fn learning_provider_response(
+    outcome: ProviderPhaseOutcome<
+        deadreckon_providers::Result<deadreckon_providers::ProviderResponse>,
+    >,
+) -> Result<deadreckon_providers::ProviderResponse> {
+    match outcome {
+        ProviderPhaseOutcome::Completed(result) => result.map_err(CliError::from),
+        ProviderPhaseOutcome::WorkExpired { cleanup } => Err(learning_provider_boundary_error(
+            "exceeded its work budget",
+            cleanup,
+        )),
+        ProviderPhaseOutcome::Cancelled { cleanup } => {
+            Err(learning_provider_boundary_error("was cancelled", cleanup))
+        }
+    }
+}
+
+fn learning_provider_boundary_error(reason: &str, cleanup: ProviderCleanup) -> CliError {
+    let cleanup_detail = match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => String::new(),
+        ProviderCleanup::RetainedAuthority { path, detail } => format!(
+            "; cleanup was not proven and process authority remains at {}: {detail}",
+            path.display()
+        ),
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &format!("learning reflection {reason}{cleanup_detail}"),
+        if cleanup_detail.is_empty() {
+            "retry deadreckon learn propose"
+        } else {
+            "inspect the retained process record, then run deadreckon doctor before retrying"
+        },
+    ))
 }
 
 fn learn_propose_surface(
@@ -1092,4 +1145,59 @@ pub(crate) fn open_self_improve_pr_if_eligible(
         },
     )?;
     Ok(pr_url)
+}
+
+#[cfg(test)]
+mod provider_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn learning_timeout_fails_closed_after_proven_cleanup() {
+        let error = learning_provider_response(ProviderPhaseOutcome::WorkExpired {
+            cleanup: ProviderCleanup::Proven,
+        })
+        .expect_err("a timed-out reflection must not persist a proposal");
+
+        assert!(error.to_string().contains("exceeded its work budget"));
+        assert!(!error.to_string().contains("process authority remains"));
+    }
+
+    #[test]
+    fn learning_timeout_preserves_unproven_process_authority() {
+        let authority = PathBuf::from("/tmp/deadreckon-learning-retained.pid");
+        let error = learning_provider_response(ProviderPhaseOutcome::WorkExpired {
+            cleanup: ProviderCleanup::RetainedAuthority {
+                path: authority.clone(),
+                detail: "provider tree still alive".to_string(),
+            },
+        })
+        .expect_err("unproven cleanup must fail closed");
+        let message = error.to_string();
+
+        assert!(message.contains("cleanup was not proven"));
+        assert!(message.contains(authority.to_string_lossy().as_ref()));
+        assert!(message.contains("provider tree still alive"));
+    }
+
+    #[tokio::test]
+    async fn expired_learning_boundary_does_not_start_provider_work() {
+        let router = ProviderRouter::smoke();
+        let mut request = ProviderRequest::enforceably_read_only("reflect", 32, ".");
+        let outcome = complete_provider_phase(
+            &router,
+            &mut request,
+            ProviderPhaseDeadline::new(
+                tokio::time::Instant::now(),
+                LEARNING_PROVIDER_CLEANUP_BUDGET,
+            ),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            ProviderPhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::NotApplicable
+            }
+        ));
+    }
 }

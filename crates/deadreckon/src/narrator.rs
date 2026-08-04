@@ -18,7 +18,8 @@ use chrono::{DateTime, Utc};
 use deadreckon_core::RunEventBus;
 use deadreckon_protocol::{LedgerItem, RunEvent, RunEventKind, SpendRecord};
 use deadreckon_providers::{
-    NarratorBackend, ProviderRequest, ProviderResponse, ProviderRouter, select_narrator_backend,
+    NarratorBackend, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
+    ProviderResponse, ProviderRouter, complete_provider_phase, select_narrator_backend,
 };
 use deadreckon_runtime::NarratorConfig;
 use tokio::sync::broadcast;
@@ -34,6 +35,8 @@ use crate::narrative::{
 
 const NARRATOR_MAX_TOKENS: u32 = 1024;
 const QUIET_TICK: Duration = Duration::from_secs(10);
+const NARRATOR_PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+const NARRATOR_PROVIDER_SAFETY_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// Decide whether to narrate and how, from the run's surface and flags.
 ///
@@ -145,6 +148,9 @@ pub(crate) struct NarratorCtx {
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) backend: NarratorBackend,
     pub(crate) config: NarratorConfig,
+    /// One cumulative provider-work cutoff for this narrator task. Every beat
+    /// reuses this instant; a later beat never receives a fresh timeout.
+    work_expires_at: tokio::time::Instant,
 }
 
 /// Resolve the narrator backend for a run from the provider registry, honoring
@@ -211,9 +217,46 @@ pub(crate) fn build_run_narration(
         config_path,
         backend,
         config,
+        work_expires_at: narrator_work_expires_at(run_root),
     };
     let (sender, handle) = build_narration(ctx);
     (Some(sender), Some(handle))
+}
+
+fn narrator_work_expires_at(run_root: &Path) -> tokio::time::Instant {
+    let run_remaining = deadreckon_core::state::load_state(&run_root.join("state.json"))
+        .ok()
+        .map_or(NARRATOR_PROVIDER_SAFETY_WINDOW, |state| {
+            narrator_remaining_work(state.max_wall_seconds, state.total_wall_seconds)
+        });
+    let now = Utc::now();
+    let supervisor_remaining =
+        match std::env::var(crate::commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV) {
+            Ok(value) => value
+                .parse::<DateTime<Utc>>()
+                .ok()
+                .and_then(|cutoff| cutoff.signed_duration_since(now).to_std().ok())
+                .unwrap_or(Duration::ZERO),
+            Err(std::env::VarError::NotPresent) => NARRATOR_PROVIDER_SAFETY_WINDOW,
+            Err(std::env::VarError::NotUnicode(_)) => Duration::ZERO,
+        };
+    let remaining = run_remaining.min(supervisor_remaining);
+    tokio::time::Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(tokio::time::Instant::now)
+}
+
+fn narrator_remaining_work(max_wall_seconds: Option<f64>, total_wall_seconds: f64) -> Duration {
+    if !total_wall_seconds.is_finite() || total_wall_seconds < 0.0 {
+        return Duration::ZERO;
+    }
+    let Some(max_wall_seconds) = max_wall_seconds else {
+        return NARRATOR_PROVIDER_SAFETY_WINDOW;
+    };
+    if !max_wall_seconds.is_finite() || max_wall_seconds < 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64((max_wall_seconds - total_wall_seconds).max(0.0))
 }
 
 fn append_narrator_spend(run_root: &Path, record: &SpendRecord) -> deadreckon_core::Result<()> {
@@ -380,7 +423,22 @@ impl NarratorEngine {
             // so emit() falls through to a floor beat instead of the task
             // being killed mid-call with no beat written.
             request.cancellation_token = Some(self.cancel.clone());
-            if let Ok(response) = router.complete(&request).await
+            request.pid_file = Some(
+                self.ctx
+                    .run_root
+                    .join("child-pids")
+                    .join(format!("narrator-{}.pid", uuid::Uuid::new_v4().simple())),
+            );
+            let completion = complete_provider_phase(
+                router,
+                &mut request,
+                ProviderPhaseDeadline::new(
+                    self.ctx.work_expires_at,
+                    NARRATOR_PROVIDER_CLEANUP_BUDGET,
+                ),
+            )
+            .await;
+            if let ProviderPhaseOutcome::Completed(Ok(response)) = completion
                 && self.commit_model_beat(&response, now).is_ok()
             {
                 return;
@@ -727,7 +785,31 @@ mod tests {
                 foreground: false,
                 ..NarratorConfig::default()
             },
+            work_expires_at: tokio::time::Instant::now() + NARRATOR_PROVIDER_SAFETY_WINDOW,
         }
+    }
+
+    #[test]
+    fn narrator_reuses_the_runs_remaining_work_budget() {
+        assert_eq!(
+            narrator_remaining_work(Some(120.0), 45.0),
+            Duration::from_secs(75)
+        );
+        assert_eq!(narrator_remaining_work(Some(120.0), 120.0), Duration::ZERO);
+        assert_eq!(narrator_remaining_work(Some(120.0), 130.0), Duration::ZERO);
+    }
+
+    #[test]
+    fn narrator_without_a_run_cap_gets_one_fixed_safety_window() {
+        assert_eq!(
+            narrator_remaining_work(None, 45.0),
+            NARRATOR_PROVIDER_SAFETY_WINDOW
+        );
+        assert_eq!(
+            narrator_remaining_work(Some(f64::NAN), 45.0),
+            Duration::ZERO,
+            "invalid durable timing fails closed"
+        );
     }
 
     #[test]
