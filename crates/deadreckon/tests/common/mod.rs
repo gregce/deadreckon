@@ -12,6 +12,10 @@ use tempfile::TempDir;
 
 const SUPERVISOR_INSTANCE_SCHEMA: u64 = 3;
 const SUPERVISOR_STATUS_SCHEMA: u64 = 3;
+// Keep the hermetic service fixture aligned with production's bounded
+// readiness window. A debug integration-test binary is large, and both
+// install and serve hash its exact bytes before readiness can be trusted.
+const SUPERVISOR_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A hermetic per-user service environment for public `start` integration
 /// tests.  Both configured and unconfigured fixtures redirect HOME, the
@@ -196,7 +200,8 @@ impl SupervisorServiceFixture {
         self.service = Some(child);
 
         let checkpoint = self.deadreckon_home.join("supervisor/instance.json");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let readiness_started = Instant::now();
+        let deadline = readiness_started + SUPERVISOR_READINESS_TIMEOUT;
         let mut last_checkpoint = None;
         loop {
             if let Some(service) = self.service.as_mut()
@@ -216,8 +221,10 @@ impl SupervisorServiceFixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "isolated supervisor did not publish a live v{SUPERVISOR_INSTANCE_SCHEMA} checkpoint at {}; last observed checkpoint: {}",
+                "isolated supervisor pid {expected_pid} did not publish a live v{SUPERVISOR_INSTANCE_SCHEMA} checkpoint at {} within {}s (elapsed: {:.2?}); last observed checkpoint: {}",
                 checkpoint.display(),
+                SUPERVISOR_READINESS_TIMEOUT.as_secs(),
+                readiness_started.elapsed(),
                 last_checkpoint
                     .as_ref()
                     .map(Value::to_string)
