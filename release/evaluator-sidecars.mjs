@@ -31,6 +31,8 @@ const EVALUATORS = [
 // default. Keep extraction bounded, but high enough for optimized host and
 // evaluator binaries so archive inventory cannot fail with an opaque ENOBUFS.
 const MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024;
+const GATE_PROTOCOL_MARKER = "deadreckon-gate-evaluator-protocol-v1";
+const BUNDLE_BUILD_ID_PATTERN = /deadreckon-bundle-build-id-sha256:[a-f0-9]{64}/g;
 
 const command = process.argv[2];
 const args = parseArgs(process.argv.slice(3));
@@ -260,6 +262,13 @@ function archiveInventory(archive, target) {
       if (evaluator) {
         validateStaticLinuxElf(bytes, evaluator);
       }
+      const gateBundleMember =
+        name === "deadreckon" ||
+        name === "deadreckon.exe" ||
+        name === "dr-gate" ||
+        name === "dr-gate.exe" ||
+        evaluator;
+      const bundleBuildId = gateBundleMember ? requireGateBundleIdentity(bytes, name) : null;
       return {
         path: entry,
         name,
@@ -271,9 +280,21 @@ function archiveInventory(archive, target) {
         sha256: sha256Bytes(bytes),
         bytes: bytes.length,
         target: evaluator?.target ?? (hostHelpers(target).includes(name) ? target : null),
+        ...(bundleBuildId ? { bundle_build_id: bundleBuildId } : {}),
       };
     })
     .sort((left, right) => left.path.localeCompare(right.path));
+
+  const bundleBuildIds = new Set(
+    members.filter((member) => member.bundle_build_id).map((member) => member.bundle_build_id),
+  );
+  if (bundleBuildIds.size !== 1) {
+    throw new Error(
+      `${path.basename(archive)} mixes incompatible DeadReckon gate build bundles: ${[
+        ...bundleBuildIds,
+      ].join(", ")}`,
+    );
+  }
 
   return {
     name: path.basename(archive),
@@ -291,7 +312,7 @@ function verifySidecarDirectory(dir, target = null) {
   if (evaluators.length === 0) {
     throw new Error(`unsupported evaluator target ${target}`);
   }
-  return evaluators.map((evaluator) => {
+  const verified = evaluators.map((evaluator) => {
     const matches = [];
     walk(dir, (file) => {
       if (path.basename(file) === evaluator.name) {
@@ -303,14 +324,37 @@ function verifySidecarDirectory(dir, target = null) {
     }
     const bytes = fs.readFileSync(matches[0]);
     validateStaticLinuxElf(bytes, evaluator);
+    const bundleBuildId = requireGateBundleIdentity(bytes, evaluator.name);
     return {
       name: evaluator.name,
       target: evaluator.target,
       path: matches[0],
       sha256: sha256Bytes(bytes),
       bytes: bytes.length,
+      bundle_build_id: bundleBuildId,
     };
   });
+  const bundleBuildIds = new Set(verified.map((entry) => entry.bundle_build_id));
+  if (bundleBuildIds.size !== 1) {
+    throw new Error(
+      `gate evaluator sidecars mix incompatible DeadReckon build bundles: ${[
+        ...bundleBuildIds,
+      ].join(", ")}`,
+    );
+  }
+  return verified;
+}
+
+function requireGateBundleIdentity(bytes, name) {
+  const text = bytes.toString("latin1");
+  if (!text.includes(GATE_PROTOCOL_MARKER)) {
+    throw new Error(`${name} is missing ${GATE_PROTOCOL_MARKER}`);
+  }
+  const identities = [...new Set(text.match(BUNDLE_BUILD_ID_PATTERN) ?? [])];
+  if (identities.length !== 1) {
+    throw new Error(`${name} must embed exactly one DeadReckon bundle build identity`);
+  }
+  return identities[0];
 }
 
 function validateStaticLinuxElf(bytes, evaluator) {

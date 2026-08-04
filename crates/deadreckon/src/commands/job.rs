@@ -14,10 +14,10 @@ use std::process::{Command, Stdio};
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
     AppliedGitDeliveryReceipt, AuthorityAcceptedBy, DockerGateIdentity,
-    GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity,
-    GateEvaluatorIdentity, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
-    JobExecutionPolicy, JobId, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
-    StopReason,
+    GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_MARKER,
+    GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, Job, JobAuthority,
+    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobId, JobPolicy,
+    JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
 };
 use sha2::Sha256;
 
@@ -1689,17 +1689,10 @@ fn freeze_gate_evaluator_identity(
     job_id: &str,
     sandbox_requested: &str,
 ) -> Result<GateEvaluatorIdentity> {
-    let controller_source = locate_installed_gate("dr-gate")?;
-    let controller_bytes = read_stable_executable(&controller_source)?;
     let controller_os = host_gate_os()?;
     let controller_arch = host_gate_arch()?;
-    validate_gate_binary(
-        &controller_bytes,
-        controller_os,
-        controller_arch,
-        false,
-        &controller_source,
-    )?;
+    let (_, controller_bytes) =
+        read_compatible_installed_gate("dr-gate", controller_os, controller_arch, false)?;
     let controller_target = paths.job_frozen_controller_gate(job_id);
     let controller_sha256 = freeze_executable(&controller_target, &controller_bytes)?;
     let controller = GateBinaryIdentity {
@@ -1723,9 +1716,8 @@ fn freeze_gate_evaluator_identity(
                 ("x86_64", "dr-gate-evaluator-x86_64-unknown-linux-musl")
             }
         };
-        let evaluator_source = locate_installed_gate(sidecar_name)?;
-        let evaluator_bytes = read_stable_executable(&evaluator_source)?;
-        validate_gate_binary(&evaluator_bytes, "linux", arch, true, &evaluator_source)?;
+        let (_, evaluator_bytes) =
+            read_compatible_installed_gate(sidecar_name, "linux", arch, true)?;
         let evaluator_target = paths.job_frozen_evaluator_gate(job_id);
         let evaluator_sha256 = freeze_executable(&evaluator_target, &evaluator_bytes)?;
         (
@@ -1772,7 +1764,7 @@ fn gate_evaluator_identity_sha256(identity: &GateEvaluatorIdentity) -> Result<St
     Ok(deadreckon_core::flight::sha256_text(&raw))
 }
 
-fn locate_installed_gate(name: &str) -> Result<PathBuf> {
+fn installed_gate_candidates(name: &str) -> Result<Vec<PathBuf>> {
     let current = std::env::current_exe().map_err(|source| {
         CliError::Core(DeadreckonError::Io {
             path: PathBuf::from("current-exe"),
@@ -1803,15 +1795,50 @@ fn locate_installed_gate(name: &str) -> Result<PathBuf> {
     } else {
         name.to_string()
     };
-    for root in roots {
-        let candidate = root.join(&native_name);
-        if candidate.exists() {
-            return Ok(candidate);
+    Ok(roots
+        .into_iter()
+        .map(|root| root.join(&native_name))
+        .filter(|candidate| candidate.exists())
+        .collect())
+}
+
+fn read_compatible_installed_gate(
+    name: &str,
+    os: &str,
+    arch: &str,
+    require_static_elf: bool,
+) -> Result<(PathBuf, Vec<u8>)> {
+    let candidates = installed_gate_candidates(name)?;
+    if candidates.is_empty() {
+        return Err(CliError::Core(DeadreckonError::NotFound(format!(
+            "trusted release helper {name} next to the DeadReckon installation; reinstall the matching release, or for a source build run `cargo build --release --workspace --locked`"
+        ))));
+    }
+
+    let mut rejected = Vec::new();
+    for candidate in candidates {
+        let attempt = (|| {
+            let bytes = read_stable_executable(&candidate)?;
+            validate_gate_binary(&bytes, os, arch, require_static_elf, &candidate)?;
+            validate_gate_protocol(&bytes, &candidate)?;
+            Ok::<_, CliError>(bytes)
+        })();
+        match attempt {
+            Ok(bytes) => return Ok((candidate, bytes)),
+            Err(error) => rejected.push(format!("{} ({error})", candidate.display())),
         }
     }
-    Err(CliError::Core(DeadreckonError::NotFound(format!(
-        "trusted release helper {native_name} next to the DeadReckon installation"
+
+    Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+        "no compatible {name} helper was found for gate protocol {GATE_EVALUATOR_PROTOCOL_VERSION}; rejected {}; reinstall the matching release, or for a source build run `cargo build --release --workspace --locked`",
+        rejected.join(", ")
     ))))
+}
+
+pub(crate) fn inspect_compatible_host_gate() -> Result<PathBuf> {
+    let (path, _) =
+        read_compatible_installed_gate("dr-gate", host_gate_os()?, host_gate_arch()?, false)?;
+    Ok(path)
 }
 
 fn read_stable_executable(path: &Path) -> Result<Vec<u8>> {
@@ -1973,6 +2000,28 @@ fn validate_gate_binary(
     Ok(())
 }
 
+fn validate_gate_protocol(bytes: &[u8], path: &Path) -> Result<()> {
+    let marker = GATE_EVALUATOR_PROTOCOL_MARKER.as_bytes();
+    if !bytes.windows(marker.len()).any(|window| window == marker) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable {} does not implement required protocol {}",
+            path.display(),
+            GATE_EVALUATOR_PROTOCOL_VERSION
+        ))));
+    }
+    let build_id = env!("DEADRECKON_BUNDLE_BUILD_ID").as_bytes();
+    if !bytes
+        .windows(build_id.len())
+        .any(|window| window == build_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "gate executable {} belongs to a different DeadReckon build bundle",
+            path.display()
+        ))));
+    }
+    Ok(())
+}
+
 fn elf_has_interpreter(bytes: &[u8]) -> bool {
     if bytes.get(0..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
         return false;
@@ -2116,6 +2165,37 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn gate_helper_requires_protocol_and_exact_bundle_build_identity() {
+        let compatible = format!(
+            "prefix{}middle{}suffix",
+            GATE_EVALUATOR_PROTOCOL_MARKER,
+            env!("DEADRECKON_BUNDLE_BUILD_ID")
+        );
+        validate_gate_protocol(compatible.as_bytes(), Path::new("dr-gate"))
+            .expect("matching gate helper");
+
+        let stale_same_protocol = format!(
+            "prefix{}middledeadreckon-bundle-build-id-sha256:{}suffix",
+            GATE_EVALUATOR_PROTOCOL_MARKER,
+            "0".repeat(64)
+        );
+        let error = validate_gate_protocol(stale_same_protocol.as_bytes(), Path::new("dr-gate"))
+            .expect_err("same-version stale bundle must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("different DeadReckon build bundle")
+        );
+
+        let error = validate_gate_protocol(
+            env!("DEADRECKON_BUNDLE_BUILD_ID").as_bytes(),
+            Path::new("dr-gate"),
+        )
+        .expect_err("missing protocol marker must be rejected");
+        assert!(error.to_string().contains("required protocol"));
+    }
 
     fn request<'a>(
         paths: &'a DeadreckonPaths,

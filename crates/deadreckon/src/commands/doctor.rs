@@ -47,6 +47,11 @@ struct DeadreckonBinaryHealth {
     installations: Vec<DeadreckonBinaryInstallation>,
     conflicts: Vec<String>,
     advisories: Vec<String>,
+    gate_helper_compatible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate_helper_path: Option<PathBuf>,
+    gate_protocol_version: u32,
+    bundle_build_id: String,
     repairable_receipt: bool,
     repairable_active_installation: bool,
 }
@@ -604,6 +609,14 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
 
     let mut conflicts = Vec::new();
     let mut advisories = Vec::new();
+    let (gate_helper_compatible, gate_helper_path) =
+        match super::job::inspect_compatible_host_gate() {
+            Ok(path) => (true, Some(path)),
+            Err(error) => {
+                conflicts.push(format!("gate helper is incompatible: {error}"));
+                (false, None)
+            }
+        };
     let mut repairable_receipt = false;
     match read_receipt(paths) {
         Ok(Some(receipt)) => {
@@ -698,6 +711,10 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
         installations,
         conflicts,
         advisories,
+        gate_helper_compatible,
+        gate_helper_path,
+        gate_protocol_version: deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+        bundle_build_id: env!("DEADRECKON_BUNDLE_BUILD_ID").to_string(),
         repairable_receipt,
         repairable_active_installation,
     })
@@ -863,7 +880,18 @@ fn binary_health_finding(health: &DeadreckonBinaryHealth) -> DoctorFinding {
             health.advisories.join("; ")
         ));
     }
-    if health.conflicts.is_empty() {
+    if !health.gate_helper_compatible {
+        DoctorFinding::failed(
+            "deadreckon binary bundle",
+            detail,
+            Some(
+                super::providers::channel_native_update_command(detect_channel(
+                    &health.current_path,
+                ))
+                .to_string(),
+            ),
+        )
+    } else if health.conflicts.is_empty() {
         DoctorFinding::passed("deadreckon binaries", detail, None)
     } else {
         DoctorFinding::warning(

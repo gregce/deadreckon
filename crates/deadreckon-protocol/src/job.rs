@@ -19,7 +19,15 @@ use crate::{JobId, RunId};
 /// The only job wire version understood by this release.
 pub const JOB_SCHEMA_VERSION: u32 = 1;
 pub const GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION: u32 = 1;
+/// Behavioural contract spoken by `deadreckon` and every `dr-gate` helper.
+///
+/// This is deliberately independent of the package version. Bump it when the
+/// persisted invocation or wire contract becomes incompatible. A separate
+/// exact bundle-build identity rejects stale same-protocol source builds.
 pub const GATE_EVALUATOR_PROTOCOL_VERSION: u32 = 1;
+/// Marker embedded in every compatible gate helper, including cross-platform
+/// evaluator sidecars that the host cannot execute during admission.
+pub const GATE_EVALUATOR_PROTOCOL_MARKER: &str = "deadreckon-gate-evaluator-protocol-v1";
 pub const DOCKER_GATE_GUEST_PATH: &str = "/usr/local/bin/dr-gate-evaluate";
 
 /// A checked numeric discriminator for every persisted job artifact.

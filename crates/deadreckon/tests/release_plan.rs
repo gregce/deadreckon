@@ -1504,7 +1504,13 @@ fn evaluator_sidecar_tool_assembles_and_manifests_static_linux_helpers() {
     fs::create_dir_all(&payload).expect("payload");
 
     for helper in ["deadreckon", "dr-gate", "dr-capture"] {
-        fs::write(payload.join(helper), format!("{helper} native")).expect("native helper");
+        let identity = if helper == "dr-capture" {
+            ""
+        } else {
+            FAKE_GATE_BUNDLE
+        };
+        fs::write(payload.join(helper), format!("{helper} native{identity}"))
+            .expect("native helper");
     }
     write_fake_static_elf_sized(
         &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
@@ -1666,6 +1672,42 @@ fn evaluator_sidecar_tool_rejects_dynamically_linked_evaluator() {
 }
 
 #[test]
+fn evaluator_sidecar_tool_rejects_same_protocol_mixed_build_bundles() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let arm = temp
+        .path()
+        .join("dr-gate-evaluator-aarch64-unknown-linux-musl");
+    let intel = temp
+        .path()
+        .join("dr-gate-evaluator-x86_64-unknown-linux-musl");
+    write_fake_static_elf(&arm, 0xb7, false);
+    write_fake_static_elf(&intel, 0x3e, false);
+    let mut stale = fs::read(&intel).expect("fake evaluator");
+    let identity = b"1111111111111111111111111111111111111111111111111111111111111111";
+    let offset = stale
+        .windows(identity.len())
+        .position(|window| window == identity)
+        .expect("fake build identity");
+    stale[offset..offset + identity.len()].fill(b'2');
+    fs::write(&intel, stale).expect("mixed evaluator bundle");
+
+    let output = evaluator_tool([
+        "verify-sidecars",
+        "--sidecars-dir",
+        temp.path().to_str().expect("temp path"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "mixed build bundle must fail closed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mix incompatible"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let distrib = temp.path().join("target/distrib");
@@ -1699,8 +1741,16 @@ fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
             format!("dr-gate{extension}"),
             format!("dr-capture{extension}"),
         ] {
-            fs::write(payload.join(&helper), format!("{helper} for {target}"))
-                .expect("native helper");
+            let identity = if helper.starts_with("dr-capture") {
+                ""
+            } else {
+                FAKE_GATE_BUNDLE
+            };
+            fs::write(
+                payload.join(&helper),
+                format!("{helper} for {target}{identity}"),
+            )
+            .expect("native helper");
         }
 
         let archive = if target.ends_with("windows-msvc") {
@@ -2165,6 +2215,12 @@ fn write_fake_static_elf(path: &Path, machine: u16, with_interp: bool) {
     write_fake_static_elf_sized(path, machine, with_interp, 64 + 56);
 }
 
+const FAKE_GATE_BUNDLE: &str = concat!(
+    " deadreckon-gate-evaluator-protocol-v1 ",
+    "deadreckon-bundle-build-id-sha256:",
+    "1111111111111111111111111111111111111111111111111111111111111111"
+);
+
 fn write_fake_static_elf_sized(path: &Path, machine: u16, with_interp: bool, size: usize) {
     let mut bytes = vec![0_u8; size.max(64 + 56)];
     bytes[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -2179,6 +2235,7 @@ fn write_fake_static_elf_sized(path: &Path, machine: u16, with_interp: bool, siz
     bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
     bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
     bytes[64..68].copy_from_slice(&(if with_interp { 3_u32 } else { 1_u32 }).to_le_bytes());
+    bytes.extend_from_slice(FAKE_GATE_BUNDLE.as_bytes());
     fs::write(path, bytes).expect("write fake ELF");
 }
 

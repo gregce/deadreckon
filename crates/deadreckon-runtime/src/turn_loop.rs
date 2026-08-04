@@ -5468,6 +5468,15 @@ fn revalidate_gate_toolchain(toolchain: &ResolvedGateToolchain) -> Result<()> {
     let Some(identity) = toolchain.identity.as_ref() else {
         return Ok(());
     };
+    if identity.schema_version != deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION
+        || identity.protocol_version != deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved gate evaluator protocol {} is incompatible with this supervisor (requires {}); start a fresh Job with a matching DeadReckon installation",
+            identity.protocol_version,
+            deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION
+        )));
+    }
     validate_frozen_gate(&toolchain.controller, &identity.controller.sha256)?;
     validate_frozen_gate(&toolchain.evaluator, &identity.evaluator.sha256)
 }

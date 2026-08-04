@@ -19,7 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = std::env::args_os().skip(1);
     let mode = raw
         .next()
-        .ok_or("usage: dr-gate <evaluate|sign> [arguments]")?;
+        .ok_or("usage: dr-gate <protocol|evaluate|sign> [arguments]")?;
+    if mode == OsStr::new("protocol") {
+        if raw.next().is_some() {
+            return Err("protocol accepts no arguments".into());
+        }
+        return print_protocol();
+    }
     if mode == OsStr::new("guarded-exec") {
         let args = parse_guarded_exec(raw)?;
         return guarded_exec(&args);
@@ -45,6 +51,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         GateCommand::Evaluate(args) => evaluate(&args),
         GateCommand::Sign(args) => sign(args),
     }
+}
+
+fn print_protocol() -> Result<(), Box<dyn std::error::Error>> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer(
+        &mut stdout,
+        &serde_json::json!({
+            "schema_version": deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
+            "protocol_version": deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
+            "protocol_marker": deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_MARKER,
+            "package_version": env!("CARGO_PKG_VERSION"),
+            "bundle_build_id": env!("DEADRECKON_BUNDLE_BUILD_ID"),
+        }),
+    )?;
+    stdout.write_all(b"\n")?;
+    Ok(())
 }
 
 fn probe_boundary() -> Result<(), Box<dyn std::error::Error>> {
@@ -505,6 +528,20 @@ mod tests {
         CommonArgs, GateCommand, SignArgs, SigningEnvironment, explicit_containment, parse_command,
         parse_guarded_exec, read_evaluation, reject_evaluator_gate_environment, sign,
     };
+
+    #[test]
+    fn compiled_protocol_marker_matches_the_controller_contract() {
+        assert_eq!(
+            deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_MARKER,
+            format!(
+                "deadreckon-gate-evaluator-protocol-v{}",
+                deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION
+            )
+        );
+        assert!(
+            env!("DEADRECKON_BUNDLE_BUILD_ID").starts_with("deadreckon-bundle-build-id-sha256:")
+        );
+    }
 
     fn common_args(command: &str) -> Vec<String> {
         vec![

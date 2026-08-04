@@ -77,6 +77,32 @@ machine reboot, 20–30-task dogfood matrix, Apple notarization, Windows
 Authenticode signing, npm publication or GitHub attestation. Those require the
 later operator and protected-CI steps.
 
+### Same-version stale-helper drill
+
+Before a stable cut, prove that a locally rebuilt controller cannot silently
+freeze an older helper which happens to report the same package version:
+
+```bash
+cargo build --release --workspace --locked
+target/release/dr-gate protocol
+cargo test -p deadreckon \
+  gate_helper_requires_protocol_and_exact_bundle_build_identity \
+  --bin deadreckon
+cargo test -p deadreckon --test release_plan evaluator_sidecar_tool_ -- --nocapture
+```
+
+Accept when:
+
+- [ ] `protocol` reports the expected gate protocol, package version and one
+  `deadreckon-bundle-build-id-sha256:` identity;
+- [ ] a same-protocol helper with a different bundle identity is rejected;
+- [ ] release assembly rejects mixed controller, native-gate or evaluator
+  sidecar build identities;
+- [ ] `deadreckon doctor` reports a missing or incompatible gate helper as a
+  blocking binary-bundle failure, not a healthy installation;
+- [ ] no rejected Job reaches `Queued`, and no frozen authority is rewritten to
+  repair an existing Job.
+
 ## 0.8.1 start-authoring regression acceptance
 
 Use this short drill to accept the Codex schema, retired-feature, supervisor
@@ -85,7 +111,7 @@ the selected provider may consume subscription quota.
 
 ```bash
 cd /path/to/deadreckon
-cargo build --release
+cargo build --release --workspace --locked
 export WK_BIN="$PWD/target/release/deadreckon"
 export WK_081_FIXTURE="$(mktemp -d)"
 
@@ -201,7 +227,7 @@ valued working tree or the normal production state directory.
 
 ```bash
 cd /path/to/deadreckon
-cargo build --release
+cargo build --release --workspace --locked
 
 export WK_BIN="$PWD/target/release/deadreckon"
 export WK_STATE="/path/to/disposable/watchkeeper-state"
