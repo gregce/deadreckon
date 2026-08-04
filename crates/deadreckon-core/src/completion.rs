@@ -244,7 +244,10 @@ pub fn seal_completion_receipt(
         source_tree_sha256: authority.source_tree_sha256.clone(),
         source_revision: authority.source_revision.clone(),
         result_tree_sha256,
-        result_revision: result_revision.or_else(|| current_git_revision(&state.working_dir)),
+        result_revision: match result_revision {
+            Some(revision) => Some(revision),
+            None => current_git_revision(&state.working_dir)?,
+        },
         deterministic_marker_sha256: sha256_file(&marker_path)?,
         semantic_judgment_sha256: sha256_file(&semantic_path)?,
         sandbox_boundary_observation_sha256: sandbox_boundary_observation_sha256(
@@ -263,6 +266,36 @@ pub fn seal_completion_receipt(
     receipt.signature = sign_receipt(&receipt, &key)?;
     atomic_write_json(&paths.job_receipt(authority.job_id.as_ref()), &receipt)?;
     Ok(receipt)
+}
+
+/// Seal a receipt while every nested Git subprocess inherits the enclosing
+/// Job's absolute work cutoff, cancellation signal, cleanup budget, and
+/// durable process-authority directory.
+pub fn seal_completion_receipt_bounded(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    authority: &JobAuthority,
+    marker: &AcceptanceMarker,
+    judgment: &SemanticJudgment,
+    scope: crate::git::WorkBoundaryScope,
+) -> Result<CompletionReceipt> {
+    let receipt_path = paths.job_receipt(authority.job_id.as_ref());
+    let result = crate::git::with_git_command_scope(scope, || {
+        seal_completion_receipt(paths, state, authority, marker, judgment)
+    });
+    if matches!(result, Err(DeadreckonError::ProcessBoundary { .. })) {
+        match fs::remove_file(&receipt_path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(DeadreckonError::Io {
+                    path: receipt_path,
+                    source,
+                });
+            }
+        }
+    }
+    result
 }
 
 pub fn validate_completion_receipt(
@@ -386,6 +419,15 @@ pub fn validate_completion_receipt(
     let key = read_gate_key(paths, &state.run_id)?;
     verify_receipt_signature(&receipt, &key)?;
     Ok(receipt)
+}
+
+/// Validate a receipt under the same inherited Git boundary used to seal it.
+pub fn validate_completion_receipt_bounded(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    scope: crate::git::WorkBoundaryScope,
+) -> Result<CompletionReceipt> {
+    crate::git::with_git_command_scope(scope, || validate_completion_receipt(paths, state))
 }
 
 fn validate_parent_repair_lineage_if_present(
@@ -1194,7 +1236,7 @@ fn validate_worktree_result_boundary(
                 "result branch revision does not match the sealed receipt",
             ));
         }
-    } else if current_git_revision(&state.working_dir).as_deref() != Some(result_revision.as_str())
+    } else if current_git_revision(&state.working_dir)?.as_deref() != Some(result_revision.as_str())
     {
         return Err(completion_error(
             job_id,
@@ -1426,20 +1468,14 @@ fn require_filesystem_matches_git_result(
 
     let mut read_tree = crate::git::git_command(git_root, &["read-tree", revision]);
     read_tree.env("GIT_INDEX_FILE", &index_path);
-    let output = read_tree.output().map_err(|source| DeadreckonError::Io {
-        path: git_root.to_path_buf(),
-        source,
-    })?;
+    let output = crate::git::run_git_command(git_root, &mut read_tree)?;
     require_git_success(git_root, &output, "materialize signed result index")?;
     refuse_filtered_result_entries(git_root, &index_path)?;
     if base_revision != revision {
         let base_index_path = materialized.path().join("base-index");
         let mut read_base = crate::git::git_command(git_root, &["read-tree", base_revision]);
         read_base.env("GIT_INDEX_FILE", &base_index_path);
-        let output = read_base.output().map_err(|source| DeadreckonError::Io {
-            path: git_root.to_path_buf(),
-            source,
-        })?;
+        let output = crate::git::run_git_command(git_root, &mut read_base)?;
         require_git_success(git_root, &output, "materialize approved base index")?;
         refuse_filtered_result_entries(git_root, &base_index_path)?;
     }
@@ -1449,10 +1485,7 @@ fn require_filesystem_matches_git_result(
     prefix.push(std::path::MAIN_SEPARATOR.to_string());
     let mut checkout = crate::git::git_command(git_root, &["checkout-index", "--all", "--force"]);
     checkout.env("GIT_INDEX_FILE", &index_path).arg(prefix);
-    let output = checkout.output().map_err(|source| DeadreckonError::Io {
-        path: git_root.to_path_buf(),
-        source,
-    })?;
+    let output = crate::git::run_git_command(git_root, &mut checkout)?;
     require_git_success(git_root, &output, "materialize signed result tree")?;
 
     let committed = build_deliverable_file_index(&tree_path)?;
@@ -1473,10 +1506,7 @@ fn require_filesystem_matches_git_result(
 fn refuse_filtered_result_entries(git_root: &Path, index_path: &Path) -> Result<()> {
     let mut list = crate::git::git_command(git_root, &["ls-files", "-z", "--"]);
     list.env("GIT_INDEX_FILE", index_path);
-    let output = list.output().map_err(|source| DeadreckonError::Io {
-        path: git_root.to_path_buf(),
-        source,
-    })?;
+    let output = crate::git::run_git_command(git_root, &mut list)?;
     require_git_success(git_root, &output, "enumerate signed result paths")?;
     if output.stdout.is_empty() {
         return Ok(());
@@ -1716,13 +1746,13 @@ fn require_digest(expected: &str, actual: &str, label: &str, job_id: &str) -> Re
     }
 }
 
-fn current_git_revision(working_dir: &Path) -> Option<String> {
-    let output = crate::git::run_git(working_dir, &["rev-parse", "HEAD"]).ok()?;
-    output
+fn current_git_revision(working_dir: &Path) -> Result<Option<String>> {
+    let output = crate::git::run_git(working_dir, &["rev-parse", "HEAD"])?;
+    Ok(output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty()))
 }
 
 fn completion_error(job_id: &str, detail: &str) -> DeadreckonError {
@@ -1765,6 +1795,7 @@ fn hex_nibble(value: u8) -> std::result::Result<u8, String> {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use chrono::Utc;
     use deadreckon_protocol::{
@@ -1776,7 +1807,9 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
-    use super::{seal_completion_receipt, validate_completion_receipt};
+    use super::{
+        seal_completion_receipt, seal_completion_receipt_bounded, validate_completion_receipt,
+    };
     use crate::codebase::{
         CodebaseMode, CodebaseRecord, write_codebase_record, write_trusted_codebase_record,
     };
@@ -2680,6 +2713,37 @@ mod tests {
             validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate"),
             receipt
         );
+    }
+
+    #[test]
+    fn expired_job_boundary_prevents_receipt_sealing() {
+        let fixture = fixture();
+        let scope = crate::git::WorkBoundaryScope::new(
+            Instant::now(),
+            Duration::from_secs(3),
+            || false,
+            "completion receipt sealing",
+        )
+        .with_authority_dir(fixture.state.run_root.join("child-pids"));
+
+        let error = seal_completion_receipt_bounded(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+            scope,
+        )
+        .expect_err("expired Job boundary must prevent sealing");
+
+        assert!(matches!(
+            error,
+            crate::DeadreckonError::ProcessBoundary {
+                kind: crate::ProcessBoundaryKind::WorkExpired,
+                ..
+            }
+        ));
+        assert!(!fixture.paths.job_receipt("job-1").exists());
     }
 
     #[test]

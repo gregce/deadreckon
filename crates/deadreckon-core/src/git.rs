@@ -1,11 +1,13 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::error::{DeadreckonError, Result};
+use crate::error::{DeadreckonError, ProcessBoundaryKind, Result};
 
 const COMMIT_FAMILY_VERBS: &[&str] = &[
     "commit",
@@ -18,12 +20,131 @@ const COMMIT_FAMILY_VERBS: &[&str] = &[
 ];
 
 pub fn run_git(cwd: &Path, args: &[&str]) -> Result<Output> {
-    git_command(cwd, args).output().map_err(git_io)
+    let mut command = git_command(cwd, args);
+    run_git_command(cwd, &mut command)
 }
 
 pub fn run_git_with_input(cwd: &Path, args: &[&str], input: &[u8]) -> Result<Output> {
     let mut command = git_command(cwd, args);
     run_git_command_with_input(cwd, &mut command, input)
+}
+
+/// An owned work boundary inherited by local completion operations and every
+/// Git subprocess they launch.
+///
+/// The scope is thread-local on purpose: receipt verification is synchronous,
+/// while parallel tests and unrelated operator commands must not inherit one
+/// another's Job authority.
+#[derive(Clone)]
+pub struct WorkBoundaryScope {
+    pub work_expires_at: Instant,
+    pub cleanup_budget: Duration,
+    cancellation_requested: Arc<dyn Fn() -> bool + Send + Sync>,
+    pub authority_dir: Option<PathBuf>,
+    pub operation: String,
+}
+
+impl WorkBoundaryScope {
+    pub fn new(
+        work_expires_at: Instant,
+        cleanup_budget: Duration,
+        cancellation_requested: impl Fn() -> bool + Send + Sync + 'static,
+        operation: impl Into<String>,
+    ) -> Self {
+        Self {
+            work_expires_at,
+            cleanup_budget,
+            cancellation_requested: Arc::new(cancellation_requested),
+            authority_dir: None,
+            operation: operation.into(),
+        }
+    }
+
+    pub fn with_authority_dir(mut self, authority_dir: impl Into<PathBuf>) -> Self {
+        self.authority_dir = Some(authority_dir.into());
+        self
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if (self.cancellation_requested)() {
+            return Err(self.boundary_error(
+                ProcessBoundaryKind::Cancelled,
+                None,
+                "cancellation was requested",
+            ));
+        }
+        if Instant::now() >= self.work_expires_at {
+            return Err(self.boundary_error(
+                ProcessBoundaryKind::WorkExpired,
+                None,
+                "the approved work cutoff was reached",
+            ));
+        }
+        Ok(())
+    }
+
+    fn deadline(&self) -> GitCommandDeadline<'_> {
+        let mut deadline = GitCommandDeadline::new(
+            self.work_expires_at,
+            self.cleanup_budget,
+            self.cancellation_requested.as_ref(),
+        );
+        if let Some(authority_dir) = self.authority_dir.as_deref() {
+            deadline = deadline.with_authority_dir(authority_dir);
+        }
+        deadline
+    }
+
+    fn boundary_error(
+        &self,
+        kind: ProcessBoundaryKind,
+        authority: Option<PathBuf>,
+        detail: impl Into<String>,
+    ) -> DeadreckonError {
+        DeadreckonError::ProcessBoundary {
+            kind,
+            operation: self.operation.clone(),
+            authority,
+            detail: detail.into(),
+        }
+    }
+}
+
+thread_local! {
+    static GIT_COMMAND_SCOPES: RefCell<Vec<WorkBoundaryScope>> = const { RefCell::new(Vec::new()) };
+}
+
+struct GitCommandScopeGuard;
+
+impl Drop for GitCommandScopeGuard {
+    fn drop(&mut self) {
+        GIT_COMMAND_SCOPES.with(|scopes| {
+            let _ = scopes.borrow_mut().pop();
+        });
+    }
+}
+
+/// Run synchronous work with one inherited Git subprocess boundary.
+pub fn with_git_command_scope<T>(
+    scope: WorkBoundaryScope,
+    work: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    scope.check()?;
+    GIT_COMMAND_SCOPES.with(|scopes| scopes.borrow_mut().push(scope.clone()));
+    let _guard = GitCommandScopeGuard;
+    let result = work();
+    if result.is_ok() {
+        scope.check()?;
+    }
+    result
+}
+
+fn current_git_command_scope() -> Option<WorkBoundaryScope> {
+    GIT_COMMAND_SCOPES.with(|scopes| scopes.borrow().last().cloned())
+}
+
+pub(crate) fn inherited_work_boundary() -> Option<WorkBoundaryScope> {
+    current_git_command_scope()
 }
 
 /// Absolute boundaries for one bounded Git subprocess.
@@ -141,6 +262,18 @@ pub fn run_git_command_with_input(
     command: &mut Command,
     input: &[u8],
 ) -> Result<Output> {
+    if let Some(scope) = current_git_command_scope() {
+        let outcome = run_git_command_bounded(cwd, command, Some(input), scope.deadline())?;
+        return finish_scoped_git(scope, outcome);
+    }
+    run_git_command_with_input_unbounded(cwd, command, input)
+}
+
+fn run_git_command_with_input_unbounded(
+    cwd: &Path,
+    command: &mut Command,
+    input: &[u8],
+) -> Result<Output> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -164,6 +297,44 @@ pub fn run_git_command_with_input(
     })?;
     write_result.map_err(|source| git_io_at(cwd, source))?;
     output_result.map_err(|source| git_io_at(cwd, source))
+}
+
+/// Run a preconfigured Git command, inheriting the active completion boundary
+/// when one is installed.
+pub fn run_git_command(cwd: &Path, command: &mut Command) -> Result<Output> {
+    if let Some(scope) = current_git_command_scope() {
+        let outcome = run_git_command_bounded(cwd, command, None, scope.deadline())?;
+        return finish_scoped_git(scope, outcome);
+    }
+    command.output().map_err(|source| git_io_at(cwd, source))
+}
+
+fn finish_scoped_git(scope: WorkBoundaryScope, outcome: BoundedGitOutcome) -> Result<Output> {
+    match outcome {
+        BoundedGitOutcome::Completed(output) => Ok(output),
+        BoundedGitOutcome::WorkExpired => Err(scope.boundary_error(
+            ProcessBoundaryKind::WorkExpired,
+            None,
+            "the approved work cutoff was reached and cleanup was proven",
+        )),
+        BoundedGitOutcome::Cancelled => Err(scope.boundary_error(
+            ProcessBoundaryKind::Cancelled,
+            None,
+            "cancellation was requested and cleanup was proven",
+        )),
+        BoundedGitOutcome::SupervisionFailed { detail } => {
+            Err(scope.boundary_error(ProcessBoundaryKind::SupervisionFailed, None, detail))
+        }
+        BoundedGitOutcome::CleanupIncomplete {
+            boundary,
+            authority,
+            detail,
+        } => Err(scope.boundary_error(
+            ProcessBoundaryKind::CleanupIncomplete,
+            authority.record_path,
+            format!("cleanup after {boundary:?} was not proven: {detail}"),
+        )),
+    }
 }
 
 fn run_git_command_bounded(
@@ -635,13 +806,6 @@ fn first_git_verb<'a>(args: &'a [&str]) -> Option<&'a str> {
     args.iter().copied().find(|arg| !arg.starts_with('-'))
 }
 
-fn git_io(source: std::io::Error) -> DeadreckonError {
-    DeadreckonError::Io {
-        path: PathBuf::from("git"),
-        source,
-    }
-}
-
 fn git_io_at(path: &Path, source: std::io::Error) -> DeadreckonError {
     DeadreckonError::Io {
         path: path.to_path_buf(),
@@ -659,9 +823,12 @@ mod tests {
 
     use tempfile::TempDir;
 
+    use crate::{DeadreckonError, ProcessBoundaryKind};
+
     use super::{
-        BoundedGitOutcome, GitCommandBoundary, GitCommandDeadline, run_git,
+        BoundedGitOutcome, GitCommandBoundary, GitCommandDeadline, WorkBoundaryScope, run_git,
         run_git_command_bounded, run_git_with_input, run_git_with_input_bounded,
+        with_git_command_scope,
     };
 
     #[test]
@@ -744,6 +911,50 @@ mod tests {
                 .is_none(),
             "completed Git must compare-and-remove its durable authority"
         );
+    }
+
+    #[test]
+    fn inherited_scope_rejects_git_after_the_shared_work_cutoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let scope = WorkBoundaryScope::new(
+            Instant::now(),
+            Duration::from_secs(3),
+            || false,
+            "completion receipt",
+        );
+
+        let error = with_git_command_scope(scope, || run_git(temp.path(), &["version"]))
+            .expect_err("expired scope must fail before Git launches");
+
+        assert!(matches!(
+            error,
+            DeadreckonError::ProcessBoundary {
+                kind: ProcessBoundaryKind::WorkExpired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn inherited_scope_preserves_cancellation_as_a_typed_boundary() {
+        let temp = TempDir::new().expect("tempdir");
+        let scope = WorkBoundaryScope::new(
+            Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(3),
+            || true,
+            "completion receipt",
+        );
+
+        let error = with_git_command_scope(scope, || run_git(temp.path(), &["version"]))
+            .expect_err("cancelled scope must fail before Git launches");
+
+        assert!(matches!(
+            error,
+            DeadreckonError::ProcessBoundary {
+                kind: ProcessBoundaryKind::Cancelled,
+                ..
+            }
+        ));
     }
 
     #[cfg(unix)]

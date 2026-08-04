@@ -575,7 +575,7 @@ pub fn capture_workspace(
     projection: CaptureProjection,
     purpose: CapturePurpose,
 ) -> Result<WorkspaceCapturePlan> {
-    capture_workspace_inner(root, policy, projection, purpose, false)
+    capture_workspace_inner(root, policy, projection, purpose, false, None)
 }
 
 /// Capture using only an explicit controller-frozen Git hydration record.
@@ -589,7 +589,18 @@ pub fn capture_workspace_strict(
     projection: CaptureProjection,
     purpose: CapturePurpose,
 ) -> Result<WorkspaceCapturePlan> {
-    capture_workspace_inner(root, policy, projection, purpose, true)
+    capture_workspace_inner(root, policy, projection, purpose, true, None)
+}
+
+/// Strict capture clamped to the enclosing Job work boundary.
+pub fn capture_workspace_strict_bounded(
+    root: &Path,
+    policy: &WorkspaceCapturePolicy,
+    projection: CaptureProjection,
+    purpose: CapturePurpose,
+    boundary: &crate::git::WorkBoundaryScope,
+) -> Result<WorkspaceCapturePlan> {
+    capture_workspace_inner(root, policy, projection, purpose, true, Some(boundary))
 }
 
 fn capture_workspace_inner(
@@ -598,7 +609,16 @@ fn capture_workspace_inner(
     projection: CaptureProjection,
     purpose: CapturePurpose,
     require_hydration: bool,
+    boundary: Option<&crate::git::WorkBoundaryScope>,
 ) -> Result<WorkspaceCapturePlan> {
+    let inherited_boundary = boundary
+        .is_none()
+        .then(crate::git::inherited_work_boundary)
+        .flatten();
+    let boundary = boundary.or(inherited_boundary.as_ref());
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     let started_at = Utc::now();
     let started = Instant::now();
     let policy_sha256 = policy_sha256(policy)?;
@@ -644,6 +664,9 @@ fn capture_workspace_inner(
     let mut subtree_stats = BTreeMap::<PathBuf, SubtreeAccumulator>::new();
     let mut stopped = false;
     for item in builder.build() {
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
         if started.elapsed() > Duration::from_millis(policy.budgets.max_traversal_millis) {
             push_omission(
                 &mut omissions,
@@ -796,6 +819,9 @@ fn capture_workspace_inner(
         .checked_add(Duration::from_millis(policy.budgets.max_traversal_millis))
         .unwrap_or_else(Instant::now);
     for (path, reason) in pruned {
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
         let summary = summarize_omitted_subtree(root, &path, capture_deadline);
         push_omission(
             &mut omissions,
@@ -861,6 +887,9 @@ fn capture_workspace_inner(
             )
         },
     );
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     Ok(WorkspaceCapturePlan {
         entries,
         manifest: WorkspaceCaptureManifest {
@@ -894,17 +923,93 @@ pub fn read_capture_manifest(path: &Path) -> Result<WorkspaceCaptureManifest> {
     serde_json::from_slice(&raw).with_json_path(path)
 }
 
+/// Remove one real directory tree without following symlinks, checking an
+/// inherited Job boundary between entries. A boundary interruption leaves a
+/// recoverable partial staging tree instead of blocking the controller.
+pub fn remove_captured_directory_tree(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(DeadreckonError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "refusing to remove capture tree {} because it is not a real directory",
+            path.display()
+        )));
+    }
+    let boundary = crate::git::inherited_work_boundary();
+    remove_captured_directory_tree_inner(path, boundary.as_ref())
+}
+
+fn remove_captured_directory_tree_inner(
+    path: &Path,
+    boundary: Option<&crate::git::WorkBoundaryScope>,
+) -> Result<()> {
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
+    for entry in fs::read_dir(path).with_path(path)? {
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
+        let entry = entry.with_path(path)?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child).with_path(&child)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            remove_captured_directory_tree_inner(&child, boundary)?;
+        } else {
+            fs::remove_file(&child).with_path(&child)?;
+        }
+    }
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
+    fs::remove_dir(path).with_path(path)
+}
+
 /// Materialize the selected leaves without following symbolic links.
 ///
 /// The capture plan has already established the trusted traversal boundary.
 /// Materialization therefore creates only parent directories required by an
 /// admitted leaf and refuses a destination hierarchy containing a symlink.
 pub fn materialize_capture_plan(plan: &WorkspaceCapturePlan, destination: &Path) -> Result<()> {
+    let inherited_boundary = crate::git::inherited_work_boundary();
+    let boundary = inherited_boundary.as_ref();
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     ensure_materialization_root(destination)?;
     for entry in &plan.entries {
-        materialize_capture_entry(entry, destination, None)?;
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
+        materialize_capture_entry(entry, destination, None, boundary)?;
+    }
+    if let Some(boundary) = boundary {
+        boundary.check()?;
     }
     Ok(())
+}
+
+/// Materialize selected leaves under the enclosing Job work boundary.
+pub fn materialize_capture_plan_bounded(
+    plan: &WorkspaceCapturePlan,
+    destination: &Path,
+    boundary: &crate::git::WorkBoundaryScope,
+) -> Result<()> {
+    boundary.check()?;
+    ensure_materialization_root(destination)?;
+    for entry in &plan.entries {
+        boundary.check()?;
+        materialize_capture_entry(entry, destination, None, Some(boundary))?;
+    }
+    boundary.check()
 }
 
 /// Materialize a capture through a run-scoped whole-file content store.
@@ -917,13 +1022,45 @@ pub fn materialize_capture_plan_with_blob_store(
     destination: &Path,
     blob_root: &Path,
 ) -> Result<CaptureMaterialization> {
+    let inherited_boundary = crate::git::inherited_work_boundary();
+    let boundary = inherited_boundary.as_ref();
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     ensure_materialization_root(destination)?;
     ensure_materialization_root(blob_root)?;
     let mut stats = CaptureMaterialization::default();
     for entry in &plan.entries {
-        let entry_stats = materialize_capture_entry(entry, destination, Some(blob_root))?;
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
+        let entry_stats = materialize_capture_entry(entry, destination, Some(blob_root), boundary)?;
         stats.add(&entry_stats);
     }
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
+    Ok(stats)
+}
+
+/// Materialize a content-addressed capture under the enclosing Job cutoff.
+pub fn materialize_capture_plan_with_blob_store_bounded(
+    plan: &WorkspaceCapturePlan,
+    destination: &Path,
+    blob_root: &Path,
+    boundary: &crate::git::WorkBoundaryScope,
+) -> Result<CaptureMaterialization> {
+    boundary.check()?;
+    ensure_materialization_root(destination)?;
+    ensure_materialization_root(blob_root)?;
+    let mut stats = CaptureMaterialization::default();
+    for entry in &plan.entries {
+        boundary.check()?;
+        let entry_stats =
+            materialize_capture_entry(entry, destination, Some(blob_root), Some(boundary))?;
+        stats.add(&entry_stats);
+    }
+    boundary.check()?;
     Ok(stats)
 }
 
@@ -939,6 +1076,11 @@ pub fn materialize_capture_entry_with_blob_store(
     relative: &Path,
     blob_root: &Path,
 ) -> Result<CaptureMaterialization> {
+    let inherited_boundary = crate::git::inherited_work_boundary();
+    let boundary = inherited_boundary.as_ref();
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     ensure_materialization_root(destination_root)?;
     ensure_materialization_root(blob_root)?;
     materialize_capture_entry(
@@ -951,6 +1093,7 @@ pub fn materialize_capture_entry_with_blob_store(
         },
         destination_root,
         Some(blob_root),
+        boundary,
     )
 }
 
@@ -972,7 +1115,11 @@ fn materialize_capture_entry(
     entry: &CaptureEntry,
     destination: &Path,
     blob_root: Option<&Path>,
+    boundary: Option<&crate::git::WorkBoundaryScope>,
 ) -> Result<CaptureMaterialization> {
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
     let target = destination.join(&entry.relative);
     ensure_materialization_parent(destination, &entry.relative)?;
     remove_materialization_target(&target)?;
@@ -982,10 +1129,12 @@ fn materialize_capture_entry(
             stats.regular_files = 1;
             stats.materialized_bytes = entry.size;
             if let Some(blob_root) = blob_root {
-                materialize_regular_file_from_blob(entry, &target, blob_root, &mut stats)?;
+                materialize_regular_file_from_blob(
+                    entry, &target, blob_root, &mut stats, boundary,
+                )?;
             } else {
                 let metadata = fs::symlink_metadata(&entry.source).with_path(&entry.source)?;
-                fs::copy(&entry.source, &target).with_path(&entry.source)?;
+                copy_regular_file(&entry.source, &target, boundary)?;
                 fs::set_permissions(&target, metadata.permissions()).with_path(&target)?;
             }
         }
@@ -1004,6 +1153,7 @@ fn materialize_regular_file_from_blob(
     target: &Path,
     blob_root: &Path,
     stats: &mut CaptureMaterialization,
+    boundary: Option<&crate::git::WorkBoundaryScope>,
 ) -> Result<()> {
     let metadata = fs::symlink_metadata(&entry.source).with_path(&entry.source)?;
     let permission_key = permission_identity(&metadata);
@@ -1015,6 +1165,9 @@ fn materialize_regular_file_from_blob(
     let mut copied = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
         let read = source.read(&mut buffer).with_path(&entry.source)?;
         if read == 0 {
             break;
@@ -1064,11 +1217,37 @@ fn materialize_regular_file_from_blob(
     if fs::hard_link(&blob, target).is_ok() {
         stats.hardlinks = 1;
     } else {
-        fs::copy(&blob, target).with_path(&blob)?;
+        copy_regular_file(&blob, target, boundary)?;
         fs::set_permissions(target, metadata.permissions()).with_path(target)?;
         stats.copy_fallbacks = 1;
     }
     Ok(())
+}
+
+fn copy_regular_file(
+    source_path: &Path,
+    target_path: &Path,
+    boundary: Option<&crate::git::WorkBoundaryScope>,
+) -> Result<u64> {
+    let mut source = fs::File::open(source_path).with_path(source_path)?;
+    let mut target = fs::File::create(target_path).with_path(target_path)?;
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if let Some(boundary) = boundary {
+            boundary.check()?;
+        }
+        let read = source.read(&mut buffer).with_path(source_path)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read]).with_path(target_path)?;
+        copied = copied.saturating_add(read as u64);
+    }
+    if let Some(boundary) = boundary {
+        boundary.check()?;
+    }
+    Ok(copied)
 }
 
 #[cfg(unix)]
@@ -2218,13 +2397,15 @@ fn is_ecosystem_marker(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{Duration, Instant};
 
     use tempfile::TempDir;
 
     use super::{
         CaptureBudgets, CaptureOmissionReason, CaptureProjection, CapturePurpose,
         EncodedWorkspacePath, GeneratedOutputSource, capture_workspace, capture_workspace_strict,
-        freeze_workspace_capture_policy,
+        capture_workspace_strict_bounded, freeze_workspace_capture_policy,
+        materialize_capture_plan,
     };
     use crate::git::run_git;
 
@@ -2238,6 +2419,73 @@ mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn strict_capture_stops_at_the_inherited_job_boundary() {
+        let temp = TempDir::new().expect("temp");
+        fs::write(temp.path().join("app.swift"), "print(\"ready\")\n").expect("source");
+        let policy = freeze_workspace_capture_policy(temp.path()).expect("freeze");
+        let boundary = crate::git::WorkBoundaryScope::new(
+            Instant::now(),
+            Duration::from_secs(3),
+            || false,
+            "workspace snapshot",
+        );
+
+        let error = capture_workspace_strict_bounded(
+            temp.path(),
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::TurnSnapshot,
+            &boundary,
+        )
+        .expect_err("expired Job boundary must stop capture");
+
+        assert!(matches!(
+            error,
+            crate::DeadreckonError::ProcessBoundary {
+                kind: crate::ProcessBoundaryKind::WorkExpired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn materialization_inherits_cancellation_before_copying() {
+        let temp = TempDir::new().expect("temp");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::write(source.join("large.bin"), vec![7_u8; 256 * 1024]).expect("source file");
+        let policy = freeze_workspace_capture_policy(&source).expect("freeze");
+        let plan = capture_workspace_strict(
+            &source,
+            &policy,
+            CaptureProjection::Recoverable,
+            CapturePurpose::TurnSnapshot,
+        )
+        .expect("capture plan");
+        let boundary = crate::git::WorkBoundaryScope::new(
+            Instant::now() + Duration::from_secs(3),
+            Duration::from_secs(3),
+            || true,
+            "workspace snapshot",
+        );
+
+        let error = crate::git::with_git_command_scope(boundary, || {
+            materialize_capture_plan(&plan, &destination)
+        })
+        .expect_err("cancelled Job boundary must stop materialization");
+
+        assert!(matches!(
+            error,
+            crate::DeadreckonError::ProcessBoundary {
+                kind: crate::ProcessBoundaryKind::Cancelled,
+                ..
+            }
+        ));
+        assert!(!destination.join("large.bin").exists());
+    }
 
     #[test]
     fn frozen_ignores_do_not_trust_agent_rewrites_and_tracked_files_override_them() {

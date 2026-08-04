@@ -105,6 +105,11 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
         .prefix(&format!(".turn-{turn}-staging-"))
         .tempdir_in(snapshots_dir)
         .with_path(snapshots_dir)?;
+    // Keep the path immediately. If the Job boundary interrupts capture or
+    // materialization, TempDir::drop must not perform an unbounded recursive
+    // cleanup on the controller thread; a later bounded snapshot pass can
+    // reconcile the staging directory.
+    let staging_path = staging.keep();
     let policy = require_workspace_capture_policy(state)?;
     let mut capture = capture_workspace_strict(
         &state.working_dir,
@@ -114,18 +119,17 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
     )?;
     let materialization = materialize_capture_plan_with_blob_store(
         &capture,
-        staging.path(),
+        &staging_path,
         &state.run_root.join(WORKSPACE_BLOBS_DIR),
     )?;
     capture.manifest.materialization = Some(materialization);
     write_capture_manifest(
-        &staging.path().join(SNAPSHOT_CAPTURE_MANIFEST_JSON),
+        &staging_path.join(SNAPSHOT_CAPTURE_MANIFEST_JSON),
         &capture.manifest,
     )?;
     if snapshot_dir.exists() {
-        fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
+        crate::workspace_capture::remove_captured_directory_tree(&snapshot_dir)?;
     }
-    let staging_path = staging.keep();
     fs::rename(&staging_path, &snapshot_dir).with_path(&snapshot_dir)?;
     write_capture_manifest(
         &snapshot_capture_manifest_path(state, turn),

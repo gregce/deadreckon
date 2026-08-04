@@ -57,6 +57,17 @@ pub fn promote_completed_run(
     promote_completed_run_with_hook(paths, state, |_, _| Ok(()))
 }
 
+/// Promote under the same cumulative Job work boundary used by verification.
+/// Partially prepared candidates remain in their recoverable staging paths if
+/// the boundary is reached; they are never published after expiry.
+pub fn promote_completed_run_bounded(
+    paths: &DeadreckonPaths,
+    state: &mut PipelineState,
+    scope: crate::git::WorkBoundaryScope,
+) -> Result<PathBuf> {
+    crate::git::with_git_command_scope(scope, || promote_completed_run(paths, state))
+}
+
 fn promote_completed_run_with_hook(
     paths: &DeadreckonPaths,
     state: &mut PipelineState,
@@ -355,7 +366,7 @@ fn cleanup_owned_working(
             owned_working.display()
         )));
     }
-    fs::remove_dir_all(&owned_working).with_path(&owned_working)
+    remove_real_directory_tree(&owned_working)
 }
 
 fn validate_manifest(
@@ -441,13 +452,17 @@ fn remove_temporary_tree(path: &Path) -> Result<()> {
                 path.display()
             )))
         }
-        Ok(_) => fs::remove_dir_all(path).with_path(path),
+        Ok(_) => remove_real_directory_tree(path),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(DeadreckonError::Io {
             path: path.to_path_buf(),
             source,
         }),
     }
+}
+
+fn remove_real_directory_tree(path: &Path) -> Result<()> {
+    crate::workspace_capture::remove_captured_directory_tree(path)
 }
 
 fn write_manifest(
