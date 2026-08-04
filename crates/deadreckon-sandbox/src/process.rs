@@ -4,27 +4,28 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
-use tokio::time::{Duration, sleep};
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, Instant, sleep};
 use uuid::Uuid;
 
 use crate::backend::{Result, SandboxBackend, SandboxError};
 use crate::commands::build_command;
-use crate::docker::{DockerExecution, reconcile_docker_execution};
+use crate::docker::{DockerExecution, reconcile_docker_execution, reconcile_docker_execution_by};
 use crate::spec::{GuardedLaunchSpec, SandboxSpec, WorkspaceAccess};
 
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const OUTPUT_CAPTURE_HEAD_BYTES: usize = OUTPUT_CAPTURE_LIMIT_BYTES / 2;
 const OUTPUT_CAPTURE_TAIL_BYTES: usize = OUTPUT_CAPTURE_LIMIT_BYTES - OUTPUT_CAPTURE_HEAD_BYTES;
 const OUTPUT_READ_BUFFER_BYTES: usize = 64 * 1024;
+const PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+const PROCESS_TERM_GRACE: Duration = Duration::from_secs(2);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(unix)]
-const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(250);
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_secs(2);
 #[cfg(unix)]
 const PROCESS_GROUP_KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(unix)]
-const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRunOutput {
     pub backend: SandboxBackend,
@@ -93,16 +94,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         // signing material, or host-specific command routing.
         process.env_clear();
     }
-    if guarded.is_some()
-        && let Some(boot_id) = std::env::var_os("DEADRECKON_BOOT_ID")
-        && !boot_id.is_empty()
-    {
-        // The guarded helper must compare the child against the same boot
-        // identity used to prepare its durable record. This is principally a
-        // reboot-test seam; dr-gate removes it before executing repository
-        // code, so it does not weaken the sandbox environment boundary.
-        process.env("DEADRECKON_BOOT_ID", boot_id);
-    }
+    scrub_inherited_deadreckon_environment(&mut process);
     process
         .envs(&command.env)
         // Signing inputs belong only to the trusted gate-signing phase. The
@@ -118,6 +110,18 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if guarded.is_some()
+        && let Some(boot_id) = std::env::var_os("DEADRECKON_BOOT_ID")
+        && !boot_id.is_empty()
+    {
+        // The guarded helper must compare the child against the same boot
+        // identity used to prepare its durable record. This is principally a
+        // reboot-test seam; dr-gate removes it before executing repository
+        // code, so it does not weaken the sandbox environment boundary.
+        // Apply it last so neither ambient state nor caller-provided env can
+        // replace the controller's boot identity.
+        process.env("DEADRECKON_BOOT_ID", boot_id);
+    }
     // A guarded helper must remain in the worker's existing group until its
     // identity is durable. It creates the fresh group itself only after the
     // private release capability is validated.
@@ -144,24 +148,38 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         ) {
             Ok(record) => record,
             Err(error) => {
-                signal_process(pid, true, false);
-                let _ = child.wait().await;
-                reconcile_optional_docker(docker_execution.as_ref())?;
+                cleanup_spawned_execution(
+                    &mut child,
+                    pid,
+                    guarded.is_some(),
+                    supervise_process_group,
+                    docker_execution.as_ref(),
+                )
+                .await?;
                 return Err(error.into());
             }
         };
         if let Err(error) = deadreckon_core::write_supervised_process_record(pid_file, &record) {
-            signal_process(pid, true, false);
-            let _ = child.wait().await;
-            reconcile_optional_docker(docker_execution.as_ref())?;
+            cleanup_spawned_execution(
+                &mut child,
+                pid,
+                guarded.is_some(),
+                supervise_process_group,
+                docker_execution.as_ref(),
+            )
+            .await?;
             return Err(error.into());
         }
         process_record_identity = Some((guard.launch_id.clone(), pid));
         let Some(mut release) = child.stdin.take() else {
-            signal_process(pid, true, false);
-            let _ = child.wait().await;
-            cleanup_residual_process_tree(pid).await?;
-            reconcile_optional_docker(docker_execution.as_ref())?;
+            cleanup_spawned_execution(
+                &mut child,
+                pid,
+                guarded.is_some(),
+                supervise_process_group,
+                docker_execution.as_ref(),
+            )
+            .await?;
             remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(SandboxError::Io(std::io::Error::other(
                 "guarded sandbox helper did not expose its release pipe",
@@ -174,12 +192,14 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         }
         .await
         {
-            signal_process(pid, true, false);
-            let _ = child.wait().await;
-            let process_cleanup = cleanup_residual_process_tree(pid).await;
-            let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
-            process_cleanup?;
-            docker_cleanup?;
+            cleanup_spawned_execution(
+                &mut child,
+                pid,
+                guarded.is_some(),
+                supervise_process_group,
+                docker_execution.as_ref(),
+            )
+            .await?;
             remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(error.into());
         }
@@ -192,23 +212,31 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         ) {
             Ok(record) => record,
             Err(error) => {
-                signal_process(pid, true, supervise_process_group);
-                let _ = child.wait().await;
-                cleanup_residual_process_tree(pid).await?;
-                reconcile_optional_docker(docker_execution.as_ref())?;
+                cleanup_spawned_execution(
+                    &mut child,
+                    pid,
+                    false,
+                    supervise_process_group,
+                    docker_execution.as_ref(),
+                )
+                .await?;
                 return Err(error.into());
             }
         };
         if let Err(error) = deadreckon_core::write_supervised_process_record(pid_file, &record) {
-            signal_process(pid, true, supervise_process_group);
-            let _ = child.wait().await;
-            cleanup_residual_process_tree(pid).await?;
-            reconcile_optional_docker(docker_execution.as_ref())?;
+            cleanup_spawned_execution(
+                &mut child,
+                pid,
+                false,
+                supervise_process_group,
+                docker_execution.as_ref(),
+            )
+            .await?;
             return Err(error.into());
         }
         process_record_identity = Some((record.launch_id, pid));
     }
-    let stdin_task = if guarded.is_none() {
+    let mut stdin_task = if guarded.is_none() {
         spec.stdin.take().and_then(|bytes| {
             child.stdin.take().map(|mut stdin| {
                 tokio::spawn(async move {
@@ -223,37 +251,23 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     let status = if let Some(token) = spec.cancellation_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
-                if let Some(pid) = pid {
-                    if guarded.is_some() {
-                        // Before release the guard is a raw child in the outer
-                        // group; after release it is the leader of its own
-                        // group. Target both identities to close that race.
-                        signal_process(pid, false, true);
-                        signal_process(pid, false, false);
-                    } else {
-                        signal_process(pid, false, supervise_process_group);
-                    }
-                    sleep(Duration::from_secs(2)).await;
-                    if child.try_wait()?.is_none() {
-                        if guarded.is_some() {
-                            signal_process(pid, true, true);
-                            signal_process(pid, true, false);
-                        } else {
-                            signal_process(pid, true, supervise_process_group);
-                        }
-                    }
+                if let Some(stdin_task) = stdin_task.take() {
+                    stdin_task.abort();
                 }
-                let _ = child.wait().await;
-                let process_cleanup = if let Some(pid) =
-                    pid.filter(|_| supervise_process_group)
-                {
-                    cleanup_residual_process_tree(pid).await
+                let cleanup = if let Some(pid) = pid {
+                    cleanup_spawned_execution(
+                        &mut child,
+                        pid,
+                        guarded.is_some(),
+                        supervise_process_group,
+                        docker_execution.as_ref(),
+                    ).await
                 } else {
-                    Ok(())
+                    reconcile_optional_docker(docker_execution.as_ref())
                 };
-                let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
-                process_cleanup?;
-                docker_cleanup?;
+                stdout_task.abort();
+                stderr_task.abort();
+                cleanup?;
                 remove_pid_file(&spec, process_record_identity.as_ref()).await?;
                 return Err(SandboxError::Cancelled);
             }
@@ -265,25 +279,20 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     // A check can exit its direct shell while leaving background descendants
     // alive. Clean the process group before consuming output or returning
     // control to a caller that may subsequently read a signing key.
+    let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
     let process_cleanup = if let Some(pid) = pid.filter(|_| supervise_process_group) {
-        cleanup_residual_process_tree(pid).await
+        cleanup_residual_process_tree_until(pid, cleanup_deadline).await
     } else {
         Ok(())
     };
-    let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
+    let docker_cleanup = reconcile_optional_docker_by(docker_execution.as_ref(), cleanup_deadline);
     process_cleanup?;
     docker_cleanup?;
     let status = status?;
-    let stdout = stdout_task
-        .await
-        .unwrap_or_else(|err| Ok(format!("stdout join error: {err}")))?;
-    let stderr = stderr_task
-        .await
-        .unwrap_or_else(|err| Ok(format!("stderr join error: {err}")))?;
+    let stdout = join_pipe_until(stdout_task, cleanup_deadline, "stdout").await?;
+    let stderr = join_pipe_until(stderr_task, cleanup_deadline, "stderr").await?;
     if let Some(stdin_task) = stdin_task {
-        stdin_task
-            .await
-            .unwrap_or_else(|err| Err(std::io::Error::other(format!("stdin join error: {err}"))))?;
+        join_stdin_until(stdin_task, cleanup_deadline).await?;
     }
     remove_pid_file(&spec, process_record_identity.as_ref()).await?;
     Ok(SandboxRunOutput {
@@ -296,8 +305,166 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
     })
 }
 
+async fn cleanup_spawned_execution(
+    child: &mut Child,
+    pid: u32,
+    guarded: bool,
+    supervise_process_group: bool,
+    docker: Option<&DockerExecution>,
+) -> Result<()> {
+    let cleanup_deadline = Instant::now() + PROCESS_CLEANUP_TIMEOUT;
+    let process_cleanup = terminate_spawned_child(
+        child,
+        pid,
+        guarded,
+        supervise_process_group,
+        cleanup_deadline,
+    )
+    .await;
+    let docker_cleanup = reconcile_optional_docker_by(docker, cleanup_deadline);
+    process_cleanup?;
+    docker_cleanup
+}
+
+async fn terminate_spawned_child(
+    child: &mut Child,
+    pid: u32,
+    guarded: bool,
+    supervise_process_group: bool,
+    cleanup_deadline: Instant,
+) -> Result<()> {
+    signal_child_identity(pid, false, guarded, supervise_process_group);
+    let term_deadline = cleanup_deadline.min(Instant::now() + PROCESS_TERM_GRACE);
+    if wait_for_child_exit_until(child, term_deadline)
+        .await?
+        .is_none()
+    {
+        signal_child_identity(pid, true, guarded, supervise_process_group);
+        if wait_for_child_exit_until(child, cleanup_deadline)
+            .await?
+            .is_none()
+        {
+            return Err(cleanup_timeout(format!(
+                "could not prove sandbox process {pid} exited after SIGKILL; retaining process authority"
+            )));
+        }
+    }
+    if supervise_process_group {
+        cleanup_residual_process_tree_until(pid, cleanup_deadline).await?;
+    }
+    Ok(())
+}
+
+fn signal_child_identity(pid: u32, force: bool, guarded: bool, process_group: bool) {
+    if guarded {
+        // Before release the guard is a raw child in the outer group; after
+        // release it is the leader of its own group. Target both identities to
+        // close that race.
+        signal_process(pid, force, true);
+        signal_process(pid, force, false);
+    } else {
+        signal_process(pid, force, process_group);
+    }
+}
+
+async fn wait_for_child_exit_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<Option<std::process::ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        sleep(PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
+}
+
+async fn join_pipe_until(
+    mut task: JoinHandle<std::io::Result<String>>,
+    deadline: Instant,
+    stream: &str,
+) -> Result<String> {
+    if task.is_finished() {
+        return task
+            .await
+            .unwrap_or_else(|error| Ok(format!("{stream} join error: {error}")))
+            .map_err(SandboxError::Io);
+    }
+    tokio::select! {
+        joined = &mut task => joined
+            .unwrap_or_else(|error| Ok(format!("{stream} join error: {error}")))
+            .map_err(SandboxError::Io),
+        _ = tokio::time::sleep_until(deadline) => {
+            task.abort();
+            Err(cleanup_timeout(format!(
+                "sandbox {stream} pipe remained open after process cleanup"
+            )))
+        }
+    }
+}
+
+async fn join_stdin_until(
+    mut task: JoinHandle<std::io::Result<()>>,
+    deadline: Instant,
+) -> Result<()> {
+    if task.is_finished() {
+        return task
+            .await
+            .unwrap_or_else(|error| {
+                Err(std::io::Error::other(format!("stdin join error: {error}")))
+            })
+            .map_err(SandboxError::Io);
+    }
+    tokio::select! {
+        joined = &mut task => joined
+            .unwrap_or_else(|error| Err(std::io::Error::other(format!("stdin join error: {error}"))))
+            .map_err(SandboxError::Io),
+        _ = tokio::time::sleep_until(deadline) => {
+            task.abort();
+            Err(cleanup_timeout(
+                "sandbox stdin pipe remained blocked after process cleanup".to_string(),
+            ))
+        }
+    }
+}
+
+fn cleanup_timeout(message: String) -> SandboxError {
+    SandboxError::CleanupIncomplete(message)
+}
+
+fn scrub_inherited_deadreckon_environment(process: &mut Command) {
+    scrub_deadreckon_environment_names(process, std::env::vars_os().map(|(name, _)| name));
+}
+
+fn scrub_deadreckon_environment_names(
+    process: &mut Command,
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) {
+    for name in names {
+        let rendered = name.to_string_lossy();
+        if rendered
+            .get(.."DEADRECKON_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("DEADRECKON_"))
+        {
+            process.env_remove(name);
+        }
+    }
+}
+
 fn reconcile_optional_docker(execution: Option<&DockerExecution>) -> Result<()> {
     execution.map_or(Ok(()), reconcile_docker_execution)
+}
+
+fn reconcile_optional_docker_by(
+    execution: Option<&DockerExecution>,
+    deadline: Instant,
+) -> Result<()> {
+    execution.map_or(Ok(()), |execution| {
+        reconcile_docker_execution_by(execution, deadline.into_std())
+    })
 }
 
 fn validate_docker_guard_identity(
@@ -400,7 +567,7 @@ fn configure_process_tree(command: &mut Command, cleanup_process_group: bool) {
 fn configure_process_tree(_command: &mut Command, _cleanup_process_group: bool) {}
 
 #[cfg(unix)]
-async fn cleanup_residual_process_tree(pid: u32) -> Result<()> {
+async fn cleanup_residual_process_tree_until(pid: u32, cleanup_deadline: Instant) -> Result<()> {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
@@ -418,25 +585,24 @@ async fn cleanup_residual_process_tree(pid: u32) -> Result<()> {
     if !signal_process_group(group, pid, Signal::SIGTERM, "terminate")? {
         return Ok(());
     }
-    if wait_for_process_group_exit(group, pid, PROCESS_GROUP_TERM_GRACE).await? {
+    let term_deadline = cleanup_deadline.min(Instant::now() + PROCESS_GROUP_TERM_GRACE);
+    if wait_for_process_group_exit_until(group, pid, term_deadline).await? {
         return Ok(());
     }
     if !signal_process_group(group, pid, Signal::SIGKILL, "kill")? {
         return Ok(());
     }
-    if wait_for_process_group_exit(group, pid, PROCESS_GROUP_KILL_CONFIRM_TIMEOUT).await? {
+    let kill_deadline = cleanup_deadline.min(Instant::now() + PROCESS_GROUP_KILL_CONFIRM_TIMEOUT);
+    if wait_for_process_group_exit_until(group, pid, kill_deadline).await? {
         return Ok(());
     }
-    Err(SandboxError::Io(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!(
-            "could not prove sandbox process group {pid} exited after SIGKILL; retaining process authority"
-        ),
+    Err(SandboxError::CleanupIncomplete(format!(
+        "could not prove sandbox process group {pid} exited after SIGKILL; retaining process authority"
     )))
 }
 
 #[cfg(not(unix))]
-async fn cleanup_residual_process_tree(_pid: u32) -> Result<()> {
+async fn cleanup_residual_process_tree_until(_pid: u32, _cleanup_deadline: Instant) -> Result<()> {
     Ok(())
 }
 
@@ -474,12 +640,11 @@ fn signal_process_group(
 }
 
 #[cfg(unix)]
-async fn wait_for_process_group_exit(
+async fn wait_for_process_group_exit_until(
     group: nix::unistd::Pid,
     pid: i32,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<bool> {
-    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if process_group_is_absent(pid, nix::sys::signal::kill(group, None))? {
             return Ok(true);
@@ -487,7 +652,7 @@ async fn wait_for_process_group_exit(
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
         }
-        sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+        sleep(PROCESS_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
     }
 }
 
@@ -586,6 +751,8 @@ fn signal_process(_pid: u32, _force: bool, _process_group: bool) {}
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use tokio::io::AsyncWriteExt as _;
 
     use super::{OUTPUT_CAPTURE_LIMIT_BYTES, read_pipe};
@@ -620,5 +787,39 @@ mod tests {
 
         assert!(error.to_string().contains("failed to inspect"));
         assert!(error.to_string().contains("EPERM"));
+    }
+
+    #[test]
+    fn inherited_deadreckon_environment_is_removed_before_authorized_env() {
+        let mut command = tokio::process::Command::new("ignored");
+        super::scrub_deadreckon_environment_names(
+            &mut command,
+            [
+                OsString::from("PATH"),
+                OsString::from("DEADRECKON_BUNDLE_BUILD_ID"),
+                OsString::from("DEADRECKON_GATE_KEY"),
+                OsString::from("deadreckon_case_insensitive"),
+            ],
+        );
+        command.env("DEADRECKON_SAFE_INPUT", "ordinary");
+
+        let configured = command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(configured.get("DEADRECKON_BUNDLE_BUILD_ID"), Some(&None));
+        assert_eq!(configured.get("DEADRECKON_GATE_KEY"), Some(&None));
+        assert_eq!(configured.get("deadreckon_case_insensitive"), Some(&None));
+        assert_eq!(
+            configured.get("DEADRECKON_SAFE_INPUT"),
+            Some(&Some("ordinary".to_string()))
+        );
+        assert!(!configured.contains_key("PATH"));
     }
 }

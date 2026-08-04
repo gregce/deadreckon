@@ -17,12 +17,13 @@ use crate::ledger_io::append_ledger_item;
 use crate::state::{PipelineState, append_json_line};
 use crate::workspace_capture::{
     CaptureProjection, CapturePurpose, WORKSPACE_BLOBS_DIR, WorkspaceCapturePolicy,
-    capture_workspace, ensure_workspace_capture_policy, freeze_workspace_capture_policy,
+    capture_workspace, capture_workspace_strict, freeze_workspace_capture_policy,
     materialize_capture_plan, materialize_capture_plan_with_blob_store, read_capture_manifest,
-    write_capture_manifest,
+    require_workspace_capture_policy, write_capture_manifest,
 };
 
 pub const SNAPSHOT_CAPTURE_MANIFESTS_DIR: &str = "snapshot-manifests";
+const SNAPSHOT_CAPTURE_MANIFEST_JSON: &str = ".deadreckon/snapshot-capture-manifest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
@@ -96,11 +97,16 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
         .run_root
         .join("snapshots")
         .join(format!("turn-{turn}"));
-    if snapshot_dir.exists() {
-        fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
-    }
-    let policy = ensure_workspace_capture_policy(state)?;
-    let mut capture = capture_workspace(
+    let snapshots_dir = snapshot_dir.parent().ok_or_else(|| {
+        DeadreckonError::InvalidInput("snapshot path has no parent directory".to_string())
+    })?;
+    fs::create_dir_all(snapshots_dir).with_path(snapshots_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".turn-{turn}-staging-"))
+        .tempdir_in(snapshots_dir)
+        .with_path(snapshots_dir)?;
+    let policy = require_workspace_capture_policy(state)?;
+    let mut capture = capture_workspace_strict(
         &state.working_dir,
         &policy,
         CaptureProjection::Recoverable,
@@ -108,10 +114,19 @@ pub fn snapshot_working(state: &PipelineState, turn: u32) -> Result<PathBuf> {
     )?;
     let materialization = materialize_capture_plan_with_blob_store(
         &capture,
-        &snapshot_dir,
+        staging.path(),
         &state.run_root.join(WORKSPACE_BLOBS_DIR),
     )?;
     capture.manifest.materialization = Some(materialization);
+    write_capture_manifest(
+        &staging.path().join(SNAPSHOT_CAPTURE_MANIFEST_JSON),
+        &capture.manifest,
+    )?;
+    if snapshot_dir.exists() {
+        fs::remove_dir_all(&snapshot_dir).with_path(&snapshot_dir)?;
+    }
+    let staging_path = staging.keep();
+    fs::rename(&staging_path, &snapshot_dir).with_path(&snapshot_dir)?;
     write_capture_manifest(
         &snapshot_capture_manifest_path(state, turn),
         &capture.manifest,
@@ -139,18 +154,30 @@ pub fn restore_snapshot(state: &PipelineState, turn: u32) -> Result<()> {
             state.run_id
         )));
     }
-    let manifest_path = snapshot_capture_manifest_path(state, turn);
-    if manifest_path.is_file() {
-        let manifest = read_capture_manifest(&manifest_path)?;
-        if manifest.partial {
-            return Err(DeadreckonError::InvalidInput(format!(
-                "restore refused partial snapshot turn-{turn}: {}",
-                manifest.omission_summary()
-            )));
-        }
+    let transaction_manifest = snapshot_dir.join(SNAPSHOT_CAPTURE_MANIFEST_JSON);
+    let legacy_manifest = snapshot_capture_manifest_path(state, turn);
+    let manifest_path = if transaction_manifest.is_file() {
+        transaction_manifest
+    } else {
+        legacy_manifest
+    };
+    if !manifest_path.is_file() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "snapshot turn-{turn} has no capture manifest at {}; refusing an unproven restore",
+            manifest_path.display()
+        )));
+    }
+    let manifest = read_capture_manifest(&manifest_path)?;
+    if manifest.partial {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "restore refused partial snapshot turn-{turn}: {}",
+            manifest.omission_summary()
+        )));
     }
     clear_workspace_preserving_git(&state.working_dir)?;
-    copy_tree(&snapshot_dir, &state.working_dir)
+    copy_tree_with_filter(&snapshot_dir, &state.working_dir, |relative| {
+        relative != Path::new(SNAPSHOT_CAPTURE_MANIFEST_JSON)
+    })
 }
 
 fn clear_workspace_preserving_git(working_dir: &Path) -> Result<()> {
@@ -261,7 +288,7 @@ fn snapshot_file_set(root: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 fn diff_excluded_path(path: &Path) -> bool {
-    !is_deliverable_workspace_path(path)
+    path == Path::new(SNAPSHOT_CAPTURE_MANIFEST_JSON) || !is_deliverable_workspace_path(path)
 }
 
 fn file_delta(
@@ -357,8 +384,19 @@ pub fn inventory_recoverable_files_with_policy(
 }
 
 pub fn inventory_recoverable_files_for_state(state: &PipelineState) -> Result<Vec<PathBuf>> {
-    let policy = ensure_workspace_capture_policy(state)?;
-    inventory_recoverable_files_with_policy(&state.working_dir, &policy)
+    let policy = require_workspace_capture_policy(state)?;
+    let capture = capture_workspace_strict(
+        &state.working_dir,
+        &policy,
+        CaptureProjection::Recoverable,
+        CapturePurpose::WorkingInventory,
+    )?;
+    capture.require_complete("working inventory")?;
+    Ok(capture
+        .entries
+        .into_iter()
+        .map(|entry| entry.source)
+        .collect())
 }
 
 fn inventory_files_with_filter(root: &Path, include: fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -401,7 +439,7 @@ pub fn copy_recoverable_tree_with_policy(
     to: &Path,
     policy: &WorkspaceCapturePolicy,
 ) -> Result<crate::workspace_capture::WorkspaceCaptureManifest> {
-    let capture = capture_workspace(
+    let capture = capture_workspace_strict(
         from,
         policy,
         CaptureProjection::Recoverable,
@@ -682,8 +720,8 @@ mod tests {
 
     use super::{
         copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree, diff_snapshots,
-        diff_working_trees, inventory_files, inventory_recoverable_files, restore_snapshot,
-        snapshot_diff, snapshot_working,
+        diff_working_trees, inventory_files, inventory_recoverable_files_for_state,
+        restore_snapshot, snapshot_diff, snapshot_working,
     };
 
     #[test]
@@ -760,6 +798,22 @@ mod tests {
         let snapshot = state.run_root.join("snapshots/turn-1");
         let manifest = read_capture_manifest(&super::snapshot_capture_manifest_path(&state, 1))
             .expect("snapshot capture manifest");
+        assert!(
+            snapshot
+                .join(super::SNAPSHOT_CAPTURE_MANIFEST_JSON)
+                .is_file(),
+            "a snapshot must not become visible before its bound manifest"
+        );
+        assert!(
+            fs::read_dir(state.run_root.join("snapshots"))
+                .expect("snapshot directory")
+                .all(|entry| !entry
+                    .expect("snapshot entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("staging")),
+            "successful publication must not leave a staging generation"
+        );
         assert!(!manifest.partial);
         assert!(manifest.omissions.iter().any(|omission| {
             omission.path == Path::new(".build")
@@ -787,7 +841,8 @@ mod tests {
         );
         fs::create_dir_all(state.working_dir.join(".build/debug")).expect("rebuilt output");
         fs::write(state.working_dir.join(".build/debug/app"), "rebuilt").expect("rebuilt artifact");
-        let recoverable = inventory_recoverable_files(&state.working_dir).expect("recoverable");
+        let recoverable =
+            inventory_recoverable_files_for_state(&state).expect("recoverable from frozen policy");
         assert!(recoverable.iter().any(|path| path.ends_with("file.txt")));
         assert!(
             recoverable

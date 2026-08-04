@@ -438,6 +438,21 @@ fn create_run_with_optional_ownership(
     write_trusted_codebase_record(&state.run_root, &codebase)?;
     write_codebase_record(&state.working_dir, &codebase)?;
     ensure_docs_started(&state)?;
+    // Freeze Git hydration, ignore rules, and generated-output hints while the
+    // controller still owns the workspace. Post-provider capture paths must
+    // consume this record and must never reconstruct it from agent-visible
+    // Git state. Copy mode freezes the source because the working copy is
+    // materialized immediately after run creation.
+    let capture_source = if codebase.mode == CodebaseMode::Copy {
+        codebase
+            .source_path
+            .as_deref()
+            .unwrap_or(&state.working_dir)
+    } else {
+        &state.working_dir
+    };
+    let capture_policy = crate::workspace_capture::freeze_workspace_capture_policy(capture_source)?;
+    crate::workspace_capture::write_workspace_capture_policy(&state.run_root, &capture_policy)?;
     write_current_pointer(paths, &state)?;
     Ok(state)
 }
@@ -729,6 +744,9 @@ mod tests {
 
         assert!(state.state_path().exists());
         assert!(state.run_root.join(crate::TRUSTED_CODEBASE_RECORD).exists());
+        let capture_policy = crate::read_workspace_capture_policy(&state.run_root)
+            .expect("controller-frozen capture policy");
+        assert!(capture_policy.frozen_git_hydration.is_some());
         assert_eq!(
             crate::read_run_codebase_record(&state.run_root, &state.working_dir)
                 .expect("trusted codebase record"),

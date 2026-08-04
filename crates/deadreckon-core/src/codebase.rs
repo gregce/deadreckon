@@ -8,7 +8,7 @@ use crate::git::{run_git, run_git_with_input};
 use crate::paths::{DeadreckonPaths, sanitize_slug, workspace_scope};
 use crate::workspace_capture::{
     CaptureProjection, CapturePurpose, WorkspaceCaptureManifest, WorkspaceCapturePolicy,
-    capture_workspace, freeze_workspace_capture_policy, materialize_capture_plan,
+    capture_workspace_strict, freeze_workspace_capture_policy, materialize_capture_plan,
 };
 
 pub const CODEBASE_RECORD_VERSION: u32 = 1;
@@ -304,7 +304,7 @@ pub fn copy_source_to_working_with_policy(
             source.display()
         )));
     }
-    let plan = capture_workspace(
+    let plan = capture_workspace_strict(
         source,
         policy,
         CaptureProjection::Source,

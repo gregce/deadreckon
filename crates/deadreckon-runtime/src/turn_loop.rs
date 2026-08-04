@@ -4130,7 +4130,7 @@ pub async fn run_contained_verdict_evaluation(
 
     let scratch = TempDir::new().with_path(PathBuf::from("verdict-scratch"))?;
     let scratch_working_dir = scratch.path().join("workspace");
-    let capture_policy = deadreckon_core::ensure_workspace_capture_policy(state)?;
+    let capture_policy = deadreckon_core::require_workspace_capture_policy(state)?;
     copy_recoverable_tree_with_policy(&state.working_dir, &scratch_working_dir, &capture_policy)?;
     let pid_file = scratch.path().join("dr-gate-evaluate.pid");
     let result = run_keyless_gate_evaluation(
@@ -5611,8 +5611,8 @@ fn commit_worktree_turn_inner(
 }
 
 fn stage_trusted_delivery_paths(state: &PipelineState, control: &TrustedGitControl) -> Result<()> {
-    let policy = deadreckon_core::ensure_workspace_capture_policy(state)?;
-    let capture = deadreckon_core::capture_workspace(
+    let policy = deadreckon_core::require_workspace_capture_policy(state)?;
+    let capture = deadreckon_core::capture_workspace_strict(
         &state.working_dir,
         &policy,
         deadreckon_core::CaptureProjection::Deliverable,

@@ -24,10 +24,10 @@ them. A provider changing an ignore file does not change the frozen policy for
 that run. This prevents an accidental or hostile ignore rewrite from hiding a
 deliverable or admitting a generated cache into trusted Git staging.
 
-Older runs which predate this file cannot reconstruct their original ignore
-state. DeadReckon creates a compatibility policy from their current workspace
-when they are next captured. New-run guarantees therefore apply only when the
-policy was persisted before the first provider turn.
+Older persisted policies are upgraded from their already-frozen tracked-path,
+HEAD, and index fields without consulting live Git. If an active run has no
+policy after provider work may have begun, DeadReckon fails closed instead of
+manufacturing trust from the current workspace.
 
 ## How capture remains bounded
 
@@ -60,7 +60,9 @@ A run leaves the following records under its run root:
 - `workspace-capture-policy.json`: the frozen inputs and limits;
 - `source-hydration-manifest.json`: the initial source-copy result, when used;
 - `snapshot-manifests/turn-N.json`: inclusion, omission, generated-output, Git,
-  and materialisation statistics for each turn snapshot;
+  and materialisation statistics for each turn snapshot; the same manifest is
+  written inside the staged snapshot before that snapshot is atomically made
+  visible;
 - `checkpoints/<id>/manifest.json`: the equivalent record for flight
   checkpoints; and
 - `workspace-blobs/sha256/`: run-scoped immutable whole-file blobs.
@@ -91,7 +93,11 @@ Observable success is four `test result: ok` summaries. These tests prove that:
 - tracked files override ignores and generated-output classification;
 - changing `.gitignore` during a turn cannot admit a previously ignored cache;
 - partial snapshots and checkpoints cannot be restored as exact state; and
-- a second snapshot reuses the first snapshot's content blobs.
+- a second snapshot reuses the first snapshot's content blobs;
+- agent-staged build output cannot change the frozen tracked-file authority;
+  and
+- promotion materialises the same bounded, trusted capture it records and
+  rejects later payload tampering.
 
 For a live run, inspect the capture evidence after the first turn:
 
