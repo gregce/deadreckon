@@ -113,11 +113,14 @@
   reclaimable. Launchd, systemd and identity probes use a shared 30-second
   bounded runner that drains output concurrently, terminates the process group
   and reaps it on timeout.
-- macOS boot identity now compares the stable boot-second boundary rather than
-  volatile `kern.boottime` microseconds. Start/repair readiness waits 30
-  seconds for a fresh service instance, healthy lease inactivity allows 60
-  seconds, and guarded child handoff allows 30 seconds without extending any
-  operator-approved Job wall or deadline.
+- macOS boot identity now uses the kernel's immutable `kern.bootsessionuuid`
+  instead of the wall-clock-derived `kern.boottime`, which can move by whole
+  seconds after clock correction as well as vary in microseconds. Legacy time
+  identities remain comparable only with each other; upgrading to the UUID
+  identity deliberately restarts the supervisor and republishes its authority.
+  Start/repair readiness waits 30 seconds for that fresh service instance,
+  healthy lease inactivity allows 60 seconds, and guarded child handoff allows
+  30 seconds without extending any operator-approved Job wall or deadline.
 - Supervisor installation, status, readiness, and checkpoints now canonicalize
   the running executable once. A managed PATH symlink and its target therefore
   identify the same pinned binary, while a genuinely different executable
