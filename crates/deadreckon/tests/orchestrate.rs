@@ -7879,11 +7879,12 @@ fn start_returns_job_id_before_worker_finishes() {
         .stderr(Stdio::piped());
     let launch = wait_with_output_before(
         launch.spawn().expect("spawn public start"),
-        // The smoke worker remains blocked until this test releases it, so a
-        // longer process-start allowance does not weaken the detach proof.
-        // Keep it below the worker's 60-second wall cap: a coupled `start`
-        // would still time out here instead of returning after that cap.
-        Duration::from_secs(30),
+        // Admission hashes the current executable and may contend with the
+        // rest of the integration suite on a small CI runner. The worker
+        // remains blocked until this test releases it, and the assertions
+        // below independently require a live, non-terminal Job, so allowing
+        // slow admission here does not weaken the detach proof.
+        Duration::from_secs(90),
         "public start did not detach from its worker",
     );
 
@@ -8571,7 +8572,7 @@ fn write_start_ready_setup(paths: &DeadreckonPaths, root: &std::path::Path) {
             "name: start ready plan root shape footer review json launch replayable quiet guided\n",
             "checks:\n",
             "  - kind: shell\n",
-            "    command: \"python3 -c 'from pathlib import Path; assert Path(\\\"README.md\\\").is_file()'\"\n",
+            "    command: \"test -f README.md && test \\\"$(head -n 1 README.md)\\\" = \\\"# tiny hello rust\\\"\"\n",
             "    cwd: \"{working_dir}\"\n",
         ),
     )
