@@ -131,6 +131,10 @@ Accept when:
 - [ ] a clean worktree remains admissible after `start` writes the approved
   `.deadreckon/acceptance.yaml` and `.md`; the supervised child starts, reaches
   a persisted run state, and does not call those controller files user dirt;
+- [ ] `deadreckon def-done "behavior"` followed by its recommended
+  `deadreckon start "goal" --worktree --yes` command accepts the exact bounded
+  project contract without requiring `--allow-dirty`; adding any unrelated
+  uncommitted file restores the dirty-worktree refusal;
 - [ ] a generated helper under `.deadreckon/acceptance/` is copied into the
   Job's bounded contract bundle, appears in the launch-plan manifest, reaches
   the isolated worktree, and executes there;

@@ -4897,6 +4897,16 @@ remain portable through `{working_dir}` and cannot embed the original absolute
 source path. Direct `def-done` keeps its existing behavior by supplying the
 same path for both roots.
 
+The resulting project contract is authority input rather than implementation
+dirt. Before a Job exists, `start` and direct `run` inventory only
+`.deadreckon/acceptance.yaml`, its companion Markdown and its bounded regular
+helper tree; those exact Git-relative paths may cross clean-worktree preflight
+without `--allow-dirty` and are not seeded as deliverables. Symlinked contract
+roots, special files, size/count overflow and any unrelated dirty path still
+fail closed. Job creation then freezes and hashes the same bundle, and child
+admission requires the project bytes, frozen bytes and launch-plan manifest to
+agree.
+
 ### 59.4 Structured authoring under one deadline
 
 Draft and critic calls carry exact output schemas. CLI adapters must prove a

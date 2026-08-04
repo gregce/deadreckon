@@ -12,7 +12,7 @@ use serde_json::json;
 
 mod common;
 
-use common::{assert_success, deadreckon, repo_tempdir, stdout};
+use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -28,6 +28,20 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
     let workspace = temp.path().join("app");
     fs::create_dir_all(&workspace).expect("workspace");
     fs::write(workspace.join("app.py"), "print('hello from app')\n").expect("application");
+    git(&workspace, &["init", "-b", "main"]);
+    git(&workspace, &["add", "app.py"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=DeadReckon test",
+            "-c",
+            "user.email=test@deadreckon.local",
+            "commit",
+            "-m",
+            "seed fixture",
+        ],
+    );
 
     let fixture_dir = temp.path().join("fixtures");
     fs::create_dir_all(&fixture_dir).expect("fixtures");
@@ -88,6 +102,32 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
         workspace.join(".deadreckon/acceptance.yaml").is_file(),
         "the real authoring surface must persist the compiled draft"
     );
+
+    let mut preview = deadreckon(&paths);
+    preview
+        .current_dir(&workspace)
+        .env("DEADRECKON_AUTH_PROBE", "0")
+        .args([
+            "start",
+            "running the Python app prints hello from app",
+            "--mode",
+            "run",
+            "--provider",
+            "cli:codex",
+            "--model",
+            "gpt-test",
+            "--worktree",
+            "--yes",
+            "--preview",
+            "--plain",
+        ]);
+    let preview_output = output_with_timeout(preview, COMMAND_TIMEOUT);
+    assert_success(&preview_output);
+    let preview_text = format!("{}{}", stdout(&preview_output), stderr(&preview_output));
+    assert!(
+        !preview_text.contains("working tree has uncommitted changes"),
+        "the exact def-done bundle is authority input, not implementation dirt:\n{preview_text}"
+    );
 }
 
 fn write_codex_config(paths: &DeadreckonPaths, binary: &std::path::Path) {
@@ -123,6 +163,21 @@ fn make_executable(path: &std::path::Path) {
     let mut permissions = fs::metadata(path).expect("fake CLI metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod fake CLI");
+}
+
+fn git(workspace: &std::path::Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(workspace)
+        .args(args)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {} failed:\n{}{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {

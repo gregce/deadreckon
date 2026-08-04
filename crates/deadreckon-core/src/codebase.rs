@@ -371,24 +371,35 @@ fn preflight_worktree_with_allowed_paths(
     }
     let dirty = git_stdout(
         git_root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
     )?;
     if !allow_dirty && !dirty.trim().is_empty() {
         let allowed = allowed_dirty_paths
             .iter()
             .map(|path| path.to_string_lossy().replace('\\', "/"))
             .collect::<std::collections::BTreeSet<_>>();
-        let unexpected = dirty
-            .lines()
-            .filter(|line| {
-                let Some(path) = line.get(3..) else {
-                    return true;
-                };
-                path.contains(" -> ") || !allowed.contains(path)
-            })
-            .take(12)
-            .map(|line| format!("  {}", line.trim()))
-            .collect::<Vec<_>>();
+        let mut fields = dirty.split_terminator('\0');
+        let mut unexpected = Vec::new();
+        while let Some(entry) = fields.next() {
+            let Some(status) = entry.get(..2) else {
+                unexpected.push(format!("  malformed git status entry: {entry}"));
+                break;
+            };
+            let Some(path) = entry.get(3..) else {
+                unexpected.push(format!("  malformed git status entry: {entry}"));
+                break;
+            };
+            let rename_or_copy = status.bytes().any(|byte| matches!(byte, b'R' | b'C'));
+            if rename_or_copy {
+                let original = fields.next().unwrap_or("<missing source path>");
+                unexpected.push(format!("  {status} {original} -> {path}"));
+            } else if !allowed.contains(path) {
+                unexpected.push(format!("  {status} {path}"));
+            }
+            if unexpected.len() == 12 {
+                break;
+            }
+        }
         if !unexpected.is_empty() {
             return Err(user_error(
                 &format!(
