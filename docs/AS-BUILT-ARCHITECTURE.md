@@ -3754,10 +3754,10 @@ adapter that cannot enforce the posture fails closed. Capability probes are
 cached for the binary/version process lifetime. `doc_provider` remains the
 preferred authoring route.
 
-The whole authoring sequence shares one wall deadline. The default is 900
+The whole authoring sequence shares one wall deadline. The default is 1,200
 seconds, configurable as `defaults.done_contract_max_wall_seconds` and clamped
-to 900–3,600 seconds. The initial draft receives at most 300 seconds while
-reserving 120 seconds for the critic and 300 for an optional redraft. The critic
+to 1,200–3,600 seconds. The initial draft receives at most 300 seconds while
+reserving 300 seconds for the critic and 300 for an optional redraft. The critic
 must preserve the redraft reservation, and redraft receives only its remaining
 time up to 300 seconds. Startup, capability probing and active provider work
 consume that cumulative budget. Cancellation then receives one bounded
@@ -4502,6 +4502,14 @@ The recovery policy is intentionally fail-closed:
   merge-repair children from authenticated authority records. Malformed,
   foreign or swapped records stop `LostContainment` instead of leaving an
   untracked repair process or claiming a clean stop;
+- owned-child deadline and wall-cap cleanup polls direct-child reaping while
+  process-tree reconciliation runs, under one 30-second absolute boundary. A
+  reconciliation error or unreaped leader becomes `Blocked/LostContainment`;
+  its authenticated process record is retained for operator recovery;
+- the singleton restart scanner drives at most four independent Jobs at once
+  and keeps an active-Job set, preventing a long recovered child from blocking
+  later leases while bounding restart fan-out. Each task retains its own lease,
+  heartbeat, process authority and policy boundary;
 - root planner spend and wall time are embedded before child work, restored
   after mapping-creation crashes, subtracted from the Job policy, and divided
   across Plan tasks or Campaign sub-plans rather than granting every child the
@@ -4512,6 +4520,13 @@ The recovery policy is intentionally fail-closed:
 - spawn failures consume the bounded attempt policy;
 - missing identity or containment evidence stops with a typed reason instead
   of guessing.
+
+When a deterministic check requests revision and the next CLI turn exits
+cleanly without changing a deliverable, the run preserves the original
+acceptance failure. The supervisor records `deterministic_revise` and resumes
+the same isolated Job only while its approved attempt policy allows. This is a
+gate correction, not a provider failure; exhaustion remains the explicit
+attempt-limit outcome.
 
 Hermetic tests cover both guarded launch boundaries, same-ID root repair,
 Campaign sub-plan reservation, boot/PID reuse refusal, corrupt nested identity
@@ -4925,11 +4940,11 @@ web, MCP and user-rule/config surfaces, while Claude uses its corresponding
 safe/schema flags. Tool-free API routes use strict response formats. Unsupported
 adapters fail closed. Immutable capability probes are cached per binary/version.
 
-Draft, critic and optional redraft share a 900-second default deadline. Draft
-gets at most 300 seconds while reserving 120 seconds for critic and 300 for
+Draft, critic and optional redraft share a 1,200-second default deadline. Draft
+gets at most 300 seconds while reserving 300 seconds for critic and 300 for
 redraft; critic likewise preserves the redraft reservation. Redraft gets only
 the remaining time up to 300 seconds. The config key
-`defaults.done_contract_max_wall_seconds` is clamped to 900–3,600 seconds, so
+`defaults.done_contract_max_wall_seconds` is clamped to 1,200–3,600 seconds, so
 legacy 120-second defaults are lifted automatically.
 Timeout or cancellation terminates and reaps the whole provider
 process group and removes temporary files before returning. Initial failure
@@ -4938,8 +4953,8 @@ lint-clean draft may proceed to explicit human review. Redraft receives the full
 prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
 `redraft`; one critic and one redraft remain the ceiling.
 
-The earlier shape-planning turn is separately bounded at 120 seconds for CLI
-providers and 30 seconds for HTTP providers. A timeout explicitly cancels the
+The earlier shape-planning turn is separately bounded at 300 seconds for CLI
+providers and 120 seconds for HTTP providers. A timeout explicitly cancels the
 provider and allows up to 30 seconds to prove cleanup before deterministic
 fallback. Done-authoring cleanup receives 30 seconds outside active model
 work. If either boundary cannot prove cleanup, DeadReckon retains its PID

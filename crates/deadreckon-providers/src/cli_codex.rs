@@ -8,7 +8,9 @@ use serde_json::json;
 use tokio::sync::{Mutex, OnceCell};
 use which::which;
 
-use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
+use crate::cli_common::{
+    CliOutput, CliRunOptions, ensure_success, run_cli, run_cli_with_options, write_output,
+};
 use crate::cli_contract::{
     PROVIDER_ID_CODEX, ParsedStream, ProviderContract, ProviderSession, add_caveat,
     flight_rows_from, session_not_found, write_schema_file,
@@ -148,16 +150,22 @@ impl CliCodexProvider {
         schema: Option<&Path>,
     ) -> Result<CodexAttempt> {
         let args = self.build_args(request, caps, resume_id, last_message, schema);
-        let output = run_cli(
+        let output = run_cli_with_options(
             &self.name,
             &self.binary,
             &args,
-            request.cwd.clone(),
-            request.sandbox_backend,
-            request.pid_file.clone(),
-            request.cancellation_token.clone(),
-            request.workspace_access,
-            true,
+            CliRunOptions {
+                cwd: request.cwd.clone(),
+                sandbox_backend: request.sandbox_backend,
+                pid_file: request.pid_file.clone(),
+                cancellation_token: request.cancellation_token.clone(),
+                // The structured-output schema is controller authority. The
+                // provider may read it but must not be able to rewrite it.
+                extra_read_allowlist: schema.into_iter().map(Path::to_path_buf).collect(),
+                extra_write_allowlist: last_message.into_iter().map(Path::to_path_buf).collect(),
+                workspace_access: request.workspace_access,
+                inner_read_only_enforced: true,
+            },
         )
         .await?;
         Ok(CodexAttempt { output, args })

@@ -43,6 +43,7 @@ pub(crate) async fn run_cli(
             sandbox_backend,
             pid_file,
             cancellation_token,
+            extra_read_allowlist: Vec::new(),
             extra_write_allowlist: Vec::new(),
             workspace_access,
             inner_read_only_enforced,
@@ -56,6 +57,7 @@ pub(crate) struct CliRunOptions {
     pub(crate) sandbox_backend: Option<SandboxBackend>,
     pub(crate) pid_file: Option<PathBuf>,
     pub(crate) cancellation_token: Option<CancellationToken>,
+    pub(crate) extra_read_allowlist: Vec<PathBuf>,
     pub(crate) extra_write_allowlist: Vec<PathBuf>,
     pub(crate) workspace_access: WorkspaceAccess,
     /// True only when the provider CLI has its own enforceable read-only
@@ -97,8 +99,10 @@ pub(crate) async fn run_cli_with_options(
         let mut write_allowlist = cli_provider_write_allowlist(provider);
         write_allowlist.extend(options.extra_write_allowlist);
         dedup_paths(&mut write_allowlist);
-        let policy =
+        let mut policy =
             ToolSandboxPolicy::cli_provider(cwd.clone(), resolved.read_allowlist, write_allowlist);
+        policy.read_allowlist.extend(options.extra_read_allowlist);
+        dedup_paths(&mut policy.read_allowlist);
         let output = run_sandbox(SandboxSpec {
             backend,
             docker: None,
@@ -485,6 +489,7 @@ mod tests {
                 sandbox_backend: None,
                 pid_file: None,
                 cancellation_token: None,
+                extra_read_allowlist: Vec::new(),
                 extra_write_allowlist: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 inner_read_only_enforced: false,
@@ -526,6 +531,7 @@ mod tests {
                 sandbox_backend: None,
                 pid_file: Some(temp.path().join("provider.pid")),
                 cancellation_token: Some(token.clone()),
+                extra_read_allowlist: Vec::new(),
                 extra_write_allowlist: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadWrite,
                 inner_read_only_enforced: false,

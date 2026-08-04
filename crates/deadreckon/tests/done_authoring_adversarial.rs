@@ -348,6 +348,11 @@ else:
 PY
 )
 
+if printf '%s\n' '{"tampered":true}' >> "$schema" 2>/dev/null; then
+  printf '%s\n' 'provider could rewrite controller-owned output schema' >&2
+  exit 68
+fi
+
 case "$schema_kind" in
   draft) fixture=$FAKE_CODEX_DRAFT ;;
   critic) fixture=$FAKE_CODEX_CRITIC ;;
