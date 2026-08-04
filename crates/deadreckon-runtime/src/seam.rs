@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use deadreckon_core::error::{DeadreckonError, Result};
-use deadreckon_providers::ModelCatalogOverride;
+use deadreckon_providers::{ModelCatalogOverride, ProviderCleanup, ProviderPhaseDeadline};
 use deadreckon_sandbox::{
     SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, run as run_sandbox,
 };
@@ -152,6 +152,39 @@ pub enum SeamOutcome {
     LostContainment(String),
 }
 
+/// A seam result observed through the enclosing Job's work boundary.
+///
+/// `Completed` includes the seam's own configured timeout/fail-policy result.
+/// The other variants are reserved for the enclosing Job deadline and
+/// controller cancellation so a short worker timeout remains a safety ceiling
+/// instead of becoming a fresh phase-local Job clock.
+#[derive(Debug, PartialEq)]
+pub enum SeamPhaseOutcome<T> {
+    Completed(T),
+    WorkExpired { cleanup: ProviderCleanup },
+    Cancelled { cleanup: ProviderCleanup },
+}
+
+impl<T> SeamPhaseOutcome<T> {
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> SeamPhaseOutcome<U> {
+        match self {
+            Self::Completed(value) => SeamPhaseOutcome::Completed(map(value)),
+            Self::WorkExpired { cleanup } => SeamPhaseOutcome::WorkExpired { cleanup },
+            Self::Cancelled { cleanup } => SeamPhaseOutcome::Cancelled { cleanup },
+        }
+    }
+}
+
+impl<T, E> SeamPhaseOutcome<std::result::Result<T, E>> {
+    pub fn transpose(self) -> std::result::Result<SeamPhaseOutcome<T>, E> {
+        match self {
+            Self::Completed(result) => result.map(SeamPhaseOutcome::Completed),
+            Self::WorkExpired { cleanup } => Ok(SeamPhaseOutcome::WorkExpired { cleanup }),
+            Self::Cancelled { cleanup } => Ok(SeamPhaseOutcome::Cancelled { cleanup }),
+        }
+    }
+}
+
 pub fn read_seams_config(config_path: &Path, no_seams: bool) -> Result<SeamsConfig> {
     if no_seams {
         return Ok(SeamsConfig::empty(true));
@@ -236,56 +269,154 @@ pub async fn dispatch_seam(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
 ) -> SeamOutcome {
+    match dispatch_seam_inner(kind, req, seams, ctx, None, None).await {
+        SeamPhaseOutcome::Completed(outcome) => outcome,
+        SeamPhaseOutcome::WorkExpired { .. } | SeamPhaseOutcome::Cancelled { .. } => {
+            unreachable!("standalone seam dispatch has no enclosing Job boundary")
+        }
+    }
+}
+
+/// Dispatch a seam under the exact absolute work cutoff and cancellation
+/// authority owned by the enclosing Job attempt.
+pub async fn dispatch_seam_phase(
+    kind: SeamKind,
+    req: &Value,
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> SeamPhaseOutcome<SeamOutcome> {
+    dispatch_seam_inner(kind, req, seams, ctx, Some(deadline), Some(cancellation)).await
+}
+
+async fn dispatch_seam_inner(
+    kind: SeamKind,
+    req: &Value,
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    deadline: Option<ProviderPhaseDeadline>,
+    cancellation: Option<&CancellationToken>,
+) -> SeamPhaseOutcome<SeamOutcome> {
     let Some(command) = seams.command_for(kind) else {
-        return SeamOutcome::Unconfigured;
+        return SeamPhaseOutcome::Completed(SeamOutcome::Unconfigured);
     };
     let stdin = match serde_json::to_vec(req) {
         Ok(mut bytes) => {
             bytes.push(b'\n');
             bytes
         }
-        Err(err) => return fail_outcome(kind, format!("request serialization failed: {err}")),
+        Err(err) => {
+            return SeamPhaseOutcome::Completed(fail_outcome(
+                kind,
+                format!("request serialization failed: {err}"),
+            ));
+        }
     };
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return SeamPhaseOutcome::Cancelled {
+            cleanup: ProviderCleanup::NotApplicable,
+        };
+    }
+    if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline.work_expires_at) {
+        return SeamPhaseOutcome::WorkExpired {
+            cleanup: ProviderCleanup::NotApplicable,
+        };
+    }
+
     let token = CancellationToken::new();
     let process_record = seam_process_record_path(ctx, kind);
     let spec = seam_sandbox_spec(command, ctx, stdin, token.clone(), process_record.clone());
-    let mut handle = tokio::spawn(async move { run_sandbox(spec).await });
-    let timeout = Duration::from_millis(command.timeout_ms);
-    let output = tokio::select! {
-        output = &mut handle => match output {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => return fail_outcome(kind, format!("sandbox failed: {err}")),
-            Err(err) => return fail_outcome(kind, format!("sandbox task failed: {err}")),
-        },
-        _ = tokio::time::sleep(timeout) => {
-            token.cancel();
-            let cleanup = tokio::time::timeout(SEAM_CLEANUP_TIMEOUT, &mut handle).await;
-            let cleanup_proven = matches!(cleanup, Ok(Ok(_))) && !process_record.exists();
-            if !cleanup_proven {
-                // A stuck sandbox future must not turn the configured seam
-                // timeout into another unbounded wait. Aborting drops only
-                // controller-side ownership; the identity-bound process
-                // record remains for supervisor/operator reconciliation.
-                handle.abort();
+    let execution = run_sandbox(spec);
+    tokio::pin!(execution);
+
+    let now = tokio::time::Instant::now();
+    let configured_expires_at = now
+        .checked_add(Duration::from_millis(command.timeout_ms))
+        .unwrap_or_else(|| {
+            deadline
+                .map(|deadline| deadline.work_expires_at)
+                .unwrap_or(now + Duration::from_secs(100 * 365 * 24 * 60 * 60))
+        });
+    let outer_wins =
+        deadline.is_some_and(|deadline| deadline.work_expires_at <= configured_expires_at);
+    let work_expires_at = deadline
+        .map(|deadline| deadline.work_expires_at.min(configured_expires_at))
+        .unwrap_or(configured_expires_at);
+
+    enum Boundary<T> {
+        Completed(T),
+        SafetyExpired,
+        WorkExpired,
+        Cancelled,
+    }
+
+    let boundary = if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Boundary::Cancelled,
+            result = &mut execution => Boundary::Completed(result),
+            () = tokio::time::sleep_until(work_expires_at) => {
+                if outer_wins { Boundary::WorkExpired } else { Boundary::SafetyExpired }
             }
-            return seam_timeout_outcome(kind, cleanup_proven, &process_record);
+        }
+    } else {
+        tokio::select! {
+            result = &mut execution => Boundary::Completed(result),
+            () = tokio::time::sleep_until(work_expires_at) => Boundary::SafetyExpired,
+        }
+    };
+
+    let output = match boundary {
+        Boundary::Completed(Ok(output)) => output,
+        Boundary::Completed(Err(err)) => {
+            return SeamPhaseOutcome::Completed(fail_outcome(
+                kind,
+                format!("sandbox failed: {err}"),
+            ));
+        }
+        Boundary::SafetyExpired | Boundary::WorkExpired | Boundary::Cancelled => {
+            token.cancel();
+            let cleanup_budget = deadline
+                .map(|deadline| deadline.cleanup_budget.min(SEAM_CLEANUP_TIMEOUT))
+                .unwrap_or(SEAM_CLEANUP_TIMEOUT);
+            let cleanup_resolved = tokio::time::timeout(cleanup_budget, &mut execution)
+                .await
+                .is_ok();
+            let cleanup = classify_seam_cleanup(&process_record, cleanup_resolved);
+            return match boundary {
+                Boundary::SafetyExpired => SeamPhaseOutcome::Completed(seam_timeout_outcome(
+                    kind,
+                    &cleanup,
+                    &process_record,
+                    cleanup_budget,
+                )),
+                Boundary::WorkExpired => SeamPhaseOutcome::WorkExpired { cleanup },
+                Boundary::Cancelled => SeamPhaseOutcome::Cancelled { cleanup },
+                Boundary::Completed(_) => unreachable!(),
+            };
         }
     };
     if output.status_code != Some(0) {
-        return fail_outcome(
+        return SeamPhaseOutcome::Completed(fail_outcome(
             kind,
             format!(
                 "command exited with status {:?}: {}",
                 output.status_code,
                 output.stderr.trim()
             ),
-        );
+        ));
     }
     let parsed = match serde_json::from_str::<Value>(output.stdout.trim()) {
         Ok(parsed) => parsed,
-        Err(err) => return fail_outcome(kind, format!("invalid JSON response: {err}")),
+        Err(err) => {
+            return SeamPhaseOutcome::Completed(fail_outcome(
+                kind,
+                format!("invalid JSON response: {err}"),
+            ));
+        }
     };
-    map_success(kind, parsed)
+    SeamPhaseOutcome::Completed(map_success(kind, parsed))
 }
 
 pub async fn resolve_catalog_override(
@@ -308,6 +439,43 @@ pub async fn resolve_catalog_override(
         }
     };
     Ok(override_)
+}
+
+/// Resolve a catalog seam under the caller's fixed Job boundary. The result
+/// keeps expiry/cancellation typed so a pre-turn catalog hook cannot silently
+/// reset or outlive the durable Run cutoff.
+pub async fn resolve_catalog_override_phase(
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<SeamPhaseOutcome<Option<ModelCatalogOverride>>> {
+    let outcome = dispatch_seam_phase(
+        SeamKind::Catalog,
+        &Value::Object(Default::default()),
+        seams,
+        ctx,
+        deadline,
+        cancellation,
+    )
+    .await;
+    Ok(match outcome {
+        SeamPhaseOutcome::Completed(outcome) => {
+            let override_ = match outcome {
+                SeamOutcome::Ok(value) => ModelCatalogOverride::from_value(value).ok(),
+                SeamOutcome::Unconfigured
+                | SeamOutcome::Fallback
+                | SeamOutcome::Skipped(_)
+                | SeamOutcome::Deny(_) => None,
+                SeamOutcome::LostContainment(reason) => {
+                    return Err(lost_containment_error(SeamKind::Catalog, &reason));
+                }
+            };
+            SeamPhaseOutcome::Completed(override_)
+        }
+        SeamPhaseOutcome::WorkExpired { cleanup } => SeamPhaseOutcome::WorkExpired { cleanup },
+        SeamPhaseOutcome::Cancelled { cleanup } => SeamPhaseOutcome::Cancelled { cleanup },
+    })
 }
 
 fn seam_sandbox_spec(
@@ -357,29 +525,61 @@ fn seam_process_record_path(ctx: &SeamRunCtx, kind: SeamKind) -> PathBuf {
     ))
 }
 
-fn seam_timeout_reason(cleanup_proven: bool, process_record: &Path) -> String {
+fn classify_seam_cleanup(process_record: &Path, execution_resolved: bool) -> ProviderCleanup {
+    match std::fs::symlink_metadata(process_record) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && execution_resolved => {
+            ProviderCleanup::Proven
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ProviderCleanup::RetainedAuthority {
+                path: process_record.to_path_buf(),
+                detail: "seam cleanup future did not resolve before its separate cleanup deadline"
+                    .to_string(),
+            }
+        }
+        Ok(_) => ProviderCleanup::RetainedAuthority {
+            path: process_record.to_path_buf(),
+            detail: "seam process authority remains after the phase boundary".to_string(),
+        },
+        Err(error) => ProviderCleanup::RetainedAuthority {
+            path: process_record.to_path_buf(),
+            detail: format!("seam process authority could not be inspected: {error}"),
+        },
+    }
+}
+
+fn seam_timeout_reason(
+    cleanup_proven: bool,
+    process_record: &Path,
+    cleanup_budget: Duration,
+) -> String {
     if cleanup_proven {
         return "timeout; process-group cleanup proven".to_string();
     }
     if process_record.exists() {
         return format!(
             "timeout; process-group cleanup was not proven within {:.1}s; process authority retained at {}",
-            SEAM_CLEANUP_TIMEOUT.as_secs_f64(),
+            cleanup_budget.as_secs_f64(),
             process_record.display()
         );
     }
     format!(
         "timeout; process-group cleanup was not proven within {:.1}s and no durable process record was available",
-        SEAM_CLEANUP_TIMEOUT.as_secs_f64()
+        cleanup_budget.as_secs_f64()
     )
 }
 
 fn seam_timeout_outcome(
     kind: SeamKind,
-    cleanup_proven: bool,
+    cleanup: &ProviderCleanup,
     process_record: &Path,
+    cleanup_budget: Duration,
 ) -> SeamOutcome {
-    let reason = seam_timeout_reason(cleanup_proven, process_record);
+    let cleanup_proven = matches!(
+        cleanup,
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+    );
+    let reason = seam_timeout_reason(cleanup_proven, process_record, cleanup_budget);
     if cleanup_proven {
         fail_outcome(kind, reason)
     } else {
@@ -839,6 +1039,130 @@ timeout_ms = 0
         ));
     }
 
+    #[tokio::test]
+    async fn job_cutoff_preempts_longer_configured_seam_timeout() {
+        let temp = TempDir::new().expect("temp");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+                timeout_ms: 30_000,
+            },
+        )
+        .expect("hooks");
+        let cancellation = CancellationToken::new();
+        let deadline =
+            ProviderPhaseDeadline::from_now(Duration::from_millis(100), Duration::from_secs(2));
+        let started = std::time::Instant::now();
+
+        let outcome = dispatch_seam_phase(
+            SeamKind::Hooks,
+            &json!({"kind":"deadline"}),
+            &seams,
+            &ctx(&temp),
+            deadline,
+            &cancellation,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            SeamPhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::Proven
+            }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "configured timeout extended the Job cutoff: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_seams_share_one_absolute_job_cutoff() {
+        let temp = TempDir::new().expect("temp");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+                timeout_ms: 30_000,
+            },
+        )
+        .expect("hooks");
+        let cancellation = CancellationToken::new();
+        let deadline =
+            ProviderPhaseDeadline::from_now(Duration::from_millis(100), Duration::from_secs(2));
+
+        let first = dispatch_seam_phase(
+            SeamKind::Hooks,
+            &json!({"kind":"first"}),
+            &seams,
+            &ctx(&temp),
+            deadline,
+            &cancellation,
+        )
+        .await;
+        assert!(matches!(first, SeamPhaseOutcome::WorkExpired { .. }));
+
+        let second_started = std::time::Instant::now();
+        let second = dispatch_seam_phase(
+            SeamKind::Hooks,
+            &json!({"kind":"second"}),
+            &seams,
+            &ctx(&temp),
+            deadline,
+            &cancellation,
+        )
+        .await;
+        assert_eq!(
+            second,
+            SeamPhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::NotApplicable
+            }
+        );
+        assert!(
+            second_started.elapsed() < Duration::from_millis(100),
+            "the second seam received a fresh timeout: {:?}",
+            second_started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_cancellation_preempts_seam_and_proves_cleanup() {
+        let temp = TempDir::new().expect("temp");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec!["sh".to_string(), "-c".to_string(), "sleep 60".to_string()],
+                timeout_ms: 30_000,
+            },
+        )
+        .expect("hooks");
+        let cancellation = CancellationToken::new();
+        let cancellation_for_task = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancellation_for_task.cancel();
+        });
+
+        let outcome = dispatch_seam_phase(
+            SeamKind::Hooks,
+            &json!({"kind":"cancel"}),
+            &seams,
+            &ctx(&temp),
+            ProviderPhaseDeadline::from_now(Duration::from_secs(30), Duration::from_secs(2)),
+            &cancellation,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            SeamPhaseOutcome::Cancelled {
+                cleanup: ProviderCleanup::Proven
+            }
+        ));
+    }
+
     #[test]
     fn seam_workers_use_recoverable_process_group_authority() {
         let temp = TempDir::new().expect("temp");
@@ -869,7 +1193,12 @@ timeout_ms = 0
         std::fs::write(&process_record, "retained authority").expect("process record");
 
         for kind in SeamKind::all() {
-            let outcome = seam_timeout_outcome(kind, false, &process_record);
+            let cleanup = ProviderCleanup::RetainedAuthority {
+                path: process_record.clone(),
+                detail: "retained by test".to_string(),
+            };
+            let outcome =
+                seam_timeout_outcome(kind, &cleanup, &process_record, SEAM_CLEANUP_TIMEOUT);
             let SeamOutcome::LostContainment(reason) = outcome else {
                 panic!(
                     "{} seam treated lost containment as an ordinary failure: {outcome:?}",

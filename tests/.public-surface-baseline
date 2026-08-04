@@ -90,8 +90,10 @@ crate: deadreckon-core
   codebase::write_trusted_codebase_record
   completion::validate_strict_contract
   completion::seal_completion_receipt
+  completion::seal_completion_receipt_bounded
   completion::SEMANTIC_JUDGMENT_JSON
   completion::validate_completion_receipt
+  completion::validate_completion_receipt_bounded
   delivery::acquire_job_operation_lock
   delivery::GitDeliveryTarget
   delivery::JobOperationLock
@@ -158,6 +160,7 @@ crate: deadreckon-core
   docs::TurnDocInput
   docs::TurnRecord
   error::DeadreckonError
+  error::ProcessBoundaryKind
   error::Result
   error::is_retryable_io_kind
   events::emit_event
@@ -566,13 +569,16 @@ crate: deadreckon-runtime
   polish::substitute_placeholders
   polish::templated_docs_json
   seam::dispatch_seam
+  seam::dispatch_seam_phase
   seam::FailPolicy
   seam::parse_seams_config
   seam::read_seams_config
   seam::resolve_catalog_override
+  seam::resolve_catalog_override_phase
   seam::SeamCommandConfig
   seam::SeamKind
   seam::SeamOutcome
+  seam::SeamPhaseOutcome
   seam::SeamRunCtx
   seam::SeamsConfig
   seam::write_seams_audit
@@ -584,6 +590,7 @@ crate: deadreckon-runtime
   semantic_judge::run_semantic_judge_against_source
   semantic_judge::run_semantic_judge_against_source_with_budget
   semantic_judge::run_semantic_judge_against_source_with_budget_and_cancellation
+  semantic_judge::run_semantic_judge_against_source_with_deadline_and_cancellation
   semantic_judge::run_semantic_judge_with_budget
   semantic_judge::SEMANTIC_JUDGMENT_PATH
   semantic_judge::semantic_judgment_path
@@ -593,17 +600,21 @@ crate: deadreckon-runtime
   semantic_judge::SemanticJudgeResult
   semantic_judge::validate_semantic_judgment_input
   semantic_judge::validate_semantic_judgment_input_against_source
+  turn_loop::DeterministicGatePhaseOutcome
   turn_loop::GateLaunchOwner
   turn_loop::NarratorConfig
   turn_loop::ParentRepairCandidate
   turn_loop::ParentRepairCandidateContext
   turn_loop::run_contained_verdict_evaluation
   turn_loop::run_deterministic_completion_gate
+  turn_loop::run_deterministic_gate_work_phase
   turn_loop::run_parent_repair_turn_loop
   turn_loop::run_turn_loop
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig
   turn_loop::RunLoopOutcome
+  turn_loop::RunWorkBoundary
+  turn_loop::RunWorkExpiry
 crate: deadreckon-sandbox
   backend::resolve_backend
   backend::Result

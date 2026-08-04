@@ -218,6 +218,7 @@ impl DoneAuthoringBudget {
         }
     }
 
+    #[cfg(test)]
     fn new(total: Duration) -> Self {
         let started = Instant::now();
         Self {

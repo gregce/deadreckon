@@ -77,6 +77,51 @@ fn trusted_supervisor_run_id(requested: Option<String>) -> Result<Option<String>
     Ok(Some(run_id))
 }
 
+pub(crate) fn guarded_run_work_boundary(
+    paths: &DeadreckonPaths,
+    owner_job_id: Option<&str>,
+) -> Result<Option<deadreckon_runtime::RunWorkBoundary>> {
+    let Some(owner_job_id) = owner_job_id else {
+        return Ok(None);
+    };
+    let raw = std::env::var(commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV).map_err(
+        |error| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "guarded Job {owner_job_id} is missing its authenticated work cutoff: {error}"
+            )))
+        },
+    )?;
+    let cutoff = raw.parse::<DateTime<Utc>>().map_err(|error| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "guarded Job {owner_job_id} has an invalid authenticated work cutoff: {error}"
+        )))
+    })?;
+    let job = deadreckon_core::load_job(paths, owner_job_id)?;
+    let expiry = guarded_run_work_expiry(job.policy.deadline, cutoff);
+    let remaining = cutoff
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let work_expires_at = tokio::time::Instant::now()
+        .checked_add(remaining)
+        .unwrap_or_else(tokio::time::Instant::now);
+    Ok(Some(deadreckon_runtime::RunWorkBoundary::new(
+        work_expires_at,
+        expiry,
+    )))
+}
+
+fn guarded_run_work_expiry(
+    job_deadline: Option<DateTime<Utc>>,
+    authenticated_cutoff: DateTime<Utc>,
+) -> deadreckon_runtime::RunWorkExpiry {
+    if job_deadline == Some(authenticated_cutoff) {
+        deadreckon_runtime::RunWorkExpiry::Deadline
+    } else {
+        deadreckon_runtime::RunWorkExpiry::WallCap
+    }
+}
+
 /// A project done contract is controller input, not an implementation change.
 /// Permit only the exact bounded bundle that `def-done` wrote, without seeding
 /// it into the implementation worktree. The later Job freeze binds these bytes
@@ -728,6 +773,10 @@ pub(crate) async fn run_command_with_launch_plan(
         )));
     }
     let paths = DeadreckonPaths::discover();
+    let owner_job_id = requested_run_id.as_deref().map(str::to_string).or_else(|| {
+        commands::graph_job::delegated_plan_child_ownership().map(|ownership| ownership.job_id)
+    });
+    let work_boundary = guarded_run_work_boundary(&paths, owner_job_id.as_deref())?;
     let defaults = config_defaults(&paths)?;
     if let Some(model) = narrator_model.as_deref()
         && let Ok(registry) =
@@ -1133,6 +1182,7 @@ pub(crate) async fn run_command_with_launch_plan(
             provider_override.as_deref(),
             model.as_deref(),
             no_seams,
+            work_boundary,
         )
         .await?
     };
@@ -1192,6 +1242,7 @@ pub(crate) async fn run_command_with_launch_plan(
             from_turn: None,
             event_sender: narrate_event_sender,
             cancellation_token: None,
+            work_boundary,
             narrate: narrator_config,
             docs: RunLoopDocsConfig {
                 home: paths.home().to_path_buf(),
@@ -1548,6 +1599,23 @@ mod durable_direct_tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn guarded_work_cutoff_retains_deadline_vs_wall_cap() {
+        let cutoff = Utc::now() + ChronoDuration::minutes(5);
+        assert_eq!(
+            guarded_run_work_expiry(Some(cutoff), cutoff),
+            deadreckon_runtime::RunWorkExpiry::Deadline
+        );
+        assert_eq!(
+            guarded_run_work_expiry(Some(cutoff + ChronoDuration::minutes(5)), cutoff),
+            deadreckon_runtime::RunWorkExpiry::WallCap
+        );
+        assert_eq!(
+            guarded_run_work_expiry(None, cutoff),
+            deadreckon_runtime::RunWorkExpiry::WallCap
+        );
+    }
 
     fn git(repo: &Path, args: &[&str]) {
         let output = deadreckon_core::git::run_git(repo, args).expect("git command");

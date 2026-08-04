@@ -24,7 +24,7 @@ use deadreckon_sandbox::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -64,8 +64,8 @@ use deadreckon_core::state::{
 };
 
 use crate::seam::{
-    SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam, lost_containment_error,
-    read_seams_config, write_seams_audit,
+    SeamKind, SeamOutcome, SeamPhaseOutcome, SeamRunCtx, SeamsConfig, dispatch_seam_phase,
+    lost_containment_error, read_seams_config, write_seams_audit,
 };
 
 #[derive(Debug, Clone)]
@@ -79,11 +79,47 @@ pub struct RunLoopConfig {
     pub from_turn: Option<u32>,
     pub event_sender: Option<broadcast::Sender<RunEvent>>,
     pub cancellation_token: Option<CancellationToken>,
+    /// Authenticated outer work boundary for a guarded durable launch. When
+    /// absent, compatibility Runs derive their historical cumulative wall-cap
+    /// boundary from `max_wall_seconds`.
+    pub work_boundary: Option<RunWorkBoundary>,
     pub docs: RunLoopDocsConfig,
     /// Live-narration settings. `None` disables narration (every existing
     /// constructor leaves it `None`); the CLI sets `Some(..)` to spawn the
     /// in-process narrator sidecar that subscribes to `event_sender`.
     pub narrate: Option<NarratorConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunWorkExpiry {
+    WallCap,
+    Deadline,
+}
+
+impl RunWorkExpiry {
+    fn reached_label(self) -> &'static str {
+        match self {
+            Self::WallCap => "wall-clock cap reached",
+            Self::Deadline => "calendar deadline reached",
+        }
+    }
+}
+
+/// One monotonic cutoff authenticated by the guarded caller before work
+/// begins. Every nested phase reuses this exact instant.
+#[derive(Debug, Clone, Copy)]
+pub struct RunWorkBoundary {
+    pub work_expires_at: tokio::time::Instant,
+    pub expiry: RunWorkExpiry,
+}
+
+impl RunWorkBoundary {
+    pub const fn new(work_expires_at: tokio::time::Instant, expiry: RunWorkExpiry) -> Self {
+        Self {
+            work_expires_at,
+            expiry,
+        }
+    }
 }
 
 /// Durable outer launch that owns one strict deterministic-gate evaluation.
@@ -181,18 +217,37 @@ pub struct RunLoopDocsConfig {
 struct RunWorkClock {
     baseline_seconds: f64,
     started: Instant,
+    work_boundary: Option<RunWorkBoundary>,
+    boundary_cap_seconds: Option<f64>,
 }
 
 impl RunWorkClock {
+    #[cfg(test)]
     fn new(state: &PipelineState) -> Result<Self> {
+        Self::with_boundary(state, None)
+    }
+
+    fn with_boundary(
+        state: &PipelineState,
+        work_boundary: Option<RunWorkBoundary>,
+    ) -> Result<Self> {
         if !state.total_wall_seconds.is_finite() || state.total_wall_seconds < 0.0 {
             return Err(DeadreckonError::InvalidInput(
                 "run total_wall_seconds must be finite and non-negative".to_string(),
             ));
         }
+        let boundary_cap_seconds = work_boundary.map(|boundary| {
+            state.total_wall_seconds
+                + boundary
+                    .work_expires_at
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs_f64()
+        });
         Ok(Self {
             baseline_seconds: state.total_wall_seconds,
             started: Instant::now(),
+            work_boundary,
+            boundary_cap_seconds,
         })
     }
 
@@ -224,12 +279,26 @@ impl RunWorkClock {
     }
 
     fn remaining_seconds(&self, cap_seconds: Option<f64>) -> Result<Option<f64>> {
+        if let Some(boundary) = self.work_boundary {
+            return Ok(Some(
+                boundary
+                    .work_expires_at
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs_f64(),
+            ));
+        }
         self.remaining(cap_seconds)
             .map(|remaining| remaining.map(|duration| duration.as_secs_f64()))
     }
 
+    fn wall_time_cap_seconds(&self, compatibility_cap: Option<f64>) -> Option<f64> {
+        self.boundary_cap_seconds.or(compatibility_cap)
+    }
+
     fn provider_phase_deadline(&self, cap_seconds: Option<f64>) -> Result<ProviderPhaseDeadline> {
-        let work_expires_at = if let Some(cap_seconds) = cap_seconds {
+        let work_expires_at = if let Some(boundary) = self.work_boundary {
+            boundary.work_expires_at
+        } else if let Some(cap_seconds) = cap_seconds {
             if !cap_seconds.is_finite() || cap_seconds < 0.0 {
                 return Err(DeadreckonError::InvalidInput(
                     "run max_wall_seconds must be finite and non-negative".to_string(),
@@ -253,6 +322,11 @@ impl RunWorkClock {
             work_expires_at,
             PROVIDER_CLEANUP_BUDGET,
         ))
+    }
+
+    fn expiry(&self) -> RunWorkExpiry {
+        self.work_boundary
+            .map_or(RunWorkExpiry::WallCap, |boundary| boundary.expiry)
     }
 }
 
@@ -398,7 +472,7 @@ async fn run_turn_loop_inner(
     completion_mode: CompletionMode,
 ) -> Result<RunLoopOutcome> {
     let mut config = config;
-    let work_clock = RunWorkClock::new(state)?;
+    let work_clock = RunWorkClock::with_boundary(state, config.work_boundary)?;
     let provider_phase_deadline = work_clock.provider_phase_deadline(config.max_wall_seconds)?;
     // AS-BUILT §9: the harness, not the model, owns the bounded mutation loop
     // and writes state after every turn boundary.
@@ -425,20 +499,26 @@ async fn run_turn_loop_inner(
         working_dir: state.working_dir.clone(),
         sandbox_backend: config.sandbox_backend,
     };
-    let _event_sink_forwarder = if seams.command_for(SeamKind::EventSink).is_some() {
+    let run_token = config.cancellation_token.clone().unwrap_or_default();
+    let event_sink_forwarder = if seams.command_for(SeamKind::EventSink).is_some() {
         if config.event_sender.is_none() {
             let (sender, _) = broadcast::channel(256);
             config.event_sender = Some(sender);
         }
-        config
-            .event_sender
-            .as_ref()
-            .map(|sender| spawn_event_sink_forwarder(seams.clone(), seam_ctx.clone(), sender))
+        config.event_sender.as_ref().map(|sender| {
+            spawn_event_sink_forwarder(
+                seams.clone(),
+                seam_ctx.clone(),
+                sender,
+                provider_phase_deadline,
+                &run_token,
+            )
+        })
     } else {
         None
     };
-    let run_token = config.cancellation_token.clone().unwrap_or_default();
     let _cancel_marker_guard = CancelMarkerGuard::spawn(&state.run_root, run_token.clone());
+    let run_result = async {
     if should_cancel_run(state, &run_token) {
         state.status = deadreckon_core::state::RunStatus::Killed;
         state.failure_reason = Some("run cancelled before turn loop".to_string());
@@ -645,7 +725,8 @@ async fn run_turn_loop_inner(
                             .is_some_and(is_cli_provider_name),
                         estimated: false,
                         wall_time_seconds: Some(elapsed),
-                        wall_time_cap_seconds: config.max_wall_seconds,
+                        wall_time_cap_seconds: work_clock
+                            .wall_time_cap_seconds(config.max_wall_seconds),
                         kind: "loop".to_string(),
                     },
                 )?;
@@ -811,7 +892,7 @@ async fn run_turn_loop_inner(
                 subscription: response.spend.subscription,
                 estimated: false,
                 wall_time_seconds: response.spend.wall_time_seconds,
-                wall_time_cap_seconds: config.max_wall_seconds,
+                wall_time_cap_seconds: work_clock.wall_time_cap_seconds(config.max_wall_seconds),
                 kind: "loop".to_string(),
             },
         )?;
@@ -854,9 +935,10 @@ async fn run_turn_loop_inner(
             )?;
             return Ok(RunLoopOutcome::PausedAtCap);
         }
-        if config
-            .max_wall_seconds
-            .is_some_and(|cap| state.total_wall_seconds >= cap)
+        if config.work_boundary.is_none()
+            && config
+                .max_wall_seconds
+                .is_some_and(|cap| state.total_wall_seconds >= cap)
         {
             state.pause_reason = Some("wall-clock cap reached".to_string());
             work_clock.save(state)?;
@@ -870,7 +952,7 @@ async fn run_turn_loop_inner(
 
         if is_cli_subagent(&response) {
             let tool_call_id = format!("cli-subagent-turn-{turn}");
-            emit_tool_event_with_hook(
+            let hook_outcome = emit_tool_event_with_hook(
                 state,
                 config.event_sender.as_ref(),
                 &seams,
@@ -881,8 +963,21 @@ async fn run_turn_loop_inner(
                     tool_name: "cli_subagent".to_string(),
                     args: response.trace.clone(),
                 },
+                provider_phase_deadline,
+                &run_token,
             )
             .await?;
+            if let ControlFlow::Break(outcome) = settle_seam_phase(
+                state,
+                turn,
+                "CLI provider start hook",
+                PhaseId(40),
+                config.event_sender.as_ref(),
+                &work_clock,
+                hook_outcome,
+            )? {
+                return Ok(outcome);
+            }
             let changed_result = changed_files_since_snapshot(state, turn.saturating_sub(1));
             let raw_changed = persist_work_boundary(state, &work_clock, changed_result)?;
             let deliverable_result = deliverable_changed_files(state, &raw_changed);
@@ -984,7 +1079,7 @@ async fn run_turn_loop_inner(
                 },
             );
             persist_work_boundary(state, &work_clock, docs_result)?;
-            emit_tool_event_with_hook(
+            let hook_outcome = emit_tool_event_with_hook(
                 state,
                 config.event_sender.as_ref(),
                 &seams,
@@ -995,8 +1090,21 @@ async fn run_turn_loop_inner(
                     status: "ok".to_string(),
                     preview: event_preview(&response.content),
                 },
+                provider_phase_deadline,
+                &run_token,
             )
             .await?;
+            if let ControlFlow::Break(outcome) = settle_seam_phase(
+                state,
+                turn,
+                "CLI provider result hook",
+                PhaseId(40),
+                config.event_sender.as_ref(),
+                &work_clock,
+                hook_outcome,
+            )? {
+                return Ok(outcome);
+            }
             if !implementation_notes_ready_or_request_followup(
                 state,
                 config.event_sender.as_ref(),
@@ -1134,6 +1242,7 @@ async fn run_turn_loop_inner(
                 &mut history,
                 &run_token,
                 &work_clock,
+                provider_phase_deadline,
             )
             .await;
             match verification_result(state, &work_clock, semantic_result)? {
@@ -1237,7 +1346,7 @@ async fn run_turn_loop_inner(
                 command,
             } => {
                 let tool_token = turn_token.child_token();
-                emit_tool_event_with_hook(
+                let hook_outcome = emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
                     &seams,
@@ -1248,8 +1357,21 @@ async fn run_turn_loop_inner(
                         tool_name: "bash".to_string(),
                         args: tool_args_json(&command),
                     },
+                    provider_phase_deadline,
+                    &run_token,
                 )
                 .await?;
+                if let ControlFlow::Break(outcome) = settle_seam_phase(
+                    state,
+                    turn,
+                    "bash tool start hook",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    hook_outcome,
+                )? {
+                    return Ok(outcome);
+                }
                 let started = Instant::now();
                 let policy = load_tool_policy_from_sandbox_toml(state, "bash")?;
                 if let Some(reason) = bash_policy_refusal(state, &command, &policy) {
@@ -1268,16 +1390,30 @@ async fn run_turn_loop_inner(
                     work_clock.save(state)?;
                     continue;
                 }
-                if let Some(reason) = policy_seam_refusal(
+                let policy_outcome = policy_seam_refusal(
                     &seams,
                     &seam_ctx,
                     &state.run_id,
                     "bash",
                     &command,
                     &state.working_dir,
+                    provider_phase_deadline,
+                    &run_token,
                 )
-                .await?
-                {
+                .await?;
+                let refusal = match settle_seam_phase(
+                    state,
+                    turn,
+                    "bash policy seam",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    policy_outcome,
+                )? {
+                    ControlFlow::Continue(refusal) => refusal,
+                    ControlFlow::Break(outcome) => return Ok(outcome),
+                };
+                if let Some(reason) = refusal {
                     append_tool_refusal(
                         state,
                         turn,
@@ -1465,7 +1601,7 @@ async fn run_turn_loop_inner(
                     },
                 );
                 persist_work_boundary(state, &work_clock, docs_result)?;
-                emit_tool_event_with_hook(
+                let hook_outcome = emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
                     &seams,
@@ -1476,8 +1612,21 @@ async fn run_turn_loop_inner(
                         status: format!("{:?}", output.status_code),
                         preview: event_preview(format!("{}{}", output.stdout, output.stderr)),
                     },
+                    provider_phase_deadline,
+                    &run_token,
                 )
                 .await?;
+                if let ControlFlow::Break(outcome) = settle_seam_phase(
+                    state,
+                    turn,
+                    "bash tool result hook",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    hook_outcome,
+                )? {
+                    return Ok(outcome);
+                }
                 history.push(format!(
                     "tool {tool_call_id} result: status={:?}",
                     output.status_code
@@ -1488,7 +1637,7 @@ async fn run_turn_loop_inner(
                 path,
                 content,
             } => {
-                emit_tool_event_with_hook(
+                let hook_outcome = emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
                     &seams,
@@ -1499,8 +1648,21 @@ async fn run_turn_loop_inner(
                         tool_name: "write_file".to_string(),
                         args: tool_args_json(path.display().to_string()),
                     },
+                    provider_phase_deadline,
+                    &run_token,
                 )
                 .await?;
+                if let ControlFlow::Break(outcome) = settle_seam_phase(
+                    state,
+                    turn,
+                    "write-file start hook",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    hook_outcome,
+                )? {
+                    return Ok(outcome);
+                }
                 let write_policy = load_tool_policy_from_sandbox_toml(state, "write_file")?;
                 let target =
                     match safe_working_path_with_policy(&state.working_dir, &path, &write_policy) {
@@ -1524,16 +1686,30 @@ async fn run_turn_loop_inner(
                         }
                     };
                 let target_label = target.display().to_string();
-                if let Some(reason) = policy_seam_refusal(
+                let policy_outcome = policy_seam_refusal(
                     &seams,
                     &seam_ctx,
                     &state.run_id,
                     "write_file",
                     &target_label,
                     &state.working_dir,
+                    provider_phase_deadline,
+                    &run_token,
                 )
-                .await?
-                {
+                .await?;
+                let refusal = match settle_seam_phase(
+                    state,
+                    turn,
+                    "write-file policy seam",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    policy_outcome,
+                )? {
+                    ControlFlow::Continue(refusal) => refusal,
+                    ControlFlow::Break(outcome) => return Ok(outcome),
+                };
+                if let Some(reason) = refusal {
                     append_tool_refusal(
                         state,
                         turn,
@@ -1626,7 +1802,7 @@ async fn run_turn_loop_inner(
                     },
                 );
                 persist_work_boundary(state, &work_clock, docs_result)?;
-                emit_tool_event_with_hook(
+                let hook_outcome = emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
                     &seams,
@@ -1637,8 +1813,21 @@ async fn run_turn_loop_inner(
                         status: "ok".to_string(),
                         preview: "wrote file".to_string(),
                     },
+                    provider_phase_deadline,
+                    &run_token,
                 )
                 .await?;
+                if let ControlFlow::Break(outcome) = settle_seam_phase(
+                    state,
+                    turn,
+                    "write-file result hook",
+                    PhaseId(40),
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                    hook_outcome,
+                )? {
+                    return Ok(outcome);
+                }
                 history.push(format!("tool {tool_call_id} result: wrote file"));
             }
             Action::Reshape {
@@ -1824,6 +2013,7 @@ async fn run_turn_loop_inner(
                     &mut history,
                     &run_token,
                     &work_clock,
+                    provider_phase_deadline,
                 )
                 .await;
                 match verification_result(state, &work_clock, semantic_result)? {
@@ -1933,6 +2123,14 @@ async fn run_turn_loop_inner(
     work_clock.save(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
+    }
+    .await;
+    if let Some(forwarder) = event_sink_forwarder {
+        forwarder
+            .shutdown(provider_phase_deadline.cleanup_budget)
+            .await;
+    }
+    run_result
 }
 
 const ACCEPTANCE_FAILURE_PREFIX: &str = "acceptance failed after turn ";
@@ -2064,7 +2262,7 @@ fn finish_work_expired_if_reached(
     if tokio::time::Instant::now() < work_expires_at {
         return Ok(false);
     }
-    let reason = format!("wall-clock cap reached during {phase}");
+    let reason = format!("{} during {phase}", work_clock.expiry().reached_label());
     state.pause_reason = Some(reason.clone());
     state.failure_reason = Some(reason);
     work_clock.save(state)?;
@@ -2093,6 +2291,7 @@ const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 const PROVIDER_UNBOUNDED_WORK_WINDOW: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 const RUNTIME_PHASE_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+const EVENT_SINK_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 async fn wait_for_provider_retry(
     work_expires_at: tokio::time::Instant,
@@ -2255,7 +2454,8 @@ fn record_runtime_phase_interruption(
             let outcome = match interruption {
                 RuntimePhaseInterruption::WorkExpired => {
                     state.pause_reason = Some(format!(
-                        "wall-clock cap reached during {phase}; subprocess cleanup was proven"
+                        "{} during {phase}; subprocess cleanup was proven",
+                        work_clock.expiry().reached_label()
                     ));
                     RunLoopOutcome::PausedAtCap
                 }
@@ -2379,6 +2579,44 @@ fn settle_trusted_git_phase<T>(
     Ok(ControlFlow::Break(terminal))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn settle_seam_phase<T>(
+    state: &mut PipelineState,
+    turn: u32,
+    phase: &str,
+    phase_id: PhaseId,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    work_clock: &RunWorkClock,
+    outcome: SeamPhaseOutcome<T>,
+) -> Result<ControlFlow<RunLoopOutcome, T>> {
+    let terminal = match outcome {
+        SeamPhaseOutcome::Completed(value) => {
+            work_clock.save(state)?;
+            return Ok(ControlFlow::Continue(value));
+        }
+        SeamPhaseOutcome::WorkExpired { cleanup } => record_runtime_phase_interruption(
+            state,
+            turn,
+            phase,
+            phase_id,
+            RuntimePhaseInterruption::WorkExpired,
+            &cleanup,
+            work_clock,
+        )?,
+        SeamPhaseOutcome::Cancelled { cleanup } => record_runtime_phase_interruption(
+            state,
+            turn,
+            phase,
+            phase_id,
+            RuntimePhaseInterruption::Cancelled,
+            &cleanup,
+            work_clock,
+        )?,
+    };
+    emit_run_completed(state, sender, terminal.clone())?;
+    Ok(ControlFlow::Break(terminal))
+}
+
 fn record_provider_interruption(
     state: &mut PipelineState,
     turn: u32,
@@ -2387,14 +2625,15 @@ fn record_provider_interruption(
     work_clock: &RunWorkClock,
 ) -> Result<RunLoopOutcome> {
     let boundary = match interruption {
-        ProviderInterruption::WorkExpired => "work deadline expired",
+        ProviderInterruption::WorkExpired => work_clock.expiry().reached_label(),
         ProviderInterruption::Cancelled => "controller cancellation",
     };
     match cleanup {
         ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
             let outcome = match interruption {
                 ProviderInterruption::WorkExpired => {
-                    state.pause_reason = Some("wall-clock cap reached mid-turn".to_string());
+                    state.pause_reason =
+                        Some(format!("{} mid-turn", work_clock.expiry().reached_label()));
                     RunLoopOutcome::PausedAtCap
                 }
                 ProviderInterruption::Cancelled => {
@@ -3082,8 +3321,10 @@ async fn policy_seam_refusal(
     function_id: &str,
     command: &str,
     working_dir: &Path,
-) -> Result<Option<String>> {
-    let refusal = match dispatch_seam(
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<SeamPhaseOutcome<Option<String>>> {
+    let outcome = dispatch_seam_phase(
         SeamKind::Policy,
         &json!({
             "function_id": function_id,
@@ -3092,24 +3333,28 @@ async fn policy_seam_refusal(
         }),
         seams,
         ctx,
+        deadline,
+        cancellation,
     )
-    .await
-    {
-        SeamOutcome::Deny(reason) => {
-            Some(policy_seam_refusal_message(run_id, function_id, &reason))
-        }
-        SeamOutcome::Ok(_) | SeamOutcome::Unconfigured => None,
-        SeamOutcome::Fallback => None,
-        SeamOutcome::Skipped(reason) => Some(policy_seam_refusal_message(
-            run_id,
-            function_id,
-            &format!("unexpected skipped outcome: {reason}"),
-        )),
-        SeamOutcome::LostContainment(reason) => {
-            return Err(lost_containment_error(SeamKind::Policy, &reason));
-        }
-    };
-    Ok(refusal)
+    .await;
+    outcome
+        .map(|outcome| match outcome {
+            SeamOutcome::Deny(reason) => Ok(Some(policy_seam_refusal_message(
+                run_id,
+                function_id,
+                &reason,
+            ))),
+            SeamOutcome::Ok(_) | SeamOutcome::Unconfigured | SeamOutcome::Fallback => Ok(None),
+            SeamOutcome::Skipped(reason) => Ok(Some(policy_seam_refusal_message(
+                run_id,
+                function_id,
+                &format!("unexpected skipped outcome: {reason}"),
+            ))),
+            SeamOutcome::LostContainment(reason) => {
+                Err(lost_containment_error(SeamKind::Policy, &reason))
+            }
+        })
+        .transpose()
 }
 
 fn policy_seam_refusal_message(run_id: &str, function_id: &str, reason: &str) -> String {
@@ -3124,45 +3369,134 @@ async fn emit_tool_event_with_hook(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
     event: RunEventKind,
-) -> Result<()> {
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<SeamPhaseOutcome<()>> {
     emit_event(state, sender, event.clone())?;
-    dispatch_hook_event(seams, ctx, &event).await
+    dispatch_hook_event(seams, ctx, &event, deadline, cancellation).await
 }
 
 async fn dispatch_hook_event(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
     event: &RunEventKind,
-) -> Result<()> {
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> Result<SeamPhaseOutcome<()>> {
     let Ok(req) = serde_json::to_value(event) else {
-        return Ok(());
+        return Ok(SeamPhaseOutcome::Completed(()));
     };
-    let outcome = dispatch_seam(SeamKind::Hooks, &req, seams, ctx).await;
-    if let SeamOutcome::LostContainment(reason) = outcome {
-        return Err(lost_containment_error(SeamKind::Hooks, &reason));
-    }
-    Ok(())
+    dispatch_seam_phase(SeamKind::Hooks, &req, seams, ctx, deadline, cancellation)
+        .await
+        .map(|outcome| match outcome {
+            SeamOutcome::LostContainment(reason) => {
+                Err(lost_containment_error(SeamKind::Hooks, &reason))
+            }
+            _ => Ok(()),
+        })
+        .transpose()
 }
 
 fn event_sink_must_stop(outcome: &SeamOutcome) -> bool {
     matches!(outcome, SeamOutcome::LostContainment(_))
 }
 
+struct EventSinkForwarder {
+    force_shutdown: CancellationToken,
+    graceful_shutdown: Option<oneshot::Sender<()>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl EventSinkForwarder {
+    async fn shutdown(mut self, cleanup_budget: Duration) {
+        if let Some(shutdown) = self.graceful_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(EVENT_SINK_DRAIN_GRACE, &mut self.handle)
+            .await
+            .is_err()
+        {
+            self.force_shutdown.cancel();
+            if tokio::time::timeout(cleanup_budget, &mut self.handle)
+                .await
+                .is_err()
+            {
+                self.handle.abort();
+                let _ = tokio::time::timeout(Duration::from_millis(100), &mut self.handle).await;
+            }
+        }
+    }
+}
+
+impl Drop for EventSinkForwarder {
+    fn drop(&mut self) {
+        self.force_shutdown.cancel();
+        self.handle.abort();
+    }
+}
+
+async fn forward_event_to_sink(
+    event: RunEvent,
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    deadline: ProviderPhaseDeadline,
+    cancellation: &CancellationToken,
+) -> bool {
+    let Ok(req) = serde_json::to_value(event) else {
+        return false;
+    };
+    match dispatch_seam_phase(
+        SeamKind::EventSink,
+        &req,
+        seams,
+        ctx,
+        deadline,
+        cancellation,
+    )
+    .await
+    {
+        SeamPhaseOutcome::Completed(outcome) => event_sink_must_stop(&outcome),
+        SeamPhaseOutcome::WorkExpired { .. } | SeamPhaseOutcome::Cancelled { .. } => true,
+    }
+}
+
 fn spawn_event_sink_forwarder(
     seams: SeamsConfig,
     ctx: SeamRunCtx,
     sender: &broadcast::Sender<RunEvent>,
-) -> tokio::task::JoinHandle<()> {
+    deadline: ProviderPhaseDeadline,
+    run_cancellation: &CancellationToken,
+) -> EventSinkForwarder {
     let mut receiver = sender.subscribe();
-    tokio::spawn(async move {
+    let force_shutdown = run_cancellation.child_token();
+    let task_cancellation = force_shutdown.clone();
+    let (graceful_shutdown, mut graceful_receiver) = oneshot::channel();
+    let handle = tokio::spawn(async move {
         loop {
-            match receiver.recv().await {
+            let received = tokio::select! {
+                biased;
+                () = task_cancellation.cancelled() => break,
+                _ = &mut graceful_receiver => {
+                    while let Ok(event) = receiver.try_recv() {
+                        if forward_event_to_sink(
+                            event,
+                            &seams,
+                            &ctx,
+                            deadline,
+                            &task_cancellation,
+                        ).await {
+                            break;
+                        }
+                    }
+                    break;
+                },
+                received = receiver.recv() => received,
+            };
+            match received {
                 Ok(event) => {
-                    let Ok(req) = serde_json::to_value(event) else {
-                        continue;
-                    };
-                    let outcome = dispatch_seam(SeamKind::EventSink, &req, &seams, &ctx).await;
-                    if event_sink_must_stop(&outcome) {
+                    if forward_event_to_sink(event, &seams, &ctx, deadline, &task_cancellation)
+                        .await
+                    {
                         // The detached observer cannot safely dispatch another
                         // worker while authority from this one remains live.
                         // Its durable process record is left for supervisor or
@@ -3174,7 +3508,12 @@ fn spawn_event_sink_forwarder(
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    });
+    EventSinkForwarder {
+        force_shutdown,
+        graceful_shutdown: Some(graceful_shutdown),
+        handle,
+    }
 }
 
 fn changed_files_since_snapshot(state: &PipelineState, snapshot_turn: u32) -> Result<Vec<PathBuf>> {
@@ -3647,8 +3986,10 @@ fn settle_local_work_boundary(
     };
     let outcome = match kind {
         deadreckon_core::ProcessBoundaryKind::WorkExpired => {
-            let reason =
-                format!("wall-clock cap reached during {context} (approved Job work cutoff)");
+            let reason = format!(
+                "{} during {context} (approved Job work cutoff)",
+                work_clock.expiry().reached_label()
+            );
             state.pause_reason = Some(reason.clone());
             state.failure_reason = Some(reason);
             state.set_phase_status(phase, PhaseStatus::Failed)?;
@@ -4773,6 +5114,7 @@ async fn semantic_completion_disposition(
     history: &mut Vec<String>,
     cancellation_token: &CancellationToken,
     work_clock: &RunWorkClock,
+    phase_deadline: ProviderPhaseDeadline,
 ) -> Result<SemanticCompletionDisposition> {
     work_clock.sync(state);
     if should_cancel_run(state, cancellation_token) {
@@ -4800,6 +5142,11 @@ async fn semantic_completion_disposition(
         Some("spend cap reached before semantic judge")
     } else if state.total_wall_seconds >= job.policy.max_wall_seconds as f64 {
         Some("wall-clock cap reached before semantic judge")
+    } else if tokio::time::Instant::now() >= phase_deadline.work_expires_at {
+        Some(match work_clock.expiry() {
+            RunWorkExpiry::WallCap => "wall-clock cap reached before semantic judge",
+            RunWorkExpiry::Deadline => "calendar deadline reached before semantic judge",
+        })
     } else {
         None
     };
@@ -4810,16 +5157,20 @@ async fn semantic_completion_disposition(
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
 
-    let semantic_run = match crate::semantic_judge::run_semantic_judge_with_budget(
+    let semantic_run = match crate::semantic_judge::run_semantic_judge_against_source_with_deadline_and_cancellation(
         state,
         marker,
         router,
         config.sandbox_backend,
+        &state.cwd,
         crate::semantic_judge::SemanticJudgeBudget {
             remaining_spend_usd: Some(job.policy.max_spend_usd - state.total_spend_usd),
-            remaining_wall_seconds: work_clock
-                .remaining_seconds(Some(job.policy.max_wall_seconds as f64))?,
+            // The exact outer phase deadline below owns time. This relative
+            // field remains only for accounting compatibility and must not be
+            // used to construct a new work window.
+            remaining_wall_seconds: None,
         },
+        phase_deadline,
         Some(cancellation_token),
     )
     .await
@@ -4849,22 +5200,23 @@ async fn semantic_completion_disposition(
     }
     let overrun_reason = match semantic_run.budget_exhaustion {
         Some(crate::semantic_judge::SemanticBudgetExhaustion::Spend) => {
-            Some("semantic judge exhausted the approved spend cap")
+            Some("semantic judge exhausted the approved spend cap".to_string())
         }
-        Some(crate::semantic_judge::SemanticBudgetExhaustion::Wall) => {
-            Some("semantic judge exhausted the approved wall-time cap")
-        }
+        Some(crate::semantic_judge::SemanticBudgetExhaustion::Wall) => Some(format!(
+            "{} during semantic judge",
+            work_clock.expiry().reached_label()
+        )),
         None if state.total_spend_usd > job.policy.max_spend_usd => {
-            Some("semantic judge exceeded the approved spend cap")
+            Some("semantic judge exceeded the approved spend cap".to_string())
         }
         None if state.total_wall_seconds > job.policy.max_wall_seconds as f64 => {
-            Some("semantic judge exceeded the approved wall-time cap")
+            Some("semantic judge exceeded the approved wall-time cap".to_string())
         }
         None => None,
     };
     if let Some(reason) = overrun_reason {
-        state.pause_reason = Some(reason.to_string());
-        state.failure_reason = Some(reason.to_string());
+        state.pause_reason = Some(reason.clone());
+        state.failure_reason = Some(reason);
         work_clock.save(state)?;
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
@@ -4883,8 +5235,6 @@ async fn semantic_completion_disposition(
     }
     match semantic_run.result {
         crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
-            let phase_deadline =
-                work_clock.provider_phase_deadline(Some(job.policy.max_wall_seconds as f64))?;
             seal_achieved_semantic_completion(
                 state,
                 &paths,
@@ -4945,6 +5295,18 @@ fn seal_achieved_semantic_completion(
     phase_deadline: ProviderPhaseDeadline,
     cancellation_token: &CancellationToken,
 ) -> Result<SemanticCompletionDisposition> {
+    if cancellation_token.is_cancelled() {
+        return Ok(SemanticCompletionDisposition::Cancelled);
+    }
+    if tokio::time::Instant::now() >= phase_deadline.work_expires_at {
+        state.pause_reason = Some(format!(
+            "{} before completion receipt sealing",
+            work_clock.expiry().reached_label()
+        ));
+        state.failure_reason = state.pause_reason.clone();
+        work_clock.save(state)?;
+        return Ok(SemanticCompletionDisposition::BudgetExhausted);
+    }
     let seal_result = (|| -> Result<()> {
         crate::semantic_judge::validate_semantic_judgment_input(state, marker, judgment)?;
         let authority_path = paths.job_authority(&state.run_id);
@@ -4976,9 +5338,10 @@ fn seal_achieved_semantic_completion(
             ..
         } = &error
         {
-            state.pause_reason = Some(
-                "approved Job work cutoff reached while sealing the completion receipt".to_string(),
-            );
+            state.pause_reason = Some(format!(
+                "{} while sealing the completion receipt",
+                work_clock.expiry().reached_label()
+            ));
             state.failure_reason = state.pause_reason.clone();
             work_clock.save(state)?;
             return Ok(SemanticCompletionDisposition::BudgetExhausted);
@@ -5046,7 +5409,7 @@ fn record_semantic_judge_accounting(
             subscription: accounting.subscription,
             estimated: false,
             wall_time_seconds: Some(accounting.wall_time_seconds),
-            wall_time_cap_seconds: config.max_wall_seconds,
+            wall_time_cap_seconds: work_clock.wall_time_cap_seconds(config.max_wall_seconds),
             kind: "semantic_judge".to_string(),
         },
     )?;
@@ -7101,7 +7464,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use crate::seam::{SeamOutcome, SeamRunCtx, read_seams_config};
+    use crate::seam::{
+        SeamCommandConfig, SeamKind, SeamOutcome, SeamPhaseOutcome, SeamRunCtx, SeamsConfig,
+        read_seams_config,
+    };
 
     use deadreckon_core::events::RunEventBus;
     use deadreckon_core::flight::{
@@ -7122,11 +7488,11 @@ mod tests {
 
     use super::{
         GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
-        ProviderInterruption, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunWorkClock,
-        SandboxedPhaseOutcome, SemanticCompletionDisposition, TrustedGitPhaseOutcome,
-        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
-        begin_verification, build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
-        capture_trusted_turn_head_bounded, changed_files_since_snapshot,
+        ProviderInterruption, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunWorkBoundary,
+        RunWorkClock, RunWorkExpiry, SandboxedPhaseOutcome, SemanticCompletionDisposition,
+        TrustedGitPhaseOutcome, append_provider_approval_traces, append_tool_refusal,
+        bash_policy_refusal, begin_verification, build_cli_subagent_prompt, build_prompt,
+        capture_trusted_turn_head, capture_trusted_turn_head_bounded, changed_files_since_snapshot,
         classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
         complete_verification, deliverable_changed_files, ensure_sandbox_toml,
         event_sink_must_stop, fail_verification, implementation_notes_ready_or_request_followup,
@@ -7139,7 +7505,8 @@ mod tests {
         revise_verification, run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop,
         safe_working_path, safe_working_path_with_policy, save_history,
         seal_achieved_semantic_completion, semantic_completion_disposition,
-        snapshot_working_bounded, wait_for_provider_retry, write_workspace_file_no_follow,
+        snapshot_working_bounded, spawn_event_sink_forwarder, wait_for_provider_retry,
+        write_workspace_file_no_follow,
     };
 
     fn load_history_with_work_clock(
@@ -7264,6 +7631,7 @@ mod tests {
             from_turn: None,
             event_sender: None,
             cancellation_token: None,
+            work_boundary: None,
             docs: RunLoopDocsConfig {
                 home: PathBuf::from("/tmp"),
                 config_path: None,
@@ -7721,11 +8089,50 @@ mod tests {
             spend_usd: 0.0,
         };
         let mut history = Vec::new();
+        let authenticated_cutoff = tokio::time::Instant::now();
+        let deadline_clock = RunWorkClock::with_boundary(
+            &state,
+            Some(RunWorkBoundary::new(
+                authenticated_cutoff,
+                RunWorkExpiry::Deadline,
+            )),
+        )
+        .expect("deadline clock");
+        let first_deadline = deadline_clock
+            .provider_phase_deadline(Some(60.0))
+            .expect("semantic deadline");
+        let seal_deadline = deadline_clock
+            .provider_phase_deadline(Some(60.0))
+            .expect("seal deadline");
+        assert_eq!(first_deadline.work_expires_at, authenticated_cutoff);
+        assert_eq!(seal_deadline.work_expires_at, authenticated_cutoff);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let expired = seal_achieved_semantic_completion(
+            &mut state,
+            &paths,
+            1,
+            &marker,
+            &judgment,
+            &mut history,
+            &deadline_clock,
+            seal_deadline,
+            &cancellation,
+        )
+        .expect("expired seal disposition");
+        assert_eq!(expired, SemanticCompletionDisposition::BudgetExhausted);
+        assert_eq!(
+            state.pause_reason.as_deref(),
+            Some("calendar deadline reached before completion receipt sealing")
+        );
+        assert!(!paths.job_receipt(&state.run_id).exists());
+        state.pause_reason = None;
+        state.failure_reason = None;
+        history.clear();
+
         let work_clock = RunWorkClock::new(&state).expect("work clock");
         let phase_deadline = work_clock
             .provider_phase_deadline(Some(60.0))
             .expect("phase deadline");
-        let cancellation = tokio_util::sync::CancellationToken::new();
         let disposition = seal_achieved_semantic_completion(
             &mut state,
             &paths,
@@ -7833,6 +8240,9 @@ mod tests {
             checks: Vec::new(),
         };
         let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let phase_deadline = work_clock
+            .provider_phase_deadline(Some(60.0))
+            .expect("phase deadline");
 
         let disposition = semantic_completion_disposition(
             &mut state,
@@ -7843,6 +8253,7 @@ mod tests {
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
             &work_clock,
+            phase_deadline,
         )
         .await
         .expect("semantic disposition");
@@ -7888,6 +8299,9 @@ mod tests {
             checks: Vec::new(),
         };
         let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let phase_deadline = work_clock
+            .provider_phase_deadline(Some(60.0))
+            .expect("phase deadline");
 
         let disposition = semantic_completion_disposition(
             &mut state,
@@ -7898,6 +8312,7 @@ mod tests {
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
             &work_clock,
+            phase_deadline,
         )
         .await
         .expect("semantic disposition");
@@ -7912,6 +8327,67 @@ mod tests {
                 .run_root
                 .join(deadreckon_core::SEMANTIC_JUDGMENT_JSON)
                 .exists()
+        );
+        let traces =
+            std::fs::read_to_string(state.run_root.join("traces.jsonl")).unwrap_or_default();
+        assert!(!traces.contains("semantic_judge."), "{traces}");
+    }
+
+    #[tokio::test]
+    async fn semantic_judge_retains_the_authenticated_calendar_deadline() {
+        use chrono::Utc;
+        use deadreckon_core::{AcceptanceMarker, AcceptanceProofKind};
+
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "deadline-bound semantic result");
+        write_required_semantic_job(&paths, &state, 10.0, 600);
+        let marker = AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "passed".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 0,
+            checks: Vec::new(),
+        };
+        let authenticated_cutoff = tokio::time::Instant::now();
+        let work_clock = RunWorkClock::with_boundary(
+            &state,
+            Some(RunWorkBoundary::new(
+                authenticated_cutoff,
+                RunWorkExpiry::Deadline,
+            )),
+        )
+        .expect("deadline clock");
+        let phase_deadline = work_clock
+            .provider_phase_deadline(Some(600.0))
+            .expect("phase deadline");
+
+        let disposition = semantic_completion_disposition(
+            &mut state,
+            &ProviderRouter::smoke(),
+            &base_run_loop_config(),
+            1,
+            &marker,
+            &mut Vec::new(),
+            &tokio_util::sync::CancellationToken::new(),
+            &work_clock,
+            phase_deadline,
+        )
+        .await
+        .expect("semantic disposition");
+
+        assert_eq!(phase_deadline.work_expires_at, authenticated_cutoff);
+        assert_eq!(disposition, SemanticCompletionDisposition::BudgetExhausted);
+        assert_eq!(
+            state.pause_reason.as_deref(),
+            Some("calendar deadline reached before semantic judge")
         );
         let traces =
             std::fs::read_to_string(state.run_root.join("traces.jsonl")).unwrap_or_default();
@@ -7950,6 +8426,7 @@ mod tests {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -7988,6 +8465,7 @@ mod tests {
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -8191,10 +8669,12 @@ timeout_ms = 1000
             "write_file",
             "../outside.txt",
             &state.working_dir,
+            ProviderPhaseDeadline::from_now(Duration::from_secs(1), Duration::from_millis(100)),
+            &CancellationToken::new(),
         )
         .await
         .expect("policy seam dispatch");
-        assert!(seam_refusal.is_none());
+        assert!(matches!(seam_refusal, SeamPhaseOutcome::Completed(None)));
 
         ensure_sandbox_toml(&state).expect("sandbox.toml");
         let policy =
@@ -8229,6 +8709,74 @@ timeout_ms = 1000
         assert!(!event_sink_must_stop(&SeamOutcome::Skipped(
             "ordinary observer failure".to_string()
         )));
+    }
+
+    #[tokio::test]
+    async fn event_sink_shutdown_cancels_active_dispatch_and_joins_boundedly() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().join("run");
+        let working_dir = temp.path().join("work");
+        std::fs::create_dir_all(run_root.join("gate")).expect("gate");
+        std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
+        std::fs::create_dir_all(&working_dir).expect("work");
+        let started_marker = working_dir.join("sink-started");
+        let seams = SeamsConfig::with_command(
+            SeamKind::EventSink,
+            SeamCommandConfig {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "cat >/dev/null; touch {}; sleep 60",
+                        sh_quote(&started_marker)
+                    ),
+                ],
+                timeout_ms: 30_000,
+            },
+        )
+        .expect("event sink seam");
+        let ctx = SeamRunCtx {
+            run_root: run_root.clone(),
+            working_dir,
+            sandbox_backend: SandboxBackend::None,
+        };
+        let (sender, _) = tokio::sync::broadcast::channel(8);
+        let cancellation = CancellationToken::new();
+        let forwarder = spawn_event_sink_forwarder(
+            seams,
+            ctx,
+            &sender,
+            ProviderPhaseDeadline::from_now(Duration::from_secs(30), Duration::from_secs(2)),
+            &cancellation,
+        );
+        sender
+            .send(deadreckon_protocol::RunEvent {
+                timestamp: chrono::Utc::now(),
+                run_id: "event-sink-test".to_string(),
+                event: RunEventKind::TurnStarted { turn: 1 },
+            })
+            .expect("event sent");
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !started_marker.exists() && tokio::time::Instant::now() < wait_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started_marker.exists(), "event sink did not start");
+
+        let shutdown_started = std::time::Instant::now();
+        forwarder.shutdown(Duration::from_secs(2)).await;
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(3),
+            "event-sink join exceeded its cleanup budget: {:?}",
+            shutdown_started.elapsed()
+        );
+        let remaining = std::fs::read_dir(run_root.join("child-pids"))
+            .expect("child-pids")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("authority entries");
+        assert!(
+            remaining.is_empty(),
+            "event sink retained process authority after joined shutdown: {remaining:?}"
+        );
     }
 
     #[tokio::test]
@@ -8500,6 +9048,7 @@ fallback_context_window = 80
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -8866,6 +9415,7 @@ fallback_context_window = 80
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: Some(cancel_for_loop),
+                    work_boundary: None,
                     narrate: None,
                     docs: RunLoopDocsConfig {
                         home: paths.home().to_path_buf(),
@@ -8935,6 +9485,7 @@ fallback_context_window = 80
                     from_turn: None,
                     event_sender: Some(bus.sender()),
                     cancellation_token: None,
+                    work_boundary: None,
                     narrate: None,
                     docs: RunLoopDocsConfig {
                         home: paths.home().to_path_buf(),
@@ -8993,6 +9544,7 @@ fallback_context_window = 80
                 from_turn: None,
                 event_sender: Some(bus.sender()),
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -9097,6 +9649,7 @@ storage = "jsonl"
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -10603,6 +11156,37 @@ network = []
         assert_eq!(retry.cleanup_budget, Duration::from_secs(30));
     }
 
+    #[test]
+    fn authenticated_resume_ignores_relative_cap_against_durable_baseline() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "authenticated resume clock");
+        state.total_wall_seconds = 120.0;
+        let cutoff = tokio::time::Instant::now() + Duration::from_secs(30);
+        let work_clock = RunWorkClock::with_boundary(
+            &state,
+            Some(RunWorkBoundary::new(cutoff, RunWorkExpiry::Deadline)),
+        )
+        .expect("work clock");
+
+        let remaining = work_clock
+            .remaining_seconds(Some(30.0))
+            .expect("remaining")
+            .expect("bounded");
+        let cap = work_clock
+            .wall_time_cap_seconds(Some(30.0))
+            .expect("accounting cap");
+
+        assert!(remaining > 29.0, "relative cap was reapplied: {remaining}");
+        assert!(cap > 149.0, "durable baseline was discarded: {cap}");
+        assert_eq!(
+            work_clock
+                .provider_phase_deadline(Some(30.0))
+                .expect("phase deadline")
+                .work_expires_at,
+            cutoff
+        );
+    }
+
     #[tokio::test]
     async fn provider_retry_backoff_never_runs_past_the_absolute_work_deadline() {
         let token = tokio_util::sync::CancellationToken::new();
@@ -10821,6 +11405,7 @@ network = []
                 from_turn: None,
                 event_sender: None,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: None,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),

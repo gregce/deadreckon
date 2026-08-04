@@ -2163,15 +2163,13 @@ fn plan_task_budget_shares(
         .map(Some)
         .collect()
     });
-    let wall = max_wall_seconds.map(|cap| {
-        deadreckon_core::campaign::allocate_budget(
-            (cap - accounting.wall_seconds).max(0.0),
-            plan.tasks.len(),
-        )
-        .into_iter()
-        .map(Some)
-        .collect()
-    });
+    // Wall time is elapsed time under the owning Job, not a fungible amount
+    // to divide between graph nodes. Every child inherits the same remaining
+    // cumulative window and the supervisor remains the sole authority that
+    // closes it. Splitting this value made a four-node plan fail each healthy
+    // child at one quarter of the operator-approved duration.
+    let wall = max_wall_seconds
+        .map(|cap| vec![Some((cap - accounting.wall_seconds).max(0.0)); plan.tasks.len()]);
     Ok(PlanTaskBudgetDecision::Shares(PlanTaskBudgetShares {
         spend: spend.unwrap_or_else(|| vec![None; plan.tasks.len()]),
         wall: wall.unwrap_or_else(|| vec![None; plan.tasks.len()]),
@@ -6034,7 +6032,7 @@ mod tests {
     }
 
     #[test]
-    fn job_owned_plan_subtracts_root_planning_and_splits_the_remaining_tree_budget() {
+    fn job_owned_plan_splits_spend_but_shares_one_remaining_wall_window() {
         let decision = plan_task_budget_shares(&budget_plan(), Some(5.0), Some(40.0), true)
             .expect("budget shares");
         let PlanTaskBudgetDecision::Shares(shares) = decision else {
@@ -6043,9 +6041,8 @@ mod tests {
         let spend = shares.spend.into_iter().flatten().collect::<Vec<_>>();
         let wall = shares.wall.into_iter().flatten().collect::<Vec<_>>();
         assert!((spend.iter().sum::<f64>() - 3.0).abs() < 0.000_001);
-        assert!((wall.iter().sum::<f64>() - 30.0).abs() < 0.000_001);
+        assert_eq!(wall, vec![30.0; 3]);
         assert!(spend.iter().all(|share| *share <= 1.0));
-        assert!(wall.iter().all(|share| *share <= 10.0));
     }
 
     #[test]

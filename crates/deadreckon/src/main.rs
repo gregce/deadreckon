@@ -96,13 +96,14 @@ use deadreckon_providers::registry::{
 };
 use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
-    ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
-    ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate, complete_provider_phase,
-    read_config,
+    ProviderCleanup, ProviderError, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome,
+    ProviderRequest, ProviderRouteInfo, ProviderRouter, ProviderUsage, SpendEstimate,
+    complete_provider_phase, read_config,
 };
 use deadreckon_runtime::{
-    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamKind, SeamRunCtx,
-    SeamsConfig, polish_run_docs, read_seams_config, resolve_catalog_override, run_turn_loop,
+    PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamKind, SeamPhaseOutcome,
+    SeamRunCtx, SeamsConfig, polish_run_docs, read_seams_config, resolve_catalog_override,
+    resolve_catalog_override_phase, run_turn_loop,
 };
 use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
@@ -237,6 +238,291 @@ enum CliError {
 }
 
 type Result<T> = std::result::Result<T, CliError>;
+
+const COMPATIBILITY_CHILD_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const COMPATIBILITY_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const COMPATIBILITY_CHILD_TERM_GRACE: Duration = Duration::from_millis(250);
+
+struct CompatibilityChildPipes {
+    stdout: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+impl CompatibilityChildPipes {
+    fn spawn(child: &mut std::process::Child) -> std::io::Result<Self> {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::other("compatibility child did not expose its stdout pipe")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::other("compatibility child did not expose its stderr pipe")
+        })?;
+        Ok(Self {
+            stdout: spawn_compatibility_child_reader(stdout),
+            stderr: spawn_compatibility_child_reader(stderr),
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stdout.is_finished() && self.stderr.is_finished()
+    }
+
+    fn join(self, operation: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let stdout = join_compatibility_child_reader(self.stdout, operation, "stdout")?;
+        let stderr = join_compatibility_child_reader(self.stderr, operation, "stderr")?;
+        Ok((stdout, stderr))
+    }
+}
+
+fn spawn_compatibility_child_reader<R>(
+    mut reader: R,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut capture =
+            deadreckon_core::HeadTailBuffer::new(COMPATIBILITY_CHILD_OUTPUT_LIMIT_BYTES);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            capture.push(&buffer[..read]);
+        }
+        Ok(capture.render(None).into_bytes())
+    })
+}
+
+fn join_compatibility_child_reader(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    operation: &str,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{operation} {stream} reader panicked"
+            )))
+        })?
+        .map_err(|source| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{operation} could not capture bounded {stream}: {source}"
+            )))
+        })
+}
+
+fn compatibility_child_boundary_error(
+    kind: deadreckon_core::ProcessBoundaryKind,
+    operation: &str,
+    authority: Option<PathBuf>,
+    detail: impl Into<String>,
+) -> CliError {
+    CliError::Core(DeadreckonError::ProcessBoundary {
+        kind,
+        operation: operation.to_string(),
+        authority,
+        detail: detail.into(),
+    })
+}
+
+/// Bound historical, explicitly untrusted subprocess routes retained only for
+/// characterization and migration. Durable Job-owned work uses the stricter
+/// supervisor-backed process boundaries in `commands::graph_job` instead.
+fn wait_bounded_compatibility_child(
+    mut child: std::process::Child,
+    terminator: Box<dyn deadreckon_core::ChildTerminator>,
+    work_budget: Duration,
+    cleanup_budget: Duration,
+    operation: &str,
+    authority: Option<&Path>,
+) -> Result<std::process::Output> {
+    let pipes = CompatibilityChildPipes::spawn(&mut child).map_err(|source| {
+        let cleanup = terminator.terminate(COMPATIBILITY_CHILD_TERM_GRACE);
+        let _ = child.kill();
+        let _ = child.wait();
+        compatibility_child_boundary_error(
+            deadreckon_core::ProcessBoundaryKind::CleanupIncomplete,
+            operation,
+            authority.map(Path::to_path_buf),
+            format!(
+                "could not establish concurrent output drainage: {source}; cleanup: {cleanup:?}"
+            ),
+        )
+    })?;
+    let work_expires_at = Instant::now()
+        .checked_add(work_budget)
+        .unwrap_or_else(Instant::now);
+    let mut status = None;
+    let mut work_expired = false;
+    let mut supervision_error = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(found)) => {
+                status = Some(found);
+                break;
+            }
+            Ok(None) if Instant::now() >= work_expires_at => {
+                work_expired = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(
+                COMPATIBILITY_CHILD_POLL_INTERVAL
+                    .min(work_expires_at.saturating_duration_since(Instant::now())),
+            ),
+            Err(source) => {
+                supervision_error = Some(format!("could not inspect child status: {source}"));
+                break;
+            }
+        }
+    }
+
+    // Even after the leader exits, terminate its owned process group so a
+    // descendant cannot retain the output pipes and make the compatibility
+    // wait unbounded.
+    let cleanup_expires_at = Instant::now()
+        .checked_add(cleanup_budget)
+        .unwrap_or_else(Instant::now);
+    let cleanup = terminator.terminate(
+        COMPATIBILITY_CHILD_TERM_GRACE
+            .min(cleanup_expires_at.saturating_duration_since(Instant::now())),
+    );
+    if matches!(cleanup, deadreckon_core::TerminationOutcome::Failed(_)) {
+        let _ = child.kill();
+    }
+    while status.is_none() && Instant::now() < cleanup_expires_at {
+        match child.try_wait() {
+            Ok(Some(found)) => status = Some(found),
+            Ok(None) => std::thread::sleep(
+                COMPATIBILITY_CHILD_POLL_INTERVAL
+                    .min(cleanup_expires_at.saturating_duration_since(Instant::now())),
+            ),
+            Err(source) => {
+                supervision_error
+                    .get_or_insert_with(|| format!("could not reap compatibility child: {source}"));
+                break;
+            }
+        }
+    }
+    while !pipes.is_finished() && Instant::now() < cleanup_expires_at {
+        std::thread::sleep(
+            COMPATIBILITY_CHILD_POLL_INTERVAL
+                .min(cleanup_expires_at.saturating_duration_since(Instant::now())),
+        );
+    }
+    let cleanup_proven = status.is_some()
+        && pipes.is_finished()
+        && !matches!(cleanup, deadreckon_core::TerminationOutcome::Failed(_));
+    if !cleanup_proven {
+        return Err(compatibility_child_boundary_error(
+            deadreckon_core::ProcessBoundaryKind::CleanupIncomplete,
+            operation,
+            authority.map(Path::to_path_buf),
+            format!(
+                "bounded cleanup could not prove leader and pipe shutdown within {:.1}s; termination: {cleanup:?}{}",
+                cleanup_budget.as_secs_f64(),
+                supervision_error
+                    .as_deref()
+                    .map(|detail| format!("; {detail}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    let status = status.expect("cleanup_proven requires a reaped child");
+    let (stdout, stderr) = pipes.join(operation)?;
+    if work_expired {
+        return Err(compatibility_child_boundary_error(
+            deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            operation,
+            None,
+            format!(
+                "standalone compatibility safety cutoff elapsed after {:.1}s and process cleanup was proven",
+                work_budget.as_secs_f64()
+            ),
+        ));
+    }
+    if let Some(detail) = supervision_error {
+        return Err(compatibility_child_boundary_error(
+            deadreckon_core::ProcessBoundaryKind::SupervisionFailed,
+            operation,
+            None,
+            detail,
+        ));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(all(test, unix))]
+mod compatibility_child_boundary_tests {
+    use super::*;
+
+    fn grouped_shell(
+        script: &str,
+    ) -> (
+        std::process::Child,
+        Box<dyn deadreckon_core::ChildTerminator>,
+    ) {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        deadreckon_core::spawn_grouped(command).expect("grouped compatibility child")
+    }
+
+    #[test]
+    fn compatibility_wait_captures_output_without_leaking_a_descendant_pipe() {
+        let (child, terminator) = grouped_shell("sleep 30 & printf 'ready\\n'");
+        let started = Instant::now();
+        let output = wait_bounded_compatibility_child(
+            child,
+            terminator,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            "compatibility test",
+            None,
+        )
+        .expect("leader completion should reap the inherited-pipe descendant");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ready\n");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn compatibility_wait_types_work_expiry_after_proven_cleanup() {
+        let (child, terminator) = grouped_shell("sleep 30");
+        let pid = child.id();
+        let started = Instant::now();
+        let error = wait_bounded_compatibility_child(
+            child,
+            terminator,
+            Duration::from_millis(25),
+            Duration::from_secs(2),
+            "compatibility test",
+            None,
+        )
+        .expect_err("compatibility child must not outlive its work budget");
+
+        assert!(matches!(
+            error,
+            CliError::Core(DeadreckonError::ProcessBoundary {
+                kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+                authority: None,
+                ..
+            })
+        ));
+        assert!(!pid_is_alive(pid));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+}
 
 impl CliError {
     fn exit_code(&self) -> i32 {
@@ -2778,6 +3064,7 @@ async fn provider_router_for_run_with_catalog_seam(
     provider_override: Option<&str>,
     model: Option<&str>,
     no_seams: bool,
+    work_boundary: Option<deadreckon_runtime::RunWorkBoundary>,
 ) -> Result<ProviderRouter> {
     let seams = read_seams_config(&paths.config_path(), no_seams)?;
     let seam_ctx = SeamRunCtx {
@@ -2785,7 +3072,51 @@ async fn provider_router_for_run_with_catalog_seam(
         working_dir: state.working_dir.clone(),
         sandbox_backend: backend,
     };
-    let catalog_override = resolve_catalog_override(&seams, &seam_ctx).await?;
+    let catalog_override = if let Some(work_boundary) = work_boundary {
+        let cancellation = CancellationToken::new();
+        let marker = deadreckon_core::cancel_marker_path(state);
+        if marker.is_file() {
+            cancellation.cancel();
+        }
+        let watched = cancellation.clone();
+        let watcher = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(25));
+            loop {
+                interval.tick().await;
+                if watched.is_cancelled() || marker.is_file() {
+                    watched.cancel();
+                    break;
+                }
+            }
+        });
+        let outcome = resolve_catalog_override_phase(
+            &seams,
+            &seam_ctx,
+            ProviderPhaseDeadline::new(work_boundary.work_expires_at, Duration::from_secs(30)),
+            &cancellation,
+        )
+        .await;
+        watcher.abort();
+        match outcome? {
+            SeamPhaseOutcome::Completed(value) => value,
+            SeamPhaseOutcome::WorkExpired { cleanup } => {
+                return Err(orchestration_provider_phase_error(
+                    "catalog seam",
+                    "reached the authenticated Job work cutoff",
+                    cleanup,
+                ));
+            }
+            SeamPhaseOutcome::Cancelled { cleanup } => {
+                return Err(orchestration_provider_phase_error(
+                    "catalog seam",
+                    "was cancelled",
+                    cleanup,
+                ));
+            }
+        }
+    } else {
+        resolve_catalog_override(&seams, &seam_ctx).await?
+    };
     ProviderRouter::from_config_path_with_model_and_catalog_override(
         &paths.config_path(),
         provider_override,
@@ -5366,10 +5697,31 @@ async fn refresh_plan_docs(
         provider_cwd,
     );
     request.output_path = Some(plan_doc_path(paths, &plan.plan_id, "plan-doc-provider.out"));
-    let response = router.complete(&request).await;
-    let response = match response {
-        Ok(response) => response,
+    let phase = match orchestration_provider_phase(paths, "plan-doc-provider") {
+        Ok(phase) => phase,
         Err(err) => {
+            write_plan_provider_error(paths, plan, &provider, &err.to_string())?;
+            return write_plan_docs_deterministic(
+                paths,
+                plan,
+                Some(provider),
+                &options.provider_source,
+                Some(err.to_string()),
+            );
+        }
+    };
+    request.pid_file = Some(phase.pid_file.clone());
+    request.cancellation_token = phase
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.token.clone());
+    let outcome = complete_provider_phase(&router, &mut request, phase.deadline).await;
+    let response = match outcome {
+        ProviderPhaseOutcome::Completed(Ok(response)) => response,
+        ProviderPhaseOutcome::Completed(Err(err @ ProviderError::CleanupIncomplete { .. })) => {
+            return Err(CliError::from(err));
+        }
+        ProviderPhaseOutcome::Completed(Err(err)) => {
             write_plan_provider_error(paths, plan, &provider, &err.to_string())?;
             append_plan_doc_event(
                 paths,
@@ -5384,6 +5736,20 @@ async fn refresh_plan_docs(
                 &options.provider_source,
                 Some(err.to_string()),
             );
+        }
+        ProviderPhaseOutcome::WorkExpired { cleanup } => {
+            return Err(orchestration_provider_phase_error(
+                "plan documentation provider",
+                "reached its work cutoff",
+                cleanup,
+            ));
+        }
+        ProviderPhaseOutcome::Cancelled { cleanup } => {
+            return Err(orchestration_provider_phase_error(
+                "plan documentation provider",
+                "was cancelled",
+                cleanup,
+            ));
         }
     };
     let duration_ms = started.elapsed().as_millis();
@@ -7158,6 +7524,271 @@ struct MergeRepairResult {
     repair_run_id: Option<String>,
 }
 
+const ORCHESTRATION_PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+const STANDALONE_ORCHESTRATION_PROVIDER_WORK_BUDGET: Duration = Duration::from_secs(600);
+
+struct OrchestrationProviderCancellation {
+    token: CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl OrchestrationProviderCancellation {
+    fn for_job(paths: &DeadreckonPaths, job_id: &str) -> Self {
+        let token = CancellationToken::new();
+        if deadreckon_core::load_job_projection(paths, job_id)
+            .ok()
+            .is_some_and(|projection| {
+                projection.stop_reason == Some(deadreckon_protocol::StopReason::CancelRequested)
+                    || projection.outcome == Some(deadreckon_protocol::JobOutcome::Cancelled)
+            })
+        {
+            token.cancel();
+        }
+        let watched_paths = paths.clone();
+        let watched_job_id = job_id.to_string();
+        let watched_token = token.clone();
+        let watcher = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(25));
+            loop {
+                interval.tick().await;
+                if watched_token.is_cancelled() {
+                    break;
+                }
+                if deadreckon_core::load_job_projection(&watched_paths, &watched_job_id)
+                    .ok()
+                    .is_some_and(|projection| {
+                        projection.stop_reason
+                            == Some(deadreckon_protocol::StopReason::CancelRequested)
+                            || projection.outcome
+                                == Some(deadreckon_protocol::JobOutcome::Cancelled)
+                    })
+                {
+                    watched_token.cancel();
+                    break;
+                }
+            }
+        });
+        Self { token, watcher }
+    }
+}
+
+impl Drop for OrchestrationProviderCancellation {
+    fn drop(&mut self) {
+        self.watcher.abort();
+    }
+}
+
+struct OrchestrationProviderPhase {
+    deadline: ProviderPhaseDeadline,
+    cancellation: Option<OrchestrationProviderCancellation>,
+    pid_file: PathBuf,
+}
+
+fn current_parent_job_work_stop_reason(
+    paths: &DeadreckonPaths,
+) -> Result<Option<deadreckon_protocol::StopReason>> {
+    let Some(job_id) = commands::graph_job::current_parent_job_id() else {
+        return Ok(None);
+    };
+    let job = deadreckon_core::load_job(paths, job_id)?;
+    let allowance = commands::supervisor::current_job_work_allowance(paths, &job, Utc::now())?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "durable provider phase cannot prove its parent Job work allowance".to_string(),
+            ))
+        })?;
+    Ok(Some(match allowance.boundary {
+        commands::supervisor::ActivePolicyBoundary::Deadline => {
+            deadreckon_protocol::StopReason::Deadline
+        }
+        commands::supervisor::ActivePolicyBoundary::WallCap => {
+            deadreckon_protocol::StopReason::WallCap
+        }
+    }))
+}
+
+fn expired_parent_job_work_stop_reason(
+    paths: &DeadreckonPaths,
+) -> Result<Option<deadreckon_protocol::StopReason>> {
+    let Some(job_id) = commands::graph_job::current_parent_job_id() else {
+        return Ok(None);
+    };
+    let job = deadreckon_core::load_job(paths, job_id)?;
+    let Some(allowance) =
+        commands::supervisor::current_job_work_allowance(paths, &job, Utc::now())?
+    else {
+        return Ok(None);
+    };
+    if !allowance.remaining.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(match allowance.boundary {
+        commands::supervisor::ActivePolicyBoundary::Deadline => {
+            deadreckon_protocol::StopReason::Deadline
+        }
+        commands::supervisor::ActivePolicyBoundary::WallCap => {
+            deadreckon_protocol::StopReason::WallCap
+        }
+    }))
+}
+
+fn orchestration_provider_phase(
+    paths: &DeadreckonPaths,
+    operation: &str,
+) -> Result<OrchestrationProviderPhase> {
+    let Some(job_id) = commands::graph_job::current_parent_job_id() else {
+        return Ok(OrchestrationProviderPhase {
+            deadline: ProviderPhaseDeadline::from_now(
+                STANDALONE_ORCHESTRATION_PROVIDER_WORK_BUDGET,
+                ORCHESTRATION_PROVIDER_CLEANUP_BUDGET,
+            ),
+            cancellation: None,
+            pid_file: std::env::temp_dir().join(format!(
+                "deadreckon-{}-{}.pid",
+                operation.replace(' ', "-"),
+                Uuid::new_v4().simple()
+            )),
+        });
+    };
+    let job = deadreckon_core::load_job(paths, job_id)?;
+    let now = Utc::now();
+    let work_remaining = commands::supervisor::remaining_job_work_duration(paths, &job, now)?;
+    let supervisor_cutoff =
+        match std::env::var(commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV) {
+            Ok(value) => Some(value.parse::<DateTime<Utc>>().map_err(|error| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "trusted supervisor work cutoff is invalid: {error}"
+                )))
+            })?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "trusted supervisor work cutoff could not be read: {error}"
+                ))));
+            }
+        };
+    let remaining = orchestration_provider_remaining_at(
+        work_remaining,
+        job.policy.deadline,
+        supervisor_cutoff,
+        now,
+    );
+    let authority_dir = paths.job_dir(job_id).join("child-pids");
+    fs::create_dir_all(&authority_dir)?;
+    Ok(OrchestrationProviderPhase {
+        deadline: ProviderPhaseDeadline::new(
+            tokio::time::Instant::now() + remaining,
+            ORCHESTRATION_PROVIDER_CLEANUP_BUDGET,
+        ),
+        cancellation: Some(OrchestrationProviderCancellation::for_job(paths, job_id)),
+        pid_file: authority_dir.join(format!(
+            "{}-{}.pid",
+            operation.replace(' ', "-"),
+            Uuid::new_v4().simple()
+        )),
+    })
+}
+
+fn orchestration_provider_remaining_at(
+    work_remaining: Duration,
+    job_deadline: Option<DateTime<Utc>>,
+    supervisor_cutoff: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Duration {
+    let calendar_cutoff = match (job_deadline, supervisor_cutoff) {
+        (Some(job), Some(supervisor)) => Some(job.min(supervisor)),
+        (Some(job), None) => Some(job),
+        (None, Some(supervisor)) => Some(supervisor),
+        (None, None) => None,
+    };
+    calendar_cutoff.map_or(work_remaining, |cutoff| {
+        cutoff
+            .signed_duration_since(now)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(work_remaining)
+    })
+}
+
+fn orchestration_provider_phase_error(
+    operation: &str,
+    reason: &str,
+    cleanup: ProviderCleanup,
+) -> CliError {
+    let cleanup_detail = match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => String::new(),
+        ProviderCleanup::RetainedAuthority { path, detail } => format!(
+            "; cleanup was not proven and process authority remains at {}: {detail}",
+            path.display()
+        ),
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &format!("{operation} {reason}{cleanup_detail}"),
+        if cleanup_detail.is_empty() {
+            "retry the Job or raise its wall/deadline policy"
+        } else {
+            "inspect the retained process record, then run deadreckon doctor before retrying"
+        },
+    ))
+}
+
+#[cfg(test)]
+mod orchestration_provider_phase_tests {
+    use super::*;
+
+    #[test]
+    fn durable_provider_uses_earliest_cumulative_or_calendar_cutoff() {
+        let now = DateTime::parse_from_rfc3339("2026-08-04T12:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            orchestration_provider_remaining_at(
+                Duration::from_secs(300),
+                Some(now + ChronoDuration::seconds(240)),
+                Some(now + ChronoDuration::seconds(90)),
+                now,
+            ),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            orchestration_provider_remaining_at(
+                Duration::from_secs(45),
+                Some(now + ChronoDuration::seconds(240)),
+                Some(now + ChronoDuration::seconds(90)),
+                now,
+            ),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            orchestration_provider_remaining_at(
+                Duration::from_secs(45),
+                None,
+                Some(now - ChronoDuration::seconds(1)),
+                now,
+            ),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn provider_boundary_preserves_unproved_cleanup_authority() {
+        let error = orchestration_provider_phase_error(
+            "merge repair planner",
+            "reached the approved Job work cutoff",
+            ProviderCleanup::RetainedAuthority {
+                path: PathBuf::from("/tmp/merge-repair.pid"),
+                detail: "process tree still live".to_string(),
+            },
+        );
+        let rendered = error.to_string();
+
+        assert!(rendered.contains("/tmp/merge-repair.pid"));
+        assert!(rendered.contains("process tree still live"));
+        assert!(rendered.contains("deadreckon doctor"));
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MergeRepairOptions<'a> {
     provider: &'a str,
@@ -7257,6 +7888,15 @@ async fn invoke_merge_repair_planner(
     request_path: &Path,
     quiet: bool,
 ) -> Result<MergeRepairPlan> {
+    if plan.owner_job_id.is_some()
+        && commands::graph_job::current_parent_job_id().is_none()
+        && !cfg!(test)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "Job-owned merge repair planning cannot run without its durable parent driver context"
+                .to_string(),
+        )));
+    }
     let request_json = fs::read_to_string(request_path)?;
     let router = if provider == "smoke" || provider.starts_with("smoke:") {
         ProviderRouter::smoke()
@@ -7275,12 +7915,55 @@ async fn invoke_merge_repair_planner(
     let sandbox_backend = commands::graph_job::current_driver_sandbox_backend(paths)?
         .filter(|backend| *backend != deadreckon_sandbox::SandboxBackend::None)
         .unwrap_or(deadreckon_sandbox::SandboxBackend::Auto);
-    let request =
+    let phase = orchestration_provider_phase(paths, "merge-repair-planner")?;
+    let mut request =
         ProviderRequest::enforceably_read_only_with_backend(prompt, 8192, cwd, sandbox_backend);
+    request.pid_file = Some(phase.pid_file.clone());
+    request.cancellation_token = phase
+        .cancellation
+        .as_ref()
+        .map(|cancellation| cancellation.token.clone());
     let started_at = std::time::Instant::now();
-    let response =
-        maybe_with_cli_wait_status(!quiet, "planning merge repair", router.complete(&request))
-            .await?;
+    let outcome = maybe_with_cli_wait_status(
+        !quiet,
+        "planning merge repair",
+        complete_provider_phase(&router, &mut request, phase.deadline),
+    )
+    .await;
+    let response = match outcome {
+        ProviderPhaseOutcome::Completed(response) => response?,
+        ProviderPhaseOutcome::WorkExpired { cleanup } => {
+            let cleanup_proven = matches!(
+                &cleanup,
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+            );
+            let reason = "merge repair planner reached the approved Job work cutoff";
+            if cleanup_proven && commands::graph_job::current_parent_job_id().is_some() {
+                record_merge_repair_budget_exhaustion(
+                    paths,
+                    plan,
+                    current_parent_job_work_stop_reason(paths)?.ok_or_else(|| {
+                        CliError::Core(DeadreckonError::InvalidInput(
+                            "merge repair planner lost its parent Job identity".to_string(),
+                        ))
+                    })?,
+                    reason,
+                )?;
+            }
+            return Err(orchestration_provider_phase_error(
+                "merge repair planner",
+                "reached the approved Job work cutoff",
+                cleanup,
+            ));
+        }
+        ProviderPhaseOutcome::Cancelled { cleanup } => {
+            return Err(orchestration_provider_phase_error(
+                "merge repair planner",
+                "was cancelled",
+                cleanup,
+            ));
+        }
+    };
     let mut plan = parse_merge_repair_response(&response.content)?;
     plan.planner_spend_usd = response.spend.cost_usd;
     plan.planner_wall_seconds = started_at.elapsed().as_secs_f64();
@@ -7732,19 +8415,14 @@ async fn execute_merge_repair_child(
                 paths, plan, context, &repair_id, run_id, &library,
             );
         }
-        if available_budget.is_some() {
+        if let Some(stop_reason) = expired_parent_job_work_stop_reason(paths)? {
             let reason = format!(
-                "merge repair child did not finish within the parent Job's remaining wall-time budget ({wait_seconds:.3}s)"
+                "merge repair child did not finish before the parent Job's approved work cutoff ({wait_seconds:.3}s)"
             );
-            record_merge_repair_budget_exhaustion(
-                paths,
-                plan,
-                deadreckon_protocol::StopReason::WallCap,
-                &reason,
-            )?;
+            record_merge_repair_budget_exhaustion(paths, plan, stop_reason, &reason)?;
             return Err(CliError::Core(deadreckon_core::user_error(
                 &reason,
-                "raise the approved parent wall-time budget before waiting for more repair work",
+                "raise the limiting approved parent policy before waiting for more repair work",
             )));
         }
         return Err(CliError::Core(DeadreckonError::InvalidInput(
@@ -7835,7 +8513,7 @@ async fn execute_merge_repair_child(
     if prepared.is_none() && commands::plan::internal_characterization_requested() {
         command.env(commands::run::LEGACY_CHAIN_FOREGROUND_ENV, "1");
     }
-    let launch_authority = merge_repair_launch_record(
+    let mut launch_authority = merge_repair_launch_record(
         plan,
         context,
         &repair_id,
@@ -7847,26 +8525,74 @@ async fn execute_merge_repair_child(
         prepared.as_ref().map(|prepared| prepared.capability_id()),
         repair_plan.planner_spend_usd,
         repair_plan.planner_wall_seconds,
-        available_budget.map_or(120.0, |(_, wall_seconds)| wall_seconds),
+        available_budget.map_or(
+            STANDALONE_ORCHESTRATION_PROVIDER_WORK_BUDGET.as_secs_f64(),
+            |(_, wall_seconds)| wall_seconds,
+        ),
     )?;
     let authority_path = context.proof_dir.join("repair-run.json");
-    let child = if let Some(prepared) = prepared.as_ref() {
-        commands::graph_job::spawn_merge_repair_delegated(
+    let (pid, output) = if let Some(prepared) = prepared.as_ref() {
+        let child = commands::graph_job::spawn_merge_repair_delegated(
             paths,
             command,
             prepared,
             &authority_path,
             launch_authority,
-        )?
+        )?;
+        let pid = child.id();
+        let output = maybe_with_cli_wait_status(!quiet, "running merge repair child", async move {
+            child.wait()
+        })
+        .await;
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    CliError::Core(DeadreckonError::ProcessBoundary {
+                        kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+                        ..
+                    })
+                ) {
+                    record_merge_repair_budget_exhaustion(
+                        paths,
+                        plan,
+                        current_parent_job_work_stop_reason(paths)?.ok_or_else(|| {
+                            CliError::Core(DeadreckonError::InvalidInput(
+                                "merge repair child lost its parent Job identity".to_string(),
+                            ))
+                        })?,
+                        "merge-repair child reached the approved Job work cutoff",
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        (pid, output)
     } else {
+        let (child, terminator) = deadreckon_core::spawn_grouped(command)?;
+        let pid = child.id();
+        let process = deadreckon_core::SupervisedProcessRecord::running(
+            deadreckon_core::SupervisedProcess {
+                pid,
+                pgid: cfg!(unix).then_some(pid),
+            },
+        )?;
+        launch_authority["process"] = serde_json::to_value(process)?;
         commands::job::write_json_synced(&authority_path, &launch_authority)?;
-        command.spawn()?
+        let output = maybe_with_cli_wait_status(!quiet, "running merge repair child", async move {
+            wait_bounded_compatibility_child(
+                child,
+                terminator,
+                STANDALONE_ORCHESTRATION_PROVIDER_WORK_BUDGET,
+                ORCHESTRATION_PROVIDER_CLEANUP_BUDGET,
+                "standalone merge-repair child",
+                Some(&authority_path),
+            )
+        })
+        .await?;
+        (pid, output)
     };
-    let pid = child.id();
-    let output = maybe_with_cli_wait_status(!quiet, "running merge repair child", async move {
-        child.wait_with_output()
-    })
-    .await?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let run_id = commands::chain::parse_started_run_id(&stdout).ok_or_else(|| {
@@ -7951,6 +8677,9 @@ fn record_merge_repair_budget_exhaustion(
     stop_reason: deadreckon_protocol::StopReason,
     reason: &str,
 ) -> Result<()> {
+    let Some(dimension) = merge_repair_budget_dimension(stop_reason)? else {
+        return Ok(());
+    };
     let Some(job_id) = commands::graph_job::current_parent_job_id() else {
         return Ok(());
     };
@@ -7961,20 +8690,6 @@ fn record_merge_repair_budget_exhaustion(
                 .iter()
                 .any(|event| matches!(event.event, PlanEventKind::RootBudgetExhausted { .. }))
             {
-                let dimension = match stop_reason {
-                    deadreckon_protocol::StopReason::SpendCap => {
-                        deadreckon_core::plan::BudgetDimension::Spend
-                    }
-                    deadreckon_protocol::StopReason::WallCap => {
-                        deadreckon_core::plan::BudgetDimension::Wall
-                    }
-                    _ => {
-                        return Err(CliError::Core(DeadreckonError::InvalidInput(
-                            "merge repair budget exhaustion used a non-budget stop reason"
-                                .to_string(),
-                        )));
-                    }
-                };
                 append_plan_event(
                     paths,
                     job_id,
@@ -8017,6 +8732,42 @@ fn record_merge_repair_budget_exhaustion(
             "merge repair budget evidence has incompatible durable Job shape {shape:?}"
         )))),
     }
+}
+
+fn merge_repair_budget_dimension(
+    stop_reason: deadreckon_protocol::StopReason,
+) -> Result<Option<deadreckon_core::plan::BudgetDimension>> {
+    match stop_reason {
+        deadreckon_protocol::StopReason::SpendCap => {
+            Ok(Some(deadreckon_core::plan::BudgetDimension::Spend))
+        }
+        deadreckon_protocol::StopReason::WallCap => {
+            Ok(Some(deadreckon_core::plan::BudgetDimension::Wall))
+        }
+        // An absolute deadline is not a wall budget dimension. The supervisor
+        // is the sole authority that records the typed Deadline terminal
+        // event; do not write lossy Plan/Campaign WallCap evidence that could
+        // be replayed as the wrong outcome after restart.
+        deadreckon_protocol::StopReason::Deadline => Ok(None),
+        other => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge repair budget exhaustion used a non-budget stop reason {other:?}"
+        )))),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn merge_repair_deadline_is_not_coerced_to_wall_budget_evidence() {
+    assert_eq!(
+        merge_repair_budget_dimension(deadreckon_protocol::StopReason::Deadline)
+            .expect("deadline classification"),
+        None
+    );
+    assert_eq!(
+        merge_repair_budget_dimension(deadreckon_protocol::StopReason::WallCap)
+            .expect("wall classification"),
+        Some(deadreckon_core::plan::BudgetDimension::Wall)
+    );
 }
 
 fn merge_repair_test_failpoint_once(context: &MergeRepairContext, name: &str) -> Result<()> {
@@ -11465,6 +12216,17 @@ async fn resume_loaded_command_with_mode(
     lock.heartbeat("resume-turn-loop")?;
     let provider = state.provider.clone();
     let backend: SandboxBackend = state.sandbox.parse()?;
+    let owner_job_id = state
+        .ownership
+        .as_ref()
+        .map(|ownership| ownership.job_id.as_str())
+        .or_else(|| {
+            paths
+                .job_json(&state.run_id)
+                .is_file()
+                .then_some(state.run_id.as_str())
+        });
+    let work_boundary = commands::run::guarded_run_work_boundary(paths, owner_job_id)?;
     let router = provider_router_for_run_with_catalog_seam(
         paths,
         &state,
@@ -11472,6 +12234,7 @@ async fn resume_loaded_command_with_mode(
         provider.as_deref(),
         model,
         false,
+        work_boundary,
     )
     .await?;
     let selected_route = router.selected_route_info();
@@ -11507,6 +12270,7 @@ async fn resume_loaded_command_with_mode(
         from_turn,
         event_sender: None,
         cancellation_token: None,
+        work_boundary,
         narrate: None,
         docs: RunLoopDocsConfig {
             home: paths.home().to_path_buf(),
@@ -16650,15 +17414,47 @@ async fn refresh_narrative_projection_with_provider(
         2_000,
         cwd.unwrap_or_else(|| paths.home().to_path_buf()),
     );
-    provider_request.output_path = Some(output_path);
+    provider_request.output_path = Some(output_path.clone());
+    provider_request.pid_file = Some(
+        output_path
+            .parent()
+            .unwrap_or_else(|| paths.home())
+            .join(format!("provider-refresh-{}.pid", Uuid::new_v4().simple())),
+    );
     provider_request.cancellation_token = cancellation_token;
-    let response = match router.complete(&provider_request).await {
-        Ok(response) => response,
-        Err(err) => {
+    let response = match complete_provider_phase(
+        &router,
+        &mut provider_request,
+        ProviderPhaseDeadline::from_now(
+            STANDALONE_ORCHESTRATION_PROVIDER_WORK_BUDGET,
+            ORCHESTRATION_PROVIDER_CLEANUP_BUDGET,
+        ),
+    )
+    .await
+    {
+        ProviderPhaseOutcome::Completed(Ok(response)) => response,
+        ProviderPhaseOutcome::Completed(Err(err)) => {
             return Ok(narrative::projection_with_provider_failure(
                 &projection,
                 Some(route),
                 format!("provider refresh failed: {err}"),
+            ));
+        }
+        ProviderPhaseOutcome::WorkExpired { cleanup }
+        | ProviderPhaseOutcome::Cancelled { cleanup } => {
+            let detail = match cleanup {
+                ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+                    "provider refresh reached its bounded work cutoff".to_string()
+                }
+                ProviderCleanup::RetainedAuthority { path, detail } => format!(
+                    "provider refresh lost containment; process authority remains at {}: {detail}",
+                    path.display()
+                ),
+            };
+            return Ok(narrative::projection_with_provider_failure(
+                &projection,
+                Some(route),
+                detail,
             ));
         }
     };

@@ -36,12 +36,13 @@ impl ProviderAdapter {
             api_key,
             input_cost_per_million: entry.input_cost_per_million.unwrap_or(0.0),
             output_cost_per_million: entry.output_cost_per_million.unwrap_or(0.0),
-            // A stalled connection must never hang an unattended run: bound
-            // connect and total request time. Long completions stream within
-            // the request window; the turn loop's wall budget is the outer cap.
+            // Bound connection establishment, but do not install a second
+            // wall clock around the whole response. Every provider phase is
+            // cancelled by the controller's cumulative work deadline; a
+            // fixed transport timeout could reject healthy work earlier and
+            // report a different terminal reason than the owning job.
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(600))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }

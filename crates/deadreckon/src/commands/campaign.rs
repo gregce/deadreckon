@@ -2358,9 +2358,12 @@ async fn execute_campaign_state(
     let per_sub = campaign_obj
         .tree_budget_usd
         .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
+    // Spend is consumptive and is divided. Wall time is one elapsed campaign
+    // window, so every concurrently or sequentially launched sub-orchestrator
+    // inherits the same remainder while the parent supervisor owns expiry.
     let per_sub_wall = campaign_obj
         .tree_wall_seconds
-        .map(|budget| campaign::allocate_budget(budget, campaign_obj.sub_goals.len()));
+        .map(|remaining| inherited_campaign_wall_windows(remaining, campaign_obj.sub_goals.len()));
     let home = paths.home().to_path_buf();
     let planner = providers.planner.clone();
     let child_provider = providers.default_child.clone();
@@ -2692,34 +2695,11 @@ async fn execute_campaign_state(
             "inspect `deadreckon status` and restart with a larger approved cap",
         )));
     }
-    let final_tree_wall_seconds = campaign_obj
-        .sub_goals
-        .iter()
-        .filter_map(|sub| sub.result_run_id.as_deref())
-        .filter_map(|run_id| load_run(paths, run_id).ok())
-        .map(|state| state.total_wall_seconds)
-        .sum::<f64>();
-    if campaign_obj
-        .tree_wall_seconds
-        .is_some_and(|cap| final_tree_wall_seconds >= cap)
-    {
-        campaign_obj.status = campaign::CampaignStatus::Failed;
-        campaign::append_campaign_event(
-            &campaign_dir,
-            "budget_exhausted",
-            json!({
-                "wall_seconds": final_tree_wall_seconds,
-                "tree_wall_seconds": campaign_obj.tree_wall_seconds,
-                "phase": "post_children_pre_merge",
-                "stop_reason": StopReason::WallCap,
-            }),
-        )?;
-        campaign::write_campaign(&campaign_dir, &campaign_obj)?;
-        return Err(CliError::Core(deadreckon_core::user_error(
-            "campaign children exhausted the remaining approved wall time before parent verification",
-            "inspect `deadreckon status` and restart with a larger approved cap",
-        )));
-    }
+    // Do not compare child Run wall totals with the Campaign wall policy here.
+    // A sub-orchestrator's result can summarize parallel Plan workers, so its
+    // recorded worker-seconds are not elapsed parent time. The durable Job
+    // supervisor is the sole wall/deadline authority through merge and parent
+    // verification.
 
     let rollup = campaign::build_rollup(&campaign_obj, |run_id| match load_run(paths, run_id) {
         Ok(state) => {
@@ -2763,6 +2743,10 @@ async fn execute_campaign_state(
         print_campaign_completion(paths, &campaign_obj, &rollup, &result_state, args.no_hints);
     }
     Ok(())
+}
+
+fn inherited_campaign_wall_windows(remaining: f64, child_count: usize) -> Vec<f64> {
+    vec![remaining; child_count]
 }
 
 fn campaign_depth_refusal_surface(
@@ -3855,7 +3839,7 @@ mod durable_campaign_launch_tests {
 
     use super::{
         CampaignArgs, PlannerAccounting, campaign_accepted_by, campaign_contract_preview,
-        campaign_remaining_after_planning, schedule_campaign_job,
+        campaign_remaining_after_planning, inherited_campaign_wall_windows, schedule_campaign_job,
     };
     use deadreckon_protocol::StopReason;
 
@@ -3881,6 +3865,14 @@ mod durable_campaign_launch_tests {
             no_narrate: true,
             narrator_model: None,
         }
+    }
+
+    #[test]
+    fn campaign_children_inherit_one_wall_window_instead_of_dividing_it() {
+        assert_eq!(
+            inherited_campaign_wall_windows(90.0, 4),
+            vec![90.0, 90.0, 90.0, 90.0]
+        );
     }
 
     #[test]

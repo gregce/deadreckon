@@ -2513,7 +2513,8 @@ fn invoke_chain_hook(
     let Some(path) = resolve_chain_hook(paths, &chain.cwd, hook) else {
         return Ok(0);
     };
-    let mut child = std::process::Command::new(&path)
+    let mut command = std::process::Command::new(&path);
+    command
         .env("DEADRECKON_CHAIN_ID", &chain.chain_id)
         .env("DEADRECKON_HOME", paths.home())
         .env(
@@ -2524,12 +2525,20 @@ fn invoke_chain_hook(
         )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .stderr(std::process::Stdio::piped());
+    let (mut child, terminator) = deadreckon_core::spawn_grouped(command)?;
     if let Some(stdin) = child.stdin.as_mut() {
         write_hook_payload(stdin, &payload)?;
     }
-    let output = child.wait_with_output()?;
+    drop(child.stdin.take());
+    let output = wait_bounded_compatibility_child(
+        child,
+        terminator,
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+        "legacy chain hook",
+        None,
+    )?;
     let stdout = truncate_text(&String::from_utf8_lossy(&output.stdout), 4096);
     let stderr = truncate_text(&String::from_utf8_lossy(&output.stderr), 4096);
     let code = output.status.code().unwrap_or(1);
