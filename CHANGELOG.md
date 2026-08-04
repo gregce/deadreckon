@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.1 — Steadier starts — 2026-08-04
+
 - Runtime, provider and scheduler phases now consume one monotonic cumulative
   work allowance across retries and restarts, then use a separate bounded
   cleanup window that cannot authorize more work. Fractional remaining time is
@@ -65,13 +67,14 @@
 - Restart recovery now supervises up to four independent Jobs concurrently,
   so one long-running recovered Job cannot prevent later Jobs from being
   leased and resumed. The cap bounds the recovery process burst.
+- A released Single Job interrupted by a machine restart now retains its
+  validated launch acknowledgement and resumes the same persisted logical
+  attempt. Recovery no longer misclassifies that interruption as a provider
+  failure or consumes additional retries.
 - Read-only Codex admission and judging requests now mount their
   controller-owned output schema read-only while granting write access only to
   the last-message destination. Linux containment no longer hides the schema
   in its private `/tmp`, and the provider cannot rewrite that authority input.
-
-## 0.8.1 — Steadier starts — 2026-08-04
-
 - Release trust generation now discovers signing records in the nested CI
   artifact layout, and public flat-download verification independently checks
   manifest signing claims against checksummed trust evidence. Conflicting,
