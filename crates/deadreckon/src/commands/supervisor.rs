@@ -3,7 +3,9 @@
 //! The append-only job history is control truth. Process exit is only a wakeup
 //! to inspect persisted run evidence; it is never accepted as completion.
 
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -34,6 +36,11 @@ use super::run::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+// Fresh starts launch one fenced supervisor per Job. After a machine or
+// service restart, however, the singleton scanner must recover every eligible
+// Job. Keep that recovery concurrent so one long-lived child cannot prevent
+// unrelated Jobs from being leased, while bounding the process burst.
+const MAX_CONCURRENT_RECOVERY_JOBS: usize = 4;
 // A lease is an inactivity bound, not an operator wall budget. Fifteen
 // seconds was short enough for host sleep or load to reclaim a healthy owner;
 // exact boot/PID fencing still permits immediate reboot recovery.
@@ -45,6 +52,8 @@ const SUPERVISOR_STDERR_FILE: &str = "supervisor.err";
 const GUARDED_LAUNCH_PROTOCOL: &str = "stdin_release_v1";
 const MAX_RELEASE_TOKEN_BYTES: u64 = 512;
 const GUARDED_CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+const POLICY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+const POLICY_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SUPERVISOR_FAILPOINT_ENABLE_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINTS";
 const SUPERVISOR_FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
 const TRUSTED_DRIVER_ATTEMPT_ENV: &str = "DEADRECKON_SUPERVISOR_ATTEMPT";
@@ -247,6 +256,12 @@ enum ChildMonitorOutcome {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum ActivePolicyBoundary {
+    Deadline,
+    WallCap,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct ChildExit {
     status: Option<ExitStatus>,
     adopted: bool,
@@ -284,23 +299,98 @@ pub(crate) async fn supervisor_serve_command(
         None
     };
 
+    if let Some(job_id) = requested_job_id {
+        return supervise_one_job(&paths, &instance, &job_id).await;
+    }
+
+    if once {
+        return supervise_job_batch(&paths, &instance, eligible_job_ids(&paths)?).await;
+    }
+
+    let mut active_job_ids = BTreeSet::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut scan = tokio::time::interval(HEARTBEAT_INTERVAL);
+    scan.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        let job_ids = match requested_job_id.as_deref() {
-            Some(job_id) => vec![job_id.to_string()],
-            None => eligible_job_ids(&paths)?,
-        };
-        for job_id in job_ids {
-            match supervise_one_job(&paths, &instance, &job_id).await {
-                Ok(()) => {}
-                Err(error) if requested_job_id.is_none() && live_lease_refusal(&error) => {}
-                Err(error) => return Err(error),
+        scan.tick().await;
+        while let Some(joined) = tasks.try_join_next() {
+            let job_id = joined_supervision_result(joined)?;
+            active_job_ids.remove(&job_id);
+        }
+        for job_id in eligible_job_ids(&paths)? {
+            if tasks.len() >= MAX_CONCURRENT_RECOVERY_JOBS {
+                break;
+            }
+            if active_job_ids.insert(job_id.clone()) {
+                spawn_supervision_task(&mut tasks, paths.clone(), instance.clone(), job_id);
             }
         }
-        if once {
-            return Ok(());
-        }
-        tokio::time::sleep(HEARTBEAT_INTERVAL).await;
     }
+}
+
+async fn supervise_job_batch(
+    paths: &DeadreckonPaths,
+    instance: &SupervisorInstance,
+    job_ids: Vec<String>,
+) -> Result<()> {
+    let paths = paths.clone();
+    let instance = instance.clone();
+    run_bounded_job_batch(job_ids, move |job_id| {
+        let paths = paths.clone();
+        let instance = instance.clone();
+        async move { supervise_one_job(&paths, &instance, &job_id).await }
+    })
+    .await
+}
+
+async fn run_bounded_job_batch<Start, Work>(job_ids: Vec<String>, start: Start) -> Result<()>
+where
+    Start: Fn(String) -> Work,
+    Work: Future<Output = Result<()>> + Send + 'static,
+{
+    let mut pending = job_ids.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    loop {
+        while tasks.len() < MAX_CONCURRENT_RECOVERY_JOBS {
+            let Some(job_id) = pending.next() else {
+                break;
+            };
+            let work = start(job_id.clone());
+            tasks.spawn(async move { (job_id, work.await) });
+        }
+        let Some(joined) = tasks.join_next().await else {
+            return Ok(());
+        };
+        joined_supervision_result(joined)?;
+    }
+}
+
+fn spawn_supervision_task(
+    tasks: &mut tokio::task::JoinSet<(String, Result<()>)>,
+    paths: DeadreckonPaths,
+    instance: SupervisorInstance,
+    job_id: String,
+) {
+    tasks.spawn(async move {
+        let result = supervise_one_job(&paths, &instance, &job_id).await;
+        (job_id, result)
+    });
+}
+
+fn joined_supervision_result(
+    joined: std::result::Result<(String, Result<()>), tokio::task::JoinError>,
+) -> Result<String> {
+    let (job_id, result) = joined.map_err(|error| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "supervisor Job task did not finish cleanly: {error}"
+        )))
+    })?;
+    match result {
+        Ok(()) => {}
+        Err(error) if live_lease_refusal(&error) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(job_id)
 }
 
 pub(crate) fn supervisor_launch_command(
@@ -2257,6 +2347,133 @@ fn prepare_unlinked_launch_recovery(
     Ok(UnlinkedLaunchDisposition::Relaunch)
 }
 
+fn finish_owned_child_policy_boundary(
+    paths: &DeadreckonPaths,
+    token: &LeaseToken,
+    job: &Job,
+    child: &mut Child,
+    boundary: ActivePolicyBoundary,
+) -> Result<bool> {
+    let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
+    let cleanup_paths = paths.clone();
+    let cleanup_token = token.clone();
+    let cleanup_job = job.clone();
+    let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
+    let cleanup = std::thread::Builder::new()
+        .name(format!(
+            "dr-policy-cleanup-{}",
+            &token.job_id.as_ref()[..token.job_id.as_ref().len().min(8)]
+        ))
+        .spawn(move || {
+            let result = match boundary {
+                ActivePolicyBoundary::Deadline => {
+                    finish_deadline_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
+                }
+                ActivePolicyBoundary::WallCap => {
+                    finish_wall_cap_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
+                }
+            };
+            let _ = result_sender.send(result);
+        })?;
+    let mut reaped = false;
+    let mut reap_error = None;
+
+    loop {
+        if !reaped && reap_error.is_none() {
+            match child.try_wait() {
+                Ok(Some(_)) => reaped = true,
+                Ok(None) => {}
+                Err(error) => reap_error = Some(error.to_string()),
+            }
+        }
+
+        match result_receiver.try_recv() {
+            Ok(result) => {
+                cleanup.join().map_err(|_| {
+                    CliError::Core(DeadreckonError::InvalidInput(
+                        "policy cleanup thread panicked".to_string(),
+                    ))
+                })?;
+                let terminalized = match result {
+                    Ok(terminalized) => terminalized,
+                    Err(error) => {
+                        block_for_lost_containment(
+                            paths,
+                            token,
+                            &format!(
+                                "policy cleanup failed before containment was proven: {error}"
+                            ),
+                        )?;
+                        return Ok(true);
+                    }
+                };
+                if !terminalized {
+                    return Ok(false);
+                }
+                let projection = JobView::load(paths, token.job_id.as_ref())?.projection;
+                if projection.stop_reason == Some(StopReason::LostContainment) {
+                    return Ok(true);
+                }
+                if let Some(error) = reap_error.as_deref() {
+                    block_for_lost_containment(
+                        paths,
+                        token,
+                        &format!(
+                            "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
+                        ),
+                    )?;
+                    return Ok(true);
+                }
+                if reaped {
+                    return Ok(true);
+                }
+                while Instant::now() < cleanup_deadline {
+                    match child.try_wait() {
+                        Ok(Some(_)) => return Ok(true),
+                        Ok(None) => std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL),
+                        Err(error) => {
+                            block_for_lost_containment(
+                                paths,
+                                token,
+                                &format!(
+                                    "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
+                                ),
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                }
+                block_for_lost_containment(
+                    paths,
+                    token,
+                    "policy cleanup reported success, but the owned leader was not reaped within the bounded 30-second window",
+                )?;
+                return Ok(true);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = cleanup.join();
+                block_for_lost_containment(
+                    paths,
+                    token,
+                    "policy cleanup ended without reporting whether containment was restored",
+                )?;
+                return Ok(true);
+            }
+        }
+
+        if Instant::now() >= cleanup_deadline {
+            block_for_lost_containment(
+                paths,
+                token,
+                "policy cleanup exceeded its bounded 30-second termination and reap window",
+            )?;
+            return Ok(true);
+        }
+        std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL);
+    }
+}
+
 async fn monitor_child(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
@@ -2270,23 +2487,13 @@ async fn monitor_child(
             .is_some_and(|deadline| deadline <= Utc::now())
         {
             let terminalized = match &mut child {
-                MonitoredChild::Owned(child) => {
-                    // Process-group termination waits for the group to
-                    // disappear. Reap the directly owned leader in parallel
-                    // so its zombie cannot make that proof time out.
-                    let cleanup_paths = paths.clone();
-                    let cleanup_token = token.clone();
-                    let cleanup_job = job.clone();
-                    let cleanup = std::thread::spawn(move || {
-                        finish_deadline_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
-                    });
-                    let _ = child.wait();
-                    cleanup.join().map_err(|_| {
-                        CliError::Core(DeadreckonError::InvalidInput(
-                            "deadline cleanup thread panicked".to_string(),
-                        ))
-                    })??
-                }
+                MonitoredChild::Owned(child) => finish_owned_child_policy_boundary(
+                    paths,
+                    token,
+                    job,
+                    child,
+                    ActivePolicyBoundary::Deadline,
+                )?,
                 MonitoredChild::Adopted(_) => finish_deadline_reached(paths, token, job, None)?,
             };
             if terminalized {
@@ -2303,23 +2510,13 @@ async fn monitor_child(
             >= Duration::from_secs(job.policy.max_wall_seconds)
         {
             let terminalized = match &mut child {
-                MonitoredChild::Owned(child) => {
-                    // As with deadline enforcement, reap the owned leader in
-                    // parallel while reconciliation proves that its whole
-                    // process tree has stopped.
-                    let cleanup_paths = paths.clone();
-                    let cleanup_token = token.clone();
-                    let cleanup_job = job.clone();
-                    let cleanup = std::thread::spawn(move || {
-                        finish_wall_cap_reached(&cleanup_paths, &cleanup_token, &cleanup_job, None)
-                    });
-                    let _ = child.wait();
-                    cleanup.join().map_err(|_| {
-                        CliError::Core(DeadreckonError::InvalidInput(
-                            "wall-cap cleanup thread panicked".to_string(),
-                        ))
-                    })??
-                }
+                MonitoredChild::Owned(child) => finish_owned_child_policy_boundary(
+                    paths,
+                    token,
+                    job,
+                    child,
+                    ActivePolicyBoundary::WallCap,
+                )?,
                 MonitoredChild::Adopted(_) => finish_wall_cap_reached(paths, token, job, None)?,
             };
             if terminalized {
@@ -2534,6 +2731,14 @@ fn maybe_schedule_leaf_retry(
         deadreckon_core::RunStatus::Pending
         | deadreckon_core::RunStatus::Planned
         | deadreckon_core::RunStatus::Executing => StopReason::LostContainment,
+        deadreckon_core::RunStatus::Failed
+            if state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("acceptance failed after turn ")) =>
+        {
+            StopReason::DeterministicRevise
+        }
         deadreckon_core::RunStatus::Failed
             if state.provider_failure == Some(ProviderFailureDisposition::Retryable) =>
         {
@@ -4810,6 +5015,10 @@ fn process_start_identity(pid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -4823,12 +5032,100 @@ mod tests {
         JobSchemaVersion, SemanticJudgeMode,
     };
     use tempfile::TempDir;
+    use tokio::sync::{Notify, Semaphore};
 
     use super::*;
     use crate::commands::course::{
         CourseBudget, CourseContract, CourseEscape, CourseProviders, CourseResolution,
         ResolutionSource,
     };
+
+    #[tokio::test]
+    async fn restart_batch_does_not_serialize_unrelated_jobs() {
+        let release_long_job = Arc::new(Notify::new());
+        let short_job_started = Arc::new(Notify::new());
+        let release_for_work = Arc::clone(&release_long_job);
+        let started_for_work = Arc::clone(&short_job_started);
+        let batch = tokio::spawn(run_bounded_job_batch(
+            vec!["long-job".to_string(), "short-job".to_string()],
+            move |job_id| {
+                let release_long_job = Arc::clone(&release_for_work);
+                let short_job_started = Arc::clone(&started_for_work);
+                async move {
+                    if job_id == "long-job" {
+                        release_long_job.notified().await;
+                    } else {
+                        short_job_started.notify_one();
+                    }
+                    Ok(())
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), short_job_started.notified())
+            .await
+            .expect("the second Job should start while the first Job is still active");
+        assert!(
+            !batch.is_finished(),
+            "the long Job should still be holding one bounded recovery slot"
+        );
+
+        release_long_job.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), batch)
+            .await
+            .expect("bounded recovery batch should finish after the long Job exits")
+            .expect("bounded recovery task should join")
+            .expect("bounded recovery should succeed");
+    }
+
+    #[tokio::test]
+    async fn restart_batch_bounds_simultaneous_job_recovery() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let limit_reached = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let started_for_work = Arc::clone(&started);
+        let reached_for_work = Arc::clone(&limit_reached);
+        let release_for_work = Arc::clone(&release);
+        let job_ids = (0..MAX_CONCURRENT_RECOVERY_JOBS + 1)
+            .map(|index| format!("job-{index}"))
+            .collect();
+        let batch = tokio::spawn(run_bounded_job_batch(job_ids, move |_| {
+            let started = Arc::clone(&started_for_work);
+            let limit_reached = Arc::clone(&reached_for_work);
+            let release = Arc::clone(&release_for_work);
+            async move {
+                let active = started.fetch_add(1, Ordering::SeqCst) + 1;
+                if active == MAX_CONCURRENT_RECOVERY_JOBS {
+                    limit_reached.notify_one();
+                }
+                let permit = release.acquire_owned().await.map_err(|error| {
+                    CliError::Core(DeadreckonError::InvalidInput(error.to_string()))
+                })?;
+                drop(permit);
+                Ok(())
+            }
+        }));
+
+        tokio::time::timeout(Duration::from_secs(1), limit_reached.notified())
+            .await
+            .expect("the bounded recovery slots should fill");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RECOVERY_JOBS,
+            "a fifth Job must wait until one bounded recovery slot is free"
+        );
+
+        release.add_permits(MAX_CONCURRENT_RECOVERY_JOBS + 1);
+        tokio::time::timeout(Duration::from_secs(1), batch)
+            .await
+            .expect("bounded recovery batch should drain after slots are released")
+            .expect("bounded recovery task should join")
+            .expect("bounded recovery should succeed");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            MAX_CONCURRENT_RECOVERY_JOBS + 1
+        );
+    }
 
     fn write_admission_contract(source: &Path) -> PathBuf {
         let contract = source.join("acceptance.yaml");
@@ -5107,6 +5404,16 @@ mod tests {
         state.failure_reason = Some("opaque provider failure".to_string());
         state.provider_failure = Some(disposition);
         save_state(&state).expect("save provider failure");
+    }
+
+    fn failed_acceptance_attempt(paths: &DeadreckonPaths, job: &Job) {
+        executing_attempt(paths, job);
+        let mut state = load_run(paths, job.job_id.as_ref()).expect("attempt state");
+        state.status = RunStatus::Failed;
+        state.failure_reason =
+            Some("acceptance failed after turn 1: exact output differed".to_string());
+        state.provider_failure = None;
+        save_state(&state).expect("save acceptance failure");
     }
 
     fn claim_started_attempt(paths: &DeadreckonPaths, job: &Job, attempt: u32) -> LeaseToken {
@@ -6315,7 +6622,10 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
         let contract = write_admission_contract(&source);
-        let deadline = Utc::now() + chrono::TimeDelta::seconds(3);
+        // Job creation freezes and hashes admission inputs. Keep this public
+        // deadline comfortably beyond that work on a loaded CI runner; the
+        // test still crosses the exact approved instant before supervision.
+        let deadline = Utc::now() + chrono::TimeDelta::seconds(10);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
@@ -6418,8 +6728,9 @@ mod tests {
         let contract = write_admission_contract(&source);
         // Job admission freezes and hashes its trusted inputs before queueing.
         // Leave enough setup room under parallel test load, while still
-        // exercising the active-child deadline path within a few seconds.
-        let deadline = Utc::now() + chrono::TimeDelta::seconds(3);
+        // exercising the active-child deadline path without making admission
+        // race the clock on a loaded CI runner.
+        let deadline = Utc::now() + chrono::TimeDelta::seconds(10);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
@@ -6522,6 +6833,81 @@ mod tests {
             Some(deadreckon_protocol::JobOutcome::DeadlineReached)
         );
         assert_eq!(view.projection.stop_reason, Some(StopReason::Deadline));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_cleanup_failure_returns_promptly_and_retains_process_authority() {
+        for boundary in [
+            ActivePolicyBoundary::Deadline,
+            ActivePolicyBoundary::WallCap,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let (paths, mut job) = fixture(&temp, 2);
+            match boundary {
+                ActivePolicyBoundary::Deadline => {
+                    job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::seconds(1));
+                }
+                ActivePolicyBoundary::WallCap => job.policy.max_wall_seconds = 0,
+            }
+            let token = claim_started_attempt(&paths, &job, 1);
+            let (mut child, _terminator) = spawn_grouped({
+                let mut command = Command::new("sh");
+                command.arg("-c").arg("while :; do :; done");
+                command
+            })
+            .expect("long-running child");
+            let metadata = SupervisorChildMetadata {
+                process: SupervisedProcess {
+                    pid: child.id(),
+                    pgid: Some(child.id()),
+                },
+                launch_id: Some(Uuid::new_v4().to_string()),
+                attempt: Some(1),
+                release_token_sha256: Some(deadreckon_core::flight::sha256_text(
+                    "unverifiable-policy-child",
+                )),
+                boot_id: Some(boot_identity()),
+                // A live child without its process-start identity must never be
+                // signalled or reported as safely stopped.
+                process_start_identity: None,
+            };
+            let metadata_path = child_metadata_path(&paths, job.job_id.as_ref());
+            write_child_metadata(&metadata_path, &metadata).expect("child metadata");
+            append_control_event(
+                &paths,
+                &token,
+                JobEventKind::ChildLinked,
+                format!("unverifiable-policy-child:{boundary:?}"),
+                child_link_detail(&job, &metadata, false, Some(1)),
+            )
+            .expect("child linked");
+
+            let started = Instant::now();
+            let terminalized =
+                finish_owned_child_policy_boundary(&paths, &token, &job, &mut child, boundary)
+                    .expect("cleanup failure must become an honest terminal");
+
+            assert!(terminalized);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{boundary:?} cleanup waited for the live owned child instead of observing the reconciliation failure"
+            );
+            assert!(metadata_path.is_file(), "process authority was discarded");
+            assert!(pid_is_alive(child.id()), "unverifiable child was signalled");
+            let view = JobView::load(&paths, job.job_id.as_ref()).expect("blocked view");
+            assert_eq!(
+                view.projection.outcome,
+                Some(deadreckon_protocol::JobOutcome::Blocked)
+            );
+            assert_eq!(
+                view.projection.stop_reason,
+                Some(StopReason::LostContainment)
+            );
+
+            child.kill().expect("kill test child");
+            child.wait().expect("reap test child");
+        }
     }
 
     #[test]
@@ -10157,6 +10543,54 @@ mod tests {
         let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
         assert!(!view.projection.is_terminal());
         assert_eq!(view.projection.attempt_count, 1);
+    }
+
+    #[test]
+    fn deterministic_gate_revision_retries_without_blaming_the_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        failed_acceptance_attempt(&paths, &job);
+        let token = claim_started_attempt(&paths, &job, 1);
+
+        assert!(
+            maybe_schedule_leaf_retry(
+                &paths,
+                &job,
+                &token,
+                &ChildExit {
+                    status: None,
+                    adopted: false,
+                },
+                1,
+                3,
+            )
+            .expect("deterministic revision classification")
+        );
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        let stopped = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::AttemptStopped)
+            .expect("attempt stopped");
+        assert_eq!(
+            stopped.detail.get("stop_reason").and_then(Value::as_str),
+            Some("deterministic_revise")
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .any(|event| event.kind == JobEventKind::RetryScheduled)
+        );
+        let state = load_run(&paths, job.job_id.as_ref()).expect("run state");
+        assert_eq!(state.provider_failure, None);
+        assert!(
+            state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("acceptance failed after turn "))
+        );
     }
 
     #[tokio::test]

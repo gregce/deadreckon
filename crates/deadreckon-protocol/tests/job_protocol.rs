@@ -60,6 +60,7 @@ fn job_stop_reasons_are_distinct() {
             "\"cancel_requested\"",
             "\"corrupt_history\"",
             "\"deadline\"",
+            "\"deterministic_revise\"",
             "\"fatal_gate\"",
             "\"fatal_provider\"",
             "\"legacy_unknown\"",

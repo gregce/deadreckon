@@ -9,6 +9,21 @@
   cleanup proof. Done-contract authoring shares one 20-minute deadline and
   gives its independent critic the same five-minute allowance as draft and
   redraft, without starting a new clock between stages.
+- A clean provider turn after a failed deterministic check now preserves the
+  gate failure and schedules a typed `deterministic_revise` attempt when retry
+  policy allows. It is no longer rewritten as `fatal_provider`; the final
+  attempt still stops at the approved attempt limit.
+- Supervisor deadline and wall-cap enforcement no longer blocks forever while
+  reaping an owned child. Process-tree reconciliation and `try_wait` reaping
+  share one 30-second cleanup boundary; unproved termination becomes
+  `Blocked/LostContainment` and retains process authority.
+- Restart recovery now supervises up to four independent Jobs concurrently,
+  so one long-running recovered Job cannot prevent later Jobs from being
+  leased and resumed. The cap bounds the recovery process burst.
+- Read-only Codex admission and judging requests now mount their
+  controller-owned output schema read-only while granting write access only to
+  the last-message destination. Linux containment no longer hides the schema
+  in its private `/tmp`, and the provider cannot rewrite that authority input.
 
 ## 0.8.1 — Steadier starts — 2026-08-04
 

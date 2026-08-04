@@ -60,6 +60,13 @@
       "format": "uint32",
       "minimum": 0.0
     },
+    "process_start_identity": {
+      "description": "Same-boot process identity captured when the lease was acquired. Old checkpoints omit it and retain expiry-only recovery semantics.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "schema_version": {
       "type": "integer",
       "enum": [

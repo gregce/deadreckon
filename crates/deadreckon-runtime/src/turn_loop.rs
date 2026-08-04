@@ -732,9 +732,7 @@ async fn run_turn_loop_inner(
             append_provenance_for_files(state, turn, &tool_call_id, &response.model, raw_changed)?;
             commit_worktree_turn(state, turn, "cli_subagent")?;
             if changed.is_empty() {
-                state.failure_reason = Some(
-                    "cli subagent completed without file changes in the deliverable".to_string(),
-                );
+                classify_cli_no_deliverable_changes(state, &history, turn);
                 state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
                 save_state(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
@@ -1350,6 +1348,36 @@ async fn run_turn_loop_inner(
     save_state(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
+}
+
+const ACCEPTANCE_FAILURE_PREFIX: &str = "acceptance failed after turn ";
+const CLI_NO_DELIVERABLE_CHANGES: &str =
+    "cli subagent completed without file changes in the deliverable";
+
+fn classify_cli_no_deliverable_changes(state: &mut PipelineState, history: &[String], turn: u32) {
+    // A no-op provider turn after a deterministic-gate failure has not made
+    // that gate failure disappear. Preserve the actionable cause and mark the
+    // no-progress result instead of replacing it with a false provider cause.
+    // The durable supervisor can then classify the preserved gate failure and
+    // decide whether another approved, bounded attempt is available.
+    let acceptance_failure = state
+        .failure_reason
+        .as_ref()
+        .filter(|reason| reason.starts_with(ACCEPTANCE_FAILURE_PREFIX))
+        .cloned()
+        .or_else(|| {
+            history
+                .iter()
+                .rev()
+                .find(|entry| entry.starts_with(ACCEPTANCE_FAILURE_PREFIX))
+                .cloned()
+        });
+    state.turn = turn;
+    if let Some(reason) = acceptance_failure {
+        state.failure_reason = Some(reason);
+    } else {
+        state.failure_reason = Some(CLI_NO_DELIVERABLE_CHANGES.to_string());
+    }
 }
 
 fn persist_parent_repair_candidate(
@@ -5476,10 +5504,11 @@ mod tests {
         RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SemanticCompletionDisposition,
         append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
         build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
-        changed_files_since_snapshot, commit_finalized_turn, commit_worktree_turn,
-        complete_within_wall_budget, deliverable_changed_files, ensure_sandbox_toml,
-        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
-        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, load_trusted_git_control,
+        changed_files_since_snapshot, classify_cli_no_deliverable_changes, commit_finalized_turn,
+        commit_worktree_turn, complete_within_wall_budget, deliverable_changed_files,
+        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
+        is_direct_api_provider_kind, load_or_reconstruct_history,
+        load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, persist_parent_repair_candidate, policy_seam_refusal,
         policy_seam_refusal_message, provider_failure_disposition, provider_output_name,
         read_turn_codebase_record, record_semantic_judge_accounting, refuse_gitlinks,
@@ -5717,6 +5746,38 @@ mod tests {
         )
         .expect("run");
         (paths, state)
+    }
+
+    #[test]
+    fn no_changes_after_gate_failure_preserves_cause_without_blaming_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "repair the failed gate");
+        let gate_failure =
+            "acceptance failed after turn 1: check greet-exact-output failed".to_string();
+        // Durable resume clears failure_reason before starting the next loop,
+        // so the prior gate result must also be recoverable from history.
+        state.failure_reason = None;
+
+        classify_cli_no_deliverable_changes(&mut state, &[gate_failure.clone()], 2);
+
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.failure_reason, Some(gate_failure));
+        assert_eq!(state.provider_failure, None);
+    }
+
+    #[test]
+    fn first_turn_no_change_remains_a_plain_no_progress_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "make a deliverable change");
+
+        classify_cli_no_deliverable_changes(&mut state, &[], 1);
+
+        assert_eq!(state.turn, 1);
+        assert_eq!(
+            state.failure_reason.as_deref(),
+            Some("cli subagent completed without file changes in the deliverable")
+        );
+        assert_eq!(state.provider_failure, None);
     }
 
     #[tokio::test]

@@ -11628,7 +11628,10 @@ mod tests {
             &job_id,
             &owner,
             Utc::now(),
-            std::time::Duration::from_secs(60),
+            // This fixture exercises immutable hook bytes, not lease expiry.
+            // Keep the authority valid even when the full debug suite is
+            // descheduled under linker and process-launch load.
+            std::time::Duration::from_secs(300),
         )
         .expect("claim")
         .token();

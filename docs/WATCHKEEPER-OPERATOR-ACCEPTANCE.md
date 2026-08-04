@@ -171,6 +171,17 @@ Accept when:
   `${TMPDIR:-/tmp}/...XXXXXX` template;
 - [ ] shell checks observe DeadReckon's isolated `HOME`, `TMPDIR` and `PATH`
   even when the operator's shell startup files assign different values.
+- [ ] if a deterministic check fails and the corrective provider turn exits
+  cleanly without a deliverable change, status retains the exact acceptance
+  failure and records `deterministic_revise`, never `fatal_provider`;
+- [ ] a deadline or wall-cap reached with an unverifiable live child returns
+  within the 30-second cleanup boundary as `Blocked/LostContainment` and keeps
+  the process-authority record for recovery.
+- [ ] after restarting the singleton supervisor, a second pending Job starts
+  while an earlier recovered Job is still running; no more than four recovery
+  Jobs are driven concurrently;
+- [ ] a contained read-only Codex request can read its frozen output schema but
+  cannot modify it, including when Linux gives the sandbox a private `/tmp`.
 
 ## Safety and prerequisites
 

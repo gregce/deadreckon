@@ -249,6 +249,7 @@ pub enum StopReason {
     Deadline,
     AttemptLimit,
     CancelRequested,
+    DeterministicRevise,
     TransientProvider,
     FatalProvider,
     FatalGate,
@@ -258,7 +259,7 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Verified,
         Self::SemanticRevise,
         Self::SemanticUncertain,
@@ -269,6 +270,7 @@ impl StopReason {
         Self::Deadline,
         Self::AttemptLimit,
         Self::CancelRequested,
+        Self::DeterministicRevise,
         Self::TransientProvider,
         Self::FatalProvider,
         Self::FatalGate,

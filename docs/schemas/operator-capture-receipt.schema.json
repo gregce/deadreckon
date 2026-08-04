@@ -234,6 +234,7 @@
         "deadline",
         "attempt_limit",
         "cancel_requested",
+        "deterministic_revise",
         "transient_provider",
         "fatal_provider",
         "fatal_gate",

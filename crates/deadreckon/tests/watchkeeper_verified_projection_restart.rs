@@ -475,6 +475,10 @@ fn verified_single_fixture(temp: &TempDir) -> (DeadreckonPaths, Job) {
 fn expire_lease(paths: &DeadreckonPaths, job: &Job) {
     let mut lease = load_job_lease(paths, &job.job_id).expect("active supervisor lease");
     lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
+    // Model an owner that actually exited. Expiry alone must not let another
+    // supervisor steal authority from a still-live same-boot process now that
+    // leases bind the process-start identity.
+    lease.process_start_identity = Some("exited-fixture-owner".to_string());
     fs::write(
         paths.job_lease(job.job_id.as_ref()),
         serde_json::to_vec_pretty(&lease).expect("expired lease JSON"),
