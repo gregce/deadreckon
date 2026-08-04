@@ -9,12 +9,15 @@ use deadreckon_protocol::{
     GateEvaluatorIdentity, JobAuthority, JobSchemaVersion, RunEvent, RunEventKind,
     SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SpendRecord, TraceRecord,
 };
-use deadreckon_providers::{ProviderKind, ProviderRequest, ProviderResponse, ProviderRouter};
+use deadreckon_providers::{
+    ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
+    ProviderResponse, ProviderRouter, complete_provider_phase,
+};
 use deadreckon_sandbox::{
     DockerExecution, DockerImage, DockerPlatform, GuardedLaunchSpec, ProtectedPathPolicy,
-    SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, inspect_docker_image,
-    reconcile_docker_execution_record, resolve_backend, run as run_sandbox,
-    write_docker_execution_record,
+    SandboxBackend, SandboxError, SandboxRunOutput, SandboxSpec, ToolSandboxPolicy,
+    WorkspaceAccess, inspect_docker_image, reconcile_docker_execution_record, resolve_backend,
+    run as run_sandbox, write_docker_execution_record,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -166,6 +169,101 @@ pub struct RunLoopDocsConfig {
     pub no_docs: bool,
 }
 
+/// Attempt-local monotonic work clock backed by the last durable cumulative
+/// value. Supervisor downtime is not active work: a recovered attempt starts
+/// a fresh monotonic interval from the wall time persisted by its predecessor.
+#[derive(Debug)]
+struct RunWorkClock {
+    baseline_seconds: f64,
+    started: Instant,
+}
+
+impl RunWorkClock {
+    fn new(state: &PipelineState) -> Result<Self> {
+        if !state.total_wall_seconds.is_finite() || state.total_wall_seconds < 0.0 {
+            return Err(DeadreckonError::InvalidInput(
+                "run total_wall_seconds must be finite and non-negative".to_string(),
+            ));
+        }
+        Ok(Self {
+            baseline_seconds: state.total_wall_seconds,
+            started: Instant::now(),
+        })
+    }
+
+    fn total_seconds(&self) -> f64 {
+        self.baseline_seconds + self.started.elapsed().as_secs_f64()
+    }
+
+    fn sync(&self, state: &mut PipelineState) {
+        state.total_wall_seconds = state.total_wall_seconds.max(self.total_seconds());
+    }
+
+    fn save(&self, state: &mut PipelineState) -> Result<()> {
+        self.sync(state);
+        save_state(state)
+    }
+
+    fn remaining(&self, cap_seconds: Option<f64>) -> Result<Option<Duration>> {
+        let Some(cap_seconds) = cap_seconds else {
+            return Ok(None);
+        };
+        if !cap_seconds.is_finite() || cap_seconds < 0.0 {
+            return Err(DeadreckonError::InvalidInput(
+                "run max_wall_seconds must be finite and non-negative".to_string(),
+            ));
+        }
+        Ok(Some(Duration::from_secs_f64(
+            (cap_seconds - self.total_seconds()).max(0.0),
+        )))
+    }
+
+    fn remaining_seconds(&self, cap_seconds: Option<f64>) -> Result<Option<f64>> {
+        self.remaining(cap_seconds)
+            .map(|remaining| remaining.map(|duration| duration.as_secs_f64()))
+    }
+
+    fn provider_phase_deadline(&self, cap_seconds: Option<f64>) -> Result<ProviderPhaseDeadline> {
+        let work_expires_at = if let Some(cap_seconds) = cap_seconds {
+            if !cap_seconds.is_finite() || cap_seconds < 0.0 {
+                return Err(DeadreckonError::InvalidInput(
+                    "run max_wall_seconds must be finite and non-negative".to_string(),
+                ));
+            }
+            let active_budget =
+                Duration::from_secs_f64((cap_seconds - self.baseline_seconds).max(0.0));
+            let absolute = self.started.checked_add(active_budget).ok_or_else(|| {
+                DeadreckonError::InvalidInput(
+                    "run max_wall_seconds exceeds the monotonic clock range".to_string(),
+                )
+            })?;
+            tokio::time::Instant::from_std(absolute)
+        } else {
+            // Compatibility Runs may omit a wall cap. ProviderPhaseDeadline is
+            // intentionally non-optional, so use one fixed practical infinity
+            // for the entire attempt instead of rebuilding a relative timeout.
+            tokio::time::Instant::now() + PROVIDER_UNBOUNDED_WORK_WINDOW
+        };
+        Ok(ProviderPhaseDeadline::new(
+            work_expires_at,
+            PROVIDER_CLEANUP_BUDGET,
+        ))
+    }
+}
+
+/// Persist the authoritative clock after a local phase has returned, before
+/// its success or failure is propagated to the caller. This keeps failures in
+/// snapshotting, Git post-processing, documentation, verification, and
+/// promotion from leaving the durable run clock at the previous boundary.
+fn persist_work_boundary<T>(
+    state: &mut PipelineState,
+    work_clock: &RunWorkClock,
+    result: Result<T>,
+) -> Result<T> {
+    work_clock.save(state)?;
+    result
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunLoopOutcome {
     Done,
@@ -295,16 +393,18 @@ async fn run_turn_loop_inner(
     completion_mode: CompletionMode,
 ) -> Result<RunLoopOutcome> {
     let mut config = config;
+    let work_clock = RunWorkClock::new(state)?;
+    let provider_phase_deadline = work_clock.provider_phase_deadline(config.max_wall_seconds)?;
     // AS-BUILT §9: the harness, not the model, owns the bounded mutation loop
     // and writes state after every turn boundary.
-    let mut history = load_or_reconstruct_history(state, config.from_turn)?;
+    let mut history = load_or_reconstruct_history(state, config.from_turn, &work_clock)?;
     if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode
         && !history.iter().any(|entry| entry == &candidate.feedback)
     {
         history.push(candidate.feedback.clone());
         state.failure_reason = Some(candidate.feedback.clone());
         save_history(state, &history)?;
-        save_state(state)?;
+        work_clock.save(state)?;
     }
     ensure_sandbox_toml(state)?;
     let seam_config_path = config
@@ -337,7 +437,7 @@ async fn run_turn_loop_inner(
     if should_cancel_run(state, &run_token) {
         state.status = deadreckon_core::state::RunStatus::Killed;
         state.failure_reason = Some("run cancelled before turn loop".to_string());
-        save_state(state)?;
+        work_clock.save(state)?;
         emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
         return Ok(RunLoopOutcome::Killed);
     }
@@ -346,17 +446,17 @@ async fn run_turn_loop_inner(
     // process attempt. If this attempt reaches a provider failure it records
     // a fresh typed classification below.
     state.provider_failure = None;
-    save_state(state)?;
+    work_clock.save(state)?;
     if let Some(from_turn) = config.from_turn {
         state.turn = from_turn;
-        save_state(state)?;
+        work_clock.save(state)?;
     }
 
     for _ in 0..config.max_turns {
         if should_cancel_run(state, &run_token) {
             state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled".to_string());
-            save_state(state)?;
+            work_clock.save(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
             return Ok(RunLoopOutcome::Killed);
         }
@@ -367,8 +467,10 @@ async fn run_turn_loop_inner(
             config.event_sender.as_ref(),
             RunEventKind::TurnStarted { turn },
         )?;
-        capture_trusted_turn_head(state, turn)?;
-        snapshot_working(state, turn.saturating_sub(1))?;
+        let head_result = capture_trusted_turn_head(state, turn);
+        persist_work_boundary(state, &work_clock, head_result)?;
+        let snapshot_result = snapshot_working(state, turn.saturating_sub(1));
+        persist_work_boundary(state, &work_clock, snapshot_result)?;
         let selected_route = router.selected_route_info();
         let selected_provider = config
             .provider
@@ -434,21 +536,18 @@ async fn run_turn_loop_inner(
                 _ => None,
             };
         let started = Instant::now();
-        // The wall cap binds DURING the turn, not only between turns: a hung
-        // or over-long provider call is cut at the remaining budget and the
-        // in-flight subprocess is cancelled rather than orphaned.
-        let wall_remaining = config
-            .max_wall_seconds
-            .map(|cap| Duration::from_secs_f64((cap - state.total_wall_seconds).max(1.0)));
+        // One absolute cumulative work cutoff is shared by every provider
+        // attempt in this run-loop process. Cleanup has its own bounded window
+        // and never grants a retry more provider work.
+        request.cancellation_token = Some(turn_token.clone());
         let mut completion =
-            complete_within_wall_budget(router.complete(&request), wall_remaining, &turn_token)
-                .await;
+            complete_provider_phase(router, &mut request, provider_phase_deadline).await;
         // Self-healing: one bounded retry on transient provider errors (429,
         // 5xx, transport blips, CLI rate limits). The retry is recorded in
         // events.jsonl so "turn N hit a transient error; retried" is visible
         // in attach and the audit trail, and the wall budget shrinks by the
         // time the failed attempt and backoff consumed.
-        if let Some(Err(err)) = &completion
+        if let ProviderPhaseOutcome::Completed(Err(err)) = &completion
             && err.is_retryable()
             && !should_cancel_run(state, &run_token)
         {
@@ -462,16 +561,16 @@ async fn run_turn_loop_inner(
                     ),
                 },
             )?;
-            tokio::time::sleep(PROVIDER_RETRY_BACKOFF).await;
-            let wall_remaining = config.max_wall_seconds.map(|cap| {
-                Duration::from_secs_f64(
-                    (cap - state.total_wall_seconds - started.elapsed().as_secs_f64()).max(1.0),
-                )
-            });
+            wait_for_provider_retry(
+                provider_phase_deadline.work_expires_at,
+                &turn_token,
+                PROVIDER_RETRY_BACKOFF,
+            )
+            .await;
+            request.cancellation_token = Some(turn_token.clone());
             completion =
-                complete_within_wall_budget(router.complete(&request), wall_remaining, &turn_token)
-                    .await;
-            if matches!(&completion, Some(Ok(_))) {
+                complete_provider_phase(router, &mut request, provider_phase_deadline).await;
+            if matches!(&completion, ProviderPhaseOutcome::Completed(Ok(_))) {
                 emit_event(
                     state,
                     config.event_sender.as_ref(),
@@ -483,16 +582,11 @@ async fn run_turn_loop_inner(
             }
         }
         let response = match completion {
-            None => {
-                if let Some(recorder) = flight_recorder.take() {
-                    recorder
-                        .finish(state, FlightSessionStatus::Killed, &[])
-                        .await?;
-                }
+            ProviderPhaseOutcome::WorkExpired { cleanup } => {
                 // The cut turn produced no provider result, but its wall time
                 // was really consumed: account for it honestly.
                 let elapsed = started.elapsed().as_secs_f64();
-                state.total_wall_seconds += elapsed;
+                work_clock.sync(state);
                 append_spend(
                     state,
                     &SpendRecord {
@@ -519,20 +613,69 @@ async fn run_turn_loop_inner(
                         kind: "loop".to_string(),
                     },
                 )?;
-                state.pause_reason = Some("wall-clock cap reached mid-turn".to_string());
-                save_state(state)?;
-                emit_run_completed(
+                let outcome = record_provider_interruption(
                     state,
-                    config.event_sender.as_ref(),
-                    RunLoopOutcome::PausedAtCap,
+                    turn,
+                    ProviderInterruption::WorkExpired,
+                    &cleanup,
+                    &work_clock,
                 )?;
-                return Ok(RunLoopOutcome::PausedAtCap);
+                if let Some(recorder) = flight_recorder.take() {
+                    let status = if matches!(&cleanup, ProviderCleanup::RetainedAuthority { .. }) {
+                        FlightSessionStatus::Failed
+                    } else {
+                        FlightSessionStatus::Killed
+                    };
+                    recorder.finish(state, status, &[]).await?;
+                }
+                emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                return Ok(outcome);
             }
-            Some(Ok(response)) => {
+            ProviderPhaseOutcome::Cancelled { cleanup } => {
+                let outcome = record_provider_interruption(
+                    state,
+                    turn,
+                    ProviderInterruption::Cancelled,
+                    &cleanup,
+                    &work_clock,
+                )?;
+                if let Some(recorder) = flight_recorder.take() {
+                    let status = if matches!(&cleanup, ProviderCleanup::RetainedAuthority { .. }) {
+                        FlightSessionStatus::Failed
+                    } else {
+                        FlightSessionStatus::Killed
+                    };
+                    recorder.finish(state, status, &[]).await?;
+                }
+                emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                return Ok(outcome);
+            }
+            ProviderPhaseOutcome::Completed(Ok(response)) => {
                 state.provider_failure = None;
                 response
             }
-            Some(Err(err)) if should_cancel_run(state, &run_token) => {
+            ProviderPhaseOutcome::Completed(Err(
+                deadreckon_providers::ProviderError::CleanupIncomplete {
+                    authority, detail, ..
+                },
+            )) => {
+                let outcome = record_provider_lost_containment(
+                    state,
+                    turn,
+                    "completion returned without cleanup proof",
+                    authority.as_deref(),
+                    &detail,
+                    &work_clock,
+                )?;
+                if let Some(recorder) = flight_recorder.take() {
+                    recorder
+                        .finish(state, FlightSessionStatus::Failed, &[])
+                        .await?;
+                }
+                emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                return Ok(outcome);
+            }
+            ProviderPhaseOutcome::Completed(Err(err)) if should_cancel_run(state, &run_token) => {
                 if let Some(recorder) = flight_recorder.take() {
                     recorder
                         .finish(state, FlightSessionStatus::Killed, &[])
@@ -540,11 +683,11 @@ async fn run_turn_loop_inner(
                 }
                 state.status = deadreckon_core::state::RunStatus::Killed;
                 state.failure_reason = Some(format!("run cancelled during provider call: {err}"));
-                save_state(state)?;
+                work_clock.save(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            Some(Err(err)) => {
+            ProviderPhaseOutcome::Completed(Err(err)) => {
                 if let Some(recorder) = flight_recorder.take() {
                     recorder
                         .finish(state, FlightSessionStatus::Failed, &[])
@@ -556,7 +699,7 @@ async fn run_turn_loop_inner(
                 state.failure_reason = Some(format!("provider error: {err}"));
                 state.provider_failure = Some(provider_failure_disposition(&err));
                 let _ = state.set_phase_status(PhaseId(40), PhaseStatus::Failed);
-                save_state(state)?;
+                work_clock.save(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
                 return Err(provider_error(&err));
             }
@@ -569,7 +712,7 @@ async fn run_turn_loop_inner(
             }
             state.status = deadreckon_core::state::RunStatus::Killed;
             state.failure_reason = Some("run cancelled after provider call".to_string());
-            save_state(state)?;
+            work_clock.save(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Killed)?;
             return Ok(RunLoopOutcome::Killed);
         }
@@ -614,12 +757,9 @@ async fn run_turn_loop_inner(
             },
         )?;
         state.total_spend_usd += response.spend.cost_usd;
-        // Providers that don't self-report wall time (direct API routes) still
-        // consume it; accrue measured elapsed so the wall cap is universal.
-        state.total_wall_seconds += response
-            .spend
-            .wall_time_seconds
-            .unwrap_or_else(|| started.elapsed().as_secs_f64());
+        // Provider-reported wall time remains phase evidence. The authoritative
+        // cumulative run clock is controller-measured and synchronized below.
+        work_clock.sync(state);
         append_spend(
             state,
             &SpendRecord {
@@ -664,13 +804,13 @@ async fn run_turn_loop_inner(
         // Persist the provider accounting before entering that boundary so a
         // supervisor/operator never sees a turn-0, zero-spend zombie after the
         // provider has already returned useful work.
-        save_state(state)?;
+        work_clock.save(state)?;
         if config
             .max_spend_usd
             .is_some_and(|cap| state.total_spend_usd > cap)
         {
             state.pause_reason = Some("spend cap reached".to_string());
-            save_state(state)?;
+            work_clock.save(state)?;
             emit_run_completed(
                 state,
                 config.event_sender.as_ref(),
@@ -680,10 +820,10 @@ async fn run_turn_loop_inner(
         }
         if config
             .max_wall_seconds
-            .is_some_and(|cap| state.total_wall_seconds > cap)
+            .is_some_and(|cap| state.total_wall_seconds >= cap)
         {
             state.pause_reason = Some("wall-clock cap reached".to_string());
-            save_state(state)?;
+            work_clock.save(state)?;
             emit_run_completed(
                 state,
                 config.event_sender.as_ref(),
@@ -707,9 +847,12 @@ async fn run_turn_loop_inner(
                 },
             )
             .await?;
-            let raw_changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
-            let changed = deliverable_changed_files(state, &raw_changed)?;
-            snapshot_working(state, turn)?;
+            let changed_result = changed_files_since_snapshot(state, turn.saturating_sub(1));
+            let raw_changed = persist_work_boundary(state, &work_clock, changed_result)?;
+            let deliverable_result = deliverable_changed_files(state, &raw_changed);
+            let changed = persist_work_boundary(state, &work_clock, deliverable_result)?;
+            let snapshot_result = snapshot_working(state, turn);
+            persist_work_boundary(state, &work_clock, snapshot_result)?;
             append_trace(
                 state,
                 &TraceRecord {
@@ -729,16 +872,24 @@ async fn run_turn_loop_inner(
                     }),
                 },
             )?;
-            append_provenance_for_files(state, turn, &tool_call_id, &response.model, raw_changed)?;
-            commit_worktree_turn(state, turn, "cli_subagent")?;
+            let provenance_result = append_provenance_for_files(
+                state,
+                turn,
+                &tool_call_id,
+                &response.model,
+                raw_changed,
+            );
+            persist_work_boundary(state, &work_clock, provenance_result)?;
+            let commit_result = commit_worktree_turn(state, turn, "cli_subagent");
+            persist_work_boundary(state, &work_clock, commit_result)?;
             if changed.is_empty() {
                 classify_cli_no_deliverable_changes(state, &history, turn);
                 state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
-                save_state(state)?;
+                work_clock.save(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
                 return Ok(RunLoopOutcome::Failed);
             }
-            append_turn_doc_checkpoint(
+            let docs_result = append_turn_doc_checkpoint(
                 state,
                 config.event_sender.as_ref(),
                 TurnDocInput {
@@ -763,7 +914,8 @@ async fn run_turn_loop_inner(
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
                 },
-            )?;
+            );
+            persist_work_boundary(state, &work_clock, docs_result)?;
             emit_tool_event_with_hook(
                 state,
                 config.event_sender.as_ref(),
@@ -785,50 +937,115 @@ async fn run_turn_loop_inner(
             )? {
                 state.turn = turn;
                 save_history(state, &history)?;
-                save_state(state)?;
+                work_clock.save(state)?;
                 continue;
             }
             state.turn = turn;
             save_history(state, &history)?;
-            save_state(state)?;
-            complete_run_docs(state, router, &config).await?;
-            commit_finalized_turn(state, turn)?;
+            work_clock.save(state)?;
+            begin_verification(state, &work_clock)?;
+            let docs_result = complete_run_docs(state, router, &config, &work_clock).await;
+            verification_result(state, &work_clock, docs_result)?;
+            if should_cancel_run(state, &run_token) {
+                fail_verification(state, &work_clock)?;
+                finish_cancelled_run_if_requested(
+                    state,
+                    &run_token,
+                    config.event_sender.as_ref(),
+                    "run cancelled during documentation finalization",
+                    &work_clock,
+                )?;
+                return Ok(RunLoopOutcome::Killed);
+            }
+            if pause_verification_if_work_expired(
+                state,
+                config.event_sender.as_ref(),
+                provider_phase_deadline.work_expires_at,
+                "documentation finalization",
+                &work_clock,
+            )? {
+                return Ok(RunLoopOutcome::PausedAtCap);
+            }
+            let commit_result = commit_finalized_turn(state, turn);
+            let commit_result = persist_work_boundary(state, &work_clock, commit_result);
+            verification_result(state, &work_clock, commit_result)?;
+            if pause_verification_if_work_expired(
+                state,
+                config.event_sender.as_ref(),
+                provider_phase_deadline.work_expires_at,
+                "finalized turn commit",
+                &work_clock,
+            )? {
+                return Ok(RunLoopOutcome::PausedAtCap);
+            }
             if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode {
-                persist_parent_repair_candidate(state, turn, candidate)?;
+                let candidate_result = persist_parent_repair_candidate(state, turn, candidate);
+                verification_result(state, &work_clock, candidate_result)?;
+                complete_verification(state, &work_clock)?;
                 state.failure_reason = None;
-                save_state(state)?;
+                work_clock.save(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
                 return Ok(RunLoopOutcome::Done);
             }
-            let Some(marker) = acceptance_gate_passed_or_record_failure(
+            let gate_result = acceptance_gate_passed_or_record_failure(
                 state,
                 config.event_sender.as_ref(),
                 turn,
                 &mut history,
                 config.sandbox_backend,
                 &run_token,
+                &work_clock,
+                provider_phase_deadline.work_expires_at,
             )
-            .await?
-            else {
-                if finish_cancelled_run_if_requested(
+            .await;
+            let marker = match verification_result(state, &work_clock, gate_result)? {
+                DeterministicGateDisposition::Passed(marker) => marker,
+                DeterministicGateDisposition::Revise => {
+                    revise_verification(state, &work_clock)?;
+                    continue;
+                }
+                DeterministicGateDisposition::PausedAtCap => {
+                    fail_verification(state, &work_clock)?;
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::PausedAtCap,
+                    )?;
+                    return Ok(RunLoopOutcome::PausedAtCap);
+                }
+                DeterministicGateDisposition::Cancelled => {
+                    fail_verification(state, &work_clock)?;
+                    finish_cancelled_run_if_requested(
+                        state,
+                        &run_token,
+                        config.event_sender.as_ref(),
+                        "run cancelled during deterministic verification",
+                        &work_clock,
+                    )?;
+                    return Ok(RunLoopOutcome::Killed);
+                }
+                DeterministicGateDisposition::LostContainment => {
+                    fail_verification(state, &work_clock)?;
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::Failed,
+                    )?;
+                    return Ok(RunLoopOutcome::Failed);
+                }
+            };
+            if should_cancel_run(state, &run_token) {
+                fail_verification(state, &work_clock)?;
+                finish_cancelled_run_if_requested(
                     state,
                     &run_token,
                     config.event_sender.as_ref(),
-                    "run cancelled during deterministic verification",
-                )? {
-                    return Ok(RunLoopOutcome::Killed);
-                }
-                continue;
-            };
-            if finish_cancelled_run_if_requested(
-                state,
-                &run_token,
-                config.event_sender.as_ref(),
-                "run cancelled before semantic verification",
-            )? {
+                    "run cancelled before semantic verification",
+                    &work_clock,
+                )?;
                 return Ok(RunLoopOutcome::Killed);
             }
-            match semantic_completion_disposition(
+            let semantic_result = semantic_completion_disposition(
                 state,
                 router,
                 &config,
@@ -836,14 +1053,17 @@ async fn run_turn_loop_inner(
                 &marker,
                 &mut history,
                 &run_token,
+                &work_clock,
             )
-            .await?
-            {
+            .await;
+            match verification_result(state, &work_clock, semantic_result)? {
                 SemanticCompletionDisposition::Achieved => {}
-                SemanticCompletionDisposition::Revise => continue,
+                SemanticCompletionDisposition::Revise => {
+                    revise_verification(state, &work_clock)?;
+                    continue;
+                }
                 SemanticCompletionDisposition::NeedsReview => {
-                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                    save_state(state)?;
+                    fail_verification(state, &work_clock)?;
                     emit_run_completed(
                         state,
                         config.event_sender.as_ref(),
@@ -852,8 +1072,7 @@ async fn run_turn_loop_inner(
                     return Ok(RunLoopOutcome::Failed);
                 }
                 SemanticCompletionDisposition::LostContainment => {
-                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                    save_state(state)?;
+                    fail_verification(state, &work_clock)?;
                     emit_run_completed(
                         state,
                         config.event_sender.as_ref(),
@@ -862,8 +1081,7 @@ async fn run_turn_loop_inner(
                     return Ok(RunLoopOutcome::Failed);
                 }
                 SemanticCompletionDisposition::BudgetExhausted => {
-                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                    save_state(state)?;
+                    fail_verification(state, &work_clock)?;
                     emit_run_completed(
                         state,
                         config.event_sender.as_ref(),
@@ -872,27 +1090,48 @@ async fn run_turn_loop_inner(
                     return Ok(RunLoopOutcome::PausedAtCap);
                 }
                 SemanticCompletionDisposition::Cancelled => {
+                    fail_verification(state, &work_clock)?;
                     finish_cancelled_run_if_requested(
                         state,
                         &run_token,
                         config.event_sender.as_ref(),
                         "run cancelled during semantic verification",
+                        &work_clock,
                     )?;
                     return Ok(RunLoopOutcome::Killed);
                 }
             }
+            if pause_verification_if_work_expired(
+                state,
+                config.event_sender.as_ref(),
+                provider_phase_deadline.work_expires_at,
+                "semantic verification",
+                &work_clock,
+            )? {
+                return Ok(RunLoopOutcome::PausedAtCap);
+            }
+            complete_verification(state, &work_clock)?;
             if finish_cancelled_run_if_requested(
                 state,
                 &run_token,
                 config.event_sender.as_ref(),
                 "run cancelled before promotion",
+                &work_clock,
             )? {
                 return Ok(RunLoopOutcome::Killed);
             }
-            promote_if_ready(state)?;
+            state.set_phase_status(PhaseId(60), PhaseStatus::Executing)?;
+            work_clock.save(state)?;
+            let promotion_result = promote_if_ready(state);
+            let promotion_result = persist_work_boundary(state, &work_clock, promotion_result);
+            if promotion_result.is_err() {
+                state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                work_clock.save(state)?;
+            }
+            promotion_result?;
             state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
             state.failure_reason = None;
-            save_state(state)?;
+            work_clock.save(state)?;
             emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
             return Ok(RunLoopOutcome::Done);
         }
@@ -932,7 +1171,7 @@ async fn run_turn_loop_inner(
                     history.push(format!("tool {tool_call_id} refused: {reason}"));
                     state.turn = turn;
                     save_history(state, &history)?;
-                    save_state(state)?;
+                    work_clock.save(state)?;
                     continue;
                 }
                 if let Some(reason) = policy_seam_refusal(
@@ -957,58 +1196,96 @@ async fn run_turn_loop_inner(
                     history.push(format!("tool {tool_call_id} refused: {reason}"));
                     state.turn = turn;
                     save_history(state, &history)?;
-                    save_state(state)?;
+                    work_clock.save(state)?;
                     continue;
                 }
-                let output = match run_sandbox(SandboxSpec {
-                    backend: config.sandbox_backend,
-                    docker: None,
-                    cwd: state.working_dir.clone(),
-                    program: OsString::from("sh"),
-                    // A login shell rewrites PATH from /etc/profile. That
-                    // discards the supervisor's approved toolchain paths
-                    // (for example ~/.cargo/bin) inside an otherwise valid
-                    // sandbox. The private sandbox HOME has no user profile
-                    // to load, so preserve the inherited PATH with `-c`.
-                    args: vec![OsString::from("-c"), OsString::from(command.clone())],
-                    stdin: None,
-                    env: BTreeMap::new(),
-                    allow_network: policy.allow_network,
-                    pid_file: Some(
-                        state
-                            .run_root
-                            .join("child-pids")
-                            .join(format!("tool-{tool_call_id}.pid")),
-                    ),
-                    cancellation_token: Some(tool_token),
-                    profile_dir: Some(state.run_root.join("sandbox")),
-                    read_allowlist: policy.read_allowlist,
-                    write_allowlist: policy.write_allowlist,
-                    read_denylist: Vec::new(),
-                    write_denylist: Vec::new(),
-                    network_allowlist: policy.network_allowlist,
-                    workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
-                    cleanup_process_group: false,
-                    guarded_launch: None,
-                })
-                .await
-                {
-                    Ok(output) => output,
-                    Err(deadreckon_sandbox::SandboxError::Cancelled)
-                        if should_cancel_run(state, &run_token) =>
-                    {
-                        state.status = deadreckon_core::state::RunStatus::Killed;
-                        state.failure_reason = Some("run cancelled during tool call".to_string());
-                        save_state(state)?;
-                        emit_run_completed(
+                let sandboxed = run_sandboxed_work_phase(
+                    SandboxSpec {
+                        backend: config.sandbox_backend,
+                        docker: None,
+                        cwd: state.working_dir.clone(),
+                        program: OsString::from("sh"),
+                        // A login shell rewrites PATH from /etc/profile. That
+                        // discards the supervisor's approved toolchain paths
+                        // (for example ~/.cargo/bin) inside an otherwise valid
+                        // sandbox. The private sandbox HOME has no user profile
+                        // to load, so preserve the inherited PATH with `-c`.
+                        args: vec![OsString::from("-c"), OsString::from(command.clone())],
+                        stdin: None,
+                        env: BTreeMap::new(),
+                        allow_network: policy.allow_network,
+                        pid_file: Some(
+                            state
+                                .run_root
+                                .join("child-pids")
+                                .join(format!("tool-{tool_call_id}.pid")),
+                        ),
+                        cancellation_token: None,
+                        profile_dir: Some(state.run_root.join("sandbox")),
+                        read_allowlist: policy.read_allowlist,
+                        write_allowlist: policy.write_allowlist,
+                        read_denylist: Vec::new(),
+                        write_denylist: Vec::new(),
+                        network_allowlist: policy.network_allowlist,
+                        workspace_access: deadreckon_sandbox::WorkspaceAccess::ReadWrite,
+                        cleanup_process_group: false,
+                        guarded_launch: None,
+                    },
+                    provider_phase_deadline.work_expires_at,
+                    &tool_token,
+                )
+                .await;
+                let output = match sandboxed {
+                    SandboxedPhaseOutcome::Completed {
+                        cleanup: ProviderCleanup::RetainedAuthority { path, detail },
+                        ..
+                    } => {
+                        let outcome = record_runtime_lost_containment(
                             state,
-                            config.event_sender.as_ref(),
-                            RunLoopOutcome::Killed,
+                            turn,
+                            "bash tool phase",
+                            Some(&path),
+                            &detail,
+                            &work_clock,
                         )?;
-                        return Ok(RunLoopOutcome::Killed);
+                        emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                        return Ok(outcome);
                     }
-                    Err(err) => return Err(sandbox_error(&err)),
+                    SandboxedPhaseOutcome::Completed {
+                        result: Ok(output), ..
+                    } => output,
+                    SandboxedPhaseOutcome::Completed {
+                        result: Err(error), ..
+                    } => {
+                        work_clock.save(state)?;
+                        return Err(sandbox_error(&error));
+                    }
+                    SandboxedPhaseOutcome::WorkExpired { cleanup } => {
+                        let outcome = record_runtime_phase_interruption(
+                            state,
+                            turn,
+                            "bash tool phase",
+                            RuntimePhaseInterruption::WorkExpired,
+                            &cleanup,
+                            &work_clock,
+                        )?;
+                        emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                        return Ok(outcome);
+                    }
+                    SandboxedPhaseOutcome::Cancelled { cleanup } => {
+                        let outcome = record_runtime_phase_interruption(
+                            state,
+                            turn,
+                            "bash tool phase",
+                            RuntimePhaseInterruption::Cancelled,
+                            &cleanup,
+                            &work_clock,
+                        )?;
+                        emit_run_completed(state, config.event_sender.as_ref(), outcome.clone())?;
+                        return Ok(outcome);
+                    }
                 };
+                work_clock.save(state)?;
                 append_trace(
                     state,
                     &TraceRecord {
@@ -1027,18 +1304,24 @@ async fn run_turn_loop_inner(
                         }),
                     },
                 )?;
-                let raw_changed = changed_files_since_snapshot(state, turn.saturating_sub(1))?;
-                let changed = deliverable_changed_files(state, &raw_changed)?;
-                snapshot_working(state, turn)?;
-                append_provenance_for_files(
+                let changed_result = changed_files_since_snapshot(state, turn.saturating_sub(1));
+                let raw_changed = persist_work_boundary(state, &work_clock, changed_result)?;
+                let deliverable_result = deliverable_changed_files(state, &raw_changed);
+                let changed = persist_work_boundary(state, &work_clock, deliverable_result)?;
+                let snapshot_result = snapshot_working(state, turn);
+                persist_work_boundary(state, &work_clock, snapshot_result)?;
+                let provenance_result = append_provenance_for_files(
                     state,
                     turn,
                     &tool_call_id,
                     &response.model,
                     raw_changed,
-                )?;
-                commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"))?;
-                append_turn_doc_checkpoint(
+                );
+                persist_work_boundary(state, &work_clock, provenance_result)?;
+                let commit_result =
+                    commit_worktree_turn(state, turn, &format!("bash {tool_call_id}"));
+                persist_work_boundary(state, &work_clock, commit_result)?;
+                let docs_result = append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
                     TurnDocInput {
@@ -1051,7 +1334,8 @@ async fn run_turn_loop_inner(
                         tool_stdout: Some(output.stdout.clone()),
                         tool_stderr: Some(output.stderr.clone()),
                     },
-                )?;
+                );
+                persist_work_boundary(state, &work_clock, docs_result)?;
                 emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
@@ -1106,7 +1390,7 @@ async fn run_turn_loop_inner(
                             history.push(format!("tool {tool_call_id} refused: {reason}"));
                             state.turn = turn;
                             save_history(state, &history)?;
-                            save_state(state)?;
+                            work_clock.save(state)?;
                             continue;
                         }
                     };
@@ -1133,10 +1417,11 @@ async fn run_turn_loop_inner(
                     history.push(format!("tool {tool_call_id} refused: {reason}"));
                     state.turn = turn;
                     save_history(state, &history)?;
-                    save_state(state)?;
+                    work_clock.save(state)?;
                     continue;
                 }
                 write_workspace_file_no_follow(&state.working_dir, &path, content.as_bytes())?;
+                work_clock.save(state)?;
                 append_trace(
                     state,
                     &TraceRecord {
@@ -1151,17 +1436,21 @@ async fn run_turn_loop_inner(
                         }),
                     },
                 )?;
-                snapshot_working(state, turn)?;
+                let snapshot_result = snapshot_working(state, turn);
+                persist_work_boundary(state, &work_clock, snapshot_result)?;
                 let changed = vec![target.clone()];
-                append_provenance_for_files(
+                let provenance_result = append_provenance_for_files(
                     state,
                     turn,
                     &tool_call_id,
                     &response.model,
                     changed.clone(),
-                )?;
-                commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"))?;
-                append_turn_doc_checkpoint(
+                );
+                persist_work_boundary(state, &work_clock, provenance_result)?;
+                let commit_result =
+                    commit_worktree_turn(state, turn, &format!("write_file {tool_call_id}"));
+                persist_work_boundary(state, &work_clock, commit_result)?;
+                let docs_result = append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
                     TurnDocInput {
@@ -1174,7 +1463,8 @@ async fn run_turn_loop_inner(
                         tool_stdout: None,
                         tool_stderr: None,
                     },
-                )?;
+                );
+                persist_work_boundary(state, &work_clock, docs_result)?;
                 emit_tool_event_with_hook(
                     state,
                     config.event_sender.as_ref(),
@@ -1216,15 +1506,15 @@ async fn run_turn_loop_inner(
                 ));
                 state.turn = turn;
                 save_history(state, &history)?;
-                save_state(state)?;
+                work_clock.save(state)?;
                 continue;
             }
             Action::Done { summary } => {
                 state.turn = turn;
                 history.push(format!("done: {}", summary.clone().unwrap_or_default()));
                 save_history(state, &history)?;
-                save_state(state)?;
-                append_turn_doc_checkpoint(
+                work_clock.save(state)?;
+                let docs_result = append_turn_doc_checkpoint(
                     state,
                     config.event_sender.as_ref(),
                     TurnDocInput {
@@ -1237,7 +1527,8 @@ async fn run_turn_loop_inner(
                         tool_stdout: None,
                         tool_stderr: None,
                     },
-                )?;
+                );
+                persist_work_boundary(state, &work_clock, docs_result)?;
                 if !implementation_notes_ready_or_request_followup(
                     state,
                     config.event_sender.as_ref(),
@@ -1246,47 +1537,112 @@ async fn run_turn_loop_inner(
                 )? {
                     state.turn = turn;
                     save_history(state, &history)?;
-                    save_state(state)?;
+                    work_clock.save(state)?;
                     continue;
                 }
-                complete_run_docs(state, router, &config).await?;
-                commit_finalized_turn(state, turn)?;
+                begin_verification(state, &work_clock)?;
+                let docs_result = complete_run_docs(state, router, &config, &work_clock).await;
+                verification_result(state, &work_clock, docs_result)?;
+                if should_cancel_run(state, &run_token) {
+                    fail_verification(state, &work_clock)?;
+                    finish_cancelled_run_if_requested(
+                        state,
+                        &run_token,
+                        config.event_sender.as_ref(),
+                        "run cancelled during documentation finalization",
+                        &work_clock,
+                    )?;
+                    return Ok(RunLoopOutcome::Killed);
+                }
+                if pause_verification_if_work_expired(
+                    state,
+                    config.event_sender.as_ref(),
+                    provider_phase_deadline.work_expires_at,
+                    "documentation finalization",
+                    &work_clock,
+                )? {
+                    return Ok(RunLoopOutcome::PausedAtCap);
+                }
+                let commit_result = commit_finalized_turn(state, turn);
+                let commit_result = persist_work_boundary(state, &work_clock, commit_result);
+                verification_result(state, &work_clock, commit_result)?;
+                if pause_verification_if_work_expired(
+                    state,
+                    config.event_sender.as_ref(),
+                    provider_phase_deadline.work_expires_at,
+                    "finalized turn commit",
+                    &work_clock,
+                )? {
+                    return Ok(RunLoopOutcome::PausedAtCap);
+                }
                 if let CompletionMode::ParentRepairCandidate(candidate) = &completion_mode {
-                    persist_parent_repair_candidate(state, turn, candidate)?;
+                    let candidate_result = persist_parent_repair_candidate(state, turn, candidate);
+                    verification_result(state, &work_clock, candidate_result)?;
+                    complete_verification(state, &work_clock)?;
                     state.failure_reason = None;
-                    save_state(state)?;
+                    work_clock.save(state)?;
                     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
                     return Ok(RunLoopOutcome::Done);
                 }
-                let Some(marker) = acceptance_gate_passed_or_record_failure(
+                let gate_result = acceptance_gate_passed_or_record_failure(
                     state,
                     config.event_sender.as_ref(),
                     turn,
                     &mut history,
                     config.sandbox_backend,
                     &run_token,
+                    &work_clock,
+                    provider_phase_deadline.work_expires_at,
                 )
-                .await?
-                else {
-                    if finish_cancelled_run_if_requested(
+                .await;
+                let marker = match verification_result(state, &work_clock, gate_result)? {
+                    DeterministicGateDisposition::Passed(marker) => marker,
+                    DeterministicGateDisposition::Revise => {
+                        revise_verification(state, &work_clock)?;
+                        continue;
+                    }
+                    DeterministicGateDisposition::PausedAtCap => {
+                        fail_verification(state, &work_clock)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::PausedAtCap,
+                        )?;
+                        return Ok(RunLoopOutcome::PausedAtCap);
+                    }
+                    DeterministicGateDisposition::Cancelled => {
+                        fail_verification(state, &work_clock)?;
+                        finish_cancelled_run_if_requested(
+                            state,
+                            &run_token,
+                            config.event_sender.as_ref(),
+                            "run cancelled during deterministic verification",
+                            &work_clock,
+                        )?;
+                        return Ok(RunLoopOutcome::Killed);
+                    }
+                    DeterministicGateDisposition::LostContainment => {
+                        fail_verification(state, &work_clock)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::Failed,
+                        )?;
+                        return Ok(RunLoopOutcome::Failed);
+                    }
+                };
+                if should_cancel_run(state, &run_token) {
+                    fail_verification(state, &work_clock)?;
+                    finish_cancelled_run_if_requested(
                         state,
                         &run_token,
                         config.event_sender.as_ref(),
-                        "run cancelled during deterministic verification",
-                    )? {
-                        return Ok(RunLoopOutcome::Killed);
-                    }
-                    continue;
-                };
-                if finish_cancelled_run_if_requested(
-                    state,
-                    &run_token,
-                    config.event_sender.as_ref(),
-                    "run cancelled before semantic verification",
-                )? {
+                        "run cancelled before semantic verification",
+                        &work_clock,
+                    )?;
                     return Ok(RunLoopOutcome::Killed);
                 }
-                match semantic_completion_disposition(
+                let semantic_result = semantic_completion_disposition(
                     state,
                     router,
                     &config,
@@ -1294,14 +1650,17 @@ async fn run_turn_loop_inner(
                     &marker,
                     &mut history,
                     &run_token,
+                    &work_clock,
                 )
-                .await?
-                {
+                .await;
+                match verification_result(state, &work_clock, semantic_result)? {
                     SemanticCompletionDisposition::Achieved => {}
-                    SemanticCompletionDisposition::Revise => continue,
+                    SemanticCompletionDisposition::Revise => {
+                        revise_verification(state, &work_clock)?;
+                        continue;
+                    }
                     SemanticCompletionDisposition::NeedsReview => {
-                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                        save_state(state)?;
+                        fail_verification(state, &work_clock)?;
                         emit_run_completed(
                             state,
                             config.event_sender.as_ref(),
@@ -1310,8 +1669,7 @@ async fn run_turn_loop_inner(
                         return Ok(RunLoopOutcome::Failed);
                     }
                     SemanticCompletionDisposition::LostContainment => {
-                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                        save_state(state)?;
+                        fail_verification(state, &work_clock)?;
                         emit_run_completed(
                             state,
                             config.event_sender.as_ref(),
@@ -1320,8 +1678,7 @@ async fn run_turn_loop_inner(
                         return Ok(RunLoopOutcome::Failed);
                     }
                     SemanticCompletionDisposition::BudgetExhausted => {
-                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
-                        save_state(state)?;
+                        fail_verification(state, &work_clock)?;
                         emit_run_completed(
                             state,
                             config.event_sender.as_ref(),
@@ -1330,34 +1687,55 @@ async fn run_turn_loop_inner(
                         return Ok(RunLoopOutcome::PausedAtCap);
                     }
                     SemanticCompletionDisposition::Cancelled => {
+                        fail_verification(state, &work_clock)?;
                         finish_cancelled_run_if_requested(
                             state,
                             &run_token,
                             config.event_sender.as_ref(),
                             "run cancelled during semantic verification",
+                            &work_clock,
                         )?;
                         return Ok(RunLoopOutcome::Killed);
                     }
                 }
+                if pause_verification_if_work_expired(
+                    state,
+                    config.event_sender.as_ref(),
+                    provider_phase_deadline.work_expires_at,
+                    "semantic verification",
+                    &work_clock,
+                )? {
+                    return Ok(RunLoopOutcome::PausedAtCap);
+                }
+                complete_verification(state, &work_clock)?;
                 if finish_cancelled_run_if_requested(
                     state,
                     &run_token,
                     config.event_sender.as_ref(),
                     "run cancelled before promotion",
+                    &work_clock,
                 )? {
                     return Ok(RunLoopOutcome::Killed);
                 }
-                promote_if_ready(state)?;
+                state.set_phase_status(PhaseId(60), PhaseStatus::Executing)?;
+                work_clock.save(state)?;
+                let promotion_result = promote_if_ready(state);
+                let promotion_result = persist_work_boundary(state, &work_clock, promotion_result);
+                if promotion_result.is_err() {
+                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                    work_clock.save(state)?;
+                }
+                promotion_result?;
                 state.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
                 state.failure_reason = None;
-                save_state(state)?;
+                work_clock.save(state)?;
                 emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Done)?;
                 return Ok(RunLoopOutcome::Done);
             }
         }
         state.turn = turn;
         save_history(state, &history)?;
-        save_state(state)?;
+        work_clock.save(state)?;
     }
 
     state.failure_reason = Some(match state.failure_reason.take() {
@@ -1365,7 +1743,7 @@ async fn run_turn_loop_inner(
         None => "max turn budget exhausted".to_string(),
     });
     state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
-    save_state(state)?;
+    work_clock.save(state)?;
     emit_run_completed(state, config.event_sender.as_ref(), RunLoopOutcome::Failed)?;
     Ok(RunLoopOutcome::Failed)
 }
@@ -1477,20 +1855,182 @@ fn finish_cancelled_run_if_requested(
     token: &CancellationToken,
     sender: Option<&broadcast::Sender<RunEvent>>,
     reason: &str,
+    work_clock: &RunWorkClock,
 ) -> Result<bool> {
     if !should_cancel_run(state, token) {
         return Ok(false);
     }
     state.status = RunStatus::Killed;
     state.failure_reason = Some(reason.to_string());
-    save_state(state)?;
+    work_clock.save(state)?;
     emit_run_completed(state, sender, RunLoopOutcome::Killed)?;
+    Ok(true)
+}
+
+fn finish_work_expired_if_reached(
+    state: &mut PipelineState,
+    work_expires_at: tokio::time::Instant,
+    phase: &str,
+    work_clock: &RunWorkClock,
+) -> Result<bool> {
+    work_clock.sync(state);
+    if tokio::time::Instant::now() < work_expires_at {
+        return Ok(false);
+    }
+    let reason = format!("wall-clock cap reached during {phase}");
+    state.pause_reason = Some(reason.clone());
+    state.failure_reason = Some(reason);
+    work_clock.save(state)?;
+    Ok(true)
+}
+
+fn pause_verification_if_work_expired(
+    state: &mut PipelineState,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    work_expires_at: tokio::time::Instant,
+    phase: &str,
+    work_clock: &RunWorkClock,
+) -> Result<bool> {
+    if !finish_work_expired_if_reached(state, work_expires_at, phase, work_clock)? {
+        return Ok(false);
+    }
+    state.set_phase_status(PhaseId(50), PhaseStatus::Failed)?;
+    work_clock.save(state)?;
+    emit_run_completed(state, sender, RunLoopOutcome::PausedAtCap)?;
     Ok(true)
 }
 
 /// Backoff before the single transient-error retry: long enough for a rate
 /// limit window to move, short enough to be negligible against a turn.
 const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+const PROVIDER_UNBOUNDED_WORK_WINDOW: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+const RUNTIME_PHASE_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
+
+async fn wait_for_provider_retry(
+    work_expires_at: tokio::time::Instant,
+    cancellation_token: &CancellationToken,
+    backoff: Duration,
+) {
+    tokio::select! {
+        biased;
+        () = cancellation_token.cancelled() => {}
+        () = tokio::time::sleep_until(work_expires_at) => {}
+        () = tokio::time::sleep(backoff) => {}
+    }
+}
+
+#[derive(Debug)]
+enum SandboxedPhaseOutcome {
+    Completed {
+        result: std::result::Result<SandboxRunOutput, SandboxError>,
+        cleanup: ProviderCleanup,
+    },
+    WorkExpired {
+        cleanup: ProviderCleanup,
+    },
+    Cancelled {
+        cleanup: ProviderCleanup,
+    },
+}
+
+enum SandboxedPhaseBoundary<T> {
+    Completed(T),
+    WorkExpired,
+    Cancelled,
+}
+
+async fn run_sandboxed_work_phase(
+    mut spec: SandboxSpec,
+    work_expires_at: tokio::time::Instant,
+    external_cancellation: &CancellationToken,
+) -> SandboxedPhaseOutcome {
+    let authority = spec.pid_file.clone();
+    if external_cancellation.is_cancelled() {
+        return SandboxedPhaseOutcome::Cancelled {
+            cleanup: classify_runtime_phase_cleanup(authority.as_deref(), true),
+        };
+    }
+    if tokio::time::Instant::now() >= work_expires_at {
+        return SandboxedPhaseOutcome::WorkExpired {
+            cleanup: classify_runtime_phase_cleanup(authority.as_deref(), true),
+        };
+    }
+
+    let phase_token = CancellationToken::new();
+    spec.cancellation_token = Some(phase_token.clone());
+    let execution = run_sandbox(spec);
+    tokio::pin!(execution);
+    let boundary = tokio::select! {
+        biased;
+        () = external_cancellation.cancelled() => SandboxedPhaseBoundary::Cancelled,
+        result = &mut execution => SandboxedPhaseBoundary::Completed(result),
+        () = tokio::time::sleep_until(work_expires_at) => SandboxedPhaseBoundary::WorkExpired,
+    };
+
+    match boundary {
+        SandboxedPhaseBoundary::Completed(result) => SandboxedPhaseOutcome::Completed {
+            cleanup: classify_runtime_phase_cleanup(authority.as_deref(), true),
+            result,
+        },
+        SandboxedPhaseBoundary::WorkExpired => {
+            phase_token.cancel();
+            let cleanup_resolved =
+                tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut execution)
+                    .await
+                    .is_ok();
+            let cleanup = classify_runtime_phase_cleanup(authority.as_deref(), cleanup_resolved);
+            SandboxedPhaseOutcome::WorkExpired { cleanup }
+        }
+        SandboxedPhaseBoundary::Cancelled => {
+            phase_token.cancel();
+            let cleanup_resolved =
+                tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut execution)
+                    .await
+                    .is_ok();
+            let cleanup = classify_runtime_phase_cleanup(authority.as_deref(), cleanup_resolved);
+            SandboxedPhaseOutcome::Cancelled { cleanup }
+        }
+    }
+}
+
+fn classify_runtime_phase_cleanup(
+    authority: Option<&Path>,
+    execution_resolved: bool,
+) -> ProviderCleanup {
+    let Some(authority) = authority else {
+        return if execution_resolved {
+            ProviderCleanup::NotApplicable
+        } else {
+            ProviderCleanup::RetainedAuthority {
+                path: PathBuf::from("<unavailable-runtime-process-authority>"),
+                detail:
+                    "runtime subprocess cleanup did not resolve and no authority path was available"
+                        .to_string(),
+            }
+        };
+    };
+    match std::fs::symlink_metadata(authority) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && execution_resolved => {
+            ProviderCleanup::Proven
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            ProviderCleanup::RetainedAuthority {
+                path: authority.to_path_buf(),
+                detail: "runtime subprocess cleanup future did not resolve before its separate cleanup deadline"
+                    .to_string(),
+            }
+        }
+        Ok(_) => ProviderCleanup::RetainedAuthority {
+            path: authority.to_path_buf(),
+            detail: "runtime subprocess authority remains after the phase boundary".to_string(),
+        },
+        Err(error) => ProviderCleanup::RetainedAuthority {
+            path: authority.to_path_buf(),
+            detail: format!("runtime subprocess authority could not be inspected: {error}"),
+        },
+    }
+}
 
 fn provider_failure_disposition(
     error: &deadreckon_providers::ProviderError,
@@ -1502,29 +2042,200 @@ fn provider_failure_disposition(
     }
 }
 
-/// Run a provider completion bounded by the remaining wall budget. `None`
-/// means the budget elapsed first: the turn token is cancelled so the
-/// provider subprocess is reaped, with a bounded grace period for cleanup
-/// before the future is dropped.
-async fn complete_within_wall_budget<F>(
-    completion: F,
-    wall_remaining: Option<Duration>,
-    turn_token: &CancellationToken,
-) -> Option<deadreckon_providers::Result<ProviderResponse>>
-where
-    F: std::future::Future<Output = deadreckon_providers::Result<ProviderResponse>>,
-{
-    tokio::pin!(completion);
-    let Some(remaining) = wall_remaining else {
-        return Some(completion.await);
-    };
-    if let Ok(result) = tokio::time::timeout(remaining, &mut completion).await {
-        Some(result)
-    } else {
-        turn_token.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-        None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderInterruption {
+    WorkExpired,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimePhaseInterruption {
+    WorkExpired,
+    Cancelled,
+}
+
+fn record_runtime_phase_interruption(
+    state: &mut PipelineState,
+    turn: u32,
+    phase: &str,
+    interruption: RuntimePhaseInterruption,
+    cleanup: &ProviderCleanup,
+    work_clock: &RunWorkClock,
+) -> Result<RunLoopOutcome> {
+    match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+            let outcome = match interruption {
+                RuntimePhaseInterruption::WorkExpired => {
+                    state.pause_reason = Some(format!(
+                        "wall-clock cap reached during {phase}; subprocess cleanup was proven"
+                    ));
+                    RunLoopOutcome::PausedAtCap
+                }
+                RuntimePhaseInterruption::Cancelled => {
+                    state.status = RunStatus::Killed;
+                    state.failure_reason = Some(format!(
+                        "run cancelled during {phase}; subprocess cleanup was proven"
+                    ));
+                    RunLoopOutcome::Killed
+                }
+            };
+            work_clock.save(state)?;
+            Ok(outcome)
+        }
+        ProviderCleanup::RetainedAuthority { path, detail } => record_runtime_lost_containment(
+            state,
+            turn,
+            phase,
+            Some(path.as_path()),
+            detail,
+            work_clock,
+        ),
     }
+}
+
+fn record_runtime_lost_containment(
+    state: &mut PipelineState,
+    turn: u32,
+    phase: &str,
+    authority: Option<&Path>,
+    detail: &str,
+    work_clock: &RunWorkClock,
+) -> Result<RunLoopOutcome> {
+    let authority_label = authority
+        .map(|path| format!(" at {}", path.display()))
+        .unwrap_or_else(|| " with an unavailable authority path".to_string());
+    let reason =
+        format!("LOST_CONTAINMENT: {phase} retained process authority{authority_label}: {detail}");
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "runtime.lost_containment".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "phase": phase,
+                "authority": authority,
+                "reason": detail,
+            }),
+        },
+    )?;
+    state.pause_reason = None;
+    state.failure_reason = Some(reason);
+    state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
+    work_clock.save(state)?;
+    Ok(RunLoopOutcome::Failed)
+}
+
+fn record_provider_interruption(
+    state: &mut PipelineState,
+    turn: u32,
+    interruption: ProviderInterruption,
+    cleanup: &ProviderCleanup,
+    work_clock: &RunWorkClock,
+) -> Result<RunLoopOutcome> {
+    let boundary = match interruption {
+        ProviderInterruption::WorkExpired => "work deadline expired",
+        ProviderInterruption::Cancelled => "controller cancellation",
+    };
+    match cleanup {
+        ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
+            let outcome = match interruption {
+                ProviderInterruption::WorkExpired => {
+                    state.pause_reason = Some("wall-clock cap reached mid-turn".to_string());
+                    RunLoopOutcome::PausedAtCap
+                }
+                ProviderInterruption::Cancelled => {
+                    state.status = RunStatus::Killed;
+                    state.failure_reason = Some(
+                        "run cancelled during provider call after cleanup was proven".to_string(),
+                    );
+                    RunLoopOutcome::Killed
+                }
+            };
+            work_clock.save(state)?;
+            Ok(outcome)
+        }
+        ProviderCleanup::RetainedAuthority { path, detail } => record_provider_lost_containment(
+            state,
+            turn,
+            boundary,
+            Some(path.as_path()),
+            detail,
+            work_clock,
+        ),
+    }
+}
+
+fn record_provider_lost_containment(
+    state: &mut PipelineState,
+    turn: u32,
+    boundary: &str,
+    authority: Option<&Path>,
+    detail: &str,
+    work_clock: &RunWorkClock,
+) -> Result<RunLoopOutcome> {
+    let authority_label = authority
+        .map(|path| format!(" at {}", path.display()))
+        .unwrap_or_else(|| " with an unavailable authority path".to_string());
+    let reason = format!(
+        "LOST_CONTAINMENT: provider {boundary} with retained process authority{authority_label}: {detail}"
+    );
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "provider.lost_containment".to_string(),
+            latency_ms: None,
+            detail: json!({
+                "boundary": boundary,
+                "authority": authority,
+                "reason": detail,
+            }),
+        },
+    )?;
+    state.pause_reason = None;
+    state.failure_reason = Some(reason);
+    state.provider_failure = Some(deadreckon_core::ProviderFailureDisposition::Fatal);
+    state.set_phase_status(PhaseId(40), PhaseStatus::Failed)?;
+    work_clock.save(state)?;
+    Ok(RunLoopOutcome::Failed)
+}
+
+fn begin_verification(state: &mut PipelineState, work_clock: &RunWorkClock) -> Result<()> {
+    state.set_phase_status(PhaseId(40), PhaseStatus::Completed)?;
+    state.set_phase_status(PhaseId(50), PhaseStatus::Executing)?;
+    work_clock.save(state)
+}
+
+fn revise_verification(state: &mut PipelineState, work_clock: &RunWorkClock) -> Result<()> {
+    state.set_phase_status(PhaseId(50), PhaseStatus::Pending)?;
+    state.set_phase_status(PhaseId(40), PhaseStatus::Executing)?;
+    work_clock.save(state)
+}
+
+fn fail_verification(state: &mut PipelineState, work_clock: &RunWorkClock) -> Result<()> {
+    state.set_phase_status(PhaseId(50), PhaseStatus::Failed)?;
+    work_clock.save(state)
+}
+
+fn complete_verification(state: &mut PipelineState, work_clock: &RunWorkClock) -> Result<()> {
+    state.set_phase_status(PhaseId(50), PhaseStatus::Completed)?;
+    work_clock.save(state)
+}
+
+fn verification_result<T>(
+    state: &mut PipelineState,
+    work_clock: &RunWorkClock,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err() {
+        fail_verification(state, work_clock)?;
+    }
+    result
 }
 
 fn provider_error(err: &deadreckon_providers::ProviderError) -> DeadreckonError {
@@ -2447,6 +3158,7 @@ fn history_path(state: &PipelineState) -> PathBuf {
 fn load_or_reconstruct_history(
     state: &mut PipelineState,
     from_turn: Option<u32>,
+    work_clock: &RunWorkClock,
 ) -> Result<Vec<String>> {
     let trace_reconstruction = reconstruct_history_from_traces(state)?;
     let loaded = if history_path(state).exists() {
@@ -2470,13 +3182,13 @@ fn load_or_reconstruct_history(
         state.turn = from_turn;
         truncate_run_artifacts_after_turn(state, from_turn)?;
         save_history(state, &history)?;
-        save_state(state)?;
+        work_clock.save(state)?;
     } else if recovered_from_traces {
         if trace_reconstruction.last_complete_turn > state.turn {
             state.turn = trace_reconstruction.last_complete_turn;
         }
         save_history(state, &history)?;
-        save_state(state)?;
+        work_clock.save(state)?;
     }
     Ok(history)
 }
@@ -2625,6 +3337,7 @@ async fn complete_run_docs(
     state: &mut PipelineState,
     router: &ProviderRouter,
     config: &RunLoopConfig,
+    work_clock: &RunWorkClock,
 ) -> Result<()> {
     let owned_router = if let (Some(config_path), Some(doc_provider)) = (
         config.docs.config_path.as_ref(),
@@ -2652,14 +3365,13 @@ async fn complete_run_docs(
             commit_docs: false,
             no_llm: config.docs.no_docs,
             force: false,
-            max_wall_seconds: config
-                .max_wall_seconds
-                .map(|cap| (cap - state.total_wall_seconds).max(0.0)),
+            max_wall_seconds: work_clock.remaining_seconds(config.max_wall_seconds)?,
             cancellation_token: config.cancellation_token.clone(),
         },
     )
     .await;
     state.status = previous_status;
+    work_clock.save(state)?;
     result
 }
 
@@ -2910,62 +3622,23 @@ pub async fn run_deterministic_completion_gate(
         deadreckon_core::seal_sandbox_boundary_observation(&paths, state, &authority, observation)?;
     }
     revalidate_gate_toolchain(&gate_toolchain)?;
-    let gate = gate_toolchain.controller.clone();
     let gate_key = deadreckon_core::read_gate_key(&paths, &state.run_id)?;
-    let encoded_key = deadreckon_core::encode_gate_key(&gate_key)?;
-    let mut signer = std::process::Command::new(&gate);
-    signer
-        .arg("sign")
-        .arg("--run")
-        .arg(&state.run_id)
-        .arg("--run-root")
-        .arg(&state.run_root)
-        .arg("--working-dir")
-        .arg(&state.working_dir)
-        .arg("--evaluation")
-        .arg("-")
-        .arg("--contained")
-        .arg(if evaluation.contained {
-            "true"
-        } else {
-            "false"
-        })
-        .arg("--sandbox-backend")
-        .arg(evaluation.backend.to_string())
-        .env(deadreckon_core::GATE_KEY_ENV, encoded_key)
-        .env_remove(deadreckon_core::GATE_CONTAINED_ENV)
-        .env_remove(deadreckon_core::GATE_SANDBOX_BACKEND_ENV)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    if let Some(identity) = gate_toolchain.identity_sha256.as_deref() {
-        signer.arg("--gate-evaluator-sha256").arg(identity);
-    }
-    let mut signer = signer.spawn().map_err(|source| DeadreckonError::Io {
-        path: gate.clone(),
-        source,
-    })?;
-    signer
-        .stdin
-        .take()
-        .ok_or_else(|| {
-            DeadreckonError::InvalidInput("dr-gate signer stdin is unavailable".to_string())
-        })?
-        .write_all(evaluation.raw_json.as_bytes())
-        .with_path(&gate)?;
-    let output = signer
-        .wait_with_output()
-        .map_err(|source| DeadreckonError::Io {
-            path: gate.clone(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(DeadreckonError::InvalidInput(format!(
-            "dr-gate signing failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    let containment = deadreckon_core::gate::AcceptanceContainment {
+        contained: evaluation.contained,
+        sandbox_backend: evaluation.backend.to_string(),
+    };
+    // Signing executes trusted in-process code only after every evaluator has
+    // returned and its process-tree cleanup has been proven. This removes an
+    // otherwise unbounded signer subprocess while preserving the key boundary:
+    // repository-controlled checks never run in a process that holds the key.
+    deadreckon_core::sign_gate_evaluation_with_key(
+        &state.run_root,
+        &state.run_id,
+        &state.working_dir,
+        evaluation.evaluation,
+        &gate_key,
+        containment,
+    )?;
     Ok(())
 }
 
@@ -3189,7 +3862,6 @@ fn read_probe_sentinel(path: &Path) -> Result<Vec<u8>> {
 #[derive(Debug)]
 struct KeylessGateEvaluation {
     evaluation: deadreckon_core::GateEvaluation,
-    raw_json: String,
     backend: SandboxBackend,
     contained: bool,
 }
@@ -3356,7 +4028,6 @@ async fn run_keyless_gate_evaluation(
     }
     Ok(KeylessGateEvaluation {
         evaluation,
-        raw_json: output.stdout,
         backend: output.backend,
         contained,
     })
@@ -3739,7 +4410,9 @@ async fn semantic_completion_disposition(
     marker: &deadreckon_core::AcceptanceMarker,
     history: &mut Vec<String>,
     cancellation_token: &CancellationToken,
+    work_clock: &RunWorkClock,
 ) -> Result<SemanticCompletionDisposition> {
+    work_clock.sync(state);
     if should_cancel_run(state, cancellation_token) {
         return Ok(SemanticCompletionDisposition::Cancelled);
     }
@@ -3757,6 +4430,7 @@ async fn semantic_completion_disposition(
             turn,
             history,
             "semantic judging is disabled; a new job cannot be reported verified without the second key",
+            work_clock,
         )?;
         return Ok(SemanticCompletionDisposition::NeedsReview);
     }
@@ -3770,7 +4444,7 @@ async fn semantic_completion_disposition(
     if let Some(reason) = budget_reason {
         state.pause_reason = Some(reason.to_string());
         state.failure_reason = Some(reason.to_string());
-        save_state(state)?;
+        work_clock.save(state)?;
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
 
@@ -3781,9 +4455,8 @@ async fn semantic_completion_disposition(
         config.sandbox_backend,
         crate::semantic_judge::SemanticJudgeBudget {
             remaining_spend_usd: Some(job.policy.max_spend_usd - state.total_spend_usd),
-            remaining_wall_seconds: Some(
-                job.policy.max_wall_seconds as f64 - state.total_wall_seconds,
-            ),
+            remaining_wall_seconds: work_clock
+                .remaining_seconds(Some(job.policy.max_wall_seconds as f64))?,
         },
         Some(cancellation_token),
     )
@@ -3796,15 +4469,17 @@ async fn semantic_completion_disposition(
                 turn,
                 history,
                 &format!("strict semantic judge unavailable: {error}"),
+                work_clock,
             )?;
             return Ok(SemanticCompletionDisposition::NeedsReview);
         }
     };
-    record_semantic_judge_accounting(state, turn, config, &semantic_run)?;
+    work_clock.sync(state);
+    record_semantic_judge_accounting(state, turn, config, &semantic_run, work_clock)?;
     if let crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) =
         &semantic_run.result
     {
-        record_semantic_lost_containment(state, turn, history, reason)?;
+        record_semantic_lost_containment(state, turn, history, reason, work_clock)?;
         return Ok(SemanticCompletionDisposition::LostContainment);
     }
     if should_cancel_run(state, cancellation_token) {
@@ -3828,7 +4503,7 @@ async fn semantic_completion_disposition(
     if let Some(reason) = overrun_reason {
         state.pause_reason = Some(reason.to_string());
         state.failure_reason = Some(reason.to_string());
-        save_state(state)?;
+        work_clock.save(state)?;
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
     if let Some(judgment) = semantic_run.result.judgment()
@@ -3840,12 +4515,15 @@ async fn semantic_completion_disposition(
             turn,
             history,
             &format!("strict semantic judgment could not be persisted after accounting: {error}"),
+            work_clock,
         )?;
         return Ok(SemanticCompletionDisposition::NeedsReview);
     }
     match semantic_run.result {
         crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
-            seal_achieved_semantic_completion(state, &paths, turn, marker, &judgment, history)
+            seal_achieved_semantic_completion(
+                state, &paths, turn, marker, &judgment, history, work_clock,
+            )
         }
         crate::semantic_judge::SemanticJudgeResult::Revise(judgment) => {
             let missing = if judgment.missing.is_empty() {
@@ -3860,7 +4538,7 @@ async fn semantic_completion_disposition(
             history.push(feedback.clone());
             state.failure_reason = Some(feedback);
             save_history(state, history)?;
-            save_state(state)?;
+            work_clock.save(state)?;
             Ok(SemanticCompletionDisposition::Revise)
         }
         crate::semantic_judge::SemanticJudgeResult::NeedsReview(judgment) => {
@@ -3869,15 +4547,16 @@ async fn semantic_completion_disposition(
                 turn,
                 history,
                 &format!("semantic judge was uncertain: {}", judgment.summary),
+                work_clock,
             )?;
             Ok(SemanticCompletionDisposition::NeedsReview)
         }
         crate::semantic_judge::SemanticJudgeResult::Unavailable(reason) => {
-            record_needs_review(state, turn, history, &reason)?;
+            record_needs_review(state, turn, history, &reason, work_clock)?;
             Ok(SemanticCompletionDisposition::NeedsReview)
         }
         crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) => {
-            record_semantic_lost_containment(state, turn, history, &reason)?;
+            record_semantic_lost_containment(state, turn, history, &reason, work_clock)?;
             Ok(SemanticCompletionDisposition::LostContainment)
         }
     }
@@ -3890,6 +4569,7 @@ fn seal_achieved_semantic_completion(
     marker: &deadreckon_core::AcceptanceMarker,
     judgment: &deadreckon_protocol::SemanticJudgment,
     history: &mut Vec<String>,
+    work_clock: &RunWorkClock,
 ) -> Result<SemanticCompletionDisposition> {
     let seal_result = (|| -> Result<()> {
         crate::semantic_judge::validate_semantic_judgment_input(state, marker, judgment)?;
@@ -3914,6 +4594,7 @@ fn seal_achieved_semantic_completion(
             &format!(
                 "semantic judgment achieved, but the combined receipt could not be sealed: {error}"
             ),
+            work_clock,
         )?;
         return Ok(SemanticCompletionDisposition::NeedsReview);
     }
@@ -3925,10 +4606,11 @@ fn record_semantic_judge_accounting(
     turn: u32,
     config: &RunLoopConfig,
     semantic_run: &crate::semantic_judge::SemanticJudgeRun,
+    work_clock: &RunWorkClock,
 ) -> Result<()> {
     let accounting = &semantic_run.accounting;
     state.total_spend_usd += accounting.cost_usd;
-    state.total_wall_seconds += accounting.wall_time_seconds;
+    work_clock.sync(state);
     append_spend(
         state,
         &SpendRecord {
@@ -4005,7 +4687,7 @@ fn record_semantic_judge_accounting(
             }),
         },
     )?;
-    save_state(state)
+    work_clock.save(state)
 }
 
 fn record_needs_review(
@@ -4013,6 +4695,7 @@ fn record_needs_review(
     turn: u32,
     history: &mut Vec<String>,
     reason: &str,
+    work_clock: &RunWorkClock,
 ) -> Result<()> {
     let message = format!("NEEDS_REVIEW: {reason}");
     append_trace(
@@ -4028,9 +4711,9 @@ fn record_needs_review(
     )?;
     history.push(message.clone());
     state.failure_reason = Some(message);
-    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    state.set_phase_status(PhaseId(50), PhaseStatus::Failed)?;
     save_history(state, history)?;
-    save_state(state)
+    work_clock.save(state)
 }
 
 fn record_semantic_lost_containment(
@@ -4038,6 +4721,7 @@ fn record_semantic_lost_containment(
     turn: u32,
     history: &mut Vec<String>,
     reason: &str,
+    work_clock: &RunWorkClock,
 ) -> Result<()> {
     let message = format!("LOST_CONTAINMENT: {reason}");
     append_trace(
@@ -4053,9 +4737,155 @@ fn record_semantic_lost_containment(
     )?;
     history.push(message.clone());
     state.failure_reason = Some(message);
-    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    state.set_phase_status(PhaseId(50), PhaseStatus::Failed)?;
     save_history(state, history)?;
-    save_state(state)
+    work_clock.save(state)
+}
+
+#[derive(Debug)]
+enum DeterministicGateDisposition {
+    Passed(deadreckon_core::AcceptanceMarker),
+    Revise,
+    PausedAtCap,
+    Cancelled,
+    LostContainment,
+}
+
+enum DeterministicGatePhaseOutcome {
+    Completed {
+        result: Result<()>,
+        cleanup: ProviderCleanup,
+    },
+    WorkExpired {
+        cleanup: ProviderCleanup,
+    },
+    Cancelled {
+        cleanup: ProviderCleanup,
+    },
+}
+
+async fn run_deterministic_gate_work_phase(
+    state: &PipelineState,
+    sandbox_backend: SandboxBackend,
+    launch_owner: Option<&GateLaunchOwner>,
+    external_cancellation: &CancellationToken,
+    work_expires_at: tokio::time::Instant,
+) -> Result<DeterministicGatePhaseOutcome> {
+    if external_cancellation.is_cancelled() {
+        return Ok(DeterministicGatePhaseOutcome::Cancelled {
+            cleanup: ProviderCleanup::NotApplicable,
+        });
+    }
+    if tokio::time::Instant::now() >= work_expires_at {
+        return Ok(DeterministicGatePhaseOutcome::WorkExpired {
+            cleanup: ProviderCleanup::NotApplicable,
+        });
+    }
+
+    let authority_dir = state.run_root.join("runtime-phase-authority");
+    std::fs::create_dir_all(&authority_dir).with_path(&authority_dir)?;
+    let phase_authority = authority_dir.join(format!(
+        "deterministic-gate-{}.json",
+        Uuid::new_v4().simple()
+    ));
+    write_new_file(
+        &phase_authority,
+        format!(
+            "phase=deterministic_gate\nrun_id={}\nstarted_at={}\n",
+            state.run_id,
+            Utc::now().to_rfc3339()
+        )
+        .as_bytes(),
+    )?;
+    let phase_token = CancellationToken::new();
+    let gate =
+        run_deterministic_completion_gate(state, sandbox_backend, launch_owner, Some(&phase_token));
+    tokio::pin!(gate);
+    enum Boundary<T> {
+        Completed(T),
+        WorkExpired,
+        Cancelled,
+    }
+    let boundary = tokio::select! {
+        biased;
+        () = external_cancellation.cancelled() => Boundary::Cancelled,
+        result = &mut gate => Boundary::Completed(result),
+        () = tokio::time::sleep_until(work_expires_at) => Boundary::WorkExpired,
+    };
+    match boundary {
+        Boundary::Completed(result) => Ok(DeterministicGatePhaseOutcome::Completed {
+            cleanup: finish_gate_phase_cleanup(state, &phase_authority, true),
+            result,
+        }),
+        Boundary::WorkExpired => {
+            phase_token.cancel();
+            let resolved = tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut gate)
+                .await
+                .is_ok();
+            Ok(DeterministicGatePhaseOutcome::WorkExpired {
+                cleanup: finish_gate_phase_cleanup(state, &phase_authority, resolved),
+            })
+        }
+        Boundary::Cancelled => {
+            phase_token.cancel();
+            let resolved = tokio::time::timeout(RUNTIME_PHASE_CLEANUP_BUDGET, &mut gate)
+                .await
+                .is_ok();
+            Ok(DeterministicGatePhaseOutcome::Cancelled {
+                cleanup: finish_gate_phase_cleanup(state, &phase_authority, resolved),
+            })
+        }
+    }
+}
+
+fn finish_gate_phase_cleanup(
+    state: &PipelineState,
+    phase_authority: &Path,
+    execution_resolved: bool,
+) -> ProviderCleanup {
+    if !execution_resolved {
+        return ProviderCleanup::RetainedAuthority {
+            path: phase_authority.to_path_buf(),
+            detail: format!(
+                "deterministic gate did not resolve within the separate {:.0}s cleanup window",
+                RUNTIME_PHASE_CLEANUP_BUDGET.as_secs_f64()
+            ),
+        };
+    }
+    if let Some(authority) = outstanding_gate_process_authority(state) {
+        return ProviderCleanup::RetainedAuthority {
+            path: authority,
+            detail: "deterministic gate returned with subprocess authority still present"
+                .to_string(),
+        };
+    }
+    match std::fs::remove_file(phase_authority) {
+        Ok(()) => ProviderCleanup::Proven,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProviderCleanup::Proven,
+        Err(error) => ProviderCleanup::RetainedAuthority {
+            path: phase_authority.to_path_buf(),
+            detail: format!("deterministic gate phase authority could not be removed: {error}"),
+        },
+    }
+}
+
+fn outstanding_gate_process_authority(state: &PipelineState) -> Option<PathBuf> {
+    let entries = match std::fs::read_dir(state.run_root.join("child-pids")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(state.run_root.join("child-pids")),
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .find_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with("dr-gate-evaluate-")
+                || name.starts_with("sandbox-boundary-probe-")
+                || name.starts_with("docker-gate-probe-")
+                || name.starts_with("docker-gate-evaluate-"))
+            .then(|| entry.path())
+        })
 }
 
 async fn acceptance_gate_passed_or_record_failure(
@@ -4065,21 +4895,77 @@ async fn acceptance_gate_passed_or_record_failure(
     history: &mut Vec<String>,
     sandbox_backend: SandboxBackend,
     cancellation_token: &CancellationToken,
-) -> Result<Option<deadreckon_core::AcceptanceMarker>> {
+    work_clock: &RunWorkClock,
+    work_expires_at: tokio::time::Instant,
+) -> Result<DeterministicGateDisposition> {
     let launch_owner = gate_launch_owner_from_environment(state)?;
-    match run_deterministic_completion_gate(
+    work_clock.sync(state);
+    let gate_phase = run_deterministic_gate_work_phase(
         state,
         sandbox_backend,
         launch_owner.as_ref(),
-        Some(cancellation_token),
+        cancellation_token,
+        work_expires_at,
     )
-    .await
-    .and_then(|()| validate_acceptance_marker(state))
-    {
-        Ok(marker) => Ok(Some(marker)),
+    .await?;
+    let gate_result = match gate_phase {
+        DeterministicGatePhaseOutcome::Completed {
+            result,
+            cleanup: ProviderCleanup::Proven | ProviderCleanup::NotApplicable,
+        } => result.and_then(|()| validate_acceptance_marker(state)),
+        DeterministicGatePhaseOutcome::Completed {
+            cleanup: ProviderCleanup::RetainedAuthority { path, detail },
+            ..
+        } => {
+            record_runtime_lost_containment(
+                state,
+                turn,
+                "deterministic gate",
+                Some(&path),
+                &detail,
+                work_clock,
+            )?;
+            return Ok(DeterministicGateDisposition::LostContainment);
+        }
+        DeterministicGatePhaseOutcome::WorkExpired { cleanup } => {
+            let outcome = record_runtime_phase_interruption(
+                state,
+                turn,
+                "deterministic gate",
+                RuntimePhaseInterruption::WorkExpired,
+                &cleanup,
+                work_clock,
+            )?;
+            return Ok(match outcome {
+                RunLoopOutcome::PausedAtCap => DeterministicGateDisposition::PausedAtCap,
+                RunLoopOutcome::Failed => DeterministicGateDisposition::LostContainment,
+                RunLoopOutcome::Done | RunLoopOutcome::Killed => {
+                    DeterministicGateDisposition::LostContainment
+                }
+            });
+        }
+        DeterministicGatePhaseOutcome::Cancelled { cleanup } => {
+            let outcome = record_runtime_phase_interruption(
+                state,
+                turn,
+                "deterministic gate",
+                RuntimePhaseInterruption::Cancelled,
+                &cleanup,
+                work_clock,
+            )?;
+            return Ok(if outcome == RunLoopOutcome::Killed {
+                DeterministicGateDisposition::Cancelled
+            } else {
+                DeterministicGateDisposition::LostContainment
+            });
+        }
+    };
+    work_clock.save(state)?;
+    match gate_result {
+        Ok(marker) => Ok(DeterministicGateDisposition::Passed(marker)),
         Err(err) => {
             if should_cancel_run(state, cancellation_token) {
-                return Ok(None);
+                return Ok(DeterministicGateDisposition::Cancelled);
             }
             let reason = err.to_string();
             append_trace(
@@ -4106,8 +4992,8 @@ async fn acceptance_gate_passed_or_record_failure(
             ));
             state.failure_reason = Some(format!("acceptance failed after turn {turn}: {reason}"));
             save_history(state, history)?;
-            save_state(state)?;
-            Ok(None)
+            work_clock.save(state)?;
+            Ok(DeterministicGateDisposition::Revise)
         }
     }
 }
@@ -5568,11 +6454,15 @@ fn gate_binary_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use deadreckon_providers::{ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter};
-    use deadreckon_sandbox::SandboxBackend;
+    use deadreckon_providers::{
+        ProviderCleanup, ProviderConfigFile, ProviderEntry, ProviderKind, ProviderRouter,
+    };
+    use deadreckon_sandbox::{SandboxBackend, SandboxSpec, WorkspaceAccess};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
@@ -5584,7 +6474,9 @@ mod tests {
     };
     use deadreckon_core::gate::{run_acceptance_gate_and_write_marker, validate_acceptance_marker};
     use deadreckon_core::paths::DeadreckonPaths;
-    use deadreckon_core::state::{PipelineState, RunOptions, RunStatus, create_run, spend_summary};
+    use deadreckon_core::state::{
+        PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus, create_run, spend_summary,
+    };
     use deadreckon_core::{
         CodebaseMode, CodebaseRecord, TurnDocInput, append_turn_doc, implementation_notes_path,
         snapshot_working,
@@ -5595,21 +6487,31 @@ mod tests {
 
     use super::{
         GateLaunchOwner, NarratorConfig, ParentRepairCandidate, ParentRepairCandidateContext,
-        RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SemanticCompletionDisposition,
-        append_provider_approval_traces, append_tool_refusal, bash_policy_refusal,
-        build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
-        changed_files_since_snapshot, classify_cli_no_deliverable_changes, commit_finalized_turn,
-        commit_worktree_turn, complete_within_wall_budget, deliverable_changed_files,
-        ensure_sandbox_toml, event_sink_must_stop, implementation_notes_ready_or_request_followup,
+        ProviderInterruption, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunWorkClock,
+        SandboxedPhaseOutcome, SemanticCompletionDisposition, append_provider_approval_traces,
+        append_tool_refusal, bash_policy_refusal, begin_verification, build_cli_subagent_prompt,
+        build_prompt, capture_trusted_turn_head, changed_files_since_snapshot,
+        classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
+        complete_verification, deliverable_changed_files, ensure_sandbox_toml,
+        event_sink_must_stop, fail_verification, implementation_notes_ready_or_request_followup,
         is_direct_api_provider_kind, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, load_trusted_git_control,
-        non_deliverable_history_paths, persist_parent_repair_candidate, policy_seam_refusal,
-        policy_seam_refusal_message, provider_failure_disposition, provider_output_name,
-        read_turn_codebase_record, record_semantic_judge_accounting, refuse_gitlinks,
-        run_parent_repair_turn_loop, run_turn_loop, safe_working_path,
+        non_deliverable_history_paths, persist_parent_repair_candidate, persist_work_boundary,
+        policy_seam_refusal, policy_seam_refusal_message, provider_failure_disposition,
+        provider_output_name, read_turn_codebase_record, record_provider_interruption,
+        record_semantic_judge_accounting, refuse_gitlinks, revise_verification,
+        run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop, safe_working_path,
         safe_working_path_with_policy, save_history, seal_achieved_semantic_completion,
-        semantic_completion_disposition, write_workspace_file_no_follow,
+        semantic_completion_disposition, wait_for_provider_retry, write_workspace_file_no_follow,
     };
+
+    fn load_history_with_work_clock(
+        state: &mut PipelineState,
+        from_turn: Option<u32>,
+    ) -> deadreckon_core::Result<Vec<String>> {
+        let work_clock = RunWorkClock::new(state)?;
+        load_or_reconstruct_history(state, from_turn, &work_clock)
+    }
 
     #[test]
     fn gate_launch_owner_requires_a_durable_attempt_and_uuid() {
@@ -6060,7 +6962,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_judge_spend_and_time_are_durable_even_when_unavailable() {
+    fn semantic_judge_spend_and_evidence_do_not_double_add_run_wall_time() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, mut state) = create_smoke_run(&temp, "judge accounting");
         let semantic_run = crate::semantic_judge::SemanticJudgeRun {
@@ -6074,25 +6976,31 @@ mod tests {
                 output_tokens: 3,
                 cost_usd: 0.25,
                 subscription: false,
-                wall_time_seconds: 1.5,
+                wall_time_seconds: 60.0,
                 sandbox_backend: Some("sandbox-exec".to_string()),
             },
             budget_exhaustion: None,
         };
         let config = RunLoopConfig {
             max_spend_usd: Some(2.0),
-            max_wall_seconds: Some(30.0),
+            max_wall_seconds: Some(300.0),
             ..base_run_loop_config()
         };
+        state.total_wall_seconds = 7.0;
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
 
-        record_semantic_judge_accounting(&mut state, 1, &config, &semantic_run)
+        record_semantic_judge_accounting(&mut state, 1, &config, &semantic_run, &work_clock)
             .expect("record accounting");
 
         assert_eq!(state.total_spend_usd, 0.25);
-        assert_eq!(state.total_wall_seconds, 1.5);
+        assert!(state.total_wall_seconds >= 7.0);
+        assert!(
+            state.total_wall_seconds < 67.0,
+            "semantic provider accounting must not be added to the controller clock"
+        );
         let reloaded = deadreckon_core::load_run(&paths, &state.run_id).expect("durable state");
         assert_eq!(reloaded.total_spend_usd, 0.25);
-        assert_eq!(reloaded.total_wall_seconds, 1.5);
+        assert_eq!(reloaded.total_wall_seconds, state.total_wall_seconds);
         let spend = std::fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
         let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
         assert!(spend.contains("\"kind\":\"semantic_judge\""), "{spend}");
@@ -6176,6 +7084,7 @@ mod tests {
             spend_usd: 0.0,
         };
         let mut history = Vec::new();
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
         let disposition = seal_achieved_semantic_completion(
             &mut state,
             &paths,
@@ -6183,6 +7092,7 @@ mod tests {
             &marker,
             &judgment,
             &mut history,
+            &work_clock,
         )
         .expect("semantic disposition");
 
@@ -6228,6 +7138,7 @@ mod tests {
             check_count: 0,
             checks: Vec::new(),
         };
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
 
         let disposition = semantic_completion_disposition(
             &mut state,
@@ -6237,6 +7148,7 @@ mod tests {
             &marker,
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
+            &work_clock,
         )
         .await
         .expect("semantic disposition");
@@ -6281,6 +7193,7 @@ mod tests {
             check_count: 0,
             checks: Vec::new(),
         };
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
 
         let disposition = semantic_completion_disposition(
             &mut state,
@@ -6290,6 +7203,7 @@ mod tests {
             &marker,
             &mut Vec::new(),
             &tokio_util::sync::CancellationToken::new(),
+            &work_clock,
         )
         .await
         .expect("semantic disposition");
@@ -7559,7 +8473,7 @@ storage = "jsonl"
         std::fs::write(state.run_root.join("history.json"), "[\"half an entr")
             .expect("truncated history");
 
-        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        let history = load_history_with_work_clock(&mut state, None).expect("history");
         assert_eq!(history.len(), 1);
         assert!(history[0].contains("tool-1"));
     }
@@ -7592,7 +8506,7 @@ storage = "jsonl"
         let history_file = state.run_root.join("history.json");
         std::fs::write(&history_file, "not json at all \u{0}\u{1}").expect("garbage history");
 
-        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        let history = load_history_with_work_clock(&mut state, None).expect("history");
         assert_eq!(history.len(), 1);
         let resaved = std::fs::read_to_string(&history_file).expect("resaved");
         let parsed: Vec<String> =
@@ -7676,7 +8590,7 @@ storage = "jsonl"
         )
         .expect("trace");
 
-        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        let history = load_history_with_work_clock(&mut state, None).expect("history");
         assert_eq!(history.len(), 1);
         assert!(history[0].contains("tool-1"));
         let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
@@ -7711,7 +8625,7 @@ storage = "jsonl"
         )
         .expect("trace");
 
-        let history = load_or_reconstruct_history(&mut state, None).expect("history");
+        let history = load_history_with_work_clock(&mut state, None).expect("history");
 
         assert_eq!(history.len(), 1);
         assert!(history[0].contains("tool-done"));
@@ -7746,7 +8660,7 @@ storage = "jsonl"
         .expect("history");
         state.turn = 5;
 
-        let history = load_or_reconstruct_history(&mut state, Some(2)).expect("history");
+        let history = load_history_with_work_clock(&mut state, Some(2)).expect("history");
         assert_eq!(history, vec!["one".to_string(), "two".to_string()]);
         assert_eq!(state.turn, 2);
     }
@@ -7787,7 +8701,7 @@ storage = "jsonl"
         std::fs::write(future_snapshot.join("future.txt"), "future").expect("future");
         state.turn = 3;
 
-        let history = load_or_reconstruct_history(&mut state, Some(1)).expect("history");
+        let history = load_history_with_work_clock(&mut state, Some(1)).expect("history");
         let trace = std::fs::read_to_string(state.run_root.join("traces.jsonl")).expect("trace");
 
         assert_eq!(history, vec!["one".to_string()]);
@@ -8913,61 +9827,252 @@ network = []
         assert!(prompt.contains("README.md"));
     }
 
-    #[tokio::test]
-    async fn wall_budget_cuts_hung_provider_call_and_cancels_turn_token() {
-        let token = tokio_util::sync::CancellationToken::new();
-        let observer = token.clone();
-        // A provider call that only finishes once cancelled, like a CLI
-        // subprocess select()ing on the cancellation token.
-        let hung = async move {
-            observer.cancelled().await;
-            Err(deadreckon_providers::ProviderError::Cli {
-                provider: "test".to_string(),
-                detail: "cancelled".to_string(),
-            })
-        };
+    #[test]
+    fn run_work_clock_preserves_durable_baseline_and_never_decreases() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "monotonic work clock");
+        state.total_wall_seconds = 5.0;
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
 
-        let result =
-            complete_within_wall_budget(hung, Some(Duration::from_millis(50)), &token).await;
+        work_clock.sync(&mut state);
+        assert!(state.total_wall_seconds >= 5.0);
 
-        assert!(result.is_none(), "budget exhaustion must report None");
+        state.total_wall_seconds = 7.0;
+        work_clock.sync(&mut state);
         assert!(
-            token.is_cancelled(),
-            "turn token must cancel the subprocess"
+            state.total_wall_seconds >= 7.0,
+            "clock synchronization must never move durable time backward"
         );
     }
 
-    #[tokio::test]
-    async fn wall_budget_passes_through_completions_within_budget() {
-        let token = tokio_util::sync::CancellationToken::new();
-        let quick = async {
-            Err::<deadreckon_providers::ProviderResponse, _>(
-                deadreckon_providers::ProviderError::NoRoute("test".to_string()),
-            )
-        };
+    #[test]
+    fn run_work_clock_returns_zero_instead_of_extending_an_expired_cap() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "expired work clock");
+        state.total_wall_seconds = 5.0;
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
 
-        let result = complete_within_wall_budget(quick, Some(Duration::from_secs(5)), &token).await;
+        assert_eq!(
+            work_clock.remaining(Some(5.0)).expect("remaining"),
+            Some(Duration::ZERO)
+        );
+        assert!(work_clock.remaining(Some(f64::NAN)).is_err());
+    }
 
-        assert!(matches!(
-            result,
-            Some(Err(deadreckon_providers::ProviderError::NoRoute(_)))
-        ));
-        assert!(!token.is_cancelled());
+    #[test]
+    fn provider_retries_share_one_absolute_work_deadline() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "absolute provider deadline");
+        state.total_wall_seconds = 5.0;
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
+
+        let first = work_clock
+            .provider_phase_deadline(Some(30.0))
+            .expect("first deadline");
+        std::thread::sleep(Duration::from_millis(2));
+        let retry = work_clock
+            .provider_phase_deadline(Some(30.0))
+            .expect("retry deadline");
+
+        assert_eq!(first.work_expires_at, retry.work_expires_at);
+        assert_eq!(first.cleanup_budget, Duration::from_secs(30));
+        assert_eq!(retry.cleanup_budget, Duration::from_secs(30));
     }
 
     #[tokio::test]
-    async fn wall_budget_without_cap_never_times_out() {
+    async fn provider_retry_backoff_never_runs_past_the_absolute_work_deadline() {
         let token = tokio_util::sync::CancellationToken::new();
-        let quick = async {
-            Err::<deadreckon_providers::ProviderResponse, _>(
-                deadreckon_providers::ProviderError::NoRoute("test".to_string()),
-            )
+        let started = tokio::time::Instant::now();
+
+        wait_for_provider_retry(
+            started + Duration::from_millis(20),
+            &token,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "retry backoff reopened work after the absolute cutoff"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandboxed_tool_uses_work_deadline_then_proves_cleanup() {
+        let temp = TempDir::new().expect("tempdir");
+        let authority = temp.path().join("tool.pid");
+        let token = tokio_util::sync::CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let outcome = run_sandboxed_work_phase(
+            SandboxSpec {
+                backend: SandboxBackend::None,
+                docker: None,
+                cwd: temp.path().to_path_buf(),
+                program: OsString::from("sh"),
+                args: vec![OsString::from("-c"), OsString::from("sleep 30")],
+                stdin: None,
+                env: BTreeMap::new(),
+                allow_network: false,
+                pid_file: Some(authority.clone()),
+                cancellation_token: None,
+                profile_dir: None,
+                read_allowlist: Vec::new(),
+                write_allowlist: Vec::new(),
+                read_denylist: Vec::new(),
+                write_denylist: Vec::new(),
+                network_allowlist: Vec::new(),
+                workspace_access: WorkspaceAccess::ReadWrite,
+                cleanup_process_group: true,
+                guarded_launch: None,
+            },
+            started + Duration::from_millis(50),
+            &token,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            SandboxedPhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::Proven
+            }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(std::fs::symlink_metadata(authority).is_err());
+    }
+
+    #[test]
+    fn proven_provider_expiry_pauses_and_proven_cancellation_kills() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut expired) = create_smoke_run(&temp, "proven provider expiry");
+        let expired_clock = RunWorkClock::new(&expired).expect("expired clock");
+
+        let outcome = record_provider_interruption(
+            &mut expired,
+            1,
+            ProviderInterruption::WorkExpired,
+            &deadreckon_providers::ProviderCleanup::Proven,
+            &expired_clock,
+        )
+        .expect("record expiry");
+        assert_eq!(outcome, RunLoopOutcome::PausedAtCap);
+        assert_eq!(
+            expired.pause_reason.as_deref(),
+            Some("wall-clock cap reached mid-turn")
+        );
+
+        let other = TempDir::new().expect("other tempdir");
+        let (_paths, mut cancelled) = create_smoke_run(&other, "proven provider cancellation");
+        let cancelled_clock = RunWorkClock::new(&cancelled).expect("cancelled clock");
+        let outcome = record_provider_interruption(
+            &mut cancelled,
+            1,
+            ProviderInterruption::Cancelled,
+            &deadreckon_providers::ProviderCleanup::NotApplicable,
+            &cancelled_clock,
+        )
+        .expect("record cancellation");
+        assert_eq!(outcome, RunLoopOutcome::Killed);
+        assert_eq!(cancelled.status, RunStatus::Killed);
+    }
+
+    #[test]
+    fn retained_provider_authority_fails_closed_as_lost_containment() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "retained provider authority");
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let authority = temp.path().join("provider.pid");
+
+        let outcome = record_provider_interruption(
+            &mut state,
+            1,
+            ProviderInterruption::WorkExpired,
+            &deadreckon_providers::ProviderCleanup::RetainedAuthority {
+                path: authority.clone(),
+                detail: "cleanup proof deadline elapsed".to_string(),
+            },
+            &work_clock,
+        )
+        .expect("record lost containment");
+
+        assert_eq!(outcome, RunLoopOutcome::Failed);
+        assert_eq!(state.status, RunStatus::Failed);
+        assert_eq!(
+            state.provider_failure,
+            Some(deadreckon_core::ProviderFailureDisposition::Fatal)
+        );
+        let reason = state.failure_reason.as_deref().expect("failure reason");
+        assert!(reason.starts_with("LOST_CONTAINMENT:"), "{reason}");
+        assert!(
+            reason.contains(authority.to_string_lossy().as_ref()),
+            "{reason}"
+        );
+        assert_eq!(
+            state
+                .phases
+                .iter()
+                .find(|phase| phase.id == PhaseId(40))
+                .map(|phase| phase.status),
+            Some(PhaseStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn verification_phase_executes_revises_fails_and_completes_explicitly() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, mut state) = create_smoke_run(&temp, "verification transitions");
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let phase_status = |state: &PipelineState, id| {
+            state
+                .phases
+                .iter()
+                .find(|phase| phase.id == PhaseId(id))
+                .map(|phase| phase.status)
         };
 
-        let result = complete_within_wall_budget(quick, None, &token).await;
+        begin_verification(&mut state, &work_clock).expect("begin verification");
+        assert_eq!(phase_status(&state, 40), Some(PhaseStatus::Completed));
+        assert_eq!(phase_status(&state, 50), Some(PhaseStatus::Executing));
+        assert_eq!(state.current_phase_id, PhaseId(50));
 
-        assert!(result.is_some());
-        assert!(!token.is_cancelled());
+        revise_verification(&mut state, &work_clock).expect("revise verification");
+        assert_eq!(phase_status(&state, 50), Some(PhaseStatus::Pending));
+        assert_eq!(phase_status(&state, 40), Some(PhaseStatus::Executing));
+        assert_eq!(state.current_phase_id, PhaseId(40));
+
+        begin_verification(&mut state, &work_clock).expect("restart verification");
+        fail_verification(&mut state, &work_clock).expect("fail verification");
+        assert_eq!(phase_status(&state, 50), Some(PhaseStatus::Failed));
+        assert_eq!(state.status, RunStatus::Failed);
+
+        begin_verification(&mut state, &work_clock).expect("retry verification");
+        complete_verification(&mut state, &work_clock).expect("complete verification");
+        assert_eq!(phase_status(&state, 50), Some(PhaseStatus::Completed));
+        assert_eq!(state.current_phase_id, PhaseId(50));
+    }
+
+    #[test]
+    fn failed_work_boundary_persists_clock_before_propagating_the_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "failed durable boundary");
+        state.total_wall_seconds = 5.0;
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
+        work_clock.save(&mut state).expect("save baseline");
+        let before_failure = state.total_wall_seconds;
+        std::thread::sleep(Duration::from_millis(2));
+
+        let phase_result: deadreckon_core::Result<()> = Err(
+            deadreckon_core::DeadreckonError::InvalidInput("injected phase failure".to_string()),
+        );
+        let error = persist_work_boundary(&mut state, &work_clock, phase_result)
+            .expect_err("phase failure must propagate");
+
+        assert!(error.to_string().contains("injected phase failure"));
+        let reloaded = deadreckon_core::load_run(&paths, &state.run_id).expect("durable state");
+        assert!(
+            reloaded.total_wall_seconds > before_failure,
+            "failed local work must still advance the durable run clock"
+        );
     }
 
     #[tokio::test]
@@ -9010,9 +10115,13 @@ network = []
         .expect("loop");
 
         assert_eq!(outcome, RunLoopOutcome::PausedAtCap);
-        assert_eq!(
-            state.pause_reason.as_deref(),
-            Some("wall-clock cap reached")
+        assert!(
+            state
+                .pause_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("wall-clock cap reached")),
+            "unexpected pause reason: {:?}",
+            state.pause_reason
         );
         assert!(
             state.total_wall_seconds > 0.0,
