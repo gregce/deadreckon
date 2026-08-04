@@ -4209,6 +4209,7 @@ pub(crate) async fn extend_command_with_launch_plan(
         provider_override.as_deref(),
         model.as_deref(),
         false,
+        None,
     )
     .await?;
     let selected_route = router.selected_route_info();
@@ -4264,6 +4265,7 @@ pub(crate) async fn extend_command_with_launch_plan(
                 from_turn: None,
                 event_sender: narrate_event_sender,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: narrator_config,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),
@@ -4719,6 +4721,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
         provider_override.as_deref(),
         model.as_deref(),
         false,
+        None,
     )
     .await?;
     let selected_route = router.selected_route_info();
@@ -4771,6 +4774,7 @@ async fn extend_worktree_command(args: ExtendWorktreeArgs) -> Result<()> {
                 from_turn: None,
                 event_sender: narrate_event_sender,
                 cancellation_token: None,
+                work_boundary: None,
                 narrate: narrator_config,
                 docs: RunLoopDocsConfig {
                     home: paths.home().to_path_buf(),

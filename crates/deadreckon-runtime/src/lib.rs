@@ -22,8 +22,9 @@ pub use polish::{
     resolve_skill, substitute_placeholders, templated_docs_json,
 };
 pub use seam::{
-    FailPolicy, SeamCommandConfig, SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam,
-    parse_seams_config, read_seams_config, resolve_catalog_override, write_seams_audit,
+    FailPolicy, SeamCommandConfig, SeamKind, SeamOutcome, SeamPhaseOutcome, SeamRunCtx,
+    SeamsConfig, dispatch_seam, dispatch_seam_phase, parse_seams_config, read_seams_config,
+    resolve_catalog_override, resolve_catalog_override_phase, write_seams_audit,
 };
 pub use semantic_judge::{
     EvidenceItem, SEMANTIC_JUDGMENT_PATH, SemanticBudgetExhaustion, SemanticEvidencePack,
@@ -38,6 +39,7 @@ pub use semantic_judge::{
 pub use turn_loop::{
     DeterministicGatePhaseOutcome, GateLaunchOwner, NarratorConfig, ParentRepairCandidate,
     ParentRepairCandidateContext, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
-    run_contained_verdict_evaluation, run_deterministic_completion_gate,
-    run_deterministic_gate_work_phase, run_parent_repair_turn_loop, run_turn_loop,
+    RunWorkBoundary, RunWorkExpiry, run_contained_verdict_evaluation,
+    run_deterministic_completion_gate, run_deterministic_gate_work_phase,
+    run_parent_repair_turn_loop, run_turn_loop,
 };

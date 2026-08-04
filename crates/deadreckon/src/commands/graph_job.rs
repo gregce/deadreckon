@@ -8,8 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use deadreckon_protocol::{
@@ -446,6 +448,74 @@ struct ParentRepairAttemptManifest {
     started_at: chrono::DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParentBudgetStopRecord {
+    schema_version: u32,
+    job_id: String,
+    stop_reason: StopReason,
+    reason: String,
+    recorded_at: chrono::DateTime<Utc>,
+}
+
+fn parent_budget_stop_path(parent: &deadreckon_core::PipelineState) -> PathBuf {
+    parent.run_root.join("parent-budget-stop.json")
+}
+
+fn record_parent_budget_stop(
+    parent: &deadreckon_core::PipelineState,
+    stop_reason: StopReason,
+    reason: &str,
+) -> Result<()> {
+    if !matches!(
+        stop_reason,
+        StopReason::SpendCap | StopReason::WallCap | StopReason::Deadline
+    ) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "parent budget stop record rejects non-budget reason {stop_reason:?}"
+        ))));
+    }
+    commands::job::write_json_synced(
+        &parent_budget_stop_path(parent),
+        &ParentBudgetStopRecord {
+            schema_version: 1,
+            job_id: parent.run_id.clone(),
+            stop_reason,
+            reason: reason.to_string(),
+            recorded_at: Utc::now(),
+        },
+    )
+}
+
+fn read_parent_budget_stop(
+    parent: &deadreckon_core::PipelineState,
+) -> Result<Option<ParentBudgetStopRecord>> {
+    let path = parent_budget_stop_path(parent);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let record: ParentBudgetStopRecord = serde_json::from_slice(&raw).map_err(|source| {
+        CliError::Core(DeadreckonError::Json {
+            path: path.clone(),
+            source,
+        })
+    })?;
+    if record.schema_version != 1
+        || record.job_id != parent.run_id
+        || !matches!(
+            record.stop_reason,
+            StopReason::SpendCap | StopReason::WallCap | StopReason::Deadline
+        )
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "parent budget stop record has invalid identity or reason".to_string(),
+        )));
+    }
+    Ok(Some(record))
+}
+
 /// Mirrors the Single Job cancellation token while parent verification runs
 /// inside the supervisor after the conductor process has exited.
 struct ParentCompletionCancellation {
@@ -457,12 +527,23 @@ struct ParentCompletionCancellation {
 
 const PARENT_COMPLETION_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug)]
+struct ParentCompletionPhaseBoundary {
+    deadline: ProviderPhaseDeadline,
+    expiry_stop_reason: StopReason,
+}
+
 fn parent_completion_phase_deadline(
     paths: &DeadreckonPaths,
     job: &deadreckon_protocol::Job,
-) -> Result<ProviderPhaseDeadline> {
+) -> Result<ParentCompletionPhaseBoundary> {
     let now = Utc::now();
-    let work_remaining = commands::supervisor::remaining_job_work_duration(paths, job, now)?;
+    let allowance =
+        commands::supervisor::current_job_work_allowance(paths, job, now)?.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "parent completion cannot prove the current Job work allowance".to_string(),
+            ))
+        })?;
     let supervisor_cutoff =
         match std::env::var(commands::supervisor::TRUSTED_SUPERVISOR_WORK_CUTOFF_ENV) {
             Ok(value) => Some(value.parse::<chrono::DateTime<Utc>>().map_err(|error| {
@@ -477,12 +558,23 @@ fn parent_completion_phase_deadline(
                 ))));
             }
         };
-    let remaining =
-        parent_completion_remaining_at(work_remaining, job.policy.deadline, supervisor_cutoff, now);
-    Ok(ProviderPhaseDeadline::new(
-        tokio::time::Instant::now() + remaining,
-        PARENT_COMPLETION_CLEANUP_BUDGET,
-    ))
+    let remaining = parent_completion_remaining_at(
+        allowance.remaining,
+        job.policy.deadline,
+        supervisor_cutoff,
+        now,
+    );
+    let expiry_stop_reason = match allowance.boundary {
+        commands::supervisor::ActivePolicyBoundary::Deadline => StopReason::Deadline,
+        commands::supervisor::ActivePolicyBoundary::WallCap => StopReason::WallCap,
+    };
+    Ok(ParentCompletionPhaseBoundary {
+        deadline: ProviderPhaseDeadline::new(
+            tokio::time::Instant::now() + remaining,
+            PARENT_COMPLETION_CLEANUP_BUDGET,
+        ),
+        expiry_stop_reason,
+    })
 }
 
 fn parent_completion_remaining_at(
@@ -514,6 +606,7 @@ enum ParentGateSettlement {
 fn settle_parent_gate_phase(
     parent: &mut deadreckon_core::PipelineState,
     context: &str,
+    expiry_stop_reason: StopReason,
     outcome: deadreckon_runtime::DeterministicGatePhaseOutcome,
 ) -> Result<ParentGateSettlement> {
     match outcome {
@@ -540,7 +633,7 @@ fn settle_parent_gate_phase(
                 ProviderCleanup::Proven | ProviderCleanup::NotApplicable => {
                     parent_budget_exhausted(
                         parent,
-                        StopReason::WallCap,
+                        expiry_stop_reason,
                         &format!("approved Job work cutoff reached during {context}"),
                     )?
                 }
@@ -650,6 +743,9 @@ pub(crate) struct RootPlannerBudgetExhaustion {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct ParentExecutionUsage {
     spend_usd: f64,
+    /// Aggregate worker-seconds retained for evidence only. Plans can execute
+    /// independent children concurrently, so this sum is not elapsed Job time
+    /// and must never be compared with the Job wall policy.
     wall_seconds: f64,
 }
 
@@ -1337,18 +1433,559 @@ fn validate_durable_chain_completion_evidence(
     Ok(())
 }
 
-fn write_durable_hook_payload(
-    stdin: &mut dyn std::io::Write,
-    canonical_payload: &[u8],
-) -> Result<()> {
-    match stdin.write_all(canonical_payload) {
-        Ok(()) => match stdin.write_all(b"\n") {
-            Ok(()) => Ok(()),
+const DURABLE_CHAIN_HOOK_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+const DURABLE_CHAIN_HOOK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const DURABLE_CHAIN_HOOK_TERM_GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+struct DurableChainHookBoundary {
+    work_expires_at: Instant,
+    cleanup_budget: Duration,
+    cancellation_token: CancellationToken,
+    authority_path: PathBuf,
+}
+
+impl DurableChainHookBoundary {
+    fn from_job(
+        paths: &DeadreckonPaths,
+        job: &deadreckon_protocol::Job,
+        state: &deadreckon_core::PipelineState,
+        cancellation_token: CancellationToken,
+        invocation_id: &str,
+    ) -> Result<Self> {
+        let deadline = parent_completion_phase_deadline(paths, job)?.deadline;
+        Ok(Self {
+            work_expires_at: deadline.work_expires_at.into_std(),
+            cleanup_budget: deadline.cleanup_budget,
+            cancellation_token,
+            authority_path: state
+                .run_root
+                .join("child-pids")
+                .join(format!("durable-chain-hook-{invocation_id}.json")),
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        work_budget: Duration,
+        cleanup_budget: Duration,
+        cancellation_token: CancellationToken,
+        authority_path: PathBuf,
+    ) -> Self {
+        Self {
+            work_expires_at: Instant::now() + work_budget,
+            cleanup_budget,
+            cancellation_token,
+            authority_path,
+        }
+    }
+
+    fn check_before_launch(&self) -> Result<()> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(durable_chain_hook_boundary_error(
+                DurableChainHookProcessBoundary::Cancelled,
+                true,
+                None,
+                "operator cancellation was observed before hook launch",
+            ));
+        }
+        if Instant::now() >= self.work_expires_at {
+            return Err(durable_chain_hook_boundary_error(
+                DurableChainHookProcessBoundary::WorkExpired,
+                true,
+                None,
+                "the approved Job work cutoff was reached before hook launch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DurableChainHookOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableChainHookProcessBoundary {
+    WorkExpired,
+    Cancelled,
+    SupervisionFailed,
+    Completed,
+}
+
+impl DurableChainHookProcessBoundary {
+    fn process_kind(self, cleanup_proven: bool) -> deadreckon_core::ProcessBoundaryKind {
+        if !cleanup_proven {
+            return deadreckon_core::ProcessBoundaryKind::CleanupIncomplete;
+        }
+        match self {
+            Self::WorkExpired => deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            Self::Cancelled => deadreckon_core::ProcessBoundaryKind::Cancelled,
+            Self::SupervisionFailed | Self::Completed => {
+                deadreckon_core::ProcessBoundaryKind::SupervisionFailed
+            }
+        }
+    }
+}
+
+struct DurableChainHookPipes {
+    stdin_pipe: Option<std::process::ChildStdin>,
+    stdin: Option<thread::JoinHandle<std::io::Result<()>>>,
+    stdout: thread::JoinHandle<std::io::Result<String>>,
+    stderr: thread::JoinHandle<std::io::Result<String>>,
+}
+
+impl DurableChainHookPipes {
+    fn spawn(child: &mut Child) -> std::io::Result<Self> {
+        let stdin_pipe = child.stdin.take().ok_or_else(|| {
+            std::io::Error::other("durable chain hook did not expose its input pipe")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::other("durable chain hook did not expose its stdout pipe")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::other("durable chain hook did not expose its stderr pipe")
+        })?;
+        Ok(Self {
+            stdin_pipe: Some(stdin_pipe),
+            stdin: None,
+            stdout: spawn_durable_chain_hook_reader(stdout),
+            stderr: spawn_durable_chain_hook_reader(stderr),
+        })
+    }
+
+    fn release(&mut self, release_token: &str, payload: &[u8]) -> std::io::Result<()> {
+        let mut stdin = self.stdin_pipe.take().ok_or_else(|| {
+            std::io::Error::other("durable chain hook release pipe was unavailable")
+        })?;
+        let mut release = Vec::with_capacity(release_token.len() + 1);
+        release.extend_from_slice(release_token.as_bytes());
+        release.push(b'\n');
+        let mut payload = payload.to_vec();
+        payload.push(b'\n');
+        self.stdin = Some(thread::spawn(move || match stdin.write_all(&release) {
+            Ok(()) => {
+                // Do not put hook input in the pipe until `/bin/sh` has
+                // consumed the private release line and entered `exec`.
+                thread::sleep(Duration::from_millis(10));
+                match stdin.write_all(&payload) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-            Err(error) => Err(error.into()),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(error.into()),
+            Err(error) => Err(error),
+        }));
+        Ok(())
+    }
+
+    fn close_unreleased_input(&mut self) {
+        self.stdin_pipe.take();
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stdin_pipe.is_none()
+            && self
+                .stdin
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
+            && self.stdout.is_finished()
+            && self.stderr.is_finished()
+    }
+
+    fn join(mut self) -> std::result::Result<(String, String), String> {
+        self.close_unreleased_input();
+        if let Some(stdin) = self.stdin {
+            join_durable_chain_hook_thread(stdin, "stdin writer")?;
+        }
+        let stdout = join_durable_chain_hook_thread(self.stdout, "stdout reader")?;
+        let stderr = join_durable_chain_hook_thread(self.stderr, "stderr reader")?;
+        Ok((stdout, stderr))
+    }
+}
+
+fn spawn_durable_chain_hook_reader<R>(mut pipe: R) -> thread::JoinHandle<std::io::Result<String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut capture =
+            deadreckon_core::HeadTailBuffer::new(DURABLE_CHAIN_HOOK_OUTPUT_LIMIT_BYTES);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = pipe.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            capture.push(&buffer[..read]);
+        }
+        Ok(capture.render(None))
+    })
+}
+
+fn join_durable_chain_hook_thread<T>(
+    handle: thread::JoinHandle<std::io::Result<T>>,
+    label: &str,
+) -> std::result::Result<T, String> {
+    handle
+        .join()
+        .map_err(|_| format!("durable chain hook {label} panicked"))?
+        .map_err(|error| format!("durable chain hook {label} failed: {error}"))
+}
+
+fn durable_chain_hook_boundary_error(
+    boundary: DurableChainHookProcessBoundary,
+    cleanup_proven: bool,
+    authority: Option<PathBuf>,
+    detail: impl Into<String>,
+) -> CliError {
+    CliError::Core(DeadreckonError::ProcessBoundary {
+        kind: boundary.process_kind(cleanup_proven),
+        operation: "durable chain hook".to_string(),
+        authority: if cleanup_proven { None } else { authority },
+        detail: detail.into(),
+    })
+}
+
+fn durable_chain_hook_poll_interval(deadline: Instant) -> Duration {
+    DURABLE_CHAIN_HOOK_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))
+}
+
+#[cfg(unix)]
+fn durable_chain_hook_process_group_absent(pid: u32) -> std::io::Result<bool> {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let pid = i32::try_from(pid)
+        .map_err(|_| std::io::Error::other("durable chain hook pid exceeds i32"))?;
+    match kill(Pid::from_raw(-pid), None) {
+        Err(Errno::ESRCH) => Ok(true),
+        Ok(()) | Err(Errno::EPERM) => Ok(false),
+        Err(error) => Err(std::io::Error::other(format!(
+            "could not inspect durable chain hook process group {pid}: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn durable_chain_hook_process_group_absent(pid: u32) -> std::io::Result<bool> {
+    Ok(!deadreckon_core::pid_is_alive(pid))
+}
+
+fn cleanup_durable_chain_hook_process(
+    child: &mut Child,
+    terminator: &dyn deadreckon_core::ChildTerminator,
+    mut pipes: DurableChainHookPipes,
+    mut status: Option<ExitStatus>,
+    pid: u32,
+    record: Option<&deadreckon_core::SupervisedProcessRecord>,
+    boundary: &DurableChainHookBoundary,
+    trigger: DurableChainHookProcessBoundary,
+    initial_error: Option<String>,
+) -> Result<Option<DurableChainHookOutput>> {
+    let now = Instant::now();
+    let cleanup_expires_at = now.checked_add(boundary.cleanup_budget).unwrap_or(now);
+    let grace = DURABLE_CHAIN_HOOK_TERM_GRACE
+        .min(cleanup_expires_at.saturating_duration_since(Instant::now()));
+    pipes.close_unreleased_input();
+    let mut cleanup_error = initial_error;
+    if let deadreckon_core::TerminationOutcome::Failed(reason) = terminator.terminate(grace) {
+        cleanup_error = Some(reason);
+    }
+
+    loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(found) => status = found,
+                Err(error) => cleanup_error = Some(format!("could not reap hook leader: {error}")),
+            }
+        }
+        match durable_chain_hook_process_group_absent(pid) {
+            Ok(true) if status.is_some() && pipes.is_finished() => {
+                if let Some(record) = record {
+                    let removed = deadreckon_core::remove_supervised_process_record_if_same(
+                        &boundary.authority_path,
+                        record,
+                    )
+                    .map_err(|error| {
+                        durable_chain_hook_boundary_error(
+                            trigger,
+                            false,
+                            Some(boundary.authority_path.clone()),
+                            format!(
+                                "process cleanup was proven, but durable PID authority could not be compare-removed: {error}"
+                            ),
+                        )
+                    })?;
+                    if !removed && boundary.authority_path.exists() {
+                        return Err(durable_chain_hook_boundary_error(
+                            trigger,
+                            false,
+                            Some(boundary.authority_path.clone()),
+                            "process cleanup was proven, but durable PID authority changed before compare-and-remove",
+                        ));
+                    }
+                }
+                let (stdout, stderr) = pipes.join().map_err(|detail| {
+                    durable_chain_hook_boundary_error(
+                        DurableChainHookProcessBoundary::SupervisionFailed,
+                        true,
+                        None,
+                        detail,
+                    )
+                })?;
+                if trigger == DurableChainHookProcessBoundary::Completed {
+                    let status = status.ok_or_else(|| {
+                        durable_chain_hook_boundary_error(
+                            DurableChainHookProcessBoundary::SupervisionFailed,
+                            true,
+                            None,
+                            "hook process group exited without a reapable leader status",
+                        )
+                    })?;
+                    return Ok(Some(DurableChainHookOutput {
+                        status,
+                        stdout,
+                        stderr,
+                    }));
+                }
+                return Err(durable_chain_hook_boundary_error(
+                    trigger,
+                    true,
+                    None,
+                    cleanup_error.unwrap_or_else(|| match trigger {
+                        DurableChainHookProcessBoundary::WorkExpired => {
+                            "the approved Job work cutoff was reached and process cleanup was proven".to_string()
+                        }
+                        DurableChainHookProcessBoundary::Cancelled => {
+                            "operator cancellation was observed and process cleanup was proven".to_string()
+                        }
+                        DurableChainHookProcessBoundary::SupervisionFailed => {
+                            "hook supervision failed after process cleanup was proven".to_string()
+                        }
+                        DurableChainHookProcessBoundary::Completed => unreachable!(),
+                    }),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => cleanup_error = Some(error.to_string()),
+        }
+
+        if Instant::now() >= cleanup_expires_at {
+            return Err(durable_chain_hook_boundary_error(
+                trigger,
+                false,
+                record.map(|_| boundary.authority_path.clone()),
+                cleanup_error.unwrap_or_else(|| {
+                    format!(
+                        "process-group and pipe cleanup was not proven within {:.1}s; durable authority retained at {}",
+                        boundary.cleanup_budget.as_secs_f64(),
+                        boundary.authority_path.display()
+                    )
+                }),
+            ));
+        }
+        thread::sleep(durable_chain_hook_poll_interval(cleanup_expires_at));
+    }
+}
+
+#[cfg(unix)]
+fn durable_chain_hook_release_command(command: &Command, release_token: &str) -> Command {
+    let mut released = Command::new("/bin/sh");
+    released
+        .arg("-c")
+        .arg(
+            "expected=$1; shift; IFS= read -r release; \
+             test \"$release\" = \"$expected\" || exit 125; exec \"$@\"",
+        )
+        .arg("deadreckon-chain-hook-release")
+        .arg(release_token)
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(cwd) = command.get_current_dir() {
+        released.current_dir(cwd);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            released.env(name, value);
+        } else {
+            released.env_remove(name);
+        }
+    }
+    released
+}
+
+#[cfg(not(unix))]
+fn durable_chain_hook_release_command(command: &Command, _release_token: &str) -> Command {
+    let mut released = Command::new(command.get_program());
+    released.args(command.get_args());
+    if let Some(cwd) = command.get_current_dir() {
+        released.current_dir(cwd);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            released.env(name, value);
+        } else {
+            released.env_remove(name);
+        }
+    }
+    released
+}
+
+fn run_bounded_durable_chain_hook(
+    command: Command,
+    payload: &[u8],
+    boundary: &DurableChainHookBoundary,
+) -> Result<std::result::Result<DurableChainHookOutput, std::io::Error>> {
+    boundary.check_before_launch()?;
+
+    let release_token = Uuid::new_v4().to_string();
+    let mut command = durable_chain_hook_release_command(&command, &release_token);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let (mut child, terminator) = match deadreckon_core::spawn_grouped(command) {
+        Ok(spawned) => spawned,
+        Err(error) => return Ok(Err(error)),
+    };
+    let mut pipes = match DurableChainHookPipes::spawn(&mut child) {
+        Ok(pipes) => pipes,
+        Err(error) => {
+            let _ = terminator.terminate(Duration::ZERO);
+            let _ = child.try_wait();
+            return Err(durable_chain_hook_boundary_error(
+                DurableChainHookProcessBoundary::SupervisionFailed,
+                false,
+                None,
+                format!("could not establish concurrent hook pipe drainage: {error}"),
+            ));
+        }
+    };
+    let process = deadreckon_core::SupervisedProcess {
+        pid: child.id(),
+        pgid: cfg!(unix).then_some(child.id()),
+    };
+    let pid = child.id();
+    let record = match deadreckon_core::SupervisedProcessRecord::running(process) {
+        Ok(record) => record,
+        Err(error) => {
+            return cleanup_durable_chain_hook_process(
+                &mut child,
+                terminator.as_ref(),
+                pipes,
+                None,
+                pid,
+                None,
+                boundary,
+                DurableChainHookProcessBoundary::SupervisionFailed,
+                Some(format!(
+                    "could not establish durable hook process identity: {error}"
+                )),
+            )
+            .map(|_| unreachable!());
+        }
+    };
+    if let Err(error) =
+        deadreckon_core::write_supervised_process_record(&boundary.authority_path, &record)
+    {
+        return cleanup_durable_chain_hook_process(
+            &mut child,
+            terminator.as_ref(),
+            pipes,
+            None,
+            pid,
+            None,
+            boundary,
+            DurableChainHookProcessBoundary::SupervisionFailed,
+            Some(format!("could not persist durable PID authority: {error}")),
+        )
+        .map(|_| unreachable!());
+    }
+    if let Err(error) = pipes.release(&release_token, payload) {
+        return cleanup_durable_chain_hook_process(
+            &mut child,
+            terminator.as_ref(),
+            pipes,
+            None,
+            pid,
+            Some(&record),
+            boundary,
+            DurableChainHookProcessBoundary::SupervisionFailed,
+            Some(format!(
+                "could not release the authority-bound hook: {error}"
+            )),
+        )
+        .map(|_| unreachable!());
+    }
+
+    loop {
+        let trigger = if boundary.cancellation_token.is_cancelled() {
+            Some(DurableChainHookProcessBoundary::Cancelled)
+        } else if Instant::now() >= boundary.work_expires_at {
+            Some(DurableChainHookProcessBoundary::WorkExpired)
+        } else {
+            None
+        };
+        if let Some(trigger) = trigger {
+            return cleanup_durable_chain_hook_process(
+                &mut child,
+                terminator.as_ref(),
+                pipes,
+                None,
+                pid,
+                Some(&record),
+                boundary,
+                trigger,
+                None,
+            )
+            .map(|_| unreachable!());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = cleanup_durable_chain_hook_process(
+                    &mut child,
+                    terminator.as_ref(),
+                    pipes,
+                    Some(status),
+                    pid,
+                    Some(&record),
+                    boundary,
+                    DurableChainHookProcessBoundary::Completed,
+                    None,
+                )?;
+                let output = output.ok_or_else(|| {
+                    durable_chain_hook_boundary_error(
+                        DurableChainHookProcessBoundary::SupervisionFailed,
+                        true,
+                        None,
+                        "completed hook cleanup returned without captured output",
+                    )
+                })?;
+                return Ok(Ok(output));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return cleanup_durable_chain_hook_process(
+                    &mut child,
+                    terminator.as_ref(),
+                    pipes,
+                    None,
+                    pid,
+                    Some(&record),
+                    boundary,
+                    DurableChainHookProcessBoundary::SupervisionFailed,
+                    Some(format!("could not inspect hook process: {error}")),
+                )
+                .map(|_| unreachable!());
+            }
+        }
+        thread::sleep(durable_chain_hook_poll_interval(boundary.work_expires_at));
     }
 }
 
@@ -1362,6 +1999,7 @@ fn invoke_frozen_durable_chain_hook(
     attempt: u32,
     cwd: &Path,
     payload: &serde_json::Value,
+    boundary: &DurableChainHookBoundary,
 ) -> Result<i32> {
     use deadreckon_core::chain::{DurableChainHookEvent, DurableChainHookEventKind};
 
@@ -1411,6 +2049,7 @@ fn invoke_frozen_durable_chain_hook(
             "inspect the Job hook evidence and explicitly replace or terminate the Job",
         )));
     }
+    boundary.check_before_launch()?;
 
     let approved_hook_path = deadreckon_core::chain::materialize_fenced_approved_chain_hook(
         paths,
@@ -1505,8 +2144,8 @@ fn invoke_frozen_durable_chain_hook(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let output = match run_bounded_durable_chain_hook(command, &started.payload_bytes, boundary)? {
+        Ok(output) => output,
         Err(error) => {
             let completed = DurableChainHookEvent::completed(
                 &started,
@@ -1521,17 +2160,13 @@ fn invoke_frozen_durable_chain_hook(
             return Ok(-1);
         }
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        write_durable_hook_payload(stdin, &started.payload_bytes)?;
-    }
-    let output = child.wait_with_output()?;
     let exit_code = output.status.code().unwrap_or(-2);
     let completed = DurableChainHookEvent::completed(
         &started,
         Utc::now(),
         exit_code,
-        truncate_text(&String::from_utf8_lossy(&output.stdout), 4096),
-        truncate_text(&String::from_utf8_lossy(&output.stderr), 4096),
+        truncate_text(&output.stdout, 4096),
+        truncate_text(&output.stderr, 4096),
     )?;
     deadreckon_core::chain::append_fenced_durable_chain_hook_event(paths, token, &completed)?;
     Ok(exit_code)
@@ -1574,13 +2209,32 @@ pub(crate) fn invoke_current_durable_chain_hook(
     };
     let token = current_driver_lease_token(paths, &plan.plan_id)?;
     let payload = bind_durable_chain_hook_payload(adapter, &plan.plan_id, payload)?;
+    let job = deadreckon_core::load_job(paths, &plan.plan_id)?;
+    let state = deadreckon_core::load_run(paths, &plan.plan_id)?;
+    let cancellation = ParentCompletionCancellation::start(&state)?;
     let cwd = plan.parent_cwd.as_deref().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "durable chain Plan has no isolated execution workspace".to_string(),
         ))
     })?;
+    let requested = deadreckon_core::chain::DurableChainHookEvent::started(
+        token.job_id.clone(),
+        adapter.source_chain_id.clone(),
+        hook.clone(),
+        step_index,
+        attempt,
+        Utc::now(),
+        &payload,
+    )?;
+    let boundary = DurableChainHookBoundary::from_job(
+        paths,
+        &job,
+        &state,
+        cancellation.token().clone(),
+        &requested.invocation_id,
+    )?;
     invoke_frozen_durable_chain_hook(
-        paths, &token, adapter, hook, step_index, attempt, cwd, &payload,
+        paths, &token, adapter, hook, step_index, attempt, cwd, &payload, &boundary,
     )
     .map(Some)
 }
@@ -3487,13 +4141,408 @@ pub(crate) fn spawn_delegated(
     Ok(child)
 }
 
+const MERGE_REPAIR_CHILD_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const MERGE_REPAIR_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MERGE_REPAIR_CHILD_TERM_GRACE: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeRepairChildProcessBoundary {
+    WorkExpired,
+    Cancelled,
+    SupervisionFailed,
+    Completed,
+}
+
+impl MergeRepairChildProcessBoundary {
+    fn process_kind(self, cleanup_proven: bool) -> deadreckon_core::ProcessBoundaryKind {
+        if !cleanup_proven {
+            return deadreckon_core::ProcessBoundaryKind::CleanupIncomplete;
+        }
+        match self {
+            Self::WorkExpired => deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            Self::Cancelled => deadreckon_core::ProcessBoundaryKind::Cancelled,
+            Self::SupervisionFailed | Self::Completed => {
+                deadreckon_core::ProcessBoundaryKind::SupervisionFailed
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum MergeRepairChildCancellation {
+    Job {
+        paths: DeadreckonPaths,
+        job_id: String,
+    },
+    #[cfg(test)]
+    Token(CancellationToken),
+}
+
+impl MergeRepairChildCancellation {
+    fn requested(&self) -> Result<bool> {
+        match self {
+            Self::Job { paths, job_id } => {
+                let projection = deadreckon_core::load_job_projection(paths, job_id)?;
+                Ok(projection.stop_reason == Some(StopReason::CancelRequested)
+                    || projection.outcome == Some(deadreckon_protocol::JobOutcome::Cancelled))
+            }
+            #[cfg(test)]
+            Self::Token(token) => Ok(token.is_cancelled()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MergeRepairChildBoundary {
+    work_expires_at: Instant,
+    cleanup_budget: Duration,
+    cancellation: MergeRepairChildCancellation,
+}
+
+impl MergeRepairChildBoundary {
+    fn from_job(paths: &DeadreckonPaths, job: &deadreckon_protocol::Job) -> Result<Self> {
+        let deadline = parent_completion_phase_deadline(paths, job)?.deadline;
+        Ok(Self {
+            work_expires_at: deadline.work_expires_at.into_std(),
+            cleanup_budget: deadline.cleanup_budget,
+            cancellation: MergeRepairChildCancellation::Job {
+                paths: paths.clone(),
+                job_id: job.job_id.as_ref().to_string(),
+            },
+        })
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        work_budget: Duration,
+        cleanup_budget: Duration,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            work_expires_at: Instant::now() + work_budget,
+            cleanup_budget,
+            cancellation: MergeRepairChildCancellation::Token(cancellation),
+        }
+    }
+
+    fn current_trigger(&self) -> Result<Option<MergeRepairChildProcessBoundary>> {
+        if self.cancellation.requested()? {
+            return Ok(Some(MergeRepairChildProcessBoundary::Cancelled));
+        }
+        if Instant::now() >= self.work_expires_at {
+            return Ok(Some(MergeRepairChildProcessBoundary::WorkExpired));
+        }
+        Ok(None)
+    }
+
+    fn check_before_launch(&self) -> Result<()> {
+        if let Some(trigger) = self.current_trigger()? {
+            return Err(merge_repair_child_boundary_error(
+                trigger,
+                true,
+                None,
+                match trigger {
+                    MergeRepairChildProcessBoundary::Cancelled => {
+                        "operator cancellation was observed before merge-repair child launch"
+                    }
+                    MergeRepairChildProcessBoundary::WorkExpired => {
+                        "the approved Job work cutoff was reached before merge-repair child launch"
+                    }
+                    MergeRepairChildProcessBoundary::SupervisionFailed
+                    | MergeRepairChildProcessBoundary::Completed => unreachable!(),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+struct MergeRepairChildPipes {
+    stdout: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+}
+
+impl MergeRepairChildPipes {
+    fn spawn(child: &mut Child) -> std::io::Result<Self> {
+        let stdout = child.stdout.take().ok_or_else(|| {
+            std::io::Error::other("merge-repair child did not expose its stdout pipe")
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            std::io::Error::other("merge-repair child did not expose its stderr pipe")
+        })?;
+        Ok(Self {
+            stdout: spawn_merge_repair_child_reader(stdout),
+            stderr: spawn_merge_repair_child_reader(stderr),
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stdout.is_finished() && self.stderr.is_finished()
+    }
+
+    fn join(self) -> std::result::Result<(Vec<u8>, Vec<u8>), String> {
+        let stdout = join_merge_repair_child_reader(self.stdout, "stdout")?;
+        let stderr = join_merge_repair_child_reader(self.stderr, "stderr")?;
+        Ok((stdout, stderr))
+    }
+}
+
+fn spawn_merge_repair_child_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut capture =
+            deadreckon_core::HeadTailBuffer::new(MERGE_REPAIR_CHILD_OUTPUT_LIMIT_BYTES);
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            capture.push(&buffer[..read]);
+        }
+        Ok(capture.render(None).into_bytes())
+    })
+}
+
+fn join_merge_repair_child_reader(
+    reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> std::result::Result<Vec<u8>, String> {
+    reader
+        .join()
+        .map_err(|_| format!("merge-repair child {stream} reader panicked"))?
+        .map_err(|error| format!("merge-repair child {stream} reader failed: {error}"))
+}
+
+fn merge_repair_child_boundary_error(
+    trigger: MergeRepairChildProcessBoundary,
+    cleanup_proven: bool,
+    authority: Option<PathBuf>,
+    detail: impl Into<String>,
+) -> CliError {
+    CliError::Core(DeadreckonError::ProcessBoundary {
+        kind: trigger.process_kind(cleanup_proven),
+        operation: "merge-repair child".to_string(),
+        authority: if cleanup_proven { None } else { authority },
+        detail: detail.into(),
+    })
+}
+
+pub(crate) struct SupervisedMergeRepairChild {
+    paths: DeadreckonPaths,
+    job_id: String,
+    repair_id: String,
+    protected_authority_path: PathBuf,
+    process: deadreckon_core::SupervisedProcessRecord,
+    child: Child,
+    boundary: MergeRepairChildBoundary,
+}
+
+impl SupervisedMergeRepairChild {
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn settle(
+        &mut self,
+        pipes: Option<MergeRepairChildPipes>,
+        mut status: Option<ExitStatus>,
+        trigger: MergeRepairChildProcessBoundary,
+        initial_error: Option<String>,
+    ) -> Result<Output> {
+        let authority = match validated_merge_repair_wait_authority(
+            &self.paths,
+            &self.job_id,
+            &self.repair_id,
+            &self.process,
+        ) {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(merge_repair_child_boundary_error(
+                    trigger,
+                    false,
+                    Some(self.protected_authority_path.clone()),
+                    format!(
+                        "the persisted delegated process authority could not be validated before cleanup: {error}"
+                    ),
+                ));
+            }
+        };
+        let now = Instant::now();
+        let cleanup_expires_at = now.checked_add(self.boundary.cleanup_budget).unwrap_or(now);
+        let grace = MERGE_REPAIR_CHILD_TERM_GRACE
+            .min(cleanup_expires_at.saturating_duration_since(Instant::now()));
+        let mut cleanup_error = initial_error;
+        if let deadreckon_core::TerminationOutcome::Failed(reason) =
+            commands::job::terminate_supervised_process(authority.process.process, grace)
+        {
+            cleanup_error = Some(reason);
+        }
+        let mut pipes = Some(pipes);
+
+        loop {
+            if status.is_none() {
+                match self.child.try_wait() {
+                    Ok(found) => status = found,
+                    Err(error) => {
+                        cleanup_error = Some(format!("could not reap merge-repair leader: {error}"))
+                    }
+                }
+            }
+            let pipes_finished = pipes
+                .as_ref()
+                .and_then(Option::as_ref)
+                .is_none_or(MergeRepairChildPipes::is_finished);
+            match durable_chain_hook_process_group_absent(self.process.process.pid) {
+                Ok(true) if status.is_some() && pipes_finished => {
+                    if let Err(error) =
+                        remove_pending_merge_repair_capability(&self.paths, &authority)
+                    {
+                        return Err(merge_repair_child_boundary_error(
+                            trigger,
+                            false,
+                            Some(self.protected_authority_path.clone()),
+                            format!(
+                                "process cleanup was proven, but the delegated capability could not be revoked: {error}"
+                            ),
+                        ));
+                    }
+                    let pipes = pipes.take().flatten().ok_or_else(|| {
+                        merge_repair_child_boundary_error(
+                            MergeRepairChildProcessBoundary::SupervisionFailed,
+                            true,
+                            None,
+                            "process cleanup was proven, but output capture was unavailable",
+                        )
+                    })?;
+                    let (stdout, stderr) = pipes.join().map_err(|detail| {
+                        merge_repair_child_boundary_error(
+                            MergeRepairChildProcessBoundary::SupervisionFailed,
+                            true,
+                            None,
+                            detail,
+                        )
+                    })?;
+                    if trigger == MergeRepairChildProcessBoundary::Completed {
+                        return Ok(Output {
+                            status: status.expect("checked above"),
+                            stdout,
+                            stderr,
+                        });
+                    }
+                    return Err(merge_repair_child_boundary_error(
+                        trigger,
+                        true,
+                        None,
+                        cleanup_error.unwrap_or_else(|| match trigger {
+                            MergeRepairChildProcessBoundary::WorkExpired => {
+                                "the approved Job work cutoff was reached and process cleanup was proven".to_string()
+                            }
+                            MergeRepairChildProcessBoundary::Cancelled => {
+                                "operator cancellation was observed and process cleanup was proven".to_string()
+                            }
+                            MergeRepairChildProcessBoundary::SupervisionFailed => {
+                                "merge-repair child supervision failed after process cleanup was proven".to_string()
+                            }
+                            MergeRepairChildProcessBoundary::Completed => unreachable!(),
+                        }),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => cleanup_error = Some(error.to_string()),
+            }
+
+            if Instant::now() >= cleanup_expires_at {
+                return Err(merge_repair_child_boundary_error(
+                    trigger,
+                    false,
+                    Some(self.protected_authority_path.clone()),
+                    cleanup_error.unwrap_or_else(|| {
+                        format!(
+                            "process-group, leader, and pipe cleanup was not proven within {:.1}s; durable authority retained at {}",
+                            self.boundary.cleanup_budget.as_secs_f64(),
+                            self.protected_authority_path.display()
+                        )
+                    }),
+                ));
+            }
+            thread::sleep(
+                MERGE_REPAIR_CHILD_POLL_INTERVAL
+                    .min(cleanup_expires_at.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    pub(crate) fn wait(mut self) -> Result<Output> {
+        let pipes = match MergeRepairChildPipes::spawn(&mut self.child) {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                return self.settle(
+                    None,
+                    None,
+                    MergeRepairChildProcessBoundary::SupervisionFailed,
+                    Some(format!(
+                        "could not establish concurrent merge-repair output drainage: {error}"
+                    )),
+                );
+            }
+        };
+        loop {
+            let trigger = match self.boundary.current_trigger() {
+                Ok(trigger) => trigger,
+                Err(error) => {
+                    return self.settle(
+                        Some(pipes),
+                        None,
+                        MergeRepairChildProcessBoundary::SupervisionFailed,
+                        Some(format!(
+                            "could not inspect the Job cancellation boundary: {error}"
+                        )),
+                    );
+                }
+            };
+            if let Some(trigger) = trigger {
+                return self.settle(Some(pipes), None, trigger, None);
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    return self.settle(
+                        Some(pipes),
+                        Some(status),
+                        MergeRepairChildProcessBoundary::Completed,
+                        None,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return self.settle(
+                        Some(pipes),
+                        None,
+                        MergeRepairChildProcessBoundary::SupervisionFailed,
+                        Some(format!("could not inspect merge-repair child: {error}")),
+                    );
+                }
+            }
+            thread::sleep(
+                MERGE_REPAIR_CHILD_POLL_INTERVAL.min(
+                    self.boundary
+                        .work_expires_at
+                        .saturating_duration_since(Instant::now()),
+                ),
+            );
+        }
+    }
+}
+
 pub(crate) fn spawn_merge_repair_delegated(
     paths: &DeadreckonPaths,
     mut command: Command,
     prepared: &PreparedDelegation,
     authority_path: &Path,
     mut authority: serde_json::Value,
-) -> Result<Child> {
+) -> Result<SupervisedMergeRepairChild> {
     let context = DRIVER_CONTEXT.get().ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(
             "durable merge repair launch requires the current parent Job driver".to_string(),
@@ -3507,6 +4556,16 @@ pub(crate) fn spawn_merge_repair_delegated(
             "durable merge repair launch lost its fenced parent authority".to_string(),
         )));
     }
+    let job = deadreckon_core::load_job(paths, &context.job_id)?;
+    let boundary = match MergeRepairChildBoundary::from_job(paths, &job)
+        .and_then(|boundary| boundary.check_before_launch().map(|()| boundary))
+    {
+        Ok(boundary) => boundary,
+        Err(error) => {
+            revoke_pending_delegation(paths, prepared)?;
+            return Err(error);
+        }
+    };
     let token = match guarded_authority_lease_token(paths, &context.authority) {
         Ok(token) => token,
         Err(error) => {
@@ -3616,7 +4675,15 @@ pub(crate) fn spawn_merge_repair_delegated(
         revocation?;
         return Err(error);
     }
-    Ok(child)
+    Ok(SupervisedMergeRepairChild {
+        paths: paths.clone(),
+        job_id: context.job_id.clone(),
+        repair_id: repair_id.to_string(),
+        protected_authority_path: protected_path,
+        process,
+        child,
+        boundary,
+    })
 }
 
 fn validate_campaign_sub_launch_identity(launch: &CampaignSubLaunchAuthority) -> Result<()> {
@@ -4335,6 +5402,54 @@ pub(crate) fn validate_merge_repair_process_inventory_for_job(
         });
     }
     Ok(ValidatedMergeRepairProcessInventory { authorities })
+}
+
+fn validated_merge_repair_wait_authority(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    repair_id: &str,
+    expected: &deadreckon_core::SupervisedProcessRecord,
+) -> Result<MergeRepairProcessAuthority> {
+    let inventory = validate_merge_repair_process_inventory_for_job(paths, job_id)?;
+    let mut matches = inventory
+        .authorities
+        .into_iter()
+        .filter(|authority| authority.repair_id == repair_id);
+    let authority = matches.next().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair child {repair_id} has no protected delegated process authority"
+        )))
+    })?;
+    if matches.next().is_some()
+        || authority.job_id != job_id
+        || authority.process != *expected
+        || authority.path != merge_repair_authority_path(paths, job_id, repair_id)
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "merge-repair child {repair_id} changed or duplicated its exact delegated process authority"
+        ))));
+    }
+    Ok(authority)
+}
+
+fn remove_pending_merge_repair_capability(
+    paths: &DeadreckonPaths,
+    authority: &MergeRepairProcessAuthority,
+) -> Result<()> {
+    let pending = delegation_pending_path(paths, &authority.job_id, &authority.capability_id);
+    match fs::remove_file(&pending) {
+        Ok(()) => {
+            if let Some(parent) = pending.parent() {
+                sync_delegation_directory(parent)?;
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CliError::Core(DeadreckonError::Io {
+            path: pending,
+            source,
+        })),
+    }
 }
 
 fn required_merge_repair_string(
@@ -6563,18 +7678,37 @@ async fn run_pending_parent_repair(
     let manifest_sha256 = deadreckon_core::flight::sha256_file(&manifest_path)?;
 
     let parent_budget_spend = job.policy.max_spend_usd - execution_usage.spend_usd;
-    let parent_budget_wall = job.policy.max_wall_seconds as f64 - execution_usage.wall_seconds;
-    if parent_budget_spend <= parent.total_spend_usd
-        || parent_budget_wall <= parent.total_wall_seconds
-    {
-        let reason = if parent_budget_spend <= parent.total_spend_usd {
-            "approved aggregate spend cap was exhausted before parent repair"
+    let allowance = commands::supervisor::current_job_work_allowance(paths, job, Utc::now())?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "parent repair cannot prove the Job work allowance".to_string(),
+            ))
+        })?;
+    let parent_budget_wall = parent.total_wall_seconds + allowance.remaining.as_secs_f64();
+    if !parent_budget_wall.is_finite() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "parent repair wall allowance overflowed".to_string(),
+        )));
+    }
+    if parent_budget_spend <= parent.total_spend_usd || allowance.remaining.is_zero() {
+        let (stop_reason, reason) = if parent_budget_spend <= parent.total_spend_usd {
+            (
+                StopReason::SpendCap,
+                "approved aggregate spend cap was exhausted before parent repair",
+            )
         } else {
-            "approved aggregate wall-time cap was exhausted before parent repair"
+            (
+                match allowance.boundary {
+                    commands::supervisor::ActivePolicyBoundary::Deadline => StopReason::Deadline,
+                    commands::supervisor::ActivePolicyBoundary::WallCap => StopReason::WallCap,
+                },
+                "authoritative Job work allowance was exhausted before parent repair",
+            )
         };
         parent.pause_reason = Some(reason.to_string());
         parent.failure_reason = Some(reason.to_string());
         parent.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+        record_parent_budget_stop(&parent, stop_reason, reason)?;
         deadreckon_core::save_state(&parent)?;
         return Ok(());
     }
@@ -6666,7 +7800,8 @@ pub(crate) async fn complete_merged_plan_parent(
         }
         verify_parent_result_identity(paths, job, &existing, &merged)?;
         let cancellation = ParentCompletionCancellation::start(&existing)?;
-        let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+        let phase_boundary = parent_completion_phase_deadline(paths, job)?;
+        let phase_deadline = phase_boundary.deadline;
         match deadreckon_core::validate_completion_receipt_bounded(
             paths,
             &existing,
@@ -6691,6 +7826,7 @@ pub(crate) async fn complete_merged_plan_parent(
                             &mut existing,
                             &error,
                             "existing graph parent receipt promotion",
+                            phase_boundary.expiry_stop_reason,
                         )? {
                             return Ok(terminal);
                         }
@@ -6705,6 +7841,7 @@ pub(crate) async fn complete_merged_plan_parent(
                     &mut existing,
                     &error,
                     "existing graph parent receipt validation",
+                    phase_boundary.expiry_stop_reason,
                 )? {
                     return Ok(terminal);
                 }
@@ -6742,7 +7879,8 @@ pub(crate) async fn complete_merged_plan_parent(
     }
     let mut parent = prepare_parent_result_run(paths, job, authority, &merged)?;
     let cancellation = ParentCompletionCancellation::start(&parent)?;
-    let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+    let phase_boundary = parent_completion_phase_deadline(paths, job)?;
+    let phase_deadline = phase_boundary.deadline;
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -6782,6 +7920,7 @@ pub(crate) async fn complete_merged_plan_parent(
         let gate = match settle_parent_gate_phase(
             &mut parent,
             "graph deterministic verification",
+            phase_boundary.expiry_stop_reason,
             gate,
         )? {
             ParentGateSettlement::Completed(result) => result,
@@ -6855,6 +7994,7 @@ pub(crate) async fn complete_merged_plan_parent(
             &judgment,
             &cancellation,
             phase_deadline,
+            phase_boundary.expiry_stop_reason,
         );
     }
     if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
@@ -6879,7 +8019,7 @@ pub(crate) async fn complete_merged_plan_parent(
             &router,
             backend,
             &job.source_cwd,
-            remaining_semantic_budget(job, current_usage),
+            remaining_semantic_budget(job, current_usage, phase_deadline),
             phase_deadline,
             Some(cancellation.token()),
         )
@@ -6913,7 +8053,12 @@ pub(crate) async fn complete_merged_plan_parent(
     }
     let final_usage = combined_parent_usage(execution_usage, &parent)?;
     if let Some(dimension) = semantic.budget_exhaustion {
-        let (stop_reason, reason) = semantic_judge_budget_exhaustion(job, final_usage, dimension);
+        let (stop_reason, reason) = semantic_judge_budget_exhaustion(
+            job,
+            final_usage,
+            dimension,
+            phase_boundary.expiry_stop_reason,
+        );
         return parent_budget_exhausted(&mut parent, stop_reason, &reason);
     }
     if let Some((stop_reason, reason)) = semantic_budget_overrun(job, final_usage) {
@@ -6940,6 +8085,7 @@ pub(crate) async fn complete_merged_plan_parent(
             &judgment,
             &cancellation,
             phase_deadline,
+            phase_boundary.expiry_stop_reason,
         ),
         deadreckon_runtime::SemanticJudgeResult::Revise(judgment) => request_parent_repair(
             paths,
@@ -7031,7 +8177,8 @@ pub(crate) async fn complete_merged_campaign_parent(
             )?;
         }
         let cancellation = ParentCompletionCancellation::start(&existing)?;
-        let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+        let phase_boundary = parent_completion_phase_deadline(paths, job)?;
+        let phase_deadline = phase_boundary.deadline;
         match deadreckon_core::validate_completion_receipt_bounded(
             paths,
             &existing,
@@ -7056,6 +8203,7 @@ pub(crate) async fn complete_merged_campaign_parent(
                             &mut existing,
                             &error,
                             "existing campaign parent receipt promotion",
+                            phase_boundary.expiry_stop_reason,
                         )? {
                             return Ok(terminal);
                         }
@@ -7070,6 +8218,7 @@ pub(crate) async fn complete_merged_campaign_parent(
                     &mut existing,
                     &error,
                     "existing campaign parent receipt validation",
+                    phase_boundary.expiry_stop_reason,
                 )? {
                     return Ok(terminal);
                 }
@@ -7108,7 +8257,8 @@ pub(crate) async fn complete_merged_campaign_parent(
 
     let mut parent = prepare_parent_result_run(paths, job, authority, &merged)?;
     let cancellation = ParentCompletionCancellation::start(&parent)?;
-    let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+    let phase_boundary = parent_completion_phase_deadline(paths, job)?;
+    let phase_deadline = phase_boundary.deadline;
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -7165,6 +8315,7 @@ pub(crate) async fn complete_merged_campaign_parent(
         let gate = match settle_parent_gate_phase(
             &mut parent,
             "campaign deterministic verification",
+            phase_boundary.expiry_stop_reason,
             gate,
         )? {
             ParentGateSettlement::Completed(result) => result,
@@ -7238,6 +8389,7 @@ pub(crate) async fn complete_merged_campaign_parent(
             &judgment,
             &cancellation,
             phase_deadline,
+            phase_boundary.expiry_stop_reason,
         );
     }
     if let Some((stop_reason, reason)) = semantic_budget_exhaustion(job, current_usage) {
@@ -7262,7 +8414,7 @@ pub(crate) async fn complete_merged_campaign_parent(
             &router,
             backend,
             &job.source_cwd,
-            remaining_semantic_budget(job, current_usage),
+            remaining_semantic_budget(job, current_usage, phase_deadline),
             phase_deadline,
             Some(cancellation.token()),
         )
@@ -7296,7 +8448,12 @@ pub(crate) async fn complete_merged_campaign_parent(
     }
     let final_usage = combined_parent_usage(execution_usage, &parent)?;
     if let Some(dimension) = semantic.budget_exhaustion {
-        let (stop_reason, reason) = semantic_judge_budget_exhaustion(job, final_usage, dimension);
+        let (stop_reason, reason) = semantic_judge_budget_exhaustion(
+            job,
+            final_usage,
+            dimension,
+            phase_boundary.expiry_stop_reason,
+        );
         return parent_budget_exhausted(&mut parent, stop_reason, &reason);
     }
     if let Some((stop_reason, reason)) = semantic_budget_overrun(job, final_usage) {
@@ -7323,6 +8480,7 @@ pub(crate) async fn complete_merged_campaign_parent(
             &judgment,
             &cancellation,
             phase_deadline,
+            phase_boundary.expiry_stop_reason,
         ),
         deadreckon_runtime::SemanticJudgeResult::Revise(judgment) => request_parent_repair(
             paths,
@@ -8013,18 +9171,21 @@ fn pending_parent_repair_completion(
         return Ok(None);
     }
     if parent.status == deadreckon_core::RunStatus::Failed
-        && let Some(reason) = parent.pause_reason.as_deref()
+        && let Some(record) = read_parent_budget_stop(parent)?
     {
-        let stop_reason = if reason.contains("spend") {
-            StopReason::SpendCap
-        } else if reason.contains("wall") {
-            StopReason::WallCap
-        } else {
-            StopReason::AttemptLimit
-        };
+        let reason = parent.pause_reason.as_deref().ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "typed parent budget stop has no persisted pause reason".to_string(),
+            ))
+        })?;
+        if record.reason != reason {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(
+                "parent repair budget reason disagrees with its typed stop record".to_string(),
+            )));
+        }
         return Ok(Some(ParentCompletion::BudgetExhausted {
             reason: reason.to_string(),
-            stop_reason,
+            stop_reason: record.stop_reason,
         }));
     }
     if parent.status == deadreckon_core::RunStatus::Killed {
@@ -8507,9 +9668,15 @@ pub(crate) fn current_driver_remaining_repair_budget(
         },
         &mut usage,
     )?;
+    let allowance = commands::supervisor::current_job_work_allowance(paths, &job, Utc::now())?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "merge repair cannot prove the parent Job work allowance".to_string(),
+            ))
+        })?;
     Ok(Some(repair_budget_availability(
         job.policy.max_spend_usd,
-        job.policy.max_wall_seconds as f64,
+        allowance.remaining.as_secs_f64(),
         usage,
     )))
 }
@@ -8552,11 +9719,10 @@ fn graph_repair_execution_usage(
 
 fn repair_budget_availability(
     max_spend_usd: f64,
-    max_wall_seconds: f64,
+    authoritative_remaining_wall_seconds: f64,
     usage: ParentExecutionUsage,
 ) -> RepairBudgetAvailability {
     let remaining_spend = max_spend_usd - usage.spend_usd;
-    let remaining_wall = max_wall_seconds - usage.wall_seconds;
     if remaining_spend <= 0.0 {
         return RepairBudgetAvailability::Exhausted {
             stop_reason: StopReason::SpendCap,
@@ -8566,18 +9732,16 @@ fn repair_budget_availability(
             ),
         };
     }
-    if remaining_wall <= 0.0 {
+    if authoritative_remaining_wall_seconds <= 0.0 {
         return RepairBudgetAvailability::Exhausted {
             stop_reason: StopReason::WallCap,
-            reason: format!(
-                "merge repair child refused because the parent Job exhausted its approved wall-time cap ({:.3}s used of {max_wall_seconds:.3}s)",
-                usage.wall_seconds
-            ),
+            reason: "merge repair child refused because the authoritative parent Job work allowance is exhausted"
+                .to_string(),
         };
     }
     RepairBudgetAvailability::Available {
         spend_usd: remaining_spend,
-        wall_seconds: remaining_wall,
+        wall_seconds: authoritative_remaining_wall_seconds,
     }
 }
 
@@ -8774,10 +9938,16 @@ fn combined_parent_usage(
 fn remaining_semantic_budget(
     job: &deadreckon_protocol::Job,
     usage: ParentExecutionUsage,
+    phase_deadline: ProviderPhaseDeadline,
 ) -> deadreckon_runtime::SemanticJudgeBudget {
     deadreckon_runtime::SemanticJudgeBudget {
         remaining_spend_usd: Some(job.policy.max_spend_usd - usage.spend_usd),
-        remaining_wall_seconds: Some(job.policy.max_wall_seconds as f64 - usage.wall_seconds),
+        remaining_wall_seconds: Some(
+            phase_deadline
+                .work_expires_at
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_secs_f64(),
+        ),
     }
 }
 
@@ -8791,15 +9961,6 @@ fn semantic_budget_exhaustion(
             format!(
                 "approved spend cap was exhausted before semantic judging (${:.6} used of ${:.6})",
                 usage.spend_usd, job.policy.max_spend_usd
-            ),
-        ));
-    }
-    if usage.wall_seconds >= job.policy.max_wall_seconds as f64 {
-        return Some((
-            StopReason::WallCap,
-            format!(
-                "approved wall-time cap was exhausted before semantic judging ({:.3}s used of {}s)",
-                usage.wall_seconds, job.policy.max_wall_seconds
             ),
         ));
     }
@@ -8819,15 +9980,6 @@ fn semantic_budget_overrun(
             ),
         ));
     }
-    if usage.wall_seconds > job.policy.max_wall_seconds as f64 {
-        return Some((
-            StopReason::WallCap,
-            format!(
-                "semantic judging exceeded the approved wall-time cap ({:.3}s used of {}s)",
-                usage.wall_seconds, job.policy.max_wall_seconds
-            ),
-        ));
-    }
     None
 }
 
@@ -8835,6 +9987,7 @@ fn semantic_judge_budget_exhaustion(
     job: &deadreckon_protocol::Job,
     usage: ParentExecutionUsage,
     dimension: deadreckon_runtime::SemanticBudgetExhaustion,
+    expiry_stop_reason: StopReason,
 ) -> (StopReason, String) {
     match dimension {
         deadreckon_runtime::SemanticBudgetExhaustion::Spend => (
@@ -8845,11 +9998,8 @@ fn semantic_judge_budget_exhaustion(
             ),
         ),
         deadreckon_runtime::SemanticBudgetExhaustion::Wall => (
-            StopReason::WallCap,
-            format!(
-                "semantic judging exhausted the approved wall-time cap ({:.3}s used of {}s)",
-                usage.wall_seconds, job.policy.max_wall_seconds
-            ),
+            expiry_stop_reason,
+            "semantic judging exhausted the authoritative parent Job work allowance".to_string(),
         ),
     }
 }
@@ -8862,6 +10012,7 @@ fn parent_budget_exhausted(
     parent.pause_reason = Some(reason.to_string());
     parent.failure_reason = Some(reason.to_string());
     parent.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    record_parent_budget_stop(parent, stop_reason, reason)?;
     deadreckon_core::save_state(parent)?;
     Ok(ParentCompletion::BudgetExhausted {
         reason: reason.to_string(),
@@ -8878,6 +10029,7 @@ fn seal_achieved_parent(
     judgment: &deadreckon_protocol::SemanticJudgment,
     cancellation: &ParentCompletionCancellation,
     phase_deadline: ProviderPhaseDeadline,
+    expiry_stop_reason: StopReason,
 ) -> Result<ParentCompletion> {
     if cancellation.requested() {
         return parent_cancelled(
@@ -8903,7 +10055,7 @@ fn seal_achieved_parent(
     if tokio::time::Instant::now() >= phase_deadline.work_expires_at {
         return parent_budget_exhausted(
             parent,
-            StopReason::WallCap,
+            expiry_stop_reason,
             "approved Job work cutoff reached before the verified parent receipt was sealed",
         );
     }
@@ -8923,9 +10075,12 @@ fn seal_achieved_parent(
     ) {
         Ok(receipt) => receipt,
         Err(error) => {
-            if let Some(terminal) =
-                settle_parent_process_boundary(parent, &error, "parent completion receipt sealing")?
-            {
+            if let Some(terminal) = settle_parent_process_boundary(
+                parent,
+                &error,
+                "parent completion receipt sealing",
+                expiry_stop_reason,
+            )? {
                 return Ok(terminal);
             }
             return parent_needs_review(
@@ -8949,7 +10104,7 @@ fn seal_achieved_parent(
         remove_if_exists(&paths.job_receipt(job.job_id.as_ref()))?;
         return parent_budget_exhausted(
             parent,
-            StopReason::WallCap,
+            expiry_stop_reason,
             "approved Job work cutoff reached while the verified parent receipt was being sealed",
         );
     }
@@ -8961,6 +10116,7 @@ fn seal_achieved_parent(
                     parent,
                     &error,
                     "parent receipt validation or promotion",
+                    expiry_stop_reason,
                 )? {
                     return Ok(terminal);
                 }
@@ -8991,6 +10147,7 @@ fn settle_parent_process_boundary(
     parent: &mut deadreckon_core::PipelineState,
     error: &DeadreckonError,
     context: &str,
+    expiry_stop_reason: StopReason,
 ) -> Result<Option<ParentCompletion>> {
     let DeadreckonError::ProcessBoundary {
         kind,
@@ -9004,7 +10161,7 @@ fn settle_parent_process_boundary(
     let terminal = match kind {
         deadreckon_core::ProcessBoundaryKind::WorkExpired => parent_budget_exhausted(
             parent,
-            StopReason::WallCap,
+            expiry_stop_reason,
             &format!("approved Job work cutoff reached during {context}"),
         )?,
         deadreckon_core::ProcessBoundaryKind::Cancelled => {
@@ -10193,6 +11350,12 @@ mod tests {
             Some("approved aggregate spend cap was exhausted before parent repair".to_string());
         fixture.parent.failure_reason = fixture.parent.pause_reason.clone();
         fixture.parent.provider_failure = None;
+        record_parent_budget_stop(
+            &fixture.parent,
+            StopReason::SpendCap,
+            "approved aggregate spend cap was exhausted before parent repair",
+        )
+        .expect("typed budget stop");
         deadreckon_core::save_state(&fixture.parent).expect("budget parent");
         let budget = pending_parent_repair_completion(
             &fixture.paths,
@@ -10800,8 +11963,34 @@ mod tests {
         serde_json::Value,
         String,
     ) {
+        spawned_merge_repair_fixture_with_script(
+            paths,
+            job_id,
+            "trap '' HUP; sleep 30 & wait",
+            None,
+        )
+    }
+
+    #[cfg(unix)]
+    fn spawned_merge_repair_fixture_with_script(
+        paths: &DeadreckonPaths,
+        job_id: &str,
+        script: &str,
+        descendant_path: Option<&Path>,
+    ) -> (
+        std::process::Child,
+        Box<dyn deadreckon_core::ChildTerminator>,
+        serde_json::Value,
+        String,
+    ) {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", "trap '' HUP; sleep 30 & wait"]);
+        command
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(path) = descendant_path {
+            command.env("DESCENDANT_PID_FILE", path);
+        }
         let (child, terminator) = deadreckon_core::spawn_grouped(command).expect("grouped child");
         let capability_id = Uuid::new_v4().to_string();
         let outer_launch_id = Uuid::new_v4().to_string();
@@ -10923,6 +12112,49 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct MergeRepairProcessGroupGuard(u32);
+
+    #[cfg(unix)]
+    impl Drop for MergeRepairProcessGroupGuard {
+        fn drop(&mut self) {
+            let _ = commands::job::terminate_supervised_process(
+                deadreckon_core::SupervisedProcess {
+                    pid: self.0,
+                    pgid: Some(self.0),
+                },
+                Duration::ZERO,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn supervised_merge_repair_fixture(
+        paths: &DeadreckonPaths,
+        job_id: &str,
+        script: &str,
+        descendant_path: Option<&Path>,
+        boundary: MergeRepairChildBoundary,
+    ) -> SupervisedMergeRepairChild {
+        let (child, _terminator, authority, _capability_id) =
+            spawned_merge_repair_fixture_with_script(paths, job_id, script, descendant_path);
+        let repair_id = authority["repair_id"]
+            .as_str()
+            .expect("repair id")
+            .to_string();
+        let process = serde_json::from_value(authority["process"].clone())
+            .expect("supervised process record");
+        SupervisedMergeRepairChild {
+            paths: paths.clone(),
+            job_id: job_id.to_string(),
+            protected_authority_path: merge_repair_authority_path(paths, job_id, &repair_id),
+            repair_id,
+            process,
+            child,
+            boundary,
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn merge_repair_cleanup_terminates_the_exact_event_and_delegation_bound_process() {
         let temp = tempfile::TempDir::new().expect("temp");
@@ -10939,6 +12171,235 @@ mod tests {
             !delegation_pending_path(&paths, job_id, &capability_id).exists(),
             "cleanup must revoke an unconsumed merge-repair capability"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_work_expiry_reaps_a_hanging_descendant_with_bounded_output_drainage() {
+        struct DescendantGuard(PathBuf);
+
+        impl Drop for DescendantGuard {
+            fn drop(&mut self) {
+                let Ok(raw) = fs::read_to_string(&self.0) else {
+                    return;
+                };
+                let Ok(pid) = raw.trim().parse::<u32>() else {
+                    return;
+                };
+                if deadreckon_core::pid_is_alive(pid) {
+                    let _ = deadreckon_core::terminate_pid(pid, true);
+                }
+            }
+        }
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-wait-expiry";
+        let descendant_path = temp.path().join("merge-repair-descendant.pid");
+        let _descendant_guard = DescendantGuard(descendant_path.clone());
+        let boundary = MergeRepairChildBoundary::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            CancellationToken::new(),
+        );
+        let child = supervised_merge_repair_fixture(
+            &paths,
+            job_id,
+            "(trap '' TERM; while :; do sleep 1; done) & descendant=$!; \
+             printf '%s\\n' \"$descendant\" > \"$DESCENDANT_PID_FILE\"; \
+             trap '' TERM; wait",
+            Some(&descendant_path),
+            boundary,
+        );
+        let leader = child.id();
+        let _leader_guard = MergeRepairProcessGroupGuard(leader);
+        let started = Instant::now();
+
+        let error = child
+            .wait()
+            .expect_err("hanging merge-repair child must reach the Job cutoff");
+
+        assert!(
+            matches!(
+                error,
+                CliError::Core(DeadreckonError::ProcessBoundary {
+                    kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+                    authority: None,
+                    ..
+                })
+            ),
+            "unexpected boundary: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cleanup exceeded the separate work and cleanup windows"
+        );
+        let descendant = fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        assert!(
+            !deadreckon_core::pid_is_alive(descendant),
+            "hanging merge-repair descendant {descendant} survived proven cleanup"
+        );
+        assert!(
+            !deadreckon_core::pid_is_alive(leader),
+            "merge-repair leader {leader} survived proven cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_live_cancellation_is_typed_and_reaps_the_exact_process_group() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-wait-cancel";
+        let cancellation = CancellationToken::new();
+        let boundary = MergeRepairChildBoundary::for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            cancellation.clone(),
+        );
+        let child = supervised_merge_repair_fixture(
+            &paths,
+            job_id,
+            "trap '' TERM; while :; do sleep 1; done",
+            None,
+            boundary,
+        );
+        let leader = child.id();
+        let _leader_guard = MergeRepairProcessGroupGuard(leader);
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation.cancel();
+        });
+
+        let error = child
+            .wait()
+            .expect_err("operator cancellation must stop the merge-repair child");
+        cancel.join().expect("cancellation controller");
+
+        assert!(
+            matches!(
+                error,
+                CliError::Core(DeadreckonError::ProcessBoundary {
+                    kind: deadreckon_core::ProcessBoundaryKind::Cancelled,
+                    authority: None,
+                    ..
+                })
+            ),
+            "unexpected boundary: {error:?}"
+        );
+        assert!(
+            !deadreckon_core::pid_is_alive(leader),
+            "cancelled merge-repair leader {leader} survived proven cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn merge_repair_child_drains_large_stdout_and_stderr_without_pipe_deadlock() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let job_id = "merge-repair-output-drain";
+        let boundary = MergeRepairChildBoundary::for_test(
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+            CancellationToken::new(),
+        );
+        let child = supervised_merge_repair_fixture(
+            &paths,
+            job_id,
+            "i=0; while [ \"$i\" -lt 12000 ]; do \
+             printf 'stdout-%06d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\"; \
+             printf 'stderr-%06d-abcdefghijklmnopqrstuvwxyz0123456789\\n' \"$i\" >&2; \
+             i=$((i + 1)); done; printf 'stdout-complete\\n'; printf 'stderr-complete\\n' >&2",
+            None,
+            boundary,
+        );
+        let leader = child.id();
+        let _leader_guard = MergeRepairProcessGroupGuard(leader);
+
+        let output = child
+            .wait()
+            .expect("large output must be concurrently drained");
+
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("stdout-complete"),
+            "bounded stdout must preserve its tail"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("stderr-complete"),
+            "bounded stderr must preserve its tail"
+        );
+        assert!(
+            !deadreckon_core::pid_is_alive(leader),
+            "completed merge-repair leader {leader} was not reaped"
+        );
+    }
+
+    #[test]
+    fn merge_repair_boundary_refuses_cancelled_or_expired_work_before_launch() {
+        for (trigger, expected) in [
+            (
+                {
+                    let cancellation = CancellationToken::new();
+                    cancellation.cancel();
+                    MergeRepairChildBoundary::for_test(
+                        Duration::from_secs(30),
+                        Duration::from_secs(3),
+                        cancellation,
+                    )
+                },
+                deadreckon_core::ProcessBoundaryKind::Cancelled,
+            ),
+            (
+                {
+                    let cancellation = CancellationToken::new();
+                    cancellation.cancel();
+                    MergeRepairChildBoundary::for_test(
+                        Duration::ZERO,
+                        Duration::from_secs(3),
+                        cancellation,
+                    )
+                },
+                deadreckon_core::ProcessBoundaryKind::Cancelled,
+            ),
+            (
+                MergeRepairChildBoundary::for_test(
+                    Duration::ZERO,
+                    Duration::from_secs(3),
+                    CancellationToken::new(),
+                ),
+                deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            ),
+        ] {
+            let error = trigger
+                .check_before_launch()
+                .expect_err("terminal boundary must refuse launch");
+            assert!(matches!(
+                error,
+                CliError::Core(DeadreckonError::ProcessBoundary {
+                    kind,
+                    authority: None,
+                    ..
+                }) if kind == expected
+            ));
+        }
+        for trigger in [
+            MergeRepairChildProcessBoundary::WorkExpired,
+            MergeRepairChildProcessBoundary::Cancelled,
+            MergeRepairChildProcessBoundary::SupervisionFailed,
+            MergeRepairChildProcessBoundary::Completed,
+        ] {
+            assert_eq!(
+                trigger.process_kind(false),
+                deadreckon_core::ProcessBoundaryKind::CleanupIncomplete,
+                "lost containment must override {trigger:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -11273,7 +12734,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_receipt_work_expiry_stays_a_wall_cap_terminal() {
+    fn parent_receipt_work_expiry_preserves_the_typed_deadline_boundary() {
         let temp = tempfile::TempDir::new().expect("temp");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         std::fs::create_dir_all(temp.path().join("source")).expect("source");
@@ -11303,6 +12764,7 @@ mod tests {
             &mut parent,
             &error,
             "parent completion receipt sealing",
+            StopReason::Deadline,
         )
         .expect("settlement")
         .expect("typed boundary");
@@ -11310,7 +12772,7 @@ mod tests {
         assert!(matches!(
             terminal,
             ParentCompletion::BudgetExhausted {
-                stop_reason: StopReason::WallCap,
+                stop_reason: StopReason::Deadline,
                 ..
             }
         ));
@@ -11320,6 +12782,51 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| reason.contains("work cutoff"))
         );
+        let typed = read_parent_budget_stop(&parent)
+            .expect("typed budget stop")
+            .expect("budget stop record");
+        assert_eq!(typed.stop_reason, StopReason::Deadline);
+        assert_eq!(typed.reason, parent.pause_reason.expect("pause reason"));
+    }
+
+    #[test]
+    fn parent_gate_work_expiry_preserves_the_typed_deadline_boundary() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(temp.path().join("source")).expect("source");
+        let mut parent = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "bounded parent gate".to_string(),
+                cwd: temp.path().join("source"),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("parent-gate-boundary".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("parent run");
+
+        let terminal = settle_parent_gate_phase(
+            &mut parent,
+            "parent deterministic gate",
+            StopReason::Deadline,
+            deadreckon_runtime::DeterministicGatePhaseOutcome::WorkExpired {
+                cleanup: ProviderCleanup::NotApplicable,
+            },
+        )
+        .expect("gate settlement");
+
+        assert!(matches!(
+            terminal,
+            ParentGateSettlement::Terminal(ParentCompletion::BudgetExhausted {
+                stop_reason: StopReason::Deadline,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -11354,6 +12861,7 @@ mod tests {
             &mut parent,
             &error,
             "parent completion receipt sealing",
+            StopReason::WallCap,
         )
         .expect("settlement")
         .expect("typed boundary");
@@ -11374,7 +12882,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_semantic_budget_boundary_returns_typed_cap_reasons() {
+    fn parent_semantic_budget_enforces_spend_but_not_aggregate_worker_seconds() {
         let temp = tempfile::TempDir::new().expect("temp");
         let source_cwd = temp.path().join("source");
         std::fs::create_dir_all(&source_cwd).expect("source");
@@ -11408,15 +12916,17 @@ mod tests {
         .expect("spend cap");
         assert_eq!(spend.0, StopReason::SpendCap);
 
-        let wall = semantic_budget_exhaustion(
-            &job,
-            ParentExecutionUsage {
-                spend_usd: 1.0,
-                wall_seconds: 30.0,
-            },
-        )
-        .expect("wall cap");
-        assert_eq!(wall.0, StopReason::WallCap);
+        assert!(
+            semantic_budget_exhaustion(
+                &job,
+                ParentExecutionUsage {
+                    spend_usd: 1.0,
+                    wall_seconds: 140.0,
+                },
+            )
+            .is_none(),
+            "parallel worker-seconds are evidence, not elapsed Job wall time"
+        );
 
         assert!(
             semantic_budget_exhaustion(
@@ -11451,17 +12961,16 @@ mod tests {
             .0,
             StopReason::SpendCap
         );
-        assert_eq!(
+        assert!(
             semantic_budget_overrun(
                 &job,
                 ParentExecutionUsage {
                     spend_usd: 1.0,
-                    wall_seconds: 30.01,
+                    wall_seconds: 300.0,
                 },
             )
-            .expect("wall overrun")
-            .0,
-            StopReason::WallCap
+            .is_none(),
+            "only the supervisor's active-attempt clock may enforce wall policy"
         );
     }
 
@@ -12069,7 +13578,7 @@ mod tests {
         assert!(matches!(
             repair_budget_availability(
                 4.0,
-                90.0,
+                0.0,
                 ParentExecutionUsage {
                     spend_usd: 1.0,
                     wall_seconds: 90.0,
@@ -12080,6 +13589,21 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            repair_budget_availability(
+                4.0,
+                25.0,
+                ParentExecutionUsage {
+                    spend_usd: 1.0,
+                    wall_seconds: 140.0,
+                },
+            ),
+            RepairBudgetAvailability::Available {
+                spend_usd: 3.0,
+                wall_seconds: 25.0,
+            },
+            "parallel worker-seconds must not consume the authoritative repair window"
+        );
     }
 
     #[cfg(unix)]
@@ -12097,7 +13621,7 @@ mod tests {
         fs::write(
             &hook_path,
             format!(
-                "#!/bin/sh\nif [ \"$DEADRECKON_HOME\" = \"{}\" ]; then echo controller-home-exposed; exit 8; fi\necho approved-program\nexit 0\n",
+                "#!/bin/sh\nif [ \"$DEADRECKON_HOME\" = \"{}\" ]; then echo controller-home-exposed; exit 8; fi\nIFS= read -r payload\nprintf '%s\\n' \"$payload\"\necho approved-program\nexit 0\n",
                 paths.home().display()
             ),
         )
@@ -12153,6 +13677,12 @@ mod tests {
         )
         .expect("claim")
         .token();
+        let boundary = DurableChainHookBoundary::for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            CancellationToken::new(),
+            temp.path().join("child-pids/approved-hook.json"),
+        );
 
         let exit_code = invoke_frozen_durable_chain_hook(
             &paths,
@@ -12163,6 +13693,7 @@ mod tests {
             1,
             temp.path(),
             &json!({"step_goal": "one", "base_ref": "approved-base"}),
+            &boundary,
         )
         .expect("invoke approved hook bytes");
 
@@ -12175,8 +13706,187 @@ mod tests {
             .find(|event| event.kind == DurableChainHookEventKind::Completed)
             .expect("completed event");
         assert!(completed.stdout.contains("approved-program"));
+        assert!(completed.stdout.contains("\"step_goal\":\"one\""));
         assert!(!completed.stdout.contains("mutable-program"));
         assert!(!completed.stdout.contains("controller-home-exposed"));
         assert_eq!(completed.hook.approved_bytes, hook.approved_bytes);
+        assert!(
+            !boundary.authority_path.exists(),
+            "completed hook retained durable process authority"
+        );
+    }
+
+    #[test]
+    fn durable_chain_hook_boundary_classification_preserves_terminal_precedence() {
+        use deadreckon_core::ProcessBoundaryKind;
+
+        assert_eq!(
+            DurableChainHookProcessBoundary::Cancelled.process_kind(true),
+            ProcessBoundaryKind::Cancelled
+        );
+        assert_eq!(
+            DurableChainHookProcessBoundary::WorkExpired.process_kind(true),
+            ProcessBoundaryKind::WorkExpired
+        );
+        assert_eq!(
+            DurableChainHookProcessBoundary::SupervisionFailed.process_kind(true),
+            ProcessBoundaryKind::SupervisionFailed
+        );
+        for trigger in [
+            DurableChainHookProcessBoundary::Cancelled,
+            DurableChainHookProcessBoundary::WorkExpired,
+            DurableChainHookProcessBoundary::SupervisionFailed,
+            DurableChainHookProcessBoundary::Completed,
+        ] {
+            assert_eq!(
+                trigger.process_kind(false),
+                ProcessBoundaryKind::CleanupIncomplete,
+                "unproven cleanup must win over {trigger:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_chain_hook_work_expiry_reaps_hanging_descendant_and_removes_authority() {
+        struct DescendantGuard(PathBuf);
+
+        impl Drop for DescendantGuard {
+            fn drop(&mut self) {
+                let Ok(raw) = fs::read_to_string(&self.0) else {
+                    return;
+                };
+                let Ok(pid) = raw.trim().parse::<u32>() else {
+                    return;
+                };
+                if deadreckon_core::pid_is_alive(pid) {
+                    let _ = deadreckon_core::terminate_pid(pid, true);
+                }
+            }
+        }
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let descendant_path = temp.path().join("descendant.pid");
+        let _guard = DescendantGuard(descendant_path.clone());
+        let authority_path = temp.path().join("child-pids/hanging-hook.json");
+        let boundary = DurableChainHookBoundary::for_test(
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            CancellationToken::new(),
+            authority_path.clone(),
+        );
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                "(trap '' TERM; while :; do sleep 1; done) & descendant=$!; \
+                 printf '%s\\n' \"$descendant\" > \"$DESCENDANT_PID_FILE\"; \
+                 trap '' TERM; wait",
+            )
+            .env("DESCENDANT_PID_FILE", &descendant_path);
+
+        let started = Instant::now();
+        let error = run_bounded_durable_chain_hook(command, b"{}", &boundary)
+            .expect_err("hanging hook must reach the shared work cutoff");
+
+        assert!(
+            matches!(
+                error,
+                CliError::Core(DeadreckonError::ProcessBoundary {
+                    kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+                    authority: None,
+                    ..
+                })
+            ),
+            "unexpected boundary: {error:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cleanup exceeded the work plus cleanup windows"
+        );
+        let descendant = fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        assert!(
+            !deadreckon_core::pid_is_alive(descendant),
+            "hanging hook descendant {descendant} survived proven cleanup"
+        );
+        assert!(
+            !authority_path.exists(),
+            "proven cleanup retained durable PID authority"
+        );
+    }
+
+    #[test]
+    fn durable_chain_hook_cancellation_before_launch_is_typed_and_creates_no_authority() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let authority_path = temp.path().join("child-pids/not-launched.json");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let boundary = DurableChainHookBoundary::for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            cancellation,
+            authority_path.clone(),
+        );
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("exit 0");
+
+        let error = run_bounded_durable_chain_hook(command, b"{}", &boundary)
+            .expect_err("cancelled hook must not launch");
+        assert!(matches!(
+            error,
+            CliError::Core(DeadreckonError::ProcessBoundary {
+                kind: deadreckon_core::ProcessBoundaryKind::Cancelled,
+                authority: None,
+                ..
+            })
+        ));
+        assert!(!authority_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_chain_hook_observes_live_cancellation_and_proves_cleanup() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let authority_path = temp.path().join("child-pids/cancelled-hook.json");
+        let cancellation = CancellationToken::new();
+        let boundary = DurableChainHookBoundary::for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            cancellation.clone(),
+            authority_path.clone(),
+        );
+        let watched_authority = authority_path.clone();
+        let cancel_handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !watched_authority.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            cancellation.cancel();
+        });
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; while :; do sleep 1; done");
+
+        let error = run_bounded_durable_chain_hook(command, b"{}", &boundary)
+            .expect_err("live cancellation must stop the hook");
+        cancel_handle.join().expect("cancellation controller");
+
+        assert!(matches!(
+            error,
+            CliError::Core(DeadreckonError::ProcessBoundary {
+                kind: deadreckon_core::ProcessBoundaryKind::Cancelled,
+                authority: None,
+                ..
+            })
+        ));
+        assert!(
+            !authority_path.exists(),
+            "cancelled hook retained authority after proven cleanup"
+        );
     }
 }
