@@ -22,13 +22,6 @@ curl -fsSL https://deadreckon.sh/install.sh | sh
 
 This resolves the newest release (stable preferred, release candidates included), verifies it against `SHA256SUMS`, and installs `deadreckon`. Pin any release tag with `DEADRECKON_TAG=<tag>`.
 
-Or build from source:
-
-```bash
-cargo build --release --workspace --locked
-# coherent bundle at ./target/release/{deadreckon,dr-gate,dr-capture}
-```
-
 Then the whole tool is five commands:
 
 | Command | What it does |
@@ -38,6 +31,13 @@ Then the whole tool is five commands:
 | `deadreckon status` | What happened, and the one thing to do next. |
 | `deadreckon list` | Find recent runs and plans. |
 | `deadreckon finish latest` | Apply it to your branch, or export it. |
+
+Or build from source:
+
+```bash
+cargo build --release --workspace --locked
+# coherent bundle at ./target/release/{deadreckon,dr-gate,dr-capture}
+```
 
 For a higher-level read while it runs, `deadreckon attach latest --view narrative` shows cited prose plus an evidence-backed visual map.
 

@@ -67,14 +67,14 @@ AcceptanceSpec <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/acceptance.yaml
     {
       "id": 40,
       "name": "execute",
-      "status": "executing",
+      "status": "completed",
       "plan_path": null,
       "updated_at": "<TIMESTAMP>"
     },
     {
       "id": 50,
       "name": "verify",
-      "status": "pending",
+      "status": "completed",
       "plan_path": null,
       "updated_at": "<TIMESTAMP>"
     },

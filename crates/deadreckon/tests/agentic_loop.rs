@@ -495,6 +495,9 @@ async fn acceptance_failure_restarts_cli_subagent_until_gate_passes() {
     fs::write(
         &fake_codex,
         r#"#!/bin/sh
+if [ "$*" = "exec --help" ]; then
+  exit 0
+fi
 if [ ! -f .provider-count ]; then
   printf 1 > .provider-count
   printf 'first attempt\n' > first.txt
