@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Sandbox subprocesses now drain stdout and stderr continuously into bounded
+  head/tail captures, so output floods cannot deadlock or exhaust evidence
+  memory. Unix cleanup treats only `ESRCH` as proof of process-group absence,
+  confirms TERM/KILL cleanup before removing PID authority, and retains
+  authority when containment cannot be proven.
 - Codex and Claude capability discovery for writable runs now uses the same
   sandboxed, cancellable process authority as provider execution. Probes have
   bounded work and cleanup windows, drain and reap hostile descendants, and
