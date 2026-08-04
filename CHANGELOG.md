@@ -14,6 +14,10 @@
   process start. Rebuilding or replacing a binary in place therefore triggers
   a supervised restart instead of allowing an older same-path process to admit
   new Jobs.
+- Stable release provider evidence now binds the successful real Claude and
+  Codex runs to the source-derived bundle ID plus exact hashes for
+  `deadreckon`, `dr-gate`, and `dr-capture`. Same-version source changes,
+  partial route proofs, and mixed helper bundles fail release validation.
 - Sandbox subprocesses now drain stdout and stderr continuously into bounded
   head/tail captures, so output floods cannot deadlock or exhaust evidence
   memory. Unix cleanup treats only `ESRCH` as proof of process-group absence,

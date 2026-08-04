@@ -6,7 +6,8 @@
 #   durable run -> verified receipt -> signed gate marker -> finish succeeds
 #   -> a second run is cancelled mid-turn and its provider tree is reaped.
 # On success the probed binary versions land in
-# release/known-good-providers.json (schema_version 1).
+# release/known-good-providers.json (schema_version 2), bound to the exact
+# source-derived build bundle and all three shipped binary digests.
 #
 # Usage: release/preflight-real.sh [route ...]
 #        (defaults to cli:claude-code cli:codex)
@@ -22,6 +23,7 @@ fi
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 deadreckon_bin=${DEADRECKON_BIN:-"$repo_root/target/release/deadreckon"}
 known_good="$repo_root/release/known-good-providers.json"
+release_trust="$repo_root/release/trust/release-trust.mjs"
 goal="make purpose.sh print exactly: DeadReckon provider preflight fixture"
 operator=${USER:-unknown}
 job_timeout_seconds=${PREFLIGHT_JOB_TIMEOUT_SECONDS:-900}
@@ -29,6 +31,28 @@ job_timeout_seconds=${PREFLIGHT_JOB_TIMEOUT_SECONDS:-900}
 if [ ! -x "$deadreckon_bin" ]; then
   echo "no release binary at $deadreckon_bin — run 'make build' first," >&2
   echo "or point DEADRECKON_BIN at one." >&2
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  echo "node is required to bind provider evidence to the release bundle" >&2
+  exit 1
+fi
+
+# The build identity is calculated from these exact tracked inputs. Refuse a
+# proof whose source commit cannot reproduce the working-tree inputs used by
+# the binary. Unrelated operator notes and generated target directories remain
+# outside this boundary.
+if ! git -C "$repo_root" diff --quiet -- Cargo.toml Cargo.lock crates \
+  || ! git -C "$repo_root" diff --cached --quiet -- Cargo.toml Cargo.lock crates; then
+  echo "release Rust/Cargo inputs are dirty — commit them, rebuild, then rerun preflight" >&2
+  exit 1
+fi
+untracked_inputs=$(git -C "$repo_root" ls-files --others --exclude-standard -- \
+  Cargo.toml Cargo.lock ':(glob)crates/*/Cargo.toml' ':(glob)crates/*/build.rs' \
+  ':(glob)crates/*/src/**/*.rs')
+if [ -n "$untracked_inputs" ]; then
+  echo "release build inputs are untracked — commit or remove them before preflight:" >&2
+  printf '%s\n' "$untracked_inputs" >&2
   exit 1
 fi
 
@@ -50,6 +74,13 @@ cleanup_workdir() {
 trap cleanup_workdir EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+bundle_proof="$workdir/release-bundle-proof.json"
+node "$release_trust" bundle-proof \
+  --root "$repo_root" \
+  --deadreckon "$deadreckon_bin" \
+  --out "$bundle_proof" >/dev/null
+source_commit=$(git -C "$repo_root" rev-parse HEAD)
 
 binary_for_route() {
   case "$1" in
@@ -217,8 +248,8 @@ for route in $routes; do
   echo "==> proving $route"
   binary=$(binary_for_route "$route")
   if [ -z "$binary" ] || ! command -v "$binary" >/dev/null 2>&1; then
-    echo "    SKIP: no installed binary for $route" >&2
-    continue
+    echo "    FAIL: no installed binary for requested route $route" >&2
+    exit 1
   fi
   binary_version=$("$binary" --version 2>/dev/null | head -n1)
 
@@ -279,19 +310,31 @@ if [ -z "$results" ]; then
 fi
 
 recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-# The version actually proved. Without it a stale file from a previous release
-# cycle is indistinguishable from a fresh pass: on failure this file is left
-# untouched, so it keeps the last successful run's contents and still looks
-# valid. The release trust gate compares this against the tag.
+# The exact version and bundle actually proved. On failure this file remains
+# untouched, and stable validation rejects either an old schema or a source ID
+# that does not match the tag checkout.
 proved_version=$("$deadreckon_bin" --version 2>/dev/null | awk '{print $2}')
+bundle_version=$(sed -n 's/^[[:space:]]*"package_version": "\([^"]*\)".*$/\1/p' "$bundle_proof" | head -n1)
+if [ -z "$proved_version" ] || [ "$proved_version" != "$bundle_version" ]; then
+  echo "proved binary version ${proved_version:-unknown} does not match bundle source version ${bundle_version:-unknown}" >&2
+  exit 1
+fi
 cat > "$known_good" <<EOF
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "recorded_at": "$recorded_at",
+  "source_commit": "$source_commit",
   "deadreckon_version": "$proved_version",
+  "bundle": $(cat "$bundle_proof"),
   "providers": [
     $results
   ]
 }
 EOF
+required_routes=$(printf '%s' "$routes" | tr ' ' ',')
+node "$release_trust" verify-provider-proof \
+  --root "$repo_root" \
+  --version "$proved_version" \
+  --known-good "$known_good" \
+  --required-routes "$required_routes" >/dev/null
 echo "==> wrote $known_good"

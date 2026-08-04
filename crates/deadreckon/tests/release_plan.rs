@@ -648,6 +648,10 @@ fn preflight_real_proves_execution_routes_against_a_frozen_falsifiable_contract(
     for required in [
         "write_fixture_contract",
         "commit_fixture_contract",
+        "bundle-proof",
+        "source_commit",
+        "verify-provider-proof",
+        "release Rust/Cargo inputs are dirty",
         "deadreckon_bin\" def-done show",
         "deadreckon_bin\" def-done check",
         "preflight contract passed before provider work",
@@ -688,8 +692,20 @@ fn preflight_real_proves_execution_routes_against_a_frozen_falsifiable_contract(
 #[test]
 fn known_good_providers_schema_round_trips() {
     let fixture = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "recorded_at": "2026-06-10T00:00:00Z",
+        "source_commit": "1".repeat(40),
+        "deadreckon_version": "0.8.1",
+        "bundle": {
+            "schema_version": 1,
+            "package_version": "0.8.1",
+            "bundle_build_id": format!("deadreckon-bundle-build-id-sha256:{}", "2".repeat(64)),
+            "binaries": {
+                "deadreckon": {"sha256": "3".repeat(64), "bytes": 1},
+                "dr-gate": {"sha256": "4".repeat(64), "bytes": 1},
+                "dr-capture": {"sha256": "5".repeat(64), "bytes": 1}
+            }
+        },
         "providers": [
             {
                 "route": "cli:claude-code",
@@ -702,19 +718,179 @@ fn known_good_providers_schema_round_trips() {
     });
     let text = serde_json::to_string_pretty(&fixture).expect("serialize");
     let parsed: JsonValue = serde_json::from_str(&text).expect("parse");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(parsed["schema_version"], 2);
+    assert!(parsed["bundle"]["binaries"]["dr-capture"]["sha256"].is_string());
     assert_eq!(parsed["providers"][0]["route"], "cli:claude-code");
 
     if let Ok(committed) =
         fs::read_to_string(workspace_root().join("release/known-good-providers.json"))
     {
         let value: JsonValue = serde_json::from_str(&committed).expect("committed file parses");
-        assert_eq!(
-            value["schema_version"], 1,
-            "release/known-good-providers.json must stay on schema_version 1"
+        assert!(
+            matches!(value["schema_version"].as_u64(), Some(1 | 2)),
+            "release/known-good-providers.json must be a recognized migration schema"
         );
         assert!(value["providers"].is_array(), "{value}");
     }
+}
+
+#[test]
+fn source_bundle_identity_matches_every_compiled_release_helper() {
+    let expected = release_trust_json([
+        "source-bundle-id",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+    ]);
+    let expected = expected["bundle_build_id"]
+        .as_str()
+        .expect("source bundle ID");
+
+    for binary in [
+        env!("CARGO_BIN_EXE_dr-gate"),
+        env!("CARGO_BIN_EXE_dr-capture"),
+    ] {
+        let output = Command::new(binary)
+            .arg("protocol")
+            .current_dir(workspace_root())
+            .output()
+            .expect("query helper protocol");
+        assert!(
+            output.status.success(),
+            "{} protocol failed: {}",
+            binary,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let protocol: JsonValue =
+            serde_json::from_slice(&output.stdout).expect("helper protocol JSON");
+        assert_eq!(protocol["bundle_build_id"], expected, "{binary}");
+    }
+
+    let proof = release_trust_json([
+        "bundle-proof",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+        "--deadreckon",
+        env!("CARGO_BIN_EXE_deadreckon"),
+    ]);
+    assert_eq!(proof["bundle_build_id"], expected);
+    for binary in ["deadreckon", "dr-gate", "dr-capture"] {
+        assert_eq!(
+            proof["binaries"][binary]["sha256"].as_str().map(str::len),
+            Some(64),
+            "{binary}: {proof}"
+        );
+    }
+}
+
+#[test]
+fn provider_proof_rejects_same_version_stale_bundles_and_missing_default_routes() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let known_good = temp.path().join("known-good.json");
+    let version = workspace_version_string();
+    let source = release_trust_json([
+        "source-bundle-id",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+    ]);
+    let current_bundle = source["bundle_build_id"].as_str().expect("bundle ID");
+    let provider = |route: &str, run_id: char| {
+        serde_json::json!({
+            "route": route,
+            "binary_version": "provider 1.0",
+            "proof": "durable run -> verified receipt -> gate signed -> finish -> cancel/reap",
+            "run_id": run_id.to_string().repeat(32),
+            "operator": "release-test"
+        })
+    };
+    let fixture = |bundle: &str, providers: Vec<JsonValue>| {
+        serde_json::json!({
+            "schema_version": 2,
+            "recorded_at": "2026-08-04T12:00:00Z",
+            "source_commit": "a".repeat(40),
+            "deadreckon_version": version,
+            "bundle": {
+                "schema_version": 1,
+                "package_version": version,
+                "bundle_build_id": bundle,
+                "binaries": {
+                    "deadreckon": {"sha256": "b".repeat(64), "bytes": 10},
+                    "dr-gate": {"sha256": "c".repeat(64), "bytes": 10},
+                    "dr-capture": {"sha256": "d".repeat(64), "bytes": 10}
+                }
+            },
+            "providers": providers
+        })
+    };
+
+    fs::write(
+        &known_good,
+        serde_json::to_vec_pretty(&fixture(
+            current_bundle,
+            vec![provider("cli:claude-code", '1'), provider("cli:codex", '2')],
+        ))
+        .expect("valid fixture"),
+    )
+    .expect("write valid proof");
+    assert_release_trust_success([
+        "verify-provider-proof",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+        "--version",
+        &version,
+        "--known-good",
+        known_good.to_str().expect("proof path"),
+    ]);
+
+    let stale_bundle = format!("deadreckon-bundle-build-id-sha256:{}", "0".repeat(64));
+    fs::write(
+        &known_good,
+        serde_json::to_vec_pretty(&fixture(
+            &stale_bundle,
+            vec![provider("cli:claude-code", '1'), provider("cli:codex", '2')],
+        ))
+        .expect("stale fixture"),
+    )
+    .expect("write stale proof");
+    let stale = release_trust([
+        "verify-provider-proof",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+        "--version",
+        &version,
+        "--known-good",
+        known_good.to_str().expect("proof path"),
+    ]);
+    assert!(!stale.status.success(), "stale same-version proof passed");
+    assert!(
+        String::from_utf8_lossy(&stale.stderr).contains("stale bundle"),
+        "{}",
+        String::from_utf8_lossy(&stale.stderr)
+    );
+
+    fs::write(
+        &known_good,
+        serde_json::to_vec_pretty(&fixture(
+            current_bundle,
+            vec![provider("cli:claude-code", '1')],
+        ))
+        .expect("partial fixture"),
+    )
+    .expect("write partial proof");
+    let partial = release_trust([
+        "verify-provider-proof",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+        "--version",
+        &version,
+        "--known-good",
+        known_good.to_str().expect("proof path"),
+    ]);
+    assert!(!partial.status.success(), "partial provider proof passed");
+    assert!(
+        String::from_utf8_lossy(&partial.stderr).contains("cli:codex"),
+        "{}",
+        String::from_utf8_lossy(&partial.stderr)
+    );
 }
 
 fn workspace_version_string() -> String {
@@ -1504,13 +1680,11 @@ fn evaluator_sidecar_tool_assembles_and_manifests_static_linux_helpers() {
     fs::create_dir_all(&payload).expect("payload");
 
     for helper in ["deadreckon", "dr-gate", "dr-capture"] {
-        let identity = if helper == "dr-capture" {
-            ""
-        } else {
-            FAKE_GATE_BUNDLE
-        };
-        fs::write(payload.join(helper), format!("{helper} native{identity}"))
-            .expect("native helper");
+        fs::write(
+            payload.join(helper),
+            format!("{helper} native{FAKE_GATE_BUNDLE}"),
+        )
+        .expect("native helper");
     }
     write_fake_static_elf_sized(
         &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
@@ -1741,14 +1915,9 @@ fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
             format!("dr-gate{extension}"),
             format!("dr-capture{extension}"),
         ] {
-            let identity = if helper.starts_with("dr-capture") {
-                ""
-            } else {
-                FAKE_GATE_BUNDLE
-            };
             fs::write(
                 payload.join(&helper),
-                format!("{helper} for {target}{identity}"),
+                format!("{helper} for {target}{FAKE_GATE_BUNDLE}"),
             )
             .expect("native helper");
         }

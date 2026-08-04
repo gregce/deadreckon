@@ -267,6 +267,8 @@ function archiveInventory(archive, target) {
         name === "deadreckon.exe" ||
         name === "dr-gate" ||
         name === "dr-gate.exe" ||
+        name === "dr-capture" ||
+        name === "dr-capture.exe" ||
         evaluator;
       const bundleBuildId = gateBundleMember ? requireGateBundleIdentity(bytes, name) : null;
       return {

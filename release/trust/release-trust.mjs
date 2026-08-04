@@ -35,6 +35,21 @@ try {
     case "preflight":
       preflight(args);
       break;
+    case "source-bundle-id": {
+      const bundleBuildId = sourceBundleBuildId(args.root ?? ".");
+      if (args.raw) {
+        process.stdout.write(`${bundleBuildId}\n`);
+      } else {
+        writeJson({ schema_version: 1, bundle_build_id: bundleBuildId });
+      }
+      break;
+    }
+    case "bundle-proof":
+      writeJson(buildBundleProof(args));
+      break;
+    case "verify-provider-proof":
+      writeJson(validateProviderProof(args));
+      break;
     case "sbom":
       writeSbom(args);
       break;
@@ -52,7 +67,7 @@ try {
       break;
     default:
       throw new Error(
-        "usage: release-trust.mjs <lane|validate|preflight|sbom|checksums|manifest|verify-manifest|verify-homebrew>",
+        "usage: release-trust.mjs <lane|validate|preflight|source-bundle-id|bundle-proof|verify-provider-proof|sbom|checksums|manifest|verify-manifest|verify-homebrew>",
       );
   }
 } catch (error) {
@@ -169,20 +184,17 @@ function validateRelease(localArgs = args) {
     if (!localArgs["skip-changelog"] && !changelogHasVersion(lane.version, localArgs.changelog ?? "CHANGELOG.md")) {
       errors.push(`CHANGELOG.md must contain a release section for ${lane.version}`);
     }
-    // The real-provider preflight writes known-good-providers.json only on
-    // success, so a FAILED preflight leaves the previous cycle's file in place,
-    // still valid JSON with a convincing proof string. Comparing the proved
-    // version against the tag is what distinguishes "proved this build" from
-    // "proved some earlier build and today's run failed silently".
-    const proved = provedProviderVersion(localArgs["known-good"] ?? "release/known-good-providers.json");
-    if (proved === null) {
-      errors.push(
-        "release/known-good-providers.json has no deadreckon_version — re-run release/preflight-real.sh",
-      );
-    } else if (proved !== lane.version) {
-      errors.push(
-        `release/known-good-providers.json proves ${proved}, not ${lane.version} — re-run release/preflight-real.sh`,
-      );
+    // Version equality is not enough: several commits can all identify as the
+    // same pending patch release. Bind the real-provider evidence to the
+    // deterministic build identity derived by crates/deadreckon/build.rs.
+    try {
+      validateProviderProof({
+        root: localArgs.root ?? ".",
+        version: lane.version,
+        "known-good": localArgs["known-good"] ?? "release/known-good-providers.json",
+      });
+    } catch (error) {
+      errors.push(error.message);
     }
   }
   if (errors.length > 0) {
@@ -191,22 +203,155 @@ function validateRelease(localArgs = args) {
   writeJson(lane);
 }
 
-/// The deadreckon version the real-provider preflight last proved, or null when
-/// the file is absent or predates the field. Absent is treated as unproven
-/// rather than acceptable: a missing proof and a stale proof fail the same way.
-function provedProviderVersion(knownGoodPath) {
-  const file = path.resolve(knownGoodPath);
-  if (!fs.existsSync(file)) {
-    return null;
+function validateProviderProof(localArgs = args) {
+  const root = path.resolve(localArgs.root ?? ".");
+  const expectedVersion = required(localArgs.version, "--version");
+  const knownGoodPath = path.resolve(localArgs["known-good"] ?? "release/known-good-providers.json");
+  if (!fs.existsSync(knownGoodPath)) {
+    throw new Error(`${knownGoodPath} is missing — re-run release/preflight-real.sh`);
   }
+
+  let proof;
   try {
-    const value = JSON.parse(fs.readFileSync(file, "utf8"));
-    return typeof value.deadreckon_version === "string" && value.deadreckon_version.length > 0
-      ? value.deadreckon_version
-      : null;
-  } catch {
-    return null;
+    proof = JSON.parse(fs.readFileSync(knownGoodPath, "utf8"));
+  } catch (error) {
+    throw new Error(`${knownGoodPath} is not valid JSON: ${error.message}`);
   }
+  const errors = [];
+  if (proof.schema_version !== 2) {
+    errors.push(
+      `${knownGoodPath} uses provider-proof schema ${proof.schema_version ?? "unknown"}, not 2 — re-run release/preflight-real.sh`,
+    );
+  }
+  if (proof.deadreckon_version !== expectedVersion) {
+    errors.push(
+      `${knownGoodPath} proves ${proof.deadreckon_version ?? "no version"}, not ${expectedVersion} — re-run release/preflight-real.sh`,
+    );
+  }
+  if (typeof proof.recorded_at !== "string" || Number.isNaN(Date.parse(proof.recorded_at))) {
+    errors.push(`${knownGoodPath} has no valid recorded_at timestamp`);
+  }
+  if (typeof proof.source_commit !== "string" || !/^[a-f0-9]{40,64}$/.test(proof.source_commit)) {
+    errors.push(`${knownGoodPath} has no exact source_commit`);
+  }
+
+  const expectedBundleBuildId = sourceBundleBuildId(root);
+  const bundle = proof.bundle;
+  if (!bundle || bundle.schema_version !== 1) {
+    errors.push(`${knownGoodPath} has no supported exact bundle proof`);
+  } else {
+    if (bundle.package_version !== expectedVersion) {
+      errors.push(
+        `${knownGoodPath} bundle proves ${bundle.package_version ?? "no version"}, not ${expectedVersion}`,
+      );
+    }
+    if (bundle.bundle_build_id !== expectedBundleBuildId) {
+      errors.push(
+        `${knownGoodPath} proves stale bundle ${bundle.bundle_build_id ?? "unknown"}; current source requires ${expectedBundleBuildId} — re-run release/preflight-real.sh`,
+      );
+    }
+    for (const name of ["deadreckon", "dr-gate", "dr-capture"]) {
+      const binary = bundle.binaries?.[name];
+      if (
+        !binary ||
+        typeof binary.sha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(binary.sha256) ||
+        !Number.isSafeInteger(binary.bytes) ||
+        binary.bytes <= 0
+      ) {
+        errors.push(`${knownGoodPath} has no exact digest and size for ${name}`);
+      }
+    }
+  }
+
+  const providers = Array.isArray(proof.providers) ? proof.providers : [];
+  const routes = new Set();
+  for (const provider of providers) {
+    if (!provider || typeof provider.route !== "string" || routes.has(provider.route)) {
+      errors.push(`${knownGoodPath} contains a missing or duplicate provider route`);
+      continue;
+    }
+    routes.add(provider.route);
+    for (const field of ["binary_version", "proof", "operator"]) {
+      if (typeof provider[field] !== "string" || provider[field].trim().length === 0) {
+        errors.push(`${knownGoodPath} provider ${provider.route} has no ${field}`);
+      }
+    }
+    if (typeof provider.run_id !== "string" || !/^[a-f0-9]{32}$/.test(provider.run_id)) {
+      errors.push(`${knownGoodPath} provider ${provider.route} has no exact run_id`);
+    }
+  }
+  const requiredRoutes = String(localArgs["required-routes"] ?? "cli:claude-code,cli:codex")
+    .split(",")
+    .map((route) => route.trim())
+    .filter(Boolean);
+  for (const route of requiredRoutes) {
+    if (!routes.has(route)) {
+      errors.push(`${knownGoodPath} has no successful real-provider proof for ${route}`);
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(errors.join("\n"));
+  }
+  return {
+    schema_version: 1,
+    valid: true,
+    deadreckon_version: expectedVersion,
+    bundle_build_id: expectedBundleBuildId,
+    required_routes: requiredRoutes,
+  };
+}
+
+function buildBundleProof(localArgs = args) {
+  const root = path.resolve(localArgs.root ?? ".");
+  const deadreckon = path.resolve(required(localArgs.deadreckon, "--deadreckon"));
+  const extension = path.basename(deadreckon).toLowerCase().endsWith(".exe") ? ".exe" : "";
+  const directory = path.dirname(deadreckon);
+  const binaries = {
+    deadreckon,
+    "dr-gate": path.join(directory, `dr-gate${extension}`),
+    "dr-capture": path.join(directory, `dr-capture${extension}`),
+  };
+  const expectedBundleBuildId = sourceBundleBuildId(root);
+  const evidence = {};
+  for (const [name, file] of Object.entries(binaries)) {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`${file} must be a regular, non-symlinked release binary`);
+    }
+    const bytes = fs.readFileSync(file);
+    const bundleBuildId = embeddedBundleBuildId(bytes, name);
+    if (bundleBuildId !== expectedBundleBuildId) {
+      throw new Error(
+        `${name} belongs to ${bundleBuildId}, but current release source requires ${expectedBundleBuildId}`,
+      );
+    }
+    evidence[name] = {
+      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+      bytes: stat.size,
+    };
+  }
+  return {
+    schema_version: 1,
+    package_version: workspaceVersionAt(root),
+    bundle_build_id: expectedBundleBuildId,
+    binaries: evidence,
+  };
+}
+
+function embeddedBundleBuildId(bytes, name) {
+  const matches = [
+    ...new Set(
+      bytes
+        .toString("latin1")
+        .match(/deadreckon-bundle-build-id-sha256:[a-f0-9]{64}/g) ?? [],
+    ),
+  ];
+  if (matches.length !== 1) {
+    throw new Error(`${name} must embed exactly one DeadReckon bundle build identity`);
+  }
+  return matches[0];
 }
 
 function preflight(localArgs = args) {
@@ -723,12 +868,100 @@ function cargoMetadata() {
 }
 
 function workspaceVersion() {
-  const text = fs.readFileSync("Cargo.toml", "utf8");
+  return workspaceVersionAt(".");
+}
+
+function workspaceVersionAt(root) {
+  const text = fs.readFileSync(path.join(root, "Cargo.toml"), "utf8");
   const match = /\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/.exec(text);
   if (!match) {
     throw new Error("Cargo.toml [workspace.package] version not found");
   }
   return match[1];
+}
+
+// Keep this byte-for-byte equivalent to crates/deadreckon/build.rs. The ID is
+// deliberately independent of the proof file itself, so an operator can prove
+// a clean source commit, commit known-good-providers.json, and tag that result
+// without invalidating the binary evidence.
+function sourceBundleBuildId(rootValue) {
+  const root = path.resolve(rootValue);
+  const inputs = [path.join(root, "Cargo.toml"), path.join(root, "Cargo.lock")];
+  const crates = path.join(root, "crates");
+  const crateDirectories = fs
+    .readdirSync(crates, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => path.join(crates, entry.name));
+  for (const crateDirectory of crateDirectories) {
+    for (const candidate of [
+      path.join(crateDirectory, "Cargo.toml"),
+      path.join(crateDirectory, "build.rs"),
+    ]) {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        inputs.push(candidate);
+      }
+    }
+    const source = path.join(crateDirectory, "src");
+    if (fs.existsSync(source) && fs.statSync(source).isDirectory()) {
+      collectBundleRustSources(source, inputs);
+    }
+  }
+  // Rust PathBuf ordering compares one path component at a time. A plain
+  // string sort puts `deadreckon-core` before `deadreckon/` because `-` sorts
+  // before `/`, which silently produces a different digest.
+  inputs.sort((left, right) => comparePathComponents(root, left, right));
+
+  const digest = crypto.createHash("sha256");
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (const file of inputs) {
+    const relative = normalizedRelative(root, file);
+    digest.update(relative, "utf8");
+    digest.update(Buffer.from([0]));
+    let text;
+    try {
+      text = decoder.decode(fs.readFileSync(file));
+    } catch (error) {
+      throw new Error(`bundle build input must be UTF-8 (${file}): ${error.message}`);
+    }
+    digest.update(text.replaceAll("\r\n", "\n"), "utf8");
+    digest.update(Buffer.from([0]));
+  }
+  return `deadreckon-bundle-build-id-sha256:${digest.digest("hex")}`;
+}
+
+function collectBundleRustSources(directory, inputs) {
+  const entries = fs.readdirSync(directory, { withFileTypes: true });
+  for (const entry of entries) {
+    const file = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== "target") {
+        collectBundleRustSources(file, inputs);
+      }
+    } else if (entry.isFile() && path.extname(entry.name) === ".rs") {
+      inputs.push(file);
+    }
+  }
+}
+
+function normalizedRelative(root, file) {
+  return path.relative(root, file).split(path.sep).join("/");
+}
+
+function comparePathComponents(root, left, right) {
+  const leftComponents = normalizedRelative(root, left).split("/");
+  const rightComponents = normalizedRelative(root, right).split("/");
+  const common = Math.min(leftComponents.length, rightComponents.length);
+  for (let index = 0; index < common; index += 1) {
+    const leftComponent = leftComponents[index];
+    const rightComponent = rightComponents[index];
+    if (leftComponent < rightComponent) {
+      return -1;
+    }
+    if (leftComponent > rightComponent) {
+      return 1;
+    }
+  }
+  return leftComponents.length - rightComponents.length;
 }
 
 function wrapperPackageVersion() {
