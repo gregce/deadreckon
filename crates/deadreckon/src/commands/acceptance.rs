@@ -6,8 +6,10 @@ const PROJECT_ACCEPTANCE_DIR: &str = ".deadreckon";
 const PROJECT_ACCEPTANCE_YAML: &str = "acceptance.yaml";
 const PROJECT_ACCEPTANCE_MD: &str = "acceptance.md";
 const PROJECT_ACCEPTANCE_HELPERS: &str = "acceptance";
-const DONE_AUTHORING_PROVIDER_RECOVERY: &str =
-    "deadreckon config set defaults.doc_provider cli:codex";
+const DONE_AUTHORING_RETRY_RECOVERY: &str =
+    "deadreckon def-done \"builds and passes behavioral tests\"";
+const DONE_AUTHORING_CONFIG_RECOVERY: &str = "deadreckon doctor";
+const DONE_AUTHORING_SCHEMA_RECOVERY: &str = "deadreckon update --check";
 
 #[derive(Clone, Debug)]
 pub(crate) struct AcceptanceSource {
@@ -129,9 +131,17 @@ pub(crate) struct CriticVerdict {
     pub(crate) verdict: CriticDecision,
 }
 
-const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 120.0;
-const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 30.0;
-const MAX_DONE_AUTHORING_WALL_SECONDS: f64 = 600.0;
+// Authoring can contain three independent provider turns. Subscription CLIs
+// may spend a minute cold-starting or compacting before they emit progress, so
+// the legacy 120-second total rejected healthy work. Keep one cumulative hard
+// deadline, but make its default and stage allocations match real CLI latency.
+const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 600.0;
+const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 300.0;
+const MAX_DONE_AUTHORING_WALL_SECONDS: f64 = 3_600.0;
+const DONE_AUTHORING_DRAFT_WALL_SECONDS: u64 = 300;
+const DONE_AUTHORING_CRITIC_WALL_SECONDS: u64 = 120;
+const DONE_AUTHORING_REDRAFT_WALL_SECONDS: u64 = 300;
+const DONE_AUTHORING_CLEANUP_GRACE_SECONDS: u64 = 10;
 
 #[derive(Clone, Copy, Debug)]
 enum DoneAuthoringStage {
@@ -181,9 +191,9 @@ impl DoneAuthoringBudget {
     fn allocation(self, stage: DoneAuthoringStage) -> Option<Duration> {
         let remaining = self.deadline.checked_duration_since(Instant::now())?;
         let stage_cap = match stage {
-            DoneAuthoringStage::Draft => self.total.div_f64(2.0).min(Duration::from_secs(60)),
-            DoneAuthoringStage::Critic => Duration::from_secs(20),
-            DoneAuthoringStage::Redraft => Duration::from_secs(60),
+            DoneAuthoringStage::Draft => Duration::from_secs(DONE_AUTHORING_DRAFT_WALL_SECONDS),
+            DoneAuthoringStage::Critic => Duration::from_secs(DONE_AUTHORING_CRITIC_WALL_SECONDS),
+            DoneAuthoringStage::Redraft => Duration::from_secs(DONE_AUTHORING_REDRAFT_WALL_SECONDS),
         };
         Some(remaining.min(stage_cap))
     }
@@ -193,14 +203,10 @@ impl DoneAuthoringBudget {
     }
 }
 
-struct DoneAuthoringTempFiles(Vec<PathBuf>);
-
-impl Drop for DoneAuthoringTempFiles {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = fs::remove_file(path);
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+enum DoneAuthoringStageWait<T> {
+    Completed(T),
+    TimedOut { cleanup_proven: bool },
 }
 
 async fn await_done_authoring_stage<F, T>(
@@ -208,18 +214,24 @@ async fn await_done_authoring_stage<F, T>(
     token: &CancellationToken,
     allocation: Duration,
     cleanup_grace: Duration,
-) -> Option<T>
+) -> DoneAuthoringStageWait<T>
 where
     F: Future<Output = T>,
 {
     tokio::pin!(future);
     tokio::select! {
-        output = &mut future => Some(output),
+        output = &mut future => DoneAuthoringStageWait::Completed(output),
         () = tokio::time::sleep(allocation) => {
             token.cancel();
-            let _ = tokio::time::timeout(cleanup_grace, &mut future).await;
-            None
+            let cleanup_proven = tokio::time::timeout(cleanup_grace, &mut future).await.is_ok();
+            DoneAuthoringStageWait::TimedOut { cleanup_proven }
         }
+    }
+}
+
+fn remove_done_authoring_outputs(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -302,50 +314,77 @@ async fn run_done_authoring_stage(
     let id = Uuid::new_v4().simple().to_string();
     let pid_file = std::env::temp_dir().join(format!("deadreckon-done-authoring-{id}.pid"));
     let output_path = std::env::temp_dir().join(format!("deadreckon-done-authoring-{id}.out"));
-    let _temp_files = DoneAuthoringTempFiles(vec![
-        pid_file.clone(),
-        output_path.clone(),
-        output_path.with_extension("last.txt"),
-    ]);
+    let output_files = vec![output_path.clone(), output_path.with_extension("last.txt")];
     let mut request = ProviderRequest::enforceably_read_only(prompt, max_output_tokens, cwd);
     request.output_schema = Some(output_schema);
     request.output_path = Some(output_path);
-    request.pid_file = Some(pid_file);
+    request.pid_file = Some(pid_file.clone());
     request.cancellation_token = Some(token.clone());
 
     // CLI adapters reap the process group before resolving. A transport that
     // ignores cancellation is dropped after a bounded cleanup grace rather
     // than extending the authoring deadline indefinitely.
-    let cleanup_grace = Duration::from_secs(3).min(allocation);
-    let active_allocation = allocation.saturating_sub(cleanup_grace);
+    let cleanup_grace = Duration::from_secs(DONE_AUTHORING_CLEANUP_GRACE_SECONDS);
     let wait_label = format!("{wait_label} [{} · {route_label}]", stage.label());
     let response = with_cli_wait_status_limit(
         &wait_label,
         budget.total,
-        await_done_authoring_stage(
-            router.complete(&request),
-            &token,
-            active_allocation,
-            cleanup_grace,
-        ),
+        await_done_authoring_stage(router.complete(&request), &token, allocation, cleanup_grace),
     )
     .await;
     match response {
-        Some(Ok(response)) => Ok(response),
-        Some(Err(error)) => Err(CliError::Core(deadreckon_core::user_error(
-            &format!(
-                "done criteria {} provider failed via {route_label}: {error}",
-                stage.label()
-            ),
-            DONE_AUTHORING_PROVIDER_RECOVERY,
-        ))),
-        None => Err(done_authoring_timeout_error(
-            stage,
-            budget,
-            allocation,
-            &route_label,
-        )),
+        DoneAuthoringStageWait::Completed(Ok(response)) => {
+            remove_done_authoring_outputs(&output_files);
+            Ok(response)
+        }
+        DoneAuthoringStageWait::Completed(Err(error)) => {
+            remove_done_authoring_outputs(&output_files);
+            Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "done criteria {} provider failed via {route_label}: {error}",
+                    stage.label()
+                ),
+                done_authoring_provider_recovery(&error),
+            )))
+        }
+        DoneAuthoringStageWait::TimedOut { cleanup_proven } => {
+            let cleanup_proven = cleanup_proven && !pid_file.exists();
+            if cleanup_proven {
+                remove_done_authoring_outputs(&output_files);
+            }
+            Err(done_authoring_timeout_error(
+                stage,
+                budget,
+                allocation,
+                &route_label,
+                cleanup_proven,
+                &pid_file,
+            ))
+        }
     }
+}
+
+fn done_authoring_provider_recovery(error: &deadreckon_providers::ProviderError) -> &'static str {
+    let rendered = error.to_string().to_ascii_lowercase();
+    if matches!(
+        error,
+        deadreckon_providers::ProviderError::InvalidOutputSchema { .. }
+    ) || rendered.contains("invalid_json_schema")
+        || rendered.contains("invalid schema for response_format")
+    {
+        // This is a controller/provider compatibility defect. Pointing the
+        // operator back at the route that just failed creates a retry loop.
+        return DONE_AUTHORING_SCHEMA_RECOVERY;
+    }
+    if matches!(
+        error,
+        deadreckon_providers::ProviderError::MissingCredential(_)
+            | deadreckon_providers::ProviderError::InvalidConfig(_)
+            | deadreckon_providers::ProviderError::NoRoute(_)
+    ) {
+        return DONE_AUTHORING_CONFIG_RECOVERY;
+    }
+    DONE_AUTHORING_RETRY_RECOVERY
 }
 
 fn done_authoring_timeout_error(
@@ -353,16 +392,30 @@ fn done_authoring_timeout_error(
     budget: DoneAuthoringBudget,
     allocation: Duration,
     route_label: &str,
+    cleanup_proven: bool,
+    pid_file: &Path,
 ) -> CliError {
+    let cleanup = if cleanup_proven {
+        String::new()
+    } else {
+        format!(
+            "; provider cleanup was not proven and its process record was retained at {}",
+            pid_file.display()
+        )
+    };
     CliError::Core(deadreckon_core::user_error(
         &format!(
-            "done criteria {} timed out after {:.1}s (elapsed {:.1}s of {:.1}s cumulative) via {route_label}",
+            "done criteria {} timed out after {:.1}s (elapsed {:.1}s of {:.1}s cumulative) via {route_label}{cleanup}",
             stage.label(),
             allocation.as_secs_f64(),
             budget.elapsed().as_secs_f64(),
             budget.total.as_secs_f64()
         ),
-        "deadreckon def-done \"builds and passes behavioral tests\"",
+        if cleanup_proven {
+            DONE_AUTHORING_RETRY_RECOVERY
+        } else {
+            DONE_AUTHORING_CONFIG_RECOVERY
+        },
     ))
 }
 
@@ -1011,7 +1064,7 @@ async fn acceptance_agent_command_with_review_policy(
     } else {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done contract critic is unavailable for a strict launch",
-            DONE_AUTHORING_PROVIDER_RECOVERY,
+            DONE_AUTHORING_CONFIG_RECOVERY,
         )));
     };
     if let Some(verdict) = critic
@@ -1666,7 +1719,7 @@ fn parse_schema_constrained_acceptance_response(content: &str) -> Result<Accepta
     if object.len() != expected.len() || expected.iter().any(|key| !object.contains_key(*key)) {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done criteria provider result did not match the exact acceptance schema",
-            DONE_AUTHORING_PROVIDER_RECOVERY,
+            DONE_AUTHORING_RETRY_RECOVERY,
         )));
     }
     if object
@@ -1681,7 +1734,7 @@ fn parse_schema_constrained_acceptance_response(content: &str) -> Result<Accepta
     {
         return Err(CliError::Core(deadreckon_core::user_error(
             "done criteria provider result used invalid acceptance field types",
-            DONE_AUTHORING_PROVIDER_RECOVERY,
+            DONE_AUTHORING_RETRY_RECOVERY,
         )));
     }
     acceptance_json_payload(&value)?.ok_or_else(|| {
@@ -2142,7 +2195,7 @@ async fn run_contract_critic(
     let provider = parse_critic_verdict(&response.content).ok_or_else(|| {
         CliError::Core(deadreckon_core::user_error(
             "done contract critic returned invalid structured output",
-            DONE_AUTHORING_PROVIDER_RECOVERY,
+            DONE_AUTHORING_RETRY_RECOVERY,
         ))
     })?;
     Ok(apply_critic_floor(
@@ -2972,59 +3025,78 @@ mod tests {
     }
 
     #[test]
-    fn done_authoring_recovery_updates_the_provider_it_selects() {
+    fn done_authoring_recovery_matches_the_failure_instead_of_reselecting_the_same_route() {
+        let schema = deadreckon_providers::ProviderError::InvalidOutputSchema {
+            provider: "cli:codex".to_string(),
+            path: "$.properties.files".to_string(),
+            detail: "dynamic maps are unsupported".to_string(),
+        };
         assert_eq!(
-            DONE_AUTHORING_PROVIDER_RECOVERY,
-            "deadreckon config set defaults.doc_provider cli:codex"
+            done_authoring_provider_recovery(&schema),
+            "deadreckon update --check"
         );
+        let config = deadreckon_providers::ProviderError::InvalidConfig("bad route".to_string());
+        assert_eq!(
+            done_authoring_provider_recovery(&config),
+            "deadreckon doctor"
+        );
+        let transient = deadreckon_providers::ProviderError::Cli {
+            provider: "cli:codex".to_string(),
+            detail: "request timed out".to_string(),
+        };
+        assert_eq!(
+            done_authoring_provider_recovery(&transient),
+            DONE_AUTHORING_RETRY_RECOVERY
+        );
+        assert!(!DONE_AUTHORING_RETRY_RECOVERY.contains("config set"));
     }
 
     #[test]
     fn done_contract_wall_budget_defaults_and_clamps() {
         assert_eq!(
             DoneAuthoringBudget::from_config(None).total,
-            Duration::from_secs(120)
+            Duration::from_secs(600)
         );
         assert_eq!(
             DoneAuthoringBudget::from_config(Some(1.0)).total,
-            Duration::from_secs(30)
+            Duration::from_secs(300)
         );
         assert_eq!(
             DoneAuthoringBudget::from_config(Some(9_999.0)).total,
-            Duration::from_secs(600)
+            Duration::from_secs(3_600)
         );
     }
 
     #[test]
-    fn done_authoring_latency_matrix_enforces_120_second_default() {
+    fn done_authoring_latency_matrix_gives_each_provider_phase_realistic_room() {
         let immediate = DoneAuthoringBudget::from_config(None);
-        assert_eq!(immediate.total, Duration::from_secs(120));
+        assert_eq!(immediate.total, Duration::from_secs(600));
         assert!(
             immediate
                 .allocation(DoneAuthoringStage::Draft)
                 .expect("draft allocation")
-                <= Duration::from_secs(60)
+                <= Duration::from_secs(300)
         );
         assert!(
             immediate
                 .allocation(DoneAuthoringStage::Critic)
                 .expect("critic allocation")
-                <= Duration::from_secs(20)
+                <= Duration::from_secs(120)
         );
         assert!(
             immediate
                 .allocation(DoneAuthoringStage::Redraft)
                 .expect("redraft allocation")
-                <= Duration::from_secs(60)
+                <= Duration::from_secs(300)
         );
 
         // A critic/redraft path shares the original deadline. Advancing the
         // request clock can only shrink later allocations; it cannot grant a
-        // fresh stage budget or extend the 120-second admission window.
+        // fresh stage budget or extend the 600-second admission window.
         let near_deadline = DoneAuthoringBudget {
-            started: Instant::now() - Duration::from_secs(119),
+            started: Instant::now() - Duration::from_secs(599),
             deadline: Instant::now() + Duration::from_secs(1),
-            total: Duration::from_secs(120),
+            total: Duration::from_secs(600),
         };
         assert!(
             near_deadline
@@ -3051,7 +3123,12 @@ mod tests {
             Duration::from_millis(10),
         )
         .await;
-        assert!(output.is_none());
+        assert_eq!(
+            output,
+            DoneAuthoringStageWait::TimedOut {
+                cleanup_proven: false
+            }
+        );
         assert!(token.is_cancelled());
         assert!(started.elapsed() < Duration::from_millis(100));
     }
@@ -3078,12 +3155,20 @@ mod tests {
             Duration::from_millis(5),
         )
         .await;
-        assert!(result.is_none());
+        assert_eq!(
+            result,
+            DoneAuthoringStageWait::TimedOut {
+                cleanup_proven: false
+            }
+        );
+        let pid_file = project.path().join("provider.pid");
         let error = done_authoring_timeout_error(
             DoneAuthoringStage::Draft,
             budget,
             Duration::from_millis(5),
             "cli:test / fixture",
+            false,
+            &pid_file,
         )
         .to_string();
         assert_eq!(error.matches("try:").count(), 1, "{error}");
@@ -3123,27 +3208,29 @@ mod tests {
         let line = cli_wait_status_line_with_limit(
             "initial draft [initial draft · cli:codex / gpt-test]",
             Duration::from_secs(7),
-            Duration::from_secs(120),
+            Duration::from_secs(600),
             0,
         );
         let plain = crate::ui::strip_ansi(&line);
         assert!(plain.contains("initial draft"), "{plain}");
         assert!(plain.contains("cli:codex / gpt-test"), "{plain}");
-        assert!(plain.contains("7s / 120s"), "{plain}");
+        assert!(plain.contains("7s / 600s"), "{plain}");
     }
 
     #[test]
-    fn done_timeout_removes_schema_pid_and_partial_output_files() {
+    fn done_output_cleanup_never_deletes_unproven_process_authority() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let paths =
-            ["schema.json", "provider.pid", "partial.out"].map(|name| dir.path().join(name));
-        for path in &paths {
+        let outputs = ["provider.out", "provider.last.txt"].map(|name| dir.path().join(name));
+        let pid_file = dir.path().join("provider.pid");
+        for path in outputs.iter().chain(std::iter::once(&pid_file)) {
             fs::write(path, "partial").expect("temp artifact");
         }
-        {
-            let _cleanup = DoneAuthoringTempFiles(paths.to_vec());
-        }
-        assert!(paths.iter().all(|path| !path.exists()));
+        remove_done_authoring_outputs(&outputs);
+        assert!(outputs.iter().all(|path| !path.exists()));
+        assert!(
+            pid_file.exists(),
+            "PID authority must survive unproven cleanup"
+        );
     }
 
     #[test]

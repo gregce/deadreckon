@@ -104,10 +104,11 @@ pub use exec::ProcessGroupTerminator;
 pub use exec::{
     ChildTerminator, HeadTailBuffer, RawPidTerminator, SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION,
     SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase, SupervisedProcessRecord,
-    TerminationOutcome, TruncationPolicy, boot_identity, process_start_identity,
-    read_supervised_process, read_supervised_process_record,
-    remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
-    spawn_grouped, write_supervised_process, write_supervised_process_record,
+    TerminationOutcome, TruncationPolicy, boot_identities_match, boot_identity,
+    normalize_boot_identity, process_start_identity, read_supervised_process,
+    read_supervised_process_record, remove_supervised_process_record_if_matches,
+    remove_supervised_process_record_if_same, spawn_grouped, write_supervised_process,
+    write_supervised_process_record,
 };
 pub use gate::{
     ACCEPTANCE_PROGRESS_JSONL, AcceptanceCheck, AcceptanceCheckResult, AcceptanceContainment,

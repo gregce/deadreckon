@@ -12,10 +12,11 @@ mod truncation;
 pub use head_tail_buffer::HeadTailBuffer;
 pub use pid_file::{
     SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION, SupervisedProcess, SupervisedProcessIdentity,
-    SupervisedProcessPhase, SupervisedProcessRecord, boot_identity, process_start_identity,
-    read_supervised_process, read_supervised_process_record,
-    remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
-    write_supervised_process, write_supervised_process_record,
+    SupervisedProcessPhase, SupervisedProcessRecord, boot_identities_match, boot_identity,
+    normalize_boot_identity, process_start_identity, read_supervised_process,
+    read_supervised_process_record, remove_supervised_process_record_if_matches,
+    remove_supervised_process_record_if_same, write_supervised_process,
+    write_supervised_process_record,
 };
 #[cfg(unix)]
 pub use termination::ProcessGroupTerminator;

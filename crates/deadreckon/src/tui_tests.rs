@@ -2917,19 +2917,19 @@ fn deterministic_recommendation(goal: &str) -> GoalShapeRecommendation {
 
 #[test]
 fn planner_timeout_gives_cli_routes_room_to_answer() {
-    // A cold `claude -p` takes ~10-15s; the 5s HTTP ceiling guaranteed a
-    // silent ladder fallback for every CLI-routed launch.
+    // Cold subscription CLIs may compact or initialize before emitting any
+    // response. The phase remains bounded and cancellation is reconciled.
     assert_eq!(
         super::commands::start::course_planner_timeout("cli:claude-code").as_secs(),
-        30
+        60
     );
     assert_eq!(
         super::commands::start::course_planner_timeout("cli:codex").as_secs(),
-        30
+        60
     );
     assert_eq!(
         super::commands::start::course_planner_timeout("anthropic").as_secs(),
-        5
+        15
     );
 }
 

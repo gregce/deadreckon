@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use deadreckon_core::{
-    DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock, boot_identity,
-    process_start_identity,
+    DeadreckonError, DeadreckonPaths, LockGuard, acquire_lock, boot_identities_match,
+    boot_identity, process_start_identity,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -298,7 +298,7 @@ pub(crate) fn validate_supervisor_service_live_evidence(
         .as_ref()
         .ok_or_else(|| invalid_input("supervisor status has no live instance checkpoint"))?;
     validate_service_instance_checkpoint(checkpoint)?;
-    if checkpoint.boot_id != report.current_boot_id {
+    if !boot_identities_match(&checkpoint.boot_id, &report.current_boot_id) {
         return Err(invalid_input(format!(
             "supervisor checkpoint boot {} does not match current boot {}",
             checkpoint.boot_id, report.current_boot_id
@@ -497,13 +497,20 @@ pub(crate) fn repair_supervisor_service() -> Result<String> {
             "the supervisor service cannot be repaired on this platform",
         )));
     }
+    let prior_instance = before.instance().cloned();
 
     supervisor_service_install_command()?;
     supervisor_service_start_command()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + supervisor_readiness_timeout();
     loop {
         match supervisor_service_preflight() {
-            Ok(ready) if ready.is_ready() => {
+            Ok(ready)
+                if ready.is_ready()
+                    && supervisor_instance_is_fresh_successor(
+                        prior_instance.as_ref(),
+                        ready.instance(),
+                    ) =>
+            {
                 return Ok(
                     "managed supervisor now matches this binary and is restart-ready".to_string(),
                 );
@@ -517,6 +524,21 @@ pub(crate) fn repair_supervisor_service() -> Result<String> {
             Err(error) if std::time::Instant::now() >= deadline => return Err(error),
             _ => std::thread::sleep(std::time::Duration::from_millis(100)),
         }
+    }
+}
+
+pub(crate) fn supervisor_readiness_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+pub(crate) fn supervisor_instance_is_fresh_successor(
+    prior: Option<&SupervisorServiceInstance>,
+    current: Option<&SupervisorServiceInstance>,
+) -> bool {
+    match (prior, current) {
+        (None, Some(_)) => true,
+        (Some(prior), Some(current)) => current.is_fresh_successor_of(prior),
+        _ => false,
     }
 }
 
@@ -1034,7 +1056,7 @@ fn validate_checkpoint_identity(
             context.deadreckon_home.display()
         )));
     }
-    if runtime.is_running() && checkpoint.boot_id != current_boot_id {
+    if runtime.is_running() && !boot_identities_match(&checkpoint.boot_id, current_boot_id) {
         return Err(invalid_input(format!(
             "service manager reports the supervisor running, but checkpoint boot {} does not match current boot {}",
             checkpoint.boot_id, current_boot_id
@@ -2198,6 +2220,54 @@ mod tests {
     }
 
     #[test]
+    fn running_service_accepts_a_legacy_same_boot_macos_checkpoint() {
+        let context = context(ServicePlatform::Launchd);
+        let runtime = ServiceManagerRuntime {
+            loaded: Some(true),
+            enabled: Some("enabled".to_string()),
+            active: None,
+        };
+        let report = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime.clone(),
+            Some(checkpoint(
+                &context,
+                9,
+                "legacy-macos-instance",
+                "macos:{ sec = 1785530788, usec = 930989 } legacy",
+            )),
+            BootIdentityObservation {
+                current_boot_id: "macos:sec=1785530788".to_string(),
+                source: BootIdentitySource::MacosSysctl,
+                test_override: false,
+            },
+        )
+        .expect("legacy same-boot checkpoint");
+        validate_supervisor_service_live_evidence(&report)
+            .expect("legacy checkpoint remains valid live evidence");
+
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime,
+            Some(checkpoint(
+                &context,
+                9,
+                "prior-macos-instance",
+                "macos:{ sec = 1785530787, usec = 930989 } prior boot",
+            )),
+            BootIdentityObservation {
+                current_boot_id: "macos:sec=1785530788".to_string(),
+                source: BootIdentitySource::MacosSysctl,
+                test_override: false,
+            },
+        )
+        .expect_err("different boot seconds must fail closed");
+        assert!(error.to_string().contains("does not match current boot"));
+    }
+
+    #[test]
     fn running_service_status_rejects_dead_or_reused_checkpoint_pid() {
         let context = context(ServicePlatform::Systemd);
         let runtime = ServiceManagerRuntime {
@@ -2245,6 +2315,13 @@ mod tests {
         next_checkpoint.pid = next_checkpoint.pid.saturating_add(1);
         let next = SupervisorServiceInstance::from(&next_checkpoint);
         assert!(next.is_fresh_successor_of(&prior));
+        assert!(supervisor_instance_is_fresh_successor(
+            Some(&prior),
+            Some(&next)
+        ));
+        assert!(supervisor_instance_is_fresh_successor(None, Some(&next)));
+        assert!(!supervisor_instance_is_fresh_successor(Some(&prior), None));
+        assert_eq!(supervisor_readiness_timeout(), Duration::from_secs(30));
 
         let mut same_generation = next.clone();
         same_generation.generation = prior.generation;

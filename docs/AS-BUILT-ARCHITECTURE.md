@@ -4441,7 +4441,16 @@ claim records owner ID, monotonically increasing epoch, boot ID, PID, process
 group, heartbeat, and expiry. Every supervisor-authored lifecycle event must
 present the current owner/epoch/boot token; a stale worker cannot append after
 reclaim. Heartbeats update only the lease checkpoint and do not create fake
-phase transitions.
+phase transitions. The supervisor heartbeats every two seconds and uses a
+60-second inactivity lease so host load or sleep does not reclaim a healthy
+owner. The operator-approved Job wall and absolute deadline remain unchanged.
+
+On macOS, boot identity canonicalizes `kern.boottime` to its seconds field.
+Legacy checkpoints containing the same boot second but a different volatile
+microsecond rendering remain valid; a different second, malformed identity,
+PID reuse, or process-start mismatch still fails closed. Service start and
+repair allow 30 seconds for a fresh successor checkpoint, and an already-linked
+guarded child has 30 seconds to publish its durable release acknowledgement.
 
 Capstan's process helper starts the worker in its own process group and writes
 `supervised-child.json`. Cancellation records `cancel_requested` first, then
@@ -4894,15 +4903,23 @@ web, MCP and user-rule/config surfaces, while Claude uses its corresponding
 safe/schema flags. Tool-free API routes use strict response formats. Unsupported
 adapters fail closed. Immutable capability probes are cached per binary/version.
 
-Draft, critic and optional redraft share a 120-second default deadline. Draft
-gets at most 60 seconds, critic 20, and redraft only the remaining time up to
-60. The config key `defaults.done_contract_max_wall_seconds` is clamped to
-30–600 seconds. Timeout or cancellation terminates and reaps the whole provider
+Draft, critic and optional redraft share a 600-second default deadline. Draft
+gets at most 300 seconds, critic 120, and redraft only the remaining time up to
+300. The config key `defaults.done_contract_max_wall_seconds` is clamped to
+300–3,600 seconds, so legacy 120-second defaults are lifted automatically.
+Timeout or cancellation terminates and reaps the whole provider
 process group and removes temporary files before returning. Initial failure
 writes nothing. Critic/redraft failure cannot approve a weak candidate; only a
 lint-clean draft may proceed to explicit human review. Redraft receives the full
 prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
 `redraft`; one critic and one redraft remain the ceiling.
+
+The earlier shape-planning turn is separately bounded at 60 seconds for CLI
+providers and 15 seconds for HTTP providers. A timeout explicitly cancels the
+provider and allows up to 30 seconds to prove cleanup before deterministic
+fallback. Done-authoring cleanup receives ten seconds outside active model
+work. If either boundary cannot prove cleanup, DeadReckon retains its PID
+authority and reports the unresolved process instead of deleting the evidence.
 
 ### 59.5 Compatibility and proof boundary
 

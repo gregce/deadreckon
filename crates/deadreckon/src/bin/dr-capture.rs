@@ -12,11 +12,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use deadreckon_core::git::run_git;
 use deadreckon_core::{
     DeadreckonPaths, JobView, OperatorCaptureEventDraft, OperatorCapturePassLineage,
-    RUN_EVENTS_JSONL, append_operator_capture_event, boot_identity, load_job, load_job_lease,
-    load_operator_capture_binding, load_plan, load_run, operator_capture_binding_sha256,
-    pid_is_alive, process_start_identity, read_job_history, read_operator_capture_history,
-    read_plan_events, reduce_job_history, seal_operator_capture_receipt,
-    validate_completion_receipt, validate_operator_capture_receipt, write_operator_capture_binding,
+    RUN_EVENTS_JSONL, append_operator_capture_event, boot_identities_match, boot_identity,
+    load_job, load_job_lease, load_operator_capture_binding, load_plan, load_run,
+    operator_capture_binding_sha256, pid_is_alive, process_start_identity, read_job_history,
+    read_operator_capture_history, read_plan_events, reduce_job_history,
+    seal_operator_capture_receipt, validate_completion_receipt, validate_operator_capture_receipt,
+    write_operator_capture_binding,
 };
 use deadreckon_protocol::{
     CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobLease, JobOutcome, JobShape,
@@ -2123,7 +2124,7 @@ fn network_process_is_current(
     expected_start_identity: &str,
 ) -> bool {
     pid != 0
-        && expected_boot_id == boot_identity()
+        && boot_identities_match(expected_boot_id, &boot_identity())
         && pid_is_alive(pid)
         && process_start_identity(pid).as_deref() == Some(expected_start_identity)
 }

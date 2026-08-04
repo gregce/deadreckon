@@ -17,6 +17,7 @@ use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::boot_identities_match;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::job::{
     JOB_CONTROL_LOCK, JobProjection, append_job_event_locked, open_job_control_lock,
@@ -141,7 +142,10 @@ pub fn claim_job_lease(
     let durable_epoch = projection.current_lease_epoch.max(checkpoint_epoch);
 
     let disposition = match prior.as_ref() {
-        Some(lease) if lease.epoch == durable_epoch && lease.boot_id != owner.boot_id => {
+        Some(lease)
+            if lease.epoch == durable_epoch
+                && !boot_identities_match(&lease.boot_id, &owner.boot_id) =>
+        {
             LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
         }
         Some(lease) if lease.epoch == durable_epoch && lease.expires_at <= now => {
@@ -1128,6 +1132,43 @@ mod tests {
             reclaimed.disposition,
             LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
         );
+    }
+
+    #[test]
+    fn legacy_macos_microseconds_do_not_reclaim_a_live_same_boot_lease() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-same-macos-boot".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        claim_job_lease(
+            &paths,
+            &job_id,
+            &owner(
+                "supervisor-a",
+                "macos:{ sec = 1785530788, usec = 930989 } legacy",
+                4500,
+            ),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("first claim");
+
+        let error = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner(
+                "supervisor-b",
+                "macos:{ sec = 1785530788, usec = 7 } current",
+                4501,
+            ),
+            now + TimeDelta::seconds(1),
+            Duration::from_secs(15),
+        )
+        .expect_err("same-boot lease must remain fenced");
+
+        assert!(error.to_string().contains("live lease held by owner"));
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(history.events().len(), 1, "no false reclaim event");
     }
 
     #[test]
