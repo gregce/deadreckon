@@ -450,6 +450,61 @@ pub(crate) fn print_job_status_after_attach(
     print_job_status_with_open_action(view, json_output, "status")
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct JobWorkClockProjection {
+    pub(crate) active_elapsed_seconds: f64,
+    pub(crate) remaining_seconds: f64,
+    pub(crate) cutoff: chrono::DateTime<Utc>,
+    pub(crate) limiting_boundary: String,
+}
+
+/// Project the supervisor's one cumulative Job work clock without mutating
+/// lifecycle state. Terminal Jobs retain their recorded terminal state and do
+/// not advertise a live allowance, but their history is still validated so a
+/// corrupt control log can never produce a plausible timing display.
+pub(crate) fn current_job_work_clock(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<JobWorkClockProjection>> {
+    let effective = commands::supervisor::current_job_work_allowance(paths, &view.job, now)?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Job {} has no authoritative work allowance",
+                view.job.job_id
+            )))
+        })?;
+    if view.projection.is_terminal() {
+        return Ok(None);
+    }
+
+    // The effective allowance may be limited by an earlier calendar
+    // deadline. Ask the same authoritative supervisor clock for a wall-only
+    // projection so active elapsed never gets inferred from that shorter
+    // deadline allowance.
+    let mut wall_only_job = view.job.clone();
+    wall_only_job.policy.deadline = None;
+    let wall = commands::supervisor::current_job_work_allowance(paths, &wall_only_job, now)?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "Job {} has no authoritative wall allowance",
+                view.job.job_id
+            )))
+        })?;
+    let active_elapsed =
+        Duration::from_secs(view.job.policy.max_wall_seconds).saturating_sub(wall.remaining);
+    Ok(Some(JobWorkClockProjection {
+        active_elapsed_seconds: active_elapsed.as_secs_f64(),
+        remaining_seconds: effective.remaining.as_secs_f64(),
+        cutoff: effective.cutoff,
+        limiting_boundary: match effective.boundary {
+            commands::supervisor::ActivePolicyBoundary::Deadline => "deadline",
+            commands::supervisor::ActivePolicyBoundary::WallCap => "wall_cap",
+        }
+        .to_string(),
+    }))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JobDeliveryKind {
     Exported,
@@ -697,6 +752,8 @@ fn print_job_status_with_open_action(
 ) -> Result<()> {
     let id = view.job.job_id.as_ref();
     let status = job_status_label(view);
+    let paths = DeadreckonPaths::discover();
+    let work_clock = current_job_work_clock(&paths, view, Utc::now())?;
     let next_action = format!(
         "deadreckon {} {}",
         job_primary_action(view, open_action),
@@ -725,7 +782,6 @@ fn print_job_status_with_open_action(
         _ => "not-applicable",
     };
     if json_output {
-        let paths = DeadreckonPaths::discover();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -743,6 +799,7 @@ fn print_job_status_with_open_action(
                     "process": process_durability,
                     "machine_restart": machine_restart_durability,
                 },
+                "work_clock": work_clock,
                 "job": view,
             }))?
         );
@@ -769,6 +826,20 @@ fn print_job_status_with_open_action(
         ("delivered to", &delivered_to),
         ("verified proof", proof_status),
     ]);
+    if let Some(clock) = work_clock {
+        print_kv_block(&[
+            (
+                "active elapsed",
+                &format!("{:.3}s", clock.active_elapsed_seconds),
+            ),
+            (
+                "work remaining",
+                &format!("{:.3}s", clock.remaining_seconds),
+            ),
+            ("work cutoff", &clock.cutoff.to_rfc3339()),
+            ("limiting boundary", &clock.limiting_boundary),
+        ]);
+    }
     if let Some(error) = view.verified_receipt_error.as_deref() {
         println!();
         println!("  {} {}", ui_muted("proof error:"), error);
@@ -3306,6 +3377,95 @@ mod tests {
             serialized_label(deadreckon_protocol::StopReason::SemanticUnavailable),
             "semantic_unavailable"
         );
+    }
+
+    #[test]
+    fn status_work_clock_uses_attempt_history_and_preserves_terminal_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let now = Utc::now();
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId("status-work-clock-job".to_string()),
+            scope: "status-work-clock".to_string(),
+            goal: "prove the authoritative work clock".to_string(),
+            shape: JobShape::Graph,
+            created_at: now - chrono::TimeDelta::seconds(20),
+            source_cwd: source,
+            launch_plan_sha256: "sha256:launch".to_string(),
+            authority_sha256: "sha256:authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 1.0,
+                max_wall_seconds: 90,
+                max_attempts: 2,
+                deadline: Some(now + chrono::TimeDelta::seconds(30)),
+                semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
+            },
+        };
+        deadreckon_core::write_job(&paths, &job).expect("Job");
+        deadreckon_core::append_job_event(
+            &paths,
+            &JobEvent {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: job.job_id.clone(),
+                sequence: JobEventSequence::new(1).expect("first sequence"),
+                event_id: "status-work-clock-attempt".to_string(),
+                causation_id: "status-work-clock-attempt".to_string(),
+                timestamp: now - chrono::TimeDelta::seconds(20),
+                lease_epoch: 0,
+                kind: JobEventKind::AttemptStarted,
+                detail: json!({ "attempt": 1 }),
+            },
+        )
+        .expect("attempt start");
+        let mut view = deadreckon_core::JobView {
+            job,
+            projection: deadreckon_core::JobProjection {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: JobId("status-work-clock-job".to_string()),
+                phase: deadreckon_protocol::JobPhase::Running,
+                outcome: None,
+                stop_reason: None,
+                last_sequence: 1,
+                current_lease_epoch: 0,
+                attempt_count: 1,
+                child_run_ids: Vec::new(),
+                delivery: None,
+                updated_at: Some(now),
+                caveats: Vec::new(),
+            },
+            attempts: Vec::new(),
+            missing_attempts: Vec::new(),
+            verified_receipt_error: None,
+        };
+
+        let clock = current_job_work_clock(&paths, &view, now)
+            .expect("valid history")
+            .expect("live work clock");
+
+        assert_eq!(clock.active_elapsed_seconds, 20.0);
+        assert_eq!(clock.remaining_seconds, 30.0);
+        assert_eq!(clock.cutoff, now + chrono::TimeDelta::seconds(30));
+        assert_eq!(clock.limiting_boundary, "deadline");
+
+        view.projection.phase = deadreckon_protocol::JobPhase::Terminal;
+        view.projection.outcome = Some(deadreckon_protocol::JobOutcome::Failed);
+        assert_eq!(
+            current_job_work_clock(&paths, &view, now).expect("terminal history"),
+            None,
+            "terminal Jobs must retain their recorded state without a live allowance"
+        );
+
+        let history_path = paths.job_events(view.job.job_id.as_ref());
+        let mut corrupt = fs::read(&history_path).expect("history");
+        corrupt.extend_from_slice(b"{not-json}\n");
+        fs::write(&history_path, corrupt).expect("corrupt history");
+        let error = current_job_work_clock(&paths, &view, now)
+            .expect_err("corrupt terminal history must fail closed");
+        assert!(error.to_string().contains("job history corrupt"), "{error}");
     }
 
     #[test]
