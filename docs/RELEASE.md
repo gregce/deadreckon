@@ -14,7 +14,7 @@ pushing the Homebrew tap remain operator actions.
 | Stable | `vX.Y.Z` | Requires tag/version/changelog agreement, full verify, enabled official-repo trust material, release artifacts, checksums, manifest, SBOM, GitHub attestations, and Homebrew integrity. npm publication and Windows Authenticode may be explicitly deferred by the checked-in release policy. |
 
 Windows artifacts require Authenticode signing whenever
-`windowsSigningDeferred` is false. The initial `v0.8.0` lane deliberately keeps
+`windowsSigningDeferred` is false. The narrowed `v0.8.x` lane deliberately keeps
 that flag true until a certificate is configured, so its Windows archive is
 unsigned but remains covered by checksums and GitHub attestations. This is an
 explicit release-scope decision, not a missing-secret fallback.
@@ -83,7 +83,8 @@ Forks, PRs, and branch dry-runs do not require these secrets.
 ## Required Windows Secrets
 
 Official stable releases fail if Windows signing is enabled and signing
-material is absent. Windows Authenticode is explicitly deferred for `v0.8.0`.
+material is absent. Windows Authenticode is explicitly deferred for the
+narrowed `v0.8.x` lane.
 
 | Secret | Purpose |
 | --- | --- |
@@ -153,7 +154,7 @@ attestations and npm provenance.
 
 ## Stable operator checklist
 
-Everything the operator confirms before the narrowed `v0.8.0` stable release:
+Everything the operator confirms before a narrowed `v0.8.x` stable release:
 
 1. Work from a clean revision whose branch CI and release-plan workflow pass.
 2. Confirm the `gregce/homebrew-tap` repository is reachable and

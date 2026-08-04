@@ -117,7 +117,7 @@ function classifyRelease(localArgs = args) {
   const official_repo = repo === officialRepo;
   const releaseLane = lane === "stable" || lane === "rc";
   const officialRelease = official_repo && releaseLane;
-  // v0.8.0 lane narrowing (operator decision, 2026-08-02): publish the
+  // v0.8.x lane narrowing (operator decision, 2026-08-02): publish the
   // checksummed/attested GitHub payload and Homebrew formula now. npm waits on
   // trusted-publisher setup; Windows Authenticode waits on a certificate. Flip
   // either flag to false only after its corresponding trust material exists.
