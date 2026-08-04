@@ -806,15 +806,28 @@ printf 'changed notes\n'
         .expect("run");
     let state = load_run(&paths, &run.run_id).expect("state");
     let pause_reason = state.pause_reason.as_deref().expect("pause reason");
-    // Depending on timing the cap binds mid-turn (provider call cut at the
-    // remaining budget) or at the post-turn check; both are the wall cap.
+    // The 100 ms Job budget can bind at any bounded phase reached first on a
+    // contended machine: before provider launch, during the call, or at the
+    // post-turn check. Preserve the canonical cap classification while also
+    // requiring contextual phase-boundary reasons to name the authoritative
+    // Job cutoff.
     assert!(
         pause_reason == "wall-clock cap reached"
-            || pause_reason == "wall-clock cap reached mid-turn",
+            || pause_reason == "wall-clock cap reached mid-turn"
+            || (pause_reason.starts_with("wall-clock cap reached during ")
+                && pause_reason.ends_with("(approved Job work cutoff)")),
         "{pause_reason}"
     );
-    let spend = fs::read_to_string(state.run_root.join("spend.jsonl")).expect("spend");
-    assert!(spend.contains("wall_time_seconds"));
+    assert!(
+        state.total_wall_seconds >= 0.1,
+        "the durable Job clock did not reach its cap: {}",
+        state.total_wall_seconds
+    );
+    let spend_path = state.run_root.join("spend.jsonl");
+    if spend_path.exists() {
+        let spend = fs::read_to_string(spend_path).expect("provider spend");
+        assert!(spend.contains("wall_time_seconds"));
+    }
     let state_before = fs::read(state.state_path()).expect("state before refused resume");
     let resume_provider_sentinel = temp.path().join("resume-provider-started");
     fs::write(
