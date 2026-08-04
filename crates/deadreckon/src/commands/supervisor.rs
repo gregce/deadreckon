@@ -2954,11 +2954,17 @@ fn finish_owned_child_policy_boundary(
     let terminalized = match terminalized {
         Ok(terminalized) => terminalized,
         Err(error) => {
-            let _ = stop_and_reap_owned_child(child);
+            let owned_cleanup = reap_owned_child_until(child, cleanup_deadline);
             block_for_lost_containment(
                 paths,
                 token,
-                &format!("policy cleanup failed before containment was proven: {error}"),
+                &format!(
+                    "policy cleanup failed before containment was proven: {error}{}",
+                    owned_cleanup
+                        .err()
+                        .map(|cleanup| format!("; owned-leader cleanup: {cleanup}"))
+                        .unwrap_or_default()
+                ),
             )?;
             return Ok(true);
         }
@@ -2976,19 +2982,23 @@ fn finish_owned_child_policy_boundary(
             Ok(Some(_)) => return Ok(true),
             Ok(None) => std::thread::sleep(POLICY_CLEANUP_POLL_INTERVAL),
             Err(error) => {
-                let _ = stop_and_reap_owned_child(child);
+                let owned_cleanup = reap_owned_child_until(child, cleanup_deadline);
                 block_for_lost_containment(
                     paths,
                     token,
                     &format!(
-                        "policy cleanup stopped the supervised process tree, but the owned leader could not be reaped: {error}"
+                        "policy cleanup stopped the supervised process tree, but the owned leader could not be inspected: {error}{}",
+                        owned_cleanup
+                            .err()
+                            .map(|cleanup| format!("; bounded reap: {cleanup}"))
+                            .unwrap_or_default()
                     ),
                 )?;
                 return Ok(true);
             }
         }
     }
-    let final_reap = stop_and_reap_owned_child(child);
+    let final_reap = reap_owned_child_until(child, cleanup_deadline);
     block_for_lost_containment(
         paths,
         token,
@@ -3003,16 +3013,6 @@ fn finish_owned_child_policy_boundary(
     Ok(true)
 }
 
-fn stop_and_reap_owned_child(child: &mut Child) -> std::io::Result<()> {
-    match child.try_wait()? {
-        Some(_) => Ok(()),
-        None => {
-            child.kill()?;
-            child.wait().map(|_| ())
-        }
-    }
-}
-
 fn fail_closed_after_heartbeat(
     paths: &DeadreckonPaths,
     token: &LeaseToken,
@@ -3020,29 +3020,26 @@ fn fail_closed_after_heartbeat(
     child: &mut MonitoredChild,
     heartbeat_error: &CliError,
 ) -> Result<()> {
-    let cleanup = reconcile_job_processes_for_policy_boundary(
-        paths,
-        job,
-        Some(Instant::now() + POLICY_CLEANUP_TIMEOUT),
-    );
+    let cleanup_deadline = Instant::now() + POLICY_CLEANUP_TIMEOUT;
+    let cleanup = reconcile_job_processes_for_policy_boundary(paths, job, Some(cleanup_deadline));
 
-    if let MonitoredChild::Owned(child) = child {
-        match child.try_wait() {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            Err(_) => {}
-        }
-    }
+    let owned_cleanup = match child {
+        MonitoredChild::Owned(child) => reap_owned_child_until(child, cleanup_deadline),
+        MonitoredChild::Adopted(_) => Ok(()),
+    };
 
-    let reason = match cleanup {
-        Ok(()) => format!(
+    let reason = match (cleanup, owned_cleanup) {
+        (Ok(()), Ok(())) => format!(
             "lease heartbeat failed while Job work was active; the supervised process tree was stopped before authority was released: {heartbeat_error}"
         ),
-        Err(cleanup_error) => format!(
-            "lease heartbeat failed while Job work was active and process-tree cleanup could not be proven: {heartbeat_error}; cleanup: {cleanup_error}"
+        (process_cleanup, owned_cleanup) => format!(
+            "lease heartbeat failed while Job work was active and cleanup could not be proven inside the bounded window: {heartbeat_error}; process tree: {}; owned leader: {}",
+            process_cleanup
+                .err()
+                .map_or_else(|| "stopped".to_string(), |error| error.to_string()),
+            owned_cleanup
+                .err()
+                .map_or_else(|| "reaped".to_string(), |error| error.to_string())
         ),
     };
     block_for_lost_containment(paths, token, &reason)
@@ -8178,6 +8175,28 @@ mod tests {
             Some(StopReason::CancelRequested)
         );
         heartbeat.finish(Ok(())).expect("stop heartbeat");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_owned_reap_deadline_never_enters_an_unbounded_wait() {
+        let (mut child, _terminator) = spawn_grouped({
+            let mut command = Command::new("sh");
+            command.arg("-c").arg("sleep 30");
+            command
+        })
+        .expect("long-running child");
+        let started = Instant::now();
+
+        let error = reap_owned_child_until(&mut child, Instant::now())
+            .expect_err("expired cleanup must fail closed");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expired cleanup entered an unbounded owned-child wait"
+        );
+        assert!(error.to_string().contains("cleanup deadline"), "{error}");
+        let _ = child.wait();
     }
 
     #[cfg(unix)]
