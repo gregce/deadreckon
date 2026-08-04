@@ -17,7 +17,6 @@ use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use crate::boot_identities_match;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::job::{
     JOB_CONTROL_LOCK, JobProjection, append_job_event_locked, open_job_control_lock,
@@ -25,6 +24,7 @@ use crate::job::{
 };
 use crate::paths::DeadreckonPaths;
 use crate::state::atomic_write_json;
+use crate::{boot_identities_match, process_start_identity};
 
 /// Process identity supplied by one supervisor instance.
 ///
@@ -148,6 +148,24 @@ pub fn claim_job_lease(
         {
             LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::BootIdentityChanged)
         }
+        Some(lease)
+            if lease.epoch == durable_epoch
+                && lease.expires_at <= now
+                && lease
+                    .process_start_identity
+                    .as_deref()
+                    .is_some_and(|expected| {
+                        process_start_identity(lease.pid).as_deref() == Some(expected)
+                    }) =>
+        {
+            return Err(lease_error(
+                job_id,
+                &format!(
+                    "live lease held by owner {} at epoch {} beyond its heartbeat window; try: deadreckon attach {}",
+                    lease.owner_id, lease.epoch, job_id
+                ),
+            ));
+        }
         Some(lease) if lease.epoch == durable_epoch && lease.expires_at <= now => {
             LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::Expired)
         }
@@ -179,6 +197,7 @@ pub fn claim_job_lease(
         expires_at,
         boot_id: owner.boot_id.clone(),
         pid: owner.pid,
+        process_start_identity: process_start_identity(owner.pid),
         process_group: owner.process_group,
         child_pid: None,
     };
@@ -667,7 +686,7 @@ mod tests {
     use super::{
         CreateFencedJobJsonDisposition, FencedJobJsonEvent, LeaseClaimDisposition, LeaseOwner,
         LeaseReclaimReason, append_fenced_job_event, append_next_fenced_job_event, claim_job_lease,
-        create_fenced_job_json_and_append_event, heartbeat_job_lease,
+        create_fenced_job_json_and_append_event, heartbeat_job_lease, load_job_lease,
         replace_fenced_job_json_and_append_event,
     };
     use crate::job::{load_job_projection, read_job_history};
@@ -805,6 +824,120 @@ mod tests {
         assert_eq!(second.lease.epoch, 2);
         assert_eq!(
             second.disposition,
+            LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::Expired)
+        );
+    }
+
+    #[test]
+    fn expired_same_boot_lease_does_not_reclaim_its_exact_live_owner() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-host-sleep".to_string());
+        let now = Utc::now();
+        let pid = std::process::id();
+        let first = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-before-sleep", &crate::boot_identity(), pid),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("first claim");
+        assert!(first.lease.process_start_identity.is_some());
+
+        let error = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner(
+                "supervisor-after-sleep",
+                &crate::boot_identity(),
+                pid.saturating_add(1),
+            ),
+            now + TimeDelta::minutes(5),
+            Duration::from_secs(15),
+        )
+        .expect_err("live exact owner must survive an expired heartbeat window");
+        assert!(error.to_string().contains("beyond its heartbeat window"));
+        let retained = load_job_lease(&paths, &job_id).expect("retained live lease");
+        assert_eq!(retained.owner_id, first.lease.owner_id);
+        assert_eq!(retained.epoch, first.lease.epoch);
+        assert_eq!(
+            retained.process_start_identity, first.lease.process_start_identity,
+            "a wall-clock jump must not rewrite live same-boot process authority"
+        );
+        let history = read_job_history(&paths.job_events(job_id.as_ref())).expect("history");
+        assert_eq!(history.events().len(), 1, "no false reclaim event");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_same_boot_lease_reclaims_a_dead_exact_owner() {
+        use std::process::Command;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-dead-owner".to_string());
+        let now = Utc::now();
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .expect("live owner fixture");
+        let child_pid = child.id();
+        let first = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", &crate::boot_identity(), child_pid),
+            now,
+            Duration::from_secs(1),
+        )
+        .expect("first claim");
+        assert!(first.lease.process_start_identity.is_some());
+        child.wait().expect("reap owner fixture");
+
+        let reclaimed = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-b", &crate::boot_identity(), std::process::id()),
+            now + TimeDelta::seconds(2),
+            Duration::from_secs(15),
+        )
+        .expect("dead owner may be reclaimed");
+        assert_eq!(
+            reclaimed.disposition,
+            LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::Expired)
+        );
+    }
+
+    #[test]
+    fn expired_same_boot_lease_reclaims_a_reused_pid_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-reused-owner-pid".to_string());
+        let now = Utc::now();
+        let pid = std::process::id();
+        claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-a", &crate::boot_identity(), pid),
+            now,
+            Duration::from_secs(1),
+        )
+        .expect("first claim");
+        let mut lease = load_job_lease(&paths, &job_id).expect("lease");
+        lease.process_start_identity = Some("same-pid-different-process".to_string());
+        crate::state::atomic_write_json(&paths.job_lease(job_id.as_ref()), &lease)
+            .expect("substitute stale process identity");
+
+        let reclaimed = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-b", &crate::boot_identity(), pid),
+            now + TimeDelta::seconds(2),
+            Duration::from_secs(15),
+        )
+        .expect("reused pid must not preserve the stale lease");
+        assert_eq!(
+            reclaimed.disposition,
             LeaseClaimDisposition::Reclaimed(LeaseReclaimReason::Expired)
         );
     }

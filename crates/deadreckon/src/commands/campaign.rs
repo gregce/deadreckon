@@ -1739,7 +1739,7 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
             planner_sandbox,
             args.plain,
         )
-        .await;
+        .await?;
         write_goal_shape_preview_record(&paths, &scope, &recommendation)?;
         recommendation
             .n

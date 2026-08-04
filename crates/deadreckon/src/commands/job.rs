@@ -152,6 +152,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
             "durable Job attempt cap must be greater than zero".to_string(),
         )));
     }
+    ensure_admission_deadline_future(request.deadline, Utc::now())?;
     if request
         .launch_plan
         .budget
@@ -300,6 +301,10 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         semantic_judge_mode: SemanticJudgeMode::Required,
         gate_evaluator_sha256: Some(gate_evaluator_sha256.clone()),
     };
+    // Absolute deadlines continue advancing during contract authoring,
+    // service repair and input freezing. Recheck at the last admission
+    // boundary so start never queues a Job that is already terminal.
+    ensure_admission_deadline_future(request.deadline, Utc::now())?;
     let authority_path = request.paths.job_authority(job_id.as_ref());
     write_json_synced(&authority_path, &authority)?;
     let authority_sha256 = deadreckon_core::flight::sha256_file(&authority_path)?;
@@ -360,6 +365,19 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
     }
     pending_job_directory.commit();
     Ok(job)
+}
+
+fn ensure_admission_deadline_future(
+    deadline: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if deadline.is_some_and(|deadline| deadline <= now) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "the approved absolute deadline elapsed before the durable Job could be queued",
+            "choose a later --deadline and rerun deadreckon start",
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn launch_detached_supervisor(paths: &DeadreckonPaths, job_id: &JobId) -> Result<()> {
@@ -2153,6 +2171,36 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_admission_deadline_creates_no_job() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let mut expired = request(&paths, &source, None);
+        expired.deadline = Some(Utc::now() - chrono::TimeDelta::seconds(1));
+
+        let error = create_job(expired).expect_err("elapsed deadline must refuse admission");
+        assert!(error.to_string().contains("elapsed before"), "{error}");
+        assert!(
+            !paths.jobs_dir().exists(),
+            "an already elapsed deadline must fail before durable identity"
+        );
+    }
+
+    #[test]
+    fn final_deadline_boundary_refuses_crossing_without_extending_it() {
+        let approved = Utc::now() + chrono::TimeDelta::seconds(30);
+        ensure_admission_deadline_future(
+            Some(approved),
+            approved - chrono::TimeDelta::nanoseconds(1),
+        )
+        .expect("still-future deadline");
+        let error = ensure_admission_deadline_future(Some(approved), approved)
+            .expect_err("deadline crossing must refuse at the final boundary");
+        assert!(error.to_string().contains("choose a later --deadline"));
+    }
+
+    #[test]
     fn approved_inputs_exist_before_job_is_queued() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));
@@ -2166,7 +2214,10 @@ mod tests {
         )
         .expect("contract");
 
-        let job = create_job(request(&paths, &source, Some(&contract))).expect("create job");
+        let deadline = Utc::now() + chrono::TimeDelta::hours(1);
+        let mut approved = request(&paths, &source, Some(&contract));
+        approved.deadline = Some(deadline);
+        let job = create_job(approved).expect("create job");
         let authority_path = paths.job_authority(job.job_id.as_ref());
         let authority: JobAuthority =
             serde_json::from_slice(&fs::read(&authority_path).expect("authority bytes"))
@@ -2177,6 +2228,11 @@ mod tests {
                 .expect("contract digest")
         );
         assert_eq!(authority.semantic_judge_mode, SemanticJudgeMode::Required);
+        assert_eq!(job.policy.deadline, Some(deadline));
+        let launch =
+            commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
+                .expect("launch plan");
+        assert_eq!(launch.budget.deadline, Some(deadline));
         let execution = job
             .policy
             .execution

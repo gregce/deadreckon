@@ -5386,14 +5386,20 @@ mod tests {
         }
     }
 
-    fn expire_supervisor_lease(paths: &DeadreckonPaths, job: &Job) {
+    fn abandon_supervisor_lease_for_recovery(paths: &DeadreckonPaths, job: &Job) {
         let mut lease = deadreckon_core::load_job_lease(paths, &job.job_id).expect("active lease");
         lease.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        // The fixtures acquire the original lease with this still-live test
+        // process. Expiry alone must not permit a same-boot replacement to
+        // steal that lease. Model the recovery boundary as PID reuse by
+        // retaining the PID while making its captured process-start identity
+        // stale.
+        lease.process_start_identity = Some("test:abandoned-or-reused-process".to_string());
         fs::write(
             paths.job_lease(job.job_id.as_ref()),
             serde_json::to_vec_pretty(&lease).expect("expired lease json"),
         )
-        .expect("expire supervisor lease");
+        .expect("abandon supervisor lease");
     }
 
     fn assert_exact_verified_projection(paths: &DeadreckonPaths, job: &Job) {
@@ -5942,7 +5948,7 @@ mod tests {
             let receipt = deadreckon_core::validate_completion_receipt(&paths, &state)
                 .expect("durable single receipt");
             seed_verified_projection_boundary(&paths, &token, &receipt, &state.run_id, boundary);
-            expire_supervisor_lease(&paths, &job);
+            abandon_supervisor_lease_for_recovery(&paths, &job);
             let recovery = SupervisorInstance {
                 owner: LeaseOwner {
                     owner_id: format!("single-recovery-{boundary:?}"),
@@ -5974,7 +5980,7 @@ mod tests {
             let receipt = deadreckon_core::validate_completion_receipt(&paths, &parent)
                 .expect("durable graph receipt");
             seed_verified_projection_boundary(&paths, &token, &receipt, "result-run", boundary);
-            expire_supervisor_lease(&paths, &job);
+            abandon_supervisor_lease_for_recovery(&paths, &job);
             let recovery = SupervisorInstance {
                 owner: LeaseOwner {
                     owner_id: format!("graph-recovery-{boundary:?}"),
@@ -6033,7 +6039,7 @@ mod tests {
             .expect("attempt-stop binding"),
         )
         .expect("reversed attempt stop");
-        expire_supervisor_lease(&paths, &job);
+        abandon_supervisor_lease_for_recovery(&paths, &job);
         let recovery = SupervisorInstance {
             owner: LeaseOwner {
                 owner_id: "reversed-projection-recovery".to_string(),
@@ -6099,7 +6105,7 @@ mod tests {
                 semantic,
             )
             .expect("differently bound semantic projection");
-            expire_supervisor_lease(&paths, &job);
+            abandon_supervisor_lease_for_recovery(&paths, &job);
             let recovery = SupervisorInstance {
                 owner: LeaseOwner {
                     owner_id: format!("binding-recovery-{mismatched_field}"),
@@ -6153,7 +6159,7 @@ mod tests {
                 "campaign-result",
                 boundary,
             );
-            expire_supervisor_lease(&paths, &job);
+            abandon_supervisor_lease_for_recovery(&paths, &job);
             let recovery = SupervisorInstance {
                 owner: LeaseOwner {
                     owner_id: format!("campaign-recovery-{boundary:?}"),
@@ -6309,7 +6315,7 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
         let contract = write_admission_contract(&source);
-        let deadline = Utc::now() - chrono::TimeDelta::seconds(1);
+        let deadline = Utc::now() + chrono::TimeDelta::seconds(3);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
@@ -6341,6 +6347,13 @@ mod tests {
                 .expect("frozen launch plan");
         assert_eq!(job.policy.deadline, Some(deadline));
         assert_eq!(frozen.budget.deadline, Some(deadline));
+
+        let until_deadline = (deadline - Utc::now()).to_std().unwrap_or_default();
+        tokio::time::sleep(until_deadline + Duration::from_millis(50)).await;
+        assert!(
+            Utc::now() >= deadline,
+            "fixture must cross the approved deadline"
+        );
 
         supervise_one_job(
             &paths,
@@ -6403,7 +6416,10 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
         let contract = write_admission_contract(&source);
-        let deadline = Utc::now() + chrono::TimeDelta::milliseconds(300);
+        // Job admission freezes and hashes its trusted inputs before queueing.
+        // Leave enough setup room under parallel test load, while still
+        // exercising the active-child deadline path within a few seconds.
+        let deadline = Utc::now() + chrono::TimeDelta::seconds(3);
         let job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
@@ -8556,14 +8572,7 @@ mod tests {
         deadreckon_runtime::persist_semantic_judgment(&parent.run_root, &achieved)
             .expect("achieved judgment");
 
-        let mut expired =
-            deadreckon_core::load_job_lease(&paths, &job.job_id).expect("active lease");
-        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        fs::write(
-            paths.job_lease(job.job_id.as_ref()),
-            serde_json::to_vec_pretty(&expired).expect("expired lease json"),
-        )
-        .expect("expire abandoned supervisor lease");
+        abandon_supervisor_lease_for_recovery(&paths, &job);
         let recovery_owner = LeaseOwner {
             owner_id: "replacement-supervisor".to_string(),
             boot_id: token.boot_id.clone(),

@@ -20,11 +20,24 @@
   Recovery guidance now distinguishes controller compatibility, local setup,
   transient provider failure, and invalid authoring results instead of
   suggesting the provider that just failed.
-- Start planning and done-contract phases use realistic cumulative CLI
-  deadlines: contract authoring defaults to ten minutes with bounded per-stage
-  allocations, while old 120-second configuration is safely lifted. Planner
-  cancellation and authoring cleanup now prove that provider processes are
-  reaped before fallback or retry.
+- Start planning and done-contract phases use realistic cumulative provider
+  deadlines: contract authoring defaults to fifteen minutes, caps draft,
+  critic and redraft at five, two and five minutes while reserving later
+  stages, and allows 30 seconds to prove cleanup. Goal-shape planning allows
+  two minutes for subscription CLIs or 30 seconds for HTTP routes. Old
+  120-second authoring configuration is safely lifted, and no planner fallback
+  or authoring retry proceeds while provider cleanup remains unproven.
+- Root graph planning is capped at ten minutes or the remaining approved Job
+  deadline, whichever is shorter, and retains process authority when cleanup
+  cannot be proven. Durable admission rechecks the absolute deadline before
+  writing authority, rolls back a partial Job, and replay finishes contract
+  materialization before mutating the supervisor service.
+- Supervisor leases now bind the owner's same-boot process-start identity. A
+  sleeping host can therefore cross the heartbeat window without a second
+  supervisor stealing a still-live Job, while dead and PID-reused owners remain
+  reclaimable. Launchd, systemd and identity probes use a shared 30-second
+  bounded runner that drains output concurrently, terminates the process group
+  and reaps it on timeout.
 - macOS boot identity now compares the stable boot-second boundary rather than
   volatile `kern.boottime` microseconds. Start/repair readiness waits 30
   seconds for a fresh service instance, healthy lease inactivity allows 60

@@ -3754,13 +3754,15 @@ adapter that cannot enforce the posture fails closed. Capability probes are
 cached for the binary/version process lifetime. `doc_provider` remains the
 preferred authoring route.
 
-The whole authoring sequence shares one wall deadline. The default is 120
+The whole authoring sequence shares one wall deadline. The default is 900
 seconds, configurable as `defaults.done_contract_max_wall_seconds` and clamped
-to 30–600 seconds. The initial draft receives at most 60 seconds, the critic at
-most 20, and redraft receives only the remaining time up to 60 seconds. Startup,
-capability probing, provider work and cleanup all consume the same budget.
-Cancellation first terminates and reaps the provider's full owned process group
-and removes temporary schema, PID and partial-output files. The wait surface
+to 900–3,600 seconds. The initial draft receives at most 300 seconds while
+reserving 120 seconds for the critic and 300 for an optional redraft. The critic
+must preserve the redraft reservation, and redraft receives only its remaining
+time up to 300 seconds. Startup, capability probing and active provider work
+consume that cumulative budget. Cancellation then receives one bounded
+30-second grace to terminate and reap the provider's full owned process group;
+unproven cleanup blocks admission and retains the PID evidence. The wait surface
 reports stage, provider/model and cumulative elapsed/limit; it is not the
 timeout mechanism.
 
@@ -4903,10 +4905,12 @@ web, MCP and user-rule/config surfaces, while Claude uses its corresponding
 safe/schema flags. Tool-free API routes use strict response formats. Unsupported
 adapters fail closed. Immutable capability probes are cached per binary/version.
 
-Draft, critic and optional redraft share a 600-second default deadline. Draft
-gets at most 300 seconds, critic 120, and redraft only the remaining time up to
-300. The config key `defaults.done_contract_max_wall_seconds` is clamped to
-300–3,600 seconds, so legacy 120-second defaults are lifted automatically.
+Draft, critic and optional redraft share a 900-second default deadline. Draft
+gets at most 300 seconds while reserving 120 seconds for critic and 300 for
+redraft; critic likewise preserves the redraft reservation. Redraft gets only
+the remaining time up to 300 seconds. The config key
+`defaults.done_contract_max_wall_seconds` is clamped to 900–3,600 seconds, so
+legacy 120-second defaults are lifted automatically.
 Timeout or cancellation terminates and reaps the whole provider
 process group and removes temporary files before returning. Initial failure
 writes nothing. Critic/redraft failure cannot approve a weak candidate; only a
@@ -4914,10 +4918,10 @@ lint-clean draft may proceed to explicit human review. Redraft receives the full
 prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
 `redraft`; one critic and one redraft remain the ceiling.
 
-The earlier shape-planning turn is separately bounded at 60 seconds for CLI
-providers and 15 seconds for HTTP providers. A timeout explicitly cancels the
+The earlier shape-planning turn is separately bounded at 120 seconds for CLI
+providers and 30 seconds for HTTP providers. A timeout explicitly cancels the
 provider and allows up to 30 seconds to prove cleanup before deterministic
-fallback. Done-authoring cleanup receives ten seconds outside active model
+fallback. Done-authoring cleanup receives 30 seconds outside active model
 work. If either boundary cannot prove cleanup, DeadReckon retains its PID
 authority and reports the unresolved process instead of deleting the evidence.
 

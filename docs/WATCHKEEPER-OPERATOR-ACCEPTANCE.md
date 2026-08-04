@@ -113,6 +113,14 @@ deliberately interrupted or the provider is made unavailable, verify that the
 recovery prompt offers retry, revise and stop without asking for the source,
 launch shape, provider or model again.
 
+The timing boundary for this drill is one 15-minute contract-authoring clock:
+draft may use five minutes only while leaving two minutes for critic and five
+for an optional redraft; critic must preserve the redraft reservation. Provider
+cleanup gets a separate 30-second proof window but cannot authorize fallback or
+extend the Job's approved wall/deadline. Goal-shape planning is independently
+bounded at two minutes for a CLI provider or 30 seconds for an HTTP provider,
+followed by the same fail-closed cleanup proof.
+
 Accept when:
 
 - [ ] neither command reports `web_search_request` as deprecated;
@@ -138,6 +146,15 @@ Accept when:
   fails closed;
 - [ ] no supervised PID record is removed when timeout cleanup cannot be
   proven;
+- [ ] unresolved goal-shape provider cleanup stops before a Job ID is created;
+  deterministic shape fallback occurs only after the provider tree is reaped;
+- [ ] contract stages share one 15-minute admission deadline and preserve the
+  critic/redraft reservations rather than starting a fresh clock per stage;
+- [ ] an absolute deadline that elapses during admission creates no queued Job
+  and tells the operator to choose a later deadline;
+- [ ] after suspending and waking the host beyond one lease heartbeat window,
+  a still-live same-boot supervisor retains its lease epoch and owner; a second
+  supervisor does not reclaim the Job merely because wall clock advanced;
 - [ ] Job wall, spend and absolute deadline values remain the operator-approved
   values; only setup/readiness/inactivity allowances are relaxed.
 

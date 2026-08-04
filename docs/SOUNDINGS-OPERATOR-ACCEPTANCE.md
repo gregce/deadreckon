@@ -45,7 +45,7 @@ Expected signals:
   canonical source path;
 - when authoring is needed, it names the source as the inspection root, this
   launch project as the writer root, the structured provider/model route and a
-  `120s` total limit;
+  `900s` total limit;
 - it does not say that `--from` is unsupported;
 - preview creates no Job.
 
@@ -122,14 +122,19 @@ cargo test -j 1 -p deadreckon-providers --lib \
   -- --exact --nocapture
 
 cargo test -j 1 -p deadreckon --bin deadreckon \
-  commands::acceptance::tests::done_authoring_latency_matrix_enforces_120_second_default \
+  commands::acceptance::tests::done_authoring_latency_matrix_gives_each_provider_phase_realistic_room \
+  -- --exact --nocapture
+
+cargo test -j 1 -p deadreckon --bin deadreckon \
+  commands::acceptance::tests::done_authoring_contract_stage_reservations_shrink_the_current_stage_only \
   -- --exact --nocapture
 ```
 
-Expected signals: both commands report `1 passed; 0 failed`. The first starts a
+Expected signals: all three commands report `1 passed; 0 failed`. The first starts a
 provider plus grandchild, cancels it, waits for both to disappear and removes
-the PID file. The second pins the 120-second cumulative default, 60-second
-draft ceiling, 20-second critic ceiling and remaining-time-only redraft.
+the PID file. The other two pin the 900-second cumulative default, 300-second
+draft ceiling, 120-second critic ceiling, 300-second redraft ceiling and the
+critic/redraft reservations that earlier stages cannot consume.
 
 ## 5. Prove retry reuses a valid written contract
 

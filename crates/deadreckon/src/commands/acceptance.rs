@@ -135,13 +135,13 @@ pub(crate) struct CriticVerdict {
 // may spend a minute cold-starting or compacting before they emit progress, so
 // the legacy 120-second total rejected healthy work. Keep one cumulative hard
 // deadline, but make its default and stage allocations match real CLI latency.
-const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 600.0;
-const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 300.0;
+const DEFAULT_DONE_AUTHORING_WALL_SECONDS: f64 = 900.0;
+const MIN_DONE_AUTHORING_WALL_SECONDS: f64 = 900.0;
 const MAX_DONE_AUTHORING_WALL_SECONDS: f64 = 3_600.0;
 const DONE_AUTHORING_DRAFT_WALL_SECONDS: u64 = 300;
 const DONE_AUTHORING_CRITIC_WALL_SECONDS: u64 = 120;
 const DONE_AUTHORING_REDRAFT_WALL_SECONDS: u64 = 300;
-const DONE_AUTHORING_CLEANUP_GRACE_SECONDS: u64 = 10;
+const DONE_AUTHORING_CLEANUP_GRACE_SECONDS: u64 = 30;
 
 #[derive(Clone, Copy, Debug)]
 enum DoneAuthoringStage {
@@ -195,7 +195,14 @@ impl DoneAuthoringBudget {
             DoneAuthoringStage::Critic => Duration::from_secs(DONE_AUTHORING_CRITIC_WALL_SECONDS),
             DoneAuthoringStage::Redraft => Duration::from_secs(DONE_AUTHORING_REDRAFT_WALL_SECONDS),
         };
-        Some(remaining.min(stage_cap))
+        let later_stage_reserve = match stage {
+            DoneAuthoringStage::Draft => Duration::from_secs(
+                DONE_AUTHORING_CRITIC_WALL_SECONDS + DONE_AUTHORING_REDRAFT_WALL_SECONDS,
+            ),
+            DoneAuthoringStage::Critic => Duration::from_secs(DONE_AUTHORING_REDRAFT_WALL_SECONDS),
+            DoneAuthoringStage::Redraft => Duration::ZERO,
+        };
+        Some(remaining.checked_sub(later_stage_reserve)?.min(stage_cap))
     }
 
     fn elapsed(self) -> Duration {
@@ -3059,11 +3066,11 @@ mod tests {
     fn done_contract_wall_budget_defaults_and_clamps() {
         assert_eq!(
             DoneAuthoringBudget::from_config(None).total,
-            Duration::from_secs(600)
+            Duration::from_secs(900)
         );
         assert_eq!(
             DoneAuthoringBudget::from_config(Some(1.0)).total,
-            Duration::from_secs(300)
+            Duration::from_secs(900)
         );
         assert_eq!(
             DoneAuthoringBudget::from_config(Some(9_999.0)).total,
@@ -3074,39 +3081,43 @@ mod tests {
     #[test]
     fn done_authoring_latency_matrix_gives_each_provider_phase_realistic_room() {
         let immediate = DoneAuthoringBudget::from_config(None);
-        assert_eq!(immediate.total, Duration::from_secs(600));
-        assert!(
+        assert_eq!(immediate.total, Duration::from_secs(900));
+        assert_eq!(
             immediate
                 .allocation(DoneAuthoringStage::Draft)
                 .expect("draft allocation")
-                <= Duration::from_secs(300)
+                .as_secs(),
+            300
         );
-        assert!(
+        assert_eq!(
             immediate
                 .allocation(DoneAuthoringStage::Critic)
                 .expect("critic allocation")
-                <= Duration::from_secs(120)
+                .as_secs(),
+            120
         );
-        assert!(
+        assert_eq!(
             immediate
                 .allocation(DoneAuthoringStage::Redraft)
                 .expect("redraft allocation")
-                <= Duration::from_secs(300)
+                .as_secs(),
+            300
         );
 
         // A critic/redraft path shares the original deadline. Advancing the
         // request clock can only shrink later allocations; it cannot grant a
-        // fresh stage budget or extend the 600-second admission window.
+        // fresh stage budget or extend the 900-second admission window. Once
+        // the reserved redraft time is gone, critic admission fails closed.
         let near_deadline = DoneAuthoringBudget {
-            started: Instant::now() - Duration::from_secs(599),
+            started: Instant::now() - Duration::from_secs(899),
             deadline: Instant::now() + Duration::from_secs(1),
-            total: Duration::from_secs(600),
+            total: Duration::from_secs(900),
         };
         assert!(
             near_deadline
                 .allocation(DoneAuthoringStage::Critic)
-                .expect("critic remainder")
-                <= Duration::from_secs(1)
+                .is_none(),
+            "critic must not consume the redraft reserve"
         );
         assert!(
             near_deadline
@@ -3114,6 +3125,39 @@ mod tests {
                 .expect("redraft remainder")
                 <= Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn done_authoring_contract_stage_reservations_shrink_the_current_stage_only() {
+        let draft_budget = DoneAuthoringBudget {
+            started: Instant::now() - Duration::from_secs(250),
+            deadline: Instant::now() + Duration::from_secs(650),
+            total: Duration::from_secs(900),
+        };
+        let draft = draft_budget
+            .allocation(DoneAuthoringStage::Draft)
+            .expect("draft has time above the critic and redraft reserve");
+        assert!(
+            (Duration::from_secs(229)..=Duration::from_secs(230)).contains(&draft),
+            "draft must leave 120s critic + 300s redraft reserve, got {draft:?}"
+        );
+
+        let critic_budget = DoneAuthoringBudget {
+            started: Instant::now() - Duration::from_secs(550),
+            deadline: Instant::now() + Duration::from_secs(350),
+            total: Duration::from_secs(900),
+        };
+        let critic = critic_budget
+            .allocation(DoneAuthoringStage::Critic)
+            .expect("critic has time above the redraft reserve");
+        assert!(
+            (Duration::from_secs(49)..=Duration::from_secs(50)).contains(&critic),
+            "critic must leave the 300s redraft reserve, got {critic:?}"
+        );
+        let redraft = critic_budget
+            .allocation(DoneAuthoringStage::Redraft)
+            .expect("redraft may consume its own reserved stage budget");
+        assert_eq!(redraft.as_secs(), 300);
     }
 
     #[tokio::test]
