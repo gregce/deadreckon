@@ -142,7 +142,7 @@ impl SupervisedProcessRecord {
         {
             return SupervisedProcessIdentity::Unverifiable;
         }
-        if self.boot_id != boot_identity() {
+        if !boot_identities_match(&self.boot_id, &boot_identity()) {
             return SupervisedProcessIdentity::DifferentBoot;
         }
         if !pid_is_alive(self.process.pid) {
@@ -247,11 +247,65 @@ pub fn read_supervised_process(path: &Path) -> io::Result<SupervisedProcess> {
     Ok(SupervisedProcess { pid, pgid: None })
 }
 
+/// Return one stable representation for a boot identity written by older or
+/// current DeadReckon versions.
+///
+/// macOS `kern.boottime` includes a microsecond field whose rendering is not a
+/// reliable reboot boundary. The seconds field is the durable machine-boot
+/// identity. Opaque identities (Linux UUIDs, platform fallbacks, and explicit
+/// test identities) remain byte-for-byte unchanged.
+pub fn normalize_boot_identity(identity: &str) -> String {
+    macos_boot_seconds(identity)
+        .map(|seconds| format!("macos:sec={seconds}"))
+        .unwrap_or_else(|| identity.to_string())
+}
+
+/// Compare boot identities without turning a legacy macOS rendering change
+/// into a false reboot.
+///
+/// Both the legacy `macos:{ sec = ..., usec = ... } ...` form and the current
+/// `macos:sec=...` form are accepted. Unrecognized values compare exactly, so
+/// malformed or cross-platform identities never gain a permissive fallback.
+pub fn boot_identities_match(left: &str, right: &str) -> bool {
+    if left.trim().is_empty() || right.trim().is_empty() {
+        return false;
+    }
+    match (macos_boot_seconds(left), macos_boot_seconds(right)) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => left == right,
+        (Some(_), None) | (None, Some(_)) => false,
+    }
+}
+
+fn macos_boot_seconds(identity: &str) -> Option<u64> {
+    let payload = identity.trim().strip_prefix("macos:")?;
+    if let Some(seconds) = payload.strip_prefix("sec=") {
+        return parse_boot_seconds(seconds);
+    }
+
+    let fields = payload.trim_start().strip_prefix('{')?.split_once('}')?.0;
+    let seconds = fields
+        .split(',')
+        .next()?
+        .trim()
+        .strip_prefix("sec")?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim();
+    parse_boot_seconds(seconds)
+}
+
+fn parse_boot_seconds(seconds: &str) -> Option<u64> {
+    (!seconds.is_empty() && seconds.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| seconds.parse().ok())
+        .flatten()
+}
+
 pub fn boot_identity() -> String {
     if let Some(value) = std::env::var_os("DEADRECKON_BOOT_ID")
         && !value.is_empty()
     {
-        return value.to_string_lossy().into_owned();
+        return normalize_boot_identity(&value.to_string_lossy());
     }
     #[cfg(target_os = "linux")]
     if let Ok(value) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
@@ -269,7 +323,7 @@ pub fn boot_identity() -> String {
         let value = String::from_utf8_lossy(&output.stdout);
         let value = value.trim();
         if !value.is_empty() {
-            return format!("macos:{value}");
+            return normalize_boot_identity(&format!("macos:{value}"));
         }
     }
     // Unknown is deliberately stable. A random per-process value would look
@@ -431,10 +485,45 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::{
         SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase,
-        SupervisedProcessRecord, read_supervised_process, read_supervised_process_record,
+        SupervisedProcessRecord, boot_identities_match, normalize_boot_identity,
+        read_supervised_process, read_supervised_process_record,
         remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
         write_supervised_process, write_supervised_process_record,
     };
+
+    #[test]
+    fn macos_boot_identity_ignores_legacy_microsecond_rendering() {
+        let first = "macos:{ sec = 1785530788, usec = 930989 } Fri Jul 31 16:46:28 2026";
+        let second = "macos:{ sec = 1785530788, usec = 7 } Fri Jul 31 16:46:28 2026";
+
+        assert_eq!(normalize_boot_identity(first), "macos:sec=1785530788");
+        assert!(boot_identities_match(first, second));
+        assert!(boot_identities_match(first, "macos:sec=1785530788"));
+    }
+
+    #[test]
+    fn macos_boot_identity_rejects_a_different_boot_second() {
+        let prior = "macos:{ sec = 1785530788, usec = 930989 } Fri Jul 31 16:46:28 2026";
+        let later = "macos:{ sec = 1785530789, usec = 1 } Fri Jul 31 16:46:29 2026";
+
+        assert!(!boot_identities_match(prior, later));
+        assert!(!boot_identities_match(prior, "macos:sec=1785530789"));
+    }
+
+    #[test]
+    fn malformed_and_opaque_boot_identities_remain_fail_closed() {
+        assert!(boot_identities_match("linux-boot-a", "linux-boot-a"));
+        assert!(!boot_identities_match("linux-boot-a", "linux-boot-b"));
+        assert!(!boot_identities_match("", ""));
+        assert!(!boot_identities_match(
+            "macos:{ usec = 7, sec = 1785530788 }",
+            "macos:sec=1785530788"
+        ));
+        assert!(!boot_identities_match(
+            "macos:sec=not-a-number",
+            "macos:sec=1785530788"
+        ));
+    }
 
     #[test]
     fn pid_file_gains_additive_pgid_key() {
@@ -569,6 +658,30 @@ mod tests {
                 .expect("replacement cleanup must fail closed")
         );
         assert!(path.exists(), "replacement identity evidence must remain");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_macos_pid_record_matches_the_current_boot_by_seconds() {
+        let pid = std::process::id();
+        let mut record = SupervisedProcessRecord::running(SupervisedProcess {
+            pid,
+            pgid: Some(pid),
+        })
+        .expect("running record");
+        let seconds = record
+            .boot_id
+            .strip_prefix("macos:sec=")
+            .expect("current macOS boot identity must be canonical")
+            .parse::<u64>()
+            .expect("boot seconds");
+
+        record.boot_id =
+            format!("macos:{{ sec = {seconds}, usec = 1 }} legacy checkpoint rendering");
+        assert_eq!(record.identity(), SupervisedProcessIdentity::Current);
+
+        record.boot_id = format!("macos:sec={}", seconds.saturating_add(1));
+        assert_eq!(record.identity(), SupervisedProcessIdentity::DifferentBoot);
     }
 
     #[test]

@@ -13,12 +13,12 @@ use crate::cli_contract::{
     PROVIDER_ID_CODEX, ParsedStream, ProviderContract, ProviderSession, add_caveat,
     flight_rows_from, session_not_found, write_schema_file,
 };
+#[cfg(test)]
+use crate::codex_events::STRUCTURED_TEXT_DISABLED_FEATURES;
 use crate::codex_events::{
     CodexCapabilities, parse_codex_capabilities, parse_codex_capabilities_with_features,
     parse_codex_line, probe_codex_capabilities, structured_text_features_to_disable,
 };
-#[cfg(test)]
-use crate::codex_events::STRUCTURED_TEXT_DISABLED_FEATURES;
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
     ProviderResponse, ProviderUsage, Result, SpendEstimate, validate_openai_strict_output_schema,

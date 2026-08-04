@@ -553,19 +553,63 @@ async fn provider_course_plan(
     ladder: &commands::course::LadderDecision,
 ) -> Option<commands::course::ResolvedCoursePlan> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(provider)).ok()?;
-    let request = ProviderRequest::enforceably_read_only_with_backend(
+    let token = CancellationToken::new();
+    let attempt_id = Uuid::new_v4().simple().to_string();
+    let pid_file = std::env::temp_dir().join(format!("deadreckon-course-{attempt_id}.pid"));
+    let output_path = std::env::temp_dir().join(format!("deadreckon-course-{attempt_id}.out"));
+    let mut request = ProviderRequest::enforceably_read_only_with_backend(
         commands::course::course_planner_prompt(goal, signals),
         512,
         cwd,
         sandbox_backend,
     );
-    let response = tokio::time::timeout(
-        course_planner_timeout(provider),
-        maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request)),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    request.pid_file = Some(pid_file.clone());
+    request.output_path = Some(output_path.clone());
+    request.cancellation_token = Some(token.clone());
+    let completion =
+        maybe_with_cli_wait_status(!plain, "plotting the course", router.complete(&request));
+    tokio::pin!(completion);
+    let response = tokio::select! {
+        response = &mut completion => response,
+        () = tokio::time::sleep(course_planner_timeout(provider)) => {
+            token.cancel();
+            let cleanup = tokio::time::timeout(
+                course_planner_cleanup_timeout(),
+                &mut completion,
+            ).await;
+            if cleanup.is_err() || pid_file.exists() {
+                eprintln!(
+                    "{}",
+                    ui_warn(format!(
+                        "course planner timed out via {provider}; cleanup was not proven and process authority remains at {}",
+                        pid_file.display()
+                    ))
+                );
+                return None;
+            }
+            remove_course_planner_outputs(&output_path);
+            eprintln!(
+                "{}",
+                ui_warn(format!(
+                    "course planner timed out via {provider}; using the deterministic course"
+                ))
+            );
+            return None;
+        }
+    };
+    remove_course_planner_outputs(&output_path);
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                ui_warn(format!(
+                    "course planner unavailable via {provider}; using the deterministic course: {error}"
+                ))
+            );
+            return None;
+        }
+    };
     commands::course::resolve_provider_course_plan(
         &response.content,
         signals,
@@ -574,15 +618,24 @@ async fn provider_course_plan(
     )
 }
 
-/// CLI subagent providers cold-start in ~10-15s; the 5s ceiling that suits
-/// HTTP routes guarantees a silent ladder fallback for them. The planner is
-/// one bounded read-only call either way — give CLIs room to answer.
+fn remove_course_planner_outputs(output_path: &Path) {
+    let _ = fs::remove_file(output_path);
+    let _ = fs::remove_file(output_path.with_extension("last.txt"));
+}
+
+/// The shape planner is a bounded read-only phase, but subscription CLIs can
+/// cold-start or compact for tens of seconds. Give both local and HTTP routes
+/// realistic room, then cancel and prove cleanup before falling back.
 pub(crate) fn course_planner_timeout(provider: &str) -> Duration {
     if provider.starts_with("cli:") {
-        Duration::from_secs(30)
+        Duration::from_secs(60)
     } else {
-        Duration::from_secs(5)
+        Duration::from_secs(15)
     }
+}
+
+fn course_planner_cleanup_timeout() -> Duration {
+    Duration::from_secs(30)
 }
 
 fn course_shape_to_goal_shape(shape: commands::course::CourseShape) -> GoalShape {
@@ -3059,6 +3112,77 @@ fn start_done_authoring_selection(
     (provider.map(str::to_string), model)
 }
 
+fn recover_start_done_authoring(
+    decision: &mut StartLaunchDecision,
+    request: &str,
+    overwrite_existing: bool,
+    error: &CliError,
+    prompter: &mut dyn StartPrompter,
+) -> Result<bool> {
+    eprintln!(
+        "{}",
+        ui_warn(format!("done contract authoring stopped: {error}"))
+    );
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Recover done contract authoring".to_string(),
+        help: Some(
+            "Your source and execution-team choices are preserved. Retry, revise only the done wording, or stop before launch."
+                .to_string(),
+        ),
+        choices: vec![
+            start_prompt_choice(
+                "retry",
+                "Retry the same execution team",
+                "keeps the selected provider, model, source, and launch shape",
+            ),
+            start_prompt_choice(
+                "revise",
+                "Revise the definition of done",
+                "keeps every other start choice and recompiles the contract",
+            ),
+            prompt::SelectChoice::new("cancel", "Stop before launch"),
+        ],
+        default_index: 0,
+    })?;
+    match choice.id.as_str() {
+        "retry" => Ok(true),
+        "revise" => {
+            let revised = prompter.input("revised definition of done: ", Some(request))?;
+            if revised.trim().is_empty() {
+                set_start_recovery(
+                    decision,
+                    "empty done criteria were not saved",
+                    vec![format!(
+                        "deadreckon start \"{}\"",
+                        shell_display_quote(&decision.goal)
+                    )],
+                );
+                return Ok(false);
+            }
+            decision.done_action = StartDoneAction::ManualText {
+                text: revised.trim().to_string(),
+                overwrite_existing,
+            };
+            Ok(true)
+        }
+        _ => {
+            set_start_recovery(
+                decision,
+                "guided start stopped after done contract authoring failed",
+                vec![
+                    format!(
+                        "deadreckon start \"{}\"",
+                        shell_display_quote(&decision.goal)
+                    ),
+                    "deadreckon doctor".to_string(),
+                    "deadreckon update --check".to_string(),
+                ],
+            );
+            Ok(false)
+        }
+    }
+}
+
 async fn materialize_start_done_criteria(
     decision: &mut StartLaunchDecision,
     mut prompter: Option<&mut dyn StartPrompter>,
@@ -3084,26 +3208,41 @@ async fn materialize_start_done_criteria(
             inspect_root: &inspect_root,
             goal: Some(&decision.goal),
         };
-        if prompter.is_some() {
+        let authoring_result = if prompter.is_some() {
             commands::acceptance::acceptance_agent_command_with_explicit_review(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
-                vec![request],
+                vec![request.clone()],
                 authoring_provider.clone(),
                 authoring_model.clone(),
                 overwrite_existing,
             )
-            .await?;
+            .await
         } else {
             commands::acceptance::acceptance_agent_command_with_context(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
-                vec![request],
+                vec![request.clone()],
                 authoring_provider.clone(),
                 authoring_model.clone(),
                 overwrite_existing,
             )
-            .await?;
+            .await
+        };
+        if let Err(error) = authoring_result {
+            let Some(active_prompter) = prompter.as_mut() else {
+                return Err(error);
+            };
+            if recover_start_done_authoring(
+                decision,
+                &request,
+                overwrite_existing,
+                &error,
+                &mut **active_prompter,
+            )? {
+                continue;
+            }
+            return Ok(());
         }
         let Some(source) = commands::acceptance::mark_generated_done_criteria(
             commands::acceptance::resolve_acceptance_source(&write_root, None)?,
@@ -3568,16 +3707,16 @@ fn require_start_supervisor_service(mut prompter: Option<&mut dyn StartPrompter>
     commands::supervisor_service::supervisor_service_install_command()?;
     commands::supervisor_service::supervisor_service_start_command()?;
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline =
+        std::time::Instant::now() + commands::supervisor_service::supervisor_readiness_timeout();
     loop {
         match commands::supervisor_service::supervisor_service_preflight() {
             Ok(ready)
                 if ready.is_ready()
-                    && match (prior_instance.as_ref(), ready.instance()) {
-                        (None, Some(_)) => true,
-                        (Some(prior), Some(current)) => current.is_fresh_successor_of(prior),
-                        _ => false,
-                    } =>
+                    && commands::supervisor_service::supervisor_instance_is_fresh_successor(
+                        prior_instance.as_ref(),
+                        ready.instance(),
+                    ) =>
             {
                 return Ok(());
             }
@@ -3830,12 +3969,6 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     } else if decision.recovery.is_none() {
         resolve_start_provider_and_done_setup(&mut decision, &args, None)?;
     }
-    if decision.recovery.is_none() && start_launch_intent(&args) == StartLaunchIntent::Launch {
-        let service_prompter = eligibility
-            .allows_prompts()
-            .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-        require_start_supervisor_service(service_prompter)?;
-    }
     let force_contract_review = args.review_done
         || config_defaults(&paths)
             .ok()
@@ -3859,6 +3992,15 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     }
     if decision.recovery.is_none() && eligibility.allows_prompts() {
         prompt_start_launch_confirmation(&mut decision, &args, &paths, &mut terminal_prompter)?;
+    }
+    // Service installation is the first durable machine mutation. Perform it
+    // only after provider-backed contract authoring and the operator's final
+    // launch confirmation have both succeeded.
+    if decision.recovery.is_none() && start_launch_intent(&args) == StartLaunchIntent::Launch {
+        let service_prompter = eligibility
+            .allows_prompts()
+            .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
+        require_start_supervisor_service(service_prompter)?;
     }
     if !args.quiet && !args.json && decision.recovery.is_none() {
         println!("{}", ui_heading("guided start"));
@@ -5008,6 +5150,35 @@ mod contract_tests {
         }
     }
 
+    struct RecoveryPrompter {
+        choice: &'static str,
+        input: &'static str,
+        offered: Vec<String>,
+    }
+
+    impl StartPrompter for RecoveryPrompter {
+        fn select_one(&mut self, prompt: prompt::SelectPrompt) -> Result<prompt::SelectChoice> {
+            self.offered = prompt
+                .choices
+                .iter()
+                .map(|choice| choice.id.clone())
+                .collect();
+            Ok(prompt
+                .choices
+                .into_iter()
+                .find(|choice| choice.id == self.choice)
+                .expect("recovery choice"))
+        }
+
+        fn confirm(&mut self, _question: &str, _default_yes: bool) -> Result<bool> {
+            panic!("recovery does not confirm")
+        }
+
+        fn input(&mut self, _message: &str, _default: Option<&str>) -> Result<String> {
+            Ok(self.input.to_string())
+        }
+    }
+
     #[tokio::test]
     async fn materialize_without_manual_text_never_prompts() {
         // The post-draft review pauses only when the drafter actually ran:
@@ -5026,6 +5197,37 @@ mod contract_tests {
                 .await
                 .expect("materialize");
         }
+    }
+
+    #[test]
+    fn failed_done_authoring_can_revise_without_losing_the_execution_team() {
+        let mut d = decision("build a realtime dashboard");
+        d.provider_route = Some("cli:codex".to_string());
+        d.model = Some("gpt-5.6-sol".to_string());
+        let mut prompter = RecoveryPrompter {
+            choice: "revise",
+            input: "the dashboard passes its network smoke test",
+            offered: Vec::new(),
+        };
+        let error = CliError::Core(deadreckon_core::user_error(
+            "provider failed",
+            "deadreckon doctor",
+        ));
+
+        assert!(
+            recover_start_done_authoring(&mut d, "old done wording", false, &error, &mut prompter)
+                .expect("recovery")
+        );
+        assert_eq!(prompter.offered, ["retry", "revise", "cancel"]);
+        assert_eq!(d.provider_route.as_deref(), Some("cli:codex"));
+        assert_eq!(d.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            d.done_action,
+            StartDoneAction::ManualText {
+                text: "the dashboard passes its network smoke test".to_string(),
+                overwrite_existing: false,
+            }
+        );
     }
 
     #[test]

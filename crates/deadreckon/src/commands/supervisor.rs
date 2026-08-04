@@ -13,9 +13,10 @@ use chrono::Utc;
 use deadreckon_core::{
     DeadreckonError, DeadreckonPaths, JobProjection, JobView, LeaseClaimDisposition, LeaseOwner,
     LeaseReclaimReason, LeaseToken, ProviderFailureDisposition, SupervisedProcess,
-    append_next_fenced_job_event, claim_job_lease, heartbeat_job_lease, load_job_lease, load_run,
-    pid_is_alive, read_job_history, read_supervised_process, spawn_grouped,
-    validate_acceptance_marker, validate_completion_receipt,
+    append_next_fenced_job_event, boot_identities_match, boot_identity, claim_job_lease,
+    heartbeat_job_lease, load_job_lease, load_run, pid_is_alive, read_job_history,
+    read_supervised_process, spawn_grouped, validate_acceptance_marker,
+    validate_completion_receipt,
 };
 use deadreckon_protocol::{
     CompletionReceipt, Job, JobAuthority, JobEvent, JobEventKind, JobId, JobShape, RunId,
@@ -33,14 +34,17 @@ use super::run::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
-const LEASE_TTL: Duration = Duration::from_secs(15);
+// A lease is an inactivity bound, not an operator wall budget. Fifteen
+// seconds was short enough for host sleep or load to reclaim a healthy owner;
+// exact boot/PID fencing still permits immediate reboot recovery.
+const LEASE_TTL: Duration = Duration::from_secs(60);
 const CHILD_METADATA_FILE: &str = "supervised-child.json";
 const CHILD_RELEASE_ACK_PREFIX: &str = "supervised-release-";
 const SUPERVISOR_STDOUT_FILE: &str = "supervisor.out";
 const SUPERVISOR_STDERR_FILE: &str = "supervisor.err";
 const GUARDED_LAUNCH_PROTOCOL: &str = "stdin_release_v1";
 const MAX_RELEASE_TOKEN_BYTES: u64 = 512;
-const GUARDED_CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+const GUARDED_CHILD_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SUPERVISOR_FAILPOINT_ENABLE_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINTS";
 const SUPERVISOR_FAILPOINT_ENV: &str = "DEADRECKON_TEST_SUPERVISOR_FAILPOINT";
 const TRUSTED_DRIVER_ATTEMPT_ENV: &str = "DEADRECKON_SUPERVISOR_ATTEMPT";
@@ -1936,8 +1940,12 @@ fn child_metadata(
 }
 
 fn child_identity_is_current(metadata: &SupervisorChildMetadata) -> bool {
+    let current_boot = boot_identity();
     if !pid_is_alive(metadata.process.pid)
-        || metadata.boot_id.as_deref() != Some(boot_identity().as_str())
+        || !metadata
+            .boot_id
+            .as_deref()
+            .is_some_and(|stored| boot_identities_match(stored, &current_boot))
     {
         return false;
     }
@@ -1948,8 +1956,12 @@ fn child_identity_is_current(metadata: &SupervisorChildMetadata) -> bool {
 }
 
 fn child_process_may_still_be_live(metadata: &SupervisorChildMetadata) -> bool {
+    let current_boot = boot_identity();
     if !pid_is_alive(metadata.process.pid)
-        || metadata.boot_id.as_deref() != Some(boot_identity().as_str())
+        || !metadata
+            .boot_id
+            .as_deref()
+            .is_some_and(|stored| boot_identities_match(stored, &current_boot))
     {
         return false;
     }
@@ -1977,7 +1989,7 @@ fn supervisor_child_identity(metadata: &SupervisorChildMetadata) -> SupervisorCh
     let Some(stored_boot) = metadata.boot_id.as_deref() else {
         return SupervisorChildIdentity::Unverifiable;
     };
-    if stored_boot != boot_identity() {
+    if !boot_identities_match(stored_boot, &boot_identity()) {
         return SupervisorChildIdentity::DifferentBoot;
     }
     let Some(expected) = metadata.process_start_identity.as_deref() else {
@@ -4743,37 +4755,6 @@ fn supervisor_test_failpoint(name: &str) {
     {
         std::process::exit(86);
     }
-}
-
-fn boot_identity() -> String {
-    if let Some(value) = std::env::var_os("DEADRECKON_BOOT_ID")
-        && !value.is_empty()
-    {
-        return value.to_string_lossy().into_owned();
-    }
-    #[cfg(target_os = "linux")]
-    if let Ok(value) = fs::read_to_string("/proc/sys/kernel/random/boot_id") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if let Ok(output) = Command::new("sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
-        && output.status.success()
-    {
-        let value = String::from_utf8_lossy(&output.stdout);
-        let value = value.trim();
-        if !value.is_empty() {
-            return format!("macos:{value}");
-        }
-    }
-    // Unknown is deliberately stable. A random per-process value would look
-    // like a reboot and could reclaim a live lease; stable unknown instead
-    // waits for normal expiry and fails safely.
-    "unknown-boot".to_string()
 }
 
 fn process_start_identity(pid: u32) -> Option<String> {

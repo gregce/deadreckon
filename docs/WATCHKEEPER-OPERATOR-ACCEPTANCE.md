@@ -77,6 +77,61 @@ machine reboot, 20–30-task dogfood matrix, Apple notarization, Windows
 Authenticode signing, npm publication or GitHub attestation. Those require the
 later operator and protected-CI steps.
 
+## 0.8.1 start-authoring regression acceptance
+
+Use this short drill to accept the Codex schema, retired-feature, supervisor
+boot-identity and phase-timing corrections. It uses a disposable repository but
+the selected provider may consume subscription quota.
+
+```bash
+cd /path/to/deadreckon
+cargo build --release
+export WK_BIN="$PWD/target/release/deadreckon"
+export WK_081_FIXTURE="$(mktemp -d)"
+
+cd "$WK_081_FIXTURE"
+git init
+git config user.email watchkeeper@example.invalid
+git config user.name Watchkeeper
+printf '%s\n' 'print("hello from app")' > app.py
+git add app.py
+git commit -m fixture
+
+"$WK_BIN" def-done \
+  "running python3 app.py prints hello from app" \
+  --provider cli:codex \
+  --model gpt-5.6-sol
+"$WK_BIN" def-done show
+"$WK_BIN" def-done check
+"$WK_BIN" supervisor status
+```
+
+Then remove the disposable contract files and run interactive `start` with a
+small goal. Choose Codex and `gpt-5.6-sol`, and enter the same one-line done
+criterion. If authoring is deliberately interrupted or the provider is made
+unavailable, verify that the recovery prompt offers retry, revise and stop
+without asking for the source, launch shape, provider or model again. Stop at
+the final launch confirmation if this is only an admission drill.
+
+Accept when:
+
+- [ ] neither command reports `web_search_request` as deprecated;
+- [ ] neither command reports `invalid_json_schema`, a `files` required-key
+  mismatch, or a dynamic `additionalProperties` map;
+- [ ] the generated contract contains a behavioral shell check and `check`
+  passes;
+- [ ] an authoring failure never suggests setting the provider to the same
+  route that just failed;
+- [ ] the guided recovery keeps the already selected source, mode, provider
+  and model;
+- [ ] `supervisor status` accepts a live legacy macOS checkpoint when only the
+  `kern.boottime` microseconds differ, while a different boot second still
+  fails closed;
+- [ ] no supervised PID record is removed when timeout cleanup cannot be
+  proven;
+- [ ] Job wall, spend and absolute deadline values remain the operator-approved
+  values; only setup/readiness/inactivity allowances are relaxed.
+
 ## Safety and prerequisites
 
 Use two disposable clones. `finish` changes the selected checkout. Do not use a

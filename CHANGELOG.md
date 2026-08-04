@@ -13,6 +13,14 @@
   for helper files, validates controller-owned schemas before provider launch,
   and omits retired Codex feature switches instead of replaying deprecated
   configuration into current CLIs.
+- Start planning and done-contract phases use realistic cumulative CLI
+  deadlines: contract authoring defaults to ten minutes with bounded per-stage
+  allocations, while old 120-second configuration is safely lifted.
+- macOS boot identity now compares the stable boot-second boundary rather than
+  volatile `kern.boottime` microseconds. Start/repair readiness waits 30
+  seconds for a fresh service instance, healthy lease inactivity allows 60
+  seconds, and guarded child handoff allows 30 seconds without extending any
+  operator-approved Job wall or deadline.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 
