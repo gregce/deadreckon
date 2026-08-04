@@ -7,10 +7,6 @@
 //! unknown `type` tags degrade to [`CliStreamEvent::Unknown`] and never abort a
 //! turn.
 
-use std::collections::HashMap;
-use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -57,32 +53,6 @@ pub(crate) fn parse_claude_capabilities(help: &str) -> ClaudeCapabilities {
         .iter()
         .all(|flag| help.contains(flag)),
     }
-}
-
-/// Probe `claude --help` once per binary path and cache the result. A binary
-/// that cannot be executed reports [`ClaudeCapabilities::none`].
-pub(crate) fn probe_claude_capabilities(binary: &str) -> ClaudeCapabilities {
-    static CACHE: OnceLock<Mutex<HashMap<String, ClaudeCapabilities>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(found) = guard.get(binary)
-    {
-        return *found;
-    }
-    let caps = Command::new(binary)
-        .arg("--help")
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| {
-            let text = String::from_utf8_lossy(&output.stdout);
-            parse_claude_capabilities(&text)
-        })
-        .unwrap_or_else(ClaudeCapabilities::none);
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(binary.to_string(), caps);
-    }
-    caps
 }
 
 // ---------------------------------------------------------------------------

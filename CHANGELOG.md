@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Codex and Claude capability discovery for writable runs now uses the same
+  sandboxed, cancellable process authority as provider execution. Probes have
+  bounded work and cleanup windows, drain and reap hostile descendants, and
+  fail closed if PID-authority removal cannot be proven instead of blocking a
+  phase indefinitely.
 - New Jobs now require the controller, `dr-gate`, and cross-platform gate
   sidecars to carry the same deterministic build-bundle identity as well as a
   compatible gate protocol. Admission searches the installation for a

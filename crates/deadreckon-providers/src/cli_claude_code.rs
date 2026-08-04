@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use deadreckon_sandbox::WorkspaceAccess;
 use serde_json::json;
+use tokio::sync::Mutex;
 use which::which;
 
-use crate::claude_events::{
-    ClaudeCapabilities, parse_claude_capabilities, parse_claude_line, probe_claude_capabilities,
+use crate::claude_events::{ClaudeCapabilities, parse_claude_capabilities, parse_claude_line};
+use crate::cli_common::{
+    CLI_CAPABILITY_PROBE_TIMEOUT, CliOutput, ensure_success, run_cli, run_cli_capability_probe,
+    write_output,
 };
-use crate::cli_common::{CliOutput, ensure_success, run_cli, write_output};
 use crate::cli_contract::{
     PROVIDER_ID_CLAUDE, ParsedStream, ProviderContract, ProviderSession, add_caveat,
     flight_rows_from, session_not_found,
@@ -19,6 +23,11 @@ use crate::{
 };
 
 const EMPTY_MCP_CONFIG: &str = r#"{"mcpServers":{}}"#;
+
+fn claude_read_write_probe_cache() -> &'static Mutex<HashMap<String, ClaudeCapabilities>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ClaudeCapabilities>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Clone)]
 pub struct CliClaudeCodeProvider {
@@ -118,11 +127,50 @@ impl CliClaudeCodeProvider {
         Ok(ClaudeAttempt { output, args })
     }
 
-    async fn capabilities_for_request(&self, request: &ProviderRequest) -> ClaudeCapabilities {
+    async fn capabilities_for_request(
+        &self,
+        request: &ProviderRequest,
+    ) -> Result<ClaudeCapabilities> {
+        self.capabilities_for_request_with_timeout(request, CLI_CAPABILITY_PROBE_TIMEOUT)
+            .await
+    }
+
+    async fn capabilities_for_request_with_timeout(
+        &self,
+        request: &ProviderRequest,
+        probe_timeout: Duration,
+    ) -> Result<ClaudeCapabilities> {
         if request.workspace_access == WorkspaceAccess::ReadWrite {
-            return probe_claude_capabilities(&self.binary);
+            if let Some(cached) = claude_read_write_probe_cache()
+                .lock()
+                .await
+                .get(&self.binary)
+                .copied()
+            {
+                return Ok(cached);
+            }
+            let capabilities = run_cli_capability_probe(
+                &self.name,
+                &self.binary,
+                &["--help".to_string()],
+                request.cwd.clone(),
+                request.sandbox_backend,
+                request.pid_file.clone(),
+                request.cancellation_token.clone(),
+                WorkspaceAccess::ReadWrite,
+                false,
+                probe_timeout,
+            )
+            .await?
+            .map(|output| parse_claude_capabilities(&output.stdout))
+            .unwrap_or_else(ClaudeCapabilities::none);
+            claude_read_write_probe_cache()
+                .lock()
+                .await
+                .insert(self.binary.clone(), capabilities);
+            return Ok(capabilities);
         }
-        run_cli(
+        Ok(run_cli(
             &self.name,
             &self.binary,
             &["--help".to_string()],
@@ -137,11 +185,11 @@ impl CliClaudeCodeProvider {
         .ok()
         .filter(|output| output.status_code == Some(0))
         .map(|output| parse_claude_capabilities(&output.stdout))
-        .unwrap_or_else(ClaudeCapabilities::none)
+        .unwrap_or_else(ClaudeCapabilities::none))
     }
 
     async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
-        let caps = self.capabilities_for_request(request).await;
+        let caps = self.capabilities_for_request(request).await?;
         if request.output_schema.is_some() && !(caps.json_schema && caps.schema_only_posture) {
             return Err(ProviderError::Cli {
                 provider: self.name.clone(),
@@ -335,9 +383,29 @@ impl WithWallTime for SpendEstimate {
 #[cfg(test)]
 mod tests {
     use super::{CliClaudeCodeProvider, EMPTY_MCP_CONFIG};
+    #[cfg(unix)]
+    use crate::ProviderKind;
     use crate::claude_events::ClaudeCapabilities;
     use crate::{ProviderEntry, ProviderRequest};
     use deadreckon_sandbox::WorkspaceAccess;
+
+    #[cfg(unix)]
+    struct DescendantGuard(std::path::PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for DescendantGuard {
+        fn drop(&mut self) {
+            let Ok(raw) = std::fs::read_to_string(&self.0) else {
+                return;
+            };
+            let Ok(pid) = raw.trim().parse::<u32>() else {
+                return;
+            };
+            if deadreckon_core::pid_is_alive(pid) {
+                let _ = deadreckon_core::terminate_pid(pid, true);
+            }
+        }
+    }
 
     fn provider() -> CliClaudeCodeProvider {
         CliClaudeCodeProvider::new(
@@ -420,5 +488,66 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_str(EMPTY_MCP_CONFIG).expect("empty MCP config must be valid JSON");
         assert!(config["mcpServers"].is_object());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_write_claude_probe_timeout_reaps_descendant_and_pid_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("hanging-claude-probe");
+        let descendant_path = temp.path().join("descendant.pid");
+        let _descendant_guard = DescendantGuard(descendant_path.clone());
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = '--help' ]; then\n  (trap '' TERM; sleep 30) &\n  descendant=$!\n  printf '%s\\n' \"$descendant\" > '{}'\n  trap '' TERM\n  wait\nfi\nexit 1\n",
+                descendant_path.display()
+            ),
+        )
+        .expect("fake claude");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+            .expect("fake claude permissions");
+        let provider = CliClaudeCodeProvider::new(
+            "cli:claude-code",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliClaudeCode),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: None,
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some(binary.display().to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let pid_file = temp.path().join("claude-probe.pid");
+        let request = ProviderRequest {
+            cwd: Some(temp.path().to_path_buf()),
+            pid_file: Some(pid_file.clone()),
+            ..ProviderRequest::default()
+        };
+
+        let started = std::time::Instant::now();
+        let capabilities = provider
+            .capabilities_for_request_with_timeout(&request, Duration::from_secs(1))
+            .await
+            .expect("clean probe timeout degrades capabilities");
+
+        assert_eq!(capabilities, ClaudeCapabilities::none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!pid_file.exists(), "probe retained PID authority");
+        let descendant = std::fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        assert!(
+            !deadreckon_core::pid_is_alive(descendant),
+            "Claude capability-probe descendant survived timeout"
+        );
     }
 }

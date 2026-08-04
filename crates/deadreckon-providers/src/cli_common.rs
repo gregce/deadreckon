@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use deadreckon_sandbox::{
     SandboxBackend, SandboxSpec, ToolSandboxPolicy, WorkspaceAccess, run as run_sandbox,
@@ -11,6 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::registry::ProviderRegistry;
 use crate::{ProviderError, Result};
+
+pub(crate) const CLI_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub(crate) struct CliOutput {
@@ -51,6 +55,147 @@ pub(crate) async fn run_cli(
         },
     )
     .await
+}
+
+/// Run a CLI capability probe under the same process authority as the provider
+/// request, but with its own bounded cancellation token.
+///
+/// Capability discovery is advisory: launch failures, non-zero exits, and a
+/// clean timeout return `Ok(None)` so the adapter can degrade its optional
+/// features. Controller cancellation and any failure to prove PID-authority
+/// cleanup remain hard errors.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_cli_capability_probe(
+    provider: &str,
+    binary: &str,
+    args: &[String],
+    cwd: Option<PathBuf>,
+    sandbox_backend: Option<SandboxBackend>,
+    pid_file: Option<PathBuf>,
+    external_cancellation: Option<CancellationToken>,
+    workspace_access: WorkspaceAccess,
+    inner_read_only_enforced: bool,
+    timeout: Duration,
+) -> Result<Option<CliOutput>> {
+    if external_cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+    {
+        return Err(ProviderError::Cli {
+            provider: provider.to_string(),
+            detail: "request cancelled before capability probe".to_string(),
+        });
+    }
+
+    let probe_cancellation = CancellationToken::new();
+    let completion = run_cli(
+        provider,
+        binary,
+        args,
+        cwd,
+        sandbox_backend,
+        pid_file.clone(),
+        Some(probe_cancellation.clone()),
+        workspace_access,
+        inner_read_only_enforced,
+    );
+    tokio::pin!(completion);
+
+    enum ProbeBoundary<T> {
+        Finished(T),
+        TimedOut,
+        Cancelled,
+    }
+
+    let boundary = if let Some(external) = external_cancellation.as_ref() {
+        tokio::select! {
+            biased;
+            () = external.cancelled() => ProbeBoundary::Cancelled,
+            result = &mut completion => ProbeBoundary::Finished(result),
+            () = tokio::time::sleep(timeout) => ProbeBoundary::TimedOut,
+        }
+    } else {
+        tokio::select! {
+            result = &mut completion => ProbeBoundary::Finished(result),
+            () = tokio::time::sleep(timeout) => ProbeBoundary::TimedOut,
+        }
+    };
+
+    match boundary {
+        ProbeBoundary::Finished(result) => {
+            prove_capability_probe_cleanup(provider, pid_file.as_deref())?;
+            Ok(result.ok().filter(|output| output.status_code == Some(0)))
+        }
+        ProbeBoundary::TimedOut => {
+            probe_cancellation.cancel();
+            // `run_cli` returns only after it has drained the child pipes,
+            // reaped the direct child, reconciled descendants, and removed the
+            // identity-bound PID record. Do not drop this future at the phase
+            // boundary: awaiting it is the cleanup proof.
+            if tokio::time::timeout(CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT, &mut completion)
+                .await
+                .is_err()
+            {
+                return Err(ProviderError::Cli {
+                    provider: provider.to_string(),
+                    detail: format!(
+                        "capability probe cleanup exceeded the bounded {}s safety window{}",
+                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs(),
+                        pid_file.as_ref().map_or_else(String::new, |path| format!(
+                            "; process authority remains at {}",
+                            path.display()
+                        ))
+                    ),
+                });
+            }
+            prove_capability_probe_cleanup(provider, pid_file.as_deref())?;
+            Ok(None)
+        }
+        ProbeBoundary::Cancelled => {
+            probe_cancellation.cancel();
+            if tokio::time::timeout(CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT, &mut completion)
+                .await
+                .is_err()
+            {
+                return Err(ProviderError::Cli {
+                    provider: provider.to_string(),
+                    detail: format!(
+                        "cancelled capability probe cleanup exceeded the bounded {}s safety window{}",
+                        CLI_CAPABILITY_PROBE_CLEANUP_TIMEOUT.as_secs(),
+                        pid_file.as_ref().map_or_else(String::new, |path| format!(
+                            "; process authority remains at {}",
+                            path.display()
+                        ))
+                    ),
+                });
+            }
+            prove_capability_probe_cleanup(provider, pid_file.as_deref())?;
+            Err(ProviderError::Cli {
+                provider: provider.to_string(),
+                detail: "request cancelled during capability probe".to_string(),
+            })
+        }
+    }
+}
+
+fn prove_capability_probe_cleanup(provider: &str, pid_file: Option<&Path>) -> Result<()> {
+    let Some(pid_file) = pid_file else {
+        return Ok(());
+    };
+    match std::fs::symlink_metadata(pid_file) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(ProviderError::Cli {
+            provider: provider.to_string(),
+            detail: format!(
+                "capability probe returned without proving process cleanup; process authority remains at {}",
+                pid_file.display()
+            ),
+        }),
+        Err(source) => Err(ProviderError::Io {
+            path: pid_file.display().to_string(),
+            source,
+        }),
+    }
 }
 
 pub(crate) struct CliRunOptions {
