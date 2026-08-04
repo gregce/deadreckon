@@ -32,6 +32,18 @@ const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
 const SERVICE_INSTANCE_DIR: &str = "supervisor";
 const SERVICE_INSTANCE_FILE: &str = "instance.json";
 const SERVICE_STATUS_SCHEMA: u32 = 2;
+// launchd can report a transient bootstrap failure while completing a
+// successful bootout. Six bounded pauses keep that restart transition below
+// six seconds and well inside the 30-second service readiness timeout.
+const LAUNCHD_BOOTSTRAP_RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(2),
+];
+const LAUNCHD_BOOTSTRAP_ACTION: &str = "load and start the DeadReckon supervisor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Both variants are rendered and tested on each supported host.
@@ -1635,7 +1647,8 @@ fn launchd_start(context: &ServiceContext) -> Result<()> {
         ["enable", target.as_str()],
         "enable the DeadReckon supervisor",
     )?;
-    if command_succeeds("launchctl", ["print", target.as_str()])? {
+    let restarting = command_succeeds("launchctl", ["print", target.as_str()])?;
+    if restarting {
         run_required(
             "launchctl",
             ["bootout", target.as_str()],
@@ -1644,11 +1657,42 @@ fn launchd_start(context: &ServiceContext) -> Result<()> {
     }
     let unit_path = context.unit_path();
     let unit = path_to_utf8("launchd unit", &unit_path)?;
+    if restarting {
+        return retry_launchd_bootstrap_transition(
+            || {
+                run_observational(
+                    "launchctl",
+                    ["bootstrap", domain.as_str(), unit],
+                    LAUNCHD_BOOTSTRAP_ACTION,
+                )
+            },
+            std::thread::sleep,
+        );
+    }
     run_required(
         "launchctl",
         ["bootstrap", domain.as_str(), unit],
-        "load and start the DeadReckon supervisor",
+        LAUNCHD_BOOTSTRAP_ACTION,
     )
+}
+
+fn retry_launchd_bootstrap_transition<F, S>(mut attempt: F, mut sleep: S) -> Result<()>
+where
+    F: FnMut() -> Result<Output>,
+    S: FnMut(Duration),
+{
+    let mut output = attempt()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    for delay in LAUNCHD_BOOTSTRAP_RETRY_DELAYS {
+        sleep(delay);
+        output = attempt()?;
+        if output.status.success() {
+            return Ok(());
+        }
+    }
+    Err(command_failure(LAUNCHD_BOOTSTRAP_ACTION, &output))
 }
 
 fn launchd_domain() -> Result<String> {
@@ -2111,6 +2155,71 @@ mod tests {
                 .to_string()
                 .contains("invalid enablement value")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_bootstrap_transition_retries_a_failed_observation_then_succeeds() {
+        let mut outputs = std::collections::VecDeque::from([
+            command_output("", "Input/output error", false),
+            command_output("", "", true),
+        ]);
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+
+        retry_launchd_bootstrap_transition(
+            || {
+                attempts += 1;
+                Ok(outputs.pop_front().expect("simulated launchctl output"))
+            },
+            |delay| delays.push(delay),
+        )
+        .expect("transient bootstrap transition");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(delays, vec![LAUNCHD_BOOTSTRAP_RETRY_DELAYS[0]]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchd_bootstrap_transition_preserves_the_final_failure_diagnostic() {
+        let mut attempt = 0;
+        let mut delays = Vec::new();
+        let error = retry_launchd_bootstrap_transition(
+            || {
+                attempt += 1;
+                let stderr = if attempt == LAUNCHD_BOOTSTRAP_RETRY_DELAYS.len() + 1 {
+                    "final launchd diagnostic"
+                } else {
+                    "transient launchd diagnostic"
+                };
+                Ok(command_output("", stderr, false))
+            },
+            |delay| delays.push(delay),
+        )
+        .expect_err("persistent bootstrap failure");
+
+        assert_eq!(attempt, LAUNCHD_BOOTSTRAP_RETRY_DELAYS.len() + 1);
+        assert_eq!(delays, LAUNCHD_BOOTSTRAP_RETRY_DELAYS);
+        assert!(error.to_string().contains("final launchd diagnostic"));
+    }
+
+    #[test]
+    fn launchd_bootstrap_transition_does_not_retry_command_execution_errors() {
+        let mut attempts = 0;
+        let mut delays = Vec::new();
+        let error = retry_launchd_bootstrap_transition(
+            || {
+                attempts += 1;
+                Err(invalid_input("launchctl could not be executed"))
+            },
+            |delay| delays.push(delay),
+        )
+        .expect_err("execution errors are not transition observations");
+
+        assert_eq!(attempts, 1);
+        assert!(delays.is_empty());
+        assert!(error.to_string().contains("could not be executed"));
     }
 
     #[test]

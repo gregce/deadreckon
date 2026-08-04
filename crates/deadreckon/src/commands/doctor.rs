@@ -608,23 +608,15 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
     match read_receipt(paths) {
         Ok(Some(receipt)) => {
             add_binary_candidate(&mut candidates, &receipt.binary_path, "install-receipt");
-            if !same_binary_identity(&receipt.binary_path, &current_path) {
-                conflicts.push(format!(
-                    "install receipt points at {}, not the running binary {}",
-                    receipt.binary_path.display(),
-                    current_path.display()
-                ));
-            } else if receipt.channel_version != current_version
-                || receipt.binary_path != current_path
-            {
-                repairable_receipt = true;
-                conflicts.push(format!(
-                    "install receipt says {} at {}; the running binary is {} at {}",
-                    receipt.channel_version,
-                    receipt.binary_path.display(),
-                    current_version,
-                    current_path.display()
-                ));
+            let (conflict, repairable) = install_receipt_conflict(
+                &receipt.binary_path,
+                &receipt.channel_version,
+                &current_path,
+                &current_version,
+            );
+            repairable_receipt = repairable;
+            if let Some(conflict) = conflict {
+                conflicts.push(conflict);
             }
         }
         Ok(None) => {
@@ -731,6 +723,40 @@ fn same_binary_identity(left: &Path, right: &Path) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
     }
+}
+
+/// Classify receipt drift by executable identity and version, not path
+/// spelling. Installer-managed aliases deliberately point at the canonical
+/// binary recorded in the receipt.
+fn install_receipt_conflict(
+    receipt_path: &Path,
+    receipt_version: &str,
+    current_path: &Path,
+    current_version: &str,
+) -> (Option<String>, bool) {
+    if !same_binary_identity(receipt_path, current_path) {
+        return (
+            Some(format!(
+                "install receipt points at {}, not the running binary {}",
+                receipt_path.display(),
+                current_path.display()
+            )),
+            false,
+        );
+    }
+    if receipt_version != current_version {
+        return (
+            Some(format!(
+                "install receipt says {} at {}; the running binary is {} at {}",
+                receipt_version,
+                receipt_path.display(),
+                current_version,
+                current_path.display()
+            )),
+            true,
+        );
+    }
+    (None, false)
 }
 
 fn add_binary_candidate(
@@ -1470,6 +1496,60 @@ timeout_ms = 1234
         assert!(version_is_newer("0.8.0", "0.7.0"));
         assert!(!version_is_newer("0.7.0", "0.7.0"));
         assert!(!version_is_newer("0.6.9", "0.7.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_receipt_accepts_a_same_version_binary_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let receipt_target = temp.path().join("target/deadreckon");
+        let running_alias = temp.path().join("bin/deadreckon");
+        fs::create_dir_all(receipt_target.parent().expect("target parent")).expect("target parent");
+        fs::create_dir_all(running_alias.parent().expect("alias parent")).expect("alias parent");
+        fs::write(&receipt_target, b"same binary").expect("receipt target");
+        symlink(&receipt_target, &running_alias).expect("running alias");
+
+        let (conflict, repairable) =
+            install_receipt_conflict(&receipt_target, "0.8.1", &running_alias, "0.8.1");
+        assert_eq!(conflict, None);
+        assert!(!repairable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_receipt_still_flags_stale_versions_and_different_binaries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let receipt_target = temp.path().join("target/deadreckon");
+        let running_alias = temp.path().join("bin/deadreckon");
+        let different = temp.path().join("other/deadreckon");
+        for path in [&receipt_target, &running_alias, &different] {
+            fs::create_dir_all(path.parent().expect("binary parent")).expect("binary parent");
+        }
+        fs::write(&receipt_target, b"receipt binary").expect("receipt target");
+        fs::write(&different, b"different binary").expect("different binary");
+        symlink(&receipt_target, &running_alias).expect("running alias");
+
+        let (stale_conflict, stale_repairable) =
+            install_receipt_conflict(&receipt_target, "0.8.0", &running_alias, "0.8.1");
+        assert!(
+            stale_conflict
+                .as_deref()
+                .is_some_and(|conflict| conflict.contains("install receipt says 0.8.0"))
+        );
+        assert!(stale_repairable);
+
+        let (different_conflict, different_repairable) =
+            install_receipt_conflict(&different, "0.8.1", &running_alias, "0.8.1");
+        assert!(
+            different_conflict
+                .as_deref()
+                .is_some_and(|conflict| conflict.contains("not the running binary"))
+        );
+        assert!(!different_repairable);
     }
 
     #[cfg(unix)]
