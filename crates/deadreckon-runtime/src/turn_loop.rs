@@ -56,8 +56,8 @@ use deadreckon_core::state::{
 };
 
 use crate::seam::{
-    SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam, read_seams_config,
-    write_seams_audit,
+    SeamKind, SeamOutcome, SeamRunCtx, SeamsConfig, dispatch_seam, lost_containment_error,
+    read_seams_config, write_seams_audit,
 };
 
 #[derive(Debug, Clone)]
@@ -851,6 +851,16 @@ async fn run_turn_loop_inner(
                     )?;
                     return Ok(RunLoopOutcome::Failed);
                 }
+                SemanticCompletionDisposition::LostContainment => {
+                    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                    save_state(state)?;
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::Failed,
+                    )?;
+                    return Ok(RunLoopOutcome::Failed);
+                }
                 SemanticCompletionDisposition::BudgetExhausted => {
                     state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
                     save_state(state)?;
@@ -933,7 +943,7 @@ async fn run_turn_loop_inner(
                     &command,
                     &state.working_dir,
                 )
-                .await
+                .await?
                 {
                     append_tool_refusal(
                         state,
@@ -1109,7 +1119,7 @@ async fn run_turn_loop_inner(
                     &target_label,
                     &state.working_dir,
                 )
-                .await
+                .await?
                 {
                     append_tool_refusal(
                         state,
@@ -1290,6 +1300,16 @@ async fn run_turn_loop_inner(
                     SemanticCompletionDisposition::Achieved => {}
                     SemanticCompletionDisposition::Revise => continue,
                     SemanticCompletionDisposition::NeedsReview => {
+                        state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+                        save_state(state)?;
+                        emit_run_completed(
+                            state,
+                            config.event_sender.as_ref(),
+                            RunLoopOutcome::Failed,
+                        )?;
+                        return Ok(RunLoopOutcome::Failed);
+                    }
+                    SemanticCompletionDisposition::LostContainment => {
                         state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
                         save_state(state)?;
                         emit_run_completed(
@@ -2100,8 +2120,8 @@ async fn policy_seam_refusal(
     function_id: &str,
     command: &str,
     working_dir: &Path,
-) -> Option<String> {
-    match dispatch_seam(
+) -> Result<Option<String>> {
+    let refusal = match dispatch_seam(
         SeamKind::Policy,
         &json!({
             "function_id": function_id,
@@ -2123,7 +2143,11 @@ async fn policy_seam_refusal(
             function_id,
             &format!("unexpected skipped outcome: {reason}"),
         )),
-    }
+        SeamOutcome::LostContainment(reason) => {
+            return Err(lost_containment_error(SeamKind::Policy, &reason));
+        }
+    };
+    Ok(refusal)
 }
 
 fn policy_seam_refusal_message(run_id: &str, function_id: &str, reason: &str) -> String {
@@ -2140,15 +2164,26 @@ async fn emit_tool_event_with_hook(
     event: RunEventKind,
 ) -> Result<()> {
     emit_event(state, sender, event.clone())?;
-    dispatch_hook_event(seams, ctx, &event).await;
+    dispatch_hook_event(seams, ctx, &event).await
+}
+
+async fn dispatch_hook_event(
+    seams: &SeamsConfig,
+    ctx: &SeamRunCtx,
+    event: &RunEventKind,
+) -> Result<()> {
+    let Ok(req) = serde_json::to_value(event) else {
+        return Ok(());
+    };
+    let outcome = dispatch_seam(SeamKind::Hooks, &req, seams, ctx).await;
+    if let SeamOutcome::LostContainment(reason) = outcome {
+        return Err(lost_containment_error(SeamKind::Hooks, &reason));
+    }
     Ok(())
 }
 
-async fn dispatch_hook_event(seams: &SeamsConfig, ctx: &SeamRunCtx, event: &RunEventKind) {
-    let Ok(req) = serde_json::to_value(event) else {
-        return;
-    };
-    let _ = dispatch_seam(SeamKind::Hooks, &req, seams, ctx).await;
+fn event_sink_must_stop(outcome: &SeamOutcome) -> bool {
+    matches!(outcome, SeamOutcome::LostContainment(_))
 }
 
 fn spawn_event_sink_forwarder(
@@ -2164,7 +2199,14 @@ fn spawn_event_sink_forwarder(
                     let Ok(req) = serde_json::to_value(event) else {
                         continue;
                     };
-                    let _ = dispatch_seam(SeamKind::EventSink, &req, &seams, &ctx).await;
+                    let outcome = dispatch_seam(SeamKind::EventSink, &req, &seams, &ctx).await;
+                    if event_sink_must_stop(&outcome) {
+                        // The detached observer cannot safely dispatch another
+                        // worker while authority from this one remains live.
+                        // Its durable process record is left for supervisor or
+                        // operator reconciliation.
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -2610,6 +2652,10 @@ async fn complete_run_docs(
             commit_docs: false,
             no_llm: config.docs.no_docs,
             force: false,
+            max_wall_seconds: config
+                .max_wall_seconds
+                .map(|cap| (cap - state.total_wall_seconds).max(0.0)),
+            cancellation_token: config.cancellation_token.clone(),
         },
     )
     .await;
@@ -3680,6 +3726,7 @@ enum SemanticCompletionDisposition {
     Achieved,
     Revise,
     NeedsReview,
+    LostContainment,
     BudgetExhausted,
     Cancelled,
 }
@@ -3754,6 +3801,12 @@ async fn semantic_completion_disposition(
         }
     };
     record_semantic_judge_accounting(state, turn, config, &semantic_run)?;
+    if let crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) =
+        &semantic_run.result
+    {
+        record_semantic_lost_containment(state, turn, history, reason)?;
+        return Ok(SemanticCompletionDisposition::LostContainment);
+    }
     if should_cancel_run(state, cancellation_token) {
         return Ok(SemanticCompletionDisposition::Cancelled);
     }
@@ -3822,6 +3875,10 @@ async fn semantic_completion_disposition(
         crate::semantic_judge::SemanticJudgeResult::Unavailable(reason) => {
             record_needs_review(state, turn, history, &reason)?;
             Ok(SemanticCompletionDisposition::NeedsReview)
+        }
+        crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) => {
+            record_semantic_lost_containment(state, turn, history, &reason)?;
+            Ok(SemanticCompletionDisposition::LostContainment)
         }
     }
 }
@@ -3902,6 +3959,9 @@ fn record_semantic_judge_accounting(
         crate::semantic_judge::SemanticJudgeResult::Unavailable(reason) => {
             ("semantic_judge.unavailable", Some(reason.as_str()))
         }
+        crate::semantic_judge::SemanticJudgeResult::LostContainment(reason) => {
+            ("semantic_judge.lost_containment", Some(reason.as_str()))
+        }
     };
     let input_sha256 = semantic_run
         .result
@@ -3962,6 +4022,31 @@ fn record_needs_review(
             run_id: state.run_id.clone(),
             turn,
             event: "semantic_judge.needs_review".to_string(),
+            latency_ms: None,
+            detail: json!({ "reason": reason }),
+        },
+    )?;
+    history.push(message.clone());
+    state.failure_reason = Some(message);
+    state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
+    save_history(state, history)?;
+    save_state(state)
+}
+
+fn record_semantic_lost_containment(
+    state: &mut PipelineState,
+    turn: u32,
+    history: &mut Vec<String>,
+    reason: &str,
+) -> Result<()> {
+    let message = format!("LOST_CONTAINMENT: {reason}");
+    append_trace(
+        state,
+        &TraceRecord {
+            timestamp: Utc::now(),
+            run_id: state.run_id.clone(),
+            turn,
+            event: "semantic_judge.lost_containment".to_string(),
             latency_ms: None,
             detail: json!({ "reason": reason }),
         },
@@ -5482,7 +5567,7 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
-    use crate::seam::{SeamRunCtx, read_seams_config};
+    use crate::seam::{SeamOutcome, SeamRunCtx, read_seams_config};
 
     use deadreckon_core::events::RunEventBus;
     use deadreckon_core::flight::{
@@ -5506,7 +5591,7 @@ mod tests {
         build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
         changed_files_since_snapshot, classify_cli_no_deliverable_changes, commit_finalized_turn,
         commit_worktree_turn, complete_within_wall_budget, deliverable_changed_files,
-        ensure_sandbox_toml, implementation_notes_ready_or_request_followup,
+        ensure_sandbox_toml, event_sink_must_stop, implementation_notes_ready_or_request_followup,
         is_direct_api_provider_kind, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, persist_parent_repair_candidate, policy_seam_refusal,
@@ -6490,7 +6575,8 @@ timeout_ms = 1000
             "../outside.txt",
             &state.working_dir,
         )
-        .await;
+        .await
+        .expect("policy seam dispatch");
         assert!(seam_refusal.is_none());
 
         ensure_sandbox_toml(&state).expect("sandbox.toml");
@@ -6516,6 +6602,16 @@ timeout_ms = 1000
             read_seams_json(&state)["kinds"]["policy"]["source"].as_str(),
             Some("builtin")
         );
+    }
+
+    #[test]
+    fn detached_event_sink_stops_after_lost_containment() {
+        assert!(event_sink_must_stop(&SeamOutcome::LostContainment(
+            "retained process authority".to_string()
+        )));
+        assert!(!event_sink_must_stop(&SeamOutcome::Skipped(
+            "ordinary observer failure".to_string()
+        )));
     }
 
     #[tokio::test]

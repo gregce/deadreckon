@@ -45,6 +45,7 @@ pub(crate) async fn run_cli(
             cancellation_token,
             extra_read_allowlist: Vec::new(),
             extra_write_allowlist: Vec::new(),
+            extra_write_denylist: Vec::new(),
             workspace_access,
             inner_read_only_enforced,
         },
@@ -59,6 +60,7 @@ pub(crate) struct CliRunOptions {
     pub(crate) cancellation_token: Option<CancellationToken>,
     pub(crate) extra_read_allowlist: Vec<PathBuf>,
     pub(crate) extra_write_allowlist: Vec<PathBuf>,
+    pub(crate) extra_write_denylist: Vec<PathBuf>,
     pub(crate) workspace_access: WorkspaceAccess,
     /// True only when the provider CLI has its own enforceable read-only
     /// sandbox (currently Codex). This permits a read-only request without an
@@ -99,6 +101,14 @@ pub(crate) async fn run_cli_with_options(
         let mut write_allowlist = cli_provider_write_allowlist(provider);
         write_allowlist.extend(options.extra_write_allowlist);
         dedup_paths(&mut write_allowlist);
+        let mut write_denylist = options.extra_write_denylist;
+        write_denylist.extend(
+            write_denylist
+                .clone()
+                .into_iter()
+                .filter_map(|path| path.canonicalize().ok()),
+        );
+        dedup_paths(&mut write_denylist);
         let mut policy =
             ToolSandboxPolicy::cli_provider(cwd.clone(), resolved.read_allowlist, write_allowlist);
         policy.read_allowlist.extend(options.extra_read_allowlist);
@@ -118,7 +128,7 @@ pub(crate) async fn run_cli_with_options(
             read_allowlist: policy.read_allowlist,
             write_allowlist: policy.write_allowlist,
             read_denylist: Vec::new(),
-            write_denylist: Vec::new(),
+            write_denylist,
             network_allowlist: policy.network_allowlist,
             workspace_access: options.workspace_access,
             // A deadline/cancellation is not complete until every descendant
@@ -491,6 +501,7 @@ mod tests {
                 cancellation_token: None,
                 extra_read_allowlist: Vec::new(),
                 extra_write_allowlist: Vec::new(),
+                extra_write_denylist: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadOnly,
                 inner_read_only_enforced: false,
             },
@@ -533,6 +544,7 @@ mod tests {
                 cancellation_token: Some(token.clone()),
                 extra_read_allowlist: Vec::new(),
                 extra_write_allowlist: Vec::new(),
+                extra_write_denylist: Vec::new(),
                 workspace_access: WorkspaceAccess::ReadWrite,
                 inner_read_only_enforced: false,
             },

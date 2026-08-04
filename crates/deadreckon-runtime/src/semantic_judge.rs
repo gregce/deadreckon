@@ -31,6 +31,7 @@ const MAX_DIFF_BYTES: usize = 256 * 1024;
 const MAX_NOTES_BYTES: usize = 64 * 1024;
 const MAX_SUMMARY_CHARS: usize = 4_000;
 const MAX_FINDINGS: usize = 64;
+const SEMANTIC_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const EVIDENCE_GOAL: &str = "approved-goal";
 const EVIDENCE_CONTRACT: &str = "approved-contract";
@@ -67,6 +68,7 @@ pub enum SemanticJudgeResult {
     Revise(SemanticJudgment),
     NeedsReview(SemanticJudgment),
     Unavailable(String),
+    LostContainment(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,7 +108,7 @@ impl SemanticJudgeResult {
             Self::Achieved(judgment) | Self::Revise(judgment) | Self::NeedsReview(judgment) => {
                 Some(judgment)
             }
-            Self::Unavailable(_) => None,
+            Self::Unavailable(_) | Self::LostContainment(_) => None,
         }
     }
 }
@@ -453,10 +455,12 @@ async fn run_semantic_judge_with_baseline(
                 path: state.run_root.join("semantic-judge-workspace"),
                 source,
             })?;
+    let process_authority = semantic_judge_process_authority(state)?;
     let mut request = semantic_provider_request(
         &input,
         judge_workspace.as_ref().map(TempDir::path),
         sandbox_backend,
+        Some(&process_authority),
     );
     let cancellation_token = CancellationToken::new();
     request.cancellation_token = Some(cancellation_token.clone());
@@ -483,6 +487,7 @@ async fn run_semantic_judge_with_baseline(
         provider_wall_budget,
         &cancellation_token,
         external_cancellation,
+        SEMANTIC_CLEANUP_TIMEOUT,
     )
     .await;
     let accounting = match &completion {
@@ -496,14 +501,18 @@ async fn run_semantic_judge_with_baseline(
                 started.elapsed().as_secs_f64(),
             ),
         },
-        SemanticProviderCompletion::WallExpired | SemanticProviderCompletion::Cancelled => {
-            accounting_without_response(
-                selected.as_ref(),
-                sandbox_backend,
-                started.elapsed().as_secs_f64(),
-            )
-        }
+        SemanticProviderCompletion::WallExpired { .. }
+        | SemanticProviderCompletion::Cancelled { .. } => accounting_without_response(
+            selected.as_ref(),
+            sandbox_backend,
+            started.elapsed().as_secs_f64(),
+        ),
     };
+    if let Some(reason) =
+        semantic_cleanup_failure(&completion, &process_authority, SEMANTIC_CLEANUP_TIMEOUT)
+    {
+        return Ok(lost_containment_run(reason, accounting));
+    }
     let after = match semantic_guard_identity(&state.working_dir) {
         Ok(after) => after,
         Err(error) => {
@@ -533,14 +542,14 @@ async fn run_semantic_judge_with_baseline(
                 ));
             }
         },
-        SemanticProviderCompletion::WallExpired => {
+        SemanticProviderCompletion::WallExpired { .. } => {
             return Ok(budget_exhausted_run(
                 "strict semantic judge exceeded the remaining wall-time budget".to_string(),
                 SemanticBudgetExhaustion::Wall,
                 accounting,
             ));
         }
-        SemanticProviderCompletion::Cancelled => {
+        SemanticProviderCompletion::Cancelled { .. } => {
             return Ok(unavailable_run(
                 "strict semantic judge cancelled by the durable run controller".to_string(),
                 accounting,
@@ -557,6 +566,18 @@ async fn run_semantic_judge_with_baseline(
         accounting,
         budget_exhaustion: None,
     })
+}
+
+fn semantic_judge_process_authority(state: &PipelineState) -> Result<PathBuf> {
+    let directory = state.run_root.join("child-pids");
+    fs::create_dir_all(&directory).map_err(|source| DeadreckonError::Io {
+        path: directory.clone(),
+        source,
+    })?;
+    Ok(directory.join(format!(
+        "semantic-judge-{}.pid",
+        uuid::Uuid::new_v4().simple()
+    )))
 }
 
 fn semantic_guard_identity(working_dir: &Path) -> Result<(String, String)> {
@@ -592,8 +613,55 @@ fn workspace_git_control_identity(working_dir: &Path) -> Result<String> {
 
 enum SemanticProviderCompletion {
     Finished(Box<deadreckon_providers::Result<ProviderResponse>>),
-    WallExpired,
-    Cancelled,
+    WallExpired { cleanup_proven: bool },
+    Cancelled { cleanup_proven: bool },
+}
+
+impl SemanticProviderCompletion {
+    fn cleanup_proven(&self) -> bool {
+        match self {
+            Self::Finished(_) => true,
+            Self::WallExpired { cleanup_proven } | Self::Cancelled { cleanup_proven } => {
+                *cleanup_proven
+            }
+        }
+    }
+}
+
+fn semantic_cleanup_failure(
+    completion: &SemanticProviderCompletion,
+    process_authority: &Path,
+    cleanup_timeout: Duration,
+) -> Option<String> {
+    if !completion.cleanup_proven() {
+        let retained = process_authority_may_remain(process_authority).then(|| {
+            format!(
+                "; process authority remains at {}",
+                process_authority.display()
+            )
+        });
+        return Some(format!(
+            "strict semantic judge cleanup was not proven within the bounded {:.1}s safety window{}",
+            cleanup_timeout.as_secs_f64(),
+            retained.unwrap_or_default()
+        ));
+    }
+    process_authority_may_remain(process_authority).then(|| {
+        format!(
+            "strict semantic judge returned without proving provider cleanup; process authority remains at {}",
+            process_authority.display()
+        )
+    })
+}
+
+fn process_authority_may_remain(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        // An unreadable authority path is not proof that the exact process
+        // tree exited. Preserve the fail-closed classification.
+        Err(_) => true,
+    }
 }
 
 async fn complete_with_semantic_wall_budget<F>(
@@ -601,6 +669,7 @@ async fn complete_with_semantic_wall_budget<F>(
     remaining: Option<Duration>,
     cancellation_token: &CancellationToken,
     external_cancellation: Option<&CancellationToken>,
+    cleanup_timeout: Duration,
 ) -> SemanticProviderCompletion
 where
     F: std::future::Future<Output = deadreckon_providers::Result<ProviderResponse>>,
@@ -613,8 +682,10 @@ where
                 SemanticProviderCompletion::Finished(Box::new(result))
             } else {
                 cancellation_token.cancel();
-                let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-                SemanticProviderCompletion::WallExpired
+                let cleanup_proven = tokio::time::timeout(cleanup_timeout, &mut completion)
+                    .await
+                    .is_ok();
+                SemanticProviderCompletion::WallExpired { cleanup_proven }
             }
         }
         (None, Some(external)) => {
@@ -622,8 +693,9 @@ where
                 result = &mut completion => SemanticProviderCompletion::Finished(Box::new(result)),
                 _ = external.cancelled() => {
                     cancellation_token.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-                    SemanticProviderCompletion::Cancelled
+                    let cleanup_proven =
+                        tokio::time::timeout(cleanup_timeout, &mut completion).await.is_ok();
+                    SemanticProviderCompletion::Cancelled { cleanup_proven }
                 }
             }
         }
@@ -632,13 +704,15 @@ where
                 result = &mut completion => SemanticProviderCompletion::Finished(Box::new(result)),
                 _ = tokio::time::sleep(remaining) => {
                     cancellation_token.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-                    SemanticProviderCompletion::WallExpired
+                    let cleanup_proven =
+                        tokio::time::timeout(cleanup_timeout, &mut completion).await.is_ok();
+                    SemanticProviderCompletion::WallExpired { cleanup_proven }
                 }
                 _ = external.cancelled() => {
                     cancellation_token.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(10), &mut completion).await;
-                    SemanticProviderCompletion::Cancelled
+                    let cleanup_proven =
+                        tokio::time::timeout(cleanup_timeout, &mut completion).await.is_ok();
+                    SemanticProviderCompletion::Cancelled { cleanup_proven }
                 }
             }
         }
@@ -648,6 +722,14 @@ where
 fn unavailable_run(reason: String, accounting: SemanticJudgeAccounting) -> SemanticJudgeRun {
     SemanticJudgeRun {
         result: SemanticJudgeResult::Unavailable(reason),
+        accounting,
+        budget_exhaustion: None,
+    }
+}
+
+fn lost_containment_run(reason: String, accounting: SemanticJudgeAccounting) -> SemanticJudgeRun {
+    SemanticJudgeRun {
+        result: SemanticJudgeResult::LostContainment(reason),
         accounting,
         budget_exhaustion: None,
     }
@@ -758,6 +840,7 @@ fn semantic_provider_request(
     evidence_json: &str,
     judge_workspace: Option<&Path>,
     sandbox_backend: SandboxBackend,
+    process_authority: Option<&Path>,
 ) -> ProviderRequest {
     ProviderRequest {
         prompt: format!(
@@ -772,7 +855,7 @@ fn semantic_provider_request(
         output_path: None,
         sandbox_backend: Some(sandbox_backend),
         workspace_access: WorkspaceAccess::ReadOnly,
-        pid_file: None,
+        pid_file: process_authority.map(Path::to_path_buf),
         cancellation_token: None,
         session_dir: None,
         output_schema: Some(semantic_output_schema()),
@@ -1012,7 +1095,10 @@ mod tests {
     use std::fs;
     use std::time::Duration;
 
-    use deadreckon_providers::{ProviderResponse, ProviderUsage, SpendEstimate};
+    use deadreckon_providers::{
+        ProviderConfigFile, ProviderEntry, ProviderRequest, ProviderResponse, ProviderRouter,
+        ProviderUsage, SpendEstimate, WorkspaceAccess,
+    };
     use deadreckon_sandbox::SandboxBackend;
 
     use super::{
@@ -1021,8 +1107,8 @@ mod tests {
         SemanticProviderCompletion, accounting_from_response,
         build_semantic_evidence_against_source, classify_semantic_response,
         complete_with_semantic_wall_budget, provider_kind_is_cli, semantic_budget_overrun,
-        semantic_guard_identity, semantic_output_schema, semantic_provider_request,
-        strip_json_fence, validate_evidence_references,
+        semantic_cleanup_failure, semantic_guard_identity, semantic_output_schema,
+        semantic_provider_request, strip_json_fence, validate_evidence_references,
         validate_semantic_judgment_input_against_source,
     };
     use deadreckon_protocol::{
@@ -1032,17 +1118,19 @@ mod tests {
 
     #[test]
     fn semantic_judge_has_no_worker_session_or_write_capability() {
+        let process_authority = std::path::Path::new("/tmp/semantic-judge.pid");
         let request = semantic_provider_request(
             "{}",
             Some(std::path::Path::new("/tmp/empty-judge-workspace")),
             SandboxBackend::SandboxExec,
+            Some(process_authority),
         );
         assert_eq!(
             request.workspace_access,
             deadreckon_providers::WorkspaceAccess::ReadOnly
         );
         assert!(request.session_dir.is_none());
-        assert!(request.pid_file.is_none());
+        assert_eq!(request.pid_file.as_deref(), Some(process_authority));
         assert_eq!(
             request.cwd.as_deref(),
             Some(std::path::Path::new("/tmp/empty-judge-workspace"))
@@ -1084,7 +1172,12 @@ mod tests {
 
     #[test]
     fn semantic_judge_receives_goal_contract_diff_and_gate_evidence() {
-        let request = semantic_provider_request("{\"goal\":\"x\"}", None, SandboxBackend::Docker);
+        let request = semantic_provider_request(
+            "{\"goal\":\"x\"}",
+            None,
+            SandboxBackend::Docker,
+            Some(std::path::Path::new("/tmp/semantic-judge.pid")),
+        );
         for evidence in [EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE] {
             assert!(request.prompt.contains(evidence));
         }
@@ -1326,10 +1419,16 @@ mod tests {
             Some(Duration::from_millis(20)),
             &token,
             None,
+            Duration::from_secs(1),
         )
         .await;
 
-        assert!(matches!(response, SemanticProviderCompletion::WallExpired));
+        assert!(matches!(
+            response,
+            SemanticProviderCompletion::WallExpired {
+                cleanup_proven: true
+            }
+        ));
         assert!(token.is_cancelled());
     }
 
@@ -1384,6 +1483,7 @@ mod tests {
                 None,
                 &helper_cancellation,
                 Some(&helper_external_cancellation),
+                Duration::from_secs(1),
             )
             .await
         });
@@ -1394,7 +1494,179 @@ mod tests {
         let result = completion.await.expect("semantic completion task");
         drained_rx.await.expect("provider request drained");
         assert!(request_cancellation.is_cancelled());
-        assert!(matches!(result, SemanticProviderCompletion::Cancelled));
+        assert!(matches!(
+            result,
+            SemanticProviderCompletion::Cancelled {
+                cleanup_proven: true
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn expired_semantic_call_retains_unproven_process_authority() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let process_authority = temp.path().join("semantic-judge.pid");
+        fs::write(&process_authority, b"retained authority\n").expect("process authority");
+        let token = tokio_util::sync::CancellationToken::new();
+        let completion = std::future::pending::<deadreckon_providers::Result<ProviderResponse>>();
+
+        let outcome = complete_with_semantic_wall_budget(
+            completion,
+            Some(Duration::from_millis(10)),
+            &token,
+            None,
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            SemanticProviderCompletion::WallExpired {
+                cleanup_proven: false
+            }
+        ));
+        let reason =
+            semantic_cleanup_failure(&outcome, &process_authority, Duration::from_millis(20))
+                .expect("unresolved cleanup must fail closed");
+        assert!(reason.contains("cleanup was not proven"), "{reason}");
+        assert!(reason.contains(&process_authority.display().to_string()));
+        assert!(
+            process_authority.exists(),
+            "unproven process authority must remain available for recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn semantic_cancellation_reaps_adversarial_background_descendant() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        struct DescendantGuard(std::path::PathBuf);
+        impl Drop for DescendantGuard {
+            fn drop(&mut self) {
+                let Ok(raw) = fs::read_to_string(&self.0) else {
+                    return;
+                };
+                let Ok(pid) = raw.trim().parse::<u32>() else {
+                    return;
+                };
+                if deadreckon_core::pid_is_alive(pid) {
+                    let _ = deadreckon_core::terminate_pid(pid, true);
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let binary = temp.path().join("adversarial-judge");
+        let descendant_path = temp.path().join("descendant.pid");
+        let _descendant_guard = DescendantGuard(descendant_path.clone());
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"--help\" ]; then printf '%s\\n' 'Usage: adversarial-judge'; exit 0; fi\n(trap '' TERM; sleep 60) &\ndescendant=$!\nprintf '%s\\n' \"$descendant\" > '{}'\ntrap '' TERM\nwait\n",
+                descendant_path.display()
+            ),
+        )
+        .expect("adversarial judge");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))
+            .expect("adversarial judge permissions");
+        let router = ProviderRouter::from_config(
+            ProviderConfigFile {
+                default_provider: None,
+                fallback: Some(vec!["cli:claude-code".to_string()]),
+                providers: [(
+                    "cli:claude-code".to_string(),
+                    ProviderEntry {
+                        kind: Some(ProviderKind::CliClaudeCode),
+                        api_key: None,
+                        api_key_env: None,
+                        base_url: None,
+                        model: Some("adversarial-judge".to_string()),
+                        input_cost_per_million: Some(0.0),
+                        output_cost_per_million: Some(0.0),
+                        binary: Some(binary.display().to_string()),
+                        extra_args: Vec::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            },
+            None,
+        )
+        .expect("judge router");
+        let process_authority = temp.path().join("semantic-judge.pid");
+        let request_cancellation = tokio_util::sync::CancellationToken::new();
+        let external_cancellation = tokio_util::sync::CancellationToken::new();
+        let request = ProviderRequest {
+            prompt: "judge evidence".to_string(),
+            max_output_tokens: 64,
+            cwd: Some(temp.path().to_path_buf()),
+            output_path: None,
+            sandbox_backend: None,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            pid_file: Some(process_authority.clone()),
+            cancellation_token: Some(request_cancellation.clone()),
+            session_dir: None,
+            output_schema: None,
+            capability_posture: None,
+        };
+        let provider = router.complete(&request);
+        let cancel_after_descendant_starts = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !descendant_path.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                descendant_path.exists(),
+                "adversarial descendant did not start before cancellation"
+            );
+            external_cancellation.cancel();
+        };
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(6), async {
+            tokio::join!(
+                complete_with_semantic_wall_budget(
+                    provider,
+                    None,
+                    &request_cancellation,
+                    Some(&external_cancellation),
+                    Duration::from_secs(3),
+                ),
+                cancel_after_descendant_starts,
+            )
+        })
+        .await
+        .expect("semantic cancellation and cleanup must remain bounded");
+
+        assert!(matches!(
+            outcome,
+            SemanticProviderCompletion::Cancelled {
+                cleanup_proven: true
+            }
+        ));
+        assert!(
+            semantic_cleanup_failure(&outcome, &process_authority, Duration::from_secs(3))
+                .is_none(),
+            "completed descendant reconciliation must prove semantic cleanup"
+        );
+        assert!(
+            !process_authority.exists(),
+            "proven semantic cleanup must remove process authority"
+        );
+        let descendant = fs::read_to_string(&descendant_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while deadreckon_core::pid_is_alive(descendant) && std::time::Instant::now() < exit_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let survived = deadreckon_core::pid_is_alive(descendant);
+        if survived {
+            let _ = deadreckon_core::terminate_pid(descendant, true);
+        }
+        assert!(!survived, "background semantic descendant survived cleanup");
     }
 
     #[test]

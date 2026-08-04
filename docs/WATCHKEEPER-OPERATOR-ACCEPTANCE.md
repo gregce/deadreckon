@@ -181,7 +181,18 @@ Accept when:
   while an earlier recovered Job is still running; no more than four recovery
   Jobs are driven concurrently;
 - [ ] a contained read-only Codex request can read its frozen output schema but
-  cannot modify it, including when Linux gives the sandbox a private `/tmp`.
+  cannot modify it, including through the schema's canonical path, and its
+  precreated last-message output remains visible when Linux gives the sandbox a
+  private `/tmp`;
+- [ ] a documentation provider that hangs with a TERM-ignoring descendant is
+  killed and reaped at its call boundary, leaves no child authority, and keeps
+  the deterministic narrative; unproved cleanup fails the run instead;
+- [ ] a timed-out hook that leaves a pipe-holding descendant cannot extend its
+  configured timeout indefinitely. Proven cleanup follows the configured seam
+  fallback; unproved cleanup reports `LostContainment` and stops dispatch;
+- [ ] semantic judge cancellation reaps its complete process group and removes
+  its identity record. If that cannot be proved, leaf, graph and campaign Jobs
+  stop as `Blocked/LostContainment`, never `NEEDS_REVIEW` or `fatal_provider`.
 
 ## Safety and prerequisites
 

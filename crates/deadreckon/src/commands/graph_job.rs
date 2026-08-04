@@ -6730,6 +6730,9 @@ pub(crate) async fn complete_merged_plan_parent(
             }
         };
     record_parent_semantic_accounting(&mut parent, job, &semantic)?;
+    if let deadreckon_runtime::SemanticJudgeResult::LostContainment(reason) = &semantic.result {
+        return parent_failed(&mut parent, reason, StopReason::LostContainment);
+    }
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -6785,6 +6788,9 @@ pub(crate) async fn complete_merged_plan_parent(
         ),
         deadreckon_runtime::SemanticJudgeResult::Unavailable(reason) => {
             parent_needs_review(&mut parent, &reason, None, StopReason::SemanticUnavailable)
+        }
+        deadreckon_runtime::SemanticJudgeResult::LostContainment(reason) => {
+            parent_failed(&mut parent, &reason, StopReason::LostContainment)
         }
     }
 }
@@ -7053,6 +7059,9 @@ pub(crate) async fn complete_merged_campaign_parent(
             }
         };
     record_parent_semantic_accounting(&mut parent, job, &semantic)?;
+    if let deadreckon_runtime::SemanticJudgeResult::LostContainment(reason) = &semantic.result {
+        return parent_failed(&mut parent, reason, StopReason::LostContainment);
+    }
     if cancellation.requested() {
         return parent_cancelled(
             &mut parent,
@@ -7108,6 +7117,9 @@ pub(crate) async fn complete_merged_campaign_parent(
         ),
         deadreckon_runtime::SemanticJudgeResult::Unavailable(reason) => {
             parent_needs_review(&mut parent, &reason, None, StopReason::SemanticUnavailable)
+        }
+        deadreckon_runtime::SemanticJudgeResult::LostContainment(reason) => {
+            parent_failed(&mut parent, &reason, StopReason::LostContainment)
         }
     }
 }
@@ -8803,6 +8815,9 @@ fn record_parent_semantic_accounting(
         }
         deadreckon_runtime::SemanticJudgeResult::Unavailable(reason) => {
             ("semantic_judge.unavailable", Some(reason.as_str()))
+        }
+        deadreckon_runtime::SemanticJudgeResult::LostContainment(reason) => {
+            ("semantic_judge.lost_containment", Some(reason.as_str()))
         }
     };
     let judgment = semantic.result.judgment();

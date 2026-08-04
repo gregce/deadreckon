@@ -63,6 +63,39 @@ impl Drop for RemoveFileOnDrop {
     }
 }
 
+async fn prepare_last_message_file(provider: &str, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|source| ProviderError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(ProviderError::Cli {
+            provider: provider.to_string(),
+            detail: format!(
+                "refusing non-regular Codex last-message path: {}",
+                path.display()
+            ),
+        });
+    }
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|source| ProviderError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    Ok(())
+}
+
 impl CliCodexProvider {
     pub fn new(name: impl Into<String>, entry: ProviderEntry) -> Self {
         let (model, model_arg) = cli_model(entry.model, "cli:codex");
@@ -163,6 +196,7 @@ impl CliCodexProvider {
                 // provider may read it but must not be able to rewrite it.
                 extra_read_allowlist: schema.into_iter().map(Path::to_path_buf).collect(),
                 extra_write_allowlist: last_message.into_iter().map(Path::to_path_buf).collect(),
+                extra_write_denylist: schema.into_iter().map(Path::to_path_buf).collect(),
                 workspace_access: request.workspace_access,
                 inner_read_only_enforced: true,
             },
@@ -185,7 +219,7 @@ impl CliCodexProvider {
                 &["exec".to_string(), "--help".to_string()],
                 request.cwd.clone(),
                 request.sandbox_backend,
-                None,
+                request.pid_file.clone(),
                 request.cancellation_token.clone(),
                 WorkspaceAccess::ReadOnly,
                 true,
@@ -203,7 +237,7 @@ impl CliCodexProvider {
             &["--version".to_string()],
             request.cwd.clone(),
             request.sandbox_backend,
-            None,
+            request.pid_file.clone(),
             request.cancellation_token.clone(),
             WorkspaceAccess::ReadOnly,
             true,
@@ -236,7 +270,7 @@ impl CliCodexProvider {
                     &["exec".to_string(), "--help".to_string()],
                     request.cwd.clone(),
                     request.sandbox_backend,
-                    None,
+                    request.pid_file.clone(),
                     request.cancellation_token.clone(),
                     WorkspaceAccess::ReadOnly,
                     true,
@@ -248,7 +282,7 @@ impl CliCodexProvider {
                     &["features".to_string(), "list".to_string()],
                     request.cwd.clone(),
                     request.sandbox_backend,
-                    None,
+                    request.pid_file.clone(),
                     request.cancellation_token.clone(),
                     WorkspaceAccess::ReadOnly,
                     true,
@@ -305,10 +339,11 @@ impl CliCodexProvider {
             .output_path
             .as_ref()
             .map(|p| p.with_extension("last.txt"));
-        // codex writes the last-message file itself; ensure its parent exists
-        // before the binary runs so the write lands.
-        if let Some(parent) = last_message_path.as_ref().and_then(|p| p.parent()) {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        // Bubblewrap gives read-only requests a private /tmp. Precreate the
+        // exact host file so its narrow writable bind cannot be skipped and
+        // the structured result remains visible after the sandbox exits.
+        if let Some(path) = last_message_path.as_deref() {
+            prepare_last_message_file(&self.name, path).await?;
         }
 
         // A fresh read-only request deliberately has no resumable worker
@@ -380,11 +415,28 @@ impl CliCodexProvider {
             persist_session(dir, PROVIDER_ID_CODEX, id, reset);
         }
 
-        let last_message = last_message_path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let last_message = match last_message_path.as_ref() {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(message) if !message.trim().is_empty() => Some(message.trim().to_string()),
+                Ok(_) if request.output_schema.is_some() => {
+                    return Err(ProviderError::Cli {
+                        provider: self.name.clone(),
+                        detail: format!(
+                            "schema-constrained Codex request left --output-last-message empty at {}",
+                            path.display()
+                        ),
+                    });
+                }
+                Err(source) if request.output_schema.is_some() => {
+                    return Err(ProviderError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+                _ => None,
+            },
+            None => None,
+        };
         let content = match (&last_message, parsed.answer.as_ref(), degraded) {
             (Some(msg), _, false) => msg.clone(),
             (_, Some(answer), false) => answer.clone(),

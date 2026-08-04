@@ -12,10 +12,12 @@ use deadreckon_sandbox::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::error::IoContext;
 
 pub const SEAMS_AUDIT_JSON: &str = "seams.json";
+const SEAM_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -145,6 +147,9 @@ pub enum SeamOutcome {
     Deny(String),
     Fallback,
     Skipped(String),
+    /// The worker exceeded its execution bound and DeadReckon could not prove
+    /// that every process retaining the seam's authority was reaped.
+    LostContainment(String),
 }
 
 pub fn read_seams_config(config_path: &Path, no_seams: bool) -> Result<SeamsConfig> {
@@ -242,7 +247,8 @@ pub async fn dispatch_seam(
         Err(err) => return fail_outcome(kind, format!("request serialization failed: {err}")),
     };
     let token = CancellationToken::new();
-    let spec = seam_sandbox_spec(command, ctx, stdin, token.clone());
+    let process_record = seam_process_record_path(ctx, kind);
+    let spec = seam_sandbox_spec(command, ctx, stdin, token.clone(), process_record.clone());
     let mut handle = tokio::spawn(async move { run_sandbox(spec).await });
     let timeout = Duration::from_millis(command.timeout_ms);
     let output = tokio::select! {
@@ -253,8 +259,16 @@ pub async fn dispatch_seam(
         },
         _ = tokio::time::sleep(timeout) => {
             token.cancel();
-            let _ = handle.await;
-            return fail_outcome(kind, "timeout".to_string());
+            let cleanup = tokio::time::timeout(SEAM_CLEANUP_TIMEOUT, &mut handle).await;
+            let cleanup_proven = matches!(cleanup, Ok(Ok(_))) && !process_record.exists();
+            if !cleanup_proven {
+                // A stuck sandbox future must not turn the configured seam
+                // timeout into another unbounded wait. Aborting drops only
+                // controller-side ownership; the identity-bound process
+                // record remains for supervisor/operator reconciliation.
+                handle.abort();
+            }
+            return seam_timeout_outcome(kind, cleanup_proven, &process_record);
         }
     };
     if output.status_code != Some(0) {
@@ -277,8 +291,8 @@ pub async fn dispatch_seam(
 pub async fn resolve_catalog_override(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
-) -> Option<ModelCatalogOverride> {
-    match dispatch_seam(
+) -> Result<Option<ModelCatalogOverride>> {
+    let override_ = match dispatch_seam(
         SeamKind::Catalog,
         &Value::Object(Default::default()),
         seams,
@@ -289,7 +303,11 @@ pub async fn resolve_catalog_override(
         SeamOutcome::Ok(value) => ModelCatalogOverride::from_value(value).ok(),
         SeamOutcome::Unconfigured | SeamOutcome::Fallback | SeamOutcome::Skipped(_) => None,
         SeamOutcome::Deny(_) => None,
-    }
+        SeamOutcome::LostContainment(reason) => {
+            return Err(lost_containment_error(SeamKind::Catalog, &reason));
+        }
+    };
+    Ok(override_)
 }
 
 fn seam_sandbox_spec(
@@ -297,6 +315,7 @@ fn seam_sandbox_spec(
     ctx: &SeamRunCtx,
     stdin: Vec<u8>,
     cancellation_token: CancellationToken,
+    process_record: PathBuf,
 ) -> SandboxSpec {
     let policy = ToolSandboxPolicy::bash(ctx.working_dir.clone());
     let denied = seam_denied_paths(&ctx.run_root);
@@ -313,7 +332,10 @@ fn seam_sandbox_spec(
         stdin: Some(stdin),
         env,
         allow_network: false,
-        pid_file: None,
+        // The record makes a timeout observable and restart-recoverable. The
+        // sandbox runner removes it only after the exact process group and
+        // residual descendants have been reconciled.
+        pid_file: Some(process_record),
         cancellation_token: Some(cancellation_token),
         profile_dir: Some(ctx.run_root.join("sandbox").join("seams")),
         read_allowlist: policy.read_allowlist,
@@ -322,9 +344,54 @@ fn seam_sandbox_spec(
         write_denylist: denied,
         network_allowlist: Vec::new(),
         workspace_access: WorkspaceAccess::ReadWrite,
-        cleanup_process_group: false,
+        cleanup_process_group: true,
         guarded_launch: None,
     }
+}
+
+fn seam_process_record_path(ctx: &SeamRunCtx, kind: SeamKind) -> PathBuf {
+    ctx.run_root.join("child-pids").join(format!(
+        "seam-{}-{}.json",
+        kind.config_key(),
+        Uuid::new_v4().simple()
+    ))
+}
+
+fn seam_timeout_reason(cleanup_proven: bool, process_record: &Path) -> String {
+    if cleanup_proven {
+        return "timeout; process-group cleanup proven".to_string();
+    }
+    if process_record.exists() {
+        return format!(
+            "timeout; process-group cleanup was not proven within {:.1}s; process authority retained at {}",
+            SEAM_CLEANUP_TIMEOUT.as_secs_f64(),
+            process_record.display()
+        );
+    }
+    format!(
+        "timeout; process-group cleanup was not proven within {:.1}s and no durable process record was available",
+        SEAM_CLEANUP_TIMEOUT.as_secs_f64()
+    )
+}
+
+fn seam_timeout_outcome(
+    kind: SeamKind,
+    cleanup_proven: bool,
+    process_record: &Path,
+) -> SeamOutcome {
+    let reason = seam_timeout_reason(cleanup_proven, process_record);
+    if cleanup_proven {
+        fail_outcome(kind, reason)
+    } else {
+        SeamOutcome::LostContainment(reason)
+    }
+}
+
+pub fn lost_containment_error(kind: SeamKind, reason: &str) -> DeadreckonError {
+    DeadreckonError::InvalidInput(format!(
+        "seam '{}' lost process containment: {reason}",
+        kind.config_key()
+    ))
 }
 
 fn seam_denied_paths(run_root: &Path) -> Vec<PathBuf> {
@@ -772,6 +839,121 @@ timeout_ms = 0
         ));
     }
 
+    #[test]
+    fn seam_workers_use_recoverable_process_group_authority() {
+        let temp = TempDir::new().expect("temp");
+        let run_ctx = ctx(&temp);
+        let process_record = run_ctx.run_root.join("child-pids/seam-test.json");
+        let command = SeamCommandConfig {
+            command: vec!["worker".to_string()],
+            timeout_ms: 100,
+        };
+
+        let spec = seam_sandbox_spec(
+            &command,
+            &run_ctx,
+            b"{}\n".to_vec(),
+            CancellationToken::new(),
+            process_record.clone(),
+        );
+
+        assert!(spec.cleanup_process_group);
+        assert_eq!(spec.pid_file.as_deref(), Some(process_record.as_path()));
+        assert!(spec.cancellation_token.is_some());
+    }
+
+    #[test]
+    fn unproven_cleanup_never_uses_the_configured_failure_fallback() {
+        let temp = TempDir::new().expect("temp");
+        let process_record = temp.path().join("seam-policy-test.json");
+        std::fs::write(&process_record, "retained authority").expect("process record");
+
+        for kind in SeamKind::all() {
+            let outcome = seam_timeout_outcome(kind, false, &process_record);
+            let SeamOutcome::LostContainment(reason) = outcome else {
+                panic!(
+                    "{} seam treated lost containment as an ordinary failure: {outcome:?}",
+                    kind.config_key()
+                );
+            };
+            assert!(reason.contains("cleanup was not proven"), "{reason}");
+            assert!(
+                reason.contains(process_record.to_string_lossy().as_ref()),
+                "{reason}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_timeout_reaps_background_descendant_that_retains_output_pipes() {
+        let temp = TempDir::new().expect("temp");
+        let run_ctx = ctx(&temp);
+        let descendant_pid_path = temp.path().join("descendant.pid");
+        let seams = SeamsConfig::with_command(
+            SeamKind::Hooks,
+            SeamCommandConfig {
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "(trap '' TERM; sleep 60) & descendant=$!; printf '%s\\n' \"$descendant\" > {}; trap '' TERM; sleep 60",
+                        sh_quote(&descendant_pid_path)
+                    ),
+                ],
+                timeout_ms: 250,
+            },
+        )
+        .expect("hooks seam");
+
+        let started = std::time::Instant::now();
+        let outcome = dispatch_seam(
+            SeamKind::Hooks,
+            &json!({"kind":"adversarial_pipe_holder"}),
+            &seams,
+            &run_ctx,
+        )
+        .await;
+
+        let SeamOutcome::Skipped(reason) = outcome else {
+            panic!("timed-out hook did not fail safe: {outcome:?}");
+        };
+        assert!(reason.contains("timeout"), "{reason}");
+        assert!(reason.contains("cleanup proven"), "{reason}");
+        assert!(
+            started.elapsed()
+                < Duration::from_millis(250) + SEAM_CLEANUP_TIMEOUT + Duration::from_secs(1),
+            "configured execution timeout plus bounded cleanup grace was exceeded: {:?}",
+            started.elapsed()
+        );
+
+        let descendant_pid = std::fs::read_to_string(&descendant_pid_path)
+            .expect("descendant pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric descendant pid");
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while deadreckon_core::pid_is_alive(descendant_pid)
+            && std::time::Instant::now() < exit_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !deadreckon_core::pid_is_alive(descendant_pid),
+            "background hook descendant {descendant_pid} survived timeout cleanup"
+        );
+
+        let authority_dir = run_ctx.run_root.join("child-pids");
+        let remaining = std::fs::read_dir(&authority_dir)
+            .expect("process authority directory")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("process authority entries");
+        assert!(
+            remaining.is_empty(),
+            "proven cleanup retained stale process authority: {remaining:?}"
+        );
+    }
+
     #[tokio::test]
     async fn catalog_seam_malformed_falls_back_to_builtin() {
         let temp = TempDir::new().expect("temp");
@@ -788,7 +970,9 @@ timeout_ms = 0
         )
         .expect("seams");
 
-        let catalog = resolve_catalog_override(&seams, &ctx(&temp)).await;
+        let catalog = resolve_catalog_override(&seams, &ctx(&temp))
+            .await
+            .expect("catalog seam dispatch");
 
         assert!(catalog.is_none());
     }

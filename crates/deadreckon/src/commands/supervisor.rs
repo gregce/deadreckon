@@ -2744,6 +2744,14 @@ fn maybe_schedule_leaf_retry(
         {
             StopReason::TransientProvider
         }
+        deadreckon_core::RunStatus::Failed
+            if state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("LOST_CONTAINMENT:")) =>
+        {
+            return Ok(false);
+        }
         deadreckon_core::RunStatus::Completed
         | deadreckon_core::RunStatus::Killed
         | deadreckon_core::RunStatus::Failed => return Ok(false),
@@ -4315,6 +4323,33 @@ fn classify_persisted_attempt(
             if state
                 .failure_reason
                 .as_deref()
+                .is_some_and(|reason| reason.starts_with("LOST_CONTAINMENT:")) =>
+        {
+            append_attempt_stopped(
+                paths,
+                token,
+                StopReason::LostContainment,
+                json!({
+                    "exit": exit_detail,
+                    "run_status": "failed",
+                    "failure_reason": state.failure_reason,
+                }),
+            )?;
+            append_terminal_event(
+                paths,
+                token,
+                JobEventKind::Blocked,
+                StopReason::LostContainment,
+                json!({
+                    "reason": "semantic judge process cleanup could not be proven",
+                    "failure_reason": state.failure_reason,
+                }),
+            )?;
+        }
+        deadreckon_core::RunStatus::Failed
+            if state
+                .failure_reason
+                .as_deref()
                 .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:")) =>
         {
             if let Err(error) = validate_acceptance_marker(&state) {
@@ -5414,6 +5449,18 @@ mod tests {
             Some("acceptance failed after turn 1: exact output differed".to_string());
         state.provider_failure = None;
         save_state(&state).expect("save acceptance failure");
+    }
+
+    fn failed_lost_containment_attempt(paths: &DeadreckonPaths, job: &Job) {
+        executing_attempt(paths, job);
+        let mut state = load_run(paths, job.job_id.as_ref()).expect("attempt state");
+        state.status = RunStatus::Failed;
+        state.failure_reason = Some(
+            "LOST_CONTAINMENT: strict semantic judge cleanup was not proven; process authority remains"
+                .to_string(),
+        );
+        state.provider_failure = None;
+        save_state(&state).expect("save lost-containment failure");
     }
 
     fn claim_started_attempt(paths: &DeadreckonPaths, job: &Job, attempt: u32) -> LeaseToken {
@@ -6730,8 +6777,8 @@ mod tests {
         // Leave enough setup room under parallel test load, while still
         // exercising the active-child deadline path without making admission
         // race the clock on a loaded CI runner.
-        let deadline = Utc::now() + chrono::TimeDelta::seconds(10);
-        let job = super::super::job::create_job(super::super::job::CreateJob {
+        let admission_deadline = Utc::now() + chrono::TimeDelta::minutes(5);
+        let mut job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
             scope: deadreckon_core::paths::workspace_scope(&source).expect("scope"),
@@ -6751,7 +6798,7 @@ mod tests {
             max_spend_usd: 3.0,
             max_wall_seconds: 60,
             max_attempts: 2,
-            deadline: Some(deadline),
+            deadline: Some(admission_deadline),
             sandbox_requested: "auto".to_string(),
             accepted_by: AuthorityAcceptedBy::YesFlagGuardrail,
         })
@@ -6807,6 +6854,11 @@ mod tests {
         let token = claim_job_lease(&paths, &job.job_id, &owner, Utc::now(), LEASE_TTL)
             .expect("claim")
             .token();
+        // Admission itself is covered separately and can be CPU-starved when
+        // the complete workspace suite runs concurrently. Expire only the
+        // in-memory monitor fixture after linking the child so this test has
+        // no admission race or arbitrary sleep.
+        job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::milliseconds(1));
         let outcome = monitor_child(&paths, &token, &job, MonitoredChild::Owned(child))
             .await
             .expect("deadline stops active child");
@@ -10455,6 +10507,53 @@ mod tests {
         assert_eq!(view.projection.stop_reason, Some(StopReason::FatalProvider));
         let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
             .expect("history");
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::RetryScheduled)
+        );
+    }
+
+    #[test]
+    fn semantic_cleanup_loss_blocks_leaf_without_provider_retry() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        failed_lost_containment_attempt(&paths, &job);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let exit = ChildExit {
+            status: None,
+            adopted: false,
+        };
+
+        assert!(
+            !maybe_schedule_leaf_retry(&paths, &job, &token, &exit, 1, 3)
+                .expect("lost containment cannot be retried")
+        );
+        classify_persisted_attempt(&paths, &job, &token, exit, false)
+            .expect("lost containment classification");
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert!(view.projection.is_terminal());
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::Blocked)
+        );
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::LostContainment)
+        );
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        assert!(history.events().iter().any(|event| {
+            event.kind == JobEventKind::AttemptStopped
+                && event.detail.get("stop_reason").and_then(Value::as_str)
+                    == Some("lost_containment")
+        }));
+        assert_eq!(
+            history.events().last().map(|event| event.kind),
+            Some(JobEventKind::Blocked)
+        );
         assert!(
             history
                 .events()

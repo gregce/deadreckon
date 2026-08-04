@@ -8,8 +8,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use deadreckon_core::DeadreckonPaths;
-use serde_json::json;
-
 mod common;
 
 use common::{assert_success, deadreckon, repo_tempdir, stderr, stdout};
@@ -43,39 +41,6 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
         ],
     );
 
-    let fixture_dir = temp.path().join("fixtures");
-    fs::create_dir_all(&fixture_dir).expect("fixtures");
-    let draft = fixture_dir.join("draft.json");
-    let critic = fixture_dir.join("critic.json");
-    fs::write(
-        &draft,
-        json!({
-            "acceptance_yaml": concat!(
-                "name: adversarial codex authoring\n",
-                "checks:\n",
-                "  - kind: shell\n",
-                "    command: >-\n",
-                "      test \"$(python3 app.py)\" = \"hello from app\"\n",
-                "    cwd: \"{working_dir}\"\n"
-            ),
-            "acceptance_md": "# Done criteria\n\nRunning the application prints `hello from app`.\n",
-            "files": []
-        })
-        .to_string(),
-    )
-    .expect("draft fixture");
-    fs::write(
-        &critic,
-        json!({
-            "stub_would_pass": false,
-            "uncovered_goal_clauses": [],
-            "weak_check_indices": [],
-            "verdict": "pass"
-        })
-        .to_string(),
-    )
-    .expect("critic fixture");
-
     let fake_codex = temp.path().join("fake-codex");
     fs::write(&fake_codex, FAKE_CODEX).expect("fake Codex CLI");
     make_executable(&fake_codex);
@@ -85,8 +50,6 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
     command
         .current_dir(&workspace)
         .env("DEADRECKON_AUTH_PROBE", "0")
-        .env("FAKE_CODEX_DRAFT", &draft)
-        .env("FAKE_CODEX_CRITIC", &critic)
         .args([
             "def-done",
             "running the Python app prints hello from app",
@@ -217,7 +180,7 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
     }
 }
 
-const FAKE_CODEX: &str = r#"#!/bin/sh
+const FAKE_CODEX: &str = r##"#!/bin/sh
 set -eu
 
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
@@ -354,13 +317,20 @@ if printf '%s\n' '{"tampered":true}' >> "$schema" 2>/dev/null; then
 fi
 
 case "$schema_kind" in
-  draft) fixture=$FAKE_CODEX_DRAFT ;;
-  critic) fixture=$FAKE_CODEX_CRITIC ;;
+  draft)
+    cat > "$last_message" <<'JSON'
+{"acceptance_yaml":"name: adversarial codex authoring\nchecks:\n  - kind: shell\n    command: >-\n      test \"$(python3 app.py)\" = \"hello from app\"\n    cwd: \"{working_dir}\"\n","acceptance_md":"# Done criteria\n\nRunning the application prints `hello from app`.\n","files":[]}
+JSON
+    ;;
+  critic)
+    cat > "$last_message" <<'JSON'
+{"stub_would_pass":false,"uncovered_goal_clauses":[],"weak_check_indices":[],"verdict":"pass"}
+JSON
+    ;;
   *) printf '%s\n' "unexpected schema kind: $schema_kind" >&2; exit 67 ;;
 esac
-cp "$fixture" "$last_message"
 
 printf '%s\n' '{"type":"thread.started","thread_id":"done-authoring-adversarial"}'
 printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"structured response written"}}'
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
-"#;
+"##;
