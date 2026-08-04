@@ -9,6 +9,10 @@
 - Watchkeeper cancellation acceptance now waits on the authoritative guarded
   process transition instead of a downstream workspace sentinel, with bounded
   progress deadlines and complete timeout diagnostics under host load.
+- Codex done-contract authoring now emits an OpenAI-strict fixed-record schema
+  for helper files, validates controller-owned schemas before provider launch,
+  and omits retired Codex feature switches instead of replaying deprecated
+  configuration into current CLIs.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 

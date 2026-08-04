@@ -1961,7 +1961,7 @@ async fn done_plain_english_uses_configured_provider() {
     let response = json!({
         "acceptance_yaml": "name: done\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'done app'\"\n    cwd: \"{working_dir}\"\n",
         "acceptance_md": "# Done Criteria\n\nREADME must contain the expected application marker.",
-        "files": {}
+        "files": []
     })
     .to_string();
     let server = MockServer::start(vec![
@@ -2125,7 +2125,7 @@ async fn acceptance_draft_uses_configured_provider() {
     let response = json!({
         "acceptance_yaml": "name: drafted\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'draft app'\"\n    cwd: \"{working_dir}\"\n",
         "acceptance_md": "# Acceptance\n\nREADME must contain the expected draft marker.",
-        "files": {}
+        "files": []
     })
     .to_string();
     let server = MockServer::start(vec![
@@ -2224,9 +2224,10 @@ async fn acceptance_add_plain_english_uses_provider_files() {
     let response = json!({
         "acceptance_yaml": "name: english\nchecks:\n  - kind: shell\n    command: \"node .deadreckon/acceptance/gallery-check.mjs\"\n    cwd: \"{working_dir}\"\n",
         "acceptance_md": "# Acceptance\n\nUsers can add and browse artwork.",
-        "files": {
-            ".deadreckon/acceptance/gallery-check.mjs": "import fs from 'node:fs';\nif (fs.readFileSync('README.md', 'utf8').trim() !== 'gallery') process.exit(1);\nconsole.log('gallery ok');\n"
-        }
+        "files": [{
+            "path": ".deadreckon/acceptance/gallery-check.mjs",
+            "contents": "import fs from 'node:fs';\nif (fs.readFileSync('README.md', 'utf8').trim() !== 'gallery') process.exit(1);\nconsole.log('gallery ok');\n"
+        }]
     })
     .to_string();
     let server = MockServer::start(vec![

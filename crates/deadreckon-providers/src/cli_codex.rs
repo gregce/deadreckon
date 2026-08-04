@@ -14,12 +14,14 @@ use crate::cli_contract::{
     flight_rows_from, session_not_found, write_schema_file,
 };
 use crate::codex_events::{
-    CodexCapabilities, STRUCTURED_TEXT_DISABLED_FEATURES, parse_codex_capabilities,
-    parse_codex_capabilities_with_features, parse_codex_line, probe_codex_capabilities,
+    CodexCapabilities, parse_codex_capabilities, parse_codex_capabilities_with_features,
+    parse_codex_line, probe_codex_capabilities, structured_text_features_to_disable,
 };
+#[cfg(test)]
+use crate::codex_events::STRUCTURED_TEXT_DISABLED_FEATURES;
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+    ProviderResponse, ProviderUsage, Result, SpendEstimate, validate_openai_strict_output_schema,
 };
 
 #[derive(Clone)]
@@ -85,8 +87,8 @@ impl CliCodexProvider {
         let structured_text_only = request.output_schema.is_some();
         let mut args = vec!["--ask-for-approval".to_string(), "never".to_string()];
         if structured_text_only {
-            for feature in STRUCTURED_TEXT_DISABLED_FEATURES {
-                args.extend(["--disable".to_string(), (*feature).to_string()]);
+            for feature in structured_text_features_to_disable(*caps) {
+                args.extend(["--disable".to_string(), feature.to_string()]);
             }
         }
         args.push("exec".to_string());
@@ -268,6 +270,9 @@ impl CliCodexProvider {
     }
 
     pub(crate) async fn run(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        if let Some(schema) = request.output_schema.as_ref() {
+            validate_openai_strict_output_schema(&self.name, schema)?;
+        }
         let caps = self.capabilities_for_request(request).await?;
         if request.output_schema.is_some() && !supports_schema_only_posture(caps) {
             return Err(ProviderError::Cli {
@@ -597,6 +602,7 @@ mod tests {
             strict_config: true,
             disable_features: true,
             structured_text_features: true,
+            structured_text_disable_mask: (1_u32 << STRUCTURED_TEXT_DISABLED_FEATURES.len()) - 1,
         }
     }
 
@@ -635,9 +641,9 @@ mod tests {
         ] {
             assert!(args.iter().any(|arg| arg == required), "{args:?}");
         }
-        for feature in STRUCTURED_TEXT_DISABLED_FEATURES {
+        for feature in structured_text_features_to_disable(schema_only_capabilities()) {
             assert!(
-                args.windows(2).any(|pair| pair == ["--disable", *feature]),
+                args.windows(2).any(|pair| pair == ["--disable", feature]),
                 "{args:?}"
             );
         }
@@ -652,6 +658,36 @@ mod tests {
         capabilities.structured_text_features = true;
         capabilities.output_schema = false;
         assert!(!supports_schema_only_posture(capabilities));
+    }
+
+    #[tokio::test]
+    async fn incompatible_schema_fails_before_codex_is_started() {
+        let provider = CliCodexProvider::new(
+            "cli:codex",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some("binary-that-must-not-run".to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let mut request = ProviderRequest::enforceably_read_only("json", 100, ".");
+        request.output_schema = Some(json!({
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "required": [],
+            "properties": {}
+        }));
+        let error = provider
+            .run(&request)
+            .await
+            .expect_err("controller schema must fail locally");
+        assert!(matches!(error, ProviderError::InvalidOutputSchema { .. }));
     }
 
     #[cfg(unix)]

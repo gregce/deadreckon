@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::{
     Provider, ProviderEntry, ProviderError, ProviderFuture, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderUsage, Result, SpendEstimate,
+    ProviderResponse, ProviderUsage, Result, SpendEstimate, validate_openai_strict_output_schema,
 };
 
 #[derive(Clone)]
@@ -137,6 +137,13 @@ impl ProviderAdapter {
     }
 
     async fn send(&self, request: &ProviderRequest) -> Result<ProviderResponse> {
+        if matches!(
+            self.kind,
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+        ) && let Some(schema) = request.output_schema.as_ref()
+        {
+            validate_openai_strict_output_schema(&self.name, schema)?;
+        }
         let headers = self.headers()?;
         let request_future = self
             .client
