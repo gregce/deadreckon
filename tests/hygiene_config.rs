@@ -611,6 +611,15 @@ fn provider_error_variants() -> Vec<ProviderError> {
             provider: "cli".to_string(),
             detail: "detail".to_string(),
         },
+        ProviderError::Cancelled {
+            provider: "cli".to_string(),
+            detail: "cancelled".to_string(),
+        },
+        ProviderError::CleanupIncomplete {
+            provider: "cli".to_string(),
+            authority: Some("provider.pid".into()),
+            detail: "retained authority".to_string(),
+        },
         ProviderError::InvalidConfig("bad".to_string()),
     ]
 }

@@ -735,6 +735,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "uuid",
  "which",
 ]
 

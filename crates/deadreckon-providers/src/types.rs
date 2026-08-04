@@ -15,6 +15,16 @@ use crate::error::Result;
 
 pub type ProviderFuture<'a> = Pin<Box<dyn Future<Output = Result<ProviderResponse>> + Send + 'a>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProcessLifetime {
+    /// The provider process belongs to one completion and must be gone when
+    /// that completion resolves.
+    Invocation,
+    /// The route deliberately retains one supervised process between normal
+    /// completions. Cancellation still requires explicit shutdown and reaping.
+    RouterSession,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderKind {
     Anthropic,
@@ -235,6 +245,9 @@ pub trait Provider: Send + Sync {
     fn model(&self) -> &str;
     fn has_credential(&self) -> bool;
     fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate;
+    fn process_lifetime(&self, _request: &ProviderRequest) -> ProviderProcessLifetime {
+        ProviderProcessLifetime::Invocation
+    }
     fn complete<'a>(&'a self, request: &'a ProviderRequest) -> ProviderFuture<'a>;
 }
 

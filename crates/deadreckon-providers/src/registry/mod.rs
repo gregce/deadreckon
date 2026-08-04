@@ -4,7 +4,6 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -14,6 +13,9 @@ use toml::Value;
 
 use crate::ProviderError;
 use crate::Result;
+use crate::WorkspaceAccess;
+use crate::cli_common::{CLI_CAPABILITY_PROBE_TIMEOUT, run_cli_capability_probe};
+use crate::phase_boundary::fresh_process_authority_path;
 
 const BUILTIN_DESCRIPTOR_SOURCES: &[(&str, &str)] = &[
     (
@@ -615,7 +617,7 @@ async fn probe_descriptor(
     options: ProviderProbeOptions,
 ) -> ProviderProbeResult {
     match descriptor.kind {
-        DescriptorKind::Cli => probe_cli_descriptor(descriptor),
+        DescriptorKind::Cli => probe_cli_descriptor(descriptor).await,
         DescriptorKind::Http => probe_http_descriptor(descriptor, options).await,
         DescriptorKind::LocalHttp => probe_local_http_descriptor(descriptor, options).await,
         DescriptorKind::Scripted => base_probe_result(
@@ -630,7 +632,7 @@ async fn probe_descriptor(
     }
 }
 
-fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult {
+async fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult {
     let Some(binary) = descriptor.default_binary.as_deref() else {
         return base_probe_result(
             descriptor,
@@ -656,25 +658,23 @@ fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult 
     if let Some(probe) = descriptor.version_probe.as_ref()
         && !probe.args.is_empty()
     {
-        match Command::new(&location).args(&probe.args).output() {
-            Ok(output) => {
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    return base_probe_result(
-                        descriptor,
-                        ProbeStatus::Failed,
-                        Some(location.display().to_string()),
-                        None,
-                        "missing",
-                        Some(ProbeErrorKind::ProbeFailed),
-                        Some(trim_probe_message(&stderr)),
-                    );
-                }
-                let version = trim_probe_message(&format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
+        let authority = fresh_process_authority_path();
+        match run_cli_capability_probe(
+            &descriptor.id,
+            &location.display().to_string(),
+            &probe.args,
+            std::env::current_dir().ok(),
+            None,
+            Some(authority.clone()),
+            None,
+            WorkspaceAccess::ReadWrite,
+            false,
+            CLI_CAPABILITY_PROBE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(output)) => {
+                let version = trim_probe_message(&format!("{}{}", output.stdout, output.stderr));
                 if let Some(expected) = probe.expect_substring.as_deref()
                     && !version.contains(expected)
                 {
@@ -711,18 +711,7 @@ fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult 
                     None,
                 );
             }
-            Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => {
-                return base_probe_result(
-                    descriptor,
-                    ProbeStatus::Failed,
-                    Some(location.display().to_string()),
-                    None,
-                    "missing",
-                    Some(ProbeErrorKind::PermissionDenied),
-                    Some(format!("permission denied running {binary}")),
-                );
-            }
-            Err(source) => {
+            Ok(None) => {
                 return base_probe_result(
                     descriptor,
                     ProbeStatus::Failed,
@@ -730,7 +719,24 @@ fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult 
                     None,
                     "missing",
                     Some(ProbeErrorKind::ProbeFailed),
-                    Some(source.to_string()),
+                    Some(format!(
+                        "version probe failed or exceeded {:.1}s",
+                        CLI_CAPABILITY_PROBE_TIMEOUT.as_secs_f64()
+                    )),
+                );
+            }
+            Err(error) => {
+                return base_probe_result(
+                    descriptor,
+                    ProbeStatus::Failed,
+                    Some(location.display().to_string()),
+                    None,
+                    "missing",
+                    Some(ProbeErrorKind::ProbeFailed),
+                    Some(format!(
+                        "{error}; process authority checkpoint: {}",
+                        authority.display()
+                    )),
                 );
             }
         }

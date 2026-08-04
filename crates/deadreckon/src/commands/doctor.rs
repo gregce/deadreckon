@@ -1,6 +1,9 @@
 use super::super::*;
 use deadreckon_core::install_receipt::{Channel, detect_channel};
-use deadreckon_providers::{CliAuthStatus, probe_cli_auth};
+use deadreckon_providers::{
+    CliAuthStatus, ProviderCleanup, ProviderPhaseDeadline, ProviderPhaseOutcome,
+    complete_provider_phase, probe_cli_auth,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1195,32 +1198,51 @@ async fn collect_doctor_provider_ping(
     kind_label: &str,
 ) -> Result<DoctorFinding> {
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
-    let request =
+    let mut request =
         ProviderRequest::enforceably_read_only("Reply with OK only.", 8, std::env::current_dir()?);
+    request.pid_file = Some(std::env::temp_dir().join(format!(
+        "deadreckon-doctor-provider-{}.pid",
+        uuid::Uuid::new_v4().simple()
+    )));
     let subject = format!("provider {name} kind={kind_label}");
-    match tokio::time::timeout(
+    let deadline = ProviderPhaseDeadline::from_now(
         std::time::Duration::from_secs(20),
-        router.complete(&request),
-    )
-    .await
-    {
-        Ok(Ok(response)) => Ok(DoctorFinding::passed(
+        std::time::Duration::from_secs(10),
+    );
+    match complete_provider_phase(&router, &mut request, deadline).await {
+        ProviderPhaseOutcome::Completed(Ok(response)) => Ok(DoctorFinding::passed(
             subject,
             format!("ping ok model {}", response.model),
             Some(format!(
                 "deadreckon run \"goal\" --provider {name} --preview"
             )),
         )),
-        Ok(Err(err)) => Ok(DoctorFinding::failed(
+        ProviderPhaseOutcome::Completed(Err(err)) => Ok(DoctorFinding::failed(
             subject,
             format!("ping failed: {err}"),
             Some("deadreckon config provider".to_string()),
         )),
-        Err(_) => Ok(DoctorFinding::failed(
+        ProviderPhaseOutcome::WorkExpired { cleanup } => Ok(DoctorFinding::failed(
             subject,
-            "ping timed out",
+            provider_ping_stop_detail("timed out", &cleanup),
             Some("deadreckon config provider".to_string()),
         )),
+        ProviderPhaseOutcome::Cancelled { cleanup } => Ok(DoctorFinding::failed(
+            subject,
+            provider_ping_stop_detail("was cancelled", &cleanup),
+            Some("deadreckon config provider".to_string()),
+        )),
+    }
+}
+
+fn provider_ping_stop_detail(reason: &str, cleanup: &ProviderCleanup) -> String {
+    match cleanup {
+        ProviderCleanup::Proven => format!("ping {reason}; provider cleanup proven"),
+        ProviderCleanup::NotApplicable => format!("ping {reason}"),
+        ProviderCleanup::RetainedAuthority { path, detail } => format!(
+            "ping {reason}; provider cleanup was not proven ({detail}); process authority remains at {}",
+            path.display()
+        ),
     }
 }
 

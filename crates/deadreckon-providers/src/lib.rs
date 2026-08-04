@@ -15,6 +15,7 @@ mod error;
 mod http;
 mod model_catalog;
 mod output_schema;
+mod phase_boundary;
 mod router;
 mod smoke;
 mod types;
@@ -36,11 +37,15 @@ pub use narrator::{
     select_narrator_route,
 };
 pub use output_schema::validate_openai_strict_output_schema;
+pub use phase_boundary::{
+    ProviderCleanup, ProviderPhaseDeadline, ProviderPhaseOutcome, complete_provider_phase,
+};
 pub use registry::{ModelCatalogOverride, ModelEntry};
 pub use router::{ModelContextWindowSource, ProviderRouter};
 pub use types::{
-    Provider, ProviderConfigFile, ProviderEntry, ProviderFuture, ProviderKind, ProviderRequest,
-    ProviderResponse, ProviderRouteInfo, ProviderUsage, SpendEstimate,
+    Provider, ProviderConfigFile, ProviderEntry, ProviderFuture, ProviderKind,
+    ProviderProcessLifetime, ProviderRequest, ProviderResponse, ProviderRouteInfo, ProviderUsage,
+    SpendEstimate,
 };
 
 #[cfg(test)]
