@@ -6665,9 +6665,50 @@ pub(crate) async fn complete_merged_plan_parent(
             return Ok(completion);
         }
         verify_parent_result_identity(paths, job, &existing, &merged)?;
-        if let Ok(receipt) = deadreckon_core::validate_completion_receipt(paths, &existing) {
-            let receipt = validate_and_promote_parent(paths, &mut existing, &receipt)?;
-            return Ok(ParentCompletion::Verified(Box::new(receipt)));
+        let cancellation = ParentCompletionCancellation::start(&existing)?;
+        let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+        match deadreckon_core::validate_completion_receipt_bounded(
+            paths,
+            &existing,
+            parent_completion_git_scope(
+                &existing,
+                &cancellation,
+                phase_deadline,
+                "existing graph parent receipt validation",
+            ),
+        ) {
+            Ok(receipt) => {
+                let receipt = match validate_and_promote_parent(
+                    paths,
+                    &mut existing,
+                    &receipt,
+                    &cancellation,
+                    phase_deadline,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(CliError::Core(error)) => {
+                        if let Some(terminal) = settle_parent_process_boundary(
+                            &mut existing,
+                            &error,
+                            "existing graph parent receipt promotion",
+                        )? {
+                            return Ok(terminal);
+                        }
+                        return Err(CliError::Core(error));
+                    }
+                    Err(error) => return Err(error),
+                };
+                return Ok(ParentCompletion::Verified(Box::new(receipt)));
+            }
+            Err(error) => {
+                if let Some(terminal) = settle_parent_process_boundary(
+                    &mut existing,
+                    &error,
+                    "existing graph parent receipt validation",
+                )? {
+                    return Ok(terminal);
+                }
+            }
         }
         if let Some(reason) = existing
             .failure_reason
@@ -6989,9 +7030,50 @@ pub(crate) async fn complete_merged_campaign_parent(
                 &rollup,
             )?;
         }
-        if let Ok(receipt) = deadreckon_core::validate_completion_receipt(paths, &existing) {
-            let receipt = validate_and_promote_parent(paths, &mut existing, &receipt)?;
-            return Ok(ParentCompletion::Verified(Box::new(receipt)));
+        let cancellation = ParentCompletionCancellation::start(&existing)?;
+        let phase_deadline = parent_completion_phase_deadline(paths, job)?;
+        match deadreckon_core::validate_completion_receipt_bounded(
+            paths,
+            &existing,
+            parent_completion_git_scope(
+                &existing,
+                &cancellation,
+                phase_deadline,
+                "existing campaign parent receipt validation",
+            ),
+        ) {
+            Ok(receipt) => {
+                let receipt = match validate_and_promote_parent(
+                    paths,
+                    &mut existing,
+                    &receipt,
+                    &cancellation,
+                    phase_deadline,
+                ) {
+                    Ok(receipt) => receipt,
+                    Err(CliError::Core(error)) => {
+                        if let Some(terminal) = settle_parent_process_boundary(
+                            &mut existing,
+                            &error,
+                            "existing campaign parent receipt promotion",
+                        )? {
+                            return Ok(terminal);
+                        }
+                        return Err(CliError::Core(error));
+                    }
+                    Err(error) => return Err(error),
+                };
+                return Ok(ParentCompletion::Verified(Box::new(receipt)));
+            }
+            Err(error) => {
+                if let Some(terminal) = settle_parent_process_boundary(
+                    &mut existing,
+                    &error,
+                    "existing campaign parent receipt validation",
+                )? {
+                    return Ok(terminal);
+                }
+            }
         }
         if let Some(reason) = existing
             .failure_reason
@@ -8825,11 +8907,27 @@ fn seal_achieved_parent(
             "approved Job work cutoff reached before the verified parent receipt was sealed",
         );
     }
-    let receipt = match deadreckon_core::seal_completion_receipt(
-        paths, parent, authority, marker, judgment,
+    let receipt_scope = parent_completion_git_scope(
+        parent,
+        cancellation,
+        phase_deadline,
+        "parent completion receipt sealing",
+    );
+    let receipt = match deadreckon_core::seal_completion_receipt_bounded(
+        paths,
+        parent,
+        authority,
+        marker,
+        judgment,
+        receipt_scope,
     ) {
         Ok(receipt) => receipt,
         Err(error) => {
+            if let Some(terminal) =
+                settle_parent_process_boundary(parent, &error, "parent completion receipt sealing")?
+            {
+                return Ok(terminal);
+            }
             return parent_needs_review(
                 parent,
                 &format!(
@@ -8855,8 +8953,82 @@ fn seal_achieved_parent(
             "approved Job work cutoff reached while the verified parent receipt was being sealed",
         );
     }
-    let receipt = validate_and_promote_parent(paths, parent, &receipt)?;
+    let receipt =
+        match validate_and_promote_parent(paths, parent, &receipt, cancellation, phase_deadline) {
+            Ok(receipt) => receipt,
+            Err(CliError::Core(error)) => {
+                if let Some(terminal) = settle_parent_process_boundary(
+                    parent,
+                    &error,
+                    "parent receipt validation or promotion",
+                )? {
+                    return Ok(terminal);
+                }
+                return Err(CliError::Core(error));
+            }
+            Err(error) => return Err(error),
+        };
     Ok(ParentCompletion::Verified(Box::new(receipt)))
+}
+
+fn parent_completion_git_scope(
+    parent: &deadreckon_core::PipelineState,
+    cancellation: &ParentCompletionCancellation,
+    phase_deadline: ProviderPhaseDeadline,
+    operation: &str,
+) -> deadreckon_core::git::WorkBoundaryScope {
+    let token = cancellation.token().clone();
+    deadreckon_core::git::WorkBoundaryScope::new(
+        phase_deadline.work_expires_at.into_std(),
+        phase_deadline.cleanup_budget,
+        move || token.is_cancelled(),
+        operation,
+    )
+    .with_authority_dir(parent.run_root.join("child-pids"))
+}
+
+fn settle_parent_process_boundary(
+    parent: &mut deadreckon_core::PipelineState,
+    error: &DeadreckonError,
+    context: &str,
+) -> Result<Option<ParentCompletion>> {
+    let DeadreckonError::ProcessBoundary {
+        kind,
+        authority,
+        detail,
+        ..
+    } = error
+    else {
+        return Ok(None);
+    };
+    let terminal = match kind {
+        deadreckon_core::ProcessBoundaryKind::WorkExpired => parent_budget_exhausted(
+            parent,
+            StopReason::WallCap,
+            &format!("approved Job work cutoff reached during {context}"),
+        )?,
+        deadreckon_core::ProcessBoundaryKind::Cancelled => {
+            parent_cancelled(parent, &format!("operator cancelled during {context}"))?
+        }
+        deadreckon_core::ProcessBoundaryKind::CleanupIncomplete => parent_failed(
+            parent,
+            &format!(
+                "LOST_CONTAINMENT: {context} retained process authority{}: {detail}",
+                authority
+                    .as_deref()
+                    .map(|path| format!(" at {}", path.display()))
+                    .unwrap_or_default()
+            ),
+            StopReason::LostContainment,
+        )?,
+        deadreckon_core::ProcessBoundaryKind::SupervisionFailed => parent_needs_review(
+            parent,
+            &format!("{context} could not be supervised after cleanup was proven: {detail}"),
+            Some(SemanticDecision::Achieved),
+            StopReason::SemanticUnavailable,
+        )?,
+    };
+    Ok(Some(terminal))
 }
 
 fn parent_cancelled(
@@ -8878,10 +9050,21 @@ fn validate_and_promote_parent(
     paths: &DeadreckonPaths,
     parent: &mut deadreckon_core::PipelineState,
     expected: &CompletionReceipt,
+    cancellation: &ParentCompletionCancellation,
+    phase_deadline: ProviderPhaseDeadline,
 ) -> Result<CompletionReceipt> {
     // Receipt validation is deliberately before promotion: no unverified
     // parent tree may enter the library that `finish` delivers.
-    let validated = deadreckon_core::validate_completion_receipt(paths, parent)?;
+    let validated = deadreckon_core::validate_completion_receipt_bounded(
+        paths,
+        parent,
+        parent_completion_git_scope(
+            parent,
+            cancellation,
+            phase_deadline,
+            "parent receipt validation before promotion",
+        ),
+    )?;
     if &validated != expected {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "sealed graph receipt did not round-trip through the finish validator".to_string(),
@@ -8892,8 +9075,26 @@ fn validate_and_promote_parent(
         parent.set_phase_status(PhaseId(60), PhaseStatus::Completed)?;
         deadreckon_core::save_state(parent)?;
     }
-    deadreckon_core::promote_completed_run(paths, parent)?;
-    let promoted = deadreckon_core::validate_completion_receipt(paths, parent)?;
+    deadreckon_core::promotion::promote_completed_run_bounded(
+        paths,
+        parent,
+        parent_completion_git_scope(
+            parent,
+            cancellation,
+            phase_deadline,
+            "parent result promotion",
+        ),
+    )?;
+    let promoted = deadreckon_core::validate_completion_receipt_bounded(
+        paths,
+        parent,
+        parent_completion_git_scope(
+            parent,
+            cancellation,
+            phase_deadline,
+            "parent receipt validation after promotion",
+        ),
+    )?;
     if promoted != validated {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "graph receipt changed while promoting the parent result".to_string(),
@@ -11068,6 +11269,107 @@ mod tests {
                 now,
             ),
             std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn parent_receipt_work_expiry_stays_a_wall_cap_terminal() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(temp.path().join("source")).expect("source");
+        let mut parent = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "bounded parent receipt".to_string(),
+                cwd: temp.path().join("source"),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("parent-boundary".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("parent run");
+        let error = DeadreckonError::ProcessBoundary {
+            kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            operation: "parent receipt".to_string(),
+            authority: None,
+            detail: "cutoff reached".to_string(),
+        };
+
+        let terminal = settle_parent_process_boundary(
+            &mut parent,
+            &error,
+            "parent completion receipt sealing",
+        )
+        .expect("settlement")
+        .expect("typed boundary");
+
+        assert!(matches!(
+            terminal,
+            ParentCompletion::BudgetExhausted {
+                stop_reason: StopReason::WallCap,
+                ..
+            }
+        ));
+        assert!(
+            parent
+                .pause_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("work cutoff"))
+        );
+    }
+
+    #[test]
+    fn parent_receipt_incomplete_cleanup_fails_as_lost_containment() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(temp.path().join("source")).expect("source");
+        let mut parent = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "contained parent receipt".to_string(),
+                cwd: temp.path().join("source"),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("parent-containment".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("parent run");
+        let authority = parent.run_root.join("child-pids/git-test.json");
+        let error = DeadreckonError::ProcessBoundary {
+            kind: deadreckon_core::ProcessBoundaryKind::CleanupIncomplete,
+            operation: "parent receipt".to_string(),
+            authority: Some(authority.clone()),
+            detail: "process group still alive".to_string(),
+        };
+
+        let terminal = settle_parent_process_boundary(
+            &mut parent,
+            &error,
+            "parent completion receipt sealing",
+        )
+        .expect("settlement")
+        .expect("typed boundary");
+
+        assert!(matches!(
+            terminal,
+            ParentCompletion::Failed {
+                stop_reason: StopReason::LostContainment,
+                ..
+            }
+        ));
+        assert!(
+            parent
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains(authority.to_string_lossy().as_ref()))
         );
     }
 

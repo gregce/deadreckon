@@ -73,8 +73,8 @@ pub use codebase::{
     write_codebase_record, write_trusted_codebase_record,
 };
 pub use completion::{
-    SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, validate_completion_receipt,
-    validate_strict_contract,
+    SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, seal_completion_receipt_bounded,
+    validate_completion_receipt, validate_completion_receipt_bounded, validate_strict_contract,
 };
 pub use delivery::{
     GitDeliveryTarget, JobOperationLock, ValidatedAppliedGitDeliveryReceipt,
@@ -97,7 +97,7 @@ pub use docs::{
     polish_path, public_doc_path, public_docs_dir, publish_docs_for_promotion, read_turn_records,
     rewrite_templated_docs, should_emit_delta, source_layout, tool_stdio_markdown,
 };
-pub use error::{DeadreckonError, Result, is_retryable_io_kind};
+pub use error::{DeadreckonError, ProcessBoundaryKind, Result, is_retryable_io_kind};
 pub use events::{RUN_EVENTS_JSONL, RunEventBus, emit_event, event_preview};
 #[cfg(unix)]
 pub use exec::ProcessGroupTerminator;

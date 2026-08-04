@@ -1,5 +1,19 @@
 use std::path::PathBuf;
 
+/// Typed reason an owned local subprocess crossed its controller boundary.
+///
+/// Keeping these reasons out of free-form error strings lets the supervisor
+/// preserve terminal precedence: cancellation stays cancellation, exhausted
+/// work stays a wall-cap stop, and incomplete cleanup fails closed as lost
+/// containment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessBoundaryKind {
+    WorkExpired,
+    Cancelled,
+    SupervisionFailed,
+    CleanupIncomplete,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeadreckonError {
     #[error("I/O error at {path}: {source}")]
@@ -27,6 +41,13 @@ pub enum DeadreckonError {
         phase: String,
         heartbeat_age_seconds: u64,
     },
+    #[error("{kind:?} process boundary during {operation}: {detail}")]
+    ProcessBoundary {
+        kind: ProcessBoundaryKind,
+        operation: String,
+        authority: Option<PathBuf>,
+        detail: String,
+    },
 }
 
 impl DeadreckonError {
@@ -38,6 +59,7 @@ impl DeadreckonError {
             DeadreckonError::InvalidInput(_) => false,
             DeadreckonError::NotFound(_) => false,
             DeadreckonError::LockHeld { .. } => true,
+            DeadreckonError::ProcessBoundary { .. } => false,
         }
     }
 
@@ -49,6 +71,10 @@ impl DeadreckonError {
             DeadreckonError::InvalidInput(_) => true,
             DeadreckonError::NotFound(_) => true,
             DeadreckonError::LockHeld { .. } => false,
+            DeadreckonError::ProcessBoundary { kind, .. } => matches!(
+                kind,
+                ProcessBoundaryKind::SupervisionFailed | ProcessBoundaryKind::CleanupIncomplete
+            ),
         }
     }
 }

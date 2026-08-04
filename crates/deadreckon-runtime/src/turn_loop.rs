@@ -58,7 +58,7 @@ use deadreckon_core::git::{
     run_git_with_input, run_git_with_input_bounded,
 };
 use deadreckon_core::paths::DeadreckonPaths;
-use deadreckon_core::promotion::promote_completed_run;
+use deadreckon_core::promotion::promote_completed_run_bounded;
 use deadreckon_core::state::{
     PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state,
 };
@@ -485,8 +485,28 @@ async fn run_turn_loop_inner(
         )? {
             return Ok(outcome);
         }
-        let snapshot_result = snapshot_working(state, turn.saturating_sub(1));
-        persist_work_boundary(state, &work_clock, snapshot_result)?;
+        let snapshot_result = snapshot_working_bounded(
+            state,
+            turn.saturating_sub(1),
+            provider_phase_deadline,
+            &run_token,
+        );
+        let snapshot_result = persist_work_boundary(state, &work_clock, snapshot_result);
+        if let Err(error) = &snapshot_result
+            && let Some(outcome) = settle_local_work_boundary(
+                state,
+                turn,
+                &mut history,
+                error,
+                PhaseId(40),
+                "pre-provider workspace snapshot",
+                config.event_sender.as_ref(),
+                &work_clock,
+            )?
+        {
+            return Ok(outcome);
+        }
+        snapshot_result?;
         let selected_route = router.selected_route_info();
         let selected_provider = config
             .provider
@@ -867,8 +887,24 @@ async fn run_turn_loop_inner(
             let raw_changed = persist_work_boundary(state, &work_clock, changed_result)?;
             let deliverable_result = deliverable_changed_files(state, &raw_changed);
             let changed = persist_work_boundary(state, &work_clock, deliverable_result)?;
-            let snapshot_result = snapshot_working(state, turn);
-            persist_work_boundary(state, &work_clock, snapshot_result)?;
+            let snapshot_result =
+                snapshot_working_bounded(state, turn, provider_phase_deadline, &run_token);
+            let snapshot_result = persist_work_boundary(state, &work_clock, snapshot_result);
+            if let Err(error) = &snapshot_result
+                && let Some(outcome) = settle_local_work_boundary(
+                    state,
+                    turn,
+                    &mut history,
+                    error,
+                    PhaseId(40),
+                    "CLI provider workspace snapshot",
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                )?
+            {
+                return Ok(outcome);
+            }
+            snapshot_result?;
             append_trace(
                 state,
                 &TraceRecord {
@@ -1166,8 +1202,22 @@ async fn run_turn_loop_inner(
             }
             state.set_phase_status(PhaseId(60), PhaseStatus::Executing)?;
             work_clock.save(state)?;
-            let promotion_result = promote_if_ready(state);
+            let promotion_result = promote_if_ready(state, provider_phase_deadline, &run_token);
             let promotion_result = persist_work_boundary(state, &work_clock, promotion_result);
+            if let Err(error) = &promotion_result
+                && let Some(outcome) = settle_local_work_boundary(
+                    state,
+                    turn,
+                    &mut history,
+                    error,
+                    PhaseId(60),
+                    "result promotion",
+                    config.event_sender.as_ref(),
+                    &work_clock,
+                )?
+            {
+                return Ok(outcome);
+            }
             if promotion_result.is_err() {
                 state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
                 work_clock.save(state)?;
@@ -1355,8 +1405,24 @@ async fn run_turn_loop_inner(
                 let raw_changed = persist_work_boundary(state, &work_clock, changed_result)?;
                 let deliverable_result = deliverable_changed_files(state, &raw_changed);
                 let changed = persist_work_boundary(state, &work_clock, deliverable_result)?;
-                let snapshot_result = snapshot_working(state, turn);
-                persist_work_boundary(state, &work_clock, snapshot_result)?;
+                let snapshot_result =
+                    snapshot_working_bounded(state, turn, provider_phase_deadline, &run_token);
+                let snapshot_result = persist_work_boundary(state, &work_clock, snapshot_result);
+                if let Err(error) = &snapshot_result
+                    && let Some(outcome) = settle_local_work_boundary(
+                        state,
+                        turn,
+                        &mut history,
+                        error,
+                        PhaseId(40),
+                        "bash tool workspace snapshot",
+                        config.event_sender.as_ref(),
+                        &work_clock,
+                    )?
+                {
+                    return Ok(outcome);
+                }
+                snapshot_result?;
                 let provenance_result = append_provenance_for_files(
                     state,
                     turn,
@@ -1499,8 +1565,24 @@ async fn run_turn_loop_inner(
                         }),
                     },
                 )?;
-                let snapshot_result = snapshot_working(state, turn);
-                persist_work_boundary(state, &work_clock, snapshot_result)?;
+                let snapshot_result =
+                    snapshot_working_bounded(state, turn, provider_phase_deadline, &run_token);
+                let snapshot_result = persist_work_boundary(state, &work_clock, snapshot_result);
+                if let Err(error) = &snapshot_result
+                    && let Some(outcome) = settle_local_work_boundary(
+                        state,
+                        turn,
+                        &mut history,
+                        error,
+                        PhaseId(40),
+                        "write-file workspace snapshot",
+                        config.event_sender.as_ref(),
+                        &work_clock,
+                    )?
+                {
+                    return Ok(outcome);
+                }
+                snapshot_result?;
                 let changed = vec![target.clone()];
                 let provenance_result = append_provenance_for_files(
                     state,
@@ -1810,8 +1892,22 @@ async fn run_turn_loop_inner(
                 }
                 state.set_phase_status(PhaseId(60), PhaseStatus::Executing)?;
                 work_clock.save(state)?;
-                let promotion_result = promote_if_ready(state);
+                let promotion_result = promote_if_ready(state, provider_phase_deadline, &run_token);
                 let promotion_result = persist_work_boundary(state, &work_clock, promotion_result);
+                if let Err(error) = &promotion_result
+                    && let Some(outcome) = settle_local_work_boundary(
+                        state,
+                        turn,
+                        &mut history,
+                        error,
+                        PhaseId(60),
+                        "result promotion",
+                        config.event_sender.as_ref(),
+                        &work_clock,
+                    )?
+                {
+                    return Ok(outcome);
+                }
                 if promotion_result.is_err() {
                     state.set_phase_status(PhaseId(60), PhaseStatus::Failed)?;
                     work_clock.save(state)?;
@@ -3483,9 +3579,118 @@ fn truncate_jsonl_after_turn(path: &Path, from_turn: u32) -> Result<()> {
     .with_path(path)
 }
 
-fn promote_if_ready(state: &mut PipelineState) -> Result<()> {
+fn run_work_boundary_scope(
+    state: &PipelineState,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: &CancellationToken,
+    operation: &str,
+) -> deadreckon_core::git::WorkBoundaryScope {
+    let cancellation = cancellation_token.clone();
+    deadreckon_core::git::WorkBoundaryScope::new(
+        phase_deadline.work_expires_at.into_std(),
+        phase_deadline.cleanup_budget,
+        move || cancellation.is_cancelled(),
+        operation,
+    )
+    .with_authority_dir(state.run_root.join("child-pids"))
+}
+
+fn snapshot_working_bounded(
+    state: &PipelineState,
+    turn: u32,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: &CancellationToken,
+) -> Result<()> {
+    let scope = run_work_boundary_scope(
+        state,
+        phase_deadline,
+        cancellation_token,
+        "workspace snapshot",
+    );
+    deadreckon_core::git::with_git_command_scope(scope, || snapshot_working(state, turn))
+        .map(|_| ())
+}
+
+fn promote_if_ready(
+    state: &mut PipelineState,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: &CancellationToken,
+) -> Result<()> {
     let paths = paths_for_state(state)?;
-    promote_completed_run(&paths, state).map(|_| ())
+    let scope = run_work_boundary_scope(
+        state,
+        phase_deadline,
+        cancellation_token,
+        "result promotion",
+    );
+    promote_completed_run_bounded(&paths, state, scope).map(|_| ())
+}
+
+fn settle_local_work_boundary(
+    state: &mut PipelineState,
+    turn: u32,
+    history: &mut Vec<String>,
+    error: &DeadreckonError,
+    phase: PhaseId,
+    context: &str,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+    work_clock: &RunWorkClock,
+) -> Result<Option<RunLoopOutcome>> {
+    let DeadreckonError::ProcessBoundary {
+        kind,
+        authority,
+        detail,
+        ..
+    } = error
+    else {
+        return Ok(None);
+    };
+    let outcome = match kind {
+        deadreckon_core::ProcessBoundaryKind::WorkExpired => {
+            let reason =
+                format!("wall-clock cap reached during {context} (approved Job work cutoff)");
+            state.pause_reason = Some(reason.clone());
+            state.failure_reason = Some(reason);
+            state.set_phase_status(phase, PhaseStatus::Failed)?;
+            work_clock.save(state)?;
+            RunLoopOutcome::PausedAtCap
+        }
+        deadreckon_core::ProcessBoundaryKind::Cancelled => {
+            state.status = RunStatus::Killed;
+            state.failure_reason = Some(format!("operator cancelled during {context}"));
+            state.set_phase_status(phase, PhaseStatus::Failed)?;
+            work_clock.save(state)?;
+            RunLoopOutcome::Killed
+        }
+        deadreckon_core::ProcessBoundaryKind::CleanupIncomplete => {
+            let reason = format!(
+                "{context} lost process containment{}: {detail}",
+                authority
+                    .as_deref()
+                    .map(|path| format!("; authority retained at {}", path.display()))
+                    .unwrap_or_default()
+            );
+            record_semantic_lost_containment(state, turn, history, &reason, work_clock)?;
+            state.set_phase_status(phase, PhaseStatus::Failed)?;
+            RunLoopOutcome::Failed
+        }
+        deadreckon_core::ProcessBoundaryKind::SupervisionFailed => {
+            record_needs_review(
+                state,
+                turn,
+                history,
+                &format!(
+                    "{context} subprocess supervision failed after cleanup was proven: {detail}"
+                ),
+                work_clock,
+            )?;
+            state.set_phase_status(phase, PhaseStatus::Failed)?;
+            RunLoopOutcome::Failed
+        }
+    };
+    work_clock.save(state)?;
+    emit_run_completed(state, sender, outcome.clone())?;
+    Ok(Some(outcome))
 }
 
 async fn complete_run_docs(
@@ -4678,8 +4883,18 @@ async fn semantic_completion_disposition(
     }
     match semantic_run.result {
         crate::semantic_judge::SemanticJudgeResult::Achieved(judgment) => {
+            let phase_deadline =
+                work_clock.provider_phase_deadline(Some(job.policy.max_wall_seconds as f64))?;
             seal_achieved_semantic_completion(
-                state, &paths, turn, marker, &judgment, history, work_clock,
+                state,
+                &paths,
+                turn,
+                marker,
+                &judgment,
+                history,
+                work_clock,
+                phase_deadline,
+                cancellation_token,
             )
         }
         crate::semantic_judge::SemanticJudgeResult::Revise(judgment) => {
@@ -4727,6 +4942,8 @@ fn seal_achieved_semantic_completion(
     judgment: &deadreckon_protocol::SemanticJudgment,
     history: &mut Vec<String>,
     work_clock: &RunWorkClock,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: &CancellationToken,
 ) -> Result<SemanticCompletionDisposition> {
     let seal_result = (|| -> Result<()> {
         crate::semantic_judge::validate_semantic_judgment_input(state, marker, judgment)?;
@@ -4740,10 +4957,56 @@ fn seal_achieved_semantic_completion(
                 path: authority_path,
                 source,
             })?;
-        deadreckon_core::seal_completion_receipt(paths, state, &authority, marker, judgment)?;
+        let cancellation = cancellation_token.clone();
+        let scope = deadreckon_core::git::WorkBoundaryScope::new(
+            phase_deadline.work_expires_at.into_std(),
+            phase_deadline.cleanup_budget,
+            move || cancellation.is_cancelled(),
+            "completion receipt sealing",
+        )
+        .with_authority_dir(state.run_root.join("child-pids"));
+        deadreckon_core::seal_completion_receipt_bounded(
+            paths, state, &authority, marker, judgment, scope,
+        )?;
         Ok(())
     })();
     if let Err(error) = seal_result {
+        if let DeadreckonError::ProcessBoundary {
+            kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+            ..
+        } = &error
+        {
+            state.pause_reason = Some(
+                "approved Job work cutoff reached while sealing the completion receipt".to_string(),
+            );
+            state.failure_reason = state.pause_reason.clone();
+            work_clock.save(state)?;
+            return Ok(SemanticCompletionDisposition::BudgetExhausted);
+        }
+        if let DeadreckonError::ProcessBoundary {
+            kind: deadreckon_core::ProcessBoundaryKind::Cancelled,
+            ..
+        } = &error
+        {
+            return Ok(SemanticCompletionDisposition::Cancelled);
+        }
+        if let DeadreckonError::ProcessBoundary {
+            kind: deadreckon_core::ProcessBoundaryKind::CleanupIncomplete,
+            authority,
+            detail,
+            ..
+        } = &error
+        {
+            let reason = format!(
+                "completion receipt sealing lost process containment{}: {detail}",
+                authority
+                    .as_deref()
+                    .map(|path| format!("; authority retained at {}", path.display()))
+                    .unwrap_or_default()
+            );
+            record_semantic_lost_containment(state, turn, history, &reason, work_clock)?;
+            return Ok(SemanticCompletionDisposition::LostContainment);
+        }
         record_needs_review(
             state,
             turn,
@@ -6850,8 +7113,8 @@ mod tests {
         PhaseId, PhaseStatus, PipelineState, RunOptions, RunStatus, create_run, spend_summary,
     };
     use deadreckon_core::{
-        CodebaseMode, CodebaseRecord, TurnDocInput, append_turn_doc, implementation_notes_path,
-        snapshot_working,
+        CodebaseMode, CodebaseRecord, DeadreckonError, TurnDocInput, append_turn_doc,
+        implementation_notes_path, snapshot_working,
     };
     use deadreckon_protocol::{
         FlightEventKind, RunEventKind, RunId, SemanticDecision, SemanticJudgment,
@@ -6870,12 +7133,13 @@ mod tests {
         is_direct_api_provider_kind, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, persist_parent_repair_candidate, persist_work_boundary,
-        policy_seam_refusal, policy_seam_refusal_message, provider_failure_disposition,
-        provider_output_name, read_turn_codebase_record, record_provider_interruption,
-        record_semantic_judge_accounting, refuse_gitlinks, revise_verification,
-        run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop, safe_working_path,
-        safe_working_path_with_policy, save_history, seal_achieved_semantic_completion,
-        semantic_completion_disposition, wait_for_provider_retry, write_workspace_file_no_follow,
+        policy_seam_refusal, policy_seam_refusal_message, promote_if_ready,
+        provider_failure_disposition, provider_output_name, read_turn_codebase_record,
+        record_provider_interruption, record_semantic_judge_accounting, refuse_gitlinks,
+        revise_verification, run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop,
+        safe_working_path, safe_working_path_with_policy, save_history,
+        seal_achieved_semantic_completion, semantic_completion_disposition,
+        snapshot_working_bounded, wait_for_provider_retry, write_workspace_file_no_follow,
     };
 
     fn load_history_with_work_clock(
@@ -7458,6 +7722,10 @@ mod tests {
         };
         let mut history = Vec::new();
         let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let phase_deadline = work_clock
+            .provider_phase_deadline(Some(60.0))
+            .expect("phase deadline");
+        let cancellation = tokio_util::sync::CancellationToken::new();
         let disposition = seal_achieved_semantic_completion(
             &mut state,
             &paths,
@@ -7466,6 +7734,8 @@ mod tests {
             &judgment,
             &mut history,
             &work_clock,
+            phase_deadline,
+            &cancellation,
         )
         .expect("semantic disposition");
 
@@ -7485,6 +7755,57 @@ mod tests {
                 .is_some_and(|reason| reason.contains("receipt could not be sealed"))
         );
         assert_eq!(state.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn workspace_snapshot_does_not_start_after_the_job_cutoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "bounded snapshot");
+        let deadline = ProviderPhaseDeadline::new(
+            tokio::time::Instant::now(),
+            std::time::Duration::from_secs(3),
+        );
+
+        let error = snapshot_working_bounded(
+            &state,
+            1,
+            deadline,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .expect_err("expired Job cutoff must prevent a snapshot");
+
+        assert!(matches!(
+            error,
+            DeadreckonError::ProcessBoundary {
+                kind: deadreckon_core::ProcessBoundaryKind::WorkExpired,
+                ..
+            }
+        ));
+        assert!(!state.run_root.join("snapshots/turn-1").exists());
+    }
+
+    #[test]
+    fn result_promotion_does_not_start_after_cancellation() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "cancelled promotion");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let deadline = ProviderPhaseDeadline::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(3),
+        );
+
+        let error = promote_if_ready(&mut state, deadline, &cancellation)
+            .expect_err("cancelled Job must prevent promotion");
+
+        assert!(matches!(
+            error,
+            DeadreckonError::ProcessBoundary {
+                kind: deadreckon_core::ProcessBoundaryKind::Cancelled,
+                ..
+            }
+        ));
+        assert!(!paths.library_dir(&state.scope, &state.run_id).exists());
     }
 
     #[tokio::test]
