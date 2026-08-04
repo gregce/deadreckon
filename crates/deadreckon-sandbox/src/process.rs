@@ -13,6 +13,18 @@ use crate::commands::build_command;
 use crate::docker::{DockerExecution, reconcile_docker_execution};
 use crate::spec::{GuardedLaunchSpec, SandboxSpec, WorkspaceAccess};
 
+const OUTPUT_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const OUTPUT_CAPTURE_HEAD_BYTES: usize = OUTPUT_CAPTURE_LIMIT_BYTES / 2;
+const OUTPUT_CAPTURE_TAIL_BYTES: usize = OUTPUT_CAPTURE_LIMIT_BYTES - OUTPUT_CAPTURE_HEAD_BYTES;
+const OUTPUT_READ_BUFFER_BYTES: usize = 64 * 1024;
+
+#[cfg(unix)]
+const PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(250);
+#[cfg(unix)]
+const PROCESS_GROUP_KILL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRunOutput {
     pub backend: SandboxBackend,
@@ -148,6 +160,7 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         let Some(mut release) = child.stdin.take() else {
             signal_process(pid, true, false);
             let _ = child.wait().await;
+            cleanup_residual_process_tree(pid).await?;
             reconcile_optional_docker(docker_execution.as_ref())?;
             remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(SandboxError::Io(std::io::Error::other(
@@ -163,7 +176,9 @@ pub async fn run(mut spec: SandboxSpec) -> Result<SandboxRunOutput> {
         {
             signal_process(pid, true, false);
             let _ = child.wait().await;
+            let process_cleanup = cleanup_residual_process_tree(pid).await;
             let docker_cleanup = reconcile_optional_docker(docker_execution.as_ref());
+            process_cleanup?;
             docker_cleanup?;
             remove_pid_file(&spec, process_record_identity.as_ref()).await?;
             return Err(error.into());
@@ -386,7 +401,6 @@ fn configure_process_tree(_command: &mut Command, _cleanup_process_group: bool) 
 
 #[cfg(unix)]
 async fn cleanup_residual_process_tree(pid: u32) -> Result<()> {
-    use nix::errno::Errno;
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
@@ -398,28 +412,27 @@ async fn cleanup_residual_process_tree(pid: u32) -> Result<()> {
         )));
     }
     let group = Pid::from_raw(-pid);
-    match kill(group, None) {
-        Err(Errno::ESRCH) => return Ok(()),
-        Ok(()) => {}
-        Err(error) => return Err(process_tree_error("inspect", pid, error)),
+    if process_group_is_absent(pid, kill(group, None))? {
+        return Ok(());
     }
-    match kill(group, Some(Signal::SIGTERM)) {
-        Err(Errno::ESRCH) => return Ok(()),
-        Ok(()) => {}
-        Err(error) => return Err(process_tree_error("terminate", pid, error)),
+    if !signal_process_group(group, pid, Signal::SIGTERM, "terminate")? {
+        return Ok(());
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
-    while tokio::time::Instant::now() < deadline {
-        match kill(group, None) {
-            Err(Errno::ESRCH) | Err(Errno::EPERM) => return Ok(()),
-            Ok(()) => sleep(Duration::from_millis(10)).await,
-            Err(error) => return Err(process_tree_error("inspect", pid, error)),
-        }
+    if wait_for_process_group_exit(group, pid, PROCESS_GROUP_TERM_GRACE).await? {
+        return Ok(());
     }
-    match kill(group, Some(Signal::SIGKILL)) {
-        Ok(()) | Err(Errno::ESRCH) | Err(Errno::EPERM) => Ok(()),
-        Err(error) => Err(process_tree_error("kill", pid, error)),
+    if !signal_process_group(group, pid, Signal::SIGKILL, "kill")? {
+        return Ok(());
     }
+    if wait_for_process_group_exit(group, pid, PROCESS_GROUP_KILL_CONFIRM_TIMEOUT).await? {
+        return Ok(());
+    }
+    Err(SandboxError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "could not prove sandbox process group {pid} exited after SIGKILL; retaining process authority"
+        ),
+    )))
 }
 
 #[cfg(not(unix))]
@@ -434,6 +447,50 @@ fn process_tree_error(operation: &str, pid: i32, error: nix::errno::Errno) -> Sa
     )))
 }
 
+#[cfg(unix)]
+fn process_group_is_absent(
+    pid: i32,
+    probe: std::result::Result<(), nix::errno::Errno>,
+) -> Result<bool> {
+    match probe {
+        Err(nix::errno::Errno::ESRCH) => Ok(true),
+        Ok(()) => Ok(false),
+        Err(error) => Err(process_tree_error("inspect", pid, error)),
+    }
+}
+
+#[cfg(unix)]
+fn signal_process_group(
+    group: nix::unistd::Pid,
+    pid: i32,
+    signal: nix::sys::signal::Signal,
+    operation: &str,
+) -> Result<bool> {
+    match nix::sys::signal::kill(group, Some(signal)) {
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Ok(()) => Ok(true),
+        Err(error) => Err(process_tree_error(operation, pid, error)),
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(
+    group: nix::unistd::Pid,
+    pid: i32,
+    timeout: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if process_group_is_absent(pid, nix::sys::signal::kill(group, None))? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        sleep(PROCESS_GROUP_POLL_INTERVAL).await;
+    }
+}
+
 async fn read_pipe<R>(pipe: Option<R>) -> std::io::Result<String>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -441,9 +498,71 @@ where
     let Some(mut pipe) = pipe else {
         return Ok(String::new());
     };
-    let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    let mut capture = BoundedOutputCapture::default();
+    let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
+    loop {
+        let read = pipe.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        capture.push(&buffer[..read]);
+    }
+    Ok(capture.finish())
+}
+
+#[derive(Default)]
+struct BoundedOutputCapture {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total_bytes: usize,
+}
+
+impl BoundedOutputCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(bytes.len());
+        let head_remaining = OUTPUT_CAPTURE_HEAD_BYTES.saturating_sub(self.head.len());
+        let head_bytes = head_remaining.min(bytes.len());
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+        self.push_tail(&bytes[head_bytes..]);
+    }
+
+    fn push_tail(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if bytes.len() >= OUTPUT_CAPTURE_TAIL_BYTES {
+            self.tail.clear();
+            self.tail
+                .extend_from_slice(&bytes[bytes.len() - OUTPUT_CAPTURE_TAIL_BYTES..]);
+            return;
+        }
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(OUTPUT_CAPTURE_TAIL_BYTES);
+        if overflow > 0 {
+            self.tail.drain(..overflow);
+        }
+        self.tail.extend_from_slice(bytes);
+    }
+
+    fn finish(self) -> String {
+        let omitted = self
+            .total_bytes
+            .saturating_sub(self.head.len().saturating_add(self.tail.len()));
+        let mut retained = self.head;
+        if omitted > 0 {
+            retained.extend_from_slice(
+                format!(
+                    "\n[... {omitted} bytes omitted; sandbox output bounded to {OUTPUT_CAPTURE_LIMIT_BYTES} bytes ...]\n"
+                )
+                .as_bytes(),
+            );
+        }
+        retained.extend_from_slice(&self.tail);
+        String::from_utf8_lossy(&retained).into_owned()
+    }
 }
 
 #[cfg(unix)]
@@ -464,3 +583,42 @@ fn signal_process(pid: u32, force: bool, process_group: bool) {
 
 #[cfg(not(unix))]
 fn signal_process(_pid: u32, _force: bool, _process_group: bool) {}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::{OUTPUT_CAPTURE_LIMIT_BYTES, read_pipe};
+
+    #[tokio::test]
+    async fn output_flood_is_drained_while_retaining_bounded_head_and_tail() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"stdout-head-sentinel\n").await?;
+            let flood = vec![b'x'; 64 * 1024];
+            for _ in 0..32 {
+                writer.write_all(&flood).await?;
+            }
+            writer.write_all(b"\nstdout-tail-sentinel").await?;
+            writer.shutdown().await
+        });
+
+        let captured = read_pipe(Some(reader)).await.expect("bounded capture");
+        writer_task.await.expect("writer join").expect("writer");
+
+        assert!(captured.starts_with("stdout-head-sentinel\n"));
+        assert!(captured.ends_with("\nstdout-tail-sentinel"));
+        assert!(captured.contains("bytes omitted; sandbox output bounded"));
+        assert!(captured.len() <= OUTPUT_CAPTURE_LIMIT_BYTES + 128);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_does_not_prove_process_group_absence() {
+        let error = super::process_group_is_absent(123, Err(nix::errno::Errno::EPERM))
+            .expect_err("EPERM must retain process authority");
+
+        assert!(error.to_string().contains("failed to inspect"));
+        assert!(error.to_string().contains("EPERM"));
+    }
+}

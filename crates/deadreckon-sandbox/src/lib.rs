@@ -120,6 +120,48 @@ mod tests {
         assert!(output.warning.expect("warning").contains("unsafe"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subprocess_output_flood_is_bounded_with_useful_head_and_tail() {
+        let mut spec = shell_spec();
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(
+                r#"printf 'stdout-head\n'
+dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' x
+printf '\nstdout-tail'
+{
+  printf 'stderr-head\n'
+  dd if=/dev/zero bs=1048576 count=2 2>/dev/null | tr '\000' y
+  printf '\nstderr-tail'
+} >&2"#,
+            ),
+        ];
+
+        let output = tokio::time::timeout(Duration::from_secs(10), run(spec))
+            .await
+            .expect("output flood must not deadlock")
+            .expect("output flood run");
+
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+        assert!(output.stdout.starts_with("stdout-head\n"));
+        assert!(output.stdout.ends_with("\nstdout-tail"));
+        assert!(
+            output
+                .stdout
+                .contains("bytes omitted; sandbox output bounded")
+        );
+        assert!(output.stdout.len() <= 1024 * 1024 + 128);
+        assert!(output.stderr.starts_with("stderr-head\n"));
+        assert!(output.stderr.ends_with("\nstderr-tail"));
+        assert!(
+            output
+                .stderr
+                .contains("bytes omitted; sandbox output bounded")
+        );
+        assert!(output.stderr.len() <= 1024 * 1024 + 128);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn bwrap_executes_an_approved_temp_script_with_a_private_tmp() {
@@ -288,6 +330,48 @@ mod tests {
         );
         handle.await.expect("join").expect("run");
         assert!(!pid_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_removes_authority_only_after_exact_process_group_is_gone() {
+        use nix::errno::Errno;
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let temp = TempDir::new().expect("tempdir");
+        let pid_file = temp.path().join("child-pids/provider.pid");
+        let token = CancellationToken::new();
+        let mut spec = shell_spec();
+        spec.cleanup_process_group = true;
+        spec.pid_file = Some(pid_file.clone());
+        spec.cancellation_token = Some(token.clone());
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from("trap '' TERM; (trap '' TERM; while true; do sleep 1; done) & wait"),
+        ];
+
+        let handle = tokio::spawn(async move { run(spec).await });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let record = deadreckon_core::read_supervised_process_record(&pid_file)
+            .expect("identity-bound process authority");
+        let pgid = i32::try_from(record.process.pgid.expect("process group")).expect("i32 pgid");
+
+        token.cancel();
+        let error = handle.await.expect("join").expect_err("cancelled run");
+
+        assert!(matches!(error, SandboxError::Cancelled));
+        assert!(
+            !pid_file.exists(),
+            "process authority remained after group absence was proven"
+        );
+        assert!(
+            matches!(kill(Pid::from_raw(-pgid), None), Err(Errno::ESRCH)),
+            "process group {pgid} remained reachable after authority deletion"
+        );
     }
 
     #[test]
