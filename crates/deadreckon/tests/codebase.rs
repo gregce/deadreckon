@@ -404,6 +404,31 @@ fn allow_dirty_seeds_uncommitted_into_worktree() {
 }
 
 #[test]
+fn controller_owned_dirty_paths_are_exact_and_never_seeded() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    fs::create_dir_all(repo.join(".deadreckon")).expect("controller directory");
+    fs::write(repo.join(".deadreckon/acceptance.yaml"), "controller\n").expect("controller file");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let options = WorktreeOptions {
+        run_id: "abababababababababababababababab".to_string(),
+        task_key: "controller-owned".to_string(),
+        source_path: repo.clone(),
+        base_ref: None,
+        branch_name: None,
+        allow_dirty: false,
+        allowed_dirty_paths: vec![PathBuf::from(".deadreckon/acceptance.yaml")],
+    };
+
+    let record = prepare_worktree_record(&paths, options.clone()).expect("exact path admitted");
+    assert!(!record.dirty_files_seeded);
+
+    fs::write(repo.join("operator.txt"), "unrelated\n").expect("operator file");
+    let error = prepare_worktree_record(&paths, options).expect_err("other dirt must be refused");
+    assert!(error.to_string().contains("operator.txt"), "{error}");
+}
+
+#[test]
 fn branch_collision_refused_with_branch_hint() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);
@@ -443,6 +468,7 @@ fn worktree_path_collision_appends_suffix() {
         base_ref: None,
         branch_name: Some("dr/collision-a".to_string()),
         allow_dirty: false,
+        allowed_dirty_paths: Vec::new(),
     };
     let first = prepare_worktree_record(&paths, options.clone()).expect("first");
     fs::create_dir_all(first.worktree_path.as_ref().expect("worktree")).expect("worktree");
@@ -2109,6 +2135,7 @@ fn abandon_force_terminates_running_run_then_cleans() {
             base_ref: None,
             branch_name: Some("dr/force-abandon-bbbbbbbb".to_string()),
             allow_dirty: false,
+            allowed_dirty_paths: Vec::new(),
         },
     )
     .expect("record");

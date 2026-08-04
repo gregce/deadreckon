@@ -100,6 +100,10 @@ pub struct WorktreeOptions {
     pub base_ref: Option<String>,
     pub branch_name: Option<String>,
     pub allow_dirty: bool,
+    /// Controller-owned paths that may be dirty without being copied into the
+    /// isolated worktree. Callers must bind these paths to immutable authority
+    /// before using this escape hatch.
+    pub allowed_dirty_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +225,12 @@ pub fn prepare_worktree_record(
     let base_ref = options
         .base_ref
         .unwrap_or_else(|| current_branch(&git_root).unwrap_or_else(|_| "HEAD".to_string()));
-    preflight_worktree(&git_root, &base_ref, options.allow_dirty)?;
+    preflight_worktree_with_allowed_paths(
+        &git_root,
+        &base_ref,
+        options.allow_dirty,
+        &options.allowed_dirty_paths,
+    )?;
     let branch_name = options.branch_name.unwrap_or_else(|| {
         format!(
             "dr/{}-{}",
@@ -329,6 +338,15 @@ pub fn current_branch(git_root: &Path) -> Result<String> {
 }
 
 pub fn preflight_worktree(git_root: &Path, base_ref: &str, allow_dirty: bool) -> Result<()> {
+    preflight_worktree_with_allowed_paths(git_root, base_ref, allow_dirty, &[])
+}
+
+fn preflight_worktree_with_allowed_paths(
+    git_root: &Path,
+    base_ref: &str,
+    allow_dirty: bool,
+    allowed_dirty_paths: &[PathBuf],
+) -> Result<()> {
     let head = git_stdout(git_root, &["rev-parse", "HEAD"])
         .map_err(|_| user_error("git repo has no commits", "git commit -m initial"))?;
     if current_branch(git_root).is_err() {
@@ -351,18 +369,35 @@ pub fn preflight_worktree(git_root: &Path, base_ref: &str, allow_dirty: bool) ->
             "git rebase --abort",
         ));
     }
-    let dirty = git_stdout(git_root, &["status", "--porcelain"])?;
+    let dirty = git_stdout(
+        git_root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
     if !allow_dirty && !dirty.trim().is_empty() {
-        let files = dirty
+        let allowed = allowed_dirty_paths
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let unexpected = dirty
             .lines()
+            .filter(|line| {
+                let Some(path) = line.get(3..) else {
+                    return true;
+                };
+                path.contains(" -> ") || !allowed.contains(path)
+            })
             .take(12)
             .map(|line| format!("  {}", line.trim()))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(user_error(
-            &format!("working tree has uncommitted changes:\n{files}"),
-            "git stash && deadreckon run … (or --allow-dirty)",
-        ));
+            .collect::<Vec<_>>();
+        if !unexpected.is_empty() {
+            return Err(user_error(
+                &format!(
+                    "working tree has uncommitted changes:\n{}",
+                    unexpected.join("\n")
+                ),
+                "git stash && deadreckon run … (or --allow-dirty)",
+            ));
+        }
     }
     git_stdout(git_root, &["rev-parse", "--verify", base_ref])?;
     Ok(())

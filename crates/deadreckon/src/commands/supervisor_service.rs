@@ -1149,7 +1149,7 @@ impl ServiceContext {
         // macOS. Resolve installer-owned aliases once so status, readiness,
         // start, and install all compare the executable the service will run,
         // not the PATH entry through which this command was reached.
-        let binary = canonical_service_binary(std::env::current_exe()?)?;
+        let binary = canonical_service_binary(&std::env::current_exe()?)?;
         let paths = DeadreckonPaths::discover();
         let deadreckon_home = absolute_path(paths.home().to_path_buf())?;
         let user_home = std::env::var_os("HOME")
@@ -1200,8 +1200,8 @@ impl ServiceContext {
     }
 }
 
-fn canonical_service_binary(path: PathBuf) -> Result<PathBuf> {
-    let path = fs::canonicalize(&path)?;
+fn canonical_service_binary(path: &Path) -> Result<PathBuf> {
+    let path = fs::canonicalize(path)?;
     if !path.is_file() {
         return Err(invalid_input(format!(
             "DeadReckon service binary must resolve to a regular file: {}",
@@ -2844,10 +2844,9 @@ mod tests {
         fs::write(&different, "candidate-b").expect("different binary fixture");
         symlink(&canonical, &alias).expect("binary alias");
 
-        let canonical_identity =
-            canonical_service_binary(canonical.clone()).expect("canonical identity");
-        let alias_identity = canonical_service_binary(alias).expect("alias identity");
-        let different_identity = canonical_service_binary(different).expect("different identity");
+        let canonical_identity = canonical_service_binary(&canonical).expect("canonical identity");
+        let alias_identity = canonical_service_binary(&alias).expect("alias identity");
+        let different_identity = canonical_service_binary(&different).expect("different identity");
         assert_eq!(alias_identity, canonical_identity);
         assert_ne!(different_identity, canonical_identity);
 

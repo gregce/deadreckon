@@ -39,6 +39,13 @@
 - Guided start defers supervisor installation or repair until contract
   authoring and final launch confirmation are complete, so a rejected draft or
   cancelled launch does not mutate the user's service state.
+- A trusted guided Job now recognizes its byte-identical generated YAML and
+  notes as controller-owned admission files instead of rejecting the clean
+  source as newly dirty. The exception is fail-closed: unrelated files,
+  changed YAML, and helper subtrees that were not frozen into the Job remain
+  rejected. A child that exits before writing run state is reported as an
+  unknown preflight failure with its supervisor log path, never invented as a
+  provider failure.
 
 ## 0.8.0 — The watch keeps — 2026-08-02
 
