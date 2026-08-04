@@ -1133,7 +1133,11 @@ impl ServiceContext {
     }
 
     fn discover_for_platform(platform: ServicePlatform) -> Result<Self> {
-        let binary = absolute_path(std::env::current_exe()?)?;
+        // `current_exe` preserves the spelling used to invoke DeadReckon on
+        // macOS. Resolve installer-owned aliases once so status, readiness,
+        // start, and install all compare the executable the service will run,
+        // not the PATH entry through which this command was reached.
+        let binary = canonical_service_binary(std::env::current_exe()?)?;
         let paths = DeadreckonPaths::discover();
         let deadreckon_home = absolute_path(paths.home().to_path_buf())?;
         let user_home = std::env::var_os("HOME")
@@ -1182,6 +1186,21 @@ impl ServiceContext {
     fn log_dir(&self) -> PathBuf {
         self.deadreckon_home.join("logs")
     }
+}
+
+fn canonical_service_binary(path: PathBuf) -> Result<PathBuf> {
+    let path = fs::canonicalize(&path)?;
+    if !path.is_file() {
+        return Err(invalid_input(format!(
+            "DeadReckon service binary must resolve to a regular file: {}",
+            path.display()
+        )));
+    }
+    validate_service_value(
+        "canonical DeadReckon service binary",
+        path_to_utf8("canonical DeadReckon service binary", &path)?,
+    )?;
+    Ok(path)
 }
 
 fn detected_platform() -> Result<ServicePlatform> {
@@ -2701,6 +2720,46 @@ mod tests {
             machine_restart_posture(&path_drift).expect("PATH-independent current posture"),
             MachineRestartPosture::InstalledCurrent
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_binary_identity_accepts_a_symlink_alias_but_rejects_a_different_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let canonical = temp.path().join("deadreckon-canonical");
+        let alias = temp.path().join("deadreckon-alias");
+        let different = temp.path().join("deadreckon-different");
+        fs::write(&canonical, "candidate-a").expect("canonical binary fixture");
+        fs::write(&different, "candidate-b").expect("different binary fixture");
+        symlink(&canonical, &alias).expect("binary alias");
+
+        let canonical_identity =
+            canonical_service_binary(canonical.clone()).expect("canonical identity");
+        let alias_identity = canonical_service_binary(alias).expect("alias identity");
+        let different_identity = canonical_service_binary(different).expect("different identity");
+        assert_eq!(alias_identity, canonical_identity);
+        assert_ne!(different_identity, canonical_identity);
+
+        for platform in [ServicePlatform::Launchd, ServicePlatform::Systemd] {
+            let mut installed_context = context(platform);
+            installed_context.binary = canonical_identity.clone();
+            let installed = render_service(&installed_context).expect("installed unit");
+
+            let mut alias_context = installed_context.clone();
+            alias_context.binary = alias_identity.clone();
+            assert!(
+                managed_unit_matches_context(&alias_context, &installed).expect("same-file alias")
+            );
+
+            let mut different_context = installed_context.clone();
+            different_context.binary = different_identity.clone();
+            assert!(
+                !managed_unit_matches_context(&different_context, &installed)
+                    .expect("different binary")
+            );
+        }
     }
 
     #[test]

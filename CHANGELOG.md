@@ -30,6 +30,10 @@
   seconds for a fresh service instance, healthy lease inactivity allows 60
   seconds, and guarded child handoff allows 30 seconds without extending any
   operator-approved Job wall or deadline.
+- Supervisor installation, status, readiness, and checkpoints now canonicalize
+  the running executable once. A managed PATH symlink and its target therefore
+  identify the same pinned binary, while a genuinely different executable
+  remains stale and is never silently accepted.
 - Guided start defers supervisor installation or repair until contract
   authoring and final launch confirmation are complete, so a rejected draft or
   cancelled launch does not mutate the user's service state.
