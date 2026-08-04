@@ -26,13 +26,13 @@ use super::super::{CliError, Result};
 const LAUNCHD_LABEL: &str = "com.deadreckon.supervisor";
 const SYSTEMD_UNIT: &str = "deadreckon-supervisor.service";
 const MANAGED_MARKER: &str = "deadreckon-managed-supervisor-v1";
-const SERVICE_INSTANCE_SCHEMA: u32 = 2;
+const SERVICE_INSTANCE_SCHEMA: u32 = 3;
 const SERVICE_LOCK_SCOPE: &str = "watchkeeper";
 const SERVICE_LOCK_TASK: &str = "supervisor-service";
 const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
 const SERVICE_INSTANCE_DIR: &str = "supervisor";
 const SERVICE_INSTANCE_FILE: &str = "instance.json";
-const SERVICE_STATUS_SCHEMA: u32 = 2;
+const SERVICE_STATUS_SCHEMA: u32 = 3;
 const SERVICE_MANAGER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_MANAGER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const SERVICE_MANAGER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -61,6 +61,7 @@ enum ServicePlatform {
 struct ServiceContext {
     platform: ServicePlatform,
     binary: PathBuf,
+    binary_sha256: String,
     deadreckon_home: PathBuf,
     user_home: PathBuf,
     xdg_config_home: Option<PathBuf>,
@@ -183,6 +184,16 @@ struct ServiceInstanceCheckpoint {
     started_at: DateTime<Utc>,
     binary: PathBuf,
     deadreckon_home: PathBuf,
+    /// Exact source-bundle identity of the live process. The executable path
+    /// alone is insufficient because an in-place rebuild leaves an older
+    /// process running at the same path.
+    #[serde(default)]
+    bundle_build_id: String,
+    /// Digest of the exact executable bytes observed by the service process.
+    /// This catches an in-place replacement even when the canonical path and
+    /// compiled source-bundle identity are unchanged.
+    #[serde(default)]
+    binary_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,6 +395,8 @@ pub(crate) fn acquire_supervisor_service_guard(
         started_at: Utc::now(),
         binary: binary.to_path_buf(),
         deadreckon_home: paths.home().to_path_buf(),
+        bundle_build_id: env!("DEADRECKON_BUNDLE_BUILD_ID").to_string(),
+        binary_sha256: deadreckon_core::flight::sha256_file(binary)?,
     };
     fs::create_dir_all(
         checkpoint_path
@@ -433,10 +446,12 @@ pub(crate) fn supervisor_service_preflight() -> Result<SupervisorServicePrefligh
     let paths = DeadreckonPaths::from_home(context.deadreckon_home.clone());
     let checkpoint_path = service_instance_checkpoint_path(&paths);
     if read_service_instance_header(&checkpoint_path)?
-        .is_some_and(|header| header.schema_version == 1)
+        .is_some_and(|header| header.schema_version != SERVICE_INSTANCE_SCHEMA)
     {
         return Ok(SupervisorServicePreflight::SetupRequired {
-            reason: "the supervisor has a legacy checkpoint without live process identity; restart it to publish a v2 checkpoint".to_string(),
+            reason: format!(
+                "the supervisor has a legacy checkpoint without exact build identity; restart it to publish a v{SERVICE_INSTANCE_SCHEMA} checkpoint"
+            ),
             last_instance: None,
         });
     }
@@ -1073,6 +1088,19 @@ fn validate_checkpoint_identity(
             context.deadreckon_home.display()
         )));
     }
+    if checkpoint.bundle_build_id != env!("DEADRECKON_BUNDLE_BUILD_ID") {
+        return Err(invalid_input(format!(
+            "service manager reports a supervisor from build {:?}, but this command is build {:?}; restart the managed supervisor before admitting durable work",
+            checkpoint.bundle_build_id,
+            env!("DEADRECKON_BUNDLE_BUILD_ID")
+        )));
+    }
+    if checkpoint.binary_sha256 != context.binary_sha256 {
+        return Err(invalid_input(format!(
+            "service manager reports supervisor executable digest {:?}, but this command observes {:?} at the same path; restart the managed supervisor before admitting durable work",
+            checkpoint.binary_sha256, context.binary_sha256
+        )));
+    }
     if runtime.is_running() && !boot_identities_match(&checkpoint.boot_id, current_boot_id) {
         return Err(invalid_input(format!(
             "service manager reports the supervisor running, but checkpoint boot {} does not match current boot {}",
@@ -1159,6 +1187,7 @@ impl ServiceContext {
         // start, and install all compare the executable the service will run,
         // not the PATH entry through which this command was reached.
         let binary = canonical_service_binary(&std::env::current_exe()?)?;
+        let binary_sha256 = deadreckon_core::flight::sha256_file(&binary)?;
         let paths = DeadreckonPaths::discover();
         let deadreckon_home = absolute_path(paths.home().to_path_buf())?;
         let user_home = std::env::var_os("HOME")
@@ -1180,6 +1209,7 @@ impl ServiceContext {
         Ok(Self {
             platform,
             binary,
+            binary_sha256,
             deadreckon_home,
             user_home,
             xdg_config_home,
@@ -1349,9 +1379,9 @@ fn read_service_instance_header(path: &Path) -> Result<Option<ServiceInstanceChe
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| invalid_input("supervisor checkpoint schema_version must be an integer"))?;
-    if schema != 1 && schema != u64::from(SERVICE_INSTANCE_SCHEMA) {
+    if schema != 1 && schema != 2 && schema != u64::from(SERVICE_INSTANCE_SCHEMA) {
         return Err(invalid_input(format!(
-            "unsupported supervisor checkpoint schema {schema}; replacement accepts schema 1 or {}",
+            "unsupported supervisor checkpoint schema {schema}; replacement accepts schemas 1, 2 or {}",
             SERVICE_INSTANCE_SCHEMA
         )));
     }
@@ -1387,6 +1417,14 @@ fn validate_service_instance_checkpoint(checkpoint: &ServiceInstanceCheckpoint) 
     validate_service_value(
         "supervisor checkpoint process-start identity",
         &checkpoint.process_start_identity,
+    )?;
+    validate_service_value(
+        "supervisor checkpoint bundle build id",
+        &checkpoint.bundle_build_id,
+    )?;
+    validate_service_value(
+        "supervisor checkpoint binary sha256",
+        &checkpoint.binary_sha256,
     )?;
     for (name, path) in [
         ("supervisor checkpoint binary", &checkpoint.binary),
@@ -2120,6 +2158,7 @@ mod tests {
         ServiceContext {
             platform,
             binary: PathBuf::from("/opt/Dead Reckon/bin/deadreckon"),
+            binary_sha256: "fixture-binary-sha256".to_string(),
             deadreckon_home: PathBuf::from("/Users/test/Dead Reckon State"),
             user_home: PathBuf::from("/Users/test"),
             xdg_config_home: None,
@@ -2145,6 +2184,8 @@ mod tests {
             started_at: Utc::now(),
             binary: context.binary.clone(),
             deadreckon_home: context.deadreckon_home.clone(),
+            bundle_build_id: env!("DEADRECKON_BUNDLE_BUILD_ID").to_string(),
+            binary_sha256: context.binary_sha256.clone(),
         }
     }
 
@@ -2701,6 +2742,53 @@ mod tests {
     }
 
     #[test]
+    fn running_service_rejects_same_path_process_from_an_older_build() {
+        let context = context(ServicePlatform::Systemd);
+        let runtime = ServiceManagerRuntime {
+            loaded: None,
+            enabled: Some("enabled".to_string()),
+            active: Some("active".to_string()),
+        };
+        let mut stale = checkpoint(&context, 4, "stale-build", "boot-a");
+        stale.bundle_build_id =
+            "deadreckon-bundle-build-id-sha256:stale-in-place-binary".to_string();
+
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime,
+            Some(stale),
+            boot("boot-a"),
+        )
+        .expect_err("same-path stale supervisor build must fail closed");
+        assert!(error.to_string().contains("restart the managed supervisor"));
+        assert!(error.to_string().contains("stale-in-place-binary"));
+    }
+
+    #[test]
+    fn running_service_rejects_same_path_process_with_different_executable_bytes() {
+        let context = context(ServicePlatform::Systemd);
+        let runtime = ServiceManagerRuntime {
+            loaded: None,
+            enabled: Some("enabled".to_string()),
+            active: Some("active".to_string()),
+        };
+        let mut stale = checkpoint(&context, 5, "stale-digest", "boot-a");
+        stale.binary_sha256 = "different-executable-sha256".to_string();
+
+        let error = build_service_status_report(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            runtime,
+            Some(stale),
+            boot("boot-a"),
+        )
+        .expect_err("same-path stale executable bytes must fail closed");
+        assert!(error.to_string().contains("executable digest"));
+        assert!(error.to_string().contains("restart the managed supervisor"));
+    }
+
+    #[test]
     fn fresh_service_successor_requires_generation_instance_and_process_change() {
         let context = context(ServicePlatform::Systemd);
         let prior_checkpoint = checkpoint(&context, 7, "prior", "boot-a");
@@ -2807,7 +2895,9 @@ mod tests {
             checkpoint_keys,
             [
                 "binary",
+                "binary_sha256",
                 "boot_id",
+                "bundle_build_id",
                 "deadreckon_home",
                 "generation",
                 "instance_id",
@@ -2884,7 +2974,33 @@ mod tests {
             "a new service may preserve ordering while replacing legacy evidence"
         );
 
-        let mut missing_identity = checkpoint(&context, 10, "missing-identity", "boot-a");
+        let legacy_v2 = json!({
+            "schema_version": 2,
+            "generation": 10,
+            "instance_id": "same-path-old-build",
+            "boot_id": "boot-a",
+            "pid": std::process::id(),
+            "process_start_identity": process_start_identity(std::process::id())
+                .expect("test process identity"),
+            "started_at": Utc::now(),
+            "binary": context.binary.clone(),
+            "deadreckon_home": context.deadreckon_home.clone(),
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec(&legacy_v2).expect("legacy v2 checkpoint JSON"),
+        )
+        .expect("legacy v2 checkpoint");
+        assert_eq!(
+            read_service_instance_header(&path).expect("v2 generation for replacement"),
+            Some(ServiceInstanceCheckpointHeader {
+                schema_version: 2,
+                generation: 10,
+            }),
+            "an in-place rebuild may replace v2 evidence without resetting ordering"
+        );
+
+        let mut missing_identity = checkpoint(&context, 11, "missing-identity", "boot-a");
         missing_identity.process_start_identity.clear();
         fs::write(
             &path,
@@ -3047,6 +3163,7 @@ mod tests {
         let context = ServiceContext {
             platform: ServicePlatform::Systemd,
             binary: temp.path().join("deadreckon"),
+            binary_sha256: "fixture-binary-sha256".to_string(),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
             xdg_config_home: None,
@@ -3064,6 +3181,7 @@ mod tests {
         let context = ServiceContext {
             platform: ServicePlatform::Systemd,
             binary: temp.path().join("deadreckon"),
+            binary_sha256: "fixture-binary-sha256".to_string(),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
             xdg_config_home: None,
@@ -3204,6 +3322,7 @@ mod tests {
         let context = ServiceContext {
             platform: ServicePlatform::Systemd,
             binary: temp.path().join("deadreckon"),
+            binary_sha256: "fixture-binary-sha256".to_string(),
             deadreckon_home: temp.path().join("state"),
             user_home: temp.path().join("user"),
             xdg_config_home: None,
@@ -3240,6 +3359,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("state"));
         let binary = temp.path().join("bin").join("deadreckon");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("binary directory");
+        fs::write(&binary, "service binary").expect("service binary fixture");
         let first = acquire_supervisor_service_guard(&paths, "service-a", "boot-a", &binary)
             .expect("first service");
         assert_eq!(first.checkpoint.generation, 1);
@@ -3274,6 +3395,10 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("state"));
         let workspace = temp.path().join("isolated-workspace");
+        let first_binary = temp.path().join("deadreckon-a");
+        let replacement_binary = temp.path().join("deadreckon-b");
+        fs::write(&first_binary, "service binary a").expect("first service binary");
+        fs::write(&replacement_binary, "service binary b").expect("replacement service binary");
         fs::create_dir_all(&workspace).expect("workspace");
         fs::write(workspace.join("progress.txt"), "durable work\n").expect("workspace progress");
         let job_id = JobId("service-restart-job".to_string());
@@ -3335,23 +3460,14 @@ mod tests {
             .expect("job event");
         }
         let history_before = fs::read(paths.job_events(job_id.as_ref())).expect("history bytes");
-        let first = acquire_supervisor_service_guard(
-            &paths,
-            "service-a",
-            "boot-a",
-            Path::new("/opt/deadreckon-a"),
-        )
-        .expect("first service");
+        let first = acquire_supervisor_service_guard(&paths, "service-a", "boot-a", &first_binary)
+            .expect("first service");
         let view_before = JobView::load(&paths, job_id.as_ref()).expect("job before restart");
         drop(first);
 
-        let replacement = acquire_supervisor_service_guard(
-            &paths,
-            "service-b",
-            "boot-b",
-            Path::new("/opt/deadreckon-b"),
-        )
-        .expect("replacement service");
+        let replacement =
+            acquire_supervisor_service_guard(&paths, "service-b", "boot-b", &replacement_binary)
+                .expect("replacement service");
         let view_after = JobView::load(&paths, job_id.as_ref()).expect("job after restart");
 
         assert_eq!(replacement.checkpoint.generation, 2);
