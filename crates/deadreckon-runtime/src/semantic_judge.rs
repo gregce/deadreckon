@@ -331,6 +331,34 @@ pub async fn run_semantic_judge_with_budget(
     .await
 }
 
+/// Run an ordinary leaf-result semantic judge under the exact outer Job
+/// deadline while retaining the frozen turn-snapshot evidence baseline.
+///
+/// `budget` still supplies spend accounting; `phase_deadline` is authoritative
+/// for work and is never rebuilt from a relative remaining-wall value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_semantic_judge_with_deadline_and_cancellation(
+    state: &PipelineState,
+    marker: &AcceptanceMarker,
+    router: &ProviderRouter,
+    sandbox_backend: SandboxBackend,
+    budget: SemanticJudgeBudget,
+    phase_deadline: ProviderPhaseDeadline,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<SemanticJudgeRun> {
+    run_semantic_judge_with_baseline(
+        state,
+        marker,
+        router,
+        sandbox_backend,
+        None,
+        budget,
+        Some(phase_deadline),
+        cancellation_token,
+    )
+    .await
+}
+
 /// Run the fresh, read-only semantic judge for a composed result against the
 /// source tree frozen by the parent job authority.
 pub async fn run_semantic_judge_against_source(
@@ -1103,11 +1131,12 @@ mod tests {
     use super::{
         EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SEMANTIC_CLEANUP_BUDGET,
         SemanticBudgetExhaustion, SemanticDecision, SemanticJudgeAccounting, SemanticJudgeBudget,
-        SemanticJudgeResult, accounting_from_response, build_semantic_evidence_against_source,
-        classify_semantic_response, provider_kind_is_cli, semantic_budget_overrun,
-        semantic_cleanup_failure, semantic_guard_identity_with_policy, semantic_output_schema,
-        semantic_phase_deadline, semantic_provider_request, strip_json_fence,
-        validate_evidence_references, validate_semantic_judgment_input_against_source,
+        SemanticJudgeResult, accounting_from_response, build_semantic_evidence,
+        build_semantic_evidence_against_source, classify_semantic_response, provider_kind_is_cli,
+        semantic_budget_overrun, semantic_cleanup_failure, semantic_guard_identity_with_policy,
+        semantic_output_schema, semantic_phase_deadline, semantic_provider_request,
+        strip_json_fence, validate_evidence_references, validate_semantic_judgment_input,
+        validate_semantic_judgment_input_against_source,
     };
     use deadreckon_protocol::{
         GoalCoverage, GoalCoverageStatus, JobId, JobSchemaVersion, RunId, SemanticJudgment,
@@ -1303,6 +1332,131 @@ mod tests {
             &judgment,
         )
         .expect("fresh candidate B judgment validates");
+    }
+
+    #[test]
+    fn leaf_semantic_binding_uses_frozen_turn_snapshots_not_the_live_source_tree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+        let result = temp.path().join("result");
+        fs::create_dir_all(&result).expect("result");
+        fs::write(result.join("purpose.sh"), "unfinished\n").expect("initial result");
+        fs::write(
+            result.join("implementation-notes.html"),
+            "<p>initial notes</p>\n",
+        )
+        .expect("initial notes");
+        let mut state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "finish the leaf result".to_string(),
+                cwd: result.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("independent-test-judge".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("leaf-snapshot-binding".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("leaf run");
+        deadreckon_core::snapshot_working(&state, 0).expect("turn zero snapshot");
+
+        let approved_source = temp.path().join("approved-source");
+        fs::create_dir_all(&approved_source).expect("approved source");
+        fs::write(approved_source.join("purpose.sh"), "unfinished\n").expect("source baseline");
+        state.cwd = approved_source.clone();
+        fs::write(state.working_dir.join("purpose.sh"), "finished\n").expect("finished result");
+        fs::write(
+            state.working_dir.join("implementation-notes.html"),
+            "<p>finished notes</p>\n",
+        )
+        .expect("finished notes");
+        state.turn = 1;
+        deadreckon_core::snapshot_working(&state, 1).expect("turn one snapshot");
+        fs::write(
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+            "name: leaf\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/purpose.sh\"\n",
+        )
+        .expect("contract");
+        let authority_path = paths.job_authority(&state.run_id);
+        fs::create_dir_all(authority_path.parent().expect("authority parent"))
+            .expect("authority parent");
+        fs::write(
+            &authority_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "job_id": state.run_id,
+                "authority": "test"
+            }))
+            .expect("authority json"),
+        )
+        .expect("authority");
+        let marker = deadreckon_core::AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: deadreckon_core::AcceptanceProofKind::NativeGate,
+            checked_at: chrono::Utc::now(),
+            working_dir: state.working_dir.clone(),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 1,
+            checks: Vec::new(),
+        };
+        let snapshot_input = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence(&state, &marker).expect("snapshot evidence"),
+            )
+            .expect("snapshot evidence json"),
+        );
+        let source_input = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence_against_source(&state, &marker, &approved_source)
+                    .expect("source evidence"),
+            )
+            .expect("source evidence json"),
+        );
+        assert_ne!(
+            snapshot_input, source_input,
+            "initialized leaf artifacts make source and turn baselines observably different"
+        );
+        let judgment = SemanticJudgment {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: JobId(state.run_id.clone()),
+            run_id: RunId(state.run_id.clone()),
+            judged_at: chrono::Utc::now(),
+            provider: "independent-test-judge".to_string(),
+            model: "test-model".to_string(),
+            decision: SemanticDecision::Achieved,
+            summary: "the frozen leaf result is complete".to_string(),
+            goal_coverage: vec![GoalCoverage {
+                claim: "finish the leaf result".to_string(),
+                status: GoalCoverageStatus::Met,
+                evidence: vec!["source-diff".to_string(), "deterministic-gate".to_string()],
+            }],
+            missing: Vec::new(),
+            input_sha256: snapshot_input,
+            spend_usd: 0.0,
+        };
+        validate_semantic_judgment_input(&state, &marker, &judgment)
+            .expect("leaf seal reuses the frozen snapshot evidence");
+        let mismatch = validate_semantic_judgment_input_against_source(
+            &state,
+            &marker,
+            &approved_source,
+            &judgment,
+        )
+        .expect_err("a leaf judgment must not silently switch to source-tree evidence");
+        assert!(
+            mismatch
+                .to_string()
+                .contains("does not bind the current result"),
+            "{mismatch}"
+        );
     }
 
     #[test]
