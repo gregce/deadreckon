@@ -1596,6 +1596,7 @@ Source-text scanning (keyword/vocabulary greps, content-only source checks) is I
 A helper script is allowed only when it runs the product or asserts computed results, not when it merely greps for words.
 Every substantive check must be falsifiable: there must be a plausible wrong implementation that fails it.
 Never rely on `--if-present` as the only build/test gate. If the project lacks a build/test script, author a minimal real helper under `.deadreckon/acceptance/` or use a direct invocation.
+Temporary files must stay inside the isolated gate runtime. Never use bare `mktemp` or `mktemp -t`; use an explicit template such as `mktemp \"${{TMPDIR:-/tmp}}/deadreckon.XXXXXX\"` (and the same explicit root with `-d`).
 Do not include self-attestation checks, provider-output checks, or instructions that the agent can satisfy by writing a marker.
 Use {{working_dir}} for paths inside the run. Restate the criteria in acceptance_md before listing the executable checks.
 Keep the YAML concise and include at least one required check.
@@ -1661,6 +1662,12 @@ fn validate_generated_acceptance_draft(draft: &AcceptanceDraft, inspect_root: &P
                 if embeds_source_root(&command) {
                     return Err(generated_source_path_error());
                 }
+                if generated_shell_uses_unscoped_mktemp(&command) {
+                    return Err(CliError::Core(deadreckon_core::user_error(
+                        "generated done criteria used mktemp without an isolated-runtime template",
+                        "regenerate the done criteria and use mktemp \"${TMPDIR:-/tmp}/deadreckon.XXXXXX\"",
+                    )));
+                }
             }
             AcceptanceCheck::CargoTest { args, .. } => {
                 if args.iter().any(|argument| embeds_source_root(argument)) {
@@ -1678,6 +1685,91 @@ fn validate_generated_acceptance_draft(draft: &AcceptanceDraft, inspect_root: &P
         return Err(generated_source_path_error());
     }
     Ok(())
+}
+
+fn generated_shell_uses_unscoped_mktemp(command: &str) -> bool {
+    let mut offset = 0;
+    while let Some(relative) = command[offset..].find("mktemp") {
+        let start = offset + relative;
+        let end = start + "mktemp".len();
+        let before = command[..start].chars().next_back();
+        let after = command[end..].chars().next();
+        let word_start = before.is_none_or(|character| {
+            character == '/'
+                || (!character.is_ascii_alphanumeric() && character != '_' && character != '-')
+        });
+        let word_end = after.is_none_or(|character| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        });
+        if word_start && word_end {
+            let invocation = &command[end..end_of_shell_invocation(command, end)];
+            if !contains_expanding_tmpdir_template(invocation) {
+                return true;
+            }
+        }
+        offset = end;
+    }
+    false
+}
+
+fn end_of_shell_invocation(command: &str, start: usize) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for (relative, character) in command[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        match quote {
+            Some(active) if character == active => quote = None,
+            Some(_) => {}
+            None if character == '\'' || character == '"' => quote = Some(character),
+            None if matches!(character, ';' | '\n' | '|' | '&' | ')') => {
+                return start + relative;
+            }
+            None => {}
+        }
+    }
+    command.len()
+}
+
+fn contains_expanding_tmpdir_template(invocation: &str) -> bool {
+    let mut single_quoted = false;
+    let mut escaped = false;
+    for (offset, character) in invocation.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if single_quoted {
+            continue;
+        }
+        let remaining = &invocation[offset..];
+        if [
+            "$TMPDIR/",
+            "${TMPDIR}/",
+            "${TMPDIR:-/tmp}/",
+            "${TMPDIR-/tmp}/",
+        ]
+        .iter()
+        .any(|template| remaining.starts_with(template))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn absolute_source_root_spellings(inspect_root: &Path) -> Vec<String> {
@@ -3571,6 +3663,43 @@ let package = Package(
             "{error}"
         );
         validate_generated_acceptance_draft(&valid, source.path()).expect("working-dir path");
+    }
+
+    #[test]
+    fn generated_checks_scope_temporary_files_to_the_isolated_gate_runtime() {
+        let source = tempfile::tempdir().expect("source");
+        let invalid = AcceptanceDraft {
+            yaml: "name: invalid\nchecks:\n  - kind: shell\n    command: actual=$(mktemp); sh app.sh >\"$actual\"\n    cwd: \"{working_dir}\"\n"
+                .to_string(),
+            markdown: "# invalid\n".to_string(),
+            files: BTreeMap::new(),
+        };
+        let valid = AcceptanceDraft {
+            yaml: "name: valid\nchecks:\n  - kind: shell\n    command: actual=$(mktemp \"${TMPDIR:-/tmp}/deadreckon.XXXXXX\"); sh app.sh >\"$actual\"\n    cwd: \"{working_dir}\"\n"
+                .to_string(),
+            markdown: "# valid\n".to_string(),
+            files: BTreeMap::new(),
+        };
+
+        let error = validate_generated_acceptance_draft(&invalid, source.path())
+            .expect_err("bare mktemp must fail before approval");
+        assert!(error.to_string().contains("isolated-runtime"), "{error}");
+        validate_generated_acceptance_draft(&valid, source.path())
+            .expect("explicit isolated runtime template");
+
+        for command in [
+            "printf '%s' \"$TMPDIR/looks-scoped\"; actual=$(mktemp)",
+            "first=$(mktemp); second=$(mktemp \"${TMPDIR:-/tmp}/second.XXXXXX\")",
+            "actual=$(mktemp '${TMPDIR:-/tmp}/literal.XXXXXX')",
+        ] {
+            assert!(
+                generated_shell_uses_unscoped_mktemp(command),
+                "must reject every unscoped invocation: {command}"
+            );
+        }
+        assert!(!generated_shell_uses_unscoped_mktemp(
+            "one=$(mktemp \"${TMPDIR:-/tmp}/one.XXXXXX\"); two=$(mktemp -d \"$TMPDIR/two.XXXXXX\")"
+        ));
     }
 
     #[test]

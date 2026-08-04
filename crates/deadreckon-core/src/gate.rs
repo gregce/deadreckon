@@ -1373,7 +1373,12 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 .unwrap_or_else(|| working_dir.to_path_buf());
             let started = Instant::now();
             let output = gate_check_command("sh")
-                .arg("-lc")
+                // The controller supplies a complete deterministic PATH and
+                // temporary runtime. A login shell may replace those values
+                // from host profile files. macOS bare mktemp needs a separate
+                // compatibility tool because it prefers the Darwin user temp
+                // directory even when TMPDIR is set.
+                .arg("-c")
                 .arg(&command)
                 .current_dir(&cwd)
                 .output()
