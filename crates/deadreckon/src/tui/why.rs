@@ -191,7 +191,7 @@ pub(crate) fn render_why_panel(
     let height = area.height.saturating_sub(2) as usize;
     let visible = lines
         .into_iter()
-        .skip(scroll.min(usize::MAX))
+        .skip(scroll)
         .take(height.max(1))
         .collect::<Vec<_>>();
     frame.render_widget(
