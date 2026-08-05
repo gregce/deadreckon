@@ -5077,6 +5077,9 @@ fn configure_macos_strict_toolchain(
 }
 
 #[cfg(not(target_os = "macos"))]
+// Match the fallible macOS implementation so the cross-platform call site
+// cannot accidentally omit error propagation when compiled on another host.
+#[allow(clippy::unnecessary_wraps)]
 fn configure_macos_strict_toolchain(
     _gate_tool_bin: Option<&Path>,
     _env: &mut BTreeMap<String, String>,
