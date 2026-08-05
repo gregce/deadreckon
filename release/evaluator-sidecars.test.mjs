@@ -9,9 +9,10 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TOOL = path.join(ROOT, "release", "evaluator-sidecars.mjs");
 const TARGET = "x86_64-pc-windows-msvc";
-const FAKE_BUNDLE =
-  "deadreckon-gate-evaluator-protocol-v1 deadreckon-bundle-build-id-sha256:" +
-  "1".repeat(64);
+const FAKE_BUNDLE_BUILD_ID =
+  "deadreckon-bundle-build-id-sha256:" + "1".repeat(64);
+const FAKE_GATE_BUNDLE =
+  `deadreckon-gate-evaluator-protocol-v1 ${FAKE_BUNDLE_BUILD_ID}`;
 
 test(
   "Windows assembles epoch-timestamped sidecars without relying on tar",
@@ -27,7 +28,9 @@ test(
       fs.mkdirSync(payload, { recursive: true });
 
       for (const helper of ["deadreckon.exe", "dr-gate.exe", "dr-capture.exe"]) {
-        fs.writeFileSync(path.join(payload, helper), `${helper} native helper ${FAKE_BUNDLE}`);
+        const identity =
+          helper === "dr-gate.exe" ? FAKE_GATE_BUNDLE : FAKE_BUNDLE_BUILD_ID;
+        fs.writeFileSync(path.join(payload, helper), `${helper} native helper ${identity}`);
       }
       const armEvaluator = path.join(
         sidecars,
@@ -129,7 +132,7 @@ function writeFakeStaticElf(file, machine, size) {
   bytes.writeUInt16LE(56, 54);
   bytes.writeUInt16LE(1, 56);
   bytes.writeUInt32LE(1, 64);
-  fs.writeFileSync(file, Buffer.concat([bytes, Buffer.from(FAKE_BUNDLE)]));
+  fs.writeFileSync(file, Buffer.concat([bytes, Buffer.from(FAKE_GATE_BUNDLE)]));
 }
 
 function run(program, args) {

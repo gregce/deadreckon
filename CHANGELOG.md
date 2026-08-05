@@ -18,6 +18,11 @@
   Codex runs to the source-derived bundle ID plus exact hashes for
   `deadreckon`, `dr-gate`, and `dr-capture`. Same-version source changes,
   partial route proofs, and mixed helper bundles fail release validation.
+- Release archive verification now distinguishes shared bundle identity from
+  the gate evaluator protocol: every helper must match the exact build bundle,
+  while only `dr-gate` and its static evaluator sidecars must embed the gate
+  protocol marker. Production-shaped fixtures prevent optimized host binaries
+  from being rejected by a synthetic-only marker assumption.
 - Sandbox subprocesses now drain stdout and stderr continuously into bounded
   head/tail captures, so output floods cannot deadlock or exhaust evidence
   memory. Unix cleanup treats only `ESRCH` as proof of process-group absence,
