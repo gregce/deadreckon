@@ -256,6 +256,45 @@ end
 }
 
 #[test]
+fn release_workflow_restores_artifacts_at_their_recorded_repository_paths() {
+    let workflow = release_workflow();
+    let local_downloads = workflow
+        .split("uses: actions/download-artifact@v4")
+        .skip(1)
+        .filter(|step| step.contains("pattern: dist-local-*"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        2,
+        local_downloads.len(),
+        "the global builder and trust job must both hydrate local target artifacts: {workflow}"
+    );
+    for step in local_downloads {
+        let with = step.split("- name:").next().unwrap_or(step);
+        assert!(
+            with.contains("path: ."),
+            "target artifacts already contain target/distrib and must be restored from the repository root: {with}"
+        );
+        assert!(with.contains("merge-multiple: true"), "{with}");
+        assert!(
+            !with.contains("path: target/distrib"),
+            "downloading into target/distrib creates target/distrib/target/distrib: {with}"
+        );
+    }
+
+    let global_download = workflow
+        .split("uses: actions/download-artifact@v4")
+        .skip(1)
+        .find(|step| step.contains("name: dist-global"))
+        .expect("global artifact download");
+    let with = global_download
+        .split("- name:")
+        .next()
+        .unwrap_or(global_download);
+    assert!(with.contains("path: ."), "{with}");
+    assert!(!with.contains("path: target/distrib"), "{with}");
+}
+
+#[test]
 fn homebrew_formula_installs_complete_runtime_on_every_supported_platform() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let formula = temp.path().join("deadreckon.rb");

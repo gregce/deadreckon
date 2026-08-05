@@ -375,7 +375,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: dist-local-*
-          path: target/distrib
+          # Each target artifact is uploaded from the repository root because
+          # it also carries a root-level dist manifest. Restore that recorded
+          # layout here; downloading into target/distrib would produce
+          # target/distrib/target/distrib and hide the archives from the
+          # generated Homebrew formula beside them.
+          path: .
           merge-multiple: true
       - name: Build global artifacts
         run: |
@@ -416,13 +421,16 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: dist-local-*
-          path: target/distrib
+          # Preserve the upload-time repository-relative layout. This keeps
+          # target archives, the generated formula, checksums and manifests in
+          # one canonical target/distrib tree for trust verification.
+          path: .
           merge-multiple: true
       - name: Download global artifacts
         uses: actions/download-artifact@v4
         with:
           name: dist-global
-          path: target/distrib
+          path: .
       - name: Generate and verify archive-member manifest
         run: |
           node release/evaluator-sidecars.mjs manifest \
