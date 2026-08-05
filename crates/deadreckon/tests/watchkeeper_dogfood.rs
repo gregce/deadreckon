@@ -657,7 +657,10 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
     let trials = payload["trials"]
         .as_array()
         .expect("credential-free trials");
-    let expected_trials = [
+    let source_runner_text = String::from_utf8(source_runner).expect("source runner UTF-8");
+    let includes_macos_developer_tool_gate =
+        source_runner_text.contains("macos_developer_tool_gate");
+    let mut expected_trials = vec![
         "terminal_detach",
         "worker_kill",
         "supervisor_restart",
@@ -672,6 +675,9 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         "semantic_parent_repair",
         "repair_lineage_tamper",
     ];
+    if includes_macos_developer_tool_gate {
+        expected_trials.insert(4, "macos_developer_tool_gate");
+    }
     assert_eq!(trials.len(), expected_trials.len());
     for id in expected_trials {
         let trial = trials
@@ -704,7 +710,6 @@ fn checked_adversarial_results_match_the_runner_and_have_no_false_live_claim() {
         true
     );
     let live = payload["live_claims"].as_array().expect("live claims");
-    let source_runner_text = String::from_utf8(source_runner).expect("source runner UTF-8");
     let split_live_docker_claim = source_runner_text.contains("live_docker_gate_attack");
     assert_eq!(live.len(), if split_live_docker_claim { 9 } else { 8 });
     assert!(
