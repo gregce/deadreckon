@@ -504,12 +504,18 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
     } else {
         "    (subpath \"/private/tmp\")\n    (subpath \"/tmp\")\n".to_string()
     };
+    let null_device_write = if Path::new("/dev/null").exists() {
+        "    (literal \"/dev/null\")\n"
+    } else {
+        ""
+    };
     let profile = format!(
         "(version 1)
 {default_posture}
 {network}
 {file_read_policy}
 (allow file-write*
+{null_device_write}
 {host_temp_writes}
 {write_rules})
 {ssh_deny}
@@ -1105,6 +1111,29 @@ mod tests {
         let error = super::build_command(&read_only_spec(SandboxBackend::None))
             .expect_err("none cannot enforce read-only");
         assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn disposable_seatbelt_allows_only_the_null_device_as_a_system_write() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut spec = read_only_spec(SandboxBackend::SandboxExec);
+        spec.cwd = temp.path().to_path_buf();
+        spec.workspace_access = WorkspaceAccess::Disposable;
+
+        let profile = super::sandbox_exec_profile(&spec).expect("Seatbelt profile");
+
+        let write_policy = profile
+            .split_once("(allow file-write*")
+            .expect("write policy")
+            .1
+            .split_once("\n)")
+            .expect("end of write policy")
+            .0;
+        assert!(
+            write_policy.contains("(literal \"/dev/null\")"),
+            "{profile}"
+        );
+        assert!(!write_policy.contains("(subpath \"/dev\")"), "{profile}");
     }
 
     #[test]

@@ -4966,8 +4966,8 @@ fn prepare_strict_gate_environment(
         }
         entries
     };
-    if let Some(bin) = gate_tool_bin {
-        path_entries.insert(0, bin);
+    if let Some(bin) = gate_tool_bin.as_ref() {
+        path_entries.insert(0, bin.clone());
     }
     if let Some(cargo) = host_cargo.as_ref().filter(|path| path.is_dir()) {
         let bin = cargo.join("bin");
@@ -5003,35 +5003,35 @@ fn prepare_strict_gate_environment(
     })?;
     env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
     if !docker {
-        configure_macos_strict_toolchain(env, read_allowlist);
+        configure_macos_strict_toolchain(gate_tool_bin.as_deref(), env, read_allowlist)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn configure_macos_strict_toolchain(
+    gate_tool_bin: Option<&Path>,
     env: &mut BTreeMap<String, String>,
     read_allowlist: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
     // `/usr/bin/cc` and `/usr/bin/clang` are xcrun shims. Inside the strict
     // Seatbelt profile they try to update a host-global cache below the Darwin
     // user temp directory, which is intentionally not writable. Resolve the
     // selected developer toolchain in the trusted controller and pass only
     // stable, canonical paths into the disposable evaluator.
-    let Some(clang) = xcrun_path(&["--find", "clang"], false) else {
-        return;
-    };
-    let clang_value = clang.to_string_lossy().into_owned();
-    env.insert("CC".to_string(), clang_value.clone());
-    let cargo_linker = match std::env::consts::ARCH {
-        "aarch64" => Some("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"),
-        "x86_64" => Some("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER"),
-        _ => None,
-    };
-    if let Some(key) = cargo_linker {
-        env.insert(key.to_string(), clang_value);
+    if let Some(clang) = xcrun_path(&["--find", "clang"], false) {
+        let clang_value = clang.to_string_lossy().into_owned();
+        env.insert("CC".to_string(), clang_value.clone());
+        let cargo_linker = match std::env::consts::ARCH {
+            "aarch64" => Some("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER"),
+            "x86_64" => Some("CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER"),
+            _ => None,
+        };
+        if let Some(key) = cargo_linker {
+            env.insert(key.to_string(), clang_value);
+        }
+        push_existing_unique(read_allowlist, clang);
     }
-    push_existing_unique(read_allowlist, clang);
 
     if let Some(clangxx) = xcrun_path(&["--find", "clang++"], false) {
         env.insert("CXX".to_string(), clangxx.to_string_lossy().into_owned());
@@ -5044,13 +5044,39 @@ fn configure_macos_strict_toolchain(
         );
         push_existing_unique(read_allowlist, sdk_root);
     }
+    if let Some(tool_bin) = gate_tool_bin {
+        // Shell acceptance checks commonly invoke these names directly. The
+        // `/usr/bin` entries are Apple developer-tool shims which may invoke
+        // xcrun and update its host temp cache after containment begins. Put
+        // controller-resolved, read-only aliases ahead of `/usr/bin` instead.
+        for name in [
+            "python3",
+            "swift",
+            "swiftc",
+            "clang",
+            "clang++",
+            "cc",
+            "c++",
+            "xcodebuild",
+        ] {
+            let Some(tool) = xcrun_path(&["--find", name], false) else {
+                continue;
+            };
+            let alias = tool_bin.join(name);
+            std::os::unix::fs::symlink(&tool, &alias).with_path(&alias)?;
+            push_existing_unique(read_allowlist, tool);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
 fn configure_macos_strict_toolchain(
+    _gate_tool_bin: Option<&Path>,
     _env: &mut BTreeMap<String, String>,
     _read_allowlist: &mut Vec<PathBuf>,
-) {
+) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -7530,7 +7556,8 @@ mod tests {
         let mut env = std::collections::BTreeMap::new();
         let mut read_allowlist = Vec::new();
 
-        super::configure_macos_strict_toolchain(&mut env, &mut read_allowlist);
+        super::configure_macos_strict_toolchain(None, &mut env, &mut read_allowlist)
+            .expect("controller resolves strict toolchain");
 
         let clang = PathBuf::from(env.get("CC").expect("controller resolves clang"));
         assert!(clang.is_absolute());
@@ -7618,6 +7645,68 @@ mod tests {
             Path::new(&output.stdout).starts_with(expected_tmp),
             "{output:#?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn strict_macos_gate_runs_controller_resolved_python_and_dev_null() {
+        let temp = TempDir::new().expect("tempdir");
+        let workspace = temp.path().join("workspace");
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let mut env = std::collections::BTreeMap::new();
+        let mut read_allowlist = Vec::new();
+        let mut write_allowlist = vec![workspace.clone()];
+        super::prepare_strict_gate_environment(
+            &workspace,
+            &runtime,
+            SandboxBackend::SandboxExec,
+            &mut env,
+            &mut read_allowlist,
+            &mut write_allowlist,
+        )
+        .expect("strict gate environment");
+        let expected_python = super::xcrun_path(&["--find", "python3"], false)
+            .expect("controller resolves Xcode python3");
+        let profile_dir = temp.path().join("profile");
+        env.insert(
+            "EXPECTED_PYTHON".to_string(),
+            expected_python.to_string_lossy().into_owned(),
+        );
+
+        let output = super::run_sandbox(deadreckon_sandbox::SandboxSpec {
+            backend: SandboxBackend::SandboxExec,
+            docker: None,
+            cwd: workspace.clone(),
+            program: std::ffi::OsString::from("/bin/sh"),
+            args: vec![
+                std::ffi::OsString::from("-c"),
+                std::ffi::OsString::from(
+                    "test \"$(readlink \"$(command -v python3)\")\" = \"$EXPECTED_PYTHON\"; python3 -c 'print(\"strict-python-ok\")' 2>/dev/null",
+                ),
+            ],
+            stdin: None,
+            env,
+            allow_network: false,
+            pid_file: None,
+            cancellation_token: None,
+            profile_dir: Some(profile_dir.clone()),
+            read_allowlist,
+            write_allowlist,
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
+            network_allowlist: Vec::new(),
+            workspace_access: deadreckon_sandbox::WorkspaceAccess::Disposable,
+            cleanup_process_group: true,
+            guarded_launch: None,
+        })
+        .await
+        .expect("contained python check");
+
+        let profile = std::fs::read_to_string(profile_dir.join("profile.sb"))
+            .expect("captured sandbox profile");
+        assert_eq!(output.status_code, Some(0), "{output:#?}\n{profile}");
+        assert_eq!(output.stdout, "strict-python-ok\n", "{output:#?}");
     }
 
     fn base_run_loop_config() -> RunLoopConfig {
