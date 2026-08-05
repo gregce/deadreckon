@@ -23,6 +23,10 @@
   while only `dr-gate` and its static evaluator sidecars must embed the gate
   protocol marker. Production-shaped fixtures prevent optimized host binaries
   from being rejected by a synthetic-only marker assumption.
+- `dr-gate` now retains its protocol marker as an explicit runtime datum, so
+  fat LTO and symbol stripping cannot fold it into target-specific
+  instructions. Pre-execution admission therefore recognizes optimized Intel
+  macOS helpers while continuing to reject incompatible or stale gates.
 - Sandbox subprocesses now drain stdout and stderr continuously into bounded
   head/tail captures, so output floods cannot deadlock or exhaust evidence
   memory. Unix cleanup treats only `ESRCH` as proof of process-group absence,

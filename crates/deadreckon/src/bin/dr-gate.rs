@@ -15,6 +15,14 @@ use deadreckon_core::{
 };
 use deadreckon_sandbox::SandboxBackend;
 
+// Admission validates cross-platform gate helpers before executing them, so
+// the protocol marker must survive LTO and symbol stripping as one contiguous
+// datum. Reading this retained byte array at runtime prevents serializers from
+// folding the marker into target-specific instructions.
+#[used]
+static EMBEDDED_GATE_EVALUATOR_PROTOCOL_MARKER: [u8; 37] =
+    *b"deadreckon-gate-evaluator-protocol-v1";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut raw = std::env::args_os().skip(1);
     let mode = raw
@@ -61,13 +69,21 @@ fn print_protocol() -> Result<(), Box<dyn std::error::Error>> {
         &serde_json::json!({
             "schema_version": deadreckon_protocol::GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
             "protocol_version": deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION,
-            "protocol_marker": deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_MARKER,
+            "protocol_marker": embedded_gate_evaluator_protocol_marker(),
             "package_version": env!("CARGO_PKG_VERSION"),
             "bundle_build_id": env!("DEADRECKON_BUNDLE_BUILD_ID"),
         }),
     )?;
     stdout.write_all(b"\n")?;
     Ok(())
+}
+
+fn embedded_gate_evaluator_protocol_marker() -> &'static str {
+    let bytes = std::hint::black_box(&EMBEDDED_GATE_EVALUATOR_PROTOCOL_MARKER);
+    match std::str::from_utf8(bytes) {
+        Ok(marker) => marker,
+        Err(_) => unreachable!("the compiled gate protocol marker must be valid UTF-8"),
+    }
 }
 
 fn probe_boundary() -> Result<(), Box<dyn std::error::Error>> {
@@ -525,14 +541,19 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommonArgs, GateCommand, SignArgs, SigningEnvironment, explicit_containment, parse_command,
+        CommonArgs, GateCommand, SignArgs, SigningEnvironment,
+        embedded_gate_evaluator_protocol_marker, explicit_containment, parse_command,
         parse_guarded_exec, read_evaluation, reject_evaluator_gate_environment, sign,
     };
 
     #[test]
     fn compiled_protocol_marker_matches_the_controller_contract() {
         assert_eq!(
-            deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_MARKER,
+            embedded_gate_evaluator_protocol_marker(),
+            deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_MARKER
+        );
+        assert_eq!(
+            embedded_gate_evaluator_protocol_marker(),
             format!(
                 "deadreckon-gate-evaluator-protocol-v{}",
                 deadreckon_protocol::GATE_EVALUATOR_PROTOCOL_VERSION
