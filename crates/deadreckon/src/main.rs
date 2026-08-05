@@ -8085,13 +8085,11 @@ fn validate_merge_repair_plan(
                     )));
                 }
             }
-            "spawn_repair_child" => {
-                if action.action != "repair_child" {
-                    return Err(CliError::Core(deadreckon_core::user_error(
-                        "repair child decisions require repair_child actions",
-                        "rerun with another --repair-provider",
-                    )));
-                }
+            "spawn_repair_child" if action.action != "repair_child" => {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    "repair child decisions require repair_child actions",
+                    "rerun with another --repair-provider",
+                )));
             }
             _ => {}
         }
@@ -15823,7 +15821,7 @@ fn collect_jsonl_provider_activity_scan(
     for root in &spec.roots {
         collect_recent_provider_files(root, spec, &mut candidates, 0);
     }
-    candidates.sort_by(|left, right| right.1.cmp(&left.1));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
     for (path, _) in candidates {
         if !provider_jsonl_session_matches_run(spec, &path, &working_dirs) {
             continue;

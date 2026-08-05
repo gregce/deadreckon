@@ -4208,7 +4208,7 @@ pub(crate) fn list_chain_records(
         }
         chains.push(chain);
     }
-    chains.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    chains.sort_by_key(|chain| std::cmp::Reverse(chain.created_at));
     Ok(chains)
 }
 

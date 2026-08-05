@@ -665,7 +665,7 @@ pub fn list_runs(paths: &DeadreckonPaths, scope_filter: Option<&str>) -> Result<
             state_path: entry.path().to_path_buf(),
         });
     }
-    runs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.updated_at));
     Ok(runs)
 }
 
