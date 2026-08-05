@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import stat
 import struct
@@ -18,6 +19,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+BUNDLE_BUILD_ID_PATTERN = re.compile(
+    rb"deadreckon-bundle-build-id-sha256:[a-f0-9]{64}"
+)
 
 
 @dataclass(frozen=True)
@@ -932,6 +938,27 @@ def static_linux_arm64_elf(data: bytes) -> bool:
     return True
 
 
+def source_bundle_build_id(repo: Path) -> tuple[str | None, str | None]:
+    node = shutil.which("node")
+    trust = repo / "release" / "trust" / "release-trust.mjs"
+    if node is None or not trust.is_file():
+        return None, "Node or the source-bundle verifier is unavailable"
+    completed = subprocess.run(
+        (node, str(trust), "source-bundle-id", "--root", str(repo), "--raw"),
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    value = completed.stdout.decode("utf-8", errors="replace").strip()
+    if (
+        completed.returncode != 0
+        or BUNDLE_BUILD_ID_PATTERN.fullmatch(value.encode()) is None
+    ):
+        return None, "the source-bundle verifier did not return one valid identity"
+    return value, None
+
+
 def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any]:
     sidecar_name = "dr-gate-evaluator-aarch64-unknown-linux-musl"
     sidecar = cargo_target_directory(repo) / "debug" / sidecar_name
@@ -940,6 +967,7 @@ def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any
     sidecar_executable = False
     sidecar_compatible = False
     sidecar_sha256 = None
+    sidecar_bundle_ids: list[str] = []
     try:
         metadata = sidecar.lstat()
         sidecar_present = True
@@ -949,16 +977,29 @@ def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any
             sidecar_bytes = sidecar.read_bytes()
             sidecar_sha256 = digest(sidecar_bytes)
             sidecar_compatible = static_linux_arm64_elf(sidecar_bytes)
+            sidecar_bundle_ids = sorted(
+                {
+                    match.decode("ascii")
+                    for match in BUNDLE_BUILD_ID_PATTERN.findall(sidecar_bytes)
+                }
+            )
     except OSError:
         pass
 
     image_compatible = docker.get("image_platform") == "arm64/linux"
+    source_bundle_id, source_bundle_error = source_bundle_build_id(repo)
+    bundle_compatible = (
+        len(sidecar_bundle_ids) == 1
+        and source_bundle_id is not None
+        and sidecar_bundle_ids[0] == source_bundle_id
+    )
     operational = (
         bool(docker.get("operational"))
         and image_compatible
         and sidecar_regular
         and sidecar_executable
         and sidecar_compatible
+        and bundle_compatible
     )
     if not docker.get("operational"):
         reason = docker.get("reason")
@@ -975,6 +1016,12 @@ def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any
         reason = "the static Linux arm64 evaluator sidecar is not executable"
     elif not sidecar_compatible:
         reason = "the evaluator sidecar is not a static Linux arm64 ELF binary"
+    elif len(sidecar_bundle_ids) != 1:
+        reason = "the evaluator sidecar does not carry exactly one DeadReckon build-bundle identity"
+    elif source_bundle_error is not None:
+        reason = source_bundle_error
+    elif not bundle_compatible:
+        reason = "the evaluator sidecar belongs to a different DeadReckon build bundle than the clean source"
     else:
         reason = None
     return {
@@ -986,6 +1033,11 @@ def public_docker_preflight(repo: Path, docker: dict[str, Any]) -> dict[str, Any
         "sidecar_executable": sidecar_executable,
         "sidecar_compatible": sidecar_compatible,
         "sidecar_sha256": sidecar_sha256,
+        "sidecar_bundle_id": (
+            sidecar_bundle_ids[0] if len(sidecar_bundle_ids) == 1 else None
+        ),
+        "source_bundle_id": source_bundle_id,
+        "bundle_compatible": bundle_compatible,
         "reason": reason,
     }
 

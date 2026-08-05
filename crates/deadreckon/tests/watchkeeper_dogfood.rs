@@ -199,6 +199,7 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
     assert!(source.contains("DEADRECKON_LIVE_DOCKER_TEST=1"));
     assert!(source.contains("dr-gate-evaluator-aarch64-unknown-linux-musl"));
     assert!(source.contains("arm64/linux"));
+    assert!(source.contains("bundle_compatible"));
 }
 
 #[test]
@@ -314,16 +315,49 @@ exit 2
     )
     .expect("fake cargo");
     fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("cargo executable");
-    let mut static_arm64_elf = vec![0_u8; 120];
-    static_arm64_elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
-    static_arm64_elf[18..20].copy_from_slice(&183_u16.to_le_bytes());
-    static_arm64_elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
-    static_arm64_elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
-    static_arm64_elf[56..58].copy_from_slice(&1_u16.to_le_bytes());
-    static_arm64_elf[64..68].copy_from_slice(&1_u32.to_le_bytes());
-    fs::write(&sidecar, static_arm64_elf).expect("static arm64 sidecar");
+    let static_arm64_elf = |bundle_id: &str| {
+        let mut bytes = vec![0_u8; 120];
+        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        bytes[18..20].copy_from_slice(&183_u16.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(bundle_id.as_bytes());
+        bytes
+    };
+    let mismatched_bundle = format!("deadreckon-bundle-build-id-sha256:{}", "0".repeat(64));
+    fs::write(&sidecar, static_arm64_elf(&mismatched_bundle)).expect("mismatched sidecar");
+    let mismatched = run("mismatched-sidecar", "arm64/linux");
+    assert_eq!(mismatched["trials"][0]["status"], "unproven");
+    assert_eq!(
+        mismatched["trials"][0]["reason"],
+        "the evaluator sidecar belongs to a different DeadReckon build bundle than the clean source"
+    );
+    assert_eq!(
+        mismatched["host"]["public_docker_preflight"]["bundle_compatible"],
+        false
+    );
+
+    let source_bundle = Command::new("node")
+        .arg(repo.join("release/trust/release-trust.mjs"))
+        .args(["source-bundle-id", "--root"])
+        .arg(&repo)
+        .arg("--raw")
+        .output()
+        .expect("source bundle command");
+    assert!(source_bundle.status.success());
+    let source_bundle = String::from_utf8(source_bundle.stdout)
+        .expect("source bundle UTF-8")
+        .trim()
+        .to_string();
+    fs::write(&sidecar, static_arm64_elf(&source_bundle)).expect("static arm64 sidecar");
     let ready = run("ready", "arm64/linux");
     assert_eq!(ready["trials"][0]["status"], "passed");
+    assert_eq!(
+        ready["host"]["public_docker_preflight"]["bundle_compatible"],
+        true
+    );
     let commands = ready["trials"][0]["commands"]
         .as_array()
         .expect("public Docker commands");

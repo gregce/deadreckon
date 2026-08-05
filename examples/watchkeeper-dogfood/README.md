@@ -175,6 +175,9 @@ If any public Docker prerequisite is absent or incompatible, the runner records
 `docker_gate_boundary` as `unproven` with no commands executed. It still runs
 the other credential-free groups. The three public commands set
 `DEADRECKON_LIVE_DOCKER_TEST=1` themselves and never invoke a paid provider.
+Preflight also derives the expected build-bundle identity from the clean source
+and refuses a static evaluator from an older same-version build before any Job
+is created.
 
 The result must name `WK_SOURCE_REV` and record `repository.dirty` as `false`.
 Only after checking those fields should the operator copy the result into the
