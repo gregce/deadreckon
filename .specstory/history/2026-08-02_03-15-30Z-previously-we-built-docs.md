@@ -3130,3 +3130,3697 @@ Updated:
 - [Soundings rider](/Users/gdc/deadreckon/docs/goals/2026-08-02-0016-deadreckon-soundings-rider.md)
 
 AS-BUILT now covers unified execution teams, durable stall prevention, and the honest current limits around Graph `--from` and unbounded done-contract authoring. Document checks passed. Existing MAP, code and SpecStory changes remain uncommitted and untouched.
+
+---
+
+_**User (2026-08-02 07:42:11Z)**_
+
+lets commit docs/MAP-OF-DEADRECKON.md
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:18Z)**_
+
+I’ll review the MAP diff for scope and formatting, then commit only `docs/MAP-OF-DEADRECKON.md`. All code and SpecStory changes will stay out of the commit.
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:20Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git status --short -- docs/MAP-OF-DEADRECKON.md\ngit diff --check -- docs/MAP-OF-DEADRECKON.md\ngit diff --stat -- docs/MAP-OF-DEADRECKON.md\ngit diff -- doc
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:26Z)**_
+
+The MAP diff is coherent and passes `git diff --check`. It is a substantial current-state refresh—execution teams, durable admission and wall caps, provider progress, sandbox/toolchain reality, protocol gaps, and revised recommendations—so I’ll commit it as a standalone documentation change.
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:28Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git add -- docs/MAP-OF-DEADRECKON.md\ngit diff --cached --check\ngit diff --cached --name-status\ngit diff --cached --stat","workdir":"/Users/gdc/deadreckon"
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git add -- docs/MAP-OF-DEADRECKON.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":12000,"sandbox_permissions":"require_escala
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:41Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git diff --cached --check\ngit diff --cached --name-status\ngit diff --cached --stat","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tok
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"git commit -m \"docs: refresh map of DeadReckon\"","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":20000});
+text(r.output);
+
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:49Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git show --stat --oneline --summary HEAD\ngit diff-tree --no-commit-id --name-status -r HEAD\ngit status --short -- docs/MAP-OF-DEADRECKON.md","workdir":"/Us
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 07:42:57Z)**_
+
+Committed [MAP-OF-DEADRECKON.md](/Users/gdc/deadreckon/docs/MAP-OF-DEADRECKON.md) as:
+
+`ed2013e docs: refresh map of DeadReckon`
+
+Only the MAP was included. Other working-tree changes remain untouched.
+
+---
+
+_**User (2026-08-02 22:32:07Z)**_
+
+can you go investigate these runs and understand why they fail?
+
+ setup and health:         deadreckon doctor
+➜  test-deadreckon mkdir flappy-forever      
+➜  test-deadreckon cd flappy-forever 
+➜  flappy-forever deadreckon start
+✓ goal build a mac app version of flappy bird that adds new elements to the game than that makes it more dynamic
+✓ Choose source mode Initialize git, then use worktree mode — runs git init after final confirmation
+
+✓ Choose launch path Recommended: full-plan orchestration — provider suggested orchestrate: Dynamic features must build on the core game and review needs both landed
+ so a 3-node sequential chain with per-node apply.
+✓ Configure execution team Use Codex CLI · gpt-5.6-sol for the planner and 3 implementors — cli:codex · provider cache · context 272k
+✓ How will you know it worked? (one line; Enter = draft from goal) we've screenshotted the working game loaded e
+
+error: invalid input: done criteria initial draft provider failed via cli:claude-code / provider default: CLI provider error for cli:claude-code: se(1): Error: Invalid MCP configuration:
+mcpServers: Invalid input: expected record, received undefined
+
+try: deadreckon config provider <compatible-doc-provider>
+➜  flappy-forever deadreckon start
+✓ goal build a mac app version of flappy bird that adds new elements to the game than that makes it more dynamic
+✓ Choose source mode Initialize git, then use worktree mode — runs git init after final confirmation
+
+✓ Choose launch path Recommended: full-plan orchestration — provider suggested orchestrate: Base game must exist before dynamic elements build on it, then a fresh-ey
+s review; per-node so each stage sees prior changes.
+✓ Configure execution team Use Codex CLI · provider default for the planner and 3 implementors — cli:codex · provider cache · context 258k · recommended
+✓ How will you know it worked? (one line; Enter = draft from goal) weve screenshotted it
+
+error: invalid input: done criteria initial draft provider failed via cli:claude-code / provider default: CLI provider error fbprocess exited with Some(1): Error: Invalid MCP configuration:
+mcpServers: Invalid input: expected record, received undefined
+
+try: deadreckon config provider <compatible-doc-provider>
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:32:20Z)**_
+
+I’m using the diagnose-before-edit workflow because the failure crosses three layers: guided team selection, the separate done-contract provider route, and Claude’s local MCP configuration. I’ll trace the exact provider-selection path and installed binary/config state without changing anything.
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:32:21Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/diagnose-before-edit/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":20000});
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:32:28Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({plan:[
+  {step:"Identify the installed binary, effective DeadReckon config, and any failed-launch artifacts",status:"in_progress"},
+  {step:"Trace execution-tea
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:32:42Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"command -v deadreckon\nwhich -a deadreckon\nls -l \"$(command -v deadreckon)\"\ndeadreckon --version\nshasum -a 256 \"$(command -v deadreckon)\"\nrg -n '^(de
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:32:55Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n \"done criteria initial draft provider failed|initial draft provider failed|compatible-doc-provider|done criteria provider failed\" crates docs\ngit lo
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:33:03Z)**_
+
+The first hard fact is useful: neither attempt created a run or Job—the directory stayed empty—so both failed during launch admission. There is also a binary/source timing wrinkle: the installed binary was rebuilt at 1:33pm today, and the acceptance code now contains Soundings-era provider handling that is newer than the earlier AS-BUILT baseline. I’m pinning the exact revision and route selection before attributing the failure.
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:33:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git log --oneline --decorate -16\ngit status --short | sed -n '1,40p'\ngit log --all --oneline --decorate --since='2026-08-02 00:00' -- crates/deadreckon/src
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:33:12Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,190p' crates/deadreckon/src/commands/acceptance.rs\nsed -n '860,1035p' crates/deadreckon/src/commands/acceptance.rs\nsed -n '1040,1115p' crates/dea
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:33:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -v -i '(api[_-]?key|token|secret|password)' /Users/gdc/.deadreckon/config.toml\nclaude --version 2>&1 || true\nls -ld /Users/gdc/.claude /Users/gdc/.claud
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:33:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '55,165p' crates/deadreckon-providers/src/cli_claude_code.rs\nsed -n '1,80p' crates/deadreckon-providers/descriptors/cli-claude-code.toml\nrg -n \"jso
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:34:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"claude --help 2>&1 | rg -n -- '--safe-mode|--tools|--strict-mcp-config|--mcp-config|--setting-sources|--json-schema'\nset +e\nclaude --strict-mcp-config --mc
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:34:21Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"claude --help 2>&1 | rg -n -- '--max-budget-usd|--max-turns|--output-format|--verbose'\nrg -n \"mcp-config|strict-mcp|setting-sources|schema-only|json-schema
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:34:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1900,1975p' crates/deadreckon-providers/tests/cli_providers.rs\nsed -n '2345,2395p' crates/deadreckon-providers/tests/cli_providers.rs\nsed -n '235,2
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:34:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n \"claude_router|write_fake_claude|schema.*claude|Claude.*output_schema|output_schema.*Claude\" crates/deadreckon-providers/tests/cli_providers.rs | sed
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:34:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"claude --help 2>&1 | rg -n -C 2 -- '--max-turns|--max-budget-usd'\ncommand -v claude\nls -l \"$(command -v claude)\"\nfile \"$(command -v claude)\"\nnpm root
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:35:07Z)**_
+
+The provider split is now proven: choosing Codex configured the planner and implementors only. Soundings deliberately passes no execution provider into contract authoring, which then prefers `defaults.doc_provider`; yours is `cli:claude-code`. The next question is whether Claude itself is unhealthy or DeadReckon constructs an invalid isolated Claude invocation. The local Claude state has a valid `mcpServers` object, so I’m checking the generated arguments and doctor coverage rather than blaming your user config.
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:35:07Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"deadreckon doctor --json","workdir":"/Users/gdc/test-deadreckon/flappy-forever","yield_time_ms":30000,"max_output_tokens":30000});
+text(r.output);
+
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:35:20Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"claude auth status 2>/dev/null | jq -c '{loggedIn,authMethod,subscriptionType}'\ndeadreckon supervisor status --json 2>/dev/null || deadreckon supervisor sta
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:35:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"set +e\nschema='{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}},\"required\":[\"ok\"],\"additionalProperties\":false}'\nclaude --output-f
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:35:46Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git blame -L 70,90 -- crates/deadreckon-providers/src/cli_claude_code.rs\ngit log -S'--strict-mcp-config' --oneline -- crates/deadreckon-providers/src/cli_cl
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"deadreckon config --help\ndeadreckon config provider --help\ndeadreckon config set --help\nrg -n \"ConfigProvider|config provider|doc_provider|SetupProviderR
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:13Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '3200,3285p' crates/deadreckon/src/main.rs\nsed -n '4080,4160p' crates/deadreckon/src/main.rs\nsed -n '10390,10515p' crates/deadreckon/src/main.rs\nrg
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:17Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '3360,3495p' crates/deadreckon/src/main.rs\nsed -n '3495,3590p' crates/deadreckon/src/main.rs\nsed -n '2800,2905p' crates/deadreckon/src/main.rs","wor
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:25Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '2780,2860p' crates/deadreckon/src/cli.rs\nrg -n \"struct StartCommandArgs|doc_provider\" crates/deadreckon/src/commands/start.rs crates/deadreckon/sr
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"nl -ba crates/deadreckon/src/commands/start.rs | sed -n '3038,3082p'\nnl -ba crates/deadreckon/src/commands/acceptance.rs | sed -n '930,970p'\nnl -ba crates/
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({explanation:"Both attempts failed before Job creation. The route split and malformed synthetic Claude MCP config are now reproduced independently; remaining wor
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:36:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n '^version\\s*=' Cargo.toml crates/deadreckon/Cargo.toml\nrg -n 'version = \"0\\.8\\.0-rc\\.2\"|0\\.8\\.0-rc\\.2' Cargo.toml crates release CHANGELOG.md
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:37:18Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({explanation:"Root cause is localized and independently reproduced. No files or configuration were changed.",plan:[
+  {step:"Identify the installed binary, effec
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 22:37:41Z)**_
+
+Both attempts failed for the same deterministic pre-launch bug. They never became runs: no Job ID, Git repository, acceptance file, or run artifact was created.
+
+The causal chain is:
+
+1. You selected Codex for the planner and implementors.
+2. Guided `start` deliberately passes no execution provider to contract authoring in [start.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/start.rs:3057).
+3. Contract authoring therefore prefers `defaults.doc_provider`, which is configured as `cli:claude-code`, in [acceptance.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/acceptance.rs:1071).
+4. The Claude adapter requests schema-constrained output and passes:
+   `--strict-mcp-config --mcp-config '{}'`
+   in [cli_claude_code.rs](/Users/gdc/deadreckon/crates/deadreckon-providers/src/cli_claude_code.rs:75).
+5. Claude Code 2.1.220 rejects `{}` because this mode requires an `mcpServers` record.
+
+I reproduced it independently:
+
+```text
+--mcp-config '{}'
+→ Invalid MCP configuration:
+  mcpServers: expected record, received undefined
+
+--mcp-config '{"mcpServers":{}}'
+→ MCP configuration accepted
+```
+
+This is not caused by your normal Claude MCP configuration. Your `~/.claude.json` has a valid `mcpServers` object, and DeadReckon explicitly disables those setting sources for this isolated request.
+
+There are two secondary problems:
+
+- Claude is currently logged out. Once the MCP payload is corrected, the next error is `Not logged in · Please run /login`.
+- The printed recovery command is misleading. `deadreckon config provider cli:codex` does not change `defaults.doc_provider`; [main.rs](/Users/gdc/deadreckon/crates/deadreckon/src/main.rs:2825) leaves it pointing at Claude.
+
+The immediate workaround is:
+
+```sh
+deadreckon config set defaults.doc_provider cli:codex
+```
+
+The proper code fix is to send `{"mcpServers":{}}`, add a positive schema-only Claude adapter test, and correct the recovery command. The current tests do not exercise this path; the fake Claude capability fixture in [cli_providers.rs](/Users/gdc/deadreckon/crates/deadreckon-providers/tests/cli_providers.rs:1938) omits the schema-only flags.
+
+I made no code or configuration changes.
+
+---
+
+_**User (2026-08-02 23:03:16Z)**_
+
+but shouldn't this work with claude, too?
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:03:26Z)**_
+
+Yes. Codex for execution plus Claude for done-contract authoring is an intended configuration.
+
+Claude 2.1.220 advertises every required capability. DeadReckon is constructing its isolated invocation incorrectly:
+
+```text
+current:  --mcp-config '{}'
+required: --mcp-config '{"mcpServers":{}}'
+```
+
+After correcting that, Claude reaches authentication normally. Your Claude installation is also logged out, so `claude login` is required before it can author the contract.
+
+This is a DeadReckon adapter bug, not an unsupported Claude configuration. The proper fix should include:
+
+- correct the generated MCP payload
+- add a real schema-only Claude regression test
+- make doctor test this specific capability
+- fix the misleading recovery command
+
+Switching `defaults.doc_provider` to Codex is only a workaround; Claude should work too.
+
+---
+
+_**User (2026-08-02 23:03:46Z)**_
+
+does it have to run through mcp or what?
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:03:55Z)**_
+
+No. The request runs through the Claude CLI and Claude’s normal API/subscription authentication—not through MCP.
+
+DeadReckon supplies MCP flags to ensure contract authoring has zero MCP tools available:
+
+```text
+--safe-mode
+--tools ""
+--strict-mcp-config
+--mcp-config '{"mcpServers":{}}'
+--setting-sources ""
+```
+
+So the MCP configuration is a security boundary meaning “no MCP servers,” not a dependency. The bug is simply that DeadReckon passes `{}` instead of the valid empty configuration `{"mcpServers":{}}`.
+
+---
+
+_**User (2026-08-02 23:04:24Z)**_
+
+can we fix this please in our code? and see if that exists for other providers?
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:04:32Z)**_
+
+I’ll fix the Claude adapter and audit every provider’s schema-only/structured-output path for the same empty-configuration or tool-isolation mistake. I’m using diagnose-before-edit to preserve the proven causal chain, then review-against-the-working-sibling to compare Claude with the known-good Codex path before changing code.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:04:33Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/diagnose-before-edit/SKILL.md\nsed -n '1,300p' /Users/gdc/.agents/skills/review-against-the-working-sibling/SKILL.m
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:04:46Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({plan:[
+  {step:"Audit all provider structured-output and tool-isolation paths against Codex",status:"in_progress"},
+  {step:"Add a regression test that reproduc
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:04:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n --glob '*.rs' --glob '*.toml' 'mcp-config|strict-mcp|setting-sources|mcpServers|output_schema|schema_only|structured-text|String::new\\(\\)|\"\\{\\}\"\
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:05:00Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '60,150p' crates/deadreckon-providers/src/cli_codex.rs\nsed -n '420,460p' crates/deadreckon-providers/src/cli_codex.rs\nsed -n '1,115p' crates/deadrec
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:02Z)**_
+
+The provider audit has narrowed this cleanly: the malformed empty MCP payload exists only in the Claude adapter. I’m turning that diagnosis into a regression test now, then I’ll fix the payload and the misleading recovery command that currently fails to change the actual document-authoring provider.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,220p' crates/deadreckon-providers/src/cli_claude_code.rs; sed -n '220,520p' crates/deadreckon-providers/src/cli_claude_code.rs; sed -n '300,345p' c
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n --fixed-strings 'deadreckon config provider <compatible-doc-provider>' crates; rg -n 'select_done_authoring_provider|run_done_authoring_stage' crates/d
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:16Z)**_
+
+The regression boundary is the exact Claude argument vector, which lets us prove the fix without needing a live Claude account. The known-good sibling is Codex’s schema-only path; Claude should provide the same isolation guarantee, with the intentional provider-specific difference that it uses safe mode, empty tools/settings, and a syntactically valid empty `mcpServers` object.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const patch = "*** Begin Patch\n*** Update File: /Users/gdc/deadreckon/crates/deadreckon-providers/src/cli_claude_code.rs\n@@\n     fn worker_claude_keeps_legacy_permission_posture() {\n         let a
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers schema_only_claude_uses_valid_empty_mcp_config -- --exact --nocapture","workdir":"/Users/gdc/deadreckon","yield_time_ms":3
+...
+```
+
+```
+Script running with cell ID 239
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:06:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `239`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:07:03Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 240
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:07:18Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `240`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:07:37Z)**_
+
+The new test is compiling through the provider crate’s dependency graph. Once it reaches the assertion it should fail on the current `"{}"` value; that is the red proof before the production edit.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:07:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 241
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:07:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `241`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:08:11Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 242
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:08:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `242`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:08:43Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 243
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:08:59Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `243`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:09:17Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 244
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:09:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `244`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:09:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ps -p 79117 -o pid,ppid,etime,state,command; pgrep -fl 'cargo|rustc|clang|ld' | tail -n 20","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_outp
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:09:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 246
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:10:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `246`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:10:31Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 247
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:10:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `247`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:04Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":79117,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output); if (r.session_id) text(`SESSION_ID=${r.session_id}`);
+```
+
+```
+Script running with cell ID 248
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:18Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `248`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:32Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers tests::schema_only_claude_uses_valid_empty_mcp_config -- --exact --nocapture","workdir":"/Users/gdc/deadreckon","yield_tim
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:35Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"tail -n 100 crates/deadreckon-providers/src/cli_claude_code.rs; git diff -- crates/deadreckon-providers/src/cli_claude_code.rs","workdir":"/Users/gdc/deadrec
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers --lib -- --list | rg 'claude|schema_only'","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":120
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers cli_claude_code::tests::schema_only_claude_uses_valid_empty_mcp_config -- --exact --nocapture","workdir":"/Users/gdc/deadr
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:53Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '245,340p' crates/deadreckon/src/commands/acceptance.rs; sed -n '920,1015p' crates/deadreckon/src/commands/acceptance.rs; sed -n '1625,1675p' crates/d
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:11:58Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '340,395p' crates/deadreckon/src/commands/doc.rs; sed -n '1425,1460p' crates/deadreckon/tests/self_documenting.rs; rg -n 'provider failed|initial draf
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,90p' crates/deadreckon/src/commands/acceptance.rs; rg -n '^mod tests|^\\s*use super' crates/deadreckon/src/commands/acceptance.rs | tail -n 10; sed
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:14Z)**_
+
+The red test failed exactly as expected (`left: "{}"`, `right: "{\"mcpServers\":{}}"`). I’m applying the minimal adapter correction, and I’m aligning every done-authoring failure hint with the actual selection logic: `defaults.doc_provider`, not the unrelated general provider setting.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const patch = "*** Begin Patch\n*** Update File: /Users/gdc/deadreckon/crates/deadreckon-providers/src/cli_claude_code.rs\n@@\n use crate::{\n     Provider, ProviderEntry, ProviderError, ProviderFutur
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"cargo fmt --all -- --check","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers cli_claude_code::tests::schema_only_claude_uses_valid_empty_mcp_config -- --exact --nocapture","workdir":"/Users/gdc/deadr
+...
+```
+
+```
+Script running with cell ID 258
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:12:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `258`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:13:15Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers cli_claude_code::tests::schema_only_claude_uses_valid_empty_mcp_config -- --exact","workdir":"/Users/gdc/deadreckon","yiel
+...
+```
+
+```
+Script running with cell ID 259
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:13:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `259`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:13:47Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":14266,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 260
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:14:01Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `260`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:14:22Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":14266,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 261
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:14:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `261`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:14:58Z)**_
+
+The corrected Claude argument test is green. Cargo is still walking the crate’s integration-test binaries despite the exact unit filter, so I’m letting that finish while I prepare a focused acceptance test for the corrected recovery guidance.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:14:59Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":14266,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 262
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:15:12Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `262`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:15:33Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":14266,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 263
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:15:47Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `263`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:16:06Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":14266,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:16:20Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon commands::acceptance::tests::done_authoring_recovery_updates_the_provider_it_selects -- --exact","workdir":"/Users/
+...
+```
+
+```
+Script running with cell ID 265
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:16:33Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `265`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:16:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 266
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:17:06Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `266`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:17:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 267
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:17:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `267`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:17:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 268
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:18:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `268`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:18:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 269
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:18:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `269`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:19:02Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 270
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:19:16Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `270`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:19:36Z)**_
+
+The production fix is in place and formatting passes. Verification is slower than the code path itself because this workspace is recompiling the large CLI binary; no provider process or 120-second done-authoring stage is running during this wait.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:19:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 271
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:19:49Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `271`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:20:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 272
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:20:21Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `272`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:20:41Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 273
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:20:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `273`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:21:13Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 274
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:21:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `274`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:21:47Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 275
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:22:01Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `275`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:22:19Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 276
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:22:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `276`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:22:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 277
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:23:07Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `277`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:23:25Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 278
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:23:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `278`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:02Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ps -p 63534 -o pid,ppid,etime,state,command","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":4000,"sandbox_permissions":"require_
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:06Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"pgrep -fl 'cargo|rustc|clang|ld'","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":8000,"sandbox_permissions":"require_escalated",
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:15Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"pgrep -fl '^cargo'","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":4000,"sandbox_permissions":"require_esc
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:17Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 282
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `282`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:24:51Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 283
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:25:07Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `283`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:25:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 284
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:25:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `284`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:25:56Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 285
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `285`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ps -p 94258 -o pid,ppid,etime,state,%cpu,%mem,command","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":4000,"sandbox_permissions"
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:35Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"pgrep -fl '^ld|/ld|clang'","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":4000,"sandbox_permissions":"require_escalated","justif
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:40Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ps -p 66185 -o pid,ppid,etime,state,%cpu,%mem,command","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":4000,"sandbox_permissions"
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:47Z)**_
+
+The focused CLI test build is stalled in Rust’s final test-binary link phase (Cargo and `rustc` are both sleeping at 0% CPU after ten minutes), not in our code. I’m stopping that verification process and switching to a non-linking compile check plus direct source-level tests, so the validation remains meaningful without waiting indefinitely on the local linker.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:47Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":63534,"chars":"\u0003","yield_time_ms":1000,"max_output_tokens":4000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:26:53Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"cargo check -p deadreckon --bin deadreckon","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 290
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:27:06Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `290`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:27:28Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 291
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:27:41Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `291`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:28:00Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 292
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:28:13Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `292`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:28:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 293
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:28:47Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `293`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:29:06Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 294
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:29:19Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `294`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:29:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 295
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:29:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `295`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:30:14Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":48932,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 296
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:30:28Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `296`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:30:34Z)**_
+
+The non-linking CLI compile check passed. I’m now running the provider library’s full unit suite (which covers Codex, Claude capability parsing, HTTP structured output, generic-provider fail-closed behavior, and smoke providers) to validate that the Claude-specific change did not disturb the other provider paths.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:30:35Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon-providers --lib","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":16000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:30:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n '^async fn .*schema|^fn .*schema|structured_text|output_schema|schema_only' crates/deadreckon-providers/tests/cli_providers.rs crates/deadreckon-provid
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:31:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo check -p deadreckon --bin deadreckon --tests","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(
+...
+```
+
+```
+Script running with cell ID 299
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:31:21Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `299`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:31:41Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":70509,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 300
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:31:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `300`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:32:14Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":70509,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 301
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:32:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `301`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:32:53Z)**_
+
+The provider suite is green: 91/91 tests passed, including Codex’s fail-closed structured-text posture and the new Claude regression. The CLI and all test targets also pass `cargo check`; I’m doing the final scoped diff audit now and will call out the one remaining operator prerequisite separately from this code bug.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:32:56Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git diff --check -- CHANGELOG.md crates/deadreckon-providers/src/cli_claude_code.rs crates/deadreckon/src/commands/acceptance.rs; rg -n --glob '*.rs' -- '--m
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:33:01Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({
+  explanation: "Claude's malformed schema-only MCP config is fixed, all provider paths were audited, regression coverage is in place, and focused provider plus
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:33:22Z)**_
+
+Fixed.
+
+The failure chain was: done authoring selected Claude → DeadReckon supplied `{}` as an empty MCP config → Claude 2.1.220 requires an `mcpServers` record, even when MCP is disabled.
+
+Changes:
+
+- Claude now receives `{"mcpServers":{}}` in its isolated schema-only posture: [cli_claude_code.rs](/Users/gdc/deadreckon/crates/deadreckon-providers/src/cli_claude_code.rs:21)
+- Added a regression test for the exact argument payload: [cli_claude_code.rs](/Users/gdc/deadreckon/crates/deadreckon-providers/src/cli_claude_code.rs:389)
+- Corrected failure guidance to update `defaults.doc_provider`, the setting actually used: [acceptance.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/acceptance.rs:9)
+- Updated [CHANGELOG.md](/Users/gdc/deadreckon/CHANGELOG.md:3)
+
+It does not need to use MCP. DeadReckon deliberately disables MCP for structured done-authoring; Claude merely requires the empty configuration to have the correct wrapper shape.
+
+Other-provider audit found no equivalent defect:
+
+- Codex uses its own strict, tool-disabled schema posture.
+- Generic CLI providers fail closed when they cannot prove structured-output isolation.
+- HTTP Anthropic/OpenAI providers use API schema fields and do not load local MCP configuration.
+- Codex app-server schema requests fall back through the isolated Codex CLI path.
+
+Verification:
+
+- Provider suite: 91/91 passed.
+- CLI binary and all test targets: `cargo check` passed.
+- Formatting and scoped diff checks passed.
+
+One separate prerequisite remains: local Claude currently reports that it is logged out. After rebuilding/installing DeadReckon, Claude authoring will pass MCP validation but still requires signing in to Claude. Changes are not yet committed.
+
+---
+
+_**User (2026-08-02 23:49:12Z)**_
+
+did we comit this?
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:49:15Z)**_
+
+I’ll check the current commit and working tree so I can distinguish committed code from the unrelated session-history changes.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:49:16Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git status --short -- CHANGELOG.md crates/deadreckon-providers/src/cli_claude_code.rs crates/deadreckon/src/commands/acceptance.rs; git log -1 --oneline --de
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:49:18Z)**_
+
+No. The three fix files are still uncommitted; `HEAD` remains at `930ab3e`.
+
+---
+
+_**User (2026-08-02 23:54:28Z)**_
+
+did we recompile it to the live version?
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:54:31Z)**_
+
+I’ll compare the live binary target, version, and timestamps against the modified source.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:54:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ls -l /Users/gdc/.local/bin/deadreckon /Users/gdc/deadreckon/target/release/deadreckon; /Users/gdc/.local/bin/deadreckon --version; stat -f 'source modified:
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:54:37Z)**_
+
+No. The live binary is from 13:33 and reports `deadreckon 0.7.0`; the fix source was modified at 19:12. A release rebuild is still needed.
+
+---
+
+_**User (2026-08-02 23:55:30Z)**_
+
+do that and commit please
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:55:43Z)**_
+
+I’ll rebuild the release binary behind the live symlink, verify the version and the Claude argument behavior, then commit only the three fix files. I’m using the comprehensive-commit workflow to keep the commit narrowly scoped while recording the diagnosis and verification clearly.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:55:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/comprehensive-commit/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":20000});
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:55:53Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short -uall","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":12000}),
+  tools.exec_command({"c
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:55:56Z)**_
+
+The intended commit is cleanly isolated to `CHANGELOG.md`, the Claude adapter, and done-authoring recovery guidance. The SpecStory and generated test artifacts are unrelated and will remain unstaged. Starting the release build now; the live executable is a symlink to its output.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:55:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo build --release -p deadreckon --bin deadreckon","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringif
+...
+```
+
+```
+Script running with cell ID 308
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:56:13Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `308`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:56:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 309
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:56:43Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `309`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:57:02Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 310
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:57:16Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `310`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:57:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 311
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:57:49Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `311`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:58:07Z)**_
+
+Compilation has reached the final release link. After it completes I’ll verify the live symlink reports the RC2 version, rerun the focused regression against the built source, and only then stage and commit.
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:58:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 312
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:58:21Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `312`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:58:42Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 313
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:58:58Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `313`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:59:14Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 314
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:59:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `314`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-02 23:59:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":31352,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"/Users/gdc/.local/bin/deadreckon --version","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":2000}),
+  tools
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:10Z)**_
+
+The live executable is updated: it now reports `deadreckon 0.8.0-rc.2`, has a fresh 19:59 timestamp, and the compiled artifact contains the corrected `{"mcpServers":{}}` payload. I’m staging only the three intended files now.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:13Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git add CHANGELOG.md crates/deadreckon-providers/src/cli_claude_code.rs crates/deadreckon/src/commands/acceptance.rs","workdir":"/Users/gdc/deadreckon","yiel
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:19Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":8000}),
+  tools.exec_command({"cmd":"gi
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git commit -m \"fix(acceptance): restore Claude done authoring\" -m \"Claude Code 2.1.220 rejects a bare empty object passed through --mcp-config because it 
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:37Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short -- CHANGELOG.md crates/deadreckon-providers/src/cli_claude_code.rs crates/deadreckon/src/commands/acceptance.rs","wo
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:00:45Z)**_
+
+Done.
+
+- Live binary rebuilt and reports `deadreckon 0.8.0-rc.2`.
+- Committed as `f5b24ef fix(acceptance): restore Claude done authoring`.
+- Only the three intended files were committed.
+- Unrelated SpecStory/generated artifacts remain uncommitted.
+- Commit has not been pushed.
+
+---
+
+_**User (2026-08-03 00:03:16Z)**_
+
+we can push this
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:21Z)**_
+
+I’ll verify the committed fix matches the live binary and confirm the branch/upstream before pushing `main`. I’m using the reconciliation check because this is a user-visible remote update.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:22Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/reconcile-two-artifacts-before-acting/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:28Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"git fetch origin main","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":8000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:35Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short --branch","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":8000}),
+  tools.exec_command({
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:40Z)**_
+
+Reconciliation is green: fetched `origin/main`; local `main` is ahead by exactly `f5b24ef`, and both the committed source and the live RC2 binary contain the corrected empty `mcpServers` contract. Pushing that single commit now.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:40Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"git push origin main","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git rev-parse HEAD; git rev-parse origin/main; git status --short --branch","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":6000}
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:03:50Z)**_
+
+Pushed successfully. `main` and `origin/main` now both point to `f5b24ef`.
+
+Unrelated local SpecStory and generated artifacts remain uncommitted.
+
+---
+
+_**User (2026-08-03 00:05:50Z)**_
+
+why did i get this failure??
+
+ ____                 _ ____           _
+ |  _ \  ___  __ _  __| |  _ \ ___  ___| | _____  _ __
+ | | | |/ _ \/ _` |/ _` | |_) / _ \/ __| |/ / _ \| '_ \
+ | |_| |  __/ (_| | (_| |  _ <  __/ (__|   < (_) | | | |
+ |____/ \___|\__,_|\__,_|_| \_\___|\___|_|\_\___/|_| |_|
+ v0.8.0-rc.2 · run your coding agent unattended, and trust the result
+
+No deadreckon runs in this directory yet.
+source: plain directory — start will offer git init, copy, or fresh
+
+The flow:
+  deadreckon start "build the app"
+  deadreckon attach latest
+  deadreckon status
+  deadreckon list
+  deadreckon finish latest
+
+  runs from other directories: deadreckon list --all
+  setup and health:         deadreckon doctor
+➜  flappy-forever deadreckon start
+✓ goal lets build a new mac app version of flappy bird that introduces new elements the existing game didnt have and introduces "like Tetris 50" the ability to see o
+her players over the network
+✓ Choose source mode Initialize git, then use worktree mode — runs git init after final confirmation
+✓ Choose launch path New campaign pass — split independent projects into sub-orchestrators
+✓ Configure execution team Customize execution team — choose provider and model per role; individual child overrides are advanced
+✓ Choose implementor count 3 implementors (recommended) — current team size
+✓ Choose planner provider and model Codex CLI · provider default — cli:codex · provider cache · context 258k · recommended
+✓ Choose implementor provider and model Codex CLI · provider default — cli:codex · provider cache · context 258k · recommended
+✓ How will you know it worked? (one line; Enter = draft from goal) we can try it on the network and take a screenshot of it working on my mac 
+
+error: invalid input: done criteria initial draft timed out after 60.0s (elapsed 59.0s of 120.0s cumulative) via cli:claude-code / provider default
+try: deadreckon def-done "builds and passes behavioral tests"
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:06Z)**_
+
+This is a different failure from the MCP parsing bug: Claude was accepted and actually launched, but the initial drafting stage consumed its 60-second allocation without returning. I’m using the diagnose-before-edit workflow to trace why Claude was selected, how the 60/120-second budget is divided, and whether the provider was waiting on authentication, startup, or model output.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:07Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/diagnose-before-edit/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":20000});
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"rg -n 'struct DoneAuthoringBudget|impl DoneAuthoringBudget|fn allocation|done_authoring_timeout_error|materialize_start_done_criteria|s
+...
+```
+</details></tool-use>
+
+---
+
+_**User (2026-08-03 00:06:23Z)**_
+
+i had set my provider default to be codex i believe... and even so i didn't even choose claude
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:32Z)**_
+
+You did choose Codex for both execution roles. The surprising part is that done-contract authoring uses a separate `defaults.doc_provider` preference, which can override the general default and the interactive planner/implementor choices. I’m checking all three configured provider keys and the selection precedence now.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"/Users/gdc/.local/bin/deadreckon config get default_provider; /Users/gdc/.local/bin/deadreckon config get defaults.provider; /Users/gdc
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:46Z)**_
+
+Confirmed: your belief is correct. Both the legacy default and `defaults.provider` are `cli:codex`, but `defaults.doc_provider` is still `cli:claude-code`; the latter wins for done authoring. The execution-team prompt never displays or changes that hidden choice. I’m tracing how `config provider` left it behind so we can distinguish configuration state from a product-design defect.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:06:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"nl -ba crates/deadreckon/src/main.rs | sed -n '2800,2870p'; nl -ba crates/deadreckon/src/main.rs | sed -n '2890,3060p'; nl -ba crates/deadreckon/src/setup.rs
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:04Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"find /Users/gdc/.claude -maxdepth 3 -type f -mmin -30 -print 2>/dev/null | sed -n '1,120p'; ls -lt /Users/gdc/.claude/debug 2>/dev/null | sed -n '1,30p'","wo
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:12Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ls -lT /Users/gdc/.claude/projects/-Users-gdc-test-deadreckon-flappy-forever/*.jsonl; wc -l /Users/gdc/.claude/projects/-Users-gdc-test-deadreckon-flappy-for
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:21Z)**_
+
+There is provider-side evidence from the failed launch at 20:02, so I can determine whether Claude produced anything before DeadReckon cancelled it. I’ll inspect only event metadata and error/status fields, not the prompt or generated content.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"jq -r '[.timestamp // \"\", .type // \"\", .subtype // \"\", .message.role // \"\", .message.stop_reason // \"\", (.is_error // false), (.error // \"\" | tos
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"jq -r 'select(.type == \"system\") | [.timestamp, .level, .subtype, (.content | tostring)] | @tsv' /Users/gdc/.claude/projects/-Users-gdc-test-deadreckon-fla
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"jq -r '[input_filename, .timestamp // \"\", .entrypoint // \"\", .type // \"\", .subtype // \"\"] | @tsv' /Users/gdc/.claude/projects/-Users-gdc-test-deadrec
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:53Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"jq -r '[.timestamp // \"\", .type // \"\", .entrypoint // \"\", (.isMeta // false), (.message.role // \"\"), (.message.content | type), (.message.content | i
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:07:59Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"jq -r 'select(.type == \"user\") | [.timestamp, (.message.content | if type == \"string\" then length else (map(.text // \"\") | join(\"\") | length) end), (
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:08:20Z)**_
+
+The provider log closes the loop: Claude received the 2,704-character done-authoring prompt at 20:04:21, produced no assistant event, and DeadReckon interrupted it at 20:05:18. That is the 57-second active window plus the reserved 3-second cleanup. I’m checking whether the failed pre-launch attempt left any project state before giving you the exact recovery path.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:08:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"ls -la /Users/gdc/test-deadreckon/flappy-forever; find /Users/gdc/test-deadreckon/flappy-forever -maxdepth 3 -type f -print | sed -n '1,100p'; git -C /Users/
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:08:50Z)**_
+
+You were right: you selected Codex, and your general provider defaults are both `cli:codex`.
+
+The failure happened because DeadReckon has a separate hidden setting:
+
+```text
+default_provider:      cli:codex
+defaults.provider:     cli:codex
+defaults.doc_provider: cli:claude-code
+```
+
+Done-contract authoring currently ignores the selected execution team:
+
+1. Guided `start` passes no provider/model into done authoring: [start.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/start.rs:3057).
+2. Done authoring then prefers `defaults.doc_provider` over `defaults.provider`: [acceptance.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/acceptance.rs:1073).
+3. `deadreckon config provider cli:codex` updates the two general defaults but leaves `defaults.doc_provider` unchanged: [main.rs](/Users/gdc/deadreckon/crates/deadreckon/src/main.rs:2825).
+
+Claude received the prompt but produced no response. DeadReckon interrupted it after its 60-second draft allocation. Claude currently reports `loggedIn: false`, which likely explains the silence.
+
+The previous MCP fix did work—this run got past MCP validation and reached Claude.
+
+Immediate workaround:
+
+```sh
+deadreckon config set defaults.doc_provider cli:codex
+```
+
+Then rerun `deadreckon start`. The failed attempt left `flappy-forever` empty: no Git repository, acceptance contract, or run was created.
+
+This is a genuine UX/selection bug. The proper code fix is to make guided start’s selected planner/provider control done authoring—or explicitly show and ask for a separate authoring provider—instead of silently consulting the stale hidden setting.
+
+---
+
+_**User (2026-08-03 00:11:02Z)**_
+
+please fix it so it works like you'd expect it to when you select different providers
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:15Z)**_
+
+I’ll make done-contract authoring follow the provider/model selected for the planning role on that launch, with the general default as fallback only when the launch has no explicit team choice. I’m using the working-sibling review to trace how planner selection is already frozen and propagated elsewhere, then I’ll add a regression where `doc_provider=Claude` but the selected planner is Codex and prove Claude is never invoked.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:16Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,280p' /Users/gdc/.agents/skills/review-against-the-working-sibling/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_to
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({
+  explanation: "Diagnosed provider divergence is now authorized for implementation. The fix will reuse the frozen planner-role selection already used by orches
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:34Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'struct StartLaunchDecision|struct StartLaunchInput|planner_provider|planner_model|implementor_provider|execution_team|TeamSelection|selected.*provider
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '220,390p' crates/deadreckon/src/commands/start.rs; sed -n '1260,1390p' crates/deadreckon/src/commands/start.rs; sed -n '1580,1790p' crates/deadreckon
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:45Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'fn resolve_start_provider_and_done_setup|resolve_start_setup\\(' crates/deadreckon/src/commands/start.rs; sed -n '1460,1605p' crates/deadreckon/src/co
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:11:51Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '2300,2415p' crates/deadreckon/src/commands/start.rs; sed -n '2415,2525p' crates/deadreckon/src/commands/start.rs; sed -n '4350,4595p' crates/deadreck
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:08Z)**_
+
+The working sibling is the accepted launch plan: it already freezes the exact planner/provider/model separately from workers. I’ll make done authoring read that same decision state, with one intentional fallback—modes without a planner role use their primary execution provider/model.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:11Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'fn launch_plan_from_decision|LaunchProviders|providers:.*planner|planner_model' crates/deadreckon/src/commands/course.rs crates/deadreckon/src/command
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:15Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1560,1650p' crates/deadreckon/src/commands/course.rs; sed -n '130,165p' crates/deadreckon/src/commands/course.rs; rg -n 'done authoring|done-contract
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:20Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1610,1665p' crates/deadreckon/src/commands/course.rs; sed -n '1510,1565p' docs/AS-BUILT-ARCHITECTURE.md; sed -n '4800,4860p' docs/AS-BUILT-ARCHITECTU
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'compiling done criteria|acceptance_yaml|done criteria initial draft|def-done|review-done|How will you know|done provider' crates/deadreckon/tests/orch
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:39Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n '^fn .*done|^fn .*contract|^fn .*source|^fn retry|^fn unsupported' crates/deadreckon/tests/orchestrate.rs | sed -n '1,220p'; sed -n '1340,1545p' crates
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1260,1375p' crates/deadreckon/tests/orchestrate.rs; sed -n '1375,1518p' crates/deadreckon/tests/orchestrate.rs; sed -n '7240,7345p' crates/deadreckon
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'acceptance_draft|acceptance_yaml|stub_would_pass|weak_check_indices|json-schema|output-schema' crates/deadreckon/tests crates/deadreckon/src -g '*.rs'
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:12:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1900,1995p' crates/deadreckon/tests/lifecycle.rs; sed -n '2080,2165p' crates/deadreckon/tests/lifecycle.rs; sed -n '3450,3545p' crates/deadreckon/tes
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:13:19Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'done_authoring_route_label|done_authoring_wall_seconds|done inspect|done writer|done provider|done limit' crates/deadreckon/src/commands/start.rs crat
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:13:26Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '3095,3275p' crates/deadreckon/src/commands/start.rs; rg -n 'start_done_authoring_preview|authoring.*preview|done_authoring_preview' crates/deadreckon
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:13:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'fn resolve_start_done_criteria_with_roots|start_done_materialization_request' crates/deadreckon/src/commands/start.rs; sed -n '1900,2115p' crates/dead
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:13:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '2540,2665p' crates/deadreckon/src/commands/start.rs","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":14000});
+text(r.outp
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:14:31Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"rg -n 'enum DurableSourceMode' crates/deadreckon/src/commands/job.rs; sed -n '130,175p' crates/deadreckon/src/commands/job.rs; rg -n 'ResolvedStartSource \\{
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:14:35Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,55p' crates/deadreckon/src/commands/job.rs; sed -n '4635,4670p' crates/deadreckon/src/commands/start.rs; sed -n '4715,4745p' crates/deadreckon/src/
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:14:43Z)**_
+
+I’ve found the full surface of the bug: execution itself uses the frozen planner selection correctly, but both authoring execution and its preview/JSON still resolve independently through `doc_provider`. I’m adding the red test at the preview boundary first because it exercises the same decision object the launch will later materialize.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:14:54Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const patch = "*** Begin Patch\n*** Update File: /Users/gdc/deadreckon/crates/deadreckon/src/commands/start.rs\n@@\n     fn accepted_launch_plan_records_the_exact_execution_team() {\n         let mut 
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:14:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon commands::start::execution_team_tests::done_authoring_preview_uses_the_selected_planner_not_the_doc_default -- --ex
+...
+```
+
+```
+Script running with cell ID 359
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:15:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `359`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:15:31Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":53682,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 360
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:15:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `360`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:16:03Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":53682,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 361
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:16:17Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `361`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:16:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":53682,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 362
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:16:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `362`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:17:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":53682,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:18:01Z)**_
+
+The red test reproduces the exact mismatch: selected planner `cli:codex / selected-planner-model`, previewed authoring `cli:claude-code / provider default`. I’m now wiring authoring and its preview through one shared lead-role selector: planner for full-plan/campaign, coder for review, and primary provider for a single run. Direct `def-done` will retain its independent `doc_provider` preference.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:18:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const patch = "*** Begin Patch\n*** Update File: /Users/gdc/deadreckon/crates/deadreckon/src/commands/start.rs\n@@\n pub(crate) fn start_done_materialization_request(\n     decision: &StartLaunchDecis
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:18:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"cargo fmt --all -- --check","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:18:49Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"cargo fmt --all","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":8000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:18:55Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon done_authoring_ -- --nocapture","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":14000})
+...
+```
+
+```
+Script running with cell ID 367
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:19:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `367`
+- max_tokens: `14000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:19:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":59920,"chars":"","yield_time_ms":30000,"max_output_tokens":14000});
+text(JSON.stringify(r));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:19:38Z)**_
+
+The regression is now green: preview reports the selected Codex planner even when `defaults.doc_provider` is Claude, and route-selection tests pass for full-plan/campaign, review, and single-run shapes. Next I’m checking the broader start/acceptance call graph and then I’ll rebuild the live binary so your next retry uses this behavior.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:19:43Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon commands::start::execution_team_tests -- --nocapture","workdir":"/Users/gdc/deadreckon","yiel
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:09Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git status --short; git diff --stat; git diff -- CHANGELOG.md docs/AS-BUILT-ARCHITECTURE.md crates/deadreckon/src/commands/start.rs crates/deadreckon/src/com
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:23Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon commands::start::contract_tests -- --nocapture","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:29Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo test -p deadreckon --bin deadreckon commands::acceptance::tests -- --nocapture","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tok
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo check -p deadreckon --bin deadreckon --tests","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:52Z)**_
+
+Focused verification is clean: 6 execution-team tests, 15 start contract tests, and 36 acceptance tests passed; all CLI test targets compile. I’m rebuilding the live RC2 binary now, then I’ll verify the compiled artifact contains the new lead-role routing behavior.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:20:53Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo build --release -p deadreckon --bin deadreckon","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringif
+...
+```
+
+```
+Script running with cell ID 374
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:21:07Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `374`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:21:30Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":11637,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 375
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:21:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `375`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:22:03Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":11637,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 376
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:22:17Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `376`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:22:38Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":11637,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 377
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:22:51Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `377`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:23:11Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":11637,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 378
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:23:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `378`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:23:44Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.write_stdin({"session_id":11637,"chars":"","yield_time_ms":30000,"max_output_tokens":12000});
+text(JSON.stringify(r));
+```
+
+```
+Script running with cell ID 379
+Wall time 11.0 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:23:58Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `379`
+- max_tokens: `12000`
+- yield_time_ms: `30000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:24:41Z)**_
+
+The live rebuild completed. I’m doing one final operator-path preview with the release binary in an isolated temporary Git directory: explicit Codex planner, stale Claude doc default, and a typed done criterion. It will stop at preview, so it won’t create a run or call a model.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:24:42Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"mktemp -d /tmp/deadreckon-provider-preview.XXXXXX","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":2000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:24:46Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"git init /tmp/deadreckon-provider-preview.mOAbBo","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":3000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:24:52Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"/usr/bin/expect -c 'set timeout 45; spawn /Users/gdc/.local/bin/deadreckon start \"verify selected provider routing\" --mode full-plan --provider cli:codex -
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:24:57Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const patch = "*** Begin Patch\n*** Add File: /tmp/deadreckon-provider-preview.mOAbBo/README.md\n+provider-routing preview fixture\n*** End Patch";
+text(await tools.apply_patch(patch));
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:25:00Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"git add README.md","workdir":"/tmp/deadreckon-provider-preview.mOAbBo","yield_time_ms":10000,"max_output_tokens":2000});
+text(r.output);
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:25:05Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git -c user.name=DeadReckon-Test -c user.email=test@deadreckon.invalid commit -m initial","workdir":"/tmp/deadreckon-provider-preview.mOAbBo","yield_time_ms"
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:25:10Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"/usr/bin/expect -c 'set timeout 45; spawn /Users/gdc/.local/bin/deadreckon start \"verify selected provider routing\" --mode full-plan --provider cli:codex -
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:25:20Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input: ```
+const r = await tools.exec_command({"cmd":"rm -rf /tmp/deadreckon-provider-preview.mOAbBo","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":2000});
+text(r.output);
+```
+
+```
+Script running with cell ID 387
+Wall time 208.1 seconds
+Output:
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:28:50Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="wait"><details>
+<summary>Tool use: **wait**</summary>
+
+**Input:**
+
+- cell_id: `387`
+- max_tokens: `2000`
+- yield_time_ms: `1000`
+
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:29:14Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const result = await tools.update_plan({
+  explanation: "The selected lead-role provider/model now drives done authoring and every preview projection. Focused unit, contract, acceptance, compile, rele
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:29:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"/Users/gdc/.local/bin/deadreckon --version; stat -f 'live binary: %Sm' -t '%Y-%m-%d %H:%M:%S %Z' target/release/deadreckon; git diff --check -- CHANGELOG.md 
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:29:37Z)**_
+
+Fixed and rebuilt live.
+
+`start` now uses:
+
+- Full-plan/Campaign: selected planner provider and model.
+- Review: selected implementor provider and model.
+- Single/extend: primary provider and model.
+- Direct `def-done`: retains the separate `defaults.doc_provider`.
+
+Both preview and execution share the same routing helper: [start.rs](/Users/gdc/deadreckon/crates/deadreckon/src/commands/start.rs:3033).
+
+A live release-binary preview with `doc_provider=Claude` and planner `Codex/gpt-5.6-sol` correctly showed:
+
+```text
+done provider: cli:codex / gpt-5.6-sol (structured text)
+```
+
+Verification passed: 57 focused tests, all CLI test targets compiled, formatting passed, and the live binary was rebuilt at 20:23. AS-BUILT and CHANGELOG were updated.
+
+These changes are currently uncommitted.
+
+---
+
+_**User (2026-08-03 00:44:27Z)**_
+
+please commit and update my binary on disk
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:44:35Z)**_
+
+I’ll verify the live release binary matches the current source, then stage and commit only the four provider-routing files. I’m using the comprehensive-commit workflow so the commit records the hidden-provider failure, routing semantics, and verification without including unrelated SpecStory artifacts.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:44:36Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"sed -n '1,260p' /Users/gdc/.agents/skills/comprehensive-commit/SKILL.md","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":20000});
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:44:49Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short -uall","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":12000}),
+  tools.exec_command({"c
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:44:58Z)**_
+
+The binary is already newer than the routing source and reports RC2, but I’m rerunning the release build as the explicit installation step before committing. The staged scope will exclude all session-history and generated Docker/Python artifacts.
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:00Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"cargo build --release -p deadreckon --bin deadreckon","workdir":"/Users/gdc/deadreckon","yield_time_ms":30000,"max_output_tokens":8000});
+text(JSON.stringify
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:08Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git add CHANGELOG.md docs/AS-BUILT-ARCHITECTURE.md crates/deadreckon/src/commands/start.rs crates/deadreckon/src/commands/acceptance.rs","workdir":"/Users/gd
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:15Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short","workdir":"/Users/gdc/deadreckon","yield_time_ms":10000,"max_output_tokens":10000}),
+  tools.exec_command({"cmd":"g
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:24Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const r = await tools.exec_command({"cmd":"git commit -m \"fix(start): honor selected provider for done authoring\" -m \"Guided start previously froze the operator's planner and worker selections for 
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:33Z)**_
+
+<tool-use data-tool-type="unknown" data-tool-name="exec"><details>
+<summary>Tool use: **exec**</summary>
+Input (truncated): ```
+const results = await Promise.all([
+  tools.exec_command({"cmd":"git status --short -- CHANGELOG.md docs/AS-BUILT-ARCHITECTURE.md crates/deadreckon/src/commands/start.rs crates/deadreckon/src/commands
+...
+```
+</details></tool-use>
+
+_**Agent (gpt-5.6-sol 2026-08-03 00:45:40Z)**_
+
+Done.
+
+- Committed as `d2c087e fix(start): honor selected provider for done authoring`.
+- Release binary rebuilt successfully.
+- Live binary points to the rebuilt artifact and reports `deadreckon 0.8.0-rc.2`.
+- Unrelated local artifacts remain uncommitted.
+- Commit has not been pushed.
