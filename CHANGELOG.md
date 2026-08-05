@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed stable Homebrew formula generation and release verification so every
+  platform URL is pinned to the exact published archive SHA-256; unpinned
+  formulae now fail closed before publication instead of relying on Homebrew's
+  warning-only download path.
+
 ## 0.8.1 — Steadier starts — 2026-08-04
 
 - Runtime, provider and scheduler phases now consume one monotonic cumulative

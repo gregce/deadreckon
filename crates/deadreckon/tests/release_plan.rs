@@ -170,12 +170,13 @@ fn homebrew_formula_pins_release_sha256() {
 
     let temp = tempfile::TempDir::new().expect("tempdir");
     let formula = temp.path().join("deadreckon.rb");
+    let archive = temp.path().join("deadreckon.tar.xz");
+    fs::write(&archive, b"release archive\n").expect("archive");
     fs::write(
         &formula,
         r#"class Deadreckon < Formula
   version "9.8.7"
   url "https://github.com/gregce/deadreckon/releases/download/v9.8.7/deadreckon.tar.xz"
-  sha256 "abc123"
 
   def install_binary_aliases!
   end
@@ -201,8 +202,56 @@ end
     );
     let template = fs::read_to_string(&formula).expect("patched formula");
     assert!(
-        template.contains(r#"sha256 "abc123""#),
-        "formula patching must preserve cargo-dist release archive sha256s"
+        template.contains(
+            r#"sha256 "bcc47954ae75f0c5aa0de258d26b3e6770ad5849c194544a6d69c82880664ed1""#
+        ),
+        "formula patching must derive the exact release archive sha256: {template}"
+    );
+    assert_eq!(1, template.matches("  sha256 ").count(), "{template}");
+
+    fs::write(
+        temp.path().join("SHA256SUMS"),
+        "bcc47954ae75f0c5aa0de258d26b3e6770ad5849c194544a6d69c82880664ed1  deadreckon.tar.xz\n",
+    )
+    .expect("checksums");
+    assert_release_trust_success([
+        "verify-homebrew",
+        "--dir",
+        temp.path().to_str().expect("utf8 path"),
+        "--checksums",
+        temp.path()
+            .join("SHA256SUMS")
+            .to_str()
+            .expect("checksums path"),
+    ]);
+
+    fs::write(
+        &formula,
+        template
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("sha256 "))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("remove formula checksum");
+    let unpinned = release_trust([
+        "verify-homebrew",
+        "--dir",
+        temp.path().to_str().expect("utf8 path"),
+        "--checksums",
+        temp.path()
+            .join("SHA256SUMS")
+            .to_str()
+            .expect("checksums path"),
+    ]);
+    assert!(
+        !unpinned.status.success(),
+        "unpinned Homebrew URL was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&unpinned.stderr).contains("must pin one sha256"),
+        "{}",
+        String::from_utf8_lossy(&unpinned.stderr)
     );
 }
 
