@@ -119,6 +119,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full release verification validates checked Watchkeeper evidence
+          # against the runner at its recorded source revision.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install verification prerequisites
         shell: bash

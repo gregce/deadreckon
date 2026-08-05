@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Checked Watchkeeper evidence is allowed to cite the exact runner
+          # from an older source revision; retain history so provenance can be
+          # verified instead of depending on the current runner bytes.
+          fetch-depth: 0
           persist-credentials: false
       - name: Install test prerequisites
         shell: bash
