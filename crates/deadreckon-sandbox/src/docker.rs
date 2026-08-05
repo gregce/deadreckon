@@ -778,18 +778,15 @@ fn run_docker_command(
     let stdout_rx = spawn_docker_pipe_reader(stdout);
     let stderr_rx = spawn_docker_pipe_reader(stderr);
 
-    let status = match wait_for_docker_child_until(&mut child, deadline.work_expires_at)? {
-        Some(status) => status,
-        None => {
-            let cleanup_expires_at = deadline.cleanup_expires_at();
-            let cleanup = terminate_docker_process(&mut child, pid, cleanup_expires_at);
-            let _ = receive_docker_pipe(stdout_rx, cleanup_expires_at, "stdout");
-            let _ = receive_docker_pipe(stderr_rx, cleanup_expires_at, "stderr");
-            cleanup?;
-            return Err(docker_timeout(format!(
-                "Docker {operation} exceeded the shared operation deadline"
-            )));
-        }
+    let Some(status) = wait_for_docker_child_until(&mut child, deadline.work_expires_at)? else {
+        let cleanup_expires_at = deadline.cleanup_expires_at();
+        let cleanup = terminate_docker_process(&mut child, pid, cleanup_expires_at);
+        let _ = receive_docker_pipe(&stdout_rx, cleanup_expires_at, "stdout");
+        let _ = receive_docker_pipe(&stderr_rx, cleanup_expires_at, "stderr");
+        cleanup?;
+        return Err(docker_timeout(format!(
+            "Docker {operation} exceeded the shared operation deadline"
+        )));
     };
 
     if !docker_process_group_is_absent(pid)?
@@ -800,13 +797,13 @@ fn run_docker_command(
         return Err(work_error);
     }
     let stdout =
-        receive_docker_pipe(stdout_rx, deadline.work_expires_at, "stdout").or_else(|error| {
+        receive_docker_pipe(&stdout_rx, deadline.work_expires_at, "stdout").or_else(|error| {
             let cleanup_expires_at = deadline.cleanup_expires_at();
             terminate_docker_process(&mut child, pid, cleanup_expires_at)?;
             Err(error)
         })?;
     let stderr =
-        receive_docker_pipe(stderr_rx, deadline.work_expires_at, "stderr").or_else(|error| {
+        receive_docker_pipe(&stderr_rx, deadline.work_expires_at, "stderr").or_else(|error| {
             let cleanup_expires_at = deadline.cleanup_expires_at();
             terminate_docker_process(&mut child, pid, cleanup_expires_at)?;
             Err(error)
@@ -843,7 +840,7 @@ where
 }
 
 fn receive_docker_pipe(
-    receiver: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    receiver: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
     deadline: Instant,
     stream: &str,
 ) -> Result<Vec<u8>> {

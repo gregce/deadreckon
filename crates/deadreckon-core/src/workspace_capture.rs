@@ -466,7 +466,7 @@ pub fn freeze_workspace_capture_policy(root: &Path) -> Result<WorkspaceCapturePo
         budgets: CaptureBudgets::default(),
         warnings: discovery.warnings,
         frozen_git_head: hydration.head.clone(),
-        frozen_git_index_sha256: hydration.index_sha256.clone(),
+        frozen_git_index_sha256: hydration.index_sha256,
     })
 }
 

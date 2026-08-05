@@ -125,6 +125,9 @@ impl Drop for GitCommandScopeGuard {
 }
 
 /// Run synchronous work with one inherited Git subprocess boundary.
+// Consuming the scope prevents callers from accidentally reusing one phase's
+// authority after the enclosed work and its final boundary check complete.
+#[allow(clippy::needless_pass_by_value)]
 pub fn with_git_command_scope<T>(
     scope: WorkBoundaryScope,
     work: impl FnOnce() -> Result<T>,
@@ -153,6 +156,7 @@ pub(crate) fn inherited_work_boundary() -> Option<WorkBoundaryScope> {
 /// recomputed for retries or nested Git calls. `cleanup_budget` starts only
 /// after work is interrupted, so useful work can never consume containment
 /// time.
+#[derive(Clone, Copy)]
 pub struct GitCommandDeadline<'a> {
     pub work_expires_at: Instant,
     pub cleanup_budget: Duration,
@@ -264,7 +268,7 @@ pub fn run_git_command_with_input(
 ) -> Result<Output> {
     if let Some(scope) = current_git_command_scope() {
         let outcome = run_git_command_bounded(cwd, command, Some(input), scope.deadline())?;
-        return finish_scoped_git(scope, outcome);
+        return finish_scoped_git(&scope, outcome);
     }
     run_git_command_with_input_unbounded(cwd, command, input)
 }
@@ -304,12 +308,12 @@ fn run_git_command_with_input_unbounded(
 pub fn run_git_command(cwd: &Path, command: &mut Command) -> Result<Output> {
     if let Some(scope) = current_git_command_scope() {
         let outcome = run_git_command_bounded(cwd, command, None, scope.deadline())?;
-        return finish_scoped_git(scope, outcome);
+        return finish_scoped_git(&scope, outcome);
     }
     command.output().map_err(|source| git_io_at(cwd, source))
 }
 
-fn finish_scoped_git(scope: WorkBoundaryScope, outcome: BoundedGitOutcome) -> Result<Output> {
+fn finish_scoped_git(scope: &WorkBoundaryScope, outcome: BoundedGitOutcome) -> Result<Output> {
     match outcome {
         BoundedGitOutcome::Completed(output) => Ok(output),
         BoundedGitOutcome::WorkExpired => Err(scope.boundary_error(
@@ -367,19 +371,19 @@ fn run_git_command_bounded(
         launch_id: None,
     };
     let pipes = GitPipeThreads::spawn(&mut child, input)?;
-    if let Some(authority_dir) = deadline.authority_dir {
-        if let Err(error) = persist_git_process_authority(authority_dir, &mut authority) {
-            return cleanup_bounded_git(
-                cwd,
-                &mut child,
-                pipes,
-                None,
-                authority,
-                GitCommandBoundary::SupervisionFailure,
-                deadline.cleanup_budget,
-                Some(format!("could not persist Git process authority: {error}")),
-            );
-        }
+    if let Some(authority_dir) = deadline.authority_dir
+        && let Err(error) = persist_git_process_authority(authority_dir, &mut authority)
+    {
+        return cleanup_bounded_git(
+            cwd,
+            &mut child,
+            pipes,
+            None,
+            authority,
+            GitCommandBoundary::SupervisionFailure,
+            deadline.cleanup_budget,
+            Some(format!("could not persist Git process authority: {error}")),
+        );
     }
     let mut status = None;
 
@@ -535,6 +539,10 @@ fn join_git_pipe<T>(
         .map_err(|source| git_io_at(cwd, source))
 }
 
+// The cleanup routine deliberately receives every piece of already-owned
+// process authority explicitly; bundling them would make partial cleanup
+// state easier to construct or lose at this trust boundary.
+#[allow(clippy::too_many_arguments)]
 fn cleanup_bounded_git(
     cwd: &Path,
     child: &mut Child,
@@ -570,28 +578,30 @@ fn cleanup_bounded_git(
                 // The process tree is gone and every pipe has closed. Join the
                 // workers to release their resources; interruption-related I/O
                 // errors are not command failures after a policy boundary.
-                let _ = pipes.completed_output(cwd, status.expect("checked above"));
-                if let Err(error) = remove_git_process_authority(&authority) {
-                    return Ok(BoundedGitOutcome::CleanupIncomplete {
-                        boundary: GitCommandBoundary::SupervisionFailure,
-                        authority,
-                        detail: format!(
-                            "Git process cleanup completed but its durable authority could not be removed: {error}"
-                        ),
+                if let Some(completed_status) = status {
+                    let _ = pipes.completed_output(cwd, completed_status);
+                    if let Err(error) = remove_git_process_authority(&authority) {
+                        return Ok(BoundedGitOutcome::CleanupIncomplete {
+                            boundary: GitCommandBoundary::SupervisionFailure,
+                            authority,
+                            detail: format!(
+                                "Git process cleanup completed but its durable authority could not be removed: {error}"
+                            ),
+                        });
+                    }
+                    return Ok(match boundary {
+                        GitCommandBoundary::WorkExpired => BoundedGitOutcome::WorkExpired,
+                        GitCommandBoundary::Cancelled => BoundedGitOutcome::Cancelled,
+                        GitCommandBoundary::SupervisionFailure => {
+                            BoundedGitOutcome::SupervisionFailed {
+                                detail: cleanup_error.unwrap_or_else(|| {
+                                    "Git supervision failed after process cleanup was proven"
+                                        .to_string()
+                                }),
+                            }
+                        }
                     });
                 }
-                return Ok(match boundary {
-                    GitCommandBoundary::WorkExpired => BoundedGitOutcome::WorkExpired,
-                    GitCommandBoundary::Cancelled => BoundedGitOutcome::Cancelled,
-                    GitCommandBoundary::SupervisionFailure => {
-                        BoundedGitOutcome::SupervisionFailed {
-                            detail: cleanup_error.unwrap_or_else(|| {
-                                "Git supervision failed after process cleanup was proven"
-                                    .to_string()
-                            }),
-                        }
-                    }
-                });
             }
             Ok(_) => {}
             Err(error) => cleanup_error = Some(error.to_string()),
@@ -599,10 +609,8 @@ fn cleanup_bounded_git(
 
         let now = Instant::now();
         if now >= cleanup_expires_at {
-            if !kill_sent {
-                if let Err(error) = signal_owned_process(child, &authority, true) {
-                    cleanup_error = Some(error.to_string());
-                }
+            if !kill_sent && let Err(error) = signal_owned_process(child, &authority, true) {
+                cleanup_error = Some(error.to_string());
             }
             return Ok(BoundedGitOutcome::CleanupIncomplete {
                 boundary,
@@ -636,6 +644,9 @@ fn configure_owned_process_group(command: &mut Command) {
 fn configure_owned_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
+// The shared authority record uses `Option` because non-Unix children do not
+// have a process-group identity.
+#[allow(clippy::unnecessary_wraps)]
 fn owned_process_group(pid: u32) -> Option<u32> {
     Some(pid)
 }

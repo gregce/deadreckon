@@ -139,6 +139,7 @@ jobs:
           # by tests/portability.rs — and the PTY test handles util-linux
           # script): no release ships on a suite that never ran.
           cargo fmt --check
+          cargo clippy --workspace --locked -- -D warnings
           # Characterization integration tests spawn this gated compatibility
           # binary directly; build it first just as branch CI and `make test`
           # do, or those tests fail with ENOENT rather than exercising it.
