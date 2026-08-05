@@ -270,7 +270,13 @@ function archiveInventory(archive, target) {
         name === "dr-capture" ||
         name === "dr-capture.exe" ||
         evaluator;
-      const bundleBuildId = gateBundleMember ? requireGateBundleIdentity(bytes, name) : null;
+      const gateProtocolMember =
+        name === "dr-gate" || name === "dr-gate.exe" || evaluator;
+      const bundleBuildId = gateBundleMember
+        ? gateProtocolMember
+          ? requireGateBundleIdentity(bytes, name)
+          : requireBundleBuildIdentity(bytes, name)
+        : null;
       return {
         path: entry,
         name,
@@ -352,6 +358,11 @@ function requireGateBundleIdentity(bytes, name) {
   if (!text.includes(GATE_PROTOCOL_MARKER)) {
     throw new Error(`${name} is missing ${GATE_PROTOCOL_MARKER}`);
   }
+  return requireBundleBuildIdentity(bytes, name);
+}
+
+function requireBundleBuildIdentity(bytes, name) {
+  const text = bytes.toString("latin1");
   const identities = [...new Set(text.match(BUNDLE_BUILD_ID_PATTERN) ?? [])];
   if (identities.length !== 1) {
     throw new Error(`${name} must embed exactly one DeadReckon bundle build identity`);

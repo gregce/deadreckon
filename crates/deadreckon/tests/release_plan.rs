@@ -1680,11 +1680,13 @@ fn evaluator_sidecar_tool_assembles_and_manifests_static_linux_helpers() {
     fs::create_dir_all(&payload).expect("payload");
 
     for helper in ["deadreckon", "dr-gate", "dr-capture"] {
-        fs::write(
-            payload.join(helper),
-            format!("{helper} native{FAKE_GATE_BUNDLE}"),
-        )
-        .expect("native helper");
+        let identity = if helper == "dr-gate" {
+            FAKE_GATE_BUNDLE
+        } else {
+            FAKE_BUNDLE_BUILD_ID
+        };
+        fs::write(payload.join(helper), format!("{helper} native{identity}"))
+            .expect("native helper");
     }
     write_fake_static_elf_sized(
         &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
@@ -1846,6 +1848,85 @@ fn evaluator_sidecar_tool_rejects_dynamically_linked_evaluator() {
 }
 
 #[test]
+fn evaluator_sidecar_tool_requires_protocol_only_from_gate_members() {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let distrib = temp.path().join("target/distrib");
+    let sidecars = temp.path().join("sidecars");
+    let target = "aarch64-apple-darwin";
+    let payload_name = format!("deadreckon-{target}");
+    let payload = temp.path().join("payload").join(&payload_name);
+    fs::create_dir_all(&distrib).expect("distrib");
+    fs::create_dir_all(&sidecars).expect("sidecars");
+    fs::create_dir_all(&payload).expect("payload");
+
+    // Optimized deadreckon and dr-capture binaries retain the bundle identity
+    // but do not promise the gate evaluator protocol. A dr-gate binary must
+    // carry both, so giving all three only the bundle identity must fail on
+    // dr-gate rather than either non-gate helper.
+    for helper in ["deadreckon", "dr-gate", "dr-capture"] {
+        fs::write(
+            payload.join(helper),
+            format!("{helper} native{FAKE_BUNDLE_BUILD_ID}"),
+        )
+        .expect("native helper");
+    }
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-aarch64-unknown-linux-musl"),
+        0xb7,
+        false,
+    );
+    write_fake_static_elf(
+        &sidecars.join("dr-gate-evaluator-x86_64-unknown-linux-musl"),
+        0x3e,
+        false,
+    );
+
+    let archive = distrib.join(format!("deadreckon-{target}.tar.xz"));
+    let tar = Command::new("tar")
+        .args(["-cJf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(temp.path().join("payload"))
+        .arg(&payload_name)
+        .output()
+        .expect("create archive");
+    assert!(
+        tar.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tar.stderr)
+    );
+    fs::write(
+        format!("{}.sha256", archive.display()),
+        format!(
+            "{} *{}\n",
+            "0".repeat(64),
+            archive.file_name().unwrap().to_string_lossy()
+        ),
+    )
+    .expect("checksum sibling");
+
+    let output = evaluator_tool([
+        "assemble",
+        "--dir",
+        distrib.to_str().expect("distrib path"),
+        "--target",
+        target,
+        "--sidecars-dir",
+        sidecars.to_str().expect("sidecars path"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "host dr-gate without protocol passed"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("dr-gate is missing deadreckon-gate-evaluator-protocol-v1"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn evaluator_sidecar_tool_rejects_same_protocol_mixed_build_bundles() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let arm = temp
@@ -1915,9 +1996,14 @@ fn evaluator_sidecar_tool_rehearses_all_five_release_archives() {
             format!("dr-gate{extension}"),
             format!("dr-capture{extension}"),
         ] {
+            let identity = if helper.starts_with("dr-gate") {
+                FAKE_GATE_BUNDLE
+            } else {
+                FAKE_BUNDLE_BUILD_ID
+            };
             fs::write(
                 payload.join(&helper),
-                format!("{helper} for {target}{FAKE_GATE_BUNDLE}"),
+                format!("{helper} for {target}{identity}"),
             )
             .expect("native helper");
         }
@@ -2384,6 +2470,10 @@ fn write_fake_static_elf(path: &Path, machine: u16, with_interp: bool) {
     write_fake_static_elf_sized(path, machine, with_interp, 64 + 56);
 }
 
+const FAKE_BUNDLE_BUILD_ID: &str = concat!(
+    " deadreckon-bundle-build-id-sha256:",
+    "1111111111111111111111111111111111111111111111111111111111111111"
+);
 const FAKE_GATE_BUNDLE: &str = concat!(
     " deadreckon-gate-evaluator-protocol-v1 ",
     "deadreckon-bundle-build-id-sha256:",
