@@ -107,6 +107,33 @@ fn dogfood_harness_uses_public_start_status_finish_and_receipt() {
 }
 
 #[test]
+fn watchkeeper_provenance_jobs_checkout_full_history() {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let ci = fs::read_to_string(repo.join(".github/workflows/ci.yml")).expect("CI workflow");
+    let ci_test_job = ci
+        .split_once("  test:\n")
+        .and_then(|(_, jobs)| jobs.split_once("\n  release-zip-smoke:"))
+        .map(|(job, _)| job)
+        .expect("CI test job");
+    assert!(
+        ci_test_job.contains("fetch-depth: 0"),
+        "the Watchkeeper provenance test needs Git history in branch CI"
+    );
+
+    let release =
+        fs::read_to_string(repo.join(".github/workflows/release.yml")).expect("release workflow");
+    let release_verify_job = release
+        .split_once("  release-verify:\n")
+        .and_then(|(_, jobs)| jobs.split_once("\n  build-evaluator-sidecars:"))
+        .map(|(job, _)| job)
+        .expect("release verify job");
+    assert!(
+        release_verify_job.contains("fetch-depth: 0"),
+        "the Watchkeeper provenance test needs Git history in release verification"
+    );
+}
+
+#[test]
 fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
     let source =
         fs::read_to_string(dogfood_dir().join("adversarial.py")).expect("adversarial runner");
