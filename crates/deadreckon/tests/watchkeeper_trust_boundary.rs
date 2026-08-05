@@ -1372,14 +1372,29 @@ checks:
       deadreckon_home={deadreckon_home}
       host_secret={host_secret}
       outside_write={outside_write}
+      job_dir=$(find "$deadreckon_home/jobs" -mindepth 1 -maxdepth 1 -type d -print -quit)
+      test -n "$job_dir"
+      run_id=$(basename "$job_dir")
+      job_control="$job_dir/job.json"
+      run_root=
+      for candidate in "$deadreckon_home"/runstate/*/runs/"$run_id"; do
+        test -d "$candidate" || continue
+        test -z "$run_root"
+        run_root=$candidate
+      done
+      test -n "$run_root"
+      gate_key="$deadreckon_home/gate-keys/$run_id.key"
+      proof_control="$run_root/proofs/turn-acceptance.json"
       git_control="$PWD/.git"
+      test -f "$run_root/acceptance.yaml"
       test -f "$git_control"
-      if find "$deadreckon_home/gate-keys" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 31; fi
-      if find "$deadreckon_home/jobs" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 32; fi
-      if find "$deadreckon_home/runstate" -mindepth 1 -print -quit >/dev/null 2>&1; then exit 33; fi
-      if printf tampered >>"$git_control"; then exit 34; fi
-      if cat "$host_secret" >/dev/null 2>&1; then exit 35; fi
-      if printf escaped >"$outside_write"; then exit 36; fi
+      if cat "$gate_key" >/dev/null 2>&1; then exit 31; fi
+      if cat "$job_control" >/dev/null 2>&1; then exit 32; fi
+      if printf tampered >>"$job_control"; then exit 33; fi
+      if printf forged >"$proof_control"; then exit 34; fi
+      if printf tampered >>"$git_control"; then exit 35; fi
+      if cat "$host_secret" >/dev/null 2>&1; then exit 36; fi
+      if printf escaped >"$outside_write"; then exit 37; fi
       (sleep 1; printf escaped >"$PWD/delayed-gate-sentinel") </dev/null >/dev/null 2>&1 &
     cwd: "{{working_dir}}"
 "#,

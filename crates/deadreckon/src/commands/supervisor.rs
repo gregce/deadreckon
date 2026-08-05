@@ -7922,11 +7922,11 @@ mod tests {
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("fixture-proof.txt"), "approved fixture\n").expect("fixture proof");
         let contract = write_admission_contract(&source);
-        // Job creation freezes and hashes admission inputs. Keep this public
-        // deadline comfortably beyond that work on a loaded CI runner; the
-        // test still crosses the exact approved instant before supervision.
-        let deadline = Utc::now() + chrono::TimeDelta::seconds(10);
-        let job = super::super::job::create_job(super::super::job::CreateJob {
+        // Job creation freezes and hashes admission inputs. Keep the public
+        // deadline outside the setup path so CPU starvation cannot make
+        // admission race an arbitrary test-only clock.
+        let deadline = Utc::now() + chrono::TimeDelta::minutes(5);
+        let mut job = super::super::job::create_job(super::super::job::CreateJob {
             paths: &paths,
             source_cwd: &source,
             scope: deadreckon_core::paths::workspace_scope(&source).expect("scope"),
@@ -7958,12 +7958,15 @@ mod tests {
         assert_eq!(job.policy.deadline, Some(deadline));
         assert_eq!(frozen.budget.deadline, Some(deadline));
 
-        let until_deadline = (deadline - Utc::now()).to_std().unwrap_or_default();
-        tokio::time::sleep(until_deadline + Duration::from_millis(50)).await;
-        assert!(
-            Utc::now() >= deadline,
-            "fixture must cross the approved deadline"
-        );
+        // Supervision reads the durable Job policy. Advance that persisted
+        // fixture past its approved instant without making the test sleep or
+        // depend on host scheduling latency.
+        job.policy.deadline = Some(Utc::now() - chrono::TimeDelta::milliseconds(1));
+        fs::write(
+            paths.job_json(job.job_id.as_ref()),
+            serde_json::to_vec_pretty(&job).expect("job JSON"),
+        )
+        .expect("expired Job fixture");
 
         supervise_one_job(
             &paths,
