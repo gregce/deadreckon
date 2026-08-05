@@ -115,6 +115,7 @@ fn adversarial_runner_names_each_boundary_and_keeps_live_claims_unproven() {
         "worker_kill",
         "supervisor_restart",
         "network_denial",
+        "macos_developer_tool_gate",
         "gate_key_search_and_forgery",
         "docker_control_boundary",
         "docker_gate_boundary",

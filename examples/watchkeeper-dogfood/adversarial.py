@@ -144,6 +144,41 @@ TRIALS = (
         macos_sandbox_required=True,
     ),
     Trial(
+        "macos_developer_tool_gate",
+        "A strict macOS gate resolves Apple developer-tool shims before containment and permits shell redirection only to the null device.",
+        "host_sandbox_toolchain",
+        (
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon-sandbox",
+                    "--lib",
+                    "commands::tests::disposable_seatbelt_allows_only_the_null_device_as_a_system_write",
+                    "--",
+                    "--exact",
+                ),
+                "commands::tests::disposable_seatbelt_allows_only_the_null_device_as_a_system_write",
+            ),
+            ProofCommand(
+                (
+                    "cargo",
+                    "test",
+                    "-p",
+                    "deadreckon-runtime",
+                    "--lib",
+                    "turn_loop::tests::strict_macos_gate_runs_controller_resolved_python_and_dev_null",
+                    "--",
+                    "--exact",
+                ),
+                "turn_loop::tests::strict_macos_gate_runs_controller_resolved_python_and_dev_null",
+            ),
+        ),
+        "This executes real Seatbelt with the host Xcode toolchain, but does not consume a provider subscription or prove a complete public Job.",
+        macos_sandbox_required=True,
+    ),
+    Trial(
         "gate_key_search_and_forgery",
         "A hostile contained worker cannot find the gate key or forge a marker.",
         "host_sandbox",

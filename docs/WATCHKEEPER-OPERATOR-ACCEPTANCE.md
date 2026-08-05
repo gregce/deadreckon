@@ -199,6 +199,11 @@ Accept when:
 - [ ] on macOS, add a required shell check that captures product output with
   bare `mktemp`; the check completes under Seatbelt and its temporary file is
   created beneath the disposable gate runtime, not the Darwin user temp root;
+- [ ] on macOS, a required shell check that runs `python3` and redirects stderr
+  to `/dev/null` passes under Seatbelt without an `xcrun_db`, `xcode-select` or
+  `/dev/null: Operation not permitted` error; `python3` resolves through the
+  gate's read-only tool directory to the controller-selected Xcode interpreter,
+  while the profile still grants no general `/dev` or Darwin host-temp writes;
 - [ ] a newly generated contract never emits bare `mktemp` or `mktemp -t` and
   `def-done` rejects a provider draft that does not use an explicit
   `${TMPDIR:-/tmp}/...XXXXXX` template;
