@@ -1,29 +1,29 @@
 {
   "schema_version": 2,
-  "recorded_at": "2026-08-05T04:53:23Z",
-  "source_commit": "7b4a7b7d93f0dce3c49fb62feab44bf9ea685474",
-  "deadreckon_version": "0.8.1",
+  "recorded_at": "2026-08-05T18:45:52Z",
+  "source_commit": "05f145363e2c4b4e4a2125370ea8e2fdb8f193f2",
+  "deadreckon_version": "0.8.2",
   "bundle": {
   "schema_version": 1,
-  "package_version": "0.8.1",
-  "bundle_build_id": "deadreckon-bundle-build-id-sha256:723302f6368161fe52aeca6cd95fbbfa7c70cd06916b7305c9d26bdd11b98868",
+  "package_version": "0.8.2",
+  "bundle_build_id": "deadreckon-bundle-build-id-sha256:14db5d18707d233c6af284c823437ff2357c8dcdb6059bfe8a6dbd3088c4a01f",
   "binaries": {
     "deadreckon": {
-      "sha256": "937d0b1ce32b456e6a3491e88205e4073ecc30e271dc12ec3f662059382649bc",
+      "sha256": "58fc047e51d399225284af8ddbb3775f477de05bfe489653bd251ee58216f2e5",
       "bytes": 22974048
     },
     "dr-gate": {
-      "sha256": "86ed236d95b8d5a56deca97f20d9ad7ceeca209b3277f5495995cb4ff871f8e1",
+      "sha256": "dfb51b9c98f42dec5b194abf2447fd84c8fc5639e0b5e280fe215d803d100435",
       "bytes": 2257472
     },
     "dr-capture": {
-      "sha256": "b23306abf2822cb616f7889d96bb757af4ac07424863cb0113bb5a9416089c5f",
+      "sha256": "d6bc7368fd6c306310695291c8cd045cafcb8b357a4229cc8f2f2a655e53a51e",
       "bytes": 7605248
     }
   }
 },
   "providers": [
-    {"route":"cli:claude-code","binary_version":"2.1.222 (Claude Code)","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"477d461f71484b7894b27c5823d79783","operator":"gdc"},
-    {"route":"cli:codex","binary_version":"codex-cli 0.146.0","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"d73d6df62aea445fb71c7b3096ef63eb","operator":"gdc"}
+    {"route":"cli:claude-code","binary_version":"2.1.222 (Claude Code)","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"a2c85c799703439faa1d99f4d88812dd","operator":"gdc"},
+    {"route":"cli:codex","binary_version":"codex-cli 0.146.0","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"0c8a4cf4c5cb495e8a156066e4bd2607","operator":"gdc"}
   ]
 }
