@@ -13,6 +13,10 @@
 developer-id*
 .playwright-mcp/
 
+# Python test and proof-run caches
+__pycache__/
+*.py[cod]
+
 # SpecStory local files
 .specstory/statistics.json
 .specstory/.project.json
