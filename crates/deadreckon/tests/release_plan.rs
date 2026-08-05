@@ -1461,20 +1461,24 @@ fn release_plan_is_read_only_and_only_final_publisher_mutates_github_release() {
 }
 
 #[test]
-fn release_workflow_verification_matches_release_trust_contract() {
+fn release_workflow_verification_enforces_the_workspace_clippy_gate() {
     let workflow = release_workflow();
     let verify_step = workflow
         .split("- name: Full release verification")
         .nth(1)
         .expect("release verification step");
-    assert!(verify_step.contains("cargo fmt --check"), "{verify_step}");
+    let format = verify_step
+        .find("cargo fmt --check")
+        .expect("release verification must check formatting");
+    let clippy = verify_step
+        .find("cargo clippy --workspace --locked -- -D warnings")
+        .expect("release verification must reject workspace Clippy warnings");
+    let tests = verify_step
+        .find("cargo test --workspace --locked --no-fail-fast")
+        .expect("release verification must run workspace tests");
     assert!(
-        verify_step.contains("cargo test --workspace"),
-        "{verify_step}"
-    );
-    assert!(
-        !verify_step.contains("cargo clippy --workspace"),
-        "release trust verification must not import unrelated workspace clippy debt"
+        format < clippy && clippy < tests,
+        "formatting, Clippy, and tests must run in fail-fast release-gate order:\n{verify_step}"
     );
 }
 
