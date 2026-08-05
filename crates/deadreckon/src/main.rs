@@ -330,6 +330,9 @@ fn compatibility_child_boundary_error(
 /// Bound historical, explicitly untrusted subprocess routes retained only for
 /// characterization and migration. Durable Job-owned work uses the stricter
 /// supervisor-backed process boundaries in `commands::graph_job` instead.
+// Ownership couples the terminator's lifetime to the child for the entire
+// bounded wait and prevents authority reuse by the caller.
+#[allow(clippy::needless_pass_by_value)]
 fn wait_bounded_compatibility_child(
     mut child: std::process::Child,
     terminator: Box<dyn deadreckon_core::ChildTerminator>,
@@ -429,7 +432,14 @@ fn wait_bounded_compatibility_child(
             ),
         ));
     }
-    let status = status.expect("cleanup_proven requires a reaped child");
+    let Some(status) = status else {
+        return Err(compatibility_child_boundary_error(
+            deadreckon_core::ProcessBoundaryKind::SupervisionFailed,
+            operation,
+            None,
+            "cleanup was reported as proven without a reaped child status",
+        ));
+    };
     let (stdout, stderr) = pipes.join(operation)?;
     if work_expired {
         return Err(compatibility_child_boundary_error(

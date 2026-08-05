@@ -1677,6 +1677,9 @@ fn durable_chain_hook_process_group_absent(pid: u32) -> std::io::Result<bool> {
     Ok(!deadreckon_core::pid_is_alive(pid))
 }
 
+// Cleanup keeps the child, process authority, pipes, trigger, and policy
+// boundary explicit so partial authority cannot be hidden in a generic bag.
+#[allow(clippy::too_many_arguments)]
 fn cleanup_durable_chain_hook_process(
     child: &mut Child,
     terminator: &dyn deadreckon_core::ChildTerminator,
@@ -1837,6 +1840,9 @@ fn durable_chain_hook_release_command(command: &Command, _release_token: &str) -
     released
 }
 
+// Taking ownership prevents the caller from launching or mutating the
+// pre-release command after its authority-bound copy has been constructed.
+#[allow(clippy::needless_pass_by_value)]
 fn run_bounded_durable_chain_hook(
     command: Command,
     payload: &[u8],
@@ -4426,8 +4432,16 @@ impl SupervisedMergeRepairChild {
                         )
                     })?;
                     if trigger == MergeRepairChildProcessBoundary::Completed {
+                        let Some(completed_status) = status else {
+                            return Err(merge_repair_child_boundary_error(
+                                MergeRepairChildProcessBoundary::SupervisionFailed,
+                                true,
+                                None,
+                                "process cleanup completed without a reaped leader status",
+                            ));
+                        };
                         return Ok(Output {
-                            status: status.expect("checked above"),
+                            status: completed_status,
                             stdout,
                             stderr,
                         });
@@ -10020,6 +10034,9 @@ fn parent_budget_exhausted(
     })
 }
 
+// Parent sealing receives each independently derived proof and authority input
+// separately so their provenance is visible during review.
+#[allow(clippy::too_many_arguments)]
 fn seal_achieved_parent(
     paths: &DeadreckonPaths,
     job: &deadreckon_protocol::Job,

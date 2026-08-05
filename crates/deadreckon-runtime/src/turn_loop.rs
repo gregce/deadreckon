@@ -3314,6 +3314,9 @@ fn bash_policy_refusal(
     None
 }
 
+// Seam refusal evidence is assembled from explicit, independently reviewed
+// authority inputs rather than an opaque context bag.
+#[allow(clippy::too_many_arguments)]
 async fn policy_seam_refusal(
     seams: &SeamsConfig,
     ctx: &SeamRunCtx,
@@ -3965,6 +3968,9 @@ fn promote_if_ready(
     promote_completed_run_bounded(&paths, state, scope).map(|_| ())
 }
 
+// Settlement keeps the mutable run artifacts explicit so no phase authority
+// is accidentally retained in a shared aggregate.
+#[allow(clippy::too_many_arguments)]
 fn settle_local_work_boundary(
     state: &mut PipelineState,
     turn: u32,
@@ -5131,6 +5137,9 @@ enum SemanticCompletionDisposition {
     Cancelled,
 }
 
+// Completion is a trust boundary; keep its contract, marker, cancellation,
+// and deadline inputs explicit at the call site.
+#[allow(clippy::too_many_arguments)]
 async fn semantic_completion_disposition(
     state: &mut PipelineState,
     router: &ProviderRouter,
@@ -5310,6 +5319,9 @@ async fn semantic_completion_disposition(
     }
 }
 
+// Sealing deliberately accepts the independently derived proof components as
+// separate arguments so their provenance stays visible.
+#[allow(clippy::too_many_arguments)]
 fn seal_achieved_semantic_completion(
     state: &mut PipelineState,
     paths: &DeadreckonPaths,
@@ -5552,6 +5564,10 @@ fn record_semantic_lost_containment(
 }
 
 #[derive(Debug)]
+// This enum crosses the gate once per completion attempt. Keeping the marker
+// inline avoids heap indirection in proof-handling code and preserves its
+// concrete ownership semantics.
+#[allow(clippy::large_enum_variant)]
 enum DeterministicGateDisposition {
     Passed(deadreckon_core::AcceptanceMarker),
     Revise,
@@ -5698,6 +5714,8 @@ fn outstanding_gate_process_authority(state: &PipelineState) -> Option<PathBuf> 
         })
 }
 
+// Gate evaluation keeps each authority and deadline input explicit for audit.
+#[allow(clippy::too_many_arguments)]
 async fn acceptance_gate_passed_or_record_failure(
     state: &mut PipelineState,
     sender: Option<&broadcast::Sender<RunEvent>>,

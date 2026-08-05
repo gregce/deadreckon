@@ -1,36 +1,34 @@
 use std::env;
+use std::error::Error;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
 
-fn main() {
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
+fn main() -> Result<(), Box<dyn Error>> {
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or_else(|| io::Error::other("CARGO_MANIFEST_DIR is not set"))?,
+    );
     let workspace = manifest_dir
         .parent()
         .and_then(Path::parent)
-        .expect("deadreckon crate must live below the workspace root");
+        .ok_or_else(|| io::Error::other("deadreckon crate must live below the workspace root"))?;
 
     let mut inputs = vec![workspace.join("Cargo.toml"), workspace.join("Cargo.lock")];
-    collect_gate_build_inputs(&workspace.join("crates"), &mut inputs);
+    collect_gate_build_inputs(&workspace.join("crates"), &mut inputs)?;
     inputs.sort();
 
     let mut digest = Sha256::new();
     for path in inputs {
-        let relative = path.strip_prefix(workspace).expect("workspace input");
+        let relative = path.strip_prefix(workspace)?;
         println!("cargo:rerun-if-changed={}", path.display());
         let relative = relative.to_string_lossy().replace('\\', "/");
         digest.update(relative.as_bytes());
         digest.update([0]);
-        let bytes = fs::read(&path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read bundle build input {}: {error}",
-                path.display()
-            )
-        });
-        let normalized = String::from_utf8(bytes)
-            .unwrap_or_else(|error| panic!("bundle build input must be UTF-8: {error}"))
-            .replace("\r\n", "\n");
+        let bytes = fs::read(&path)?;
+        let normalized = String::from_utf8(bytes)?.replace("\r\n", "\n");
         digest.update(normalized.as_bytes());
         digest.update([0]);
     }
@@ -39,12 +37,14 @@ fn main() {
     println!(
         "cargo:rustc-env=DEADRECKON_BUNDLE_BUILD_ID=deadreckon-bundle-build-id-sha256:{digest:x}"
     );
+    Ok(())
 }
 
-fn collect_gate_build_inputs(root: &Path, inputs: &mut Vec<PathBuf>) {
-    let mut crate_dirs = fs::read_dir(root)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", root.display()))
-        .map(|entry| entry.expect("workspace crate entry").path())
+fn collect_gate_build_inputs(root: &Path, inputs: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
+    let mut crate_dirs = fs::read_dir(root)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .filter(|path| path.is_dir())
         .collect::<Vec<_>>();
     crate_dirs.sort();
@@ -56,18 +56,18 @@ fn collect_gate_build_inputs(root: &Path, inputs: &mut Vec<PathBuf>) {
         }
         let source = crate_dir.join("src");
         if source.is_dir() {
-            collect_rust_sources(&source, inputs);
+            collect_rust_sources(&source, inputs)?;
         }
     }
+    Ok(())
 }
 
-fn collect_rust_sources(root: &Path, inputs: &mut Vec<PathBuf>) {
+fn collect_rust_sources(root: &Path, inputs: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> {
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        let mut entries = fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
-            .map(|entry| entry.expect("workspace directory entry").path())
-            .collect::<Vec<_>>();
+        let mut entries = fs::read_dir(&directory)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
         entries.sort();
         for path in entries {
             if path.is_dir() {
@@ -80,4 +80,5 @@ fn collect_rust_sources(root: &Path, inputs: &mut Vec<PathBuf>) {
             }
         }
     }
+    Ok(())
 }

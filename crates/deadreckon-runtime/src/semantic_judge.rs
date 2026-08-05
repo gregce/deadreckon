@@ -451,6 +451,10 @@ pub async fn run_semantic_judge_against_source_with_deadline_and_cancellation(
     .await
 }
 
+// Keep each independent judge input visible at this trust boundary; hiding
+// them in a loosely related options bag makes review and call-site auditing
+// harder.
+#[allow(clippy::too_many_arguments)]
 async fn run_semantic_judge_with_baseline(
     state: &PipelineState,
     marker: &AcceptanceMarker,

@@ -78,9 +78,11 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
         return CliAuthStatus::Unknown {
             reason: format!(
                 "auth probe stdout was unavailable{}",
-                (!cleanup_proven)
-                    .then_some("; process-tree cleanup could not be proven")
-                    .unwrap_or_default()
+                if cleanup_proven {
+                    ""
+                } else {
+                    "; process-tree cleanup could not be proven"
+                }
             ),
         };
     };
@@ -89,9 +91,11 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
         return CliAuthStatus::Unknown {
             reason: format!(
                 "auth probe stderr was unavailable{}",
-                (!cleanup_proven)
-                    .then_some("; process-tree cleanup could not be proven")
-                    .unwrap_or_default()
+                if cleanup_proven {
+                    ""
+                } else {
+                    "; process-tree cleanup could not be proven"
+                }
             ),
         };
     };
@@ -106,8 +110,8 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
             let _ = child.kill();
             let direct_reaped = reap_auth_probe_child(&mut child, cleanup_deadline);
             let group_reconciled = reconcile_auth_probe_group(pid);
-            let stdout_drained = receive_bounded_output(stdout_drain, cleanup_deadline).is_some();
-            let stderr_drained = receive_bounded_output(stderr_drain, cleanup_deadline).is_some();
+            let stdout_drained = receive_bounded_output(&stdout_drain, cleanup_deadline).is_some();
+            let stderr_drained = receive_bounded_output(&stderr_drain, cleanup_deadline).is_some();
             let cleanup_proven =
                 direct_reaped && group_reconciled && stdout_drained && stderr_drained;
             let authority_removed =
@@ -115,12 +119,11 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
             return CliAuthStatus::Unknown {
                 reason: format!(
                     "could not supervise auth probe: {error}{}",
-                    (!authority_removed)
-                        .then(|| format!(
-                            "; process authority may remain at {}",
-                            authority.display()
-                        ))
-                        .unwrap_or_default()
+                    if authority_removed {
+                        String::new()
+                    } else {
+                        format!("; process authority may remain at {}", authority.display())
+                    }
                 ),
             };
         }
@@ -147,8 +150,8 @@ pub fn probe_cli_auth(binary: &str, probe: &AuthProbe) -> CliAuthStatus {
     let direct_reaped = matches!(&completion, AuthProbeCompletion::Completed)
         || reap_auth_probe_child(&mut child, cleanup_deadline);
     let group_reconciled = reconcile_auth_probe_group(pid);
-    let stdout = receive_bounded_output(stdout_drain, cleanup_deadline);
-    let stderr = receive_bounded_output(stderr_drain, cleanup_deadline);
+    let stdout = receive_bounded_output(&stdout_drain, cleanup_deadline);
+    let stderr = receive_bounded_output(&stderr_drain, cleanup_deadline);
     let drains_completed = stdout.is_some() && stderr.is_some();
     let cleanup_proven = direct_reaped
         && group_reconciled
@@ -219,7 +222,7 @@ where
     receiver
 }
 
-fn receive_bounded_output(receiver: Receiver<String>, deadline: Instant) -> Option<String> {
+fn receive_bounded_output(receiver: &Receiver<String>, deadline: Instant) -> Option<String> {
     receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .ok()
@@ -294,11 +297,11 @@ fn reconcile_auth_probe_group(pid: u32) -> bool {
         let Ok(pgid) = i32::try_from(pid) else {
             return false;
         };
-        return !matches!(
+        !matches!(
             deadreckon_core::ProcessGroupTerminator::new(pgid)
                 .terminate(Duration::from_millis(250)),
             deadreckon_core::TerminationOutcome::Failed(_)
-        );
+        )
     }
     #[cfg(not(unix))]
     {
