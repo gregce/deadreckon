@@ -149,13 +149,33 @@ impl SupervisedProcessRecord {
         if !pid_is_alive(self.process.pid) {
             return SupervisedProcessIdentity::Exited;
         }
-        match process_start_identity(self.process.pid) {
-            Some(observed) if observed == self.process_start_identity => {
-                SupervisedProcessIdentity::Current
-            }
-            Some(_) => SupervisedProcessIdentity::Reused,
-            None => SupervisedProcessIdentity::Unverifiable,
-        }
+        classify_process_identity_after_live_probe(
+            &self.process_start_identity,
+            process_start_identity(self.process.pid).as_deref(),
+            || pid_is_alive(self.process.pid),
+        )
+    }
+}
+
+/// Classify the result of a process-start probe that followed a successful
+/// liveness check.
+///
+/// A process can exit in the small interval between `kill(pid, 0)` and the
+/// platform start-time query. Recheck liveness only when that query returns no
+/// identity: a now-absent PID is an ordinary exit, while a still-live PID with
+/// no inspectable identity remains fail-closed. If the numeric PID was reused
+/// during the interval, the final liveness check also keeps the result
+/// unverifiable rather than treating the replacement as the exited child.
+fn classify_process_identity_after_live_probe(
+    expected: &str,
+    observed: Option<&str>,
+    pid_is_still_alive: impl FnOnce() -> bool,
+) -> SupervisedProcessIdentity {
+    match observed {
+        Some(observed) if observed == expected => SupervisedProcessIdentity::Current,
+        Some(_) => SupervisedProcessIdentity::Reused,
+        None if !pid_is_still_alive() => SupervisedProcessIdentity::Exited,
+        None => SupervisedProcessIdentity::Unverifiable,
     }
 }
 
@@ -533,11 +553,29 @@ mod tests {
     use super::boot_identity;
     use super::{
         SupervisedProcess, SupervisedProcessIdentity, SupervisedProcessPhase,
-        SupervisedProcessRecord, boot_identities_match, normalize_boot_identity,
-        read_supervised_process, read_supervised_process_record,
+        SupervisedProcessRecord, boot_identities_match, classify_process_identity_after_live_probe,
+        normalize_boot_identity, read_supervised_process, read_supervised_process_record,
         remove_supervised_process_record_if_matches, remove_supervised_process_record_if_same,
         write_supervised_process, write_supervised_process_record,
     };
+
+    #[test]
+    fn exit_between_liveness_and_start_identity_probes_is_not_unverifiable() {
+        assert_eq!(
+            classify_process_identity_after_live_probe("expected", None, || false),
+            SupervisedProcessIdentity::Exited
+        );
+        assert_eq!(
+            classify_process_identity_after_live_probe("expected", None, || true),
+            SupervisedProcessIdentity::Unverifiable
+        );
+        assert_eq!(
+            classify_process_identity_after_live_probe("expected", Some("replacement"), || {
+                panic!("a returned identity must not need a second liveness probe")
+            }),
+            SupervisedProcessIdentity::Reused
+        );
+    }
 
     #[test]
     fn macos_boot_identity_ignores_legacy_microsecond_rendering() {

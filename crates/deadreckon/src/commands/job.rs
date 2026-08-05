@@ -3963,6 +3963,34 @@ mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn exited_provider_record_is_reconciled_without_an_identity_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = supervised_state(&temp);
+        let command = Command::new("true");
+        let (mut child, _terminator) =
+            deadreckon_core::spawn_grouped(command).expect("grouped provider fixture");
+        let pid = child.id();
+        let path = state
+            .run_root
+            .join("child-pids")
+            .join("provider-turn-1.pid");
+        let record =
+            deadreckon_core::SupervisedProcessRecord::running(deadreckon_core::SupervisedProcess {
+                pid,
+                pgid: Some(pid),
+            })
+            .expect("provider process identity");
+        deadreckon_core::write_supervised_process_record(&path, &record).expect("record");
+        child.wait().expect("reap provider fixture");
+
+        reconcile_run_supervised_processes(&state, Duration::ZERO, false)
+            .expect("reconcile an already-exited provider");
+
+        assert!(!path.exists());
+    }
+
     #[test]
     fn reboot_stale_guarded_record_is_removed_without_signalling_reused_pid() {
         let temp = TempDir::new().expect("tempdir");
