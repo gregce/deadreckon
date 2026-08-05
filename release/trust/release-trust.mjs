@@ -639,28 +639,36 @@ function verifyHomebrew(localArgs = args) {
         throw new Error(`${formula} does not install required binary ${binary}`);
       }
     }
-    // Multi-platform formulae carry one url per target inside on_macos/on_linux
-    // blocks, and cargo-dist only embeds sha256 lines at publish/host time. So
-    // at the build+trust stage verify every referenced artifact is present in
-    // SHA256SUMS (the integrity source of truth), and match any embedded sha256
-    // we do find rather than requiring them.
+    // Multi-platform formulae carry one url per target inside platform blocks.
+    // Homebrew does not infer a checksum from our release manifest, so every
+    // URL must be immediately paired with the exact archive digest. Accepting
+    // an unpinned URL here would make `brew install` download unverified bytes.
     const urls = [...text.matchAll(/url\s+"([^"]+)"/g)].map((match) => match[1]);
-    const embeddedShas = [...text.matchAll(/sha256\s+"([0-9a-fA-F]{64})"/g)].map((match) => match[1]);
+    const pinnedUrls = [
+      ...text.matchAll(
+        /^(\s*)url\s+"([^"]+)"\s*\r?\n\1sha256\s+"([0-9a-fA-F]{64})"\s*$/gm,
+      ),
+    ];
     if (urls.length === 0) {
       throw new Error(`${formula} must reference at least one url`);
     }
-    for (const url of urls) {
+    if (pinnedUrls.length !== urls.length) {
+      throw new Error(
+        `${formula} must pin one sha256 immediately after each url (${pinnedUrls.length}/${urls.length} pinned)`,
+      );
+    }
+    for (const [, , url, pinnedSha] of pinnedUrls) {
       const basename = path.basename(url);
-      if (!findChecksum(basename)) {
+      const expectedSha = findChecksum(basename);
+      if (!expectedSha) {
         throw new Error(`${formula} references ${basename}, which is missing from SHA256SUMS`);
       }
-      verifiedUrls += 1;
-    }
-    const knownChecksums = new Set(checksums.values());
-    for (const sha of embeddedShas) {
-      if (!knownChecksums.has(sha)) {
-        throw new Error(`${formula} embeds sha256 ${sha}, which is not present in SHA256SUMS`);
+      if (pinnedSha.toLowerCase() !== expectedSha.toLowerCase()) {
+        throw new Error(
+          `${formula} pins sha256 ${pinnedSha} for ${basename}, expected ${expectedSha}`,
+        );
       }
+      verifiedUrls += 1;
     }
   }
   writeJson({ ok: true, formulae: formulae.length, verified_urls: verifiedUrls });

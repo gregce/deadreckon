@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -99,6 +100,53 @@ function withCompleteBinaryInstall(formula) {
   return patched;
 }
 
+function withArchiveChecksums(formula, formulaPath) {
+  const lines = formula.split("\n");
+  const patched = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    patched.push(line);
+    const urlMatch = line.match(/^(\s*)url\s+"([^"]+)"\s*$/);
+    if (!urlMatch) {
+      continue;
+    }
+
+    const [, indent, url] = urlMatch;
+    const nextLine = lines[index + 1] ?? "";
+    const hasPinnedChecksum = /^\s*sha256\s+"[^"]+"\s*$/.test(nextLine);
+    let archiveName;
+    try {
+      archiveName = path.basename(new URL(url).pathname);
+    } catch (error) {
+      throw new Error(`formula contains invalid archive URL ${url}: ${error.message}`);
+    }
+    const archivePath = path.join(path.dirname(formulaPath), archiveName);
+
+    if (!fs.existsSync(archivePath)) {
+      if (hasPinnedChecksum) {
+        patched.push(nextLine);
+        index += 1;
+        continue;
+      }
+      throw new Error(
+        `formula URL ${url} has no sha256 and archive ${archivePath} is unavailable`,
+      );
+    }
+    if (!fs.statSync(archivePath).isFile()) {
+      throw new Error(`formula archive is not a regular file: ${archivePath}`);
+    }
+
+    const digest = crypto.createHash("sha256").update(fs.readFileSync(archivePath)).digest("hex");
+    if (hasPinnedChecksum) {
+      index += 1;
+    }
+    patched.push(`${indent}sha256 "${digest}"`);
+  }
+
+  return patched.join("\n");
+}
+
 const formulae = walk(path.resolve(target));
 if (formulae.length === 0) {
   throw new Error(`no Homebrew formulae found under ${target}`);
@@ -106,8 +154,9 @@ if (formulae.length === 0) {
 
 for (const formulaPath of formulae) {
   const original = fs.readFileSync(formulaPath, "utf8");
-  const patched = withReceiptCall(
-    withReceiptMethod(withRequires(withCompleteBinaryInstall(original))),
+  const patched = withArchiveChecksums(
+    withReceiptCall(withReceiptMethod(withRequires(withCompleteBinaryInstall(original)))),
+    formulaPath,
   );
   fs.writeFileSync(formulaPath, patched);
 }
