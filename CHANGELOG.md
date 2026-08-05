@@ -6,6 +6,9 @@
   resolving read-only Xcode tool aliases before entering Seatbelt. Disposable
   gates also permit the harmless literal `/dev/null` write used by ordinary
   shell redirection, without granting host temp or general device writes.
+- Watchkeeper's credential-free Docker preflight now binds its static evaluator
+  to the clean source-derived build identity, so a stale same-version sidecar
+  is reported as an unproven prerequisite before any Job is created.
 - Fixed stable Homebrew formula generation and release verification so every
   platform URL is pinned to the exact published archive SHA-256; unpinned
   formulae now fail closed before publication instead of relying on Homebrew's
