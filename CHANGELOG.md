@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 — Safer release edges — 2026-08-05
 
 - Fixed strict macOS acceptance checks that invoke Apple developer tools by
   resolving read-only Xcode tool aliases before entering Seatbelt. Disposable
