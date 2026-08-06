@@ -13,6 +13,10 @@
   uninitialized directory beside a nested Git repository therefore no longer
   panics after confirmation, while ignored contents remain excluded from the
   durable source bundle.
+- Semantic completion now constrains structured evidence citations to the six
+  identifiers accepted by the verifier. Real providers can no longer turn a
+  passing deterministic gate into `semantic_unavailable` by embellishing an
+  otherwise valid citation with explanatory text.
 
 ## 0.8.2 — Safer release edges — 2026-08-05
 

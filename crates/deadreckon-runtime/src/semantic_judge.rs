@@ -1119,7 +1119,20 @@ fn semantic_output_schema() -> Value {
                     "properties": {
                         "claim": { "type": "string" },
                         "status": { "type": "string", "enum": ["met", "missing", "unclear"] },
-                        "evidence": { "type": "array", "items": { "type": "string" } }
+                        "evidence": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": [
+                                    EVIDENCE_GOAL,
+                                    EVIDENCE_CONTRACT,
+                                    EVIDENCE_DIFF,
+                                    EVIDENCE_GATE,
+                                    EVIDENCE_AUTHORITY,
+                                    EVIDENCE_NOTES
+                                ]
+                            }
+                        }
                     }
                 }
             },
@@ -1501,6 +1514,17 @@ mod tests {
             serde_json::json!(["decision", "summary", "goal_coverage", "blocking_missing"])
         );
         assert!(schema["properties"].get("missing").is_none());
+        assert_eq!(
+            schema["properties"]["goal_coverage"]["items"]["properties"]["evidence"]["items"]["enum"],
+            serde_json::json!([
+                "approved-goal",
+                "approved-contract",
+                "source-diff",
+                "deterministic-gate",
+                "authority",
+                "implementation-notes"
+            ])
+        );
         deadreckon_providers::validate_openai_strict_output_schema("semantic-test", &schema)
             .expect("semantic schema must remain valid for strict Codex/OpenAI output");
     }
