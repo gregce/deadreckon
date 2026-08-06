@@ -567,6 +567,10 @@ impl Provider for GenericCliProvider {
         which(&self.binary).is_ok() || PathBuf::from(&self.binary).exists()
     }
 
+    fn executable(&self) -> Option<&str> {
+        Some(&self.binary)
+    }
+
     fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate {
         SpendEstimate {
             provider: self.name.clone(),
