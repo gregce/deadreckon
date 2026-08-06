@@ -598,6 +598,55 @@ printf docker-boundary-ok"#,
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn sandbox_allows_declared_loopback_without_full_network() {
+        if which::which("sandbox-exec").is_err() || which::which("curl").is_err() {
+            return;
+        }
+        let (url, server) = local_http_probe();
+        let temp = TempDir::new().expect("tempdir");
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let output = run(SandboxSpec {
+            backend: SandboxBackend::SandboxExec,
+            docker: None,
+            cwd: work,
+            program: OsString::from("curl"),
+            args: vec![
+                OsString::from("--fail"),
+                OsString::from("--silent"),
+                OsString::from("--max-time"),
+                OsString::from("2"),
+                OsString::from(url),
+            ],
+            stdin: None,
+            env: BTreeMap::new(),
+            allow_network: true,
+            pid_file: None,
+            cancellation_token: None,
+            profile_dir: None,
+            read_allowlist: Vec::new(),
+            write_allowlist: Vec::new(),
+            read_denylist: Vec::new(),
+            write_denylist: Vec::new(),
+            network_allowlist: vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "::1".to_string(),
+            ],
+            workspace_access: WorkspaceAccess::ReadWrite,
+            cleanup_process_group: false,
+            guarded_launch: None,
+        })
+        .await
+        .expect("sandbox run");
+
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+        assert_eq!(output.stdout, "ok");
+        assert!(server.join().expect("loopback server"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn sandbox_blocks_outbound_to_evil_host() {
         if which::which("sandbox-exec").is_err() || which::which("curl").is_err() {
             return;

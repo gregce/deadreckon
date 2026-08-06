@@ -135,6 +135,60 @@ pub struct AcceptanceSpec {
     pub checks: Vec<AcceptanceCheck>,
 }
 
+/// Environmental authority explicitly requested by an acceptance contract.
+///
+/// Absence is deny-by-default so every existing contract keeps its historical
+/// meaning. The compiler may recommend a capability, but only this accepted
+/// and frozen field grants it to the gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptanceNetworkAccess {
+    #[default]
+    Deny,
+    Loopback,
+    Full,
+}
+
+impl AcceptanceNetworkAccess {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Loopback => "loopback",
+            Self::Full => "full",
+        }
+    }
+
+    pub const fn allows(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::Full, _)
+                | (Self::Loopback, Self::Loopback | Self::Deny)
+                | (Self::Deny, Self::Deny)
+        )
+    }
+
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::Loopback, _) | (_, Self::Loopback) => Self::Loopback,
+            (Self::Deny, Self::Deny) => Self::Deny,
+        }
+    }
+}
+
+impl std::fmt::Display for AcceptanceNetworkAccess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptanceCapabilities {
+    #[serde(default)]
+    pub network: AcceptanceNetworkAccess,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AcceptanceCheck {
@@ -1163,6 +1217,87 @@ fn write_generated_spec(
 
 pub fn acceptance_checks_from_yaml(raw: &str) -> Result<Vec<AcceptanceCheck>> {
     parse_acceptance_checks(raw)
+}
+
+/// Parse the authority declaration independently from the executable checks.
+/// Keeping this separate preserves the broad compatibility parser used for
+/// historical check spellings while making capability syntax strict.
+pub fn acceptance_capabilities_from_yaml(raw: &str) -> Result<AcceptanceCapabilities> {
+    let root: YamlValue = serde_yaml::from_str(raw).map_err(|source| {
+        DeadreckonError::InvalidInput(format!("invalid acceptance.yaml: {source}"))
+    })?;
+    let Some(value) = yaml_get(&root, "capabilities") else {
+        return Ok(AcceptanceCapabilities::default());
+    };
+    serde_yaml::from_value(value.clone()).map_err(|source| {
+        DeadreckonError::InvalidInput(format!(
+            "invalid acceptance capabilities: {source}; use `capabilities: {{ network: deny|loopback|full }}`"
+        ))
+    })
+}
+
+/// Conservative static requirement used during contract compilation and Job
+/// admission. It catches explicit network operations, including network code
+/// placed in frozen helper files, without turning goal wording into authority.
+pub fn infer_acceptance_network_access(text: &str) -> AcceptanceNetworkAccess {
+    let lower = text.to_ascii_lowercase();
+    let loopback = ["127.0.0.1", "localhost", "::1", "[::1]"]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let explicit_remote_url = lower
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '\'' | '"' | ')' | '(' | ',')
+        })
+        .filter(|token| token.starts_with("http://") || token.starts_with("https://"))
+        .any(|token| {
+            !token.contains("127.0.0.1") && !token.contains("localhost") && !token.contains("[::1]")
+        });
+    if explicit_remote_url {
+        return AcceptanceNetworkAccess::Full;
+    }
+    let network_operation = [
+        "curl ",
+        "wget ",
+        "urlsession",
+        "socket.",
+        "socket(",
+        "socket_",
+        "tcpstream",
+        "tcplistener",
+        "http.server",
+        "playwright",
+        "cypress",
+        "preview --host",
+        "serve --host",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if loopback && network_operation {
+        AcceptanceNetworkAccess::Loopback
+    } else {
+        AcceptanceNetworkAccess::Deny
+    }
+}
+
+/// Compute the network need of executable check fields only. Descriptive
+/// names, file contents, regex patterns, and comments may mention URLs without
+/// causing network activity and must not accidentally widen authority.
+pub fn required_acceptance_network_access_from_yaml(raw: &str) -> Result<AcceptanceNetworkAccess> {
+    let checks = acceptance_checks_from_yaml(raw)?;
+    Ok(checks
+        .iter()
+        .fold(AcceptanceNetworkAccess::Deny, |required, check| {
+            let check_required = match check {
+                AcceptanceCheck::Shell { command, .. } => infer_acceptance_network_access(command),
+                AcceptanceCheck::CargoTest { args, .. } => {
+                    infer_acceptance_network_access(&args.join(" "))
+                }
+                AcceptanceCheck::FileExists { .. }
+                | AcceptanceCheck::ContentMatch { .. }
+                | AcceptanceCheck::BuildSuccess { .. } => AcceptanceNetworkAccess::Deny,
+            };
+            required.combine(check_required)
+        }))
 }
 
 fn evaluate_acceptance_checks_inner(
@@ -3007,6 +3142,62 @@ mod tests {
         assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_KEY_ENV)));
         assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_CONTAINED_ENV)));
         assert!(removed.contains(&std::ffi::OsStr::new(super::GATE_SANDBOX_BACKEND_ENV)));
+    }
+
+    #[test]
+    fn acceptance_network_capabilities_are_explicit_and_deny_by_default() {
+        let absent = super::acceptance_capabilities_from_yaml(
+            "checks:\n  - kind: shell\n    command: cargo test\n",
+        )
+        .expect("legacy contract");
+        assert_eq!(
+            absent.network,
+            super::AcceptanceNetworkAccess::Deny,
+            "existing contracts must not gain authority"
+        );
+
+        for (value, expected) in [
+            ("loopback", super::AcceptanceNetworkAccess::Loopback),
+            ("full", super::AcceptanceNetworkAccess::Full),
+            ("deny", super::AcceptanceNetworkAccess::Deny),
+        ] {
+            let raw = format!(
+                "capabilities:\n  network: {value}\nchecks:\n  - kind: shell\n    command: cargo test\n"
+            );
+            assert_eq!(
+                super::acceptance_capabilities_from_yaml(&raw)
+                    .expect("declared capability")
+                    .network,
+                expected
+            );
+        }
+
+        let error = super::acceptance_capabilities_from_yaml(
+            "capabilities:\n  network: maybe\nchecks:\n  - kind: shell\n    command: cargo test\n",
+        )
+        .expect_err("unknown authority must fail closed");
+        assert!(error.to_string().contains("deny|loopback|full"), "{error}");
+    }
+
+    #[test]
+    fn executable_network_requirement_ignores_descriptive_url_text() {
+        let inspection = super::required_acceptance_network_access_from_yaml(
+            "checks:\n  - kind: content_match\n    path: \"{working_dir}/README.md\"\n    pattern: \"https://example.com\"\n",
+        )
+        .expect("inspection contract");
+        assert_eq!(inspection, super::AcceptanceNetworkAccess::Deny);
+
+        let loopback = super::required_acceptance_network_access_from_yaml(
+            "checks:\n  - kind: shell\n    command: \"python3 -m http.server --bind 127.0.0.1\"\n",
+        )
+        .expect("loopback contract");
+        assert_eq!(loopback, super::AcceptanceNetworkAccess::Loopback);
+
+        let outbound = super::required_acceptance_network_access_from_yaml(
+            "checks:\n  - kind: shell\n    command: \"curl https://example.com/fixture\"\n",
+        )
+        .expect("outbound contract");
+        assert_eq!(outbound, super::AcceptanceNetworkAccess::Full);
     }
 
     #[test]

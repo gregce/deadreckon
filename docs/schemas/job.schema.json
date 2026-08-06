@@ -158,6 +158,17 @@
         "tools"
       ],
       "properties": {
+        "gate": {
+          "description": "Contract-derived authority for the independent completion gate.\n\nThis is deliberately separate from provider tool authority: the gate may need loopback to exercise a local client/server protocol without granting the coding provider unrestricted outbound access.",
+          "default": {
+            "network": "deny"
+          },
+          "allOf": [
+            {
+              "$ref": "#/definitions/JobGatePolicy"
+            }
+          ]
+        },
         "gate_evaluator": {
           "description": "Exact controller/evaluator toolchain approved before the first turn.\n\n`None` keeps pre-identity Jobs readable. A new strict Job must persist this field together with matching authority and boundary-observation digests; partial identity state fails closed during verification.",
           "anyOf": [
@@ -180,6 +191,44 @@
           "additionalProperties": {
             "$ref": "#/definitions/JobToolPolicy"
           }
+        }
+      }
+    },
+    "JobGateNetworkAccess": {
+      "description": "Network authority granted to the deterministic completion gate.\n\nExisting Jobs deserialize as `deny`. New Jobs persist this value inside the effective-policy digest before any provider turn starts.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        },
+        {
+          "description": "Permit communication only within the sandbox's loopback interface.",
+          "type": "string",
+          "enum": [
+            "loopback"
+          ]
+        },
+        {
+          "description": "Permit unrestricted network access. This must be explicitly present in the accepted done contract; it is never inferred from the run goal.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        }
+      ]
+    },
+    "JobGatePolicy": {
+      "type": "object",
+      "properties": {
+        "network": {
+          "default": "deny",
+          "allOf": [
+            {
+              "$ref": "#/definitions/JobGateNetworkAccess"
+            }
+          ]
         }
       }
     },

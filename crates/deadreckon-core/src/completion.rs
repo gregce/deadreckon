@@ -1090,6 +1090,17 @@ pub fn validate_strict_contract(contract_path: &Path, job_id: &str) -> Result<()
             "only proves that its pre-created working directory exists",
         ));
     }
+    let capabilities = crate::gate::acceptance_capabilities_from_yaml(&raw)?;
+    let required_network = crate::gate::required_acceptance_network_access_from_yaml(&raw)?;
+    if !capabilities.network.allows(required_network) {
+        return Err(strict_contract_error(
+            job_id,
+            &format!(
+                "requires {required_network} network access but declares {}",
+                capabilities.network
+            ),
+        ));
+    }
     Ok(())
 }
 
