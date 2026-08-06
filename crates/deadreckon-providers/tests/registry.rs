@@ -82,8 +82,12 @@ fn opencode_contract_classifies_interleaved_zero_exit_errors() {
         contract.error_message_path.as_deref(),
         Some("/error/data/message")
     );
-    assert_eq!(opencode.exec_template.args_template, ["run", "{prompt}"]);
+    assert_eq!(
+        opencode.exec_template.args_template,
+        ["run", "--dir", "{cwd}", "{prompt}"]
+    );
     assert!(source.contains("OpenCode 1.18.14"));
+    assert!(source.contains("frozen worktree"));
     assert!(source.contains("top-level `opencode --help`"));
     assert!(source.contains("retains the last"));
     assert_eq!(events[1]["part"]["text"], "OPENCODE_FIXTURE_OK");

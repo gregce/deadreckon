@@ -16,14 +16,17 @@ kind = "subscription"
 [version_probe]
 args = ["--version"]
 
-# OpenCode 1.18.14 (2026-08-06) keeps structured output and unattended
-# permission approval under the `run` subcommand. Probe that exact surface:
-# top-level `opencode --help` does not expose either flag. The outer DeadReckon
-# sandbox remains the hard filesystem/network authority when `--auto` approves
-# OpenCode's inner permission prompts. The JSON-lines parser retains the last
-# non-null answer and treats nested error messages as provider failures.
+# OpenCode 1.18.14 (2026-08-06) keeps project selection, structured output, and
+# unattended permission approval under the `run` subcommand. Bind `--dir` to
+# DeadReckon's frozen worktree: OpenCode can otherwise select the source
+# checkout even when the wrapper process inherited a different cwd. Probe that
+# exact surface because top-level `opencode --help` does not expose these flags.
+# The outer DeadReckon sandbox remains the hard filesystem/network authority
+# when `--auto` approves OpenCode's inner permission prompts. The JSON-lines
+# parser retains the last non-null answer and treats nested error messages as
+# provider failures.
 [exec_template]
-args_template = ["run", "{prompt}"]
+args_template = ["run", "--dir", "{cwd}", "{prompt}"]
 model_arg = "--model"
 timeout_seconds = 1800
 
