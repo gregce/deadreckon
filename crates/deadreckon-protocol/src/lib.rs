@@ -21,9 +21,10 @@ pub use job::{
     GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, GitDeliveryIntent,
     GitDeliveryRepositoryIdentity, GitDeliveryStrategy, GoalCoverage, GoalCoverageStatus,
     JOB_SCHEMA_VERSION, Job, JobAuthority, JobEvent, JobEventKind, JobEventSequence,
-    JobExecutionPolicy, JobLease, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion, JobShape,
-    JobToolPolicy, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SemanticDecision,
-    SemanticJudgeMode, SemanticJudgment, StopReason,
+    JobExecutionPolicy, JobGateNetworkAccess, JobGatePolicy, JobLease, JobOutcome, JobPhase,
+    JobPolicy, JobSchemaVersion, JobShape, JobToolPolicy, SandboxBoundaryObservation,
+    SandboxBoundaryObservationIssuer, SemanticDecision, SemanticJudgeMode, SemanticJudgment,
+    StopReason,
 };
 pub use ledger::{
     EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,

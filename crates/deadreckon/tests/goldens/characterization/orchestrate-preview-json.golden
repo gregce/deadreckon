@@ -10,6 +10,7 @@ status: 0
     "write_root": "<TMP>/repo/.deadreckon"
   },
   "done_contract": {
+    "capabilities": null,
     "checks": null,
     "divergence": null
   },

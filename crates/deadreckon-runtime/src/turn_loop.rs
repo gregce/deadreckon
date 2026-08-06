@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use deadreckon_protocol::{
-    GateEvaluatorIdentity, JobAuthority, JobSchemaVersion, RunEvent, RunEventKind,
-    SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SpendRecord, TraceRecord,
+    GateEvaluatorIdentity, JobAuthority, JobGateNetworkAccess, JobSchemaVersion, RunEvent,
+    RunEventKind, SandboxBoundaryObservation, SandboxBoundaryObservationIssuer, SpendRecord,
+    TraceRecord,
 };
 use deadreckon_providers::{
     ProviderCleanup, ProviderKind, ProviderPhaseDeadline, ProviderPhaseOutcome, ProviderRequest,
@@ -3143,6 +3144,50 @@ fn default_sandbox_toml(state: &PipelineState) -> SandboxToml {
     SandboxToml { version: 1, tools }
 }
 
+fn approved_gate_network_access(
+    state: &PipelineState,
+    strict_job: bool,
+) -> Result<JobGateNetworkAccess> {
+    let contract_path = acceptance_spec_path_for_run_root(&state.run_root);
+    let contract_raw = std::fs::read_to_string(&contract_path).with_path(&contract_path)?;
+    let declared = deadreckon_core::gate::acceptance_capabilities_from_yaml(&contract_raw)?.network;
+    let declared = match declared {
+        deadreckon_core::gate::AcceptanceNetworkAccess::Deny => JobGateNetworkAccess::Deny,
+        deadreckon_core::gate::AcceptanceNetworkAccess::Loopback => JobGateNetworkAccess::Loopback,
+        deadreckon_core::gate::AcceptanceNetworkAccess::Full => JobGateNetworkAccess::Full,
+    };
+    if !strict_job {
+        return Ok(declared);
+    }
+
+    // Reuse the provider-policy sibling's authority/digest verification before
+    // trusting the gate-specific projection from the same immutable Job.
+    approved_sandbox_toml(state)?.ok_or_else(|| {
+        DeadreckonError::InvalidInput(
+            "strict Job is missing its immutable execution policy".to_string(),
+        )
+    })?;
+    let paths = paths_for_state(state)?;
+    let job = deadreckon_core::load_job(&paths, &state.run_id)?;
+    let approved = job
+        .policy
+        .execution
+        .as_ref()
+        .ok_or_else(|| {
+            DeadreckonError::InvalidInput(
+                "strict Job predates immutable execution policy".to_string(),
+            )
+        })?
+        .gate
+        .network;
+    if approved != declared {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "approved gate network policy {approved:?} does not match frozen done contract {declared:?}"
+        )));
+    }
+    Ok(approved)
+}
+
 fn approved_sandbox_toml(state: &PipelineState) -> Result<Option<SandboxToml>> {
     let paths = paths_for_state(state)?;
     if !paths.job_json(&state.run_id).is_file() {
@@ -4259,6 +4304,7 @@ pub async fn run_deterministic_completion_gate(
     // The keyless evaluator is deliberately read-only outside `working_dir`
     // and refuses to create or replace this approved input.
     deadreckon_core::gate::compiled_acceptance_checks(&state.run_root, &state.working_dir)?;
+    let gate_network_access = approved_gate_network_access(state, strict_job)?;
 
     let boundary_observation = if let Some(launch_owner) = launch_owner {
         Some(
@@ -4307,6 +4353,7 @@ pub async fn run_deterministic_completion_gate(
         guarded_launch,
         strict_job,
         strict_job,
+        gate_network_access,
         Some(&gate_toolchain),
         cancellation_token,
     )
@@ -4584,6 +4631,7 @@ async fn run_keyless_gate_evaluation(
     guarded_launch: Option<GuardedLaunchSpec>,
     cleanup_process_group: bool,
     require_contained: bool,
+    network_access: JobGateNetworkAccess,
     gate_toolchain: Option<&ResolvedGateToolchain>,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<KeylessGateEvaluation> {
@@ -4677,6 +4725,18 @@ async fn run_keyless_gate_evaluation(
     } else {
         None
     };
+    let (allow_network, network_allowlist) = match network_access {
+        JobGateNetworkAccess::Deny => (false, Vec::new()),
+        JobGateNetworkAccess::Loopback => (
+            true,
+            vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "::1".to_string(),
+            ],
+        ),
+        JobGateNetworkAccess::Full => (true, vec!["*".to_string()]),
+    };
     let output = run_sandbox(SandboxSpec {
         backend: requested_backend,
         docker: docker.as_ref().map(|prepared| prepared.execution.clone()),
@@ -4685,7 +4745,7 @@ async fn run_keyless_gate_evaluation(
         args: gate_args,
         stdin: None,
         env,
-        allow_network: false,
+        allow_network,
         pid_file: Some(pid_file),
         cancellation_token: cancellation_token.cloned(),
         profile_dir: None,
@@ -4693,7 +4753,7 @@ async fn run_keyless_gate_evaluation(
         write_allowlist,
         read_denylist: boundary.read_denylist,
         write_denylist: boundary.write_denylist,
-        network_allowlist: Vec::new(),
+        network_allowlist,
         workspace_access: if require_contained {
             WorkspaceAccess::Disposable
         } else {
@@ -4842,6 +4902,8 @@ pub async fn run_contained_verdict_evaluation(
     let capture_policy = deadreckon_core::require_workspace_capture_policy(state)?;
     copy_recoverable_tree_with_policy(&state.working_dir, &scratch_working_dir, &capture_policy)?;
     let pid_file = scratch.path().join("dr-gate-evaluate.pid");
+    let strict_job = paths_for_state(state)?.job_json(&state.run_id).is_file();
+    let gate_network_access = approved_gate_network_access(state, strict_job)?;
     let result = run_keyless_gate_evaluation(
         state,
         &scratch_working_dir,
@@ -4850,6 +4912,7 @@ pub async fn run_contained_verdict_evaluation(
         None,
         true,
         true,
+        gate_network_access,
         None,
         cancellation_token,
     )
@@ -7538,8 +7601,9 @@ mod tests {
         ProviderInterruption, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, RunWorkBoundary,
         RunWorkClock, RunWorkExpiry, SandboxedPhaseOutcome, SemanticCompletionDisposition,
         TrustedGitPhaseOutcome, append_provider_approval_traces, append_tool_refusal,
-        bash_policy_refusal, begin_verification, build_cli_subagent_prompt, build_prompt,
-        capture_trusted_turn_head, capture_trusted_turn_head_bounded, changed_files_since_snapshot,
+        approved_gate_network_access, bash_policy_refusal, begin_verification,
+        build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
+        capture_trusted_turn_head_bounded, changed_files_since_snapshot,
         classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
         complete_verification, deliverable_changed_files, ensure_sandbox_toml,
         event_sink_must_stop, fail_verification, implementation_notes_ready_or_request_followup,
@@ -11001,8 +11065,8 @@ network = []
         use chrono::Utc;
         use deadreckon_core::write_job;
         use deadreckon_protocol::{
-            AuthorityAcceptedBy, Job, JobAuthority, JobExecutionPolicy, JobId, JobPolicy,
-            JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
+            AuthorityAcceptedBy, Job, JobAuthority, JobExecutionPolicy, JobGateNetworkAccess,
+            JobId, JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode,
         };
 
         let temp = TempDir::new().expect("tempdir");
@@ -11024,13 +11088,24 @@ network = []
             },
         )
         .expect("run");
+        let mut execution = JobExecutionPolicy::workspace_only("sandbox-exec");
+        execution.gate.network = JobGateNetworkAccess::Loopback;
+        execution
+            .tools
+            .get_mut("bash")
+            .expect("bash policy")
+            .network_allowlist = vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "::1".to_string(),
+        ];
         let policy = JobPolicy {
             max_spend_usd: 1.0,
             max_wall_seconds: 60,
             max_attempts: 1,
             deadline: None,
             semantic_judge: SemanticJudgeMode::Required,
-            execution: Some(JobExecutionPolicy::workspace_only("sandbox-exec")),
+            execution: Some(execution),
         };
         let policy_hash = deadreckon_core::flight::sha256_text(
             &serde_json::to_string(&policy).expect("policy JSON"),
@@ -11077,6 +11152,31 @@ network = []
             },
         )
         .expect("job");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "capabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"curl http://127.0.0.1:4173/health\"\n",
+        )
+        .expect("acceptance contract");
+        assert_eq!(
+            approved_gate_network_access(&state, true).expect("approved gate network"),
+            JobGateNetworkAccess::Loopback
+        );
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "capabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: \"curl https://example.com/health\"\n",
+        )
+        .expect("changed acceptance contract");
+        let mismatch = approved_gate_network_access(&state, true)
+            .expect_err("contract/policy network drift must fail closed");
+        assert!(
+            mismatch.to_string().contains("does not match"),
+            "{mismatch}"
+        );
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "capabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"curl http://127.0.0.1:4173/health\"\n",
+        )
+        .expect("restore acceptance contract");
 
         ensure_sandbox_toml(&state).expect("approved sandbox policy");
         let sandbox_path = state.run_root.join("sandbox.toml");
