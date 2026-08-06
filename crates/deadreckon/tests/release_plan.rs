@@ -781,14 +781,12 @@ fn preflight_real_proves_execution_routes_against_a_frozen_falsifiable_contract(
 fn preflight_real_can_prove_every_registered_cli_route_without_overwriting_release_evidence() {
     let script = fs::read_to_string(workspace_root().join("release/preflight-real.sh"))
         .expect("release/preflight-real.sh");
-    let registry = deadreckon_providers::registry::ProviderRegistry::builtin()
-        .expect("provider registry");
+    let registry =
+        deadreckon_providers::registry::ProviderRegistry::builtin().expect("provider registry");
 
     for descriptor in registry
         .iter()
-        .filter(|descriptor| {
-            descriptor.kind == deadreckon_providers::registry::DescriptorKind::Cli
-        })
+        .filter(|descriptor| descriptor.kind == deadreckon_providers::registry::DescriptorKind::Cli)
     {
         assert!(
             script.contains(&format!("{})", descriptor.id)),
