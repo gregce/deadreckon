@@ -440,6 +440,8 @@ pub(crate) struct CampaignArgs {
     pub(crate) provider: Option<String>,
     pub(crate) planner_model: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) max_spend: Option<f64>,
     pub(crate) max_wall_seconds: Option<f64>,
     pub(crate) deadline: Option<DateTime<Utc>>,
@@ -1769,12 +1771,12 @@ pub(crate) async fn campaign_command(args: CampaignArgs) -> Result<()> {
         args.planner_provider.clone(),
         args.provider.clone(),
         None,
-        None,
+        args.reviewer_provider.clone(),
         commands::plan::PlanModelOverrides {
             planner_model: args.planner_model.clone(),
             model: args.model.clone(),
             coder_model: None,
-            reviewer_model: None,
+            reviewer_model: args.reviewer_model.clone(),
             child_models: BTreeMap::new(),
         },
     )?;
@@ -2063,7 +2065,7 @@ fn campaign_accepted_by(yes: bool) -> deadreckon_protocol::AuthorityAcceptedBy {
     }
 }
 
-pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
+pub(crate) fn schedule_campaign_job(mut args: CampaignArgs) -> Result<()> {
     let goal = args.goal.trim().to_string();
     if goal.is_empty() {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -2088,6 +2090,28 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    let resolved_providers = resolve_plan_providers(
+        &paths,
+        &defaults,
+        PlanMode::FullPlan,
+        args.planner_provider.clone(),
+        args.provider.clone(),
+        None,
+        args.reviewer_provider.clone(),
+        commands::plan::PlanModelOverrides {
+            planner_model: args.planner_model.clone(),
+            model: args.model.clone(),
+            coder_model: None,
+            reviewer_model: args.reviewer_model.clone(),
+            child_models: BTreeMap::new(),
+        },
+    )?;
+    args.planner_provider = resolved_providers.planner;
+    args.provider = resolved_providers.default_child;
+    args.reviewer_provider = resolved_providers.reviewer;
+    args.planner_model = resolved_providers.planner_model;
+    args.model = resolved_providers.default_child_model;
+    args.reviewer_model = resolved_providers.reviewer_model;
     let cwd = std::env::current_dir()?;
     let scope = workspace_scope(&cwd)?;
     let contract_preview = campaign_contract_preview(&args, &cwd)?;
@@ -2142,6 +2166,18 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
         "direct_campaign_job",
     );
     launch.n = args.n;
+    launch.providers = commands::course::CourseProviders {
+        planner: args.planner_provider.clone(),
+        default_child: args.provider.clone(),
+        coder: None,
+        reviewer: args.reviewer_provider.clone(),
+        planner_model: args.planner_model.clone(),
+        default_child_model: args.model.clone(),
+        coder_model: None,
+        reviewer_model: args.reviewer_model.clone(),
+        children: BTreeMap::new(),
+        child_models: BTreeMap::new(),
+    };
     launch.budget.ceiling_usd = Some(max_spend_usd);
     launch.budget.wall_seconds = Some(max_wall_seconds);
     launch.budget.deadline = args.deadline;
@@ -2184,12 +2220,12 @@ pub(crate) fn schedule_campaign_job(args: CampaignArgs) -> Result<()> {
             child_provider: args.provider,
             child_provider_overrides: Vec::new(),
             coder_provider: None,
-            reviewer_provider: None,
+            reviewer_provider: args.reviewer_provider,
             planner_model: args.planner_model,
             child_model: args.model,
             child_model_overrides: Vec::new(),
             coder_model: None,
-            reviewer_model: None,
+            reviewer_model: args.reviewer_model,
             model: None,
             source_init_git: false,
         }),
@@ -3851,6 +3887,8 @@ mod durable_campaign_launch_tests {
             provider: None,
             planner_model: None,
             model: None,
+            reviewer_provider: None,
+            reviewer_model: None,
             max_spend: Some(2.0),
             max_wall_seconds: Some(120.0),
             deadline: None,

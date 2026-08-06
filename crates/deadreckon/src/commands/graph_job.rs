@@ -7499,6 +7499,8 @@ async fn drive_campaign(
         provider: driver.child_provider,
         planner_model: driver.planner_model,
         model: driver.child_model.or(driver.model),
+        reviewer_provider: driver.reviewer_provider,
+        reviewer_model: driver.reviewer_model,
         max_spend: Some(job.policy.max_spend_usd),
         max_wall_seconds: Some(job.policy.max_wall_seconds as f64),
         deadline: job.policy.deadline,
@@ -8606,18 +8608,39 @@ fn campaign_semantic_router(
     .into_iter()
     .find(|(provider, _)| provider.is_some())
     .unwrap_or((None, None));
-    if selection
-        .0
-        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
-    {
-        Ok(ProviderRouter::smoke())
-    } else {
-        Ok(ProviderRouter::from_config_path_with_model(
-            &paths.config_path(),
-            selection.0,
-            selection.1,
-        )?)
+    schema_only_semantic_router(paths, selection.0, selection.1, "campaign rollup")
+}
+
+fn schema_only_semantic_router(
+    paths: &DeadreckonPaths,
+    provider: Option<&str>,
+    model: Option<&str>,
+    context: &str,
+) -> Result<ProviderRouter> {
+    if provider.is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:")) {
+        return Ok(ProviderRouter::smoke());
     }
+    let route = setup::route_info_for_provider(&paths.config_path(), provider, model)?.ok_or_else(
+        || {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "{context} did not resolve a semantic reviewer route"
+            )))
+        },
+    )?;
+    if !route.kind.has_schema_only_adapter() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "{context} route {} cannot perform DeadReckon's schema-only semantic judgment",
+                route.name
+            ),
+            "freeze a schema-capable --reviewer-provider such as cli:codex in the launch plan",
+        )));
+    }
+    Ok(ProviderRouter::from_config_path_with_model(
+        &paths.config_path(),
+        Some(route.name.as_str()),
+        model,
+    )?)
 }
 
 fn repair_provider_selection(
@@ -10302,18 +10325,7 @@ fn semantic_router(
     .into_iter()
     .find(|(provider, _)| provider.is_some())
     .unwrap_or((None, None));
-    if selection
-        .0
-        .is_some_and(|provider| provider == "smoke" || provider.starts_with("smoke:"))
-    {
-        Ok(ProviderRouter::smoke())
-    } else {
-        Ok(ProviderRouter::from_config_path_with_model(
-            &paths.config_path(),
-            selection.0,
-            selection.1,
-        )?)
-    }
+    schema_only_semantic_router(paths, selection.0, selection.1, "graph completion")
 }
 
 fn record_parent_semantic_accounting(

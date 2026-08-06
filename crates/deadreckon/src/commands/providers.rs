@@ -951,7 +951,7 @@ fn providers_list_verdict_surface(
     let what = if results.is_empty() && missing.is_empty() {
         "DeadReckon found no configured provider routes.".to_string()
     } else if missing.is_empty() && failed.is_empty() {
-        format!("DeadReckon listed {ok} usable provider route(s).")
+        format!("DeadReckon listed {ok} provider route(s) whose static setup probes passed.")
     } else {
         format!(
             "DeadReckon listed provider routes and found {} issue(s).",
@@ -970,7 +970,7 @@ fn providers_list_verdict_surface(
         "There is no configured provider inventory yet; listing all routes is the safest discovery step."
             .to_string()
     } else {
-        "The configured provider inventory is readable; a detect pass can refresh setup diagnostics."
+        "The configured inventory proves route resolution, credentials or binaries, and version probes. It does not prove a funded account or a successful live model turn; release/preflight-real.sh supplies that stronger evidence."
             .to_string()
     };
     let mut evidence = vec![
@@ -1024,13 +1024,19 @@ fn print_provider_list_row(
     let version = result.version.as_deref().unwrap_or("-");
     let model = descriptor.default_model.as_deref().unwrap_or("-");
     let contract = if result.contract { "yes" } else { "no" };
+    let review = if result.schema_only_review {
+        "native"
+    } else {
+        "external"
+    };
     if full {
         println!(
-            "{marker} {} {} kind={} contract={} credential={} model={} metering={} location={} version={}",
+            "{marker} {} {} kind={} contract={} review={} credential={} model={} metering={} location={} version={}",
             ui_id(&result.id),
             symbol,
             descriptor_kind_label(&descriptor.kind),
             contract,
+            review,
             result.credential,
             model,
             result.metering,
@@ -1039,11 +1045,12 @@ fn print_provider_list_row(
         );
     } else {
         println!(
-            "{marker} {} {}  kind={:<10} contract={:<3} credential={:<8} model={} metering={} location={} version={}",
+            "{marker} {} {}  kind={:<10} contract={:<3} review={:<8} credential={:<8} model={} metering={} location={} version={}",
             crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&descriptor.kind),
             contract,
+            review,
             result.credential,
             model,
             result.metering,
@@ -1102,11 +1109,16 @@ fn print_detect_results(results: &[ProviderProbeResult]) {
         let version = result.version.as_deref().unwrap_or("-");
         let message = result.message.as_deref().unwrap_or("");
         println!(
-            "{} {}  kind={:<10} contract={:<3} credential={:<14} location={:<36} version={:<18} metering={}",
+            "{} {}  kind={:<10} contract={:<3} review={:<8} credential={:<14} location={:<36} version={:<18} metering={}",
             crate::ui::pad_visible(&ui_id(&result.id), 20),
             symbol,
             descriptor_kind_label(&result.kind),
             if result.contract { "yes" } else { "no" },
+            if result.schema_only_review {
+                "native"
+            } else {
+                "external"
+            },
             result.credential,
             location,
             version,
@@ -1162,8 +1174,10 @@ fn detect_verdict_surface(
         });
     let what = if failed.is_empty() {
         match requested_id {
-            Some(id) => format!("DeadReckon verified provider probe {id}."),
-            None => "DeadReckon completed provider detection without failed probes.".to_string(),
+            Some(id) => format!("DeadReckon passed the static provider probe for {id}."),
+            None => {
+                "DeadReckon completed static provider detection without failed probes.".to_string()
+            }
         }
     } else if failed.len() == 1 {
         format!("DeadReckon found provider {} is not ready.", failed[0].id)
@@ -1178,7 +1192,7 @@ fn detect_verdict_surface(
             "A provider probe failed, so setup must be repaired before it can run work.".to_string()
         })
     } else {
-        "All failed-provider checks passed; the selected provider catalog is ready for the next setup or run command.".to_string()
+        "All static setup probes passed. This proves route resolution and required artifacts, not a funded account or successful live model turn; use the real-provider preflight for operational proof.".to_string()
     };
     let mut evidence = vec![
         ("providers".to_string(), results.len().to_string()),

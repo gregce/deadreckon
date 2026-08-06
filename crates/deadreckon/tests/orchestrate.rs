@@ -6171,7 +6171,7 @@ fn review_mode_stops_before_reviewer_when_coder_fails_gate() {
             "--coder-provider",
             "cli:review-fixture",
             "--reviewer-provider",
-            "cli:review-fixture",
+            "smoke",
             "--quiet",
         ])
         .output()
@@ -7053,7 +7053,7 @@ fn review_gate_failure_plan(
             "--coder-provider",
             "cli:review-fixture",
             "--reviewer-provider",
-            "cli:review-fixture",
+            "smoke",
             "--quiet",
         ])
         .output()
@@ -7273,6 +7273,9 @@ args_template = ["{{prompt}}"]
 default_provider = "{id}"
 fallback = ["{id}"]
 
+[defaults]
+reviewer_provider = "smoke"
+
 [providers."{id}"]
 binary = "{binary}"
 "#,
@@ -7343,6 +7346,9 @@ args_template = ["{{prompt}}"]
             r#"
 default_provider = "{id}"
 fallback = ["{id}"]
+
+[defaults]
+reviewer_provider = "smoke"
 
 [providers."{id}"]
 binary = "{binary}"
