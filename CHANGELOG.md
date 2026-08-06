@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.3 — Starts that recover — 2026-08-05
+
+- Guided `start` now treats done-contract drafting, deterministic validation,
+  and provider calls as one bounded admission process. Recovery keeps the
+  selected goal, source mode, launch shape, and execution team; interactive
+  operator time no longer consumes provider-work budget; and each explicit
+  retry receives a fresh bounded attempt instead of inheriting an exhausted
+  hidden clock.
+- Workspace capture now respects nested ignore files without asking the ignore
+  walker to evaluate a path outside that ignore file's root. Starting from an
+  uninitialized directory beside a nested Git repository therefore no longer
+  panics after confirmation, while ignored contents remain excluded from the
+  durable source bundle.
+
 ## 0.8.2 — Safer release edges — 2026-08-05
 
 - Fixed strict macOS acceptance checks that invoke Apple developer tools by
