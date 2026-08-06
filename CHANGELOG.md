@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.4 — Contracts that hold — 2026-08-06
+
+- Definition-of-done compilation now derives network requirements from the
+  accepted checks and helper commands, freezes that authority before a Job is
+  queued, and carries it through direct, guided, campaign, chain, graph, and
+  resumed launches. Gate execution receives only the approved network posture,
+  so a contract cannot discover too late that its verifier needed access it
+  was never authorized to use.
+- Worker execution and semantic completion are now distinct frozen routes.
+  Generic CLI agents can implement and pass the signed deterministic gate while
+  a schema-capable reviewer performs the final evidence judgment; every startup
+  and nested graph path preserves that reviewer choice. Provider diagnostics
+  resolve through the same runtime catalog and distinguish static readiness
+  from an explicit live check.
+- OpenCode 1.18.14 support now probes the actual `run` capability surface,
+  enables structured unattended execution, binds OpenCode's project selector
+  to DeadReckon's frozen worktree, and parses current usage and failure events.
+  All coding-agent prompts also publish the exact implementation-notes section
+  IDs enforced at completion, eliminating a hidden provider-neutral contract.
+
 ## 0.8.3 — Starts that recover — 2026-08-05
 
 - Guided `start` now treats done-contract drafting, deterministic validation,
