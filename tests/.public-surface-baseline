@@ -612,6 +612,7 @@ crate: deadreckon-runtime
   turn_loop::run_deterministic_gate_work_phase
   turn_loop::run_parent_repair_turn_loop
   turn_loop::run_turn_loop
+  turn_loop::run_turn_loop_with_semantic_router
   turn_loop::RunLoopConfig
   turn_loop::RunLoopDocsConfig
   turn_loop::RunLoopOutcome
