@@ -246,7 +246,8 @@ async fn create_orchestration_plan_with_persistence(
         plan.on_fail = OnFail::Stop;
     }
     plan.acceptance_path = acceptance_source.as_ref().map(|source| source.path.clone());
-    plan.capability_preview = infer_capability_preview(&plan.root_goal);
+    plan.capability_preview =
+        infer_capability_preview(&plan.root_goal, plan.acceptance_path.as_deref());
     let root_planner_accounting =
         commands::graph_job::root_planner_accounting(planner_accounting.as_ref());
     plan.root_planner_accounting = Some(root_planner_accounting.clone());
@@ -1075,7 +1076,10 @@ fn deterministic_plan_drafts(goal: &str, n: u8) -> Vec<PlannerDraft> {
         .collect()
 }
 
-fn infer_capability_preview(goal: &str) -> deadreckon_core::CapabilityPreview {
+fn infer_capability_preview(
+    goal: &str,
+    acceptance_path: Option<&Path>,
+) -> deadreckon_core::CapabilityPreview {
     let lower = goal.to_ascii_lowercase();
     let deploy = ["deploy", "vercel", "netlify", "production"]
         .iter()
@@ -1104,7 +1108,7 @@ fn infer_capability_preview(goal: &str) -> deadreckon_core::CapabilityPreview {
     ]
     .iter()
     .any(|needle| lower.contains(needle));
-    let network = if deploy || networked {
+    let inferred_network = if deploy || networked {
         deadreckon_core::NetworkCapability::Allowlist
     } else {
         deadreckon_core::NetworkCapability::Deny
@@ -1118,6 +1122,26 @@ fn infer_capability_preview(goal: &str) -> deadreckon_core::CapabilityPreview {
     if global_install {
         notes.push("goal mentions global install; require explicit capability".to_string());
     }
+    let contract_network = acceptance_path
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| deadreckon_core::gate::acceptance_capabilities_from_yaml(&raw).ok())
+        .map(|capabilities| capabilities.network);
+    let network = match contract_network {
+        Some(deadreckon_core::gate::AcceptanceNetworkAccess::Deny) => {
+            deadreckon_core::NetworkCapability::Deny
+        }
+        Some(deadreckon_core::gate::AcceptanceNetworkAccess::Loopback) => {
+            notes.push(
+                "done contract grants loopback only; outbound network remains denied".to_string(),
+            );
+            deadreckon_core::NetworkCapability::Allowlist
+        }
+        Some(deadreckon_core::gate::AcceptanceNetworkAccess::Full) => {
+            notes.push("done contract explicitly grants full gate network access".to_string());
+            deadreckon_core::NetworkCapability::Full
+        }
+        None => inferred_network,
+    };
     deadreckon_core::CapabilityPreview {
         network,
         deploy,
@@ -5896,6 +5920,31 @@ mod tests {
     use deadreckon_protocol::JobId;
 
     use super::*;
+
+    #[test]
+    fn graph_capability_preview_uses_the_accepted_contract_not_goal_keywords() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let contract = temp.path().join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "capabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"curl http://127.0.0.1:4173/health\"\n",
+        )
+        .expect("contract");
+
+        let preview = infer_capability_preview("build an offline desktop app", Some(&contract));
+
+        assert_eq!(
+            preview.network,
+            deadreckon_core::NetworkCapability::Allowlist
+        );
+        assert!(
+            preview
+                .notes
+                .iter()
+                .any(|note| note.contains("loopback only")),
+            "{preview:#?}"
+        );
+    }
 
     #[test]
     fn root_planner_uses_the_full_durable_remainder_or_standalone_default() {

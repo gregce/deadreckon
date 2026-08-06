@@ -182,6 +182,8 @@ pub(crate) struct CompiledCheck {
     pub(crate) summary: String,
     pub(crate) behavioral: bool,
     pub(crate) can_fail: bool,
+    #[serde(default)]
+    pub(crate) network_required: deadreckon_core::gate::AcceptanceNetworkAccess,
     pub(crate) raw: serde_json::Value,
 }
 
@@ -189,6 +191,8 @@ pub(crate) struct CompiledCheck {
 pub(crate) struct CompiledContract {
     pub(crate) name: String,
     pub(crate) md_criteria: String,
+    #[serde(default)]
+    pub(crate) capabilities: deadreckon_core::gate::AcceptanceCapabilities,
     pub(crate) checks: Vec<CompiledCheck>,
     pub(crate) source_path: PathBuf,
 }
@@ -197,9 +201,19 @@ pub(crate) struct CompiledContract {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum LintFinding {
     NoBehavioralCheck,
-    OnlySourceScanIsSubstantive { index: u32 },
-    IfPresentOnlyBuildOrTest { index: u32 },
-    UnfalsifiableCheck { index: u32 },
+    OnlySourceScanIsSubstantive {
+        index: u32,
+    },
+    IfPresentOnlyBuildOrTest {
+        index: u32,
+    },
+    UnfalsifiableCheck {
+        index: u32,
+    },
+    NetworkCapabilityMissing {
+        index: u32,
+        required: deadreckon_core::gate::AcceptanceNetworkAccess,
+    },
 }
 
 impl LintFinding {
@@ -215,6 +229,9 @@ impl LintFinding {
             Self::UnfalsifiableCheck { index } => {
                 format!("check {index} is not falsifiable")
             }
+            Self::NetworkCapabilityMissing { index, required } => format!(
+                "check {index} requires {required} network access but the contract does not grant it"
+            ),
         }
     }
 }
@@ -632,6 +649,7 @@ pub(crate) fn compile_contract_with_source(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .unwrap_or_else(|| acceptance_markdown_from_yaml(yaml));
+    let capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(yaml)?;
     let mut checks = Vec::new();
     for (group, value) in acceptance_check_groups(&root) {
         for item in yaml_items(value) {
@@ -645,6 +663,7 @@ pub(crate) fn compile_contract_with_source(
     Ok(CompiledContract {
         name,
         md_criteria,
+        capabilities,
         checks,
         source_path,
     })
@@ -657,12 +676,26 @@ fn compile_check(index: u32, group: &str, item: &serde_yaml::Value) -> CompiledC
     let command = yaml_mapping_get(item, "command").and_then(serde_yaml::Value::as_str);
     let behavioral = compiled_check_behavioral(&kind, command);
     let can_fail = compiled_check_can_fail(&kind, command);
+    let network_required = match kind {
+        CheckKind::Shell => command
+            .map(deadreckon_core::gate::infer_acceptance_network_access)
+            .unwrap_or_default(),
+        CheckKind::CargoTest => raw
+            .get("args")
+            .map(serde_json::Value::to_string)
+            .map(|args| deadreckon_core::gate::infer_acceptance_network_access(&args))
+            .unwrap_or_default(),
+        CheckKind::FileExists | CheckKind::ContentMatch => {
+            deadreckon_core::gate::AcceptanceNetworkAccess::Deny
+        }
+    };
     CompiledCheck {
         index,
         kind,
         summary,
         behavioral,
         can_fail,
+        network_required,
         raw,
     }
 }
@@ -832,6 +865,14 @@ pub(crate) fn lint_contract(contract: &CompiledContract) -> Vec<LintFinding> {
         .filter(|check| check_is_substantive(check) && !check.can_fail)
     {
         findings.push(LintFinding::UnfalsifiableCheck { index: check.index });
+    }
+    for check in &contract.checks {
+        if !contract.capabilities.network.allows(check.network_required) {
+            findings.push(LintFinding::NetworkCapabilityMissing {
+                index: check.index,
+                required: check.network_required,
+            });
+        }
     }
     findings
 }
@@ -1810,6 +1851,12 @@ The YAML must be valid deadreckon acceptance.yaml. Keep the existing durable sch
 - shell with command and optional cwd
 - cargo_test
 
+Declare environmental authority at the top level when a check needs networking:
+- `capabilities: {{ network: loopback }}` for local servers, sockets, localhost, 127.0.0.1, or ::1
+- `capabilities: {{ network: full }}` only when the accepted check must reach a live external service
+- omit capabilities (or use `network: deny`) when checks need no network
+Prefer a frozen local fixture over `network: full` whenever the result can be made deterministic. A networked product does not by itself grant network authority; an executable check must require it.
+
 Derive the contract from the Run goal, not only the acceptance request. The request refines the goal; it does not replace it.
 Prefer checks that execute the software and observe outputs: build, start the app, drive it through a headless browser, HTTP call, or CLI invocation, and assert on the result.
 Unit or integration checks must use known inputs -> known expected outputs.
@@ -1848,6 +1895,7 @@ fn validate_generated_acceptance_draft(draft: &AcceptanceDraft, inspect_root: &P
     use deadreckon_core::gate::AcceptanceCheck;
 
     let checks = deadreckon_core::gate::acceptance_checks_from_yaml(&draft.yaml)?;
+    let capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(&draft.yaml)?;
     let source_roots = absolute_source_root_spellings(inspect_root);
     let embeds_source_root = |value: &str| {
         source_roots
@@ -1904,6 +1952,26 @@ fn validate_generated_acceptance_draft(draft: &AcceptanceDraft, inspect_root: &P
             .any(|contents| embeds_source_root(contents))
     {
         return Err(generated_source_path_error());
+    }
+    let helper_network = draft.files.values().fold(
+        deadreckon_core::gate::AcceptanceNetworkAccess::Deny,
+        |required, contents| {
+            required.combine(deadreckon_core::gate::infer_acceptance_network_access(
+                contents,
+            ))
+        },
+    );
+    let yaml_network =
+        deadreckon_core::gate::required_acceptance_network_access_from_yaml(&draft.yaml)?;
+    let required_network = helper_network.combine(yaml_network);
+    if !capabilities.network.allows(required_network) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "generated done criteria require {required_network} network access but declare {}",
+                capabilities.network
+            ),
+            "regenerate the done criteria with capabilities.network set to loopback or full, or replace the live dependency with a frozen fixture",
+        )));
     }
     Ok(())
 }
@@ -2205,6 +2273,7 @@ pub(crate) async fn ensure_acceptance_before_start(
 ) -> Result<Option<AcceptanceSource>> {
     let existing = resolve_acceptance_source(cwd, override_path)?;
     if existing.is_some() || override_path.is_some() || skip_prompt || !io::stdin().is_terminal() {
+        validate_acceptance_source_capabilities(existing.as_ref())?;
         return Ok(existing);
     }
     println!("{}", ui_heading("done criteria"));
@@ -2220,7 +2289,7 @@ pub(crate) async fn ensure_acceptance_before_start(
     } else {
         request.trim().to_string()
     };
-    match acceptance_agent_command_in_dir(
+    let resolved = match acceptance_agent_command_in_dir(
         cwd,
         AcceptanceAgentMode::Draft,
         vec![request],
@@ -2251,7 +2320,22 @@ pub(crate) async fn ensure_acceptance_before_start(
             );
             resolve_acceptance_source(cwd, None).map(mark_generated_done_criteria)
         }
-    }
+    }?;
+    validate_acceptance_source_capabilities(resolved.as_ref())?;
+    Ok(resolved)
+}
+
+fn validate_acceptance_source_capabilities(source: Option<&AcceptanceSource>) -> Result<()> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let raw = fs::read_to_string(&source.path)?;
+    let markdown = source
+        .companion_doc
+        .as_ref()
+        .and_then(|path| fs::read_to_string(path).ok());
+    let contract = compile_contract_with_source(&raw, markdown.as_deref(), source.path.clone())?;
+    validate_compiled_contract_capabilities(&contract)
 }
 
 pub(crate) fn resolve_acceptance_source(
@@ -2340,7 +2424,64 @@ pub(crate) fn compiled_contract_for_selection(
         .companion_doc
         .as_ref()
         .and_then(|path| fs::read_to_string(path).ok());
-    compile_contract_with_source(&raw, md.as_deref(), path.clone()).map(Some)
+    let contract = compile_contract_with_source(&raw, md.as_deref(), path.clone())?;
+    validate_compiled_contract_capabilities(&contract)?;
+    Ok(Some(contract))
+}
+
+fn validate_compiled_contract_capabilities(contract: &CompiledContract) -> Result<()> {
+    let mut required = contract.checks.iter().fold(
+        deadreckon_core::gate::AcceptanceNetworkAccess::Deny,
+        |required, check| required.combine(check.network_required),
+    );
+    let helper_root = contract
+        .source_path
+        .parent()
+        .map(|parent| parent.join(PROJECT_ACCEPTANCE_HELPERS));
+    if let Some(helper_root) = helper_root.filter(|path| path.exists()) {
+        required = required.combine(helper_tree_network_requirement(&helper_root)?);
+    }
+    if contract.capabilities.network.allows(required) {
+        return Ok(());
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "done-contract helpers require {required} network access but the contract declares {}",
+            contract.capabilities.network
+        ),
+        "set capabilities.network to loopback or full before starting, or replace the live dependency with a frozen fixture",
+    )))
+}
+
+fn helper_tree_network_requirement(
+    path: &Path,
+) -> Result<deadreckon_core::gate::AcceptanceNetworkAccess> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("done-contract helper is a symlink: {}", path.display()),
+            "replace acceptance helper symlinks with regular files",
+        )));
+    }
+    if metadata.is_file() {
+        return Ok(fs::read_to_string(path)
+            .map(|contents| deadreckon_core::gate::infer_acceptance_network_access(&contents))
+            .unwrap_or_default());
+    }
+    if !metadata.is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done-contract helper is not a regular file: {}",
+                path.display()
+            ),
+            "remove special files from .deadreckon/acceptance",
+        )));
+    }
+    let mut required = deadreckon_core::gate::AcceptanceNetworkAccess::Deny;
+    for entry in fs::read_dir(path)? {
+        required = required.combine(helper_tree_network_requirement(&entry?.path())?);
+    }
+    Ok(required)
 }
 
 pub(crate) fn render_compiled_contract_lines(
@@ -2352,6 +2493,10 @@ pub(crate) fn render_compiled_contract_lines(
         contract.name,
         contract.source_path.display()
     )];
+    lines.push(format!(
+        "capabilities: network={}",
+        contract.capabilities.network
+    ));
     for check in &contract.checks {
         let behavior = if check.behavioral {
             "behavior"
@@ -2359,13 +2504,20 @@ pub(crate) fn render_compiled_contract_lines(
             "inspection"
         };
         let falsifiable = if check.can_fail { "can fail" } else { "weak" };
+        let network =
+            if check.network_required == deadreckon_core::gate::AcceptanceNetworkAccess::Deny {
+                String::new()
+            } else {
+                format!("; network={}", check.network_required)
+            };
         lines.push(format!(
-            "{}. {} [{}; {}; {}]",
+            "{}. {} [{}; {}; {}{}]",
             check.index,
             check.summary,
             check.kind.label(),
             behavior,
-            falsifiable
+            falsifiable,
+            network
         ));
     }
     if let Some(divergence) = divergence {
@@ -2424,7 +2576,8 @@ fn critic_floor_verdict(
         .filter_map(|finding| match finding {
             LintFinding::OnlySourceScanIsSubstantive { index }
             | LintFinding::IfPresentOnlyBuildOrTest { index }
-            | LintFinding::UnfalsifiableCheck { index } => Some(*index),
+            | LintFinding::UnfalsifiableCheck { index }
+            | LintFinding::NetworkCapabilityMissing { index, .. } => Some(*index),
             LintFinding::NoBehavioralCheck => None,
         })
         .collect::<Vec<_>>();
@@ -2924,7 +3077,7 @@ fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> AcceptanceDraft {
             "name: browser acceptance pack\nchecks:\n  - kind: shell\n    command: \"node .deadreckon/acceptance/browser-smoke.mjs\"\n    cwd: \"{working_dir}\"\n"
         }
         AcceptancePack::Playwright => {
-            "name: playwright acceptance pack\nchecks:\n  - kind: shell\n    command: \"npm run build --if-present && (npm run preview --if-present -- --host 127.0.0.1 > .deadreckon/acceptance/preview.log 2>&1 & pid=$!; trap 'kill $pid 2>/dev/null || true' EXIT; sleep 3; DEADRECKON_BASE_URL=${DEADRECKON_BASE_URL:-http://127.0.0.1:4173} npx --yes playwright test .deadreckon/acceptance/playwright-smoke.spec.mjs --reporter=line)\"\n    cwd: \"{working_dir}\"\n"
+            "name: playwright acceptance pack\ncapabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"npm run build --if-present && (npm run preview --if-present -- --host 127.0.0.1 > .deadreckon/acceptance/preview.log 2>&1 & pid=$!; trap 'kill $pid 2>/dev/null || true' EXIT; sleep 3; DEADRECKON_BASE_URL=${DEADRECKON_BASE_URL:-http://127.0.0.1:4173} npx --yes playwright test .deadreckon/acceptance/playwright-smoke.spec.mjs --reporter=line)\"\n    cwd: \"{working_dir}\"\n"
         }
         AcceptancePack::Vite => {
             "name: vite acceptance pack\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/package.json\"\n  - kind: shell\n    command: \"npm run build --if-present\"\n    cwd: \"{working_dir}\"\n  - kind: shell\n    command: \"node .deadreckon/acceptance/browser-smoke.mjs dist\"\n    cwd: \"{working_dir}\"\n"
@@ -3096,6 +3249,10 @@ fn acceptance_markdown_from_yaml(raw: &str) -> String {
 
 fn print_acceptance_yaml_summary(raw: &str) -> Result<()> {
     let root = acceptance_yaml_value(raw)?;
+    let capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(raw)?;
+    println!("{}", ui_heading("capabilities"));
+    println!("  network: {}", capabilities.network);
+    println!();
     println!("{}", ui_heading("checks"));
     for line in acceptance_summary_lines(&root) {
         println!("  {line}");
@@ -3188,6 +3345,7 @@ pub(crate) fn acceptance_check_count(raw: &str) -> Result<usize> {
 
 fn validate_acceptance_yaml_integrity(raw: &str) -> Result<()> {
     let checks = deadreckon_core::gate::acceptance_checks_from_yaml(raw)?;
+    let capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(raw)?;
     let findings = deadreckon_core::tamper::lint_checks(&checks);
     if let Some(finding) = findings.first() {
         return Err(CliError::Core(deadreckon_core::user_error(
@@ -3196,6 +3354,17 @@ fn validate_acceptance_yaml_integrity(raw: &str) -> Result<()> {
                 finding.pattern, finding.check_kind
             ),
             "deadreckon def-done \"what should count as done\" and remove the suppression; checks must fail honestly",
+        )));
+    }
+    let required_network =
+        deadreckon_core::gate::required_acceptance_network_access_from_yaml(raw)?;
+    if !capabilities.network.allows(required_network) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "done criteria require {required_network} network access but declare {}",
+                capabilities.network
+            ),
+            "set capabilities.network to loopback or full, or replace the live dependency with a frozen fixture",
         )));
     }
     Ok(())
@@ -4020,6 +4189,30 @@ let package = Package(
     }
 
     #[test]
+    fn acceptance_prompt_teaches_explicit_loopback_and_full_authority() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "verify the networked behavior",
+            Some("build a local client and server"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("capabilities: { network: loopback }"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("capabilities: { network: full }"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Prefer a frozen local fixture"), "{prompt}");
+    }
+
+    #[test]
     fn lint_flags_contract_with_no_behavioral_check() {
         let contract = compile(
             r#"
@@ -4084,6 +4277,82 @@ checks:
         );
 
         assert!(lint_contract(&contract).is_empty(), "{contract:#?}");
+    }
+
+    #[test]
+    fn compiler_requires_network_authority_and_surfaces_the_accepted_mode() {
+        let missing = compile(
+            r#"
+name: local protocol
+checks:
+  - kind: shell
+    command: "python3 .deadreckon/acceptance/socket_probe.py --host 127.0.0.1"
+    cwd: "{working_dir}"
+"#,
+        );
+        assert!(lint_contract(&missing).iter().any(|finding| matches!(
+            finding,
+            LintFinding::NetworkCapabilityMissing {
+                index: 1,
+                required: deadreckon_core::gate::AcceptanceNetworkAccess::Loopback,
+            }
+        )));
+
+        let approved = compile(
+            r#"
+name: local protocol
+capabilities:
+  network: loopback
+checks:
+  - kind: shell
+    command: "python3 .deadreckon/acceptance/socket_probe.py --host 127.0.0.1"
+    cwd: "{working_dir}"
+"#,
+        );
+        assert_eq!(
+            approved.capabilities.network,
+            deadreckon_core::gate::AcceptanceNetworkAccess::Loopback
+        );
+        assert!(
+            !lint_contract(&approved)
+                .iter()
+                .any(|finding| matches!(finding, LintFinding::NetworkCapabilityMissing { .. }))
+        );
+        let rendered = render_compiled_contract_lines(&approved, None).join("\n");
+        assert!(
+            rendered.contains("capabilities: network=loopback"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("network=loopback"), "{rendered}");
+    }
+
+    #[test]
+    fn compiler_preflight_inspects_helper_files_before_start_can_mutate_services() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let contract_path = temp.path().join("acceptance.yaml");
+        let helper_dir = temp.path().join("acceptance");
+        fs::create_dir_all(&helper_dir).expect("helper dir");
+        fs::write(
+            helper_dir.join("probe.py"),
+            "import urllib.request\nurllib.request.urlopen('https://example.com/fixture')\n",
+        )
+        .expect("helper");
+        let raw =
+            "name: helper\nchecks:\n  - kind: shell\n    command: python3 acceptance/probe.py\n";
+        let contract =
+            compile_contract_with_source(raw, None, contract_path.clone()).expect("compile");
+
+        let error = validate_compiled_contract_capabilities(&contract)
+            .expect_err("helper requirement must fail during compilation");
+        assert!(error.to_string().contains("require full"), "{error}");
+
+        let approved = compile_contract_with_source(
+            "name: helper\ncapabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: python3 acceptance/probe.py\n",
+            None,
+            contract_path,
+        )
+        .expect("approved compile");
+        validate_compiled_contract_capabilities(&approved).expect("matching helper capability");
     }
 
     #[test]

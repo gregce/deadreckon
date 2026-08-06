@@ -3615,6 +3615,12 @@ fn start_launch_preview_rows(
     paths: &DeadreckonPaths,
 ) -> Result<Vec<(String, String)>> {
     let mut rows = launch_preview_rows(&start_launch_preview_facts(decision));
+    if let Some(contract) = decision.done_contract.as_ref() {
+        rows.push((
+            "done network".to_string(),
+            contract.capabilities.network.to_string(),
+        ));
+    }
     if start_done_materialization_request(decision).is_some()
         && let Some(source) = decision.resolved_source.as_ref()
     {
@@ -3704,6 +3710,7 @@ fn start_preview_primary_action(decision: &StartLaunchDecision) -> String {
 
 fn start_done_contract_json(decision: &StartLaunchDecision) -> serde_json::Value {
     json!({
+        "capabilities": decision.done_contract.as_ref().map(|contract| contract.capabilities),
         "checks": decision.done_contract.as_ref().map(|contract| &contract.checks),
         "divergence": decision.done_divergence,
     })
@@ -4339,6 +4346,11 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .as_ref()
             .map(DateTime::to_rfc3339)
             .unwrap_or_else(|| "none".to_string());
+        let done_network_label = decision
+            .done_contract
+            .as_ref()
+            .map(|contract| contract.capabilities.network.to_string())
+            .unwrap_or_else(|| "deny".to_string());
         let mut rows: Vec<(&str, &str)> = vec![
             ("goal", decision.goal.as_str()),
             ("mode", mode),
@@ -4351,6 +4363,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         rows.extend([
             ("provider", decision.provider_label.as_str()),
             ("done", decision.done_criteria_label.as_str()),
+            ("done network", done_network_label.as_str()),
             ("workspace", decision.source_mode_label.as_str()),
             ("seams", seam_label.as_str()),
             ("deadline", deadline_label.as_str()),
@@ -6118,9 +6131,11 @@ checks:
         let contract = contract(
             r#"
 name: behavior
+capabilities:
+  network: loopback
 checks:
   - kind: shell
-    command: "npm run build && node .deadreckon/acceptance/realtime-dashboard.mjs"
+    command: "npm run build && curl http://127.0.0.1:4173/health"
     cwd: "{working_dir}"
 "#,
         );
@@ -6130,6 +6145,7 @@ checks:
         let value = start_done_contract_json(&decision);
 
         assert!(value.get("checks").is_some(), "{value}");
+        assert_eq!(value["capabilities"]["network"], "loopback");
         assert!(value.get("divergence").is_some(), "{value}");
     }
 }
