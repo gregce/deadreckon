@@ -119,6 +119,7 @@ pub(crate) struct ProviderSetupSelection {
     pub source: SetupProviderSource,
     pub kind: Option<String>,
     pub credential: Option<String>,
+    pub binary: Option<String>,
     pub install_hint: Option<String>,
     pub warnings: Vec<String>,
     pub try_lines: Vec<String>,
@@ -133,6 +134,7 @@ impl ProviderSetupSelection {
             source: SetupProviderSource::None,
             kind: None,
             credential: None,
+            binary: None,
             install_hint: None,
             warnings: Vec::new(),
             try_lines: Vec::new(),
@@ -274,6 +276,7 @@ fn selection_for_route(
             .map(|descriptor| descriptor_kind_label(&descriptor.kind).to_string())
             .or_else(|| route.as_ref().map(|route| provider_kind_label(&route.kind))),
         credential: Some(provider_credential_label(descriptor, route.as_ref())),
+        binary: route.as_ref().and_then(|route| route.executable.clone()),
         install_hint: descriptor.and_then(first_install_hint),
         warnings: Vec::new(),
         try_lines: Vec::new(),
@@ -320,8 +323,8 @@ fn selection_for_route(
         && let Some(descriptor) = descriptor
         && descriptor.kind == DescriptorKind::Cli
         && let Some(probe) = descriptor.auth_probe.as_ref()
-        && let Some(binary) = cli_binary_for(config_path, selection.provider.as_deref(), descriptor)
-        && let CliAuthStatus::NotLoggedIn { detail } = probe_cli_auth(&binary, probe)
+        && let Some(binary) = selection.binary.as_deref()
+        && let CliAuthStatus::NotLoggedIn { detail } = probe_cli_auth(binary, probe)
     {
         let provider_label = selection
             .provider
@@ -338,23 +341,6 @@ fn selection_for_route(
         });
     }
     Ok(selection)
-}
-
-/// The binary a CLI route will actually execute: config override first, then
-/// the descriptor default.
-fn cli_binary_for(
-    config_path: &Path,
-    provider: Option<&str>,
-    descriptor: &ProviderDescriptor,
-) -> Option<String> {
-    let configured = provider.and_then(|provider| {
-        read_config(config_path)
-            .ok()?
-            .providers
-            .get(provider)
-            .and_then(|entry| entry.binary.clone())
-    });
-    configured.or_else(|| descriptor.default_binary.clone())
 }
 
 fn provider_candidate<'a>(
@@ -398,7 +384,7 @@ fn provider_route_exists(config_path: &Path, registry: &ProviderRegistry, provid
             .is_some_and(|config| config.providers.contains_key(provider))
 }
 
-fn route_info_for_provider(
+pub(crate) fn route_info_for_provider(
     config_path: &Path,
     provider: Option<&str>,
     model: Option<&str>,

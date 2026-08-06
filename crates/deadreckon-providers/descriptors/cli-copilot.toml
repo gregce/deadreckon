@@ -14,7 +14,7 @@ subscription = true
 kind = "subscription"
 
 [version_probe]
-args = ["--help"]
+args = ["--version"]
 expect_substring = "GitHub Copilot CLI"
 
 [exec_template]

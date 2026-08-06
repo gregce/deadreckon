@@ -608,16 +608,29 @@ pub fn parse_custom_command(command: &str) -> Result<(String, Vec<String>)> {
 
 impl ProviderProbe for ProviderDescriptor {
     fn probe<'a>(&'a self, options: ProviderProbeOptions) -> ProviderProbeFuture<'a> {
-        Box::pin(async move { probe_descriptor(self, options).await })
+        Box::pin(async move { probe_descriptor(self, options, None).await })
+    }
+}
+
+impl ProviderDescriptor {
+    /// Probe the executable selected by the runtime route rather than
+    /// independently falling back to the descriptor default.
+    pub fn probe_with_executable<'a>(
+        &'a self,
+        options: ProviderProbeOptions,
+        executable: Option<&'a str>,
+    ) -> ProviderProbeFuture<'a> {
+        Box::pin(async move { probe_descriptor(self, options, executable).await })
     }
 }
 
 async fn probe_descriptor(
     descriptor: &ProviderDescriptor,
     options: ProviderProbeOptions,
+    executable: Option<&str>,
 ) -> ProviderProbeResult {
     match descriptor.kind {
-        DescriptorKind::Cli => probe_cli_descriptor(descriptor).await,
+        DescriptorKind::Cli => probe_cli_descriptor(descriptor, executable).await,
         DescriptorKind::Http => probe_http_descriptor(descriptor, options).await,
         DescriptorKind::LocalHttp => probe_local_http_descriptor(descriptor, options).await,
         DescriptorKind::Scripted => base_probe_result(
@@ -632,8 +645,11 @@ async fn probe_descriptor(
     }
 }
 
-async fn probe_cli_descriptor(descriptor: &ProviderDescriptor) -> ProviderProbeResult {
-    let Some(binary) = descriptor.default_binary.as_deref() else {
+async fn probe_cli_descriptor(
+    descriptor: &ProviderDescriptor,
+    executable: Option<&str>,
+) -> ProviderProbeResult {
+    let Some(binary) = executable.or(descriptor.default_binary.as_deref()) else {
         return base_probe_result(
             descriptor,
             ProbeStatus::Failed,

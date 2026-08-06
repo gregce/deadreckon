@@ -1,5 +1,22 @@
 use super::super::*;
 
+async fn probe_provider_route(
+    paths: &DeadreckonPaths,
+    descriptor: &ProviderDescriptor,
+    options: ProviderProbeOptions,
+) -> Result<ProviderProbeResult> {
+    let executable = if descriptor.kind == DescriptorKind::Cli {
+        setup::route_info_for_provider(&paths.config_path(), Some(&descriptor.id), None)
+            .map_err(CliError::Provider)?
+            .and_then(|route| route.executable)
+    } else {
+        None
+    };
+    Ok(descriptor
+        .probe_with_executable(options, executable.as_deref())
+        .await)
+}
+
 pub(crate) async fn detect_command(
     id: Option<String>,
     json_output: bool,
@@ -17,9 +34,13 @@ pub(crate) async fn detect_command(
                 "deadreckon providers list",
             )));
         };
-        vec![descriptor.probe(options).await]
+        vec![probe_provider_route(&paths, descriptor, options).await?]
     } else {
-        registry.probe_all(options).await
+        let mut results = Vec::new();
+        for descriptor in registry.iter() {
+            results.push(probe_provider_route(&paths, descriptor, options).await?);
+        }
+        results
     };
     let surface = detect_verdict_surface(&results, requested_id.as_deref());
     if json_output {
@@ -68,7 +89,8 @@ async fn providers_check_command(id: &str, json_output: bool) -> Result<()> {
             "deadreckon providers list --all",
         )));
     };
-    let result = descriptor.probe(ProviderProbeOptions { ping: false }).await;
+    let result =
+        probe_provider_route(&paths, descriptor, ProviderProbeOptions { ping: false }).await?;
     let results = vec![result];
     let warnings = descriptor.warnings.clone();
     let surface = detect_verdict_surface(&results, Some(id));
@@ -822,7 +844,10 @@ async fn providers_list_command(
     let mut missing = Vec::new();
     for id in ids {
         if let Some(descriptor) = registry.get(&id) {
-            results.push(descriptor.probe(ProviderProbeOptions { ping: false }).await);
+            results.push(
+                probe_provider_route(&paths, descriptor, ProviderProbeOptions { ping: false })
+                    .await?,
+            );
         } else {
             missing.push(id);
         }

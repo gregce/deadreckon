@@ -513,6 +513,15 @@ try_lines = ["install local-test"]
     let router =
         ProviderRouter::from_config_path_with_model(&config_path, None, Some("local-model"))
             .expect("router");
+    assert_eq!(
+        router
+            .selected_route_info()
+            .expect("selected route")
+            .executable
+            .as_deref(),
+        Some(binary.to_str().expect("binary path")),
+        "diagnostics must observe the exact executable runtime constructed"
+    );
     let response = router
         .complete(&ProviderRequest {
             prompt: "make notes".to_string(),
