@@ -214,6 +214,8 @@ enum CliError {
     #[error(transparent)]
     Core(#[from] DeadreckonError),
     #[error(transparent)]
+    DoneAuthoring(#[from] commands::acceptance::DoneAuthoringFailure),
+    #[error(transparent)]
     Provider(#[from] deadreckon_providers::ProviderError),
     #[error(transparent)]
     Sandbox(#[from] deadreckon_sandbox::SandboxError),
@@ -540,6 +542,7 @@ impl CliError {
             Self::Exit { code, .. } => *code,
             Self::Surface { code, .. } => *code,
             Self::Core(_)
+            | Self::DoneAuthoring(_)
             | Self::Provider(_)
             | Self::Sandbox(_)
             | Self::Io(_)
@@ -555,6 +558,7 @@ fn error_hint(err: &CliError) -> String {
     let hint = match err {
         CliError::Exit { hint, .. } => hint.clone(),
         CliError::Surface { .. } => String::new(),
+        CliError::DoneAuthoring(_) => String::new(),
         CliError::Provider(deadreckon_providers::ProviderError::MissingCredential(_))
         | CliError::Provider(deadreckon_providers::ProviderError::NoRoute(_)) => {
             "deadreckon try; then deadreckon config provider cli:codex".to_string()

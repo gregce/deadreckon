@@ -3758,22 +3758,33 @@ The whole authoring sequence shares one wall deadline. The default is 1,200
 seconds, configurable as `defaults.done_contract_max_wall_seconds` and clamped
 to 1,200–3,600 seconds. Guided `start` also clamps it to an earlier explicit Job
 deadline and gives goal-shape planning, draft, critic and optional redraft the
-same cumulative automated-work allowance. Each phase may use whatever provider
-time remains when it starts; there are no phase-local ceilings or reserved
-slices, and no retry resets the clock. Operator prompts pause this active-work
-allowance; an explicit calendar deadline does not. Capability probing and active
-provider work consume the allowance. Cancellation then receives one bounded
-30-second grace to terminate and reap the provider's full owned process group;
-unproven cleanup blocks admission and retains the PID evidence. The wait surface
-reports stage, provider/model and cumulative elapsed/limit; it is not the
-timeout mechanism.
+same cumulative automated-work allowance. Goal-shape planning is additionally
+bounded by its 300-second CLI or 120-second non-CLI route cap; it cannot consume
+the whole 1,200-second allowance merely because the admission deadline is
+longer. Draft, critic and redraft may use whatever cumulative remainder exists
+when each starts, with no reserved stage slices. A retry never resets this clock
+implicitly. When the allowance is exhausted, guided recovery may offer one
+explicitly labelled, operator-authorized authoring attempt with a new bounded
+allowance, but only while the absolute calendar deadline still permits work.
+Operator prompts pause the automated-work allowance; an explicit calendar
+deadline does not. Capability probing and active provider work consume the
+allowance. Cancellation then receives one bounded 30-second grace to terminate
+and reap the provider's full owned process group; unproven cleanup blocks
+admission and retains the PID evidence. The wait surface reports stage,
+provider/model and cumulative elapsed/limit; it is not the timeout mechanism.
 
 The deterministic lint remains the floor. A provider cannot override a
 deterministic `redraft`. Critic timeout can expose a lint-clean candidate only
 for explicit human review; strict/non-interactive admission refuses. Redraft
 receives the complete prior YAML, Markdown, helper bodies, dossier, lint and
 normalized verdict. `reject` is an alias for `redraft` and retains its arrays.
-There is still at most one critic and one redraft. A timed-out or invalid weak
+There is still at most one critic and one redraft per attempt. A failed final
+floor is a typed `RevisionRequired` outcome that prints the exact uncovered goal
+clauses and lint findings. Guided recovery offers revision rather than a blind
+retry, keeps the rejected candidate in memory, and supplies that candidate and
+its findings to the next explicitly authorized attempt. Budget, configuration
+and lost-containment outcomes expose different legal actions; an expired
+absolute deadline offers no impossible retry. A timed-out or invalid weak
 candidate is never written as approved. A valid generated contract already on
 disk is ordinary project state and is reused on retry without another provider
 call.
@@ -4978,9 +4989,12 @@ adapters fail closed. Immutable capability probes are cached per binary/version.
 Goal-shape planning, draft, critic and optional redraft share a 1,200-second
 default automated admission-work allowance during guided start. Every automated
 phase inherits the same cumulative remainder; there are no reserved stage slices
-or fresh retry clocks. Operator prompts pause this active-work allowance rather
-than silently spending provider time. An explicit calendar deadline continues
-to advance through prompts and can shorten the window. The config key
+or implicit fresh retry clocks. Operator prompts pause this active-work allowance
+rather than silently spending provider time. An explicit calendar deadline
+continues to advance through prompts and can shorten the window. Once the
+allowance is empty, guided start offers a new attempt only as an explicit
+operator authorization, and that attempt remains bounded by both configuration
+and the unchanged calendar deadline. The config key
 `defaults.done_contract_max_wall_seconds` is clamped to 1,200–3,600 seconds, so
 legacy 120-second defaults are lifted automatically.
 Timeout or cancellation terminates and reaps the whole provider
@@ -4990,12 +5004,12 @@ lint-clean draft may proceed to explicit human review. Redraft receives the full
 prior candidate, helpers, dossier, lint and verdict. `reject` normalizes to
 `redraft`; one critic and one redraft remain the ceiling.
 
-Standalone shape planning retains a route safety limit, but guided start uses
-the shared admission cutoff. Expiry explicitly cancels the provider and allows
-up to 30 seconds to prove cleanup before deterministic fallback. Cleanup is
-outside active model work and never extends the Job cutoff. If cleanup cannot
-be proven, DeadReckon retains its PID authority and reports the unresolved
-process instead of deleting the evidence.
+Shape planning always uses the earlier of its route safety limit and the shared
+admission cutoff. Expiry explicitly cancels the provider and allows up to 30
+seconds to prove cleanup before deterministic fallback. Cleanup is outside
+active model work and never extends the Job cutoff. If cleanup cannot be proven,
+DeadReckon retains its PID authority and reports the unresolved process instead
+of deleting the evidence.
 
 ### 59.5 Compatibility and proof boundary
 
