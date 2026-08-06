@@ -1,8 +1,7 @@
 use super::super::*;
 use deadreckon_core::install_receipt::{Channel, detect_channel};
 use deadreckon_providers::{
-    CliAuthStatus, ProviderCleanup, ProviderPhaseDeadline, ProviderPhaseOutcome,
-    complete_provider_phase, probe_cli_auth,
+    ProviderCleanup, ProviderPhaseDeadline, ProviderPhaseOutcome, complete_provider_phase,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -1103,89 +1102,58 @@ async fn collect_doctor_provider_findings(
     };
     let registry = ProviderRegistry::with_overrides(paths.home())?;
     let mut findings = Vec::new();
-    for (name, entry) in providers {
-        let kind = entry
-            .get("kind")
-            .and_then(toml::Value::as_str)
-            .unwrap_or(name);
-        let kind_label = registry
-            .get(name)
+    for name in providers.keys() {
+        let descriptor = registry.get(name);
+        let kind_label = descriptor
             .map(|descriptor| descriptor_kind_label(&descriptor.kind).to_string())
-            .unwrap_or_else(|| config_provider_kind_label(kind).to_string());
+            .unwrap_or_else(|| "unknown".to_string());
         let subject = format!("provider {name} kind={kind_label}");
-        if kind.contains("cli") || name.starts_with("cli:") {
-            let binary = entry
-                .get("binary")
-                .and_then(toml::Value::as_str)
-                .unwrap_or_else(|| {
-                    if name.contains("claude") {
-                        "claude"
-                    } else {
-                        "codex"
-                    }
-                });
-            if command_exists(binary) || PathBuf::from(binary).exists() {
-                // Presence says "installed", the auth probe says "usable":
-                // surface installed-but-logged-out here instead of mid-run.
-                let probe_status = registry
-                    .get(name)
-                    .and_then(|descriptor| descriptor.auth_probe.as_ref())
-                    .map(|probe| (probe, probe_cli_auth(binary, probe)));
-                match probe_status {
-                    Some((_, CliAuthStatus::LoggedIn)) => {
-                        findings.push(DoctorFinding::passed(
-                            subject,
-                            format!("CLI binary {binary} found; logged in"),
-                            Some(format!(
-                                "deadreckon run \"goal\" --provider {name} --preview"
-                            )),
-                        ));
-                    }
-                    Some((probe, CliAuthStatus::NotLoggedIn { detail })) => {
-                        findings.push(DoctorFinding::failed(
-                            subject,
-                            format!("CLI binary {binary} installed but not logged in ({detail})"),
-                            probe
-                                .login_try_lines
-                                .first()
-                                .cloned()
-                                .or_else(|| Some("deadreckon config provider".to_string())),
-                        ));
-                    }
-                    _ => {
-                        findings.push(DoctorFinding::passed(
-                            subject,
-                            format!("CLI binary {binary} found"),
-                            Some(format!(
-                                "deadreckon run \"goal\" --provider {name} --preview"
-                            )),
-                        ));
-                    }
-                }
-            } else {
+        let selection = setup::select_provider_setup(
+            &paths.config_path(),
+            &registry,
+            setup::ProviderSetupRequest {
+                role: setup::SetupProviderRoleRef::ConfigDefault,
+                explicit_provider: Some(name),
+                explicit_model: None,
+                config_default_provider: None,
+                config_doc_provider: None,
+                run_provider: None,
+                auto_subscription_provider: None,
+                built_in_default_provider: None,
+                use_router_default: false,
+                allow_auto_subscription: false,
+                require_usable_route: true,
+            },
+        );
+        let selection = match selection {
+            Ok(selection) => selection,
+            Err(refusal) => {
                 findings.push(DoctorFinding::failed(
                     subject,
-                    format!("CLI binary {binary} missing"),
-                    Some("deadreckon config provider".to_string()),
+                    refusal.message,
+                    Some(refusal.try_line),
                 ));
+                continue;
             }
-        } else if provider_has_key(entry) {
-            if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
-                findings.push(collect_doctor_provider_ping(paths, name, &kind_label).await?);
-            } else {
-                findings.push(DoctorFinding::passed(
-                    subject,
-                    "credential present; ping skipped",
-                    Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
-                ));
-            }
-        } else {
-            findings.push(DoctorFinding::failed(
+        };
+
+        if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
+            findings.push(collect_doctor_provider_ping(paths, name, &kind_label).await?);
+            continue;
+        }
+
+        if descriptor.is_some_and(|descriptor| descriptor.kind == DescriptorKind::Cli) {
+            let binary = selection.binary.as_deref().unwrap_or("unknown");
+            findings.push(DoctorFinding::passed(
                 subject,
-                "credential missing",
-                Some(format!(
-                    "deadreckon config set providers.{name}.api_key <KEY>"
-                )),
+                format!("CLI binary {binary} found; launch preflight passed"),
+                Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
+            ));
+        } else {
+            findings.push(DoctorFinding::passed(
+                subject,
+                "credential present; ping skipped",
+                Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
             ));
         }
     }
@@ -1393,33 +1361,6 @@ fn seam_command_basename(command: &[String]) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("-")
         .to_string()
-}
-
-fn config_provider_kind_label(kind: &str) -> &'static str {
-    let kind = kind.to_ascii_lowercase();
-    if kind.contains("cli") {
-        "cli"
-    } else if kind.contains("compatible") || kind.contains("local") {
-        "local-http"
-    } else if kind.contains("smoke") || kind.contains("script") {
-        "scripted"
-    } else if kind.contains("anthropic") || kind.contains("open-ai") || kind.contains("openai") {
-        "http"
-    } else {
-        "custom"
-    }
-}
-
-fn provider_has_key(entry: &toml::Value) -> bool {
-    entry
-        .get("api_key")
-        .and_then(toml::Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-        || entry
-            .get("api_key_env")
-            .and_then(toml::Value::as_str)
-            .and_then(std::env::var_os)
-            .is_some()
 }
 
 fn command_version(path: &std::path::Path) -> Option<String> {

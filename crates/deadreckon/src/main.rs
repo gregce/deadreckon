@@ -91,8 +91,8 @@ use deadreckon_protocol::{
     FlightEvent, FlightEventKind, RunEvent, RunEventKind, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::registry::{
-    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus, ProviderProbe,
-    ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
+    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus,
+    ProviderDescriptor, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
 };
 use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
@@ -3918,6 +3918,7 @@ mod provider_setup_row_tests {
             source: setup::SetupProviderSource::Flag,
             kind: Some("subscription-cli".to_string()),
             credential: Some("missing".to_string()),
+            binary: None,
             install_hint: None,
             warnings: vec![
                 "provider cli:codex needs credentials or an installed binary".to_string(),

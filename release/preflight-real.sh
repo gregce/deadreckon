@@ -22,7 +22,7 @@ fi
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 deadreckon_bin=${DEADRECKON_BIN:-"$repo_root/target/release/deadreckon"}
-known_good="$repo_root/release/known-good-providers.json"
+known_good=${PREFLIGHT_KNOWN_GOOD:-"$repo_root/release/known-good-providers.json"}
 release_trust="$repo_root/release/trust/release-trust.mjs"
 goal="make purpose.sh print exactly: DeadReckon provider preflight fixture"
 operator=${USER:-unknown}
@@ -86,8 +86,11 @@ binary_for_route() {
   case "$1" in
     cli:claude-code) echo "claude" ;;
     cli:codex) echo "codex" ;;
+    cli:codex-server) echo "codex" ;;
     cli:gemini) echo "gemini" ;;
+    cli:opencode) echo "opencode" ;;
     cli:copilot) echo "copilot" ;;
+    cli:pi) echo "pi" ;;
     *) echo "" ;;
   esac
 }
