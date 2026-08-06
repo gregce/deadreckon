@@ -2875,7 +2875,7 @@ fn run_skill_text(state: &PipelineState) -> String {
 
 fn implementation_notes_contract() -> String {
     format!(
-        "Implement the SPEC in the working directory.\n\nAs you work, maintain {IMPLEMENTATION_NOTES_HTML} at the working-directory root. Keep it current with anything the owner should know about how the implementation interprets or diverges from the spec:\n- Design decisions: choices made where the spec was ambiguous.\n- Deviations: intentional departures from the spec, with reasons.\n- Tradeoffs: alternatives considered and why the chosen path won.\n- Open questions: anything the owner should confirm or revise.\n\nBefore reporting done, update {IMPLEMENTATION_NOTES_HTML} after the latest documentable code/config/test/doc change. The run docs render the same content into RUN-DECISIONS.md, which is the published Markdown ledger."
+        "Implement the SPEC in the working directory.\n\nAs you work, maintain {IMPLEMENTATION_NOTES_HTML} at the working-directory root. Keep it current with anything the owner should know about how the implementation interprets or diverges from the spec. Preserve these exact section IDs and headings because deadreckon uses them to render the published decision ledger:\n- <section id=\"design-decisions\"> with heading Design decisions: choices made where the spec was ambiguous.\n- <section id=\"deviations\"> with heading Deviations: intentional departures from the spec, with reasons.\n- <section id=\"tradeoffs\"> with heading Tradeoffs: alternatives considered and why the chosen path won.\n- <section id=\"open-questions\"> with heading Open questions: anything the owner should confirm or revise.\n\nBefore reporting done, update {IMPLEMENTATION_NOTES_HTML} after the latest documentable code/config/test/doc change. The run docs render the same content into RUN-DECISIONS.md, which is the published Markdown ledger."
     )
 }
 
@@ -4217,7 +4217,7 @@ fn implementation_notes_ready_or_request_followup(
         },
     )?;
     history.push(format!(
-        "implementation notes are required before done: {reason}. Update {IMPLEMENTATION_NOTES_HTML} with Design decisions, Deviations, Tradeoffs, and Open questions, then report done again."
+        "implementation notes are required before done: {reason}. Update {IMPLEMENTATION_NOTES_HTML} with <section id=\"design-decisions\"> / Design decisions, <section id=\"deviations\"> / Deviations, <section id=\"tradeoffs\"> / Tradeoffs, and <section id=\"open-questions\"> / Open questions, then report done again."
     ));
     Ok(false)
 }
@@ -4233,7 +4233,8 @@ fn implementation_notes_try_line(
             IMPLEMENTATION_NOTES_HTML
         ),
         ImplementationNotesStatus::MissingSections(_) => {
-            "add Design decisions, Deviations, Tradeoffs, and Open questions sections".to_string()
+            "restore exact implementation-notes section IDs: design-decisions, deviations, tradeoffs, open-questions"
+                .to_string()
         }
         ImplementationNotesStatus::Stale { .. } => {
             format!(
@@ -7640,9 +7641,9 @@ mod tests {
         capture_trusted_turn_head_bounded, changed_files_since_snapshot,
         classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
         complete_verification, deliverable_changed_files, ensure_sandbox_toml,
-        event_sink_must_stop, fail_verification, implementation_notes_ready_or_request_followup,
-        is_direct_api_provider_kind, load_or_reconstruct_history,
-        load_tool_policy_from_sandbox_toml, load_trusted_git_control,
+        event_sink_must_stop, fail_verification, implementation_notes_contract,
+        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
+        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, persist_parent_repair_candidate, persist_work_boundary,
         policy_seam_refusal, policy_seam_refusal_message, promote_if_ready,
         provider_failure_disposition, provider_output_name, read_turn_codebase_record,
@@ -9439,6 +9440,14 @@ fallback_context_window = 80
         assert!(prompt.contains("Implement the SPEC"), "{prompt}");
         assert!(prompt.contains("implementation-notes.html"), "{prompt}");
         assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
+        for id in [
+            "design-decisions",
+            "deviations",
+            "tradeoffs",
+            "open-questions",
+        ] {
+            assert!(prompt.contains(id), "missing {id} in {prompt}");
+        }
         assert!(
             prompt
                 .trim_end()
@@ -9469,6 +9478,17 @@ fallback_context_window = 80
         assert!(prompt.contains("Implement the SPEC"), "{prompt}");
         assert!(prompt.contains("implementation-notes.html"), "{prompt}");
         assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
+        for id in [
+            "design-decisions",
+            "deviations",
+            "tradeoffs",
+            "open-questions",
+        ] {
+            assert!(prompt.contains(id), "missing {id} in {prompt}");
+        }
+        let fallback = implementation_notes_contract();
+        assert!(fallback.contains("id=\"design-decisions\""));
+        assert!(fallback.contains("id=\"open-questions\""));
     }
 
     #[test]
@@ -9512,6 +9532,18 @@ fallback_context_window = 80
             .expect("notes check");
         assert!(!ready);
         assert!(history[0].contains("implementation notes are required"));
+
+        std::fs::write(
+            implementation_notes_path(&state.working_dir),
+            "<h2>Design decisions</h2><h2>Deviations</h2><h2>Tradeoffs</h2><h2>Open questions</h2>",
+        )
+        .expect("heading-only notes");
+        history.clear();
+        let ready = implementation_notes_ready_or_request_followup(&state, None, 3, &mut history)
+            .expect("section id check");
+        assert!(!ready);
+        assert!(history[0].contains("id=\"design-decisions\""));
+        assert!(history[0].contains("id=\"open-questions\""));
     }
 
     #[test]
