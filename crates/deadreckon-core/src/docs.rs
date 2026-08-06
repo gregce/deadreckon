@@ -524,7 +524,7 @@ impl ImplementationNotesStatus {
             Self::Missing => format!("{IMPLEMENTATION_NOTES_HTML} is missing"),
             Self::MissingSections(sections) => {
                 format!(
-                    "{IMPLEMENTATION_NOTES_HTML} is missing required sections: {}",
+                    "{IMPLEMENTATION_NOTES_HTML} is missing required section IDs or headings for: {}",
                     sections.join(", ")
                 )
             }
