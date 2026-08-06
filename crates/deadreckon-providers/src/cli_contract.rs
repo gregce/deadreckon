@@ -62,7 +62,7 @@ enum ContractParser {
     Descriptor(Box<ContractSection>),
 }
 
-type ContractProbeCache = Mutex<HashMap<(String, String), Option<String>>>;
+type ContractProbeCache = Mutex<HashMap<(String, Vec<String>, String), Option<String>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ContractError {
@@ -151,8 +151,11 @@ pub(crate) fn evaluate_contract_probe(
     }
 }
 
-/// Probe `binary --help` once per binary/expectation pair. Failure to execute
-/// or a missing marker disables the contract with a caveat, never an error.
+/// Probe the descriptor-selected capability surface once per
+/// binary/arguments/expectation tuple. Descriptors default to `binary --help`;
+/// subcommand-owned flags can select (for example) `binary run --help`.
+/// Failure to execute or a missing marker disables the contract with a caveat,
+/// never an error.
 #[allow(dead_code)] // Generic driver wiring lands in Pennant P4.
 pub(crate) async fn probe_descriptor_contract(
     provider: &str,
@@ -160,18 +163,26 @@ pub(crate) async fn probe_descriptor_contract(
     contract: &ProviderContract,
     request: &ProviderRequest,
 ) -> crate::Result<ContractProbe> {
-    let expected = contract
-        .descriptor()
-        .and_then(|section| section.probe_substring.as_deref());
-    let Some(expected) = expected else {
+    let Some(section) = contract.descriptor() else {
         return Ok(ContractProbe {
             active: true,
             caveat: None,
         });
     };
+    let Some(expected) = section.probe_substring.as_deref() else {
+        return Ok(ContractProbe {
+            active: true,
+            caveat: None,
+        });
+    };
+    let probe_args = if section.probe_args.is_empty() {
+        vec!["--help".to_string()]
+    } else {
+        section.probe_args.clone()
+    };
     static CACHE: OnceLock<ContractProbeCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (binary.to_string(), expected.to_string());
+    let key = (binary.to_string(), probe_args.clone(), expected.to_string());
     if let Ok(guard) = cache.lock()
         && let Some(found) = guard.get(&key)
     {
@@ -180,7 +191,7 @@ pub(crate) async fn probe_descriptor_contract(
     let help = run_cli_capability_probe(
         provider,
         binary,
-        &["--help".to_string()],
+        &probe_args,
         request.cwd.clone(),
         request.sandbox_backend,
         request.pid_file.clone(),
@@ -909,6 +920,14 @@ mod tests {
         assert_eq!(
             success.parsed.answer.as_deref(),
             Some("OPENCODE_FIXTURE_OK")
+        );
+        assert_eq!(
+            success.parsed.usage,
+            Some(CliUsage {
+                input_tokens: 21,
+                output_tokens: 3,
+                cost_usd: Some(0.0),
+            })
         );
         assert!(success.parsed.failure.is_none());
 

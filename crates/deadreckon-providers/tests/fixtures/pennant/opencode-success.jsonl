@@ -1,3 +1,4 @@
 {"type":"step_start","sessionID":"ses_fixture","part":{"type":"step-start"}}
 {"type":"text","sessionID":"ses_fixture","part":{"type":"text","text":"OPENCODE_FIXTURE_OK"}}
+{"type":"step_finish","sessionID":"ses_fixture","part":{"type":"step-finish","tokens":{"total":24,"input":21,"output":3,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}
 {"type":"text","sessionID":"ses_fixture","part":{"type":null,"text":null}}
