@@ -129,6 +129,12 @@ Done criteria:
   deadreckon def-done check
   deadreckon def-done show
 
+Provider roles:
+  A direct run uses --provider for implementation and final semantic review
+  when that route can prove schema-only output. Generic CLI workers such as
+  Copilot, Gemini, OpenCode, and Pi require --reviewer-provider with a
+  schema-capable route; both roles are frozen into launch-plan.json.
+
 Modes:
   In a git repo, the default is an isolated worktree.
   Use `--fresh`, `--from <dir>`, or `--worktree` to force an isolated mode.
@@ -321,6 +327,7 @@ Compatibility:
 const DOCTOR_HELP: &str = "\
 Lifecycle:
   deadreckon doctor
+  deadreckon doctor --live
   deadreckon doctor --json
   deadreckon doctor --repair
   deadreckon init
@@ -328,6 +335,10 @@ Lifecycle:
 
 Doctor checks DeadReckon installations and supervisor readiness as well as
 providers, CLI binaries, sandboxes, disk, permissions, and OS details.
+The default provider check is static and does not claim a working account.
+`--live` spends one bounded real turn per configured route and requires an
+exact response token, proving worker transport while keeping semantic-review
+capability a separate provider field.
 Repair treats the explicitly invoked binary as authoritative. It can back up
 and repoint the PATH-selected shell installation, then reconciles the receipt
 and managed service. Package-manager copies remain under their package manager.";
@@ -771,9 +782,16 @@ pub(crate) enum Commands {
         coder_provider: Option<String>,
         #[arg(long, help = "Coder model for review start")]
         coder_model: Option<String>,
-        #[arg(long, help = "Reviewer provider route for review start")]
+        #[arg(
+            long,
+            help = "Schema-capable reviewer route for review work and final done judgment"
+        )]
         reviewer_provider: Option<String>,
-        #[arg(long, help = "Reviewer model for review start")]
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model for the schema-capable reviewer route"
+        )]
         reviewer_model: Option<String>,
         #[arg(long, help = "Show the resolved launch preview without starting work")]
         preview: bool,
@@ -928,6 +946,17 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for this run")]
         model: Option<String>,
+        #[arg(
+            long,
+            help = "Schema-capable provider route for the final semantic done judgment"
+        )]
+        reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model override for the final semantic reviewer"
+        )]
+        reviewer_model: Option<String>,
         #[arg(long, help = "Documentation provider route for generated docs")]
         doc_provider: Option<String>,
         #[arg(
@@ -1077,6 +1106,17 @@ pub(crate) enum Commands {
         model: Option<String>,
         #[arg(
             long,
+            help = "Schema-capable reviewer route for final campaign done judgment"
+        )]
+        reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model for the schema-capable campaign reviewer"
+        )]
+        reviewer_model: Option<String>,
+        #[arg(
+            long,
             help = "Tree-wide spend cap in USD, split across sub-orchestrators"
         )]
         max_spend: Option<f64>,
@@ -1147,7 +1187,10 @@ pub(crate) enum Commands {
         child_provider: Vec<String>,
         #[arg(long, help = "Coder provider route for review mode")]
         coder_provider: Option<String>,
-        #[arg(long, help = "Reviewer provider route for review mode")]
+        #[arg(
+            long,
+            help = "Schema-capable reviewer route for review work and final done judgment"
+        )]
         reviewer_provider: Option<String>,
         #[arg(long, help = "Initialize git in a plain directory before planning")]
         init_git: bool,
@@ -1200,7 +1243,10 @@ pub(crate) enum Commands {
         child_provider: Vec<String>,
         #[arg(long, help = "Coder provider route override for review mode")]
         coder_provider: Option<String>,
-        #[arg(long, help = "Reviewer provider route override for review mode")]
+        #[arg(
+            long,
+            help = "Schema-capable reviewer route override for final done judgment"
+        )]
         reviewer_provider: Option<String>,
         #[arg(long, help = "Debug only: disable automatic dependency merge repair")]
         no_repair: bool,
@@ -1390,6 +1436,12 @@ pub(crate) enum Commands {
     Doctor {
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
+        #[arg(
+            long,
+            conflicts_with = "repair",
+            help = "Run one bounded real provider turn for each configured route"
+        )]
+        live: bool,
         #[arg(
             long,
             conflicts_with = "json",
@@ -2188,11 +2240,14 @@ pub(crate) struct OrchestrateReviewArgs {
     pub(crate) sandbox: Option<String>,
     #[arg(long, help = "Coder provider route for review mode")]
     pub(crate) coder_provider: Option<String>,
-    #[arg(long, help = "Reviewer provider route for review mode")]
+    #[arg(
+        long,
+        help = "Schema-capable reviewer route for review work and final done judgment"
+    )]
     pub(crate) reviewer_provider: Option<String>,
     #[arg(long, help = "Coder model for review mode")]
     pub(crate) coder_model: Option<String>,
-    #[arg(long, help = "Reviewer model for review mode")]
+    #[arg(long, help = "Model for the schema-capable reviewer route")]
     pub(crate) reviewer_model: Option<String>,
     #[arg(
         long,
@@ -2823,6 +2878,8 @@ pub(crate) struct RunCommandArgs {
     pub(crate) untrusted: bool,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) doc_provider: Option<String>,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) skill: String,

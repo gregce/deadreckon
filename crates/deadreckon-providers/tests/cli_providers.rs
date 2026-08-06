@@ -853,16 +853,22 @@ async fn no_resume_args_means_fresh_turns_without_caveat() {
 }
 
 const PI_PENNANT_FIXTURE: &str = include_str!("fixtures/pennant/pi-simple.jsonl");
+const PI_ERROR_FIXTURE: &str = include_str!("fixtures/pennant/pi-insufficient-balance.jsonl");
 
 #[allow(clippy::expect_used)]
-fn write_pi_pennant_binary(path: &std::path::Path) {
+fn write_pi_pennant_output_binary(path: &std::path::Path, output: &str) {
     let script = format!(
         "#!/bin/sh\n\
 if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Options: --mode --session'; exit 0; fi\n\
-cat <<'JSONL'\n{PI_PENNANT_FIXTURE}\nJSONL\n"
+cat <<'JSONL'\n{output}\nJSONL\n"
     );
     fs::write(path, script).expect("pi fixture binary");
     chmod_exec(path);
+}
+
+#[allow(clippy::expect_used)]
+fn write_pi_pennant_binary(path: &std::path::Path) {
+    write_pi_pennant_output_binary(path, PI_PENNANT_FIXTURE);
 }
 
 #[allow(clippy::expect_used)]
@@ -928,6 +934,29 @@ async fn pi_fixture_yields_usage_answer_and_session() {
         session["conversation_id"],
         "019f6c15-c7c8-7936-b475-1637f9d25191"
     );
+}
+
+#[tokio::test]
+async fn pi_zero_exit_error_event_is_a_provider_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("fake-pi-error");
+    write_pi_pennant_output_binary(&binary, PI_ERROR_FIXTURE);
+    let error = pi_pennant_router(&binary)
+        .complete(&ProviderRequest {
+            prompt: "fixture".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            session_dir: Some(temp.path().join("run")),
+            ..Default::default()
+        })
+        .await
+        .expect_err("Pi error events must not become successful worker turns");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("provider contract reported an error"),
+        "{message}"
+    );
+    assert!(message.contains("402 Insufficient Balance"), "{message}");
 }
 
 #[tokio::test]

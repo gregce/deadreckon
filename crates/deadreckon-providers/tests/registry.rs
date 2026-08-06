@@ -44,14 +44,17 @@ fn gemini_contract_or_documented_gap() {
     let source = include_str!("../descriptors/cli-gemini.toml");
 
     assert!(gemini.contract.is_none());
-    assert_eq!(gemini.exec_template.args_template, ["-p", "{prompt}"]);
+    assert_eq!(
+        gemini.exec_template.args_template,
+        ["-p", "{prompt}", "--skip-trust", "--approval-mode", "yolo"]
+    );
     assert!(source.contains("Gemini CLI 0.42.0"));
     assert!(source.contains("IneligibleTierError/UNSUPPORTED_CLIENT"));
     assert!(source.contains("before any structured event is emitted"));
 }
 
 #[test]
-fn opencode_contract_or_documented_gap() {
+fn opencode_contract_classifies_interleaved_zero_exit_errors() {
     let registry = ProviderRegistry::builtin().expect("builtin registry");
     let opencode = registry.get("cli:opencode").expect("opencode descriptor");
     let source = include_str!("../descriptors/cli-opencode.toml");
@@ -61,11 +64,17 @@ fn opencode_contract_or_documented_gap() {
         .collect::<Result<Vec<_>, _>>()
         .expect("OpenCode gap fixture");
 
-    assert!(opencode.contract.is_none());
+    let contract = opencode.contract.as_ref().expect("OpenCode contract");
+    assert_eq!(contract.stream_args, ["--format", "json"]);
+    assert_eq!(contract.answer_path.as_deref(), Some("/part/text"));
+    assert_eq!(
+        contract.error_message_path.as_deref(),
+        Some("/error/data/message")
+    );
     assert_eq!(opencode.exec_template.args_template, ["run", "{prompt}"]);
     assert!(source.contains("OpenCode CLI 0.15.5"));
     assert!(source.contains("text(answer), error, then text(null)"));
-    assert!(source.contains("richer event mirror is a V1 escalation"));
+    assert!(source.contains("retains the last non-null answer"));
     assert_eq!(events[1]["part"]["text"], "OPENCODE_FIXTURE_OK");
     assert_eq!(events[2]["type"], "error");
     assert!(events[3]["part"]["text"].is_null());
@@ -172,6 +181,12 @@ fn descriptor_models_and_install_hints_cover_copilot_and_pi() {
     );
 
     let pi = registry.get("cli:pi").expect("pi descriptor");
+    assert_eq!(
+        pi.contract
+            .as_ref()
+            .and_then(|contract| contract.error_message_path.as_deref()),
+        Some("/message/errorMessage")
+    );
     assert_eq!(pi.exec_template.model_arg.as_deref(), Some("--model"));
     assert!(
         pi.install_hint

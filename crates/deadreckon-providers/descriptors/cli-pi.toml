@@ -30,6 +30,7 @@ usage_input_path = "/message/usage/input"
 usage_output_path = "/message/usage/output"
 cost_path = "/message/usage/cost/total"
 answer_path = "/assistantMessageEvent/content"
+error_message_path = "/message/errorMessage"
 flight_event_paths = ["/toolCallId"]
 resume_args = ["--session", "{conversation_id}"]
 probe_substring = "--mode"

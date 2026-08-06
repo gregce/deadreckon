@@ -428,6 +428,10 @@ pub struct ProviderProbeResult {
     pub display_name: String,
     pub kind: DescriptorKind,
     pub contract: bool,
+    /// The runtime has a route-specific adapter for schema-only semantic
+    /// review. False means the route is a worker only and needs a separate
+    /// reviewer; it does not mean the worker transport is unsupported.
+    pub schema_only_review: bool,
     pub status: ProbeStatus,
     pub location: Option<String>,
     pub version: Option<String>,
@@ -887,6 +891,7 @@ fn base_probe_result(
         display_name: descriptor.display_name.clone(),
         kind: descriptor.kind.clone(),
         contract: descriptor.contract.is_some(),
+        schema_only_review: crate::config::kind_from_name(&descriptor.id).has_schema_only_adapter(),
         status,
         location,
         version,

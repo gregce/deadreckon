@@ -6,8 +6,11 @@
 #   durable run -> verified receipt -> signed gate marker -> finish succeeds
 #   -> a second run is cancelled mid-turn and its provider tree is reaped.
 # On success the probed binary versions land in
-# release/known-good-providers.json (schema_version 2), bound to the exact
+# release/known-good-providers.json (schema_version 3), bound to the exact
 # source-derived build bundle and all three shipped binary digests.
+# Worker and semantic-review routes are recorded separately: generic CLI
+# workers use a schema-capable reviewer instead of being credited with a
+# judgment their adapter cannot make.
 #
 # Usage: release/preflight-real.sh [route ...]
 #        (defaults to cli:claude-code cli:codex)
@@ -92,6 +95,17 @@ binary_for_route() {
     cli:copilot) echo "copilot" ;;
     cli:pi) echo "pi" ;;
     *) echo "" ;;
+  esac
+}
+
+reviewer_for_route() {
+  if [ -n "${PREFLIGHT_REVIEWER_PROVIDER:-}" ]; then
+    echo "$PREFLIGHT_REVIEWER_PROVIDER"
+    return
+  fi
+  case "$1" in
+    cli:gemini|cli:opencode|cli:copilot|cli:pi) echo "cli:codex" ;;
+    *) echo "$1" ;;
   esac
 }
 
@@ -187,10 +201,12 @@ launch_route_job() {
   repo=$1
   home=$2
   route=$3
+  reviewer=$4
   (
     cd "$repo"
     DEADRECKON_HOME="$home" "$deadreckon_bin" run "$goal" \
-      --provider "$route" --yes --quiet --plain --no-docs >&2
+      --provider "$route" --reviewer-provider "$reviewer" \
+      --yes --quiet --plain --no-docs >&2
   )
   latest_job_id "$home"
 }
@@ -255,6 +271,14 @@ for route in $routes; do
     exit 1
   fi
   binary_version=$("$binary" --version 2>/dev/null | head -n1)
+  reviewer=$(reviewer_for_route "$route")
+  reviewer_binary=$(binary_for_route "$reviewer")
+  if [ -z "$reviewer_binary" ] || ! command -v "$reviewer_binary" >/dev/null 2>&1; then
+    echo "    FAIL: no installed binary for semantic reviewer route $reviewer" >&2
+    exit 1
+  fi
+  reviewer_binary_version=$("$reviewer_binary" --version 2>/dev/null | head -n1)
+  echo "    routes: worker=$route semantic-reviewer=$reviewer"
 
   home="$workdir/${route#cli:}-home"
   mkdir -p "$home"
@@ -262,7 +286,7 @@ for route in $routes; do
 
   echo "    run: durable execution to completion"
   commit_fixture_contract "$repo" "$home"
-  job_id=$(launch_route_job "$repo" "$home" "$route")
+  job_id=$(launch_route_job "$repo" "$home" "$route" "$reviewer")
   [ -n "$job_id" ] || { echo "    FAIL: no Job recorded for $route" >&2; exit 1; }
   wait_for_verified_job "$home" "$job_id"
 
@@ -288,7 +312,7 @@ for route in $routes; do
   echo "    cancel: interrupt a second run and reap its provider tree"
   repo2=$(fresh_repo "${route#cli:}-cancel")
   commit_fixture_contract "$repo2" "$home"
-  cancel_job_id=$(launch_route_job "$repo2" "$home" "$route")
+  cancel_job_id=$(launch_route_job "$repo2" "$home" "$route" "$reviewer")
   [ -n "$cancel_job_id" ] || { echo "    FAIL: no cancellation Job recorded for $route" >&2; exit 1; }
   cancel_run_id=$cancel_job_id
   provider_pid=$(wait_for_provider_pid "$home" "$cancel_run_id")
@@ -297,8 +321,8 @@ for route in $routes; do
   assert_process_reaped "$provider_pid"
   echo "    cancel: Job terminal and provider process reaped"
 
-  entry=$(printf '{"route":"%s","binary_version":"%s","proof":"durable run -> real turns -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"%s","operator":"%s"}' \
-    "$route" "$binary_version" "$run_id" "$operator")
+  entry=$(printf '{"route":"%s","binary_version":"%s","reviewer_route":"%s","reviewer_binary_version":"%s","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"%s","operator":"%s"}' \
+    "$route" "$binary_version" "$reviewer" "$reviewer_binary_version" "$run_id" "$operator")
   if [ -n "$results" ]; then
     results="$results,
     $entry"
@@ -324,7 +348,7 @@ if [ -z "$proved_version" ] || [ "$proved_version" != "$bundle_version" ]; then
 fi
 cat > "$known_good" <<EOF
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "recorded_at": "$recorded_at",
   "source_commit": "$source_commit",
   "deadreckon_version": "$proved_version",

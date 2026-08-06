@@ -454,6 +454,15 @@ async fn schedule_direct_run(
     )?;
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    if args.reviewer_model.is_some()
+        && args.reviewer_provider.is_none()
+        && launch_plan.providers.reviewer.is_none()
+        && defaults.reviewer_provider.is_none()
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--reviewer-model requires an explicit --reviewer-provider".to_string(),
+        )));
+    }
     if let Some(model) = args.narrator_model.as_deref()
         && let Ok(registry) =
             deadreckon_providers::registry::ProviderRegistry::with_overrides(paths.home())
@@ -463,6 +472,120 @@ async fn schedule_direct_run(
             crate::narrator::narrator_model_refusal(model),
         )));
     }
+    let requested_worker_provider = if args.smoke {
+        Some("smoke")
+    } else {
+        args.provider
+            .as_deref()
+            .or(launch_plan.providers.coder.as_deref())
+    };
+    let requested_worker_model = args
+        .model
+        .as_deref()
+        .or(launch_plan.providers.coder_model.as_deref());
+    let worker_setup = provider_setup_selection(
+        &paths,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::PrimaryRun,
+            explicit_provider: requested_worker_provider,
+            explicit_model: requested_worker_model,
+            config_default_provider: defaults.provider.as_deref(),
+            config_doc_provider: defaults.doc_provider.as_deref(),
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: true,
+            allow_auto_subscription: false,
+            require_usable_route: false,
+        },
+    )?;
+    let worker_provider = worker_setup.provider.clone();
+    let worker_model = args
+        .model
+        .clone()
+        .or_else(|| launch_plan.providers.coder_model.clone());
+    let worker_route = setup::route_info_for_provider(
+        &paths.config_path(),
+        worker_provider.as_deref(),
+        worker_model.as_deref(),
+    )?
+    .ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(
+            "direct run did not resolve an implementation provider route".to_string(),
+        ))
+    })?;
+
+    let explicit_reviewer = args.reviewer_provider.is_some();
+    let requested_reviewer_provider = args
+        .reviewer_provider
+        .as_deref()
+        .or(launch_plan.providers.reviewer.as_deref())
+        .or(defaults.reviewer_provider.as_deref())
+        .or_else(|| {
+            worker_route
+                .kind
+                .has_schema_only_adapter()
+                .then_some(worker_route.name.as_str())
+        });
+    let requested_reviewer_model = if explicit_reviewer {
+        args.reviewer_model.as_deref()
+    } else {
+        args.reviewer_model
+            .as_deref()
+            .or(launch_plan.providers.reviewer_model.as_deref())
+            .or(defaults.reviewer_model.as_deref())
+            .or_else(|| {
+                (requested_reviewer_provider == Some(worker_route.name.as_str()))
+                    .then_some(worker_model.as_deref())
+                    .flatten()
+            })
+    };
+    let reviewer_setup = match requested_reviewer_provider {
+        Some(reviewer) => {
+            let selection = provider_setup_selection(
+                &paths,
+                setup::ProviderSetupRequest {
+                    role: setup::SetupProviderRoleRef::Reviewer,
+                    explicit_provider: Some(reviewer),
+                    explicit_model: requested_reviewer_model,
+                    config_default_provider: None,
+                    config_doc_provider: None,
+                    run_provider: None,
+                    auto_subscription_provider: None,
+                    built_in_default_provider: None,
+                    use_router_default: false,
+                    allow_auto_subscription: false,
+                    require_usable_route: true,
+                },
+            )?;
+            let route = setup::route_info_for_provider(
+                &paths.config_path(),
+                selection.provider.as_deref(),
+                requested_reviewer_model,
+            )?
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(
+                    "direct run did not resolve a semantic reviewer route".to_string(),
+                ))
+            })?;
+            if !route.kind.has_schema_only_adapter() {
+                return Err(schema_only_reviewer_refusal(
+                    &args.goal,
+                    worker_route.name.as_str(),
+                    route.name.as_str(),
+                ));
+            }
+            Some(selection)
+        }
+        None if matches!(worker_route.kind, ProviderKind::ScriptedSmoke) => None,
+        None => {
+            return Err(schema_only_reviewer_refusal(
+                &args.goal,
+                worker_route.name.as_str(),
+                worker_route.name.as_str(),
+            ));
+        }
+    };
     let cwd = args
         .durable_source_cwd
         .clone()
@@ -531,8 +654,8 @@ async fn schedule_direct_run(
         &authority_source_cwd,
         args.acceptance.as_deref(),
         &args.goal,
-        args.provider.clone(),
-        args.model.clone(),
+        worker_provider.clone(),
+        worker_model.clone(),
         explicitly_approved,
         "run",
     )
@@ -554,19 +677,26 @@ async fn schedule_direct_run(
             "omit `--sandbox none` or choose auto, sandbox-exec, bwrap, or docker",
         )));
     }
-    let provider = if args.smoke {
-        Some("smoke".to_string())
-    } else {
-        args.provider.clone()
-    };
-    launch_plan.providers.coder.clone_from(&provider);
+    let reviewer_provider = reviewer_setup
+        .as_ref()
+        .and_then(|selection| selection.provider.clone());
+    let reviewer_model = reviewer_setup
+        .as_ref()
+        .and_then(|_| requested_reviewer_model.map(ToString::to_string));
+    freeze_direct_provider_roles(
+        launch_plan,
+        worker_provider.clone(),
+        worker_model.clone(),
+        reviewer_provider,
+        reviewer_model,
+    );
     launch_plan.pieces = vec![commands::course::CoursePiece {
         id: "run".to_string(),
         goal: args.goal.clone(),
         done_hint: None,
         role: Some("coder".to_string()),
-        provider,
-        model: args.model.clone(),
+        provider: worker_provider,
+        model: worker_model,
         budget_usd: Some(max_spend_usd),
         depends_on: Vec::new(),
         subplan: None,
@@ -620,6 +750,38 @@ async fn schedule_direct_run(
         commands::job::print_job_status(&view, false)?;
     }
     Ok(Some(job.job_id))
+}
+
+fn schema_only_reviewer_refusal(goal: &str, worker: &str, reviewer: &str) -> CliError {
+    let message = if worker == reviewer {
+        format!(
+            "provider route {worker} can perform implementation work but cannot serve as DeadReckon's schema-only semantic reviewer"
+        )
+    } else {
+        format!(
+            "reviewer provider route {reviewer} cannot serve as DeadReckon's schema-only semantic reviewer"
+        )
+    };
+    CliError::Core(deadreckon_core::user_error(
+        &message,
+        &format!(
+            "deadreckon run \"{}\" --provider {worker} --reviewer-provider cli:codex --yes",
+            shell_display_quote(goal)
+        ),
+    ))
+}
+
+fn freeze_direct_provider_roles(
+    launch_plan: &mut commands::course::LaunchPlan,
+    worker_provider: Option<String>,
+    worker_model: Option<String>,
+    reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
+) {
+    launch_plan.providers.coder = worker_provider;
+    launch_plan.providers.coder_model = worker_model;
+    launch_plan.providers.reviewer = reviewer_provider;
+    launch_plan.providers.reviewer_model = reviewer_model;
 }
 
 fn direct_run_approval_policy(
@@ -706,7 +868,7 @@ fn persist_direct_run_job(
 /// replay can read the decision from the artifact alone.
 pub(crate) async fn run_command_with_launch_plan(
     args: RunCommandArgs,
-    launch_plan: commands::course::LaunchPlan,
+    mut launch_plan: commands::course::LaunchPlan,
 ) -> Result<()> {
     let RunCommandArgs {
         goal,
@@ -736,6 +898,8 @@ pub(crate) async fn run_command_with_launch_plan(
         untrusted,
         provider,
         model,
+        reviewer_provider,
+        reviewer_model,
         doc_provider,
         acceptance,
         skill,
@@ -853,6 +1017,93 @@ pub(crate) async fn run_command_with_launch_plan(
         .as_ref()
         .map(|route| route.name.clone())
         .or(primary_setup.provider.clone());
+    let explicit_reviewer = reviewer_provider.is_some();
+    let requested_reviewer_provider = reviewer_provider
+        .as_deref()
+        .or(launch_plan.providers.reviewer.as_deref())
+        .or(defaults.reviewer_provider.as_deref())
+        .or_else(|| {
+            selected_route.as_ref().and_then(|route| {
+                route
+                    .kind
+                    .has_schema_only_adapter()
+                    .then_some(route.name.as_str())
+            })
+        });
+    let requested_reviewer_model = if explicit_reviewer {
+        reviewer_model.as_deref()
+    } else {
+        reviewer_model
+            .as_deref()
+            .or(launch_plan.providers.reviewer_model.as_deref())
+            .or(defaults.reviewer_model.as_deref())
+            .or_else(|| {
+                (requested_reviewer_provider == effective_provider.as_deref())
+                    .then_some(model.as_deref())
+                    .flatten()
+            })
+    };
+    let reviewer_setup = requested_reviewer_provider
+        .map(|reviewer| {
+            provider_setup_selection(
+                &paths,
+                setup::ProviderSetupRequest {
+                    role: setup::SetupProviderRoleRef::Reviewer,
+                    explicit_provider: Some(reviewer),
+                    explicit_model: requested_reviewer_model,
+                    config_default_provider: None,
+                    config_doc_provider: None,
+                    run_provider: None,
+                    auto_subscription_provider: None,
+                    built_in_default_provider: None,
+                    use_router_default: false,
+                    allow_auto_subscription: false,
+                    require_usable_route: false,
+                },
+            )
+        })
+        .transpose()?;
+    if let Some(selection) = reviewer_setup.as_ref() {
+        let route = setup::route_info_for_provider(
+            &paths.config_path(),
+            selection.provider.as_deref(),
+            requested_reviewer_model,
+        )?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(
+                "run did not resolve a semantic reviewer route".to_string(),
+            ))
+        })?;
+        if !route.kind.has_schema_only_adapter() {
+            return Err(schema_only_reviewer_refusal(
+                &goal,
+                effective_provider.as_deref().unwrap_or("provider"),
+                route.name.as_str(),
+            ));
+        }
+    } else if selected_route
+        .as_ref()
+        .is_some_and(|route| !matches!(route.kind, ProviderKind::ScriptedSmoke))
+    {
+        let worker = effective_provider.as_deref().unwrap_or("provider");
+        return Err(schema_only_reviewer_refusal(&goal, worker, worker));
+    }
+    let effective_reviewer = reviewer_setup
+        .as_ref()
+        .and_then(|selection| selection.provider.clone());
+    let effective_reviewer_model = reviewer_setup
+        .as_ref()
+        .and_then(|_| requested_reviewer_model.map(ToString::to_string));
+    launch_plan.providers.coder.clone_from(&effective_provider);
+    launch_plan.providers.coder_model.clone_from(&model);
+    launch_plan
+        .providers
+        .reviewer
+        .clone_from(&effective_reviewer);
+    launch_plan
+        .providers
+        .reviewer_model
+        .clone_from(&effective_reviewer_model);
     let effective_max_spend = max_spend.or(defaults.max_spend).or(Some(10.0));
     let effective_max_wall_seconds = max_wall_seconds
         .or(defaults.cli_max_wall_seconds)
@@ -973,6 +1224,8 @@ pub(crate) async fn run_command_with_launch_plan(
         provider: effective_provider.as_deref(),
         provider_source: primary_setup.source.as_str(),
         route: selected_route.as_ref(),
+        reviewer_provider: effective_reviewer.as_deref(),
+        reviewer_model: effective_reviewer_model.as_deref(),
         sandbox: &backend.to_string(),
         doc_provider: doc_provider_selection.provider.as_deref(),
         doc_provider_source: doc_provider_selection.source.as_str(),
@@ -1599,6 +1852,27 @@ mod durable_direct_tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn direct_provider_roles_freeze_worker_and_semantic_reviewer_independently() {
+        let mut plan = commands::course::trivial_operator_plan(
+            "prove the provider split",
+            commands::course::CourseShape::Single,
+            "run",
+        );
+        freeze_direct_provider_roles(
+            &mut plan,
+            Some("cli:copilot".to_string()),
+            Some("copilot-model".to_string()),
+            Some("cli:codex".to_string()),
+            Some("gpt-review".to_string()),
+        );
+
+        assert_eq!(plan.providers.coder.as_deref(), Some("cli:copilot"));
+        assert_eq!(plan.providers.coder_model.as_deref(), Some("copilot-model"));
+        assert_eq!(plan.providers.reviewer.as_deref(), Some("cli:codex"));
+        assert_eq!(plan.providers.reviewer_model.as_deref(), Some("gpt-review"));
+    }
 
     #[test]
     fn guarded_work_cutoff_retains_deadline_vs_wall_cap() {

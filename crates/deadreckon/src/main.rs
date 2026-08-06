@@ -1158,6 +1158,8 @@ async fn main_inner() -> Result<()> {
             untrusted,
             provider,
             model,
+            reviewer_provider,
+            reviewer_model,
             doc_provider,
             acceptance,
             skill,
@@ -1207,6 +1209,8 @@ async fn main_inner() -> Result<()> {
                 untrusted,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 doc_provider,
                 acceptance,
                 skill,
@@ -1281,6 +1285,8 @@ async fn main_inner() -> Result<()> {
             provider,
             planner_model,
             model,
+            reviewer_provider,
+            reviewer_model,
             max_spend,
             max_wall_seconds,
             deadline,
@@ -1330,6 +1336,8 @@ async fn main_inner() -> Result<()> {
                 provider,
                 planner_model,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 max_spend,
                 max_wall_seconds,
                 deadline,
@@ -1549,7 +1557,9 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Doctor { json, repair } => commands::doctor::doctor_command(json, repair).await,
+        Commands::Doctor { json, live, repair } => {
+            commands::doctor::doctor_command(json, live, repair).await
+        }
         Commands::Seams { command } => commands::seams::seams_command(command).await,
         Commands::Detect { id, json, ping } => {
             commands::providers::detect_command(id, json, ping).await
@@ -2549,7 +2559,7 @@ const PROVIDER_ROLE_ROWS: &[(&str, &str)] = &[
     ),
     (
         "--reviewer-provider",
-        "review-mode route that independently reviews or fixes the coder result",
+        "independent review/fix route in review mode; schema-only final done judge for runs and graphs",
     ),
     (
         "--doc-provider",
@@ -3198,6 +3208,18 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                     "default_provider",
                     toml::Value::String(provider.clone()),
                 );
+                if get_toml_path(&root, "defaults.reviewer_provider").is_none() {
+                    let registry = ProviderRegistry::with_overrides(paths.home())?;
+                    if let Some(reviewer) =
+                        preferred_schema_reviewer_for_worker(&registry, &provider)
+                    {
+                        set_toml_path(
+                            &mut root,
+                            "defaults.reviewer_provider",
+                            toml::Value::String(reviewer),
+                        );
+                    }
+                }
                 fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
                 print!(
                     "{}",
@@ -3264,6 +3286,7 @@ struct ConfigProviderRemoval {
     provider: String,
     removed_default_provider: bool,
     removed_defaults_provider: bool,
+    removed_reviewer_provider: bool,
     removed_doc_provider: bool,
     removed_fallback_entries: usize,
     removed_provider_table: bool,
@@ -3274,6 +3297,7 @@ impl ConfigProviderRemoval {
     fn changed(&self) -> bool {
         self.removed_default_provider
             || self.removed_defaults_provider
+            || self.removed_reviewer_provider
             || self.removed_doc_provider
             || self.removed_fallback_entries > 0
             || self.removed_provider_table
@@ -3287,6 +3311,9 @@ impl ConfigProviderRemoval {
         }
         if self.removed_defaults_provider {
             locations.push("defaults.provider".to_string());
+        }
+        if self.removed_reviewer_provider {
+            locations.push("defaults.reviewer_provider".to_string());
         }
         if self.removed_doc_provider {
             locations.push("defaults.doc_provider".to_string());
@@ -3355,6 +3382,11 @@ fn remove_config_provider(
 ) -> Result<ConfigProviderRemoval> {
     let removed_default_provider = remove_toml_path_if_string(root, "default_provider", provider);
     let removed_defaults_provider = remove_toml_path_if_string(root, "defaults.provider", provider);
+    let removed_reviewer_provider =
+        remove_toml_path_if_string(root, "defaults.reviewer_provider", provider);
+    if removed_reviewer_provider {
+        remove_toml_path(root, "defaults.reviewer_model");
+    }
     let removed_doc_provider = remove_toml_path_if_string(root, "defaults.doc_provider", provider);
     let removed_fallback_entries = remove_provider_from_fallback(root, provider);
     let removed_provider_table = remove_provider_table(root, provider);
@@ -3392,6 +3424,7 @@ fn remove_config_provider(
         provider: provider.to_string(),
         removed_default_provider,
         removed_defaults_provider,
+        removed_reviewer_provider,
         removed_doc_provider,
         removed_fallback_entries,
         removed_provider_table,
@@ -3440,6 +3473,7 @@ fn configured_provider_ids_from_root(root: &toml::Value) -> Vec<String> {
     let mut ids = Vec::new();
     push_toml_string_id(root, "default_provider", &mut ids);
     push_toml_string_id(root, "defaults.provider", &mut ids);
+    push_toml_string_id(root, "defaults.reviewer_provider", &mut ids);
     push_toml_string_id(root, "defaults.doc_provider", &mut ids);
     if let Some(fallback) = get_toml_path(root, "fallback").and_then(toml::Value::as_array) {
         for item in fallback {
@@ -3469,6 +3503,9 @@ fn config_provider_location_labels(root: &toml::Value, provider: &str) -> Vec<St
     }
     if toml_path_string_equals(root, "defaults.provider", provider) {
         labels.push("run default".to_string());
+    }
+    if toml_path_string_equals(root, "defaults.reviewer_provider", provider) {
+        labels.push("semantic reviewer".to_string());
     }
     if toml_path_string_equals(root, "defaults.doc_provider", provider) {
         labels.push("doc default".to_string());
@@ -3955,6 +3992,43 @@ mod provider_setup_row_tests {
     }
 }
 
+#[cfg(test)]
+mod semantic_reviewer_config_tests {
+    use super::*;
+
+    #[test]
+    fn provider_removal_clears_reviewer_route_and_model_together() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut root: toml::Value = toml::from_str(
+            r#"
+[defaults]
+provider = "cli:copilot"
+reviewer_provider = "cli:codex"
+reviewer_model = "gpt-review"
+
+[providers."cli:codex"]
+kind = "cli-codex"
+"#,
+        )
+        .expect("config");
+
+        let removal =
+            remove_config_provider(&paths, &mut root, "cli:codex").expect("remove reviewer");
+
+        assert!(removal.removed_reviewer_provider);
+        assert!(get_toml_path(&root, "defaults.reviewer_provider").is_none());
+        assert!(get_toml_path(&root, "defaults.reviewer_model").is_none());
+    }
+
+    #[test]
+    fn init_config_freezes_the_selected_semantic_reviewer() {
+        let config = init_config_text("cli:copilot", Some("cli:codex"), None, None, 10.0, "auto");
+        assert!(config.contains("provider = \"cli:copilot\""));
+        assert!(config.contains("reviewer_provider = \"cli:codex\""));
+    }
+}
+
 fn active_provider_from_config(root: &toml::Value) -> Option<String> {
     get_toml_path(root, "defaults.provider")
         .or_else(|| get_toml_path(root, "default_provider"))
@@ -3999,8 +4073,42 @@ fn provider_kind_label(kind: &ProviderKind) -> &'static str {
     }
 }
 
+fn provider_name_has_schema_only_adapter(provider: &str) -> bool {
+    matches!(
+        provider,
+        "anthropic"
+            | "openai"
+            | "openai-compatible"
+            | "cli:claude-code"
+            | "cli:codex"
+            | "cli:codex-server"
+            | "smoke"
+    ) || provider.starts_with("smoke:")
+}
+
+fn preferred_schema_reviewer_for_worker(
+    registry: &ProviderRegistry,
+    worker: &str,
+) -> Option<String> {
+    if provider_name_has_schema_only_adapter(worker) {
+        return Some(worker.to_string());
+    }
+    ["cli:codex", "cli:claude-code", "cli:codex-server"]
+        .into_iter()
+        .find(|provider| {
+            registry.get(provider).is_some_and(|descriptor| {
+                descriptor
+                    .default_binary
+                    .as_deref()
+                    .is_some_and(command_exists)
+            })
+        })
+        .map(ToString::to_string)
+}
+
 fn configured_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String>> {
     let config = read_config(&paths.config_path())?;
+    let root = load_config_value(paths)?;
     let mut ids = Vec::new();
     if let Some(default_provider) = config.default_provider {
         push_unique(&mut ids, default_provider);
@@ -4012,6 +4120,11 @@ fn configured_provider_ids(paths: &DeadreckonPaths) -> Result<Vec<String>> {
     }
     for provider in config.providers.into_keys() {
         push_unique(&mut ids, provider);
+    }
+    if let Some(reviewer) =
+        get_toml_path(&root, "defaults.reviewer_provider").and_then(toml::Value::as_str)
+    {
+        push_unique(&mut ids, reviewer.to_string());
     }
     Ok(ids)
 }
@@ -4071,6 +4184,8 @@ async fn try_command(plain: bool, json_output: bool) -> Result<()> {
         untrusted: true,
         provider: None,
         model: None,
+        reviewer_provider: None,
+        reviewer_model: None,
         doc_provider: None,
         acceptance: None,
         skill: "default-coding".to_string(),
@@ -4414,9 +4529,11 @@ fn gate_line_from_results(
 #[derive(Debug, Default)]
 struct ConfigDefaults {
     provider: Option<String>,
+    reviewer_provider: Option<String>,
     start_attach: Option<bool>,
     start_confirm_contract: Option<bool>,
     model: Option<String>,
+    reviewer_model: Option<String>,
     sandbox: Option<String>,
     max_spend: Option<f64>,
     cli_max_wall_seconds: Option<f64>,
@@ -4442,7 +4559,13 @@ fn config_defaults(paths: &DeadreckonPaths) -> Result<ConfigDefaults> {
             .or_else(|| get_toml_path(&root, "default_provider"))
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
+        reviewer_provider: get_toml_path(&root, "defaults.reviewer_provider")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
         model: get_toml_path(&root, "defaults.model")
+            .and_then(toml::Value::as_str)
+            .map(ToString::to_string),
+        reviewer_model: get_toml_path(&root, "defaults.reviewer_model")
             .and_then(toml::Value::as_str)
             .map(ToString::to_string),
         sandbox: get_toml_path(&root, "defaults.sandbox")
@@ -4630,6 +4753,8 @@ struct RunPreview<'a> {
     provider: Option<&'a str>,
     provider_source: &'a str,
     route: Option<&'a ProviderRouteInfo>,
+    reviewer_provider: Option<&'a str>,
+    reviewer_model: Option<&'a str>,
     sandbox: &'a str,
     doc_provider: Option<&'a str>,
     doc_provider_source: &'a str,
@@ -4652,6 +4777,8 @@ fn run_preview(input: &RunPreview<'_>) -> String {
         provider,
         provider_source,
         route,
+        reviewer_provider,
+        reviewer_model,
         sandbox,
         doc_provider,
         doc_provider_source,
@@ -4680,7 +4807,7 @@ fn run_preview(input: &RunPreview<'_>) -> String {
     );
     if brief {
         return format!(
-            "mode={} branch={} base={} wt={} provider={} model={} docs={} seams={} cap={}/{} done_criteria={}",
+            "mode={} branch={} base={} wt={} provider={} model={} reviewer={} reviewer_model={} docs={} seams={} cap={}/{} done_criteria={}",
             mode,
             codebase.branch_name.as_deref().unwrap_or("-"),
             codebase.base_ref.as_deref().unwrap_or("-"),
@@ -4691,6 +4818,8 @@ fn run_preview(input: &RunPreview<'_>) -> String {
                 .unwrap_or_else(|| "-".to_string()),
             agent,
             model,
+            reviewer_provider.unwrap_or("required when worker lacks schema-only review"),
+            reviewer_model.unwrap_or("provider default"),
             doc_provider.unwrap_or("templated"),
             seams,
             max_spend
@@ -4783,6 +4912,14 @@ fn run_preview(input: &RunPreview<'_>) -> String {
             format!("{agent} ({provider_source})"),
         ),
         ("model".to_string(), model.to_string()),
+        (
+            "done reviewer".to_string(),
+            format!(
+                "{}/{}",
+                reviewer_provider.unwrap_or("required when worker lacks schema-only review"),
+                reviewer_model.unwrap_or("provider default")
+            ),
+        ),
         (
             "docs".to_string(),
             format!(
@@ -4901,6 +5038,8 @@ mod seam_surface_tests {
             provider: Some("smoke"),
             provider_source: "flag",
             route: None,
+            reviewer_provider: Some("smoke"),
+            reviewer_model: None,
             sandbox: "none",
             doc_provider: None,
             doc_provider_source: "none",
@@ -11228,6 +11367,7 @@ fn deadreckoning_course_ascii(width: usize, tick: usize) -> String {
 
 fn init_config_text(
     provider: &str,
+    reviewer_provider: Option<&str>,
     api_key: Option<&str>,
     base_url: Option<&str>,
     max_spend: f64,
@@ -11248,8 +11388,11 @@ fn init_config_text(
         "openai-compatible" => "[\"openai-compatible\", \"openai\", \"anthropic\"]".to_string(),
         _ => "[\"anthropic\", \"openai\", \"cli:claude-code\", \"cli:codex\"]".to_string(),
     };
+    let reviewer_provider = reviewer_provider
+        .map(|provider| format!("reviewer_provider = \"{}\"\n", escape_toml_string(provider)))
+        .unwrap_or_default();
     let mut out = format!(
-        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\ndoc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 36000\ndone_contract_max_wall_seconds = 1200\nprevent_sleep = \"auto\"\nplain = false\nsandbox = \"{sandbox}\"\n\n"
+        "default_provider = \"{provider}\"\nfallback = {fallback}\n\n[defaults]\nprovider = \"{provider}\"\n{reviewer_provider}doc_provider = \"{provider}\"\ndoc_skill = \"run-narrator\"\ndoc_subskills = [\"narrator-overview\", \"narrator-phases\", \"narrator-as-built\", \"narrator-decisions\"]\ndoc_polish_token_budget = 16384\nmax_spend = {max_spend}\ncli_max_wall_seconds = 36000\ndone_contract_max_wall_seconds = 1200\nprevent_sleep = \"auto\"\nplain = false\nsandbox = \"{sandbox}\"\n\n"
     );
     match provider {
         "cli:claude-code" => {

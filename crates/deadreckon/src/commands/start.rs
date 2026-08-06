@@ -944,6 +944,7 @@ fn start_configured_provider_ids(paths: &DeadreckonPaths) -> Vec<String> {
     let Ok(config) = read_config(&paths.config_path()) else {
         return Vec::new();
     };
+    let root = load_config_value(paths).ok();
     let mut ids = Vec::new();
     if let Some(default_provider) = config.default_provider {
         push_unique(&mut ids, default_provider);
@@ -955,6 +956,13 @@ fn start_configured_provider_ids(paths: &DeadreckonPaths) -> Vec<String> {
     }
     for provider in config.providers.into_keys() {
         push_unique(&mut ids, provider);
+    }
+    if let Some(reviewer) = root
+        .as_ref()
+        .and_then(|root| get_toml_path(root, "defaults.reviewer_provider"))
+        .and_then(toml::Value::as_str)
+    {
+        push_unique(&mut ids, reviewer.to_string());
     }
     ids
 }
@@ -1710,6 +1718,108 @@ fn explicit_role_model(
     })
 }
 
+fn resolve_start_semantic_reviewer(
+    decision: &mut StartLaunchDecision,
+    args: &StartCommandArgs,
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+) -> Result<()> {
+    let (fallback_provider, fallback_model) = match decision.selected_mode {
+        StartSelectedMode::FullPlan | StartSelectedMode::Campaign => (
+            decision
+                .child_provider_route
+                .clone()
+                .or_else(|| decision.provider_route.clone()),
+            decision
+                .child_model
+                .clone()
+                .or_else(|| decision.model.clone()),
+        ),
+        StartSelectedMode::Review => (
+            decision
+                .reviewer_provider_route
+                .clone()
+                .or_else(|| decision.provider_route.clone()),
+            decision
+                .reviewer_model
+                .clone()
+                .or_else(|| decision.model.clone()),
+        ),
+        StartSelectedMode::Run | StartSelectedMode::Extend => {
+            (decision.provider_route.clone(), decision.model.clone())
+        }
+    };
+    let reviewer = if let Some(route) = args.reviewer_provider.as_deref() {
+        Some(resolve_explicit_start_provider(
+            paths,
+            defaults,
+            setup::SetupProviderRoleRef::Reviewer,
+            route,
+        )?)
+    } else {
+        decision
+            .reviewer_provider_route
+            .clone()
+            .or_else(|| defaults.reviewer_provider.clone())
+            .or(fallback_provider.clone())
+    };
+    let reviewer_model = args
+        .reviewer_model
+        .clone()
+        .or_else(|| decision.reviewer_model.clone())
+        .or_else(|| {
+            (reviewer.as_deref() == defaults.reviewer_provider.as_deref())
+                .then(|| defaults.reviewer_model.clone())
+                .flatten()
+        })
+        .or_else(|| {
+            (reviewer == fallback_provider)
+                .then_some(fallback_model)
+                .flatten()
+        });
+
+    let Some(reviewer) = reviewer else {
+        set_start_recovery(
+            decision,
+            "guided start could not resolve a semantic reviewer route",
+            vec![format!(
+                "deadreckon start \"{}\" --reviewer-provider cli:codex --yes",
+                shell_display_quote(&decision.goal)
+            )],
+        );
+        return Ok(());
+    };
+    if reviewer != "smoke" && !reviewer.starts_with("smoke:") {
+        let route = setup::route_info_for_provider(
+            &paths.config_path(),
+            Some(&reviewer),
+            reviewer_model.as_deref(),
+        )?
+        .ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "guided start did not resolve semantic reviewer route {reviewer}"
+            )))
+        })?;
+        if !route.kind.has_schema_only_adapter() {
+            set_start_recovery(
+                decision,
+                format!(
+                    "provider route {reviewer} can perform implementation work but cannot serve as DeadReckon's schema-only semantic reviewer"
+                ),
+                vec![format!(
+                    "deadreckon start \"{}\" --provider {} --reviewer-provider cli:codex --yes",
+                    shell_display_quote(&decision.goal),
+                    decision.provider_route.as_deref().unwrap_or("<provider>")
+                )],
+            );
+            return Ok(());
+        }
+    }
+    decision.reviewer_provider_route = Some(reviewer);
+    decision.reviewer_model = reviewer_model;
+    Ok(())
+}
+
 pub(crate) fn resolve_start_orchestration_options(
     decision: &mut StartLaunchDecision,
     args: &StartCommandArgs,
@@ -1730,8 +1840,9 @@ pub(crate) fn resolve_start_orchestration_options(
                     shell_display_quote(&decision.goal)
                 )],
             );
+            return Ok(());
         }
-        return Ok(());
+        return resolve_start_semantic_reviewer(decision, args, paths, defaults);
     }
 
     match decision.selected_mode {
@@ -1976,7 +2087,7 @@ pub(crate) fn resolve_start_orchestration_options(
         }
         StartSelectedMode::Extend | StartSelectedMode::Run => {}
     }
-    Ok(())
+    resolve_start_semantic_reviewer(decision, args, paths, defaults)
 }
 
 /// The one question `start` may ask (C-P8), and only when no contract was
@@ -2355,7 +2466,13 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
         format!("{provider}/{}", model.unwrap_or("provider default"))
     };
     match decision.selected_mode {
-        StartSelectedMode::Extend | StartSelectedMode::Run => None,
+        StartSelectedMode::Extend | StartSelectedMode::Run => {
+            let reviewer = decision.reviewer_provider_route.as_deref()?;
+            Some(format!(
+                "done reviewer={}",
+                role(reviewer, decision.reviewer_model.as_deref())
+            ))
+        }
         StartSelectedMode::Review => {
             let route = decision.provider_route.as_deref()?;
             let coder = decision.coder_provider_route.as_deref().unwrap_or(route);
@@ -2382,8 +2499,9 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
                     CliPlanMode::FullPlan,
                 )
             });
+            let reviewer = decision.reviewer_provider_route.as_deref().unwrap_or(child);
             let mut summary = format!(
-                "implementors={n}, planner={}, implementor={}",
+                "implementors={n}, planner={}, implementor={}, done reviewer={}",
                 role(
                     planner,
                     start_role_model(decision, planner, decision.planner_model.as_deref())
@@ -2391,6 +2509,10 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
                 role(
                     child,
                     start_role_model(decision, child, decision.child_model.as_deref())
+                ),
+                role(
+                    reviewer,
+                    start_role_model(decision, reviewer, decision.reviewer_model.as_deref())
                 )
             );
             if !decision.child_provider_overrides.is_empty() {
@@ -2407,6 +2529,7 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
             let route = decision.provider_route.as_deref()?;
             let planner = decision.planner_provider_route.as_deref().unwrap_or(route);
             let child = decision.child_provider_route.as_deref().unwrap_or(route);
+            let reviewer = decision.reviewer_provider_route.as_deref().unwrap_or(child);
             let n = decision.child_count.unwrap_or_else(|| {
                 commands::orchestrate::recommend_child_count_for_goal(
                     &decision.goal,
@@ -2414,7 +2537,7 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
                 )
             });
             Some(format!(
-                "subs={n}, planner={}, implementor={}",
+                "subs={n}, planner={}, implementor={}, done reviewer={}",
                 role(
                     planner,
                     start_role_model(decision, planner, decision.planner_model.as_deref())
@@ -2422,6 +2545,10 @@ pub(crate) fn start_provider_role_summary(decision: &StartLaunchDecision) -> Opt
                 role(
                     child,
                     start_role_model(decision, child, decision.child_model.as_deref())
+                ),
+                role(
+                    reviewer,
+                    start_role_model(decision, reviewer, decision.reviewer_model.as_deref())
                 )
             ))
         }
@@ -4716,19 +4843,12 @@ async fn dispatch_advanced_start_job(
                     .or_else(|| provider_route.clone())
             })
             .flatten(),
-        reviewer_provider: review
-            .then(|| {
-                decision
-                    .reviewer_provider_route
-                    .clone()
-                    .or_else(|| provider_route.clone())
-            })
-            .flatten(),
+        reviewer_provider: decision.reviewer_provider_route.clone(),
         planner_model: (!review).then(|| decision.planner_model.clone()).flatten(),
         child_model: (!review).then(|| decision.child_model.clone()).flatten(),
         child_model_overrides: decision.child_model_overrides.clone(),
         coder_model: review.then(|| decision.coder_model.clone()).flatten(),
-        reviewer_model: review.then(|| decision.reviewer_model.clone()).flatten(),
+        reviewer_model: decision.reviewer_model.clone(),
         model: None,
         source_init_git: decision.resolved_source.as_ref().is_some_and(|source| {
             matches!(
@@ -4806,8 +4926,6 @@ fn start_orchestration_flags_present(args: &StartCommandArgs) -> bool {
         || !args.child_model.is_empty()
         || args.coder_provider.is_some()
         || args.coder_model.is_some()
-        || args.reviewer_provider.is_some()
-        || args.reviewer_model.is_some()
 }
 
 /// Whether the work a guided `start` launched is still running (recommend
@@ -5031,6 +5149,8 @@ id = "custom-small"
         decision.planner_model = Some("opus".to_string());
         decision.child_provider_route = Some("cli:codex".to_string());
         decision.child_model = Some("gpt-worker".to_string());
+        decision.reviewer_provider_route = Some("cli:claude-code".to_string());
+        decision.reviewer_model = Some("sonnet-review".to_string());
         decision.child_provider_overrides = vec!["1=cli:claude-code".to_string()];
         decision.child_model_overrides = vec!["1=sonnet".to_string()];
 
@@ -5042,6 +5162,11 @@ id = "custom-small"
         assert_eq!(
             plan.providers.default_child_model.as_deref(),
             Some("gpt-worker")
+        );
+        assert_eq!(plan.providers.reviewer.as_deref(), Some("cli:claude-code"));
+        assert_eq!(
+            plan.providers.reviewer_model.as_deref(),
+            Some("sonnet-review")
         );
         assert_eq!(
             plan.providers.children.get(&1).map(String::as_str),
@@ -5150,12 +5275,14 @@ mod start_footer_tests {
     use super::{
         ResolvedStartSource, StartLaunchInput, StartLaunchIntent, StartLaunchState,
         StartSelectedMode, StartSourceProvenance, StartSupervisorAdmission, guided_extension_args,
-        plan_launch_state_from, run_launch_state, set_resolved_start_source, start_footer_content,
-        start_launch_decision, start_launch_intent, start_launch_preview_facts, start_source_json,
+        plan_launch_state_from, resolve_start_semantic_reviewer, run_launch_state,
+        set_resolved_start_source, start_footer_content, start_launch_decision,
+        start_launch_intent, start_launch_preview_facts, start_source_json,
         start_supervisor_admission,
     };
     use crate::cli::{CliStartMode, StartCommandArgs};
     use crate::commands::supervisor_service::SupervisorServicePreflight;
+    use crate::{ConfigDefaults, DeadreckonPaths};
     use deadreckon_core::{PlanStatus, RunStatus};
 
     fn start_args() -> StartCommandArgs {
@@ -5188,6 +5315,70 @@ mod start_footer_tests {
             quiet: true,
             json: false,
         }
+    }
+
+    #[test]
+    fn start_compiler_refuses_a_generic_worker_before_done_authoring_without_a_reviewer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let defaults = ConfigDefaults::default();
+        let args = start_args();
+        let mut generic = start_launch_decision(StartLaunchInput {
+            goal: "generic worker fixture",
+            requested_mode: CliStartMode::Run,
+            stdin_is_tty: false,
+        });
+        generic.selected_mode = StartSelectedMode::Run;
+        generic.provider_route = Some("cli:copilot".to_string());
+
+        resolve_start_semantic_reviewer(&mut generic, &args, &paths, &defaults)
+            .expect("reviewer resolution");
+        let recovery = generic.recovery.expect("generic worker refusal");
+        assert!(recovery.message.contains("schema-only semantic reviewer"));
+        assert!(recovery.try_lines[0].contains("--reviewer-provider cli:codex"));
+
+        let configured_defaults = ConfigDefaults {
+            reviewer_provider: Some("cli:codex".to_string()),
+            reviewer_model: Some("gpt-configured-reviewer".to_string()),
+            ..ConfigDefaults::default()
+        };
+        let mut configured_generic = start_launch_decision(StartLaunchInput {
+            goal: "configured generic worker fixture",
+            requested_mode: CliStartMode::Run,
+            stdin_is_tty: false,
+        });
+        configured_generic.selected_mode = StartSelectedMode::Run;
+        configured_generic.provider_route = Some("cli:copilot".to_string());
+        resolve_start_semantic_reviewer(
+            &mut configured_generic,
+            &args,
+            &paths,
+            &configured_defaults,
+        )
+        .expect("configured reviewer resolution");
+        assert!(configured_generic.recovery.is_none());
+        assert_eq!(
+            configured_generic.reviewer_provider_route.as_deref(),
+            Some("cli:codex")
+        );
+        assert_eq!(
+            configured_generic.reviewer_model.as_deref(),
+            Some("gpt-configured-reviewer")
+        );
+
+        let mut native = start_launch_decision(StartLaunchInput {
+            goal: "native worker fixture",
+            requested_mode: CliStartMode::Run,
+            stdin_is_tty: false,
+        });
+        native.selected_mode = StartSelectedMode::Run;
+        native.provider_route = Some("cli:codex".to_string());
+        native.model = Some("gpt-review".to_string());
+        resolve_start_semantic_reviewer(&mut native, &args, &paths, &defaults)
+            .expect("native reviewer resolution");
+        assert!(native.recovery.is_none());
+        assert_eq!(native.reviewer_provider_route.as_deref(), Some("cli:codex"));
+        assert_eq!(native.reviewer_model.as_deref(), Some("gpt-review"));
     }
 
     #[test]

@@ -1,0 +1,3 @@
+{"type":"step_start","sessionID":"ses_fixture","part":{"type":"step-start"}}
+{"type":"text","sessionID":"ses_fixture","part":{"type":"text","text":"OPENCODE_FIXTURE_OK"}}
+{"type":"text","sessionID":"ses_fixture","part":{"type":null,"text":null}}

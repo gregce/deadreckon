@@ -746,6 +746,10 @@ fn preflight_real_proves_execution_routes_against_a_frozen_falsifiable_contract(
         "output=$(sh purpose.sh); test",
         "wait_for_verified_job",
         "deadreckon_bin\" run \"$goal\"",
+        "--reviewer-provider \"$reviewer\"",
+        "reviewer_for_route",
+        "semantic-reviewer",
+        "reviewer_route",
         "deadreckon_bin\" finish \"$job_id\"",
         "verified receipt delivered",
         "wait_for_provider_pid",
@@ -803,7 +807,7 @@ fn preflight_real_can_prove_every_registered_cli_route_without_overwriting_relea
 #[test]
 fn known_good_providers_schema_round_trips() {
     let fixture = serde_json::json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "recorded_at": "2026-06-10T00:00:00Z",
         "source_commit": "1".repeat(40),
         "deadreckon_version": "0.8.1",
@@ -821,6 +825,8 @@ fn known_good_providers_schema_round_trips() {
             {
                 "route": "cli:claude-code",
                 "binary_version": "2.1.172 (Claude Code)",
+                "reviewer_route": "cli:claude-code",
+                "reviewer_binary_version": "2.1.172 (Claude Code)",
                 "proof": "start -> 2+ real turns -> gate signed -> apply -> kill/resume",
                 "run_id": "abc123",
                 "operator": "greg"
@@ -829,7 +835,7 @@ fn known_good_providers_schema_round_trips() {
     });
     let text = serde_json::to_string_pretty(&fixture).expect("serialize");
     let parsed: JsonValue = serde_json::from_str(&text).expect("parse");
-    assert_eq!(parsed["schema_version"], 2);
+    assert_eq!(parsed["schema_version"], 3);
     assert!(parsed["bundle"]["binaries"]["dr-capture"]["sha256"].is_string());
     assert_eq!(parsed["providers"][0]["route"], "cli:claude-code");
 
@@ -838,7 +844,7 @@ fn known_good_providers_schema_round_trips() {
     {
         let value: JsonValue = serde_json::from_str(&committed).expect("committed file parses");
         assert!(
-            matches!(value["schema_version"].as_u64(), Some(1 | 2)),
+            matches!(value["schema_version"].as_u64(), Some(1 | 2 | 3)),
             "release/known-good-providers.json must be a recognized migration schema"
         );
         assert!(value["providers"].is_array(), "{value}");
@@ -894,7 +900,7 @@ fn source_bundle_identity_matches_every_compiled_release_helper() {
 }
 
 #[test]
-fn provider_proof_rejects_same_version_stale_bundles_and_missing_default_routes() {
+fn provider_proof_rejects_missing_reviewer_stale_bundles_and_missing_default_routes() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let known_good = temp.path().join("known-good.json");
     let version = workspace_version_string();
@@ -908,6 +914,8 @@ fn provider_proof_rejects_same_version_stale_bundles_and_missing_default_routes(
         serde_json::json!({
             "route": route,
             "binary_version": "provider 1.0",
+            "reviewer_route": route,
+            "reviewer_binary_version": "provider 1.0",
             "proof": "durable run -> verified receipt -> gate signed -> finish -> cancel/reap",
             "run_id": run_id.to_string().repeat(32),
             "operator": "release-test"
@@ -915,7 +923,7 @@ fn provider_proof_rejects_same_version_stale_bundles_and_missing_default_routes(
     };
     let fixture = |bundle: &str, providers: Vec<JsonValue>| {
         serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "recorded_at": "2026-08-04T12:00:00Z",
             "source_commit": "a".repeat(40),
             "deadreckon_version": version,
@@ -951,6 +959,39 @@ fn provider_proof_rejects_same_version_stale_bundles_and_missing_default_routes(
         "--known-good",
         known_good.to_str().expect("proof path"),
     ]);
+
+    let mut missing_reviewer = provider("cli:claude-code", '1');
+    missing_reviewer
+        .as_object_mut()
+        .expect("provider object")
+        .remove("reviewer_route");
+    fs::write(
+        &known_good,
+        serde_json::to_vec_pretty(&fixture(
+            current_bundle,
+            vec![missing_reviewer, provider("cli:codex", '2')],
+        ))
+        .expect("missing reviewer fixture"),
+    )
+    .expect("write missing reviewer proof");
+    let missing_reviewer = release_trust([
+        "verify-provider-proof",
+        "--root",
+        workspace_root().to_str().expect("workspace path"),
+        "--version",
+        &version,
+        "--known-good",
+        known_good.to_str().expect("proof path"),
+    ]);
+    assert!(
+        !missing_reviewer.status.success(),
+        "provider proof without a reviewer route passed"
+    );
+    assert!(
+        String::from_utf8_lossy(&missing_reviewer.stderr).contains("reviewer_route"),
+        "{}",
+        String::from_utf8_lossy(&missing_reviewer.stderr)
+    );
 
     let stale_bundle = format!("deadreckon-bundle-build-id-sha256:{}", "0".repeat(64));
     fs::write(

@@ -41,8 +41,10 @@ pub(crate) async fn init_command(
             prompt::open("provider API key (leave blank to use env var): ", None).ok()
         }
     });
+    let reviewer = preferred_schema_reviewer_for_worker(&registry, &provider);
     let config = init_config_text(
         &provider,
+        reviewer.as_deref(),
         api_key.as_deref(),
         base_url.as_deref(),
         max_spend,

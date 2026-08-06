@@ -166,8 +166,11 @@ fn providers_listing_marks_contract_bearing_routes() {
         .find(|line| line.contains("cli:gemini"))
         .expect("Gemini row");
     assert!(pi.contains("contract=yes"), "{pi}");
+    assert!(pi.contains("review=external"), "{pi}");
     assert!(copilot.contains("contract=yes"), "{copilot}");
+    assert!(copilot.contains("review=external"), "{copilot}");
     assert!(gemini.contains("contract=no"), "{gemini}");
+    assert!(gemini.contains("review=external"), "{gemini}");
 
     let json_output = deadreckon(temp.path())
         .args(["providers", "list", "--all", "--json"])
@@ -186,7 +189,18 @@ fn providers_listing_marks_contract_bearing_routes() {
     assert_eq!(contract("cli:pi"), Some(true));
     assert_eq!(contract("cli:copilot"), Some(true));
     assert_eq!(contract("cli:gemini"), Some(false));
-    assert_eq!(contract("cli:opencode"), Some(false));
+    assert_eq!(contract("cli:opencode"), Some(true));
+    let review = |id: &str| {
+        providers
+            .iter()
+            .find(|provider| provider["id"] == id)
+            .and_then(|provider| provider["schema_only_review"].as_bool())
+    };
+    assert_eq!(review("cli:copilot"), Some(false));
+    assert_eq!(review("cli:gemini"), Some(false));
+    assert_eq!(review("cli:opencode"), Some(false));
+    assert_eq!(review("cli:pi"), Some(false));
+    assert_eq!(review("cli:codex"), Some(true));
 }
 
 #[test]

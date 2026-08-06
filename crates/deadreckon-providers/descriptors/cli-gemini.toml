@@ -20,9 +20,11 @@ args = ["--version"]
 # `--output-format stream-json`, `--resume`, and `--session-id`, but the
 # installed credentials exit with IneligibleTierError/UNSUPPORTED_CLIENT
 # before any structured event is emitted. Keep this descriptor contract-less
-# until a real successful stream can be recorded as a fixture.
+# until a real successful stream can be recorded as a fixture. `--skip-trust`
+# and `--approval-mode yolo` are current 0.42.0 flags required for unattended
+# workspace edits; they do not claim a structured response contract.
 [exec_template]
-args_template = ["-p", "{prompt}"]
+args_template = ["-p", "{prompt}", "--skip-trust", "--approval-mode", "yolo"]
 model_arg = "--model"
 timeout_seconds = 1800
 
