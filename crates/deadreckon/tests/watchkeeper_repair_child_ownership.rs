@@ -282,7 +282,23 @@ impl RepairFixture {
             parent_consumed_repair,
             parent_receipt_exists: self.paths.job_receipt(&job_id).is_file(),
             job_view: format!("{view:#?}"),
+            artifact_diagnostics: self.artifact_diagnostics(&job_id),
             driver_stderr: driver_stderr(&self.paths, &job_id),
+        }
+    }
+
+    fn artifact_diagnostics(&self, job_id: &str) -> String {
+        match self.shape {
+            RepairShape::Graph => match deadreckon_core::load_plan(&self.paths, job_id) {
+                Ok(plan) => format!("{:#?}", plan.tasks),
+                Err(error) => format!("could not load Graph plan: {error}"),
+            },
+            RepairShape::Campaign => {
+                match deadreckon_core::campaign::read_campaign(&self.paths.plan_dir(job_id)) {
+                    Ok(campaign) => format!("{campaign:#?}"),
+                    Err(error) => format!("could not load Campaign: {error}"),
+                }
+            }
         }
     }
 
@@ -310,7 +326,8 @@ impl RepairFixture {
                 ],
                 "providers": {
                     "planner": self.provider_id,
-                    "coder": self.provider_id
+                    "coder": self.provider_id,
+                    "reviewer": "cli:codex"
                 },
                 "budget": {
                     "ceiling_usd": 2.0,
@@ -359,6 +376,8 @@ impl RepairFixture {
                 &self.provider_id,
                 "--provider",
                 &self.provider_id,
+                "--reviewer-provider",
+                "cli:codex",
                 "--max-spend",
                 "4",
                 "--max-wall-seconds",
@@ -406,6 +425,7 @@ struct RepairObservation {
     parent_consumed_repair: bool,
     parent_receipt_exists: bool,
     job_view: String,
+    artifact_diagnostics: String,
     driver_stderr: String,
 }
 
@@ -459,10 +479,12 @@ fn assert_repair_trust_invariant(observation: &RepairObservation) {
 
 #[cfg(target_os = "macos")]
 fn assert_trusted_repair_launched(observation: &RepairObservation) {
-    let ownership = observation
-        .repair_owner
-        .as_ref()
-        .expect("durable repair child must retain parent ownership");
+    let Some(ownership) = observation.repair_owner.as_ref() else {
+        panic!(
+            "durable repair child must retain parent ownership\nJob:\n{}\nArtifact:\n{}\nDriver stderr:\n{}",
+            observation.job_view, observation.artifact_diagnostics, observation.driver_stderr
+        );
+    };
     assert_eq!(ownership.job_id, observation.job_id);
     assert!(
         observation
@@ -568,6 +590,64 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&binary, permissions).expect("provider chmod");
 
+    let reviewer_binary = provider_root.join("repair-ownership-reviewer.sh");
+    fs::write(
+        &reviewer_binary,
+        r#"#!/bin/sh
+if [ "$*" = "exec --help" ]; then
+  printf '%s\n' 'resume --json --output-last-message --output-schema --ephemeral --ignore-user-config --ignore-rules --strict-config --disable'
+  exit 0
+fi
+if [ "$*" = "features list" ]; then
+  cat <<'FEATURES'
+apps stable true
+browser_use stable true
+browser_use_external stable true
+browser_use_full_cdp_access stable true
+code_mode stable true
+code_mode_host stable true
+computer_use stable true
+enable_mcp_apps stable true
+in_app_browser stable true
+multi_agent stable true
+plugins stable true
+shell_tool stable true
+standalone_web_search stable true
+unified_exec stable true
+web_search_request deprecated false
+FEATURES
+  exit 0
+fi
+case " $* " in
+  *" --version "*) printf '%s\n' 'codex-cli repair-reviewer-fixture' ; exit 0 ;;
+esac
+previous=
+last_message=
+for argument in "$@"; do
+  if [ "$previous" = "-o" ] || [ "$previous" = "--output-last-message" ]; then
+    last_message=$argument
+  fi
+  previous=$argument
+done
+if [ -n "$last_message" ]; then
+  cat > "$last_message" <<'ANSWER'
+{"decision":"achieved","summary":"The deterministic repair fixture satisfied its approved contract.","goal_coverage":[{"claim":"repair fixture contract","status":"met","evidence":["approved-contract","deterministic-gate"]}],"missing":[]}
+ANSWER
+fi
+cat <<'JSONL'
+{"type":"thread.started","thread_id":"repair-reviewer"}
+{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"{\"decision\":\"achieved\",\"summary\":\"The deterministic repair fixture satisfied its approved contract.\",\"goal_coverage\":[{\"claim\":\"repair fixture contract\",\"status\":\"met\",\"evidence\":[\"approved-contract\",\"deterministic-gate\"]}],\"missing\":[]}"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}
+JSONL
+"#,
+    )
+    .expect("reviewer executable");
+    let mut permissions = fs::metadata(&reviewer_binary)
+        .expect("reviewer metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&reviewer_binary, permissions).expect("reviewer chmod");
+
     fs::write(
         descriptor_root.join("repair-ownership-fixture.toml"),
         format!(
@@ -601,8 +681,12 @@ cli_max_wall_seconds = 180
 
 [providers."{provider_id}"]
 binary = "{binary}"
+
+[providers."cli:codex"]
+binary = "{reviewer_binary}"
 "#,
-            binary = binary.display()
+            binary = binary.display(),
+            reviewer_binary = reviewer_binary.display()
         ),
     )
     .expect("config");

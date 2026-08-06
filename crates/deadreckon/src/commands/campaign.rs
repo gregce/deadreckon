@@ -32,8 +32,10 @@ pub(crate) struct CampaignSubLaunch<'a> {
     pub(crate) plain: bool,
     pub(crate) planner_provider: Option<&'a str>,
     pub(crate) child_provider: Option<&'a str>,
+    pub(crate) reviewer_provider: Option<&'a str>,
     pub(crate) planner_model: Option<&'a str>,
     pub(crate) child_model: Option<&'a str>,
+    pub(crate) reviewer_model: Option<&'a str>,
     pub(crate) narrate: bool,
     pub(crate) narrator_model: Option<&'a str>,
     pub(crate) ancestor_task_keys: &'a [String],
@@ -123,11 +125,17 @@ pub(crate) fn build_sub_orchestrator_command(
     if let Some(provider) = launch.child_provider {
         command.arg("--provider").arg(provider);
     }
+    if let Some(reviewer) = launch.reviewer_provider {
+        command.arg("--reviewer-provider").arg(reviewer);
+    }
     if let Some(planner_model) = launch.planner_model {
         command.arg("--planner-model").arg(planner_model);
     }
     if let Some(child_model) = launch.child_model {
         command.arg("--model").arg(child_model);
+    }
+    if let Some(reviewer_model) = launch.reviewer_model {
+        command.arg("--reviewer-model").arg(reviewer_model);
     }
     if launch.narrate {
         command.arg("--narrate");
@@ -2516,8 +2524,10 @@ async fn execute_campaign_state(
                 plain,
                 planner_provider: planner.as_deref(),
                 child_provider: child_provider.as_deref(),
+                reviewer_provider: providers.reviewer.as_deref(),
                 planner_model: providers.planner_model.as_deref(),
                 child_model: providers.default_child_model.as_deref(),
+                reviewer_model: providers.reviewer_model.as_deref(),
                 narrate: campaign_narrate,
                 narrator_model: campaign_narrator_model.as_deref(),
                 ancestor_task_keys: &ancestor_task_keys,
@@ -3778,8 +3788,10 @@ mod model_argv_tests {
             plain: false,
             planner_provider: Some("smoke"),
             child_provider: Some("smoke"),
+            reviewer_provider: Some("cli:codex"),
             planner_model: Some("planner-mx"),
             child_model: Some("child-mx"),
+            reviewer_model: Some("reviewer-mx"),
             narrate: false,
             narrator_model: None,
             ancestor_task_keys: &[],
@@ -3797,6 +3809,8 @@ mod model_argv_tests {
         };
         assert_eq!(pair("--planner-model").as_deref(), Some("planner-mx"));
         assert_eq!(pair("--model").as_deref(), Some("child-mx"));
+        assert_eq!(pair("--reviewer-provider").as_deref(), Some("cli:codex"));
+        assert_eq!(pair("--reviewer-model").as_deref(), Some("reviewer-mx"));
     }
 
     #[test]
@@ -3815,8 +3829,10 @@ mod model_argv_tests {
             plain: false,
             planner_provider: Some("smoke"),
             child_provider: Some("smoke"),
+            reviewer_provider: Some("smoke"),
             planner_model: None,
             child_model: None,
+            reviewer_model: None,
             narrate: true,
             narrator_model: Some("haiku"),
             ancestor_task_keys: &[],

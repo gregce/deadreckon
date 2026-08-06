@@ -143,6 +143,8 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
         deadline,
         provider,
         model,
+        reviewer_provider,
+        reviewer_model,
         sandbox,
         acceptance,
         base,
@@ -202,6 +204,8 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 pre_job_wall_seconds: 0.0,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 sandbox,
                 acceptance,
                 base,
@@ -254,6 +258,8 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 pre_job_wall_seconds: 0.0,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 sandbox,
                 acceptance,
                 base,
@@ -422,6 +428,8 @@ pub(crate) async fn chain_command(args: ChainCommandArgs) -> Result<()> {
                 pre_job_wall_seconds: 0.0,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 sandbox,
                 acceptance,
                 base,
@@ -458,6 +466,8 @@ struct ChainCreateOptions {
     pre_job_wall_seconds: f64,
     provider: Option<String>,
     model: Option<String>,
+    reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
     sandbox: String,
     acceptance: Option<PathBuf>,
     base: Option<String>,
@@ -665,6 +675,15 @@ fn durable_chain_plan_command(root_goal: &str, n: u8, options: &ChainCreateOptio
     if let Some(model) = options.model.as_deref() {
         parts.push(format!("--model {}", quote_chain_goal_arg(model)));
     }
+    if let Some(provider) = options.reviewer_provider.as_deref() {
+        parts.push(format!(
+            "--reviewer-provider {}",
+            quote_chain_goal_arg(provider)
+        ));
+    }
+    if let Some(model) = options.reviewer_model.as_deref() {
+        parts.push(format!("--reviewer-model {}", quote_chain_goal_arg(model)));
+    }
     if options.sandbox != "none" && options.sandbox != "auto" {
         parts.push(format!(
             "--sandbox {}",
@@ -703,6 +722,8 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
         pre_job_wall_seconds,
         provider,
         model,
+        reviewer_provider,
+        reviewer_model,
         sandbox,
         acceptance,
         base,
@@ -919,6 +940,8 @@ async fn chain_create_command(options: ChainCreateOptions) -> Result<String> {
             ))
         })?,
         &adapter_manifest,
+        reviewer_provider,
+        reviewer_model,
         quiet,
     )
 }
@@ -1396,6 +1419,8 @@ fn schedule_linear_chain_job(
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
     contract_preview: &ChainContractPreview,
     adapter_manifest: &deadreckon_core::chain::DurableChainAdapterManifest,
+    reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
     quiet: bool,
 ) -> Result<String> {
     let job = create_linear_chain_job(
@@ -1409,6 +1434,8 @@ fn schedule_linear_chain_job(
             accepted_by,
             contract_preview,
             adapter_manifest,
+            reviewer_provider,
+            reviewer_model,
         },
     )?;
     commands::job::launch_detached_supervisor(paths, &job.job_id)?;
@@ -1429,6 +1456,8 @@ struct LinearChainJobRequest<'a> {
     accepted_by: deadreckon_protocol::AuthorityAcceptedBy,
     contract_preview: &'a ChainContractPreview,
     adapter_manifest: &'a deadreckon_core::chain::DurableChainAdapterManifest,
+    reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
 }
 
 fn create_linear_chain_job(
@@ -1445,6 +1474,20 @@ fn create_linear_chain_job(
     let adapter_manifest = request.adapter_manifest;
     adapter_manifest.verify()?;
     let defaults = config_defaults(paths)?;
+    let execution_providers = commands::plan::resolve_plan_providers(
+        paths,
+        &defaults,
+        deadreckon_core::plan::PlanMode::FullPlan,
+        chain.provider.clone(),
+        chain.provider.clone(),
+        None,
+        request.reviewer_provider.clone(),
+        commands::plan::PlanModelOverrides {
+            model: chain.model.clone(),
+            reviewer_model: request.reviewer_model.clone(),
+            ..commands::plan::PlanModelOverrides::default()
+        },
+    )?;
     let approved_max_spend_usd = chain.max_spend_usd.or(defaults.max_spend).unwrap_or(10.0);
     let approved_max_wall_seconds = chain
         .max_wall_seconds
@@ -1489,6 +1532,15 @@ fn create_linear_chain_job(
         )));
     }
     let mut launch = linear_chain_launch_plan(chain, adapter_manifest)?;
+    launch.providers.default_child = execution_providers.default_child.clone();
+    launch.providers.reviewer = execution_providers.reviewer.clone();
+    launch.providers.default_child_model = chain.model.clone();
+    launch.providers.reviewer_model = execution_providers.reviewer_model.clone();
+    for piece in &mut launch.pieces {
+        if piece.provider.is_none() {
+            piece.provider = execution_providers.default_child.clone();
+        }
+    }
     launch.budget.ceiling_usd = Some(execution_max_spend_usd);
     launch.budget.wall_seconds = Some(execution_max_wall_seconds);
     launch.budget.deadline = deadline;
@@ -1543,15 +1595,15 @@ fn create_linear_chain_job(
             // candidate is promoted only after the parent gate and judge.
             apply: deadreckon_core::plan::ApplyWhen::PerNode,
             planner_provider: None,
-            child_provider: chain.provider.clone(),
+            child_provider: execution_providers.default_child,
             child_provider_overrides: Vec::new(),
             coder_provider: None,
-            reviewer_provider: None,
+            reviewer_provider: execution_providers.reviewer,
             planner_model: None,
             child_model: chain.model.clone(),
             child_model_overrides: Vec::new(),
             coder_model: None,
-            reviewer_model: None,
+            reviewer_model: execution_providers.reviewer_model,
             model: None,
             source_init_git: false,
         }),
@@ -4803,8 +4855,8 @@ mod tests {
             base_branch: "main".to_string(),
             base_sha: "a".repeat(40),
             cwd: PathBuf::from("/tmp/deadreckon-chain-test"),
-            provider: Some("cli:test".to_string()),
-            model: Some("test-model".to_string()),
+            provider: Some("smoke".to_string()),
+            model: None,
             sandbox: "auto".to_string(),
             branch_policy: BranchPolicy::Stack,
             apply_mode: ApplyMode::Auto,
@@ -4850,6 +4902,8 @@ mod tests {
         let paths = DeadreckonPaths::from_home(home.path());
         let mut chain = sample_chain(&["first", "second", "third"]);
         chain.cwd = source.path().to_path_buf();
+        chain.provider = Some("cli:copilot".to_string());
+        chain.model = Some("copilot-worker".to_string());
         let acceptance = source.path().join("acceptance.yaml");
         fs::write(
             &acceptance,
@@ -4872,6 +4926,8 @@ mod tests {
                 accepted_by: deadreckon_protocol::AuthorityAcceptedBy::YesFlagGuardrail,
                 contract_preview: &contract_preview,
                 adapter_manifest: &adapter,
+                reviewer_provider: Some("cli:codex".to_string()),
+                reviewer_model: Some("gpt-review".to_string()),
             },
         )
         .expect("create graph job");
@@ -4890,6 +4946,15 @@ mod tests {
         assert_eq!(driver.kind, commands::graph_job::DriverKind::FullPlan);
         assert_eq!(driver.apply, deadreckon_core::plan::ApplyWhen::PerNode);
         assert_eq!(driver.child_count, Some(3));
+        assert_eq!(driver.child_provider.as_deref(), Some("cli:copilot"));
+        assert_eq!(driver.child_model.as_deref(), Some("copilot-worker"));
+        assert_eq!(driver.reviewer_provider.as_deref(), Some("cli:codex"));
+        assert_eq!(driver.reviewer_model.as_deref(), Some("gpt-review"));
+        assert_eq!(launch.providers.reviewer.as_deref(), Some("cli:codex"));
+        assert_eq!(
+            launch.providers.reviewer_model.as_deref(),
+            Some("gpt-review")
+        );
         assert_eq!(
             launch.signals["watchkeeper_pre_job_budget"]["approved_total_spend_usd"],
             3.0
@@ -5014,6 +5079,8 @@ mod tests {
                 accepted_by: deadreckon_protocol::AuthorityAcceptedBy::Operator,
                 contract_preview: &contract_preview,
                 adapter_manifest: &adapter,
+                reviewer_provider: None,
+                reviewer_model: None,
             },
         )
         .expect_err("planner exhausted the approved total");
