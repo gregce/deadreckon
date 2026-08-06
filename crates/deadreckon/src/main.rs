@@ -91,8 +91,8 @@ use deadreckon_protocol::{
     FlightEvent, FlightEventKind, RunEvent, RunEventKind, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::registry::{
-    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ProbeStatus,
-    ProviderDescriptor, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
+    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ModelCatalogOverride,
+    ProbeStatus, ProviderDescriptor, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
 };
 use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
@@ -103,7 +103,7 @@ use deadreckon_providers::{
 use deadreckon_runtime::{
     PolishConfig, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome, SeamKind, SeamPhaseOutcome,
     SeamRunCtx, SeamsConfig, polish_run_docs, read_seams_config, resolve_catalog_override,
-    resolve_catalog_override_phase, run_turn_loop,
+    resolve_catalog_override_phase, run_turn_loop, run_turn_loop_with_semantic_router,
 };
 use deadreckon_sandbox::SandboxBackend;
 use ratatui::Terminal;
@@ -3101,6 +3101,39 @@ async fn provider_router_for_run_with_catalog_seam(
     no_seams: bool,
     work_boundary: Option<deadreckon_runtime::RunWorkBoundary>,
 ) -> Result<ProviderRouter> {
+    let catalog_override =
+        resolve_provider_catalog_override_for_run(paths, state, backend, no_seams, work_boundary)
+            .await?;
+    provider_router_for_run_with_catalog_override(
+        paths,
+        provider_override,
+        model,
+        catalog_override.as_ref(),
+    )
+}
+
+fn provider_router_for_run_with_catalog_override(
+    paths: &DeadreckonPaths,
+    provider_override: Option<&str>,
+    model: Option<&str>,
+    catalog_override: Option<&ModelCatalogOverride>,
+) -> Result<ProviderRouter> {
+    ProviderRouter::from_config_path_with_model_and_catalog_override(
+        &paths.config_path(),
+        provider_override,
+        model,
+        catalog_override,
+    )
+    .map_err(Into::into)
+}
+
+async fn resolve_provider_catalog_override_for_run(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    backend: SandboxBackend,
+    no_seams: bool,
+    work_boundary: Option<deadreckon_runtime::RunWorkBoundary>,
+) -> Result<Option<ModelCatalogOverride>> {
     let seams = read_seams_config(&paths.config_path(), no_seams)?;
     let seam_ctx = SeamRunCtx {
         run_root: state.run_root.clone(),
@@ -3152,13 +3185,7 @@ async fn provider_router_for_run_with_catalog_seam(
     } else {
         resolve_catalog_override(&seams, &seam_ctx).await?
     };
-    ProviderRouter::from_config_path_with_model_and_catalog_override(
-        &paths.config_path(),
-        provider_override,
-        model,
-        catalog_override.as_ref(),
-    )
-    .map_err(Into::into)
+    Ok(catalog_override)
 }
 
 fn config_command(command: ConfigCommand) -> Result<()> {
