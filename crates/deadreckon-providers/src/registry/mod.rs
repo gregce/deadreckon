@@ -161,6 +161,7 @@ pub struct ContractSection {
     pub error_message_path: Option<String>,
     pub flight_event_paths: Vec<String>,
     pub resume_args: Vec<String>,
+    pub probe_args: Vec<String>,
     pub probe_substring: Option<String>,
 }
 
@@ -181,6 +182,12 @@ impl ContractSection {
         if self.stream_args.iter().any(|arg| arg.is_empty()) {
             return Err(ContractValidationError {
                 field: "stream_args",
+                detail: "arguments must not be empty".to_string(),
+            });
+        }
+        if self.probe_args.iter().any(|arg| arg.is_empty()) {
+            return Err(ContractValidationError {
+                field: "probe_args",
                 detail: "arguments must not be empty".to_string(),
             });
         }
