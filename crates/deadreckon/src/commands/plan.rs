@@ -366,31 +366,59 @@ pub(crate) fn resolve_plan_providers(
             .or(default_child.clone())
             .or(defaults.provider.clone()),
     )?;
-    let configured_reviewer_model = (reviewer.as_deref() == defaults.reviewer_provider.as_deref())
-        .then_some(defaults.reviewer_model.as_ref())
-        .flatten()
-        .or_else(|| configured_model_for_provider(reviewer.as_ref(), defaults));
-    let reviewer_model = reviewer.as_ref().and(resolve_role_model(
-        models.reviewer_model.as_ref(),
+    let default_child_model = resolve_role_model(
+        None,
         models.model.as_ref(),
-        configured_reviewer_model,
-    ));
+        configured_model_for_provider(default_child.as_ref(), defaults),
+    );
+    let planner_model = planner.as_ref().and_then(|provider| {
+        models
+            .planner_model
+            .clone()
+            .or_else(|| {
+                (Some(provider) == default_child.as_ref())
+                    .then(|| default_child_model.clone())
+                    .flatten()
+            })
+            .or_else(|| configured_model_for_provider(Some(provider), defaults).cloned())
+    });
+    let coder_model = coder.as_ref().and_then(|provider| {
+        models
+            .coder_model
+            .clone()
+            .or_else(|| {
+                (Some(provider) == default_child.as_ref())
+                    .then(|| default_child_model.clone())
+                    .flatten()
+            })
+            .or_else(|| configured_model_for_provider(Some(provider), defaults).cloned())
+    });
+    let configured_reviewer_role_model = (reviewer.as_deref()
+        == defaults.reviewer_provider.as_deref())
+    .then_some(defaults.reviewer_model.as_ref())
+    .flatten();
+    let matching_role_model = if reviewer == coder {
+        coder_model.as_ref()
+    } else if reviewer == default_child {
+        default_child_model.as_ref()
+    } else if reviewer == planner {
+        planner_model.as_ref()
+    } else {
+        None
+    };
+    let reviewer_model = reviewer.as_ref().and_then(|_| {
+        models
+            .reviewer_model
+            .as_ref()
+            .or(configured_reviewer_role_model)
+            .or(matching_role_model)
+            .or_else(|| configured_model_for_provider(reviewer.as_ref(), defaults))
+            .cloned()
+    });
     let providers = PlanProviders {
-        planner_model: planner.as_ref().and(resolve_role_model(
-            models.planner_model.as_ref(),
-            models.model.as_ref(),
-            configured_model_for_provider(planner.as_ref(), defaults),
-        )),
-        default_child_model: resolve_role_model(
-            None,
-            models.model.as_ref(),
-            configured_model_for_provider(default_child.as_ref(), defaults),
-        ),
-        coder_model: coder.as_ref().and(resolve_role_model(
-            models.coder_model.as_ref(),
-            models.model.as_ref(),
-            configured_model_for_provider(coder.as_ref(), defaults),
-        )),
+        planner_model,
+        default_child_model,
+        coder_model,
         reviewer_model,
         child_models: models.child_models,
         planner,
@@ -2317,6 +2345,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         child_provider,
         coder_provider,
         reviewer_provider,
+        reviewer_model,
         no_repair,
         repair_provider,
         yes: _,
@@ -2395,6 +2424,7 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         &child_provider,
         coder_provider,
         reviewer_provider,
+        reviewer_model,
     )?;
     let defaults = config_defaults(&paths)?;
     freeze_legacy_plan_semantic_reviewer(&mut plan.providers, &defaults);
@@ -3051,6 +3081,7 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
         child_provider,
         coder_provider,
         reviewer_provider,
+        reviewer_model,
         no_repair,
         repair_provider,
         yes,
@@ -3117,6 +3148,7 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
         &child_provider,
         coder_provider,
         reviewer_provider,
+        reviewer_model,
     )?;
     let defaults = config_defaults(&paths)?;
     freeze_legacy_plan_semantic_reviewer(&mut plan.providers, &defaults);
@@ -4760,6 +4792,7 @@ fn apply_fork_provider_overrides(
     child_provider: &[String],
     coder_provider: Option<String>,
     reviewer_provider: Option<String>,
+    reviewer_model: Option<String>,
 ) -> Result<()> {
     match plan.mode {
         PlanMode::FullPlan => {
@@ -4796,6 +4829,9 @@ fn apply_fork_provider_overrides(
     }
     if let Some(provider) = reviewer_provider {
         plan.providers.reviewer = Some(provider.clone());
+        // A model id belongs to its provider route. Changing the route must
+        // never retain the prior provider's model by accident.
+        plan.providers.reviewer_model = reviewer_model;
         if let Some(task) = plan
             .tasks
             .iter_mut()
@@ -4803,6 +4839,8 @@ fn apply_fork_provider_overrides(
         {
             task.provider = Some(provider);
         }
+    } else if reviewer_model.is_some() {
+        plan.providers.reviewer_model = reviewer_model;
     }
     Ok(())
 }
@@ -5370,6 +5408,26 @@ fn child_argv(
     }
     if let Some(model) = child_model_for_task(&plan.providers, task) {
         argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    if let Some(reviewer) = plan.providers.reviewer.as_deref() {
+        argv.push("--reviewer-provider".to_string());
+        // `smoke:*` labels let orchestration tests prove route selection, but
+        // every scripted smoke label executes through the one registered
+        // `smoke` adapter. Preserve the label in the Plan and canonicalize
+        // only at the child-process boundary, just as the worker route above
+        // already does.
+        argv.push(
+            if reviewer == "smoke" || reviewer.starts_with("smoke:") {
+                "smoke"
+            } else {
+                reviewer
+            }
+            .to_string(),
+        );
+    }
+    if let Some(model) = plan.providers.reviewer_model.as_deref() {
+        argv.push("--reviewer-model".to_string());
         argv.push(model.to_string());
     }
     argv
@@ -6036,6 +6094,27 @@ mod tests {
         .expect("explicit schema reviewer");
         assert_eq!(providers.default_child.as_deref(), Some("cli:copilot"));
         assert_eq!(providers.reviewer.as_deref(), Some("cli:codex"));
+
+        let split_models = resolve_plan_providers(
+            &paths,
+            &defaults,
+            PlanMode::FullPlan,
+            Some("cli:codex".to_string()),
+            Some("cli:copilot".to_string()),
+            None,
+            Some("cli:codex".to_string()),
+            PlanModelOverrides {
+                model: Some("copilot-worker-model".to_string()),
+                ..PlanModelOverrides::default()
+            },
+        )
+        .expect("worker model does not leak across provider routes");
+        assert_eq!(
+            split_models.default_child_model.as_deref(),
+            Some("copilot-worker-model")
+        );
+        assert_eq!(split_models.planner_model, None);
+        assert_eq!(split_models.reviewer_model, None);
 
         let configured_defaults = ConfigDefaults {
             reviewer_provider: Some("cli:codex".to_string()),
@@ -6887,7 +6966,10 @@ mod seed_graph_tests {
 
 #[cfg(test)]
 mod model_routing_tests {
-    use super::{child_argv, child_model_for_task, configured_model_for_provider};
+    use super::{
+        apply_fork_provider_overrides, child_argv, child_model_for_task,
+        configured_model_for_provider,
+    };
     use crate::ConfigDefaults;
     use deadreckon_core::plan::{Plan, PlanProviders, PlanTask, PlanTaskStatus, TaskAttempt};
 
@@ -7098,6 +7180,99 @@ mod model_routing_tests {
         );
 
         assert_eq!(argv.first().map(String::as_str), Some("run"), "{argv:?}");
+    }
+
+    #[test]
+    fn every_plan_child_inherits_the_frozen_semantic_reviewer() {
+        let mut plan = narrate_plan();
+        plan.providers.reviewer = Some("cli:codex".to_string());
+        plan.providers.reviewer_model = Some("gpt-review".to_string());
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--reviewer-provider", "cli:codex"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--reviewer-model", "gpt-review"]),
+            "{argv:?}"
+        );
+    }
+
+    #[test]
+    fn scripted_reviewer_labels_canonicalize_only_at_the_child_boundary() {
+        let mut plan = narrate_plan();
+        plan.providers.reviewer = Some("smoke:reviewer".to_string());
+
+        let argv = child_argv(
+            &plan,
+            &plan.tasks[0],
+            "do the thing",
+            std::path::Path::new("/src"),
+            false,
+            "none",
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            argv.windows(2)
+                .find(|pair| pair[0] == "--reviewer-provider")
+                .map(|pair| pair[1].as_str()),
+            Some("smoke")
+        );
+        assert_eq!(plan.providers.reviewer.as_deref(), Some("smoke:reviewer"));
+    }
+
+    #[test]
+    fn fork_reviewer_override_cannot_retain_the_previous_routes_model() {
+        let mut plan = narrate_plan();
+        plan.providers.reviewer = Some("cli:claude-code".to_string());
+        plan.providers.reviewer_model = Some("claude-opus".to_string());
+
+        apply_fork_provider_overrides(
+            &mut plan,
+            None,
+            &[],
+            None,
+            Some("cli:codex".to_string()),
+            None,
+        )
+        .expect("reviewer override");
+
+        assert_eq!(plan.providers.reviewer.as_deref(), Some("cli:codex"));
+        assert_eq!(plan.providers.reviewer_model, None);
+
+        apply_fork_provider_overrides(
+            &mut plan,
+            None,
+            &[],
+            None,
+            Some("cli:codex".to_string()),
+            Some("gpt-review".to_string()),
+        )
+        .expect("reviewer and model override");
+        assert_eq!(plan.providers.reviewer_model.as_deref(), Some("gpt-review"));
     }
 
     #[test]

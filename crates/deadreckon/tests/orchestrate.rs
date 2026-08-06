@@ -2981,7 +2981,8 @@ fn fork_launches_each_child_with_resolved_provider() {
     assert!(
         plan.tasks
             .iter()
-            .all(|task| task.status == PlanTaskStatus::Completed)
+            .all(|task| task.status == PlanTaskStatus::Completed),
+        "{plan:#?}"
     );
 }
 

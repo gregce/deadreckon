@@ -1829,7 +1829,7 @@ pub(crate) async fn reshape_command(args: ReshapeArgs) -> Result<()> {
                 .map(|(index, provider)| format!("{index}={provider}"))
                 .collect(),
             coder_provider: None,
-            reviewer_provider: None,
+            reviewer_provider: plan.providers.reviewer.clone(),
             planner_model: plan.providers.planner_model.clone(),
             model: plan.providers.default_child_model.clone(),
             child_model: plan
