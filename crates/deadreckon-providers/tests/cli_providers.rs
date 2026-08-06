@@ -1357,6 +1357,70 @@ model_arg = "--model"
 }
 
 #[tokio::test]
+async fn builtin_opencode_binds_its_project_to_the_request_worktree() {
+    let temp = TempDir::new().expect("tempdir");
+    let workspace = temp.path().join("frozen-worktree");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let binary = temp.path().join("fake-opencode");
+    let fixture = include_str!("fixtures/pennant/opencode-success.jsonl");
+    fs::write(
+        &binary,
+        format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"--help\" ]; then\n\
+  printf '%s\\n' 'Options: --dir --format --auto'\n\
+  exit 0\n\
+fi\n\
+cat <<'JSONL'\n{fixture}\nJSONL\n"
+        ),
+    )
+    .expect("write fake opencode");
+    chmod_exec(&binary);
+    let router = ProviderRouter::from_config(
+        ProviderConfigFile {
+            default_provider: None,
+            fallback: Some(vec!["cli:opencode".to_string()]),
+            providers: [(
+                "cli:opencode".to_string(),
+                ProviderEntry {
+                    kind: None,
+                    api_key: None,
+                    api_key_env: None,
+                    base_url: None,
+                    model: None,
+                    input_cost_per_million: Some(0.0),
+                    output_cost_per_million: Some(0.0),
+                    binary: Some(binary.display().to_string()),
+                    extra_args: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        },
+        None,
+    )
+    .expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "ship it".to_string(),
+            cwd: Some(workspace.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "OPENCODE_FIXTURE_OK");
+    let args = response.trace["args"].as_array().expect("args");
+    assert_eq!(args[0], "run");
+    assert_eq!(args[1], "--dir");
+    assert_eq!(args[2], workspace.display().to_string());
+    assert!(args.iter().any(|arg| arg == "--format"));
+    assert!(args.iter().any(|arg| arg == "--auto"));
+    assert_eq!(args.last().and_then(|arg| arg.as_str()), Some("ship it"));
+}
+
+#[tokio::test]
 async fn generic_cli_provider_runs_builtin_copilot_descriptor() {
     let temp = TempDir::new().expect("tempdir");
     let binary = temp.path().join("fake-copilot");
