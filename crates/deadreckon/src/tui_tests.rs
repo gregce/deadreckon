@@ -3318,7 +3318,7 @@ fn start_full_plan_picker_collects_child_count_and_role_providers() {
     assert_eq!(
         start_provider_role_summary(&decision).as_deref(),
         Some(
-            "implementors=5, planner=smoke/local-scripted-smoke, implementor=smoke/local-scripted-smoke, overrides=1=smoke, model-overrides=1=local-scripted-smoke"
+            "implementors=5, planner=smoke/local-scripted-smoke, implementor=smoke/local-scripted-smoke, done reviewer=smoke/local-scripted-smoke, overrides=1=smoke, model-overrides=1=local-scripted-smoke"
         )
     );
 }
