@@ -1,4 +1,8 @@
-# Research Brief: DeadReckon, the Operator's Burden, and What Harnesses Actually Provide
+# Research brief for the first harness essay draft
+
+> This brief records the first research pass for commit `75a9a175`. Some current
+> product facts and several inferences in it needed correction. Read
+> [`SOURCE-AUDIT.md`](SOURCE-AUDIT.md) before using a claim from this file.
 
 Assembled from 8 research packets. Every claim below is traceable to a packet finding; file citations are preserved verbatim. **Nothing in this brief was observed at runtime** — see §6.
 

@@ -2730,3 +2730,492 @@ open http://localhost:3000/what-coding-agents-leave-to-the-operator
 ```
 
 Check that the opening now states the acceptance argument directly and that the product table scrolls horizontally without crushing its columns. The public site has not been deployed.
+
+---
+
+_**User (2026-08-06 17:34:59Z)**_
+
+based on what we wrote how can we summarize in concrete bullets the main issues that modern coding agents leave to the operator
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:35:28Z)**_
+
+Modern coding agents handle more execution, but the operator still owns acceptance and continuity.
+
+- Define the exact result. A broad prompt lets the agent make product decisions during the run.
+
+- State what completion means. The operator must name the tests, measurements, or review criteria before work begins.
+
+- Check meaning, not just execution. Tests can pass while the result still solves the wrong problem.
+
+- Keep proof outside the worker’s control. An agent’s final message and self-run tests are claims, not independent evidence.
+
+- Bind proof to the exact result. The commit or file state that passed must be the same one that gets accepted.
+
+- Preserve the job across restarts. A saved chat restores context, but it does not provide one durable record of attempts, limits, evidence, and decisions.
+
+- Enforce total limits. Time, token use, cost, and attempt counts must survive retries and session resumes.
+
+- Reconcile different agent products. Claude Code, Codex, and Pi use different completion events, permission rules, state formats, and cost units.
+
+- Control unattended access. The operator must decide which files, commands, network destinations, and outside tools the agent may use without approval.
+
+- Isolate candidate work. Parallel agents need separate working copies so they do not overwrite each other or alter the shared repository during review.
+
+- Control promotion. A worktree or passing test does not decide whether a change may enter the shared branch.
+
+- Handle missing evidence safely. If a required check did not run or its output disappeared, the system must refuse completion rather than infer success.
+
+- Keep an audit record. The operator needs the approved goal, exact inputs, actions taken, proof produced, accepted result, and final publication decision.
+
+The core distinction is simple: the agent produces a candidate result. The operator still needs a process that decides whether that exact result may be trusted and accepted.
+
+---
+
+_**User (2026-08-06 17:36:53Z)**_
+
+How can we write it as a set of problems (like what coding agents allow the operator to do first that they didnt before) and then all the extra work and action and machinery. Human first.
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:37:33Z)**_
+
+I would organize it as a sequence of new human abilities. Each ability creates a new problem, new operator work, and a need for supporting software.
+
+Modern agents do not only save typing. They let the operator change how they work.
+
+| What the operator can do now | The problem this creates | What the operator must do | Machinery needed |
+|---|---|---|---|
+| Ask for a result instead of directing each edit | The agent must make choices that the operator once made during the work | Define the approved result, constraints, and exclusions before the run | A saved job contract with clear completion checks |
+| Leave while the agent works | The operator cannot correct each bad choice as it happens | Set access rules, limits, and conditions that require human input | A sandbox, an approval policy, a watchdog, and durable cancellation |
+| Give one agent hours of work | One process can fail, lose context, or restart its counters | Decide when to resume, retry, stop, or ask for review | A job record that survives the process, with checkpoints and cumulative limits |
+| Run several agents at once | Agents can edit the same files or produce results that do not fit together | Divide the work, assign ownership, and reconcile the results | Separate working copies, a task record, and controlled integration |
+| Use different agent products for different tasks | Each product reports completion, cost, permissions, and state differently | Choose the right product and understand its actual boundary | Product adapters that preserve raw events while providing a common job record |
+| Let the agent run its own tests | The worker can select the proof, alter it, or describe it inaccurately | Decide what evidence is required and inspect any unresolved judgment | A trusted check runner and a separate meaning review |
+| Return to a finished candidate | The result may have changed after its tests passed | Confirm that the reviewed result is the exact result that produced the evidence | Content hashes and a receipt that binds the result to its proof |
+| Keep candidate work outside the shared repository | Isolation prevents damage but does not decide whether the work belongs in the product | Accept, reject, revise, or publish the candidate | A separate promotion step and a reliable way to undo it |
+| Produce changes faster than a person can review them | Human attention becomes the limit | Decide which results need judgment and which checks can settle automatically | Clear review queues, short evidence summaries, and records of unresolved proof |
+
+The argument then becomes:
+
+Coding agents let the operator stop directing every action. That freedom moves important decisions to the beginning and end of the work. Before the run, the operator must define the result and its limits. After the run, the operator must decide whether the evidence supports accepting that exact result. The machinery between those decisions must preserve the operator’s authority while the agent works.
+
+That is the human first story. The operator gains distance from execution, but that distance requires stronger specification, control, evidence, and acceptance.
+
+---
+
+_**User (2026-08-06 17:38:53Z)**_
+
+give some examples of this Coding agents let the operator stop directing every action.
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:39:16Z)**_
+
+For example, the operator can now describe the result and let the agent choose many of the steps.
+
+- “Add password reset using our existing email service. Tokens must expire after 30 minutes. Add tests.”  
+  The agent finds the authentication code, studies existing patterns, changes the database, adds the routes, updates the interface, and runs the tests.
+
+- “Fix the checkout failure reported in issue 412.”  
+  The agent reads the issue, reproduces the failure, traces the request, finds the cause, writes a regression test, applies the fix, and reruns the suite.
+
+- “Move this project from JavaScript to strict TypeScript without changing its behavior.”  
+  The agent finds the affected files, changes types, resolves compiler errors, updates configuration, and continues until the build passes.
+
+- “Replace the old billing client throughout the repository.”  
+  The agent finds every use, studies the new client, changes each call site, updates mocks, and runs integration tests.
+
+- “Make this page match the supplied design.”  
+  The agent inspects the existing components, edits the layout and styles, opens the page, compares the result, and corrects visible problems.
+
+- “Find why the continuous integration build fails on Linux and fix it.”  
+  The agent reads the logs, compares local and remote settings, reproduces the failure, changes the relevant code, and reruns the failing command.
+
+- “Split this large module without changing its public interface.”  
+  The agent maps the dependencies, chooses module boundaries, moves the code, updates imports, and confirms that existing callers still work.
+
+- “Review this change for security problems and fix anything you can prove.”  
+  The agent inspects the diff, traces affected data paths, writes focused tests, fixes confirmed problems, and records anything it could not verify.
+
+- “Implement this specification and keep working until every acceptance check passes.”  
+  The agent plans the work, edits the repository, responds to test failures, and starts another turn when the checks still fail.
+
+In older use, the operator might have directed each step:
+
+1. Open the authentication controller.
+2. Find the token model.
+3. Add an expiry field.
+4. Create the reset endpoint.
+5. Write a test.
+6. Run the test.
+7. Fix the failure.
+
+A modern coding agent can choose and carry out those actions itself. The operator can focus on the requested result, the limits, and the evidence required for acceptance.
+
+---
+
+_**User (2026-08-06 17:41:24Z)**_
+
+› I want to take this example
+ 
+  Fix the checkout failure reported in issue 412.
+  The agent reads the issue, reproduces the failure, traces the request, finds the cause,
+      writes a regression test, applies the fix, and reruns the suite.
+ 
+  but then enumerate ALL of the problems (not the deadreckon example) THAT are unaccounted for after it
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:42:29Z)**_
+
+Even if the agent performs every stated action, it has produced a candidate fix. The following questions remain unanswered.
+
+### Understanding the request
+
+1. Is issue 412 still current, or has the code changed since it was filed?
+
+2. Does the issue describe the actual failure, or only the symptom the reporter saw?
+
+3. What checkout behavior did the reporter expect?
+
+4. Which checkout path failed? The answer could differ by payment method, customer type, currency, device, or country.
+
+5. Does “fix” mean removing the error, completing the purchase, preserving inventory, or satisfying another business rule?
+
+6. What behavior must remain unchanged?
+
+7. What work is outside the scope of this fix?
+
+8. Who has authority to resolve ambiguity in the issue?
+
+### Reproducing the failure
+
+9. Did the agent reproduce the exact reported failure or a similar failure?
+
+10. Did it use the same code revision that produced the report?
+
+11. Did it use a representative browser, operating system, database, and payment provider?
+
+12. Did it use data with the same important properties as the failing order?
+
+13. Does the failure depend on timing, concurrency, stale state, or an outside service?
+
+14. Is the failure consistent, or did the reproduction succeed only once?
+
+15. Did reproduction require access to private customer data or production systems?
+
+16. Was the agent allowed to use that access?
+
+17. Did reproduction change any shared data or trigger a real payment, email, webhook, or order?
+
+### Finding the cause
+
+18. Did the agent find the cause or only a place where it could suppress the symptom?
+
+19. What evidence connects the proposed cause to the reported failure?
+
+20. Did the agent consider other possible causes?
+
+21. Could the same cause affect other checkout paths?
+
+22. Could the proposed fix hide future failures instead of reporting them?
+
+23. Did the agent change more code than the cause required?
+
+24. Did it introduce a new dependency or change an existing dependency?
+
+25. Did it alter configuration, generated files, database state, or infrastructure outside the main diff?
+
+### Writing the regression test
+
+26. Did the regression test fail before the fix?
+
+27. Did it fail for the same reason as issue 412?
+
+28. Did it pass only after the fix?
+
+29. Does the test check the customer outcome or merely confirm an implementation detail?
+
+30. Could the test pass while checkout still fails in a real browser or against the payment provider?
+
+31. Did the agent weaken an existing assertion, fixture, timeout, or test setting?
+
+32. Did it mark a test as skipped or exclude a failing path?
+
+33. Is the test stable when run repeatedly?
+
+34. Does the test cover both the successful checkout and the expected failure behavior?
+
+35. Does it cover the relevant payment methods, currencies, and customer states?
+
+36. Will the test still detect the problem after an unrelated refactor?
+
+### Evaluating the change
+
+37. Did the relevant test suite pass, or only one selected test?
+
+38. Did the agent run static checks, type checks, and database checks that apply to the changed code?
+
+39. Did it test the user interface and the server behavior together?
+
+40. Did it test failure paths such as payment rejection, a network timeout, and a repeated submission?
+
+41. Does the fix preserve payment idempotency so one action cannot create 2 charges?
+
+42. Does it preserve inventory, tax, discount, and shipping calculations?
+
+43. Does it preserve analytics, receipts, webhooks, and order records?
+
+44. Does it create a security or privacy problem?
+
+45. Does it expose payment details, customer data, secrets, or internal errors?
+
+46. Does it affect checkout speed or place more load on an outside service?
+
+47. Does it remain compatible with supported browsers and deployed service versions?
+
+48. Does it require a database migration or a configuration change?
+
+49. Can that migration be applied without blocking checkout?
+
+50. Can the change be reversed safely?
+
+### Trusting the evidence
+
+51. Are the test logs and other evidence available for review?
+
+52. Do the logs identify the commands, environment, and code revision that produced them?
+
+53. Did the agent summarize the evidence accurately?
+
+54. Did any required check fail, time out, or remain unavailable?
+
+55. Did the agent control both the implementation and all the evidence used to judge it?
+
+56. Did another person or system independently inspect the important claims?
+
+57. Is the tested code exactly the same code now proposed for acceptance?
+
+58. Did any file change after the tests passed?
+
+59. Can the operator reproduce the result from the recorded instructions?
+
+### Managing the repository
+
+60. Did the agent start from the correct branch and commit?
+
+61. Were there uncommitted changes before it began?
+
+62. Did it overwrite work that belonged to someone else?
+
+63. Did the main branch change while the agent worked?
+
+64. Does the fix still apply cleanly to the current main branch?
+
+65. Are merge conflicts resolved without changing the tested behavior?
+
+66. Are all generated files, lockfiles, and migrations included?
+
+67. Is the final diff limited to the approved issue?
+
+### Deciding whether to accept the fix
+
+68. Who reviews the code?
+
+69. Who decides that the behavior matches the product requirement?
+
+70. Who accepts any remaining risk?
+
+71. Which unresolved questions must block acceptance?
+
+72. Which unresolved questions can be recorded for later work?
+
+73. Does the change require approval from security, payments, support, or another owner?
+
+74. Is issue 412 updated with the cause, fix, and evidence?
+
+75. Does the pull request explain what changed and why?
+
+76. Is the exact accepted result recorded?
+
+### Releasing the fix
+
+77. Who may merge or deploy the change?
+
+78. Should the fix go through a test environment first?
+
+79. Does it need a feature flag or limited rollout?
+
+80. What production signal will show that checkout now works?
+
+81. What signal will show that the fix caused a new problem?
+
+82. How long should someone watch those signals?
+
+83. Who responds if checkout failures increase?
+
+84. What is the rollback procedure?
+
+85. Can the rollback restore code, configuration, and database state?
+
+86. How will the team confirm that issue 412 is fixed for the original reporter?
+
+### Controlling the work itself
+
+87. How long may the agent continue before stopping?
+
+88. How much may it spend?
+
+89. How many retries are allowed?
+
+90. What happens if the agent loses its session or its process stops?
+
+91. What happens if it needs access that the operator did not approve?
+
+92. What happens if it cannot reproduce the failure?
+
+93. What happens if the tests disagree with the issue?
+
+94. What record remains of the prompts, tools, changes, checks, and decisions?
+
+The original example accounts for producing a plausible patch:
+
+> Fix the checkout failure reported in issue 412. The agent reads the issue, reproduces the failure, traces the request, finds the cause, writes a regression test, applies the fix, and reruns the suite.
+
+It does not establish that the issue was understood correctly, the reproduction was representative, the cause was right, the test was strong, the exact patch was safe, the release was authorized, or the production problem was resolved. Those are the problems left to the operator and the process around the agent.
+
+---
+
+_**User (2026-08-06 17:44:54Z)**_
+
+how can we reduce the number of bullets (as im going to post this on linkedin)
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:45:15Z)**_
+
+Reduce it to one bullet for each decision the operator still owns.
+
+A modern coding agent can:
+
+“Fix the checkout failure reported in issue 412.”
+
+It can read the issue, reproduce the failure, find the cause, write a regression test, apply the fix, and rerun the suite.
+
+That still leaves the operator with 7 problems:
+
+- Intent. What does “fixed” mean, and which checkout paths must remain unchanged?
+
+- Reproduction. Did the agent reproduce the reported failure in a representative environment?
+
+- Proof. Did the test fail for the right reason, pass only after the fix, and check the customer outcome?
+
+- Safety. Does the change affect payments, inventory, customer data, performance, or other checkout paths?
+
+- Result identity. Is the reviewed change exactly the same version that passed the checks?
+
+- Acceptance. Who may approve the remaining risk and move the change into the shared product?
+
+- Release. How will the team deploy, monitor, verify, and reverse the fix?
+
+The agent can produce a strong candidate fix.
+
+The operator still needs a process that defines the intended result, checks the evidence, accepts the exact change, and confirms that it works after release.
+
+---
+
+_**User (2026-08-06 17:47:16Z)**_
+
+no i want more of the prior list but not have it be 100 bulelts more like 30
+
+---
+
+_**Agent (gpt-5.6-sol 2026-08-06 17:47:46Z)**_
+
+Here is the earlier list compressed to 30 questions while keeping its range.
+
+A modern coding agent can:
+
+“Fix the checkout failure reported in issue 412.”
+
+It can read the issue, reproduce the failure, trace the request, find the cause, write a regression test, apply the fix, and rerun the suite.
+
+Even if every part of that account is true, 30 questions remain.
+
+Understanding the problem
+
+1. Is issue 412 still current?
+
+2. Does it describe the cause or only the symptom?
+
+3. What exact customer outcome counts as fixed?
+
+4. Which payment methods, currencies, devices, and customer types are in scope?
+
+5. What behavior must remain unchanged?
+
+Reproducing and diagnosing it
+
+6. Did the agent reproduce the exact reported failure?
+
+7. Did it use representative code, data, services, and system settings?
+
+8. Could timing, concurrency, or an outside service cause the failure?
+
+9. Did the agent find the cause or suppress the symptom?
+
+10. Could the same cause affect other checkout paths?
+
+Testing the fix
+
+11. Did the regression test fail before the fix?
+
+12. Did it fail for the same reason as the reported problem?
+
+13. Did it pass only after the fix?
+
+14. Does it check the customer outcome rather than an implementation detail?
+
+15. Is the test stable, and can it still detect the problem after a refactor?
+
+Checking the wider effect
+
+16. Did the agent run all relevant tests and checks?
+
+17. Does the fix preserve payment idempotency and prevent duplicate charges?
+
+18. Does it preserve inventory, tax, discount, shipping, and order records?
+
+19. Does it create a security, privacy, or customer data risk?
+
+20. Does it affect performance, browser support, dependencies, configuration, or the database?
+
+Trusting the result
+
+21. Are the commands, logs, system settings, and code revision available for review?
+
+22. Did any required check fail, time out, or remain unavailable?
+
+23. Did the agent control both the change and all the evidence used to judge it?
+
+24. Is the proposed result exactly the same version that passed the checks?
+
+25. Can another person reproduce the result from the recorded evidence?
+
+Accepting and releasing it
+
+26. Did the agent start from the correct branch without overwriting other work?
+
+27. Who decides that the fix matches the product requirement and accepts the remaining risk?
+
+28. Who may merge and release the exact result?
+
+29. How will the team detect success, detect new failures, and reverse the change?
+
+30. What limits governed the agent’s access, time, spend, retries, and interruptions?
+
+The agent can produce a strong candidate fix.
+
+The operator still owns the definition of fixed, the quality of the proof, the safety of the exact result, and the decision to release it.
