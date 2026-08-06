@@ -292,6 +292,7 @@ fn prompt_output_and_machine_flags_have_one_policy() {
         &["run", "--help"][..],
         &["orchestrate", "--help"][..],
         &["plan", "--help"][..],
+        &["campaign", "--help"][..],
         &["fork", "--help"][..],
         &["merge", "--help"][..],
         &["chain", "--help"][..],
@@ -342,7 +343,7 @@ fn provider_role_help_uses_one_glossary() {
         "--coder-provider",
         "implementation pass",
         "--reviewer-provider",
-        "independently reviews or fixes",
+        "schema-only final done judge",
         "--doc-provider",
         "documentation polish route",
         "--repair-provider",
@@ -382,14 +383,74 @@ fn provider_role_help_uses_one_glossary() {
         "{plan}"
     );
     assert!(
-        plan.contains("Reviewer provider route for review mode"),
+        plan.contains("Schema-capable reviewer route for review work and final done judgment"),
         "{plan}"
+    );
+
+    let campaign = help(["campaign", "--help"]);
+    assert!(
+        campaign.contains("Schema-capable reviewer route for final campaign done judgment"),
+        "{campaign}"
     );
 
     let doc = help(["doc", "--help"]);
     assert!(
         doc.contains("Documentation provider route for polish"),
         "{doc}"
+    );
+}
+
+#[test]
+fn direct_run_exposes_a_distinct_semantic_reviewer_route() {
+    let run = help(["run", "--help"]);
+    for phrase in [
+        "--reviewer-provider",
+        "Schema-capable provider route for the final semantic done judgment",
+        "--reviewer-model",
+        "Model override for the final semantic reviewer",
+    ] {
+        assert!(run.contains(phrase), "missing `{phrase}`:\n{run}");
+    }
+
+    let temp = isolated_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let output = deadreckon(&paths)
+        .args([
+            "run",
+            "fixture",
+            "--preview",
+            "--reviewer-model",
+            "review-model",
+        ])
+        .output()
+        .expect("run clap validation");
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(
+        error.contains("--reviewer-provider") && error.contains("required"),
+        "{error}"
+    );
+
+    let generic = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "run",
+            "generic worker fixture",
+            "--provider",
+            "cli:copilot",
+            "--yes",
+            "--quiet",
+            "--plain",
+        ])
+        .output()
+        .expect("generic worker admission");
+    assert!(!generic.status.success());
+    let error = stderr(&generic);
+    assert!(
+        error.contains("can perform implementation work")
+            && error.contains("cannot serve as DeadReckon's schema-only semantic reviewer")
+            && error.contains("--reviewer-provider cli:codex"),
+        "{error}"
     );
 }
 

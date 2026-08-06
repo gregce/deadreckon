@@ -358,17 +358,24 @@ pub(crate) fn resolve_plan_providers(
         )?,
         PlanMode::FullPlan => None,
     };
-    let reviewer = match mode {
-        PlanMode::Review => resolve_provider_name(
-            paths,
-            setup::SetupProviderRoleRef::Reviewer,
-            reviewer_provider
-                .or(default_child.clone())
-                .or(defaults.provider.clone()),
-        )?,
-        PlanMode::FullPlan => None,
-    };
-    Ok(PlanProviders {
+    let reviewer = resolve_provider_name(
+        paths,
+        setup::SetupProviderRoleRef::Reviewer,
+        reviewer_provider
+            .or(defaults.reviewer_provider.clone())
+            .or(default_child.clone())
+            .or(defaults.provider.clone()),
+    )?;
+    let configured_reviewer_model = (reviewer.as_deref() == defaults.reviewer_provider.as_deref())
+        .then_some(defaults.reviewer_model.as_ref())
+        .flatten()
+        .or_else(|| configured_model_for_provider(reviewer.as_ref(), defaults));
+    let reviewer_model = reviewer.as_ref().and(resolve_role_model(
+        models.reviewer_model.as_ref(),
+        models.model.as_ref(),
+        configured_reviewer_model,
+    ));
+    let providers = PlanProviders {
         planner_model: planner.as_ref().and(resolve_role_model(
             models.planner_model.as_ref(),
             models.model.as_ref(),
@@ -384,18 +391,75 @@ pub(crate) fn resolve_plan_providers(
             models.model.as_ref(),
             configured_model_for_provider(coder.as_ref(), defaults),
         )),
-        reviewer_model: reviewer.as_ref().and(resolve_role_model(
-            models.reviewer_model.as_ref(),
-            models.model.as_ref(),
-            configured_model_for_provider(reviewer.as_ref(), defaults),
-        )),
+        reviewer_model,
         child_models: models.child_models,
         planner,
         default_child,
         coder,
         reviewer,
         children: BTreeMap::new(),
-    })
+    };
+    validate_plan_semantic_reviewer(paths, &providers)?;
+    Ok(providers)
+}
+
+fn validate_plan_semantic_reviewer(
+    paths: &DeadreckonPaths,
+    providers: &PlanProviders,
+) -> Result<()> {
+    let Some(reviewer) = providers.reviewer.as_deref() else {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "plan did not freeze a semantic reviewer route",
+            "choose a schema-capable route such as cli:codex with --reviewer-provider",
+        )));
+    };
+    if reviewer == "smoke" || reviewer.starts_with("smoke:") {
+        return Ok(());
+    }
+    let route = setup::route_info_for_provider(
+        &paths.config_path(),
+        Some(reviewer),
+        providers.reviewer_model.as_deref(),
+    )?
+    .ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "plan did not resolve semantic reviewer route {reviewer}"
+        )))
+    })?;
+    if !route.kind.has_schema_only_adapter() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "provider route {reviewer} can perform graph work but cannot serve as DeadReckon's schema-only semantic reviewer"
+            ),
+            "choose a schema-capable route such as cli:codex with --reviewer-provider",
+        )));
+    }
+    Ok(())
+}
+
+fn freeze_legacy_plan_semantic_reviewer(providers: &mut PlanProviders, defaults: &ConfigDefaults) {
+    if providers.reviewer.is_some() {
+        return;
+    }
+    if let Some(provider) = defaults.reviewer_provider.clone() {
+        providers.reviewer = Some(provider);
+        providers.reviewer_model = defaults.reviewer_model.clone();
+        return;
+    }
+    let inherited = [
+        (providers.coder.clone(), providers.coder_model.clone()),
+        (
+            providers.default_child.clone(),
+            providers.default_child_model.clone(),
+        ),
+        (providers.planner.clone(), providers.planner_model.clone()),
+    ]
+    .into_iter()
+    .find(|(provider, _)| provider.is_some());
+    if let Some((provider, model)) = inherited {
+        providers.reviewer = provider;
+        providers.reviewer_model = model;
+    }
 }
 
 pub(crate) fn resolve_provider_name(
@@ -1465,6 +1529,13 @@ pub(crate) fn orchestration_provider_role_rows(
                 "plan",
                 "runs ready children",
             ));
+            rows.push(orchestration_role_row(
+                "done reviewer",
+                plan.providers.reviewer.as_deref(),
+                plan.providers.reviewer_model.as_deref(),
+                "plan",
+                "schema-only final judgment",
+            ));
             let mut seen_overrides = BTreeSet::new();
             let mut override_indexes: BTreeSet<u32> =
                 plan.providers.children.keys().copied().collect();
@@ -2326,6 +2397,8 @@ pub(crate) async fn fork_command(args: ForkCommandArgs) -> Result<()> {
         reviewer_provider,
     )?;
     let defaults = config_defaults(&paths)?;
+    freeze_legacy_plan_semantic_reviewer(&mut plan.providers, &defaults);
+    validate_plan_semantic_reviewer(&paths, &plan.providers)?;
     let sandbox = sandbox
         .or(defaults.sandbox)
         .unwrap_or_else(|| "auto".to_string());
@@ -3045,6 +3118,9 @@ async fn schedule_pending_plan_job(args: ForkCommandArgs) -> Result<()> {
         coder_provider,
         reviewer_provider,
     )?;
+    let defaults = config_defaults(&paths)?;
+    freeze_legacy_plan_semantic_reviewer(&mut plan.providers, &defaults);
+    validate_plan_semantic_reviewer(&paths, &plan.providers)?;
     let n = u8::try_from(plan.n).map_err(|_| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
             "plan {} has too many children for durable orchestration",
@@ -4716,16 +4792,16 @@ fn apply_fork_provider_overrides(
                     task.provider = Some(provider);
                 }
             }
-            if let Some(provider) = reviewer_provider {
-                plan.providers.reviewer = Some(provider.clone());
-                if let Some(task) = plan
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.role == PlanRole::Reviewer)
-                {
-                    task.provider = Some(provider);
-                }
-            }
+        }
+    }
+    if let Some(provider) = reviewer_provider {
+        plan.providers.reviewer = Some(provider.clone());
+        if let Some(task) = plan
+            .tasks
+            .iter_mut()
+            .find(|task| task.role == PlanRole::Reviewer)
+        {
+            task.provider = Some(provider);
         }
     }
     Ok(())
@@ -5920,6 +5996,70 @@ mod tests {
     use deadreckon_protocol::JobId;
 
     use super::*;
+
+    #[test]
+    fn graph_compiler_requires_and_freezes_a_schema_capable_done_reviewer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let defaults = ConfigDefaults::default();
+        let models = || PlanModelOverrides {
+            planner_model: None,
+            model: None,
+            coder_model: None,
+            reviewer_model: None,
+            child_models: BTreeMap::new(),
+        };
+
+        let error = resolve_plan_providers(
+            &paths,
+            &defaults,
+            PlanMode::FullPlan,
+            Some("cli:codex".to_string()),
+            Some("cli:copilot".to_string()),
+            None,
+            None,
+            models(),
+        )
+        .expect_err("generic child cannot silently judge the graph");
+        assert!(error.to_string().contains("schema-only semantic reviewer"));
+
+        let providers = resolve_plan_providers(
+            &paths,
+            &defaults,
+            PlanMode::FullPlan,
+            Some("cli:codex".to_string()),
+            Some("cli:copilot".to_string()),
+            None,
+            Some("cli:codex".to_string()),
+            models(),
+        )
+        .expect("explicit schema reviewer");
+        assert_eq!(providers.default_child.as_deref(), Some("cli:copilot"));
+        assert_eq!(providers.reviewer.as_deref(), Some("cli:codex"));
+
+        let configured_defaults = ConfigDefaults {
+            reviewer_provider: Some("cli:codex".to_string()),
+            reviewer_model: Some("gpt-configured-reviewer".to_string()),
+            ..ConfigDefaults::default()
+        };
+        let configured = resolve_plan_providers(
+            &paths,
+            &configured_defaults,
+            PlanMode::FullPlan,
+            Some("cli:codex".to_string()),
+            Some("cli:copilot".to_string()),
+            None,
+            None,
+            models(),
+        )
+        .expect("configured schema reviewer");
+        assert_eq!(configured.default_child.as_deref(), Some("cli:copilot"));
+        assert_eq!(configured.reviewer.as_deref(), Some("cli:codex"));
+        assert_eq!(
+            configured.reviewer_model.as_deref(),
+            Some("gpt-configured-reviewer")
+        );
+    }
 
     #[test]
     fn graph_capability_preview_uses_the_accepted_contract_not_goal_keywords() {

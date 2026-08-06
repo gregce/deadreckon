@@ -4417,6 +4417,8 @@ async fn schedule_durable_extension(
         untrusted: false,
         provider,
         model,
+        reviewer_provider: None,
+        reviewer_model: None,
         doc_provider: None,
         acceptance,
         skill: parent.skill_name,

@@ -607,7 +607,7 @@ pub(crate) async fn orchestrate_command(args: OrchestrateRunArgs) -> Result<()> 
     merge_result
 }
 
-pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> Result<()> {
+pub(crate) async fn schedule_direct_orchestration(mut args: OrchestrateRunArgs) -> Result<()> {
     let quiet = args.plan.quiet;
     let deadline = args.deadline;
     let explicitly_approved = orchestration_approval_policy(args.yes, quiet, prompt::is_tty())?;
@@ -627,6 +627,37 @@ pub(crate) async fn schedule_direct_orchestration(args: OrchestrateRunArgs) -> R
     }
     let paths = DeadreckonPaths::discover();
     let defaults = config_defaults(&paths)?;
+    let plan_mode = match args.plan.mode {
+        CliPlanMode::Review => deadreckon_core::plan::PlanMode::Review,
+        CliPlanMode::FullPlan => deadreckon_core::plan::PlanMode::FullPlan,
+    };
+    let resolved_providers = commands::plan::resolve_plan_providers(
+        &paths,
+        &defaults,
+        plan_mode,
+        args.plan.planner_provider.clone(),
+        args.plan.provider.clone(),
+        args.plan.coder_provider.clone(),
+        args.plan.reviewer_provider.clone(),
+        commands::plan::PlanModelOverrides {
+            planner_model: args.plan.planner_model.clone(),
+            model: args.plan.model.clone(),
+            coder_model: args.plan.coder_model.clone(),
+            reviewer_model: args.plan.reviewer_model.clone(),
+            child_models: commands::plan::parse_child_model_overrides(
+                &args.plan.child_model,
+                args.plan.n,
+            )?,
+        },
+    )?;
+    args.plan.planner_provider = resolved_providers.planner;
+    args.plan.provider = resolved_providers.default_child;
+    args.plan.coder_provider = resolved_providers.coder;
+    args.plan.reviewer_provider = resolved_providers.reviewer;
+    args.plan.planner_model = resolved_providers.planner_model;
+    args.plan.model = resolved_providers.default_child_model;
+    args.plan.coder_model = resolved_providers.coder_model;
+    args.plan.reviewer_model = resolved_providers.reviewer_model;
     let cwd = std::env::current_dir()?;
     let max_spend_usd = args.plan.max_spend.or(defaults.max_spend).unwrap_or(10.0);
     let max_wall_seconds = commands::job::checked_job_wall_seconds(

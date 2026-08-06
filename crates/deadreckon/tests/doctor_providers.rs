@@ -182,3 +182,58 @@ extra_args = []
     assert_eq!(pi["status"], "ok");
     assert_eq!(pi["location"], binary.display().to_string());
 }
+
+#[test]
+fn doctor_live_runs_a_real_bounded_worker_turn_instead_of_claiming_static_readiness() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    fs::create_dir_all(paths.home()).expect("home");
+    let binary = temp.path().join("pi-live-override");
+    write_fake_cli(
+        &binary,
+        r#"if [ "$1" = "--help" ]; then
+  printf '%s\n' 'pi - AI coding assistant with read, bash, edit, write tools Options: --mode --session'
+  exit 0
+fi
+printf '%s\n' '{"id":"session-live","assistantMessageEvent":{"content":"DEADRECKON_PROVIDER_OK"},"message":{"usage":{"input":1,"output":1}}}'"#,
+    );
+    write_config(
+        &paths,
+        &format!(
+            r#"
+default_provider = "cli:pi"
+
+[providers."cli:pi"]
+kind = "cli:pi"
+binary = "{}"
+extra_args = []
+"#,
+            binary.display()
+        ),
+    );
+
+    let static_output = run_doctor(
+        &paths,
+        Path::new(&std::env::var("PATH").unwrap_or_default()),
+    );
+    assert!(
+        static_output.contains("live model turn not tested"),
+        "{static_output}"
+    );
+
+    let live = deadreckon(&paths)
+        .args(["doctor", "--live"])
+        .output()
+        .expect("live doctor");
+    assert_success(&live);
+    let output = stdout(&live);
+    assert!(output.contains("live worker ping ok"), "{output}");
+    assert!(output.contains("model provider default"), "{output}");
+
+    let help = deadreckon(&paths)
+        .args(["doctor", "--help"])
+        .output()
+        .expect("doctor help");
+    assert_success(&help);
+    assert!(stdout(&help).contains("--live"));
+}

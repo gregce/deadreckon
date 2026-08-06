@@ -225,10 +225,15 @@ existing fail-closed preflight and publication jobs become mandatory again.
    release/preflight-real.sh cli:gemini # extend by argument
    ```
 
+   Native schema-capable routes review their own bounded evidence. Generic CLI
+   workers use `cli:codex` as the default semantic reviewer; set
+   `PREFLIGHT_REVIEWER_PROVIDER` to prove a different schema-capable pairing.
+   A worker turn is not credited as a semantic-review proof.
+
    For each route the harness proves one verified delivery and one
    identity-bound cancellation with no surviving provider process. On success
    it records the probed binary versions and exact release bundle in
-   `release/known-good-providers.json` (schema_version 2); commit that file so
+   `release/known-good-providers.json` (schema_version 3); commit that file so
    the release notes can reference known-good CLI versions. Stable validation
    requires successful proofs for both default routes and recomputes the
    source bundle ID, so a stale proof from an earlier `0.8.1` commit fails.

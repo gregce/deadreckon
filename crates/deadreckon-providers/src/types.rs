@@ -48,6 +48,24 @@ impl ProviderKind {
             ProviderKind::Generic(id) => id,
         }
     }
+
+    /// Whether DeadReckon has a route-specific adapter that can request and
+    /// prove schema-only structured text for semantic done judgments.
+    ///
+    /// This is an adapter capability, not a live-health claim. Dedicated CLI
+    /// routes still capability-probe their installed binary at invocation
+    /// time, and HTTP-compatible endpoints must still honor their protocol.
+    pub fn has_schema_only_adapter(&self) -> bool {
+        matches!(
+            self,
+            ProviderKind::Anthropic
+                | ProviderKind::OpenAi
+                | ProviderKind::OpenAiCompatible
+                | ProviderKind::CliClaudeCode
+                | ProviderKind::CliCodex
+                | ProviderKind::ScriptedSmoke
+        ) || matches!(self, ProviderKind::Generic(id) if id == "cli:codex-server")
+    }
 }
 
 impl Serialize for ProviderKind {
@@ -268,6 +286,29 @@ pub struct ProviderRouteInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_only_adapter_capability_distinguishes_generic_cli_workers() {
+        for kind in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAi,
+            ProviderKind::OpenAiCompatible,
+            ProviderKind::CliClaudeCode,
+            ProviderKind::CliCodex,
+            ProviderKind::ScriptedSmoke,
+            ProviderKind::Generic("cli:codex-server".to_string()),
+        ] {
+            assert!(kind.has_schema_only_adapter(), "{kind:?}");
+        }
+        for kind in [
+            ProviderKind::Generic("cli:copilot".to_string()),
+            ProviderKind::Generic("cli:gemini".to_string()),
+            ProviderKind::Generic("cli:opencode".to_string()),
+            ProviderKind::Generic("cli:pi".to_string()),
+        ] {
+            assert!(!kind.has_schema_only_adapter(), "{kind:?}");
+        }
+    }
 
     #[test]
     fn enforceably_read_only_request_carries_a_real_boundary() {

@@ -1,0 +1,2 @@
+{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-completions","provider":"deepseek","model":"deepseek-v4-pro","usage":{"input":0,"output":0,"totalTokens":0},"stopReason":"error","errorMessage":"402 Insufficient Balance"}}
+{"type":"agent_end","messages":[],"willRetry":false}
