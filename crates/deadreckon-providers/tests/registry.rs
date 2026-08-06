@@ -65,16 +65,27 @@ fn opencode_contract_classifies_interleaved_zero_exit_errors() {
         .expect("OpenCode gap fixture");
 
     let contract = opencode.contract.as_ref().expect("OpenCode contract");
-    assert_eq!(contract.stream_args, ["--format", "json"]);
+    assert_eq!(contract.stream_args, ["--format", "json", "--auto"]);
+    assert_eq!(contract.probe_args, ["run", "--help"]);
+    assert_eq!(contract.probe_substring.as_deref(), Some("--auto"));
+    assert_eq!(
+        contract.usage_input_path.as_deref(),
+        Some("/part/tokens/input")
+    );
+    assert_eq!(
+        contract.usage_output_path.as_deref(),
+        Some("/part/tokens/output")
+    );
+    assert_eq!(contract.cost_path.as_deref(), Some("/part/cost"));
     assert_eq!(contract.answer_path.as_deref(), Some("/part/text"));
     assert_eq!(
         contract.error_message_path.as_deref(),
         Some("/error/data/message")
     );
     assert_eq!(opencode.exec_template.args_template, ["run", "{prompt}"]);
-    assert!(source.contains("OpenCode CLI 0.15.5"));
-    assert!(source.contains("text(answer), error, then text(null)"));
-    assert!(source.contains("retains the last non-null answer"));
+    assert!(source.contains("OpenCode 1.18.14"));
+    assert!(source.contains("top-level `opencode --help`"));
+    assert!(source.contains("retains the last"));
     assert_eq!(events[1]["part"]["text"], "OPENCODE_FIXTURE_OK");
     assert_eq!(events[2]["type"], "error");
     assert!(events[3]["part"]["text"].is_null());

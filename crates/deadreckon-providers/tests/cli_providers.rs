@@ -725,6 +725,73 @@ async fn contract_provider_reports_real_usage_and_answer() {
 }
 
 #[tokio::test]
+async fn contract_probe_can_target_a_subcommand_capability_surface() {
+    let temp = TempDir::new().expect("tempdir");
+    let home = temp.path().join("subcommand-probe-home");
+    fs::create_dir_all(home.join("providers.d")).expect("providers dir");
+    let binary = temp.path().join("fake-subcommand-probe-cli");
+    fs::write(
+        &binary,
+        "#!/bin/sh\n\
+if [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'top-level options'; exit 0; fi\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"--help\" ]; then printf '%s\\n' 'run options: --structured'; exit 0; fi\n\
+printf '%s\\n' '{\"answer\":\"subcommand probe active\"}'\n",
+    )
+    .expect("probe binary");
+    chmod_exec(&binary);
+    fs::write(
+        home.join("providers.d/subcommand-probe.toml"),
+        format!(
+            r#"
+id = "cli:subcommand-probe"
+display_name = "Subcommand Probe CLI"
+kind = "cli"
+default_binary = "{}"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["run", "{{prompt}}"]
+
+[contract]
+stream_args = ["--structured"]
+dialect = "json-lines"
+answer_path = "/answer"
+probe_args = ["run", "--help"]
+probe_substring = "--structured"
+"#,
+            binary.display()
+        ),
+    )
+    .expect("descriptor");
+    let config_path = home.join("config.toml");
+    fs::write(
+        &config_path,
+        "default_provider = \"cli:subcommand-probe\"\n",
+    )
+    .expect("config");
+    let router = ProviderRouter::from_config_path(&config_path, None).expect("router");
+
+    let response = router
+        .complete(&ProviderRequest {
+            prompt: "work".to_string(),
+            cwd: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await
+        .expect("completion");
+
+    assert_eq!(response.content, "subcommand probe active");
+    assert_eq!(response.trace["contract"]["active"], true);
+    assert_eq!(
+        response.trace["args"],
+        serde_json::json!(["run", "--structured", "work"])
+    );
+}
+
+#[tokio::test]
 async fn unparseable_output_degrades_with_caveat_generic() {
     let temp = TempDir::new().expect("tempdir");
     let router = generic_contract_router(&temp, "plain fallback response");
