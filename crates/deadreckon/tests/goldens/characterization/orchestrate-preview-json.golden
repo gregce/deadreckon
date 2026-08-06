@@ -59,7 +59,7 @@ status: 0
       ],
       [
         "roles",
-        "implementors=3, planner=smoke/provider default, implementor=smoke/provider default"
+        "implementors=3, planner=smoke/provider default, implementor=smoke/provider default, done reviewer=smoke/provider default"
       ],
       [
         "done",

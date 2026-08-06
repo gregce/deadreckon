@@ -31,6 +31,7 @@ provider roles
   role           route                  model    source       notes
   planner        smoke                  -        plan         writes child graph
   default child  smoke                  -        plan         runs ready children
+  done reviewer  smoke                  -        plan         schema-only final judgment
   repair         smoke                  -        derived      merge repair planning
 parallelism
   starts now: task-0, task-1, task-2
