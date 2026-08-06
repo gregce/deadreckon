@@ -1174,13 +1174,12 @@ fn collect_doctor_semantic_reviewer_finding(
     let Some(worker) = defaults.provider.as_deref() else {
         return Ok(None);
     };
-    let worker_route = match setup::route_info_for_provider(
+    let Ok(worker_route) = setup::route_info_for_provider(
         &paths.config_path(),
         Some(worker),
         defaults.model.as_deref(),
-    ) {
-        Ok(route) => route,
-        Err(_) => return Ok(None),
+    ) else {
+        return Ok(None);
     };
     let reviewer = if let Some(reviewer) = defaults.reviewer_provider.as_deref() {
         reviewer
