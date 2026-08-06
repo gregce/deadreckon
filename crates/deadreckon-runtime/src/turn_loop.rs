@@ -445,7 +445,27 @@ pub async fn run_turn_loop(
     router: &ProviderRouter,
     config: RunLoopConfig,
 ) -> Result<RunLoopOutcome> {
-    run_turn_loop_inner(state, router, config, CompletionMode::VerifyAndPromote).await
+    run_turn_loop_with_semantic_router(state, router, router, config).await
+}
+
+/// Run the mutation loop with independently resolved worker and semantic
+/// reviewer routes. Durable launch plans freeze both roles before admission;
+/// keeping the routers distinct here prevents a generic worker adapter from
+/// being reused for the schema-only completion judgment.
+pub async fn run_turn_loop_with_semantic_router(
+    state: &mut PipelineState,
+    worker_router: &ProviderRouter,
+    semantic_router: &ProviderRouter,
+    config: RunLoopConfig,
+) -> Result<RunLoopOutcome> {
+    run_turn_loop_inner(
+        state,
+        worker_router,
+        semantic_router,
+        config,
+        CompletionMode::VerifyAndPromote,
+    )
+    .await
 }
 
 /// Run the ordinary bounded mutation loop for a composed parent, but stop at
@@ -460,6 +480,7 @@ pub async fn run_parent_repair_turn_loop(
     run_turn_loop_inner(
         state,
         router,
+        router,
         config,
         CompletionMode::ParentRepairCandidate(candidate),
     )
@@ -468,7 +489,8 @@ pub async fn run_parent_repair_turn_loop(
 
 async fn run_turn_loop_inner(
     state: &mut PipelineState,
-    router: &ProviderRouter,
+    worker_router: &ProviderRouter,
+    semantic_router: &ProviderRouter,
     config: RunLoopConfig,
     completion_mode: CompletionMode,
 ) -> Result<RunLoopOutcome> {
@@ -588,7 +610,7 @@ async fn run_turn_loop_inner(
             return Ok(outcome);
         }
         snapshot_result?;
-        let selected_route = router.selected_route_info();
+        let selected_route = worker_router.selected_route_info();
         let selected_provider = config
             .provider
             .clone()
@@ -598,7 +620,7 @@ async fn run_turn_loop_inner(
             .as_ref()
             .is_some_and(|route| is_direct_api_provider_kind(&route.kind))
         {
-            let (context_window, source) = router
+            let (context_window, source) = worker_router
                 .context_window_for_route_with_source(selected_provider.as_deref())
                 .map(|(window, source)| (window, source.as_str().to_string()))
                 .unwrap_or((compaction.fallback_context_window, "fallback".to_string()));
@@ -658,7 +680,7 @@ async fn run_turn_loop_inner(
         // and never grants a retry more provider work.
         request.cancellation_token = Some(turn_token.clone());
         let mut completion =
-            complete_provider_phase(router, &mut request, provider_phase_deadline).await;
+            complete_provider_phase(worker_router, &mut request, provider_phase_deadline).await;
         // Self-healing: one bounded retry on transient provider errors (429,
         // 5xx, transport blips, CLI rate limits). The retry is recorded in
         // events.jsonl so "turn N hit a transient error; retried" is visible
@@ -686,7 +708,7 @@ async fn run_turn_loop_inner(
             .await;
             request.cancellation_token = Some(turn_token.clone());
             completion =
-                complete_provider_phase(router, &mut request, provider_phase_deadline).await;
+                complete_provider_phase(worker_router, &mut request, provider_phase_deadline).await;
             if matches!(&completion, ProviderPhaseOutcome::Completed(Ok(_))) {
                 emit_event(
                     state,
@@ -1122,7 +1144,13 @@ async fn run_turn_loop_inner(
             work_clock.save(state)?;
             begin_verification(state, &work_clock)?;
             let docs_result =
-                complete_run_docs(state, router, &config, &work_clock, provider_phase_deadline)
+                complete_run_docs(
+                    state,
+                    worker_router,
+                    &config,
+                    &work_clock,
+                    provider_phase_deadline,
+                )
                     .await;
             verification_result(state, &work_clock, docs_result)?;
             if should_cancel_run(state, &run_token) {
@@ -1236,7 +1264,7 @@ async fn run_turn_loop_inner(
             }
             let semantic_result = semantic_completion_disposition(
                 state,
-                router,
+                semantic_router,
                 &config,
                 turn,
                 &marker,
@@ -1893,7 +1921,13 @@ async fn run_turn_loop_inner(
                 }
                 begin_verification(state, &work_clock)?;
                 let docs_result =
-                    complete_run_docs(state, router, &config, &work_clock, provider_phase_deadline)
+                    complete_run_docs(
+                        state,
+                        worker_router,
+                        &config,
+                        &work_clock,
+                        provider_phase_deadline,
+                    )
                         .await;
                 verification_result(state, &work_clock, docs_result)?;
                 if should_cancel_run(state, &run_token) {
@@ -2007,7 +2041,7 @@ async fn run_turn_loop_inner(
                 }
                 let semantic_result = semantic_completion_disposition(
                     state,
-                    router,
+                    semantic_router,
                     &config,
                     turn,
                     &marker,
