@@ -93,6 +93,185 @@ fn def_done_accepts_current_codex_feature_and_schema_contract() {
     );
 }
 
+#[test]
+fn def_done_rejection_reports_exact_findings_without_publishing_the_candidate() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("app.py"),
+        "print('network sessions ready')\n",
+    )
+    .expect("application");
+    git(&workspace, &["init", "-b", "main"]);
+    git(&workspace, &["add", "app.py"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=DeadReckon test",
+            "-c",
+            "user.email=test@deadreckon.local",
+            "commit",
+            "-m",
+            "seed fixture",
+        ],
+    );
+
+    let fake_codex = temp.path().join("fake-codex");
+    fs::write(&fake_codex, FAKE_CODEX).expect("fake Codex CLI");
+    make_executable(&fake_codex);
+    write_codex_config(&paths, &fake_codex);
+
+    let mut command = deadreckon(&paths);
+    command
+        .current_dir(&workspace)
+        .env("DEADRECKON_AUTH_PROBE", "0")
+        .args([
+            "def-done",
+            "build a graphical realtime dashboard and verify network sessions",
+            "--provider",
+            "cli:codex",
+        ]);
+
+    let output = output_with_timeout(command, COMMAND_TIMEOUT);
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        text.contains("redrafted done criteria need revision before launch"),
+        "{text}"
+    );
+    assert!(
+        text.contains("check 1 is only a source-text scan"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("def-done refine"),
+        "a rejected unpublished draft must not suggest refine:\n{text}"
+    );
+    assert!(
+        !workspace.join(".deadreckon/acceptance.yaml").exists(),
+        "a rejected candidate must remain staged rather than becoming project authority"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn guided_start_revises_a_rejected_contract_without_repeating_setup_or_reusing_expired_time() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(
+        workspace.join("app.py"),
+        "print('network sessions ready')\n",
+    )
+    .expect("application");
+    git(&workspace, &["init", "-b", "main"]);
+    git(&workspace, &["add", "app.py"]);
+    git(
+        &workspace,
+        &[
+            "-c",
+            "user.name=DeadReckon test",
+            "-c",
+            "user.email=test@deadreckon.local",
+            "commit",
+            "-m",
+            "seed fixture",
+        ],
+    );
+
+    let fake_codex = temp.path().join("fake-codex");
+    fs::write(&fake_codex, FAKE_CODEX).expect("fake Codex CLI");
+    make_executable(&fake_codex);
+    write_codex_config(&paths, &fake_codex);
+
+    let command = [
+        env!("CARGO_BIN_EXE_deadreckon"),
+        "start",
+        "build a graphical realtime dashboard and verify network sessions",
+        "--mode",
+        "run",
+        "--provider",
+        "cli:codex",
+        "--model",
+        "gpt-test",
+        "--worktree",
+    ]
+    .iter()
+    .map(|part| tcl_brace_quote(part))
+    .collect::<Vec<_>>()
+    .join(" ");
+    let script = format!(
+        r#"set timeout 20
+cd {cwd}
+set env(DEADRECKON_HOME) {home}
+set env(DEADRECKON_AUTH_PROBE) 0
+set env(DEADRECKON_PROMPT_LINE_MODE) 1
+spawn {command}
+expect -re {{How will you know it worked\?}}
+send -- "verify network sessions\r"
+expect -re {{Recover done contract authoring}}
+expect -re {{choose \[[0-9]+\]:}}
+send -- "1\r"
+expect -re {{revised definition of done:}}
+send -- "launch the graphical realtime dashboard and verify two network sessions\r"
+expect -re {{Review definition of done}}
+expect -re {{choose \[[0-9]+\]:}}
+send -- "1\r"
+expect -re {{start this launch\?}}
+send -- "n\r"
+expect -re {{guided start cancelled before launch}}
+catch {{ close }}
+catch {{ wait }}
+exit 0
+"#,
+        cwd = tcl_brace_quote(&workspace.display().to_string()),
+        home = tcl_brace_quote(&paths.home().display().to_string()),
+    );
+    let output = Command::new("expect")
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("drive guided start through a PTY");
+    let text = format!("{}{}", stdout(&output), stderr(&output));
+
+    assert!(output.status.success(), "expect driver failed:\n{text}");
+
+    assert!(
+        text.contains("redrafted done criteria need revision before launch"),
+        "{text}"
+    );
+    assert!(
+        text.contains("check 1 is only a source-text scan"),
+        "{text}"
+    );
+    assert!(
+        text.contains("revision_proof_marker"),
+        "the accepted second candidate was never shown:\n{text}"
+    );
+    assert!(
+        !text.contains("initial draft exhausted"),
+        "revision reused an expired deadline:\n{text}"
+    );
+    assert!(
+        text.contains("guided start cancelled before launch"),
+        "the test did not reach final confirmation:\n{text}"
+    );
+    assert!(
+        !paths.jobs_dir().exists()
+            || fs::read_dir(paths.jobs_dir())
+                .expect("jobs directory")
+                .next()
+                .is_none(),
+        "cancelling final confirmation must create no Job"
+    );
+}
+
 fn write_codex_config(paths: &DeadreckonPaths, binary: &std::path::Path) {
     fs::create_dir_all(paths.home()).expect("DeadReckon home");
     fs::write(
@@ -118,6 +297,10 @@ model = "gpt-test"
 
 fn toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn tcl_brace_quote(value: &str) -> String {
+    format!("{{{}}}", value.replace('\\', "\\\\").replace('}', "\\}"))
 }
 
 fn make_executable(path: &std::path::Path) {
@@ -182,6 +365,15 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Output {
 
 const FAKE_CODEX: &str = r##"#!/bin/sh
 set -eu
+
+weak_done=0
+revised_done=0
+case "$*" in
+  *"graphical realtime dashboard"*|*"network sessions"*) weak_done=1 ;;
+esac
+case "$*" in
+  *"Previous candidate was rejected"*|*"two network sessions"*) revised_done=1 ;;
+esac
 
 if [ "$#" -eq 1 ] && [ "$1" = "--version" ]; then
   printf '%s\n' 'codex-cli adversarial-0.8.1'
@@ -318,14 +510,37 @@ fi
 
 case "$schema_kind" in
   draft)
-    cat > "$last_message" <<'JSON'
+    if [ "$revised_done" = "1" ]; then
+      cat > "$last_message" <<'JSON'
+{"acceptance_yaml":"name: graphical realtime dashboard network sessions revision_proof_marker\nchecks:\n  - kind: shell\n    command: >-\n      test \"$(python3 app.py)\" = \"network sessions ready\"\n    cwd: \"{working_dir}\"\n","acceptance_md":"# Graphical realtime dashboard\n\nLaunch the graphical realtime dashboard and verify two independently driven network sessions. revision_proof_marker\n","files":[]}
+JSON
+    elif [ "$weak_done" = "1" ]; then
+      cat > "$last_message" <<'JSON'
+{"acceptance_yaml":"name: network sessions\nchecks:\n  - kind: shell\n    command: >-\n      grep -R \"network\" .\n    cwd: \"{working_dir}\"\n","acceptance_md":"# Network sessions\n\nSource text mentions network sessions.\n","files":[]}
+JSON
+    else
+      cat > "$last_message" <<'JSON'
 {"acceptance_yaml":"name: adversarial codex authoring\nchecks:\n  - kind: shell\n    command: >-\n      test \"$(python3 app.py)\" = \"hello from app\"\n    cwd: \"{working_dir}\"\n","acceptance_md":"# Done criteria\n\nRunning the application prints `hello from app`.\n","files":[]}
 JSON
+    fi
     ;;
   critic)
-    cat > "$last_message" <<'JSON'
+    case "$*" in
+      *"revision_proof_marker"*) revised_done=1 ;;
+    esac
+    if [ "$revised_done" = "1" ]; then
+      cat > "$last_message" <<'JSON'
 {"stub_would_pass":false,"uncovered_goal_clauses":[],"weak_check_indices":[],"verdict":"pass"}
 JSON
+    elif [ "$weak_done" = "1" ]; then
+      cat > "$last_message" <<'JSON'
+{"stub_would_pass":false,"uncovered_goal_clauses":["build a graphical realtime dashboard"],"weak_check_indices":[],"verdict":"redraft"}
+JSON
+    else
+      cat > "$last_message" <<'JSON'
+{"stub_would_pass":false,"uncovered_goal_clauses":[],"weak_check_indices":[],"verdict":"pass"}
+JSON
+    fi
     ;;
   *) printf '%s\n' "unexpected schema kind: $schema_kind" >&2; exit 67 ;;
 esac

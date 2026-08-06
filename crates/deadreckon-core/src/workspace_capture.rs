@@ -369,6 +369,7 @@ pub struct GitHydrationState {
 struct CompiledIgnoreSource {
     kind: FrozenIgnoreKind,
     depth: usize,
+    scope_root: PathBuf,
     matcher: Gitignore,
 }
 
@@ -1765,7 +1766,8 @@ fn compile_ignores(
     let mut compiled = Vec::new();
     for source in sources {
         let base = source.base.to_path_buf()?;
-        let mut builder = GitignoreBuilder::new(root.join(&base));
+        let scope_root = root.join(&base);
+        let mut builder = GitignoreBuilder::new(&scope_root);
         for (index, line) in source.lines.iter().enumerate() {
             builder
                 .add_line(Some(PathBuf::from(&source.origin)), line)
@@ -1786,6 +1788,7 @@ fn compile_ignores(
         compiled.push(CompiledIgnoreSource {
             kind: source.kind,
             depth: path_depth(&base),
+            scope_root,
             matcher,
         });
     }
@@ -1900,6 +1903,9 @@ fn projection_boundary_allows(
 fn frozen_ignored(sources: &[CompiledIgnoreSource], path: &Path, is_dir: bool) -> bool {
     let mut ignored = false;
     for source in sources {
+        if !path.starts_with(&source.scope_root) {
+            continue;
+        }
         let matched = source.matcher.matched_path_or_any_parents(path, is_dir);
         if matched.is_ignore() {
             ignored = true;
@@ -2530,6 +2536,40 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.relative == Path::new("build/generated.o"))
+        );
+    }
+
+    #[test]
+    fn sibling_nested_ignore_files_only_apply_within_their_own_directories() {
+        let temp = TempDir::new().expect("temp");
+        let root = temp.path();
+        let left = root.join("left-app");
+        let right = root.join("right-app");
+        fs::create_dir_all(&left).expect("left app");
+        fs::create_dir_all(&right).expect("right app");
+        fs::write(left.join(".gitignore"), "generated.txt\n").expect("left ignore");
+        fs::write(right.join(".gitignore"), "cache.txt\n").expect("right ignore");
+        fs::write(left.join("generated.txt"), "ignored on the left\n").expect("left generated");
+        fs::write(right.join("generated.txt"), "kept on the right\n").expect("right source");
+
+        let policy = freeze_workspace_capture_policy(root).expect("freeze");
+        let plan = capture_workspace(
+            root,
+            &policy,
+            CaptureProjection::Source,
+            CapturePurpose::SourceHydration,
+        )
+        .expect("capture sibling projects");
+
+        assert!(
+            plan.entries
+                .iter()
+                .all(|entry| entry.relative != Path::new("left-app/generated.txt"))
+        );
+        assert!(
+            plan.entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("right-app/generated.txt"))
         );
     }
 

@@ -602,10 +602,8 @@ async fn provider_course_plan(
     request.output_path = Some(output_path.clone());
     request.cancellation_token = Some(token.clone());
     let route_kind = router.selected_route_info().map(|route| route.kind);
-    let work_expires_at = admission_budget.map_or_else(
-        || Instant::now() + course_planner_timeout(route_kind.as_ref()),
-        commands::acceptance::DoneAuthoringBudget::work_expires_at,
-    );
+    let work_expires_at =
+        course_planner_work_expires_at(Instant::now(), route_kind.as_ref(), admission_budget);
     let deadline = ProviderPhaseDeadline::new(
         tokio::time::Instant::from_std(work_expires_at),
         course_planner_cleanup_timeout(),
@@ -705,6 +703,17 @@ fn provider_kind_uses_cli_process(kind: &ProviderKind) -> bool {
 
 fn course_planner_cleanup_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+fn course_planner_work_expires_at(
+    now: Instant,
+    route_kind: Option<&ProviderKind>,
+    admission_budget: Option<commands::acceptance::DoneAuthoringBudget>,
+) -> Instant {
+    let route_expires_at = now + course_planner_timeout(route_kind);
+    admission_budget.map_or(route_expires_at, |budget| {
+        route_expires_at.min(budget.work_expires_at())
+    })
 }
 
 fn course_shape_to_goal_shape(shape: commands::course::CourseShape) -> GoalShape {
@@ -3148,6 +3157,82 @@ fn start_recovery_error(recovery: &StartRecovery) -> CliError {
     }
 }
 
+/// Owns the automated-work clock and rejected contract context for guided
+/// admission. A budget value is minted only while automated work is running;
+/// between attempts the session stores elapsed work, so operator prompt time
+/// cannot consume it.
+#[derive(Debug)]
+struct StartAdmissionSession {
+    configured_done_seconds: Option<f64>,
+    absolute_deadline: Option<DateTime<Utc>>,
+    automated_work_spent: Duration,
+    authoring_attempt: u32,
+    revision_context: Option<String>,
+}
+
+impl StartAdmissionSession {
+    fn new(configured_done_seconds: Option<f64>, absolute_deadline: Option<DateTime<Utc>>) -> Self {
+        Self {
+            configured_done_seconds,
+            absolute_deadline,
+            automated_work_spent: Duration::ZERO,
+            authoring_attempt: 1,
+            revision_context: None,
+        }
+    }
+
+    fn begin_automated_work(&self) -> commands::acceptance::DoneAuthoringBudget {
+        commands::acceptance::DoneAuthoringBudget::from_config_deadline_and_consumed(
+            self.configured_done_seconds,
+            self.absolute_deadline,
+            self.automated_work_spent,
+        )
+    }
+
+    fn finish_automated_work(&mut self, budget: commands::acceptance::DoneAuthoringBudget) {
+        self.automated_work_spent = budget.elapsed().min(budget.total());
+    }
+
+    fn remaining_work(&self) -> Duration {
+        self.begin_automated_work().remaining()
+    }
+
+    fn fresh_attempt_work(&self) -> Duration {
+        commands::acceptance::DoneAuthoringBudget::from_config_and_deadline(
+            self.configured_done_seconds,
+            self.absolute_deadline,
+        )
+        .remaining()
+    }
+
+    /// Starting another allowance is an explicit recovery action. It never
+    /// moves an absolute `--deadline`, and every new attempt remains bounded by
+    /// the configured authoring limit.
+    fn authorize_new_attempt(&mut self) {
+        self.authoring_attempt = self.authoring_attempt.saturating_add(1);
+        self.automated_work_spent = Duration::ZERO;
+    }
+
+    fn carry_revision(&mut self, failure: &commands::acceptance::DoneAuthoringFailure) {
+        self.revision_context = failure.revision_context();
+    }
+
+    fn provider_request(&self, request: &str) -> String {
+        self.revision_context.as_ref().map_or_else(
+            || request.to_string(),
+            |context| format!("{request}\n\n{context}"),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartDoneRecoveryAction {
+    Continue,
+    Stop,
+}
+
+const MIN_START_RECOVERY_WORK: Duration = Duration::from_secs(1);
+
 pub(crate) fn start_done_materialization_request(
     decision: &StartLaunchDecision,
 ) -> Option<(String, bool)> {
@@ -3191,40 +3276,136 @@ fn start_done_authoring_selection(
 
 fn recover_start_done_authoring(
     decision: &mut StartLaunchDecision,
+    admission: &mut StartAdmissionSession,
     request: &str,
     overwrite_existing: bool,
     error: &CliError,
     prompter: &mut dyn StartPrompter,
-) -> Result<bool> {
+) -> Result<StartDoneRecoveryAction> {
     eprintln!(
         "{}",
         ui_warn(format!("done contract authoring stopped: {error}"))
     );
-    let choice = prompter.select_one(prompt::SelectPrompt {
-        title: "Recover done contract authoring".to_string(),
-        help: Some(
-            "Your source and execution-team choices are preserved. Retry, revise only the done wording, or stop before launch."
-                .to_string(),
-        ),
-        choices: vec![
-            start_prompt_choice(
+    let typed_failure = match error {
+        CliError::DoneAuthoring(failure) => Some(failure),
+        _ => None,
+    };
+    let failure_kind = match error {
+        CliError::DoneAuthoring(failure) => failure.kind(),
+        CliError::Provider(
+            deadreckon_providers::ProviderError::MissingCredential(_)
+            | deadreckon_providers::ProviderError::InvalidConfig(_)
+            | deadreckon_providers::ProviderError::NoRoute(_),
+        ) => commands::acceptance::DoneAuthoringFailureKind::Configuration,
+        _ => commands::acceptance::DoneAuthoringFailureKind::Retryable,
+    };
+    let remaining = admission.remaining_work();
+    let fresh_attempt = admission.fresh_attempt_work();
+    let can_continue = remaining >= MIN_START_RECOVERY_WORK;
+    let can_authorize = fresh_attempt >= MIN_START_RECOVERY_WORK;
+    let mut choices = Vec::new();
+    match failure_kind {
+        commands::acceptance::DoneAuthoringFailureKind::RevisionRequired => {
+            if can_continue || can_authorize {
+                choices.push(start_prompt_choice(
+                    "revise",
+                    "Revise the definition of done",
+                    if can_continue {
+                        "keeps every other start choice and uses the remaining provider-work allowance"
+                    } else {
+                        "keeps every other start choice and authorizes one new bounded provider attempt"
+                    },
+                ));
+            }
+        }
+        commands::acceptance::DoneAuthoringFailureKind::Retryable if can_continue => {
+            choices.push(start_prompt_choice(
                 "retry",
                 "Retry the same execution team",
-                "keeps the selected provider, model, source, and launch shape",
-            ),
-            start_prompt_choice(
+                "keeps every start choice and uses only the remaining provider-work allowance",
+            ));
+            choices.push(start_prompt_choice(
                 "revise",
                 "Revise the definition of done",
-                "keeps every other start choice and recompiles the contract",
-            ),
-            prompt::SelectChoice::new("cancel", "Stop before launch"),
-        ],
+                "keeps every other start choice and uses the remaining provider-work allowance",
+            ));
+        }
+        commands::acceptance::DoneAuthoringFailureKind::Retryable
+        | commands::acceptance::DoneAuthoringFailureKind::BudgetExhausted
+            if can_authorize =>
+        {
+            choices.push(start_prompt_choice(
+                "new_attempt",
+                "Authorize another authoring attempt",
+                "keeps every start choice and grants one new bounded provider-work allowance",
+            ));
+            choices.push(start_prompt_choice(
+                "revise",
+                "Revise and authorize another attempt",
+                "changes only the done wording and grants one new bounded provider-work allowance",
+            ));
+        }
+        commands::acceptance::DoneAuthoringFailureKind::Configuration
+        | commands::acceptance::DoneAuthoringFailureKind::LostContainment
+        | commands::acceptance::DoneAuthoringFailureKind::BudgetExhausted
+        | commands::acceptance::DoneAuthoringFailureKind::Retryable => {}
+    }
+    choices.push(prompt::SelectChoice::new("cancel", "Stop before launch"));
+    let help = match failure_kind {
+        commands::acceptance::DoneAuthoringFailureKind::RevisionRequired => {
+            if can_continue || can_authorize {
+                "The exact deterministic findings are preserved. Revise the done wording or stop before launch."
+            } else {
+                "The exact deterministic findings are preserved, but the absolute deadline leaves no runnable authoring time. Stop before launch."
+            }
+        }
+        commands::acceptance::DoneAuthoringFailureKind::BudgetExhausted => {
+            if can_authorize {
+                "The previous work allowance is exhausted. Explicitly authorize one bounded attempt or stop before launch."
+            } else {
+                "The previous work allowance is exhausted and the absolute deadline leaves no runnable authoring time. Stop before launch."
+            }
+        }
+        commands::acceptance::DoneAuthoringFailureKind::Configuration => {
+            "This route cannot recover inside the current wizard. Stop and follow the configuration guidance above."
+        }
+        commands::acceptance::DoneAuthoringFailureKind::LostContainment => {
+            "Provider cleanup was not proven, so no more work may start from this wizard."
+        }
+        commands::acceptance::DoneAuthoringFailureKind::Retryable => {
+            if can_continue || can_authorize {
+                "Your source and execution-team choices are preserved. Retry, authorize a bounded attempt, revise only the done wording, or stop before launch."
+            } else {
+                "Your source and execution-team choices are preserved, but the absolute deadline leaves no runnable authoring time. Stop before launch."
+            }
+        }
+    };
+    let choice = prompter.select_one(prompt::SelectPrompt {
+        title: "Recover done contract authoring".to_string(),
+        help: Some(help.to_string()),
+        choices,
         default_index: 0,
     })?;
     match choice.id.as_str() {
-        "retry" => Ok(true),
+        "retry" => Ok(StartDoneRecoveryAction::Continue),
+        "new_attempt" => {
+            admission.authorize_new_attempt();
+            Ok(StartDoneRecoveryAction::Continue)
+        }
         "revise" => {
-            let revised = prompter.input("revised definition of done: ", Some(request))?;
+            let default = typed_failure
+                .and_then(|failure| {
+                    let findings = failure.findings();
+                    (!findings.is_empty()).then(|| {
+                        format!(
+                            "{}; also verify {}",
+                            request.trim_end_matches(['.', ';']),
+                            findings.join("; ")
+                        )
+                    })
+                })
+                .unwrap_or_else(|| request.to_string());
+            let revised = prompter.input("revised definition of done: ", Some(&default))?;
             if revised.trim().is_empty() {
                 set_start_recovery(
                     decision,
@@ -3234,13 +3415,19 @@ fn recover_start_done_authoring(
                         shell_display_quote(&decision.goal)
                     )],
                 );
-                return Ok(false);
+                return Ok(StartDoneRecoveryAction::Stop);
+            }
+            if let Some(failure) = typed_failure {
+                admission.carry_revision(failure);
+            }
+            if !can_continue {
+                admission.authorize_new_attempt();
             }
             decision.done_action = StartDoneAction::ManualText {
                 text: revised.trim().to_string(),
                 overwrite_existing,
             };
-            Ok(true)
+            Ok(StartDoneRecoveryAction::Continue)
         }
         _ => {
             set_start_recovery(
@@ -3255,7 +3442,7 @@ fn recover_start_done_authoring(
                     "deadreckon update --check".to_string(),
                 ],
             );
-            Ok(false)
+            Ok(StartDoneRecoveryAction::Stop)
         }
     }
 }
@@ -3263,7 +3450,7 @@ fn recover_start_done_authoring(
 async fn materialize_start_done_criteria(
     decision: &mut StartLaunchDecision,
     mut prompter: Option<&mut dyn StartPrompter>,
-    admission_budget: Option<commands::acceptance::DoneAuthoringBudget>,
+    mut admission: Option<&mut StartAdmissionSession>,
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let (write_root, inspect_root) = decision.resolved_source.as_ref().map_or_else(
@@ -3281,6 +3468,13 @@ async fn materialize_start_done_criteria(
         else {
             return Ok(());
         };
+        let provider_request = admission.as_deref().map_or_else(
+            || request.clone(),
+            |session| session.provider_request(&request),
+        );
+        let admission_budget = admission
+            .as_deref()
+            .map(StartAdmissionSession::begin_automated_work);
         let context = commands::acceptance::AcceptanceAuthoringContext {
             write_root: &write_root,
             inspect_root: &inspect_root,
@@ -3291,7 +3485,7 @@ async fn materialize_start_done_criteria(
                 commands::acceptance::acceptance_agent_command_with_explicit_review_and_budget(
                     context,
                     commands::acceptance::AcceptanceAgentMode::Draft,
-                    vec![request.clone()],
+                    vec![provider_request.clone()],
                     authoring_provider.clone(),
                     authoring_model.clone(),
                     overwrite_existing,
@@ -3302,7 +3496,7 @@ async fn materialize_start_done_criteria(
                 commands::acceptance::acceptance_agent_command_with_explicit_review(
                     context,
                     commands::acceptance::AcceptanceAgentMode::Draft,
-                    vec![request.clone()],
+                    vec![provider_request.clone()],
                     authoring_provider.clone(),
                     authoring_model.clone(),
                     overwrite_existing,
@@ -3313,7 +3507,7 @@ async fn materialize_start_done_criteria(
             commands::acceptance::acceptance_agent_command_with_context_and_budget(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
-                vec![request.clone()],
+                vec![provider_request.clone()],
                 authoring_provider.clone(),
                 authoring_model.clone(),
                 overwrite_existing,
@@ -3324,24 +3518,34 @@ async fn materialize_start_done_criteria(
             commands::acceptance::acceptance_agent_command_with_context(
                 context,
                 commands::acceptance::AcceptanceAgentMode::Draft,
-                vec![request.clone()],
+                vec![provider_request.clone()],
                 authoring_provider.clone(),
                 authoring_model.clone(),
                 overwrite_existing,
             )
             .await
         };
+        if let (Some(session), Some(budget)) = (admission.as_deref_mut(), admission_budget) {
+            session.finish_automated_work(budget);
+        }
         if let Err(error) = authoring_result {
             let Some(active_prompter) = prompter.as_mut() else {
                 return Err(error);
             };
-            if recover_start_done_authoring(
-                decision,
-                &request,
-                overwrite_existing,
-                &error,
-                &mut **active_prompter,
-            )? {
+            let Some(session) = admission.as_deref_mut() else {
+                return Err(error);
+            };
+            if matches!(
+                recover_start_done_authoring(
+                    decision,
+                    session,
+                    &request,
+                    overwrite_existing,
+                    &error,
+                    &mut **active_prompter,
+                )?,
+                StartDoneRecoveryAction::Continue
+            ) {
                 continue;
             }
             return Ok(());
@@ -4017,6 +4221,8 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     add_start_history_actions(&mut decision, latest_extendable_run.as_ref());
     let eligibility = StartPromptEligibility::from_args(&args, stdin_is_tty);
     let mut terminal_prompter = TerminalStartPrompter;
+    let mut admission =
+        StartAdmissionSession::new(defaults.done_contract_max_wall_seconds, args.deadline);
 
     // Soundings: source policy is an admission decision, not a dispatch
     // afterthought. Resolve it once before any provider process, contract
@@ -4025,8 +4231,6 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
     resolve_start_source_setup(&mut decision, &args, source_prompter, stdin_is_tty)?;
-    let mut admission_work_spent = Duration::ZERO;
-
     if decision.recovery.is_none() && start_goal_shape_should_classify(&args, eligibility) {
         let inspection_root = decision
             .resolved_source
@@ -4045,11 +4249,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .as_deref()
             .unwrap_or("auto")
             .parse::<deadreckon_sandbox::SandboxBackend>()?;
-        let course_budget = commands::acceptance::DoneAuthoringBudget::from_config_and_deadline(
-            defaults.done_contract_max_wall_seconds,
-            args.deadline,
-        );
-        let course_started = Instant::now();
+        let course_budget = admission.begin_automated_work();
         let recommendation = classify_goal_shape_for_start_with_budget(
             &paths,
             inspection_root,
@@ -4060,11 +4260,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             Some(course_budget),
         )
         .await?;
-        // Prompt time between admission phases is not provider work. Carry
-        // only the automated work already consumed into contract authoring;
-        // an explicit calendar deadline is applied again below and therefore
-        // continues to advance while the operator decides.
-        admission_work_spent = course_started.elapsed().min(course_budget.total());
+        admission.finish_automated_work(course_budget);
         apply_goal_shape_recommendation(&mut decision, recommendation.clone());
         validate_start_source_compatibility(&mut decision, &args, &cwd);
         if decision.recovery.is_none() {
@@ -4109,13 +4305,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let review_prompter: Option<&mut dyn StartPrompter> = eligibility
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
-    let authoring_budget =
-        commands::acceptance::DoneAuthoringBudget::from_config_deadline_and_consumed(
-            defaults.done_contract_max_wall_seconds,
-            args.deadline,
-            admission_work_spent,
-        );
-    materialize_start_done_criteria(&mut decision, review_prompter, Some(authoring_budget)).await?;
+    materialize_start_done_criteria(&mut decision, review_prompter, Some(&mut admission)).await?;
     if let Some(recovery) = decision.recovery.as_ref() {
         return Err(start_recovery_error(recovery));
     }
@@ -5264,10 +5454,13 @@ mod start_goal_tests {
 #[cfg(test)]
 mod course_planner_cleanup_tests {
     use super::{
-        course_planner_cleanup_timeout, course_planner_timeout,
+        course_planner_cleanup_timeout, course_planner_timeout, course_planner_work_expires_at,
         require_course_planner_cleanup_proven,
     };
+    use crate::commands::acceptance::DoneAuthoringBudget;
+    use chrono::Utc;
     use deadreckon_providers::ProviderKind;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn goal_shape_planner_budgets_cover_cli_and_http_cold_starts() {
@@ -5298,6 +5491,35 @@ mod course_planner_cleanup_tests {
             course_planner_timeout(Some(&ProviderKind::Generic("local-http".to_string())))
                 .as_secs(),
             120
+        );
+    }
+
+    #[test]
+    fn goal_shape_planner_never_bypasses_its_route_cap() {
+        let now = Instant::now();
+        let long_admission = DoneAuthoringBudget::from_config(Some(3_600.0));
+        let cli_expiry = course_planner_work_expires_at(
+            now,
+            Some(&ProviderKind::CliCodex),
+            Some(long_admission),
+        );
+        assert!(
+            cli_expiry <= now + Duration::from_secs(300),
+            "the 300-second CLI route cap must beat a longer admission budget"
+        );
+
+        let calendar_limited = DoneAuthoringBudget::from_config_and_deadline(
+            Some(3_600.0),
+            Some(Utc::now() + chrono::Duration::seconds(90)),
+        );
+        let calendar_expiry = course_planner_work_expires_at(
+            now,
+            Some(&ProviderKind::CliCodex),
+            Some(calendar_limited),
+        );
+        assert!(
+            calendar_expiry <= now + Duration::from_secs(91),
+            "the absolute deadline must beat the route cap"
         );
     }
 
@@ -5382,6 +5604,7 @@ mod contract_tests {
         choice: &'static str,
         input: &'static str,
         offered: Vec<String>,
+        input_default: Option<String>,
     }
 
     impl StartPrompter for RecoveryPrompter {
@@ -5402,7 +5625,8 @@ mod contract_tests {
             panic!("recovery does not confirm")
         }
 
-        fn input(&mut self, _message: &str, _default: Option<&str>) -> Result<String> {
+        fn input(&mut self, _message: &str, default: Option<&str>) -> Result<String> {
+            self.input_default = default.map(str::to_string);
             Ok(self.input.to_string())
         }
     }
@@ -5436,15 +5660,25 @@ mod contract_tests {
             choice: "revise",
             input: "the dashboard passes its network smoke test",
             offered: Vec::new(),
+            input_default: None,
         };
+        let mut admission = StartAdmissionSession::new(None, None);
         let error = CliError::Core(deadreckon_core::user_error(
             "provider failed",
             "deadreckon doctor",
         ));
 
-        assert!(
-            recover_start_done_authoring(&mut d, "old done wording", false, &error, &mut prompter)
-                .expect("recovery")
+        assert_eq!(
+            recover_start_done_authoring(
+                &mut d,
+                &mut admission,
+                "old done wording",
+                false,
+                &error,
+                &mut prompter,
+            )
+            .expect("recovery"),
+            StartDoneRecoveryAction::Continue
         );
         assert_eq!(prompter.offered, ["retry", "revise", "cancel"]);
         assert_eq!(d.provider_route.as_deref(), Some("cli:codex"));
@@ -5456,6 +5690,146 @@ mod contract_tests {
                 overwrite_existing: false,
             }
         );
+    }
+
+    #[test]
+    fn deterministic_rejection_offers_revision_with_exact_findings_not_retry() {
+        let mut d = decision("build a graphical realtime dashboard");
+        d.provider_route = Some("cli:codex".to_string());
+        d.model = Some("gpt-5.6-sol".to_string());
+        let failure = commands::acceptance::DoneAuthoringFailure::fixture(
+            commands::acceptance::DoneAuthoringFailureKind::RevisionRequired,
+            vec![
+                "uncovered goal clause: graphical dashboard".to_string(),
+                "check 2 is not falsifiable".to_string(),
+            ],
+            true,
+        );
+        let error = CliError::DoneAuthoring(failure);
+        // Reproduce the reported composition: the weak redraft arrives as the
+        // original allowance expires. Revision must preserve the findings and
+        // explicitly open one runnable bounded attempt instead of copying the
+        // expired deadline into the next loop iteration.
+        let mut admission = StartAdmissionSession::new(Some(1_200.0), None);
+        admission.automated_work_spent = Duration::from_secs(1_200);
+        let mut prompter = RecoveryPrompter {
+            choice: "revise",
+            input: "launch two sessions and capture the rendered dashboard",
+            offered: Vec::new(),
+            input_default: None,
+        };
+
+        assert_eq!(
+            recover_start_done_authoring(
+                &mut d,
+                &mut admission,
+                "verify network connectivity",
+                false,
+                &error,
+                &mut prompter,
+            )
+            .expect("revision recovery"),
+            StartDoneRecoveryAction::Continue
+        );
+        assert_eq!(prompter.offered, ["revise", "cancel"]);
+        let default = prompter.input_default.expect("finding-aware default");
+        assert!(default.contains("graphical dashboard"), "{default}");
+        assert!(default.contains("check 2 is not falsifiable"), "{default}");
+        let provider_request = admission.provider_request("revised operator wording");
+        assert!(provider_request.contains("Previous acceptance.yaml"));
+        assert!(provider_request.contains("swift test"));
+        assert!(provider_request.contains("graphical dashboard"));
+        assert_eq!(admission.authoring_attempt, 2);
+        assert!(admission.remaining_work() > Duration::from_secs(1_190));
+        assert_eq!(d.provider_route.as_deref(), Some("cli:codex"));
+        assert_eq!(d.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn exhausted_budget_offers_only_an_explicit_new_attempt() {
+        let mut d = decision("build a realtime dashboard");
+        let mut admission = StartAdmissionSession::new(Some(1_200.0), None);
+        admission.automated_work_spent = Duration::from_secs(1_200);
+        let failure = commands::acceptance::DoneAuthoringFailure::fixture(
+            commands::acceptance::DoneAuthoringFailureKind::BudgetExhausted,
+            Vec::new(),
+            false,
+        );
+        let error = CliError::DoneAuthoring(failure);
+        let mut prompter = RecoveryPrompter {
+            choice: "new_attempt",
+            input: "unused",
+            offered: Vec::new(),
+            input_default: None,
+        };
+
+        assert_eq!(
+            recover_start_done_authoring(
+                &mut d,
+                &mut admission,
+                "verify network connectivity",
+                false,
+                &error,
+                &mut prompter,
+            )
+            .expect("new attempt recovery"),
+            StartDoneRecoveryAction::Continue
+        );
+        assert_eq!(prompter.offered, ["new_attempt", "revise", "cancel"]);
+        assert_eq!(admission.authoring_attempt, 2);
+        assert!(
+            admission.remaining_work() > Duration::from_secs(1_190),
+            "the explicitly-authorized attempt must have runnable bounded time"
+        );
+    }
+
+    #[test]
+    fn operator_prompt_time_is_not_charged_to_the_admission_session() {
+        let mut admission = StartAdmissionSession::new(Some(1_200.0), None);
+        admission.automated_work_spent = Duration::from_secs(125);
+        let before = admission.remaining_work();
+        std::thread::sleep(Duration::from_millis(20));
+        let after = admission.remaining_work();
+
+        assert!(
+            before.abs_diff(after) < Duration::from_millis(10),
+            "operator wait changed provider-work remainder: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn expired_absolute_deadline_never_offers_an_impossible_recovery() {
+        let mut d = decision("build a realtime dashboard");
+        let mut admission = StartAdmissionSession::new(
+            Some(1_200.0),
+            Some(Utc::now() - chrono::Duration::seconds(1)),
+        );
+        let failure = commands::acceptance::DoneAuthoringFailure::fixture(
+            commands::acceptance::DoneAuthoringFailureKind::RevisionRequired,
+            vec!["uncovered goal clause: graphical dashboard".to_string()],
+            true,
+        );
+        let error = CliError::DoneAuthoring(failure);
+        let mut prompter = RecoveryPrompter {
+            choice: "cancel",
+            input: "unused",
+            offered: Vec::new(),
+            input_default: None,
+        };
+
+        assert_eq!(
+            recover_start_done_authoring(
+                &mut d,
+                &mut admission,
+                "verify network connectivity",
+                false,
+                &error,
+                &mut prompter,
+            )
+            .expect("deadline recovery"),
+            StartDoneRecoveryAction::Stop
+        );
+        assert_eq!(prompter.offered, ["cancel"]);
     }
 
     #[test]

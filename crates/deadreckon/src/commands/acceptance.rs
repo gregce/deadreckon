@@ -25,6 +25,126 @@ pub(crate) struct AcceptanceDraft {
     pub(crate) files: BTreeMap<PathBuf, String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DoneAuthoringFailureKind {
+    Retryable,
+    RevisionRequired,
+    BudgetExhausted,
+    Configuration,
+    LostContainment,
+}
+
+/// A machine-readable failure from the pre-Job done-contract phase.
+///
+/// Guided `start` uses the kind to offer only executable recovery actions and
+/// carries the candidate plus deterministic findings into a revision. Direct
+/// `def-done` callers still receive a useful, self-contained error message.
+#[derive(Clone, Debug)]
+pub(crate) struct DoneAuthoringFailure {
+    kind: DoneAuthoringFailureKind,
+    message: String,
+    findings: Vec<String>,
+    candidate: Option<AcceptanceDraft>,
+    recovery_hint: String,
+}
+
+impl DoneAuthoringFailure {
+    fn new(
+        kind: DoneAuthoringFailureKind,
+        message: impl Into<String>,
+        recovery_hint: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            findings: Vec::new(),
+            candidate: None,
+            recovery_hint: recovery_hint.into(),
+        }
+    }
+
+    fn revision_required(
+        verdict: &CriticVerdict,
+        lint_findings: &[LintFinding],
+        candidate: AcceptanceDraft,
+    ) -> Self {
+        let mut findings = verdict
+            .uncovered_goal_clauses
+            .iter()
+            .map(|clause| format!("uncovered goal clause: {clause}"))
+            .collect::<Vec<_>>();
+        findings.extend(lint_findings.iter().map(LintFinding::summary));
+        findings.sort();
+        findings.dedup();
+        Self {
+            kind: DoneAuthoringFailureKind::RevisionRequired,
+            message: "redrafted done criteria need revision before launch".to_string(),
+            findings,
+            candidate: Some(candidate),
+            recovery_hint: "revise the definition of done using the reported findings".to_string(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> DoneAuthoringFailureKind {
+        self.kind
+    }
+
+    pub(crate) fn findings(&self) -> &[String] {
+        &self.findings
+    }
+
+    /// Provider context for the next explicitly-authorized revision. Keep it
+    /// in memory instead of publishing a rejected contract into the project.
+    pub(crate) fn revision_context(&self) -> Option<String> {
+        let candidate = self.candidate.as_ref()?;
+        let findings = if self.findings.is_empty() {
+            "- no detailed finding was recorded".to_string()
+        } else {
+            self.findings
+                .iter()
+                .map(|finding| format!("- {finding}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Some(format!(
+            "The previous candidate was rejected. Preserve its useful detail, but repair every deterministic finding.\n\nDeterministic findings:\n{findings}\n\nPrevious acceptance.yaml:\n```yaml\n{}\n```\n\nPrevious acceptance.md:\n```markdown\n{}\n```",
+            candidate.yaml, candidate.markdown
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        kind: DoneAuthoringFailureKind,
+        findings: Vec<String>,
+        with_candidate: bool,
+    ) -> Self {
+        Self {
+            kind,
+            message: "fixture done-authoring failure".to_string(),
+            findings,
+            candidate: with_candidate.then(|| AcceptanceDraft {
+                yaml: "name: fixture\nchecks:\n  - kind: shell\n    command: swift test\n"
+                    .to_string(),
+                markdown: "# Fixture candidate".to_string(),
+                files: BTreeMap::new(),
+            }),
+            recovery_hint: "fixture recovery".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for DoneAuthoringFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.message)?;
+        for finding in &self.findings {
+            write!(formatter, "\n  - {finding}")?;
+        }
+        write!(formatter, "\ntry: {}", self.recovery_hint)
+    }
+}
+
+impl std::error::Error for DoneAuthoringFailure {}
+
 /// Request-scoped roots for done-contract authoring. Contract artifacts are
 /// owned by the launch project, while project facts come from the resolved
 /// source. Direct `def-done` intentionally supplies the same path twice.
@@ -233,8 +353,12 @@ impl DoneAuthoringBudget {
         self.deadline.checked_duration_since(Instant::now())
     }
 
-    fn elapsed(self) -> Duration {
+    pub(crate) fn elapsed(self) -> Duration {
         self.consumed_before.saturating_add(self.started.elapsed())
+    }
+
+    pub(crate) fn remaining(self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
     }
 
     pub(crate) fn work_expires_at(self) -> Instant {
@@ -346,14 +470,15 @@ async fn run_done_authoring_stage(
         .map(|route| format!("{} / {}", route.name, route.model))
         .unwrap_or_else(|| "configured provider".to_string());
     let allocation = budget.allocation(stage).ok_or_else(|| {
-        CliError::Core(deadreckon_core::user_error(
-            &format!(
+        DoneAuthoringFailure::new(
+            DoneAuthoringFailureKind::BudgetExhausted,
+            format!(
                 "done criteria {} exhausted the {:.1}s cumulative authoring budget via {route_label}",
                 stage.label(),
                 budget.total.as_secs_f64()
             ),
-            "deadreckon def-done \"builds and passes behavioral tests\"",
-        ))
+            "authorize another bounded authoring attempt or stop before launch",
+        )
     })?;
     let token = CancellationToken::new();
     let id = Uuid::new_v4().simple().to_string();
@@ -385,13 +510,21 @@ async fn run_done_authoring_stage(
         }
         ProviderPhaseOutcome::Completed(Err(error)) => {
             remove_done_authoring_outputs(&output_files);
-            Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
+            let recovery = done_authoring_provider_recovery(&error);
+            let kind = if recovery == DONE_AUTHORING_RETRY_RECOVERY {
+                DoneAuthoringFailureKind::Retryable
+            } else {
+                DoneAuthoringFailureKind::Configuration
+            };
+            Err(DoneAuthoringFailure::new(
+                kind,
+                format!(
                     "done criteria {} provider failed via {route_label}: {error}",
                     stage.label()
                 ),
-                done_authoring_provider_recovery(&error),
-            )))
+                recovery,
+            )
+            .into())
         }
         ProviderPhaseOutcome::WorkExpired { cleanup }
         | ProviderPhaseOutcome::Cancelled { cleanup } => {
@@ -402,7 +535,7 @@ async fn run_done_authoring_stage(
             if cleanup_proven {
                 remove_done_authoring_outputs(&output_files);
             }
-            Err(done_authoring_timeout_error(
+            Err(done_authoring_timeout_failure(
                 stage,
                 budget,
                 allocation,
@@ -437,7 +570,7 @@ fn done_authoring_provider_recovery(error: &deadreckon_providers::ProviderError)
     DONE_AUTHORING_RETRY_RECOVERY
 }
 
-fn done_authoring_timeout_error(
+fn done_authoring_timeout_failure(
     stage: DoneAuthoringStage,
     budget: DoneAuthoringBudget,
     allocation: Duration,
@@ -453,8 +586,13 @@ fn done_authoring_timeout_error(
             pid_file.display()
         )
     };
-    CliError::Core(deadreckon_core::user_error(
-        &format!(
+    DoneAuthoringFailure::new(
+        if cleanup_proven {
+            DoneAuthoringFailureKind::BudgetExhausted
+        } else {
+            DoneAuthoringFailureKind::LostContainment
+        },
+        format!(
             "done criteria {} timed out after {:.1}s (elapsed {:.1}s of {:.1}s cumulative) via {route_label}{cleanup}",
             stage.label(),
             allocation.as_secs_f64(),
@@ -462,11 +600,12 @@ fn done_authoring_timeout_error(
             budget.total.as_secs_f64()
         ),
         if cleanup_proven {
-            DONE_AUTHORING_RETRY_RECOVERY
+            "authorize another bounded authoring attempt or stop before launch"
         } else {
             DONE_AUTHORING_CONFIG_RECOVERY
         },
-    ))
+    )
+    .into()
 }
 
 #[cfg(test)]
@@ -1158,10 +1297,12 @@ async fn acceptance_agent_command_with_review_policy(
     } else if critic_fallback_allowed(explicit_human_review, &initial_floor) {
         Some(initial_floor)
     } else {
-        return Err(CliError::Core(deadreckon_core::user_error(
+        return Err(DoneAuthoringFailure::new(
+            DoneAuthoringFailureKind::Configuration,
             "done contract critic is unavailable for a strict launch",
             DONE_AUTHORING_CONFIG_RECOVERY,
-        )));
+        )
+        .into());
     };
     if let Some(verdict) = critic
         .as_ref()
@@ -1195,10 +1336,12 @@ async fn acceptance_agent_command_with_review_policy(
         lint_findings = lint_contract(&compiled);
         let final_floor = critic_floor_verdict(context.goal, &compiled, &lint_findings);
         if matches!(final_floor.verdict, CriticDecision::Redraft) {
-            return Err(CliError::Core(deadreckon_core::user_error(
-                "redrafted done criteria still fail deterministic coverage and lint checks",
-                "deadreckon def-done refine \"add behavioral checks for every goal clause\"",
-            )));
+            return Err(DoneAuthoringFailure::revision_required(
+                &final_floor,
+                &lint_findings,
+                draft,
+            )
+            .into());
         }
         critic = Some(final_floor);
     }
@@ -3411,7 +3554,7 @@ mod tests {
             }
         );
         let pid_file = project.path().join("provider.pid");
-        let error = done_authoring_timeout_error(
+        let error = done_authoring_timeout_failure(
             DoneAuthoringStage::Draft,
             budget,
             Duration::from_millis(5),

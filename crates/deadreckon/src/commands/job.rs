@@ -2355,6 +2355,52 @@ mod tests {
     }
 
     #[test]
+    fn init_git_graph_job_accepts_a_parent_directory_with_sibling_ignore_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("launch");
+        let left = source.join("left-app");
+        let right = source.join("right-app");
+        fs::create_dir_all(&left).expect("left app");
+        fs::create_dir_all(&right).expect("right app");
+        fs::write(left.join(".gitignore"), "generated.txt\n").expect("left ignore");
+        fs::write(right.join(".gitignore"), "cache.txt\n").expect("right ignore");
+        fs::write(left.join("generated.txt"), "ignored\n").expect("left generated");
+        fs::write(right.join("generated.txt"), "source\n").expect("right source");
+
+        let mut request = request(&paths, &source, None);
+        request.launch_plan.shape = commands::course::CourseShape::Plan;
+        request.shape = JobShape::Graph;
+        request.driver = Some(commands::graph_job::DriverSpec {
+            kind: commands::graph_job::DriverKind::FullPlan,
+            child_count: Some(2),
+            apply: deadreckon_core::plan::ApplyWhen::AtEnd,
+            planner_provider: Some("smoke".to_string()),
+            child_provider: Some("smoke".to_string()),
+            child_provider_overrides: Vec::new(),
+            coder_provider: None,
+            reviewer_provider: None,
+            planner_model: None,
+            child_model: None,
+            child_model_overrides: Vec::new(),
+            coder_model: None,
+            reviewer_model: None,
+            model: None,
+            source_init_git: true,
+        });
+        request.source = DurableSource {
+            mode: DurableSourceMode::InitGit,
+            from: None,
+            allow_dirty: false,
+        };
+
+        let job = create_job(request).expect("create init-git graph job");
+
+        assert_eq!(job.source_cwd, source);
+        assert!(job.source_cwd.join("right-app/generated.txt").is_file());
+    }
+
+    #[test]
     fn wall_cap_conversion_never_rewrites_an_invalid_or_fractional_approval() {
         assert_eq!(checked_job_wall_seconds(90.0).expect("whole cap"), 90);
         for invalid in [
