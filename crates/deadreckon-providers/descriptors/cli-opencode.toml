@@ -16,24 +16,28 @@ kind = "subscription"
 [version_probe]
 args = ["--version"]
 
-# Pennant probe (OpenCode CLI 0.15.5, 2026-07-16): `run` supports
-# `--format json` and `--session`, but a real successful free-model invocation
-# emitted text(answer), error, then text(null) while exiting zero. The shared
-# JSON-lines contract retains the last non-null answer and treats the nested
-# error message as a provider failure. This version also rejects the old
-# hidden `--dangerously-skip-permissions` flag.
+# OpenCode 1.18.14 (2026-08-06) keeps structured output and unattended
+# permission approval under the `run` subcommand. Probe that exact surface:
+# top-level `opencode --help` does not expose either flag. The outer DeadReckon
+# sandbox remains the hard filesystem/network authority when `--auto` approves
+# OpenCode's inner permission prompts. The JSON-lines parser retains the last
+# non-null answer and treats nested error messages as provider failures.
 [exec_template]
 args_template = ["run", "{prompt}"]
 model_arg = "--model"
 timeout_seconds = 1800
 
 [contract]
-stream_args = ["--format", "json"]
+stream_args = ["--format", "json", "--auto"]
 dialect = "json-lines"
 conversation_id_path = "/sessionID"
+usage_input_path = "/part/tokens/input"
+usage_output_path = "/part/tokens/output"
+cost_path = "/part/cost"
 answer_path = "/part/text"
 error_message_path = "/error/data/message"
-probe_substring = "--format"
+probe_args = ["run", "--help"]
+probe_substring = "--auto"
 
 [install_hint]
 url = "https://opencode.ai/docs/"
