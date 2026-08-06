@@ -2179,7 +2179,7 @@ The user-facing skip model is split by timing. `--yes` belongs to preflight prev
 
 Provider displays use the provider/route/model/kind vocabulary consistently. Human provider lists and detection rows use the same `kind=cli|http|local-http|scripted` tokens, and the configured route is marked with `*` in the selection and registry views. `setup.rs` owns runtime provider setup rows for config/default-provider, primary run, doc polish, planner, child, coder, reviewer, and repair roles; it validates unknown routes before writes, reports source/credential/install state, and leaves built-in fallback routing unforced for normal run defaults. `show --why-failed` and `chain show --why-failed` now route through one failure-summary renderer with shared `status:`, `reason:`, `evidence:`, and `try:` sections.
 
-`deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result. `--doc-provider` handles documentation polish, resolving through explicit flag, config, subscription CLI, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
+`deadreckon help-all` includes the provider-role glossary. `--provider` is the primary run provider route and the default child route in full-plan orchestration. `--planner-provider` writes the full-plan child graph. `--child-provider IDX=PROVIDER` overrides a specific child. `--coder-provider` performs the review-mode implementation pass. `--reviewer-provider` independently reviews or fixes the coder result in review mode and selects the schema-only final done judge for runs, plans, and campaigns. `--doc-provider` handles documentation polish, resolving through explicit flag, config, subscription CLI, then run provider. `--repair-provider` handles merge repair planning and repair-child runs. Normal user surfaces say provider route/model/kind; descriptor remains registry documentation vocabulary.
 
 Done-contract setup also resolves through `setup.rs`. Explicit `--acceptance <path>`, project `.deadreckon/acceptance.yaml`, generated criteria from `def-done`/pre-run drafting, and default `dr-gate` behavior all produce one `DoneCriteriaSelection`. User-facing previews and orchestration preflights say `done contract`; technical files, gate proofs, and hidden compatibility commands may still say `acceptance.yaml` or `gate`.
 
@@ -4227,16 +4227,31 @@ Fixtures recorded from the installed binaries live under
 
 | Route | Probe result | Contract status | Shipped behavior |
 |---|---|---|---|
-| `cli:pi` | Pi 0.79.1 | onboarded, JSON Lines | extracts session ID, input/output tokens, reported cost and answer; resumes with `--session`; ingests tool execution live |
+| `cli:pi` | Pi 0.79.1 | onboarded, JSON Lines | extracts session ID, input/output tokens, reported cost and answer; resumes with `--session`; classifies zero-exit provider errors including insufficient balance |
 | `cli:copilot` | GitHub Copilot CLI 1.0.45 | onboarded, JSON Lines | extracts session ID, output tokens and answer; resumes with `--resume=<id>`; ingests nested tool requests and execution events live |
 | `cli:gemini` | Gemini CLI 0.42.0 | documented gap | the binary advertises `stream-json`, resume and session flags, but the installed credentials fail with `IneligibleTierError/UNSUPPORTED_CLIENT` before any JSON event; no contract was guessed |
-| `cli:opencode` | OpenCode CLI 0.15.5 | documented gap | removed the rejected `--dangerously-skip-permissions` flag; real JSON output emitted answer, error and null-text events while exiting zero, which the pointer dialect cannot classify safely |
+| `cli:opencode` | OpenCode CLI 0.15.5 | onboarded, JSON Lines | retains the last non-null answer event, extracts the session ID, and classifies structured zero-exit provider errors such as `DecimalError` |
 
 Copilot 1.0.45 emits several standalone JSON documents even with `--stream
 off`, so its honest dialect is `json-lines`, not `json-document`. It exposes
-output tokens but no input-token count in the recorded result. OpenCode needs a
-richer event mirror before onboarding. Gemini needs a successful current
-structured fixture before onboarding.
+output tokens but no input-token count in the recorded result. Gemini still
+needs a successful current structured fixture before onboarding.
+
+Generic event contracts prove worker transport, completion, usage and error
+extraction; they do not prove arbitrary schema-only output. Consequently
+`cli:gemini`, `cli:opencode`, `cli:copilot`, `cli:pi`, and custom generic CLI
+descriptors can perform implementation work but cannot be selected as the
+final semantic judge. Any durable run, review graph, full plan, or campaign
+using one of those implementation routes requires an explicit schema-capable
+`--reviewer-provider`. Guided start, direct orchestration, fork replay, and the
+graph completion router all enforce that distinction. The worker and reviewer
+routes/models are frozen separately in `launch-plan.json`; the release
+preflight records both routes rather than crediting the worker with the
+reviewer's judgment. Dedicated Claude Code and Codex adapters provide native,
+capability-probed schema-only posture. `cli:codex-server` uses its ephemeral
+Codex fallback for schema-only/read-only requests. HTTP Anthropic and OpenAI
+adapters express the schema in their native protocol, while compatible
+third-party endpoints remain subject to live verification.
 
 ## 56. Shakedown: One Reference Resolver
 
@@ -4736,6 +4751,22 @@ evidence pack containing the approved goal, frozen contract, check result,
 authority facts, changed-file list, bounded diff, and implementation notes. A
 fresh provider request has no worker session and uses the explicit read-only
 workspace posture. The response schema permits only:
+
+The launch plan carries implementation and semantic-review roles separately.
+For a direct run, a route with a schema-only adapter is frozen as both roles by
+default. A generic CLI worker must name a distinct schema-capable reviewer;
+DeadReckon refuses before Job creation when the effective reviewer cannot
+support schema-only output. The command-specific `--reviewer-provider` and
+`--reviewer-model` values take precedence over
+`defaults.reviewer_provider` and `defaults.reviewer_model`; guided start,
+direct run, review, full-plan and campaign compilation all freeze the resolved
+reviewer before done-contract authoring or Job creation. Stored legacy plans
+adopt the configured reviewer before considering their historical
+`coder`/`default_child`/`planner` routes. `doctor` checks the default
+worker/reviewer pairing, and provider removal clears reviewer references and
+their model together. Parent completion resolves `reviewer` before its legacy
+`coder`/`planner` fallback, so old plans remain readable while new
+generic-worker plans cannot silently reuse the worker as judge.
 
 - `achieved`: only when coverage is non-empty, every claim is `met`, every
   claim cites allowed evidence, and model-facing `blocking_missing` is empty;

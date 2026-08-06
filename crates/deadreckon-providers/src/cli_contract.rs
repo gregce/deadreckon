@@ -547,7 +547,13 @@ fn extract_descriptor_value(
     }
     if let Some(found) = pointer_value(value, contract.answer_path.as_deref()) {
         state.seen_answer = true;
-        state.parsed.answer = scalar_text(found);
+        // Event streams such as OpenCode emit a terminal text event whose
+        // value is null after the real answer. A null is evidence that the
+        // pointer exists, not a new answer that should erase the last
+        // meaningful text.
+        if let Some(answer) = scalar_text(found) {
+            state.parsed.answer = Some(answer);
+        }
     }
 
     let error_message = pointer_value(value, contract.error_message_path.as_deref());
@@ -878,6 +884,44 @@ mod tests {
             })
         );
         assert!(extracted.missing_fields.is_empty());
+    }
+
+    #[test]
+    fn null_answer_event_does_not_erase_last_meaningful_text() {
+        let contract = pointer_contract(ContractDialect::JsonLines);
+        let output = concat!("{\"answer\":\"finished\"}\n", "{\"answer\":null}\n");
+        let extracted = extract_descriptor_output(&contract, output);
+        assert_eq!(extracted.parsed.answer.as_deref(), Some("finished"));
+    }
+
+    #[test]
+    fn builtin_opencode_contract_retains_answer_and_reports_error_events() {
+        let registry = crate::registry::ProviderRegistry::builtin().expect("registry");
+        let section = registry
+            .get("cli:opencode")
+            .and_then(|descriptor| descriptor.contract.as_ref())
+            .expect("OpenCode contract");
+        let contract = ProviderContract::from_descriptor(section).expect("contract");
+
+        let success = contract.parse(include_str!(
+            "../tests/fixtures/pennant/opencode-success.jsonl"
+        ));
+        assert_eq!(
+            success.parsed.answer.as_deref(),
+            Some("OPENCODE_FIXTURE_OK")
+        );
+        assert!(success.parsed.failure.is_none());
+
+        let failure = contract.parse(include_str!(
+            "../tests/fixtures/pennant/opencode-structured-gap.jsonl"
+        ));
+        assert!(
+            failure
+                .parsed
+                .failure
+                .as_deref()
+                .is_some_and(|message| message.contains("DecimalError"))
+        );
     }
 
     #[test]

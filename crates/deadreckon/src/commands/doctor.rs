@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) async fn doctor_command(json_output: bool, repair: bool) -> Result<()> {
+pub(crate) async fn doctor_command(json_output: bool, live: bool, repair: bool) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let repair_findings = if repair {
         perform_doctor_repairs(&paths)
@@ -15,7 +15,7 @@ pub(crate) async fn doctor_command(json_output: bool, repair: bool) -> Result<()
         Vec::new()
     };
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let report = build_doctor_report(&paths, source, true, repair_findings).await?;
+    let report = build_doctor_report(&paths, source, true, live, repair_findings).await?;
     let surface = doctor_verdict_surface(&report);
     if json_output {
         println!(
@@ -174,7 +174,7 @@ impl From<&DoctorReport> for DoctorSetupSummary {
 pub(crate) async fn doctor_setup_summary() -> Result<DoctorSetupSummary> {
     let paths = DeadreckonPaths::discover();
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let report = build_doctor_report(&paths, source, false, Vec::new()).await?;
+    let report = build_doctor_report(&paths, source, false, false, Vec::new()).await?;
     Ok(DoctorSetupSummary::from(&report))
 }
 
@@ -182,6 +182,7 @@ async fn build_doctor_report(
     paths: &DeadreckonPaths,
     source: PathBuf,
     include_supervisor: bool,
+    live_provider_check: bool,
     mut repair_findings: Vec<DoctorFinding>,
 ) -> Result<DoctorReport> {
     let mut findings = vec![
@@ -257,7 +258,7 @@ async fn build_doctor_report(
     }
 
     if let Some(root) = &config_root {
-        findings.extend(collect_doctor_provider_findings(paths, root).await?);
+        findings.extend(collect_doctor_provider_findings(paths, root, live_provider_check).await?);
     }
 
     let defaults = config_defaults(paths).unwrap_or_default();
@@ -279,6 +280,9 @@ async fn build_doctor_report(
             "no provider configured",
             Some("deadreckon init".to_string()),
         ));
+    }
+    if let Some(finding) = collect_doctor_semantic_reviewer_finding(paths, &defaults)? {
+        findings.push(finding);
     }
 
     let seams = match doctor_seam_resolution(paths, false) {
@@ -1068,6 +1072,7 @@ fn doctor_json_payload(
 async fn collect_doctor_provider_findings(
     paths: &DeadreckonPaths,
     root: &toml::Value,
+    live: bool,
 ) -> Result<Vec<DoctorFinding>> {
     // A config without a [providers] table is legitimate: built-in registry
     // descriptors cover every default route (e.g. after `config
@@ -1137,7 +1142,7 @@ async fn collect_doctor_provider_findings(
             }
         };
 
-        if std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
+        if live || std::env::var_os("DEADRECKON_DOCTOR_PING").is_some() {
             findings.push(collect_doctor_provider_ping(paths, name, &kind_label).await?);
             continue;
         }
@@ -1146,18 +1151,118 @@ async fn collect_doctor_provider_findings(
             let binary = selection.binary.as_deref().unwrap_or("unknown");
             findings.push(DoctorFinding::passed(
                 subject,
-                format!("CLI binary {binary} found; launch preflight passed"),
-                Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
+                format!(
+                    "CLI binary {binary} found; static launch preflight passed; live model turn not tested"
+                ),
+                Some("deadreckon doctor --live".to_string()),
             ));
         } else {
             findings.push(DoctorFinding::passed(
                 subject,
-                "credential present; ping skipped",
-                Some("DEADRECKON_DOCTOR_PING=1 deadreckon doctor".to_string()),
+                "credential present; static setup passed; live model turn not tested",
+                Some("deadreckon doctor --live".to_string()),
             ));
         }
     }
     Ok(findings)
+}
+
+fn collect_doctor_semantic_reviewer_finding(
+    paths: &DeadreckonPaths,
+    defaults: &ConfigDefaults,
+) -> Result<Option<DoctorFinding>> {
+    let Some(worker) = defaults.provider.as_deref() else {
+        return Ok(None);
+    };
+    let worker_route = match setup::route_info_for_provider(
+        &paths.config_path(),
+        Some(worker),
+        defaults.model.as_deref(),
+    ) {
+        Ok(route) => route,
+        Err(_) => return Ok(None),
+    };
+    let reviewer = if let Some(reviewer) = defaults.reviewer_provider.as_deref() {
+        reviewer
+    } else if worker_route
+        .as_ref()
+        .is_some_and(|route| route.kind.has_schema_only_adapter())
+    {
+        worker
+    } else {
+        return Ok(Some(DoctorFinding::failed(
+            "semantic reviewer",
+            format!(
+                "default worker {worker} has no schema-only adapter and defaults.reviewer_provider is not configured"
+            ),
+            Some("deadreckon config set defaults.reviewer_provider cli:codex".to_string()),
+        )));
+    };
+    let reviewer_model = if defaults.reviewer_provider.as_deref() == Some(reviewer) {
+        defaults.reviewer_model.as_deref()
+    } else {
+        defaults.model.as_deref()
+    };
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    let selection = setup::select_provider_setup(
+        &paths.config_path(),
+        &registry,
+        setup::ProviderSetupRequest {
+            role: setup::SetupProviderRoleRef::Reviewer,
+            explicit_provider: Some(reviewer),
+            explicit_model: reviewer_model,
+            config_default_provider: None,
+            config_doc_provider: None,
+            run_provider: None,
+            auto_subscription_provider: None,
+            built_in_default_provider: None,
+            use_router_default: false,
+            allow_auto_subscription: false,
+            require_usable_route: true,
+        },
+    );
+    if let Err(refusal) = selection {
+        return Ok(Some(DoctorFinding::failed(
+            "semantic reviewer",
+            refusal.message,
+            Some(refusal.try_line),
+        )));
+    }
+    let route = match setup::route_info_for_provider(
+        &paths.config_path(),
+        Some(reviewer),
+        reviewer_model,
+    ) {
+        Ok(Some(route)) => route,
+        Ok(None) => {
+            return Ok(Some(DoctorFinding::failed(
+                "semantic reviewer",
+                format!("semantic reviewer route {reviewer} did not resolve"),
+                Some("deadreckon config set defaults.reviewer_provider cli:codex".to_string()),
+            )));
+        }
+        Err(err) => {
+            return Ok(Some(DoctorFinding::failed(
+                "semantic reviewer",
+                format!("semantic reviewer route {reviewer} is invalid: {err}"),
+                Some("deadreckon config set defaults.reviewer_provider cli:codex".to_string()),
+            )));
+        }
+    };
+    if !route.kind.has_schema_only_adapter() {
+        return Ok(Some(DoctorFinding::failed(
+            "semantic reviewer",
+            format!("provider route {reviewer} cannot perform schema-only semantic review"),
+            Some("deadreckon config set defaults.reviewer_provider cli:codex".to_string()),
+        )));
+    }
+    Ok(Some(DoctorFinding::passed(
+        "semantic reviewer",
+        format!("schema-only route {reviewer} configured for worker {worker}"),
+        Some(format!(
+            "deadreckon run \"goal\" --provider {worker} --reviewer-provider {reviewer} --preview"
+        )),
+    )))
 }
 
 async fn collect_doctor_provider_ping(
@@ -1165,9 +1270,13 @@ async fn collect_doctor_provider_ping(
     name: &str,
     kind_label: &str,
 ) -> Result<DoctorFinding> {
+    const LIVE_TOKEN: &str = "DEADRECKON_PROVIDER_OK";
     let router = ProviderRouter::from_config_path(&paths.config_path(), Some(name))?;
-    let mut request =
-        ProviderRequest::enforceably_read_only("Reply with OK only.", 8, std::env::current_dir()?);
+    let mut request = ProviderRequest::enforceably_read_only(
+        format!("Reply exactly {LIVE_TOKEN} and nothing else."),
+        32,
+        std::env::current_dir()?,
+    );
     request.pid_file = Some(std::env::temp_dir().join(format!(
         "deadreckon-doctor-provider-{}.pid",
         uuid::Uuid::new_v4().simple()
@@ -1178,12 +1287,22 @@ async fn collect_doctor_provider_ping(
         std::time::Duration::from_secs(10),
     );
     match complete_provider_phase(&router, &mut request, deadline).await {
-        ProviderPhaseOutcome::Completed(Ok(response)) => Ok(DoctorFinding::passed(
+        ProviderPhaseOutcome::Completed(Ok(response)) if response.content.contains(LIVE_TOKEN) => {
+            Ok(DoctorFinding::passed(
+                subject,
+                format!("live worker ping ok model {}", response.model),
+                Some(format!(
+                    "deadreckon run \"goal\" --provider {name} --preview"
+                )),
+            ))
+        }
+        ProviderPhaseOutcome::Completed(Ok(response)) => Ok(DoctorFinding::failed(
             subject,
-            format!("ping ok model {}", response.model),
-            Some(format!(
-                "deadreckon run \"goal\" --provider {name} --preview"
-            )),
+            format!(
+                "live worker ping returned without the required token (model {})",
+                response.model
+            ),
+            Some("deadreckon config provider".to_string()),
         )),
         ProviderPhaseOutcome::Completed(Err(err)) => Ok(DoctorFinding::failed(
             subject,
@@ -1420,6 +1539,33 @@ timeout_ms = 1234
         );
     }
 
+    #[test]
+    fn doctor_requires_a_schema_capable_reviewer_for_a_generic_default_worker() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let missing = ConfigDefaults {
+            provider: Some("cli:copilot".to_string()),
+            ..ConfigDefaults::default()
+        };
+
+        let finding = collect_doctor_semantic_reviewer_finding(&paths, &missing)
+            .expect("finding")
+            .expect("configured worker finding");
+        assert_eq!(finding.status, "failed");
+        assert!(finding.detail.contains("defaults.reviewer_provider"));
+
+        let configured = ConfigDefaults {
+            provider: Some("cli:copilot".to_string()),
+            reviewer_provider: Some("smoke".to_string()),
+            ..ConfigDefaults::default()
+        };
+        let finding = collect_doctor_semantic_reviewer_finding(&paths, &configured)
+            .expect("finding")
+            .expect("configured reviewer finding");
+        assert_eq!(finding.status, "passed");
+        assert!(finding.detail.contains("schema-only route smoke"));
+    }
+
     #[tokio::test]
     async fn doctor_missing_config_surface_has_one_primary_action() {
         let temp = tempfile::TempDir::new().expect("temp");
@@ -1427,7 +1573,7 @@ timeout_ms = 1234
         let source = temp.path().join("repo");
         std::fs::create_dir_all(&source).expect("source");
 
-        let report = build_doctor_report(&paths, source, false, Vec::new())
+        let report = build_doctor_report(&paths, source, false, false, Vec::new())
             .await
             .expect("doctor report");
         let rendered = doctor_verdict_surface(&report).render_plain(false);
@@ -1454,7 +1600,7 @@ timeout_ms = 1234
         let source = temp.path().join("repo");
         std::fs::create_dir_all(&source).expect("source");
 
-        let report = build_doctor_report(&paths, source, false, Vec::new())
+        let report = build_doctor_report(&paths, source, false, false, Vec::new())
             .await
             .expect("doctor report");
         let surface = doctor_verdict_surface(&report);

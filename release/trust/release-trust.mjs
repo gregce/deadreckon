@@ -218,9 +218,9 @@ function validateProviderProof(localArgs = args) {
     throw new Error(`${knownGoodPath} is not valid JSON: ${error.message}`);
   }
   const errors = [];
-  if (proof.schema_version !== 2) {
+  if (proof.schema_version !== 3) {
     errors.push(
-      `${knownGoodPath} uses provider-proof schema ${proof.schema_version ?? "unknown"}, not 2 — re-run release/preflight-real.sh`,
+      `${knownGoodPath} uses provider-proof schema ${proof.schema_version ?? "unknown"}, not 3 — re-run release/preflight-real.sh`,
     );
   }
   if (proof.deadreckon_version !== expectedVersion) {
@@ -272,7 +272,13 @@ function validateProviderProof(localArgs = args) {
       continue;
     }
     routes.add(provider.route);
-    for (const field of ["binary_version", "proof", "operator"]) {
+    for (const field of [
+      "binary_version",
+      "reviewer_route",
+      "reviewer_binary_version",
+      "proof",
+      "operator",
+    ]) {
       if (typeof provider[field] !== "string" || provider[field].trim().length === 0) {
         errors.push(`${knownGoodPath} provider ${provider.route} has no ${field}`);
       }
