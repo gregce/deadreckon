@@ -244,6 +244,11 @@ pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn model(&self) -> &str;
     fn has_credential(&self) -> bool;
+    /// The exact executable this resolved route will launch, after descriptor
+    /// defaults and operator config overrides have been merged.
+    fn executable(&self) -> Option<&str> {
+        None
+    }
     fn estimate_spend(&self, usage: ProviderUsage) -> SpendEstimate;
     fn process_lifetime(&self, _request: &ProviderRequest) -> ProviderProcessLifetime {
         ProviderProcessLifetime::Invocation
@@ -257,6 +262,7 @@ pub struct ProviderRouteInfo {
     pub kind: ProviderKind,
     pub model: String,
     pub has_credential: bool,
+    pub executable: Option<String>,
 }
 
 #[cfg(test)]

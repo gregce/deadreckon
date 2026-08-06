@@ -147,6 +147,15 @@ fn descriptor_ingest_round_trips_for_copilot_and_pi() {
 fn descriptor_models_and_install_hints_cover_copilot_and_pi() {
     let registry = ProviderRegistry::builtin().expect("builtin registry");
     let copilot = registry.get("cli:copilot").expect("copilot descriptor");
+    let copilot_version = copilot
+        .version_probe
+        .as_ref()
+        .expect("copilot version probe");
+    assert_eq!(copilot_version.args, ["--version"]);
+    assert_eq!(
+        copilot_version.expect_substring.as_deref(),
+        Some("GitHub Copilot CLI")
+    );
     assert_eq!(copilot.exec_template.model_arg.as_deref(), Some("--model"));
     assert!(
         copilot

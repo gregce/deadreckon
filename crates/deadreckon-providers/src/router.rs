@@ -192,6 +192,7 @@ impl ProviderRouter {
                 kind: route.kind(),
                 model: route.model().to_string(),
                 has_credential: route.has_credential(),
+                executable: route.executable().map(ToString::to_string),
             })
             .collect()
     }
