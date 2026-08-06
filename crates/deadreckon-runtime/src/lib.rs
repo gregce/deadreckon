@@ -41,5 +41,5 @@ pub use turn_loop::{
     ParentRepairCandidateContext, RunLoopConfig, RunLoopDocsConfig, RunLoopOutcome,
     RunWorkBoundary, RunWorkExpiry, run_contained_verdict_evaluation,
     run_deterministic_completion_gate, run_deterministic_gate_work_phase,
-    run_parent_repair_turn_loop, run_turn_loop,
+    run_parent_repair_turn_loop, run_turn_loop, run_turn_loop_with_semantic_router,
 };

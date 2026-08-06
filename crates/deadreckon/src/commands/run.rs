@@ -784,6 +784,15 @@ fn freeze_direct_provider_roles(
     launch_plan.providers.reviewer_model = reviewer_model;
 }
 
+fn reviewer_requires_distinct_router(
+    worker_provider: Option<&str>,
+    worker_model: Option<&str>,
+    reviewer_provider: Option<&str>,
+    reviewer_model: Option<&str>,
+) -> bool {
+    reviewer_provider != worker_provider || reviewer_model != worker_model
+}
+
 fn direct_run_approval_policy(
     yes: bool,
     no_confirm: bool,
@@ -1425,20 +1434,45 @@ pub(crate) async fn run_command_with_launch_plan(
             std::process::exit(exit_code);
         }
     };
-    let router = if smoke {
-        router
+    let reviewer_provider_override = reviewer_setup
+        .as_ref()
+        .and_then(provider_override_from_setup);
+    let distinct_reviewer_route = reviewer_requires_distinct_router(
+        effective_provider.as_deref(),
+        model.as_deref(),
+        effective_reviewer.as_deref(),
+        effective_reviewer_model.as_deref(),
+    );
+    let (router, reviewer_router) = if smoke {
+        (router, None)
     } else {
-        provider_router_for_run_with_catalog_seam(
+        let catalog_override = resolve_provider_catalog_override_for_run(
             &paths,
             &state,
             backend,
-            provider_override.as_deref(),
-            model.as_deref(),
             no_seams,
             work_boundary,
         )
-        .await?
+        .await?;
+        let worker = provider_router_for_run_with_catalog_override(
+            &paths,
+            provider_override.as_deref(),
+            model.as_deref(),
+            catalog_override.as_ref(),
+        )?;
+        let reviewer = distinct_reviewer_route
+            .then(|| {
+                provider_router_for_run_with_catalog_override(
+                    &paths,
+                    reviewer_provider_override.as_deref(),
+                    effective_reviewer_model.as_deref(),
+                    catalog_override.as_ref(),
+                )
+            })
+            .transpose()?;
+        (worker, reviewer)
     };
+    let semantic_router = reviewer_router.as_ref().unwrap_or(&router);
     let selected_route = router.selected_route_info();
     if !quiet {
         print_run_started(
@@ -1482,9 +1516,10 @@ pub(crate) async fn run_command_with_launch_plan(
         force_floor,
         narrator_config.clone(),
     );
-    let turn_loop = run_turn_loop(
+    let turn_loop = run_turn_loop_with_semantic_router(
         &mut state,
         &router,
+        semantic_router,
         RunLoopConfig {
             provider: effective_provider.clone(),
             max_spend_usd: effective_max_spend,
@@ -1872,6 +1907,24 @@ mod durable_direct_tests {
         assert_eq!(plan.providers.coder_model.as_deref(), Some("copilot-model"));
         assert_eq!(plan.providers.reviewer.as_deref(), Some("cli:codex"));
         assert_eq!(plan.providers.reviewer_model.as_deref(), Some("gpt-review"));
+        assert!(reviewer_requires_distinct_router(
+            plan.providers.coder.as_deref(),
+            plan.providers.coder_model.as_deref(),
+            plan.providers.reviewer.as_deref(),
+            plan.providers.reviewer_model.as_deref(),
+        ));
+        assert!(!reviewer_requires_distinct_router(
+            Some("cli:codex"),
+            Some("gpt-review"),
+            Some("cli:codex"),
+            Some("gpt-review"),
+        ));
+        assert!(reviewer_requires_distinct_router(
+            Some("cli:codex"),
+            Some("gpt-worker"),
+            Some("cli:codex"),
+            Some("gpt-review"),
+        ));
     }
 
     #[test]
