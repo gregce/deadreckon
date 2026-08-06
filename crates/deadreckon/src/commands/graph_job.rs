@@ -7455,6 +7455,7 @@ async fn resume_plan(
             child_provider: driver.child_provider_overrides,
             coder_provider: driver.coder_provider,
             reviewer_provider: driver.reviewer_provider,
+            reviewer_model: driver.reviewer_model,
             no_repair: execution.no_repair,
             repair_provider: None,
             yes: true,

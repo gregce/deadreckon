@@ -24,8 +24,10 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
         plain: true,
         planner_provider: Some("smoke"),
         child_provider: Some("smoke"),
+        reviewer_provider: Some("cli:codex"),
         planner_model: Some("planner-mx"),
         child_model: None,
+        reviewer_model: Some("reviewer-mx"),
         narrate: false,
         narrator_model: None,
         ancestor_task_keys: &ancestors,
@@ -84,6 +86,14 @@ fn sub_orchestrator_launch_sets_lineage_env_and_isolated_scope() {
     assert!(
         args.windows(2)
             .any(|pair| pair[0] == "--max-wall-seconds" && pair[1] == "30.000000")
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--reviewer-provider" && pair[1] == "cli:codex")
+    );
+    assert!(
+        args.windows(2)
+            .any(|pair| pair[0] == "--reviewer-model" && pair[1] == "reviewer-mx")
     );
 }
 

@@ -1367,6 +1367,7 @@ async fn main_inner() -> Result<()> {
             child_provider,
             coder_provider,
             reviewer_provider,
+            reviewer_model,
             init_git,
             acceptance,
             no_hints,
@@ -1392,7 +1393,7 @@ async fn main_inner() -> Result<()> {
                 model: None,
                 child_model: Vec::new(),
                 coder_model: None,
-                reviewer_model: None,
+                reviewer_model,
                 init_git,
                 acceptance,
                 skip_acceptance_prompt: quiet || json,
@@ -1413,6 +1414,7 @@ async fn main_inner() -> Result<()> {
             child_provider,
             coder_provider,
             reviewer_provider,
+            reviewer_model,
             no_repair,
             repair_provider,
             yes,
@@ -1431,6 +1433,7 @@ async fn main_inner() -> Result<()> {
                 child_provider,
                 coder_provider,
                 reviewer_provider,
+                reviewer_model,
                 no_repair,
                 repair_provider,
                 yes,
@@ -1493,6 +1496,8 @@ async fn main_inner() -> Result<()> {
             deadline,
             provider,
             model,
+            reviewer_provider,
+            reviewer_model,
             sandbox,
             acceptance,
             base,
@@ -1533,6 +1538,8 @@ async fn main_inner() -> Result<()> {
                 deadline,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 sandbox,
                 acceptance,
                 base,
@@ -1674,6 +1681,8 @@ async fn main_inner() -> Result<()> {
             deadline,
             provider,
             model,
+            reviewer_provider,
+            reviewer_model,
             sandbox,
             no_docs,
             doc_skill,
@@ -1696,6 +1705,8 @@ async fn main_inner() -> Result<()> {
                 deadline,
                 provider,
                 model,
+                reviewer_provider,
+                reviewer_model,
                 sandbox,
                 no_docs,
                 doc_skill,
@@ -8619,6 +8630,20 @@ async fn execute_merge_repair_child(
     } else {
         argv.extend(["--provider".to_string(), provider.to_string()]);
     }
+    if let Some(reviewer) = plan.providers.reviewer.as_deref() {
+        let executable_reviewer = if reviewer == "smoke" || reviewer.starts_with("smoke:") {
+            "smoke"
+        } else {
+            reviewer
+        };
+        argv.extend([
+            "--reviewer-provider".to_string(),
+            executable_reviewer.to_string(),
+        ]);
+    }
+    if let Some(model) = plan.providers.reviewer_model.as_deref() {
+        argv.extend(["--reviewer-model".to_string(), model.to_string()]);
+    }
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
         .current_dir(&merge_working)
@@ -15060,6 +15085,8 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         deadline: None,
         provider: state.provider.clone(),
         model: None,
+        reviewer_provider: None,
+        reviewer_model: None,
         sandbox: Some(state.sandbox.clone()),
         no_docs: false,
         doc_skill: None,
