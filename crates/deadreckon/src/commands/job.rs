@@ -16,8 +16,8 @@ use deadreckon_protocol::{
     AppliedGitDeliveryReceipt, AuthorityAcceptedBy, DockerGateIdentity,
     GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION, GATE_EVALUATOR_PROTOCOL_MARKER,
     GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, Job, JobAuthority,
-    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobId, JobPolicy,
-    JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
+    JobEvent, JobEventKind, JobEventSequence, JobExecutionPolicy, JobGateNetworkAccess, JobId,
+    JobPolicy, JobSchemaVersion, JobShape, RunId, SemanticJudgeMode, StopReason,
 };
 use sha2::Sha256;
 
@@ -226,6 +226,36 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         &authority_source_cwd,
         &contract_path,
     )?;
+    let contract_raw = fs::read_to_string(&contract_path)?;
+    let contract_capabilities =
+        deadreckon_core::gate::acceptance_capabilities_from_yaml(&contract_raw)?;
+    let mut required_network =
+        deadreckon_core::gate::required_acceptance_network_access_from_yaml(&contract_raw)?;
+    for member in contract_bundle.files.iter().filter(|member| {
+        member
+            .path
+            .starts_with(&format!("{JOB_ACCEPTANCE_HELPERS}/"))
+    }) {
+        let helper_path = job_dir.join(&member.path);
+        if let Ok(contents) = fs::read_to_string(&helper_path) {
+            required_network = required_network.combine(
+                deadreckon_core::gate::infer_acceptance_network_access(&contents),
+            );
+        }
+    }
+    if !contract_capabilities.network.allows(required_network) {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "durable Job cannot start: the frozen done contract requires {required_network} network access but declares {}",
+                contract_capabilities.network
+            ),
+            "set capabilities.network to loopback or full, or replace the live dependency with a frozen fixture",
+        )));
+    }
+    // The launch plan is a summary, while the frozen YAML is completion
+    // authority. Re-project the accepted value so direct verbs, guided start,
+    // replay, and graph drivers all persist the same truth.
+    request.launch_plan.contract.capabilities = contract_capabilities;
 
     let mut signals = request
         .launch_plan
@@ -264,6 +294,22 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         freeze_gate_evaluator_identity(request.paths, job_id.as_ref(), &request.sandbox_requested)?;
     let gate_evaluator_sha256 = gate_evaluator_identity_sha256(&gate_evaluator)?;
     let mut execution = JobExecutionPolicy::workspace_only(request.sandbox_requested.clone());
+    execution.gate.network = match contract_capabilities.network {
+        deadreckon_core::gate::AcceptanceNetworkAccess::Deny => JobGateNetworkAccess::Deny,
+        deadreckon_core::gate::AcceptanceNetworkAccess::Loopback => JobGateNetworkAccess::Loopback,
+        deadreckon_core::gate::AcceptanceNetworkAccess::Full => JobGateNetworkAccess::Full,
+    };
+    if let Some(bash) = execution.tools.get_mut("bash") {
+        bash.network_allowlist = match execution.gate.network {
+            JobGateNetworkAccess::Deny => Vec::new(),
+            JobGateNetworkAccess::Loopback => vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+                "::1".to_string(),
+            ],
+            JobGateNetworkAccess::Full => vec!["*".to_string()],
+        };
+    }
     execution.gate_evaluator = Some(gate_evaluator);
     let policy = JobPolicy {
         max_spend_usd: request.max_spend_usd,
@@ -334,6 +380,7 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
             json!({
                 "contract_sha256": authority.contract_sha256,
                 "accepted_by": authority.accepted_by,
+                "capabilities": contract_capabilities,
                 "gate_evaluator_sha256": gate_evaluator_sha256,
             }),
         ),
@@ -2507,7 +2554,7 @@ mod tests {
         let contract = source.join("acceptance.yaml");
         fs::write(
             &contract,
-            "name: durable fixture\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+            "name: durable fixture\ncapabilities:\n  network: loopback\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
         )
         .expect("contract");
 
@@ -2530,6 +2577,15 @@ mod tests {
             commands::course::load_launch_plan(&paths.job_launch_plan(job.job_id.as_ref()))
                 .expect("launch plan");
         assert_eq!(launch.budget.deadline, Some(deadline));
+        let frozen_capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(
+            &fs::read_to_string(job_acceptance_path(&paths, job.job_id.as_ref()))
+                .expect("frozen contract"),
+        )
+        .expect("frozen capabilities");
+        assert_eq!(
+            launch.contract.capabilities.network, frozen_capabilities.network,
+            "LaunchPlan must project the frozen contract authority"
+        );
         let execution = job
             .policy
             .execution
@@ -2539,9 +2595,41 @@ mod tests {
         assert_eq!(execution.sandbox_requested, "auto");
         assert!(execution.tools.contains_key("bash"));
         assert!(execution.tools.contains_key("write_file"));
-        assert!(execution.tools.values().all(|tool| {
-            tool.workspace_read && tool.workspace_write && tool.network_allowlist.is_empty()
-        }));
+        assert_eq!(
+            execution.gate.network,
+            deadreckon_protocol::JobGateNetworkAccess::Loopback
+        );
+        assert_eq!(
+            execution.gate.network,
+            match frozen_capabilities.network {
+                deadreckon_core::gate::AcceptanceNetworkAccess::Deny => {
+                    deadreckon_protocol::JobGateNetworkAccess::Deny
+                }
+                deadreckon_core::gate::AcceptanceNetworkAccess::Loopback => {
+                    deadreckon_protocol::JobGateNetworkAccess::Loopback
+                }
+                deadreckon_core::gate::AcceptanceNetworkAccess::Full => {
+                    deadreckon_protocol::JobGateNetworkAccess::Full
+                }
+            },
+            "JobGatePolicy must agree with the independently parsed frozen contract"
+        );
+        assert_eq!(
+            execution
+                .tools
+                .get("bash")
+                .expect("bash policy")
+                .network_allowlist,
+            ["127.0.0.1", "localhost", "::1"]
+        );
+        assert!(
+            execution
+                .tools
+                .get("write_file")
+                .expect("write policy")
+                .network_allowlist
+                .is_empty()
+        );
         let gate_evaluator = execution
             .gate_evaluator
             .as_ref()
@@ -2611,6 +2699,60 @@ mod tests {
             ]
         );
         assert!(history.events().iter().all(|event| event.lease_epoch == 0));
+    }
+
+    #[test]
+    fn frozen_helper_network_need_must_be_declared_before_job_queueing() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        let helpers = source.join("acceptance");
+        fs::create_dir_all(&helpers).expect("helpers");
+        fs::write(source.join("README.md"), "durable").expect("source file");
+        let contract = source.join("acceptance.yaml");
+        fs::write(
+            &contract,
+            "name: remote fixture\nchecks:\n  - kind: shell\n    command: \"sh acceptance/probe.sh\"\n    cwd: \"{working_dir}\"\n",
+        )
+        .expect("contract");
+        fs::write(
+            helpers.join("probe.sh"),
+            "#!/bin/sh\ncurl --fail https://example.com/fixture\n",
+        )
+        .expect("helper");
+
+        let error = create_job(request(&paths, &source, Some(&contract)))
+            .expect_err("undeclared helper network must refuse admission");
+
+        assert!(error.to_string().contains("requires full"), "{error}");
+        assert!(
+            error.to_string().contains("capabilities.network"),
+            "{error}"
+        );
+        assert!(
+            fs::read_dir(paths.jobs_dir())
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true),
+            "a rejected capability contract must not leave a Job"
+        );
+
+        fs::write(
+            &contract,
+            "name: remote fixture\ncapabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: \"sh acceptance/probe.sh\"\n    cwd: \"{working_dir}\"\n",
+        )
+        .expect("approve external network");
+        let job = create_job(request(&paths, &source, Some(&contract)))
+            .expect("explicit full authority admits the same frozen helper");
+        let execution = job.policy.execution.expect("immutable execution policy");
+        assert_eq!(execution.gate.network, JobGateNetworkAccess::Full);
+        assert_eq!(
+            execution
+                .tools
+                .get("bash")
+                .expect("bash policy")
+                .network_allowlist,
+            ["*"]
+        );
     }
 
     #[test]

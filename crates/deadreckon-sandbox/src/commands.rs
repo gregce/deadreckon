@@ -192,7 +192,9 @@ fn bwrap_command(
         "--chdir".into(),
         cwd.into(),
     ]);
-    if !spec.allow_network {
+    // A private network namespace retains loopback while withholding the host
+    // and Internet. Only the explicit wildcard escapes that namespace.
+    if !allows_external_network(spec) {
         args.push("--unshare-net".into());
     }
     args.push("--".into());
@@ -304,7 +306,7 @@ fn docker_command(
         args.push(format!("type=bind,source={rendered},destination={rendered}").into());
         mounted.push(canonical);
     }
-    if !spec.allow_network {
+    if !allows_external_network(spec) {
         args.push("--network".into());
         args.push("none".into());
     }
@@ -437,12 +439,14 @@ fn exact_path_is_protected(path: &Path, protected: &[PathBuf]) -> bool {
 }
 
 pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
-    let network = if spec.allow_network {
-        if spec.network_allowlist.iter().any(|host| host == "*") {
-            "(allow network*)".to_string()
-        } else {
-            "(deny network*)".to_string()
-        }
+    let network = if allows_external_network(spec) {
+        "(allow network*)".to_string()
+    } else if allows_loopback_network(spec) {
+        // network* covers both listener bind/accept and client connect. The
+        // paired local/remote filters allow traffic wholly on loopback while
+        // the preceding deny keeps every non-loopback endpoint unavailable.
+        "(deny network*)\n(allow network* (local ip \"localhost:*\"))\n(allow network* (remote ip \"localhost:*\"))"
+            .to_string()
     } else {
         "(deny network*)".to_string()
     };
@@ -527,6 +531,20 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
         std::fs::write(profile_dir.join("profile.sb"), &profile)?;
     }
     Ok(profile)
+}
+
+fn allows_external_network(spec: &SandboxSpec) -> bool {
+    spec.allow_network && spec.network_allowlist.iter().any(|host| host == "*")
+}
+
+fn allows_loopback_network(spec: &SandboxSpec) -> bool {
+    spec.allow_network
+        && spec.network_allowlist.iter().any(|host| {
+            matches!(
+                host.trim().to_ascii_lowercase().as_str(),
+                "loopback" | "localhost" | "127.0.0.1" | "::1" | "[::1]"
+            )
+        })
 }
 
 fn seatbelt_read_rules(paths: &[PathBuf]) -> String {
@@ -694,6 +712,38 @@ mod tests {
         let profile =
             sandbox_exec_profile(&read_only_spec(SandboxBackend::SandboxExec)).expect("profile");
         assert!(profile.contains("(deny file-write* (subpath \"/work/project\"))"));
+    }
+
+    #[test]
+    fn loopback_policy_is_not_promoted_to_external_network() {
+        let mut spec = read_only_spec(SandboxBackend::SandboxExec);
+        spec.allow_network = true;
+        spec.network_allowlist = vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+            "::1".to_string(),
+        ];
+        let profile = sandbox_exec_profile(&spec).expect("profile");
+        assert!(profile.contains("(deny network*)"), "{profile}");
+        assert!(
+            profile.contains("(allow network* (local ip \"localhost:*\"))"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("(allow network* (remote ip \"localhost:*\"))"),
+            "{profile}"
+        );
+        assert!(!profile.lines().any(|line| line == "(allow network*)"));
+
+        spec.backend = SandboxBackend::Bwrap;
+        let bwrap =
+            bwrap_command(&spec, PathBuf::from("/usr/bin/bwrap"), None).expect("bwrap command");
+        assert!(
+            bwrap
+                .args
+                .iter()
+                .any(|argument| argument == "--unshare-net")
+        );
     }
 
     #[test]

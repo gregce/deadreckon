@@ -494,6 +494,8 @@ crate: deadreckon-protocol
   job::JobEventKind
   job::JobEventSequence
   job::JobExecutionPolicy
+  job::JobGateNetworkAccess
+  job::JobGatePolicy
   job::JobLease
   job::JobOutcome
   job::JobPhase

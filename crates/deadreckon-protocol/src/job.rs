@@ -114,6 +114,13 @@ pub struct JobExecutionPolicy {
     pub sandbox_requested: String,
     pub require_containment: bool,
     pub tools: BTreeMap<String, JobToolPolicy>,
+    /// Contract-derived authority for the independent completion gate.
+    ///
+    /// This is deliberately separate from provider tool authority: the gate
+    /// may need loopback to exercise a local client/server protocol without
+    /// granting the coding provider unrestricted outbound access.
+    #[serde(default)]
+    pub gate: JobGatePolicy,
     /// Exact controller/evaluator toolchain approved before the first turn.
     ///
     /// `None` keeps pre-identity Jobs readable. A new strict Job must persist
@@ -142,9 +149,32 @@ impl JobExecutionPolicy {
             sandbox_requested: sandbox_requested.into(),
             require_containment: true,
             tools,
+            gate: JobGatePolicy::default(),
             gate_evaluator: None,
         }
     }
+}
+
+/// Network authority granted to the deterministic completion gate.
+///
+/// Existing Jobs deserialize as `deny`. New Jobs persist this value inside
+/// the effective-policy digest before any provider turn starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobGateNetworkAccess {
+    #[default]
+    Deny,
+    /// Permit communication only within the sandbox's loopback interface.
+    Loopback,
+    /// Permit unrestricted network access. This must be explicitly present in
+    /// the accepted done contract; it is never inferred from the run goal.
+    Full,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobGatePolicy {
+    #[serde(default)]
+    pub network: JobGateNetworkAccess,
 }
 
 /// Content identity of one trusted `dr-gate` executable.
@@ -662,7 +692,7 @@ mod tests {
     use super::{
         DOCKER_GATE_GUEST_PATH, DockerGateIdentity, GATE_EVALUATOR_IDENTITY_SCHEMA_VERSION,
         GATE_EVALUATOR_PROTOCOL_VERSION, GateBinaryIdentity, GateEvaluatorIdentity, JobAuthority,
-        JobExecutionPolicy, SandboxBoundaryObservation,
+        JobExecutionPolicy, JobGateNetworkAccess, SandboxBoundaryObservation,
     };
 
     fn observation_json() -> serde_json::Value {
@@ -719,6 +749,7 @@ mod tests {
             "tools": {}
         }))
         .expect("legacy execution policy");
+        assert_eq!(policy.gate.network, JobGateNetworkAccess::Deny);
         assert!(policy.gate_evaluator.is_none());
 
         let authority: JobAuthority = serde_json::from_value(json!({

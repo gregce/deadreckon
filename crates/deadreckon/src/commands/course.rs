@@ -181,6 +181,8 @@ pub(crate) struct CourseContract {
     pub(crate) summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) caveat: Option<String>,
+    #[serde(default)]
+    pub(crate) capabilities: deadreckon_core::gate::AcceptanceCapabilities,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) checks: Vec<super::acceptance::CompiledCheck>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +196,7 @@ impl Default for CourseContract {
             kind: None,
             summary: None,
             caveat: None,
+            capabilities: deadreckon_core::gate::AcceptanceCapabilities::default(),
             checks: Vec::new(),
             divergence: None,
         }
@@ -1680,6 +1683,11 @@ pub(crate) fn launch_plan_from_decision(
         kind: None,
         summary: Some(decision.done_criteria_label.clone()),
         caveat: None,
+        capabilities: decision
+            .done_contract
+            .as_ref()
+            .map(|contract| contract.capabilities)
+            .unwrap_or_default(),
         checks: decision
             .done_contract
             .as_ref()
@@ -2013,6 +2021,7 @@ mod tests {
             kind: Some("Node(pnpm)".to_string()),
             summary: Some("pnpm test".to_string()),
             caveat: None,
+            capabilities: deadreckon_core::gate::AcceptanceCapabilities::default(),
             checks: Vec::new(),
             divergence: None,
         };

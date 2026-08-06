@@ -3694,9 +3694,10 @@ broader text input/search surfaces.
 
 ## 48. Contract: Goal-Aware, Execution-Oriented Done Criteria
 
-Contract makes the definition of done a compiled read model before launch,
-without changing the durable acceptance schema. The persisted artifacts remain
-the Polyglot gate files from §13.1 and §35: `.deadreckon/acceptance.yaml`,
+Contract makes the definition of done a compiled read model before launch.
+The durable acceptance schema keeps its existing check kinds and adds one
+backwards-compatible, optional capability declaration. The persisted artifacts
+remain the Polyglot gate files from §13.1 and §35: `.deadreckon/acceptance.yaml`,
 `.deadreckon/acceptance.md`, and helper scripts under
 `.deadreckon/acceptance/`. `CompiledContract` is a projection over those files:
 each check gets a stable summary, one of the existing check kinds
@@ -3788,6 +3789,55 @@ absolute deadline offers no impossible retry. A timed-out or invalid weak
 candidate is never written as approved. A valid generated contract already on
 disk is ordinary project state and is reused on retry without another provider
 call.
+
+### 48.2 Contract-derived gate network authority
+
+Network needed to execute the done contract is explicit authority, not an
+accidental property of the run goal or host. `acceptance.yaml` may declare:
+
+```yaml
+capabilities:
+  network: deny # deny | loopback | full
+```
+
+The field is optional and defaults to `deny`, so historical contracts and Jobs
+remain readable without gaining authority. `loopback` permits a contained check
+to start a local server and drive it through `localhost`, `127.0.0.1`, or `::1`;
+`full` is the deliberately conspicuous opt-in for external network access.
+Descriptive URLs in names, content-match patterns, or Markdown do not grant or
+require network access. The deterministic compiler examines executable shell
+and Cargo arguments plus the frozen regular helper-file tree. An explicit
+remote URL requires `full`; a recognised local client/server or socket operation
+requires `loopback`. If declared authority does not cover the executable need,
+lint, guided preflight, and Job admission all fail closed.
+
+The authority follows one traceable launch path:
+
+1. Guided and direct startup resolve the source, author or reuse the contract,
+   compile checks and capabilities, and validate the helper tree before the
+   supervisor service can be installed or started.
+2. Review, Course cards, preview rows, and JSON expose the accepted network
+   mode. The durable `LaunchPlan` carries the same compiled capability through
+   recovery and replay.
+3. `create_job` freezes the YAML, Markdown, and helper bundle, recomputes the
+   requirement from those frozen bytes, corrects the LaunchPlan projection to
+   the frozen source of truth, and persists a separate `JobGatePolicy` inside
+   the authority-bound execution policy before queueing.
+4. Full-plan Graph children and subplans inherit the same frozen acceptance
+   path and capability preview; goal keywords are only a legacy preview fallback
+   when no accepted contract exists.
+5. At completion, the runtime revalidates the authority and effective sandbox
+   policy digests, requires the frozen contract and `JobGatePolicy` to agree,
+   and then gives `dr-gate` exactly `deny`, `loopback`, or `full` network posture.
+   Drift refuses evaluation rather than widening access.
+
+Gate authority is intentionally separate from coding-provider tool authority.
+The provider policy still uses the existing per-tool network allowlist pipeline;
+the gate can therefore exercise a local protocol without implicitly granting a
+provider unrestricted outbound access. Native macOS containment uses explicit
+Seatbelt loopback rules, while Bubblewrap and Docker keep their isolated network
+namespace/container loopback for `loopback` and remove network isolation only
+for `full`.
 
 Deferred Contract work stays out of the stable slice: first-class browser/HTTP
 check kinds, a standalone `deadreckon contract` report verb, multi-round critic
