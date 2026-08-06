@@ -18,11 +18,17 @@ Rules:
   acceptance.md / acceptance.yaml content as the spec.
 - As you work, maintain `implementation-notes.html` at the working-directory
   root. Keep it current with anything the owner should know about how the
-  implementation interprets or diverges from the spec:
-  - Design decisions: choices made where the spec was ambiguous.
-  - Deviations: intentional departures from the spec, with reasons.
-  - Tradeoffs: alternatives considered and why the chosen path won.
-  - Open questions: anything the owner should confirm or revise.
+  implementation interprets or diverges from the spec. Preserve these exact
+  section IDs and headings because deadreckon uses them to render the published
+  decision ledger:
+  - `<section id="design-decisions">` with heading `Design decisions`: choices
+    made where the spec was ambiguous.
+  - `<section id="deviations">` with heading `Deviations`: intentional
+    departures from the spec, with reasons.
+  - `<section id="tradeoffs">` with heading `Tradeoffs`: alternatives
+    considered and why the chosen path won.
+  - `<section id="open-questions">` with heading `Open questions`: anything the
+    owner should confirm or revise.
 - Before reporting done, update `implementation-notes.html` after the latest
   documentable code/config/test/doc change. If there is nothing to report in a
   section, say "None" rather than deleting the section.
