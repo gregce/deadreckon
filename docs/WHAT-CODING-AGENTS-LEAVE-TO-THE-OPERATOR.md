@@ -1,871 +1,616 @@
 # What coding agents leave to the operator
 
-*Draft, 5 August 2026. My working notes and the full citation record live in the
-DeadReckon repository at `docs/research/harness-essay/`. They are notes for
-contributors and are not published separately.*
+Revised 5 August 2026. The research notes and source audit are in
+[`docs/research/harness-essay/`](research/harness-essay/).
 
-A coding agent will write the code. It will not do three other things.
+The important change is the size of the result we can delegate. One request can
+now start a long sequence of repository reads, code changes, tests, tool calls,
+and work by other agents. Claude Code and Codex can keep working toward a goal
+across several turns. Both can isolate parallel work. Pi can expose its loop as
+JSON or RPC so another program can drive it.
 
-- Decide whether the work is finished.
-- Keep the run alive after your terminal closes.
-- Stop you from accepting something that is wrong.
+This progress has reduced the work of producing a candidate change. It has not
+settled how a team should accept that change.
 
-Somebody has to do those three things. How much of your attention that takes
-decides whether you can run agents on a serious product for a long time.
+A candidate change is what an agent produced. An accepted change is the exact
+result that an owner approved after the required evidence passed. This essay is
+about the distinction between those two states.
 
-I should say up front what is mine. DeadReckon, which section 4 describes, is my
-software. The 25 patterns and the corpus behind them in section 2 are my own
-team's work, published by my company, so section 2's counts are mine to check
-rather than anyone else's. Everything I could give you a file path or a public
-link for, I have.
+For a short task, a person can make the acceptance decision after the agent
+stops. They can read the diff and run the tests. Long or unattended work needs a
+different process. The owner must define the result, limits, and required proof
+before the run. Software outside the worker must preserve those decisions while
+the work continues.
 
-This essay covers four things.
+The central claim is simple. A coding agent can choose effective steps inside a
+run. It cannot be the sole authority for what counts as done, whether its proof
+is enough, or whether its result should enter a shared product. Those are
+product decisions. An operator can make them by hand or encode them in a
+separate controller. In either case, the worker must not control the final
+decision.
 
-- What a coding agent already does for you.
-- What it leaves for you, with that work counted from a real project.
-- What the industry now says about the software wrapped around the model.
-- What has to exist for delegation to become predictable.
+That leaves four questions to settle before long work begins.
 
----
+- What result did the operator approve?
+- What evidence will show that the work is complete?
+- What should happen if a process stops or the Job hits a limit?
+- Who may accept the result and apply it to the shared repository?
+
+Current agent products answer parts of these questions. They do not answer them
+in the same way or at the same level. Some controls belong to a turn. Some
+belong to a session or worktree. None provides a common Job record across
+different products. An operator who combines them must supply that common
+control.
+
+This essay first compares where Claude Code, Codex, and Pi place their control.
+It then tests the claim that the harness matters more than the model. It ends
+with the parts of DeadReckon that try to make acceptance explicit across
+different agents.
+
+I should state my interest. DeadReckon is my software. I use its implementation
+as a design case, not as proof that this design improves outcomes in live use.
 
 ## 1. Coding agents already do a great deal
 
-Start with the part that works, because it works well.
+Simon Willison gives a useful short account of a coding agent. It is an
+"LLM + system prompt + tools in a loop." The model produces the next response.
+The product supplies instructions and gives the model tools. It reports each
+result and repeats the process. That product layer also decides what the model
+can see and what actions it can request. [Willison calls the whole product a
+harness for the model](https://simonwillison.net/guides/agentic-engineering-patterns/how-coding-agents-work/).
 
-Claude Code emits one event at the start of every session that lists everything
-it contains. You can see it by running
-`claude -p 'hi' --output-format stream-json` and reading the first line, which
-has the type `system` and the subtype `init`. On this machine that line lists the
-following.
+That account now covers products with very different scopes. A list of tools
+does not show the difference. The useful comparison is where each product puts
+control over a long piece of work.
 
-- 30 built-in tools.
-- 5 servers connected over the Model Context Protocol, with a status for each.
-- The model id.
-- The permission mode.
-- 8 subagents.
-- Around 100 slash commands.
-- Around 70 skills.
-- 7 plugins.
-
-The three counts I have approximated vary with what is installed for the current
-project. Separately from that event, and from a different source, the directory
-`~/.claude` on this machine holds 7,850 saved task lists and 199 saved plan
-documents. None of that is a claim from a product page.
-
-The three terminal agents I use most make different choices about what belongs
-inside the loop.
-
-| | Claude Code | Codex CLI | Pi |
+| Axis | Claude Code | Codex | Pi |
 |---|---|---|---|
-| Tools | 30 built in | Shell and file edit | 4: read, write, edit, bash |
-| Approvals | Permission modes, per session | Two way approval over JSON-RPC | None, by design |
-| Sandbox | None of its own | `read-only`, `workspace-write`, `danger-full-access` | Delegated to containers |
-| Sub-agents | Yes, 8 on this machine | Yes | Refused |
-| Plan mode | Yes, 199 saved plans here | Yes | Refused |
-| Task list | Yes, 7,850 saved here | Yes | Refused |
-| Model Context Protocol | Yes, 5 servers here | Yes | Refused |
-| Extension model | Skills, plugins, hooks | Config and prompts | TypeScript extensions that reload live |
+| Unit of work | A saved session holds the conversation. One `/goal` condition can keep that session working across turns and returns when the session resumes. | A saved chat or thread holds the conversation. Goal mode keeps one outcome, its constraints, and its checks in that chat. | A JSONL session stores a tree of messages by working directory. The user can resume, branch, fork, clone, import, or export it. |
+| Completion | [`/goal` uses a separate small model to judge a condition from the conversation](https://code.claude.com/docs/en/goal). The evaluator cannot run a command or read a file. A Stop hook can instead run a script. | [Goal mode asks Codex to verify its own progress against the goal](https://learn.chatgpt.com/docs/long-running-work). In scripts, `turn.completed` reports that a turn ended, and a JSON Schema can constrain the final message. | The core ends a model turn and reports its events. Pi does not include a goal loop. An extension or RPC client can add one. |
+| Coordination | [Subagents, agent teams, and scripted workflows divide work in different ways](https://code.claude.com/docs/en/agents). A workflow can hold the plan outside an agent's context. | Subagent threads can work in parallel and return results to the main thread. Separate chats can also run in parallel. | The core [does not include subagents](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md#what-pi-doesnt-have). The user can add them through extensions, packages, or other processes. |
+| State and recovery | Sessions can resume. An active goal returns too, but its timer, turn count, and token total start again. Workflows can resume inside the same session. | Chats can resume. Codex keeps each chat's transcript and working directory. App worktrees stay associated with their chats and can restore a saved snapshot after cleanup. | The full session tree stays in one JSONL file. Compaction is lossy in the active context, but the original history remains available. |
+| Execution boundary | [Tool permissions and an operating system sandbox control file and network access](https://code.claude.com/docs/en/sandboxing). Worktree rules can stop a session from editing the main checkout. | [The operating system sandbox and approval policy are separate controls](https://learn.chatgpt.com/docs/agent-approvals-security). Network access is off by default. An automatic reviewer can decide some approval requests without widening the sandbox. | [Pi has no built in permission system](https://github.com/earendil-works/pi#security). It runs with the rights of its host process. The user must add a container, a virtual machine, or an extension when they need a stronger boundary. |
+| Evidence and accounting | JSON and JSONL output include a session ID, result, usage, and cost. Hooks can observe session, turn, tool, and worktree events. Goal status records the latest reason and token use. | [`codex exec --json` emits thread, turn, tool, file change, and error events](https://learn.chatgpt.com/docs/non-interactive-mode). A completed turn includes token use. | JSON, RPC, and the SDK expose the loop to other programs. The saved session records messages and tool results. The interface shows token use and cost. |
+| Result isolation and promotion | [Worktrees isolate sessions and subagents](https://code.claude.com/docs/en/worktrees). Keeping a result still requires a chosen Git action such as a merge, push, or pull request. | [The desktop app can keep a chat in a worktree, hand it into the local checkout, or create a branch for review](https://learn.chatgpt.com/docs/environments/git-worktrees). The noninteractive guide also shows a safer split between generating a patch and opening a pull request. | Pi edits the directory supplied by its host. The host must create an isolated copy and decide how a result enters the shared repository. |
+| Limits | A goal can name a turn or time limit and shows token use. Those counters restart when a session resumes. | A goal keeps the current sandbox and approval rules. An outside workflow must track a limit that spans several chats and retries. | A session totals tokens and cost. An outside runner can enforce a total across several Pi sessions. |
 
-Codex is the one that ships its own sandbox. Its documentation names three
-levels, and DeadReckon's launch template passes one of them on every unattended
-run, so the flag is at least accepted. I have not probed whether the level holds
-against a determined process, and by the standard section 4.3 sets, that means I
-should not claim it does.
+This table records documented product behavior on 5 August 2026. It compares the
+terminal products and the local Codex app where noted. It is not a scorecard.
+Claude Code builds goals and scripted groups of agents into the product. Codex
+distributes control across chats, worktrees, automation, and event streams. Pi
+keeps the core small and makes outside control easy to add.
 
-Pi is interesting for the opposite reason. In its README, Mario Zechner describes
-Pi as "a minimal terminal coding harness", and his philosophy section is a list
-of what he left out. Containers do the isolating instead, and the README says
-plainly that Pi "does not include a built-in permission system for restricting
-filesystem, process, network, or credential access" and that by default it "runs
-with the permissions of the user and process that launched it". What Zechner adds
-instead is a way to extend Pi. An extension written in TypeScript can register a
-new tool for the model to call. It can also intercept an event, replace
-compaction, which is the step that shortens a long conversation to fit, and draw
-its own interface. An extension reloads without restarting the session.
+The comparison changes the claim. Modern coding agents do provide substantial
+harness machinery. The remaining problem is that each product defines its own
+session, completion signal, evidence, limits, and promotion path. A team can use
+one product's rules for one run. Those rules do not become a common acceptance
+process when work spans products, processes, or restarts.
 
-Simon Willison gives the plainest definition of the thing all three are. On
-16 March 2026 he wrote that
-"[a coding agent is a piece of software that acts as a harness for an LLM, extending that LLM with additional capabilities that are powered by invisible prompts and implemented as callable tools](https://simonwillison.net/guides/agentic-engineering-patterns/how-coding-agents-work/)",
-and described the shape as "LLM + system prompt + tools in a loop". An LLM is a
-large language model, the part that produces the text. Note the word invisible.
-The prompts and tool definitions that decide most of the behaviour are never
-shown to the person using the agent. Birgitta Böckeler puts the same idea as an equation in her 2 April 2026 article on
-martinfowler.com, where she defines the harness as
-"[everything in an AI agent except the model itself](https://martinfowler.com/articles/harness-engineering.html)"
-and writes it as `Agent = Model + Harness`.
+## 2. Long work requires intent and proof
 
-The loop runs. The tools work. You can set the permissions and resume a session
-by its id. For one sitting at one machine on one task, that is most of what you
-need.
+Anthropic researchers report that developers use artificial intelligence for
+about 60 percent of their work but fully delegate only 0 to 20 percent of their
+tasks. The authors say the rest still needs setup and supervision. It also needs
+validation and human judgment. The vendor did not publish enough method detail
+to treat the figures as a measure of all developers. The useful point is
+narrower. Frequent use and full delegation are not the same thing.
+[Anthropic's own account keeps validation with the
+developer](https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf).
 
-That competence creates the next problem. Once the loop can run for hours without
-you, the unit of work is no longer a small change you can read
-in a few minutes. Somebody then has to make explicit everything that used to be
-implicit.
+Long work changes when the operator must make decisions. If the operator waits
+until the end to define proof, the agent has already chosen what to test and
+what to ignore. If the operator waits for a permission request to define the
+boundary, unattended work must either stop or run with broader access. If the
+agent edits the shared checkout, review begins only after the shared state has
+changed.
 
----
+Goal modes, sandboxes, worktrees, and structured events reduce these problems.
+They do not remove the need for an acceptance rule outside the worker. A goal
+evaluator may read only what the worker put in the conversation. A worktree can
+isolate a result without deciding whether to promote it. A turn completion event
+can show that the agent stopped without showing that the approved result exists.
 
-## 2. On a long project, the operator does the rest
+Published studies show why these distinctions affect the result. They do not
+test the same setting, so their findings should remain separate.
 
-Anthropic's Societal Impacts researchers report that developers use AI in roughly
-60 percent of their work and can
-"[fully delegate](https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf)"
-only 0 to 20 percent of tasks. Those two figures count different things and the
-report never defines the first, so no arithmetic relates them. The useful part is
-what the authors say fills the rest of the job. Effective use "requires
-thoughtful set-up and prompting, active supervision, validation, and human
-judgment", and engineers delegate work where they "can relatively easily
-sniff-check on correctness".
+Cursor researchers reviewed 731 agent runs from one model on SWE Bench Pro.
+In many successful runs, the agent recovered the original fix from Git history.
+After the researchers sealed that history and limited network access, the
+reported score fell from 87.1 percent to 73.0 percent. The model had not changed.
+The test setting had stopped exposing an answer. This is a vendor study on one
+benchmark, but it shows that the boundary around a run changes what a passing
+result means. [Cursor published the setting and the
+counts](https://cursor.com/blog/reward-hacking-coding-benchmarks).
 
-That is the work as the survey authors describe it. Here is the same work counted
-inside one project.
+The Qwen team studied a different problem during model training. They added a
+quality judge and a monitor for suspicious behavior to three versions of SWE
+Bench. The share of solutions that passed through unwanted behavior fell from
+28.57 percent to 0.56 percent. The share judged clean rose from 40.22 percent to
+60.53 percent. This result supports stronger checks during training. It does not
+test DeadReckon's completion design, and it does not tell us the error rate of a
+judge in live product work. [The authors report both the method and its
+limits](https://arxiv.org/html/2606.26300v2).
 
-Between September 2025 and May 2026, six of us at SpecStory built a product on
-one shared git trunk and captured every agent session. The corpus is 1,310
-sessions and 4,670 commits, and we typed almost none of the code by hand. I
-spent months reading it back and naming what we had been doing, which turned into
-[25 patterns](https://specstory.com/books/25-patterns-in-agentic-engineering-book-2026.pdf)
-grouped into six parts. They share one idea. Once the code is cheap, the work is
-the intent behind it and the proof that it holds.
+Willison gives the operator rule that follows from both cases. Run the code, and
+review it before you publish it. He says that code never executed only works by
+luck, and he lists an unreviewed pull request as an agent use pattern to avoid.
+[His testing guide](https://simonwillison.net/guides/agentic-engineering-patterns/first-run-the-tests/)
+and [review guide](https://simonwillison.net/guides/agentic-engineering-patterns/anti-patterns/)
+put responsibility for the first review on the person who used the agent.
 
-The counts are the useful part, because they measure attention rather than
-opinion.
+Those rules are sound. They also limit delegation. If each long run ends by
+giving all intent and proof work back to a person, the agent can work alone but
+the product process cannot.
 
-| Measurement | Count | How it was counted |
-|---|---:|---|
-| Sessions captured | 1,310 | Every session, September 2025 to May 2026 |
-| Commits | 4,670 | Git history on one trunk |
-| "Request interrupted by user" | 614 across 184 transcripts | Fixed string match |
-| Tool uses declined before touching disk | 335 | Subset of the above |
-| Turns opening with a correction word | 441 | Match against no, wait, actually, stop, revert, undo. Crude, and it will over-count and under-count |
-| "Do not edit files" in the prompt history | 88, all in April and May 2026 | Fixed string match. A second pass over the same corpus counts 91 across 52 transcripts, so read the figure as approximate |
-| Briefs carrying their own exit condition | 4 | Hand count |
+This operator work led writers to focus on harnesses.
 
-That last row is the one I keep coming back to. The most effective form I found
-is a brief that includes a shell command, and that command decides when the agent
-may stop. In 1,310 sessions we wrote four of them, because a person writes each
-one by hand.
+## 3. The harness claim is useful but incomplete
 
-The patterns name the work precisely enough to check against a codebase.
+Writers now often say that the harness matters more than the model. Addy Osmani
+states the strong form. He says that a good harness around a decent model can
+beat a poor harness around a better model. His article is a useful account from
+practice. It is still an opinion, not a controlled comparison.
+[Osmani explains which product choices he includes in the
+harness](https://addyosmani.com/blog/agent-harness-engineering/).
 
-**Verification is a job someone does.** Treat every claim of "verified",
-"accurate" or "tests pass" as unverified until you have seen the check. A claim
-with no cited artifact is unverified by default. The recorded origin is one
-exchange in February 2026. The agent stated that a third party cost total was
-accurate. The operator asked how it had verified that. The agent's own reasoning
-block opened by naming the challenge and then read, in the source's own
-punctuation, "I didn't actually verify it — I just assumed it." The point is not
-that the model lied. It reported a guess in the same flat tone it uses for a
-checked fact, and the tone is not a signal.
+A study from researchers at Meta and Harvard gives the claim firmer support.
+The researchers held Claude 4.5 Sonnet and the task set fixed, then changed the
+agent software around the model. On 731 tasks from SWE Bench Pro, the reported
+mean pass rate rose from 45.8 percent with Live SWE Agent to 52.7 percent with
+their CCA system. They repeated the measurement three times with different
+random starting values. The 6.9 point change shows that the surrounding software
+can change measured results while the model stays the same. It does not show
+that the harness always matters more than the model.
+[The CCA paper gives the task set and comparison](https://arxiv.org/html/2512.10398v6).
 
-**The check has to run somewhere the agent cannot reach.** Ask what a result is
-accurate against. If the answer is another thing the agent produced, you have
-used the agent's own output to check the agent's own output.
+Birgitta Böckeler uses a wider meaning of harness. She includes the tools and
+instructions inside the agent. She also describes an outer harness that users
+build from project rules and checks. In her account, a person still directs the
+work through those instructions and checks. In a later article, Böckeler warns
+that static checks can give a false sense of safety. [Her main article describes both the inner and outer
+parts](https://martinfowler.com/articles/harness-engineering.html), and
+[Böckeler gives the full limit in her article on sensors](https://martinfowler.com/articles/sensors-for-coding-agents.html).
 
-**Somebody has to run the program itself.** The operator has to watch the running
-program, because the model cannot see what happens when it runs, e.g. it cannot
-see the interface render. The operator runs the program and brings back the
-output.
+Hugo Bowne Anderson argues for a narrower scope. Most agents do not need complex
+memory or handoffs. Most also do not need groups of agents. The right amount
+depends on how long the work runs and how many outside systems it can change.
+Coding work often needs more support than a short research task, but the support
+should answer a known failure or risk. [Anderson gives his full argument
+here](https://www.oreilly.com/radar/stop-overengineering-your-agent-harness/).
 
-**Somebody has to carry state between tools.** Codex and Claude share no memory,
-so when you want one to build on what another found, you copy it across yourself.
+Together, these sources support a more exact claim. The software around a model
+can change results by a large amount. More software is not always better. The
+word `harness` is too broad to identify the part responsible for a failure.
 
-**Somebody has to decide when work leaves the machine.** Let the agent commit at
-phase boundaries and keep the push for yourself. A commit is a save point you can
-undo on your own. A push changes what everyone else builds on.
+It helps to separate four layers.
 
-Now put those human duties next to what the tools provide. I checked everything below against
-files on this machine rather than recalling it. Two terms need defining
-first, because I use them repeatedly.
+| Layer | What it does | What it does not prove by itself |
+|---|---|---|
+| Model | Proposes the next response | That a requested action ran or worked |
+| Agent product | Runs the model tool loop and manages its session. It applies product permissions. | That its own report satisfies the operator's goal |
+| Project harness | Applies repository instructions and checks | That the worker could not alter the evidence or that the result should enter the shared product |
+| Job controller | Records the approved Job and its state. It enforces limits. It keeps independent checks and publication rights outside the worker. | That the approved contract expresses the right product choice |
 
-A **provider description** is a configuration file in the DeadReckon repository,
-one per agent route. It records three things.
+The last layer does not make product judgment disappear. It requires specific
+decisions before the run and records them. It can then refuse a result when the
+agreed proof is missing, even if the agent says the work is complete.
 
-- How to launch that agent.
-- What its `--help` output lists.
-- Where the cost, the session id and the tool events appear in its output stream.
+This is the part DeadReckon tries to provide.
 
-There are seven for command line agents, plus four more
-in the same format for direct model APIs that are not part of this argument. A
-**recorded transcript** is a saved copy of one real session with one of those
-agents, kept as a test fixture. There are nine, covering five of the seven
-command line routes. Gemini and the Codex app server have none.
+## 4. What predictable delegation requires
 
-Here is what the seven routes give an outer supervisor. The last column says what
-kind of evidence each row rests on, because that turns out to decide how much
-each row is worth.
+DeadReckon did not begin with its current completion design. The first unmet
+needs study in May 2026 focused on the burden around agent runs. It ranked live
+context and spend tracking first. It also called for the following controls.
 
-| Route | Completion signal | Cost unit | Tool call format | Unattended flag | Evidence |
-|---|---|---|---|---|---|
-| Claude Code | `stop_reason: end_turn` | `total_cost_usd` | Content blocks | `--dangerously-skip-permissions` | Recorded transcript |
-| Codex | `turn.completed` | Token counts only | `item.started` and `item.completed` | `--ask-for-approval never` | Recorded transcript |
-| Copilot | `exitCode: 0` | `premiumRequests` | `toolRequests` plus start and complete | `--allow-all` | Recorded transcript |
-| Pi | Stream end | Cost total in the usage object | `toolCallId` | No permission system to disable | Recorded transcript |
-| OpenCode | Exit code zero, after an error in the stream | None recorded | Step and text parts | Hidden flag removed in 0.15.5 | Recorded transcript, partial |
-| Codex app server | JSON-RPC turn end | Token counts only | JSON-RPC items | Approvals answered by program | Description only |
-| Gemini | Not recorded. Process exit is the fallback | None recorded | None recorded | No flag in the description | Description only, no stream ever recorded |
+- Coordination across isolated work copies.
+- Reliable undo.
+- Prompt to code records.
+- Disposable sandboxes.
+- Billing limits.
 
-Two rows carry almost nothing, for reasons the descriptions themselves record.
-The Gemini comment says the binary's help text lists structured output, but the
-installed credentials fail before it emits a single event, so nobody has captured
-one. The OpenCode comment says a successful run emitted an answer, then an error.
-It then emitted a null answer and still exited zero.
+The build plan later pulled provider routing and a run queue into its first
+release. The [first research brief](research/harness-essay/RESEARCH-BRIEF.md)
+preserves the source findings used for this account.
 
-Five things follow, and each one is work the operator has to do. I have written
-each one as a claim about the evidence rather than about the products, because
-that is what the evidence supports. A provider description records what
-DeadReckon needs from an agent, not everything that agent can emit, so a
-capability nobody asked for would not appear here.
+That research did not state the full argument in this essay. It did not begin
+with an independent meaning check or a signed completion receipt. Those parts
+came later. Building the first controls raised a deeper question. A system could
+keep a process alive and record its spend. It could preserve the output while
+still having no sound reason to accept the result.
 
-**Across the nine recorded transcripts, no agent emits a completion signal
-independent of the model's own report.** Nothing in any transcript re-runs a
-check against the goal. The agent's opinion of its own work is the whole signal.
+The current design treats an agent run as one attempt inside a durable Job. A
+Job is the stored record for one approved result. It holds the limits and the
+evidence. It accepts a result only after separate checks agree. It then applies
+that exact result through a trusted controller.
 
-**Across all seven descriptions and all nine transcripts, nothing authenticates a
-result.** No signature over the work, no message authentication code, and no
-receipt tying an outcome to a key. Two near misses are worth naming, because a
-reader running the same search will hit them. Claude Code advertises a capability
-called `interrupt_receipt_v1`, and Pi emits a field called `thinkingSignature`
-whose value is the string `reasoning_content`. The first names a protocol
-feature and the second names a place to find text. Neither authenticates
-anything. If any of these agents can sign a result, DeadReckon never found the
-surface to ask for it.
+Eight controls follow from that requirement.
 
-**Claude Code's run does not outlive its process.** This one I can state about
-the product, because the evidence is the product's own state directory rather
-than my model of it. Its session registry is keyed by operating system process
-id. The three files in `~/.claude/sessions` are named `80130.json`,
-`87885.json` and `92024.json`, which are the process ids of the three agents
-running on this machine right now. The background service writes
-`idle 5s with no clients` to its log and exits on its own. Closing the terminal
-removes the lifecycle record.
+### 4.1 Approve an executable account of done
 
-**No time bound in this system outlives a process, on either side of the
-boundary.** DeadReckon's own launch template carries one per-invocation timeout,
-`timeout_seconds = 1800`, identical across all seven routes, and it restarts at
-zero with the process. That is my number, not theirs. The more useful fact is
-that nothing in the nine recorded transcripts carries a bound of the agent's own
-that survives a restart either. Neither side of the boundary keeps a running
-total.
+A goal written in prose is necessary, but it is not enough. The operator also
+needs a completion contract that names checks which another process can run.
 
-**Running without a person turns the approvals off rather than delegating them.**
-Codex is the possible exception, because it takes a sandbox level on the same
-command line that disables its approvals, so the boundary is at least meant to
-survive. As section 1 says, I have not probed whether it does. For the other six,
-running without a person removes the boundary rather than moving it. The OpenCode
-entry records version 0.15.5, and nobody has re-checked it since.
+DeadReckon refuses to start a strict Job in any of these cases.
 
-The table shows one further problem. Every column uses different words. To find
-out whether an agent supports resuming, you read its `--help` text and look for
-substrings. The same goes for streaming and for structured output. So the
-contract can break on the agent's next release.
+- The acceptance file has no checks.
+- The file requires no check.
+- The only check confirms that a working directory exists.
 
-The outside evidence shows this problem getting worse rather than better. The
-Qwen team state the reversal in the first line of a paper of 29 June 2026.
-"[A classical intuition in computing holds that verifying a solution is easier than finding one. For today's coding agents, this asymmetry is reversing.](https://arxiv.org/html/2606.26300v2)"
-The authors argue that every check you can write stands in for what a person
-wanted and is never the thing itself. They add that a model trained against a
-stand-in learns the difference between the two.
+The [strict contract validator](../crates/deadreckon-core/src/completion.rs)
+makes an empty account of done an error before the first agent turn.
 
-Three groups have measured the size of that difference. All the percentages below
-are pass rates on the named benchmark.
+DeadReckon accepts the check types listed below.
 
-| Source | Date | Finding | Known weakness |
-|---|---|---|---|
-| Qwen team | 29 June 2026 | Adding behaviour monitoring to the tests dropped solutions that passed by cheating from 28.57 percent to 0.56 percent, and raised clean solutions from 40.22 percent to 60.53 percent, across three SWE-Bench variants | The monitor is itself a model, so it has its own error rate, which they do not report |
-| Naman Jain, Cursor | 25 June 2026 | After sealing git history and blocking network access except to package registries, Opus 4.8 Max "fell from 87.1% to 73.0%" on SWE-bench Pro | One vendor, one model, one benchmark |
-| Weco AI, SpecBench | 20 May 2026 | "The gap grows by 28 percentage points for every tenfold increase in code size" between the visible suite and a held out suite. Above 25,000 lines the worst-case gap reaches 100 percentage points | A 100 point gap means the visible suite passing completely while the held out suite fails completely. I could not tell from the paper whether that shows the effect or shows how the held out tasks were built |
-
-The Qwen pair is the most useful, because both numbers moved together. The tests
-alone were accepting a large amount of work that should have been rejected, and
-they were also rejecting work that was fine. The Cursor result is the plainest.
-The model did not get worse. Sealing the history removed the shortcuts. I would
-not rely on the
-SpecBench 100 point figure at all, and I have included it only because the
-28 point trend beneath it is the finding that generalises.
-
-Simon Willison's version of the rule is shorter.
-"[If the code has never been executed it's pure luck if it actually works when deployed to production.](https://simonwillison.net/guides/agentic-engineering-patterns/first-run-the-tests/)"
-The habit he tells people to avoid is equally short.
-"[Don't file pull requests with code you haven't reviewed yourself.](https://simonwillison.net/guides/agentic-engineering-patterns/anti-patterns/)"
-
-Every one of those instructions is correct and every one of them is a job for a
-person. That is why people started working on the software around the model.
-
----
-
-## 3. The claim that the harness decides the outcome
-
-The claim shows up in four places I keep returning to, and the strongest versions
-come with numbers.
-
-Addy Osmani, writing on 19 April 2026 and republished by O'Reilly on 15 May,
-states it as plainly as anyone. He names Claude Code, Cursor, Codex, Aider and
-Cline, calls all five of them harnesses, and writes that
-"[the model underneath is sometimes the same, but the behaviour you experience is dominated by what the harness does](https://addyosmani.com/blog/agent-harness-engineering/)".
-He adds two lines that people quote more often than they read the article they
-come from. "A decent model with a great harness beats a great model with a bad
-harness." And, "The gap between what today's models can do and what you see them
-doing is largely a harness gap."
-
-Researchers at Meta and Harvard measured a version of it on 3 February 2026.
-Holding the model fixed and changing only the scaffold, which is these authors'
-word for the harness, moved Claude 4.5 Sonnet on
-SWE-Bench-Pro from 45.8 percent to 52.7 percent. That 6.9 point rise from the scaffold
-alone is the finding I trust. They also report a crossover, where
-"[even a weaker model equipped with a strong agent scaffold (Claude 4.5 Sonnet + CCA at 52.7%) can outperform a stronger model (Claude 4.5 Opus + Anthropic's proprietary scaffold at 52.0%)](https://arxiv.org/html/2512.10398v6)".
-Those two figures are 0.7 points apart on a benchmark of a few hundred instances,
-which is close enough that I would not rely on the crossover itself. The 6.9
-point swing is roughly ten times that gap on the same instance count, which is
-the only reason I treat the two differently. The authors publish no error bars,
-so even the 6.9 is an estimate.
-
-One practitioner post is worth keeping, not for a number but for a list of the
-places things break. Writing on r/LLMObservability on 3 August 2026, an engineer
-reports that
-"[Most of the agent behaviour I have had to fix was not the model being dumb. It was the scaffolding: how tools were described, what got put back into context after a failure, how many steps were allowed, what happened on a timeout.](https://www.reddit.com/r/LLMObservability/comments/1vedbnq/the_harness_around_the_model_decides_more_of_your/)"
-He names four places where the behaviour breaks. He attaches no quantity to any
-of them, and he claims none.
-
-The claim also has a serious critic, and the criticism is right about most
-software. Hugo Bowne-Anderson, writing for O'Reilly on 22 July 2026, argues
-against building this software before you need it. Of compaction, memory,
-handoffs and
-sub-agents he writes that
-"[most agents you'll build don't need any of them](https://www.oreilly.com/radar/stop-overengineering-your-agent-harness/)",
-and his advice is to keep the harness small and "add infrastructure only when a
-real failure demands it". His own exceptions are the point. He names coding
-agents, deep research systems and long-lived assistants as the cases where the
-work does pay, because those are the systems that run long enough to accumulate
-the failures.
-
-None of these authors go on to the next question.
-
-Böckeler's model of a harness is a system of guides and sensors. Guides
-"anticipate the agent's behaviour and aim to steer it *before* it acts". Sensors
-"observe *after* the agent acts and help it self-correct". That model is correct
-and it is about one process. The guides go into the prompt. The sensors run
-inside the loop and feed their output back to the model. Osmani's list of what a
-harness contains is the same in this respect. It covers the following.
-
-- System prompts.
-- Tools.
-- Bundled infrastructure.
-- Orchestration, which is the code deciding what runs next.
-- Hooks, which are commands the harness runs at fixed points.
-- Observability, which means logs, traces and cost meters.
-
-Every item on that list is inside the agent while it is running.
-
-Böckeler is careful about the limit herself. Writing about maintainability
-sensors on 27 May 2026, she says that these sensors
-"[are not a magical solution to take the human totally out of the loop](https://martinfowler.com/articles/sensors-for-coding-agents.html)",
-and warns that they can produce "a false sense of security and an illusion of
-quality", because static analysis cannot reach the meaning of the change.
-
-Section 2 counted work that happens outside the loop. The loop never reaches any
-of the following four.
-
-- After the process exits.
-- The hours after your laptop sleeps.
-- Whether the check that passed was the right check.
-- Whether to put the result on a branch other people depend on.
-
-A better inner harness makes the agent produce better work. It does not tell you
-whether to accept the work, and it does not outlive its own process. Those are
-different problems, and they need different software.
-
----
-
-## 4. What makes delegation predictable
-
-The manual patterns say what the software has to do. Each one describes a correct
-procedure that a person performs. So take each procedure and ask what would have
-to exist for a machine to perform it instead, without weakening it.
-
-Here are eight answers, as DeadReckon implements them. The point is not the
-particular product. The point is that each mechanism is small enough to check,
-and each one answers a burden that section 2 counted.
-
-| # | Mechanism | Manual work it replaces | Where it lives |
-|---|---|---|---|
-| 4.1 | Executable definition of done, refused if empty | Writing by hand a brief that grades itself, done 4 times in 1,310 sessions | `deadreckon-core/src/gate.rs:140`, `completion.rs:1069` |
-| 4.2 | Two independent judgments, one deterministic and one about meaning, that must agree | Reading every claim with suspicion, every time | `deadreckon-core/src/completion.rs:171`, `deadreckon-runtime/src/semantic_judge.rs:873` |
-| 4.3 | Verifier whose unreachability is observed on each run, not assumed | Keeping a source of truth outside reach, by convention | `deadreckon/src/bin/dr-gate.rs:491`, `deadreckon-core/src/gate.rs:338` |
-| 4.4 | A run that outlives the terminal | Nothing. No manual procedure can do it | `deadreckon-protocol/src/job.rs:234`, `deadreckon-core/src/job_lease.rs` |
-| 4.5 | Budget computed from the log, not a timer | Watching the spend meter | `deadreckon/src/commands/supervisor.rs:5855` |
-| 4.6 | Isolated result, deliberate promotion | Committing at phase boundaries and never pushing | `deadreckon-core/src/delivery.rs:162`, `deadreckon/src/commands/undo.rs:113` |
-| 4.7 | Evidence re-checked when read | Keeping an architecture map true by hand | `deadreckon-core/src/job.rs:235` |
-| 4.8 | Provider and model fixed per role | Checking by hand which model a run used | `deadreckon-providers/src/model_catalog.rs:36` |
-
-### 4.1 Make "done" executable before the work starts
-
-Before any agent runs, DeadReckon compiles the goal into a contract of checks
-that a command can run. There are five kinds of check and each carries a flag
-saying whether it must pass. The enum is `AcceptanceCheck` in
-`crates/deadreckon-core/src/gate.rs:140`.
-
-- A Rust test run.
-- A check that a file exists.
-- A check that a file's contents match a pattern.
+- A test command.
 - A build.
-- Any shell command.
+- A file check.
+- A text match.
+- A shell command.
 
-Only the Rust test run has its own typed check. Every other language uses the shell check
-instead, so `go test ./...` and `python -m pytest -q` both run as shell commands. A separate step reads the repository and proposes
-a default for the ecosystem it finds, in
-`crates/deadreckon-core/src/acceptance_defaults.rs:82`.
+Each check says whether it must pass. The
+[acceptance types](../crates/deadreckon-core/src/gate.rs) turn part of the goal
+into a repeatable decision.
 
-The part that does the work is the refusal. `validate_strict_contract` in
-`crates/deadreckon-core/src/completion.rs:1069` runs before DeadReckon writes the
-authority, which is the signed statement of what the operator approved, and
-before a job exists. It rejects three kinds of contract.
+This work happens before the run. The operator must decide what evidence is
+useful before the agent changes the code. That is extra setup, but it prevents a
+weak test chosen at the end from becoming the definition of success.
 
-- One with no checks.
-- One where no check is marked as required.
-- One whose only proof is that the working directory it just created exists. The
-  refusal text for that case is `"only proves that its pre-created working
-  directory exists"`.
+### 4.2 Keep execution proof separate from meaning
 
-In each of those three cases the definition of done stops testing anything, and
-DeadReckon will not start.
+A test can show that a command passed. It cannot show by itself that the result
+meets the whole goal. A model can judge the goal in context. It should not be
+allowed to accept the result after a required command fails.
 
-### 4.2 Separate "the agent finished" from "the work is accepted"
+DeadReckon therefore uses two decisions. A fixed checker runs the approved checks.
+A fresh model call then judges whether the result covers the approved goal. The
+judge receives a limited evidence set and has no worker session. It can return
+one of these results.
 
-Two independent things must agree before DeadReckon marks a result as verified.
-`seal_completion_receipt` in `crates/deadreckon-core/src/completion.rs:171`
-enforces it.
+- `achieved`.
+- `revise`.
+- `uncertain`.
 
-The first is a deterministic gate that runs the approved checks and signs the
-outcome. The second is a fresh model call with no session history and no write
-access. Only the first of the two holds a signing key. The judge signs nothing.
-Its answer is tied to one result by a hash of the evidence it was given, not by a
-signature of its own.
+Only `achieved` can support completion.
+The [semantic judge](../crates/deadreckon-runtime/src/semantic_judge.rs) cannot
+override a failed fixed check.
 
-The judge reads a bounded packet of evidence and returns exactly one of three
-verdicts, which are `achieved`, `revise` and `uncertain`. Its instructions, in
-`crates/deadreckon-runtime/src/semantic_judge.rs:873`, begin, "You are an
-independent completion judge. Assess meaning only; deterministic checks have
-already passed and you may not override them."
+This split does not make the second decision objective. It makes the source of
+each decision clear. If the fixed check fails, the command or result failed. If
+the meaning check is uncertain, a person must review the Job or the agent must
+make another attempt.
 
-| Verdict | What happens |
-|---|---|
-| `achieved` | The receipt can be sealed |
-| `revise` | Another bounded attempt starts |
-| `uncertain` | The job stops and asks for a person |
-| Judge unavailable or reply malformed | The job stops and asks for a person |
-| Deterministic checks failed | The judge is never called |
+### 4.3 Keep proof outside the worker's control
 
-The judge sees exactly six things and nothing else. This is the most
-consequential list in section 4, because it is the entire input to the decision
-about whether the work is acceptable.
+Independent checks are not independent if the worker can replace their output
+or read the secret used to approve it.
 
-| Evidence item | Size limit |
-|---|---|
-| The approved goal | Bounded |
-| The approved contract | 64 KiB |
-| The diff against the source | 256 KiB |
-| The deterministic gate result | Bounded, with at most 64 findings |
-| The approved authority | Bounded |
-| The implementation notes | 64 KiB, summary capped at 4,000 characters |
+DeadReckon stores its signing material outside the agent workspace. It runs the
+check before a separate trusted process signs the result. Before completion, it
+also probes these boundaries.
 
-DeadReckon checks the answer rather than trusting it. The judgment records a
-hash of that packet, so nobody can attach a judgment to a different result later.
-If the model returns `achieved` while also listing a blocking omission, or cites
-an evidence id that is not one of the six, the parser rejects the reply.
+- The worker cannot read the signing key.
+- The worker cannot change the control records.
+- The worker cannot write the proof.
 
-### 4.3 Keep the verifier out of the agent's reach
+The
+[boundary record](../crates/deadreckon-core/src/sandbox_observation.rs) binds
+that observation to the result under review.
 
-A file is not outside reach merely because the prompt says not to edit it.
+This is stronger than asking the agent to run the tests and report what
+happened. It is also narrower than a claim that no hostile program can escape
+the host controls. The probe checks named boundaries. It does not prove every
+property of the operating system sandbox.
 
-So DeadReckon splits the gate across three separate runs of one small binary,
-`dr-gate`, each with its own environment. That binary has five modes in total.
-The two not described here handle a protocol handshake and a guarded process
-launch.
+### 4.4 Bind completion to one result
 
-- The `evaluate` mode runs the repository's own check commands and holds no key.
-  It refuses to start if the signing key or either containment marker is present
-  in its environment, checked at `crates/deadreckon/src/bin/dr-gate.rs:491`. A
-  containment marker is a variable recording whether the run was contained and
-  which sandbox backend resolved. The evaluator writes an unsigned result.
-- The `sign` mode launches no child processes. It reads the key, re-checks the
-  evaluation against the contract, and signs.
-- The `probe-boundary` mode runs inside the resolved sandbox and records whether
-  reading the key, writing proof files and writing control files were denied.
+The result that passed must be the result that gets accepted. A later edit must
+not inherit earlier proof.
 
-The key file is stored outside the workspace in a directory only its owner can
-read. The
-code opens it with `create_new(true)` at
-`crates/deadreckon-core/src/gate.rs:338`, so it is created once and never
-replaced, and it is refused if the file is a symlink, is not a regular file, or
-can be read by anyone else.
+DeadReckon creates a signed completion receipt only when all required facts are
+present.
 
-The next part is easy to overstate, so I want to state it carefully. File
-permissions alone do not put the key out of the agent's reach. The agent runs as
-the same user, so a file the user can read is a file the agent can read. What
-closes the gap is the sandbox, and only the sandbox. That is why the third mode
-exists. Unreachability is not a property you can assume from the file mode. It
-has to be observed on every run, inside whatever backend actually resolved, and
-recorded.
+- The fixed checks passed.
+- The meaning judge returned `achieved`.
+- The boundary observation belongs to the same Job attempt.
 
-The boundary observation is signed with its own separate tag,
-`deadreckon.sandbox-boundary-observation.v1`, in
-`crates/deadreckon-core/src/sandbox_observation.rs:24`. Its wire format rejects
-unknown fields, so an agent cannot add a field of its own to the record.
+The receipt records a content hash for each approved input and each proof file.
+A content hash is a short value that changes when file content changes. The
+[completion code](../crates/deadreckon-core/src/completion.rs) checks those links
+again whenever it validates the receipt.
 
-This makes 4.3 only as strong as the sandbox underneath it, and on macOS that
-sandbox denies a list of specific paths rather than denying everything by
-default. A deny list is weaker than a default deny, because it protects only what
-somebody thought to name. The honesty table at the end of this section says so
-again. Of everything I have not proven, this is the one I would fix first.
+The word `receipt` is literal here. The controller stores what it accepted and
+why. The receipt does not mean that the work is good in some wider sense. It
+means that this exact result met the contract through the recorded process.
 
-### 4.4 Give the run a life that does not depend on the terminal
+### 4.5 Keep the Job record after one process ends
 
-A job is an append-only event log. DeadReckon only ever adds a line to the end.
-An edit or a removal is detected rather than prevented, because a process with
-write access to the file can still truncate it. The list of six corruption errors
-below is how DeadReckon detects it. That log is the only record that decides what
-happened. The checkpoint file beside it is a convenience, and a program can
-rebuild it from the log.
+The controller should not lose the Job record when a terminal closes or a
+supervisor restarts.
 
-The list of names is fixed. There are 8 terminal outcomes at
-`crates/deadreckon-protocol/src/job.rs:234` and exactly 18 stop reasons at
-`crates/deadreckon-protocol/src/job.rs:249`. There are 18 stop reasons rather
-than 3 because "I could not prove containment" and "the budget ran
-out" need different responses from the operator. One is a bug report and the
-other is a spending decision. Only the stop reasons carry a fixed size array
-holding the count, so the build fails if that number changes. The allowed pairs
-of outcome and reason are a fixed table. The reducer is the program that reads
-the event log and works out the current state, and both the reducer and every
-status display read that table.
+DeadReckon records Job changes in an append only event file. A lease gives one
+worker authority at a time. Each new owner receives a higher lease number, and
+an old owner cannot add another event. The
+[Job state code](../crates/deadreckon-core/src/job.rs) rejects gaps and invalid
+state changes. The [lease code](../crates/deadreckon-core/src/job_lease.rs)
+checks ownership again while it holds the control lock.
 
-One process owns a job at a time. It holds a lease with an epoch, which is a
-counter that only increases, so a worker whose lease has gone stale has its
-writes rejected by `append_fenced_job_event` in
-`crates/deadreckon-core/src/job_lease.rs`. A lease is only taken from a previous
-owner when it has expired, when the machine has rebooted, or when its checkpoint
-is missing. A worker sends a signal at a fixed interval to show it is alive, and
-a late signal cannot take a job away from a process that is still running on the
-same boot.
+Process exit no longer decides the Job result by itself. After a restart, the
+controller rebuilds the Job state from its record and decides whether the work
+may continue. It does not treat a new process as a new task.
 
-The reducer refuses to guess. Each of the following produces a corruption error
-rather than a reading that does its best with what is there.
+### 4.6 Make limits survive restarts
 
-- A gap in the sequence.
-- An event belonging to another job.
-- A duplicate event id whose bytes differ from the first copy.
-- A lease epoch that did not increase.
-- Any event recorded after a terminal outcome.
-- Any outcome and reason pair that is not in the table.
+A timeout on one child process does not limit a Job that can start another
+child. The same problem applies to attempt counts and spend.
 
-The reducer ignores a final line that was only partly written, and it refuses to
-append after one.
+DeadReckon stores the approved limits with the Job. Its wall clock total comes
+from all recorded attempts, so a restart does not set it back to zero. It keeps
+the attempt limit and deadline in the same durable policy. The
+[supervisor](../crates/deadreckon/src/commands/supervisor.rs) refuses to record a
+clean stop until it has accounted for the child processes it started.
 
-The operating system service manager handles machine restart, using launchd on
-macOS and systemd on Linux. The preflight refuses to claim durability unless the
-service is both active and enabled with a live checkpoint. Other platforms are
-reported as unsupported rather than quietly assumed to work.
+Provider cost records need more care because products report different units.
+The controller can enforce only the spend it can observe. Missing cost data is
+an evidence limit, not a zero cost.
 
-### 4.5 Bound the work in a way that survives a restart
+### 4.7 Isolate the result and apply it on purpose
 
-DeadReckon freezes three limits when the job starts and hashes them into the
-authority record. They are a cap on dollars spent, a cap on total time, and a cap
-on attempts. A fourth limit, a deadline on the calendar, is optional and commonly
-absent.
+An agent may produce a valid candidate without receiving authority to change
+the shared branch.
 
-`active_attempt_wall` in `crates/deadreckon/src/commands/supervisor.rs:5855`
-computes elapsed time from the event log rather than from a process timer. It
-adds up every started and stopped interval, then adds the time since the current
-attempt began. That is why the total survives a crash. It also survives a supervisor restart and
-a reboot. Three faults make the count fail closed, which means it refuses to
-return a number rather than returning a wrong one.
+DeadReckon keeps candidate work in an isolated Git copy. A trusted step applies
+only the result named by the verified receipt. It records the branch state
+before and after that action so undo can check that it is reversing the same
+delivery. The [promotion code](../crates/deadreckon-core/src/promotion.rs) keeps
+completion and publication as separate decisions.
 
-- Timestamps that run backwards.
-- A second start with no stop in between.
-- Arithmetic overflow. When you set a deadline, it and the time cap limit the
-same allowance. Whichever is tighter applies.
+This preserves a useful operator choice. The operator can approve the contract
+before the run and still reserve the right to publish after seeing the result.
 
-Exhausting the cap does not end the job on its own. The supervisor first proves
-that every process it owns has stopped, including nested evaluators, sub-plans
-and containers. If it cannot prove that, the job becomes blocked with a reason of
-lost containment rather than being recorded as out of budget.
+### 4.8 Recheck old proof
 
-### 4.6 Isolate the result, then promote it on purpose
+A later reader should be able to detect missing or changed evidence.
 
-The result of a run goes into a workspace that is not your checkout. That is a
-separate decision from which sandbox confines the process, and the two should not
-be treated as one guarantee. The sandbox uses one of three backends, which are
-Seatbelt on macOS, bubblewrap on Linux and Docker, in
-`crates/deadreckon-sandbox/src/backend.rs:58`. A resolved backend of `none`
-cannot produce a trusted receipt, which
-`crates/deadreckon-core/src/completion.rs:201` enforces by refusing to sign when
-the marker reports no containment.
+When DeadReckon reads a Job marked `verified`, it validates the current receipt
+again. If someone deletes or changes the receipt, the public Job view reports
+that the verified event no longer matches the stored proof. It does not silently
+trust the old label.
 
-Promotion is a distinct act with three steps.
+That check handles a common problem in event based systems. An event says what
+the controller accepted at one time. Each later read must still check whether
+the evidence for that event exists and remains valid.
 
-1. Re-check the approved authority, the gate marker, the judgment, the signature
-   and the hash of the result tree.
-2. Sign a statement of what is about to happen, before touching git.
-   `seal_git_delivery_intent` is in `crates/deadreckon-core/src/delivery.rs:162`, and the record it signs, `GitDeliveryIntent`, is in `crates/deadreckon-protocol/src/job.rs:565`.
-3. After the change lands, re-prove the exact state and sign a second receipt.
+### What the current evidence does not prove
 
-Undo is authorised by those two signed artifacts rather than by the event log,
-and `crates/deadreckon/src/commands/undo.rs:113` verifies that the result is an
-exact revert commit.
+The repository contains substantial implementation and test evidence for these
+parts. It does not yet show that DeadReckon makes operators more effective in
+daily product work.
 
-### 4.7 Keep the evidence, and re-check it when someone reads it
+The checked hostile case record reports 13 passing proof groups and no failures.
+It also marks nine live claims as unproven. They include these distinct gaps.
 
-DeadReckon keeps five kinds of record as append-only files under the run
-directory.
+- Recovery after a machine restart.
+- A positive Linux boundary result using bubblewrap.
+- A live hostile worker trial with an independent judge.
 
-- The events.
-- The traces.
-- The spend.
-- The provenance.
-- A snapshot of the working tree, one per turn.
+The [credential free record](../examples/watchkeeper-dogfood/credential-free-results.json)
+binds its
+passing groups to a clean source revision, but later changes need new evidence.
 
-A single provenance row records which prompt id, model, tool call id and session
-id produced which files.
+A separate 24 task live matrix records only two attempts. Neither reached a
+verified receipt, and 22 tasks were not run. The
+[dogfood guide](../examples/watchkeeper-dogfood/README.md) states those results
+without treating an attempted run as success.
 
-The part that is easy to skip is re-checking that evidence when someone reads it.
-A completion receipt records ten hashes plus the attempt identity. Nine of the
-ten cover the approved inputs and the trees produced.
+The meaning judge has another open question. The code handles every result that
+does not support completion. The project has not yet measured how often the
+judge accepts bad work or rejects good work on representative Jobs.
 
-- The authority.
-- The goal.
-- The contract.
-- The effective policy.
-- The launch plan.
-- The source tree.
-- The result tree.
-- The gate marker, which is the signed record the `sign` mode writes, saying
-  which checks ran, whether they passed, and under which sandbox backend.
-- The judgment.
- The tenth hash is the one section 4.3 describes.
-It covers the sandbox boundary observation, and without it the receipt would
-record that the checks passed but not that they ran somewhere the agent could not
-reach.
+The [Map of DeadReckon](MAP-OF-DEADRECKON.md) records further limits. The macOS
+sandbox applies selected denials rather than a complete policy. Its network
+control is weaker than its file control. Several recovery claims still need a
+host event.
 
-Every time a display reads the job, `JobView::load` in
-`crates/deadreckon-core/src/job.rs:235` re-checks the recorded verified fact
-against the receipt on disk. If the two no longer agree it fills in
-`verified_receipt_error` and the display reports the mismatch rather than
-reporting success. A receipt whose proof has been edited or deleted shows as
-broken rather than continuing to show as verified.
-
-### 4.8 Fix the provider and model for each role
-
-Re-running a job six weeks later against a different model is not a replay. It is
-a new experiment recorded under an old job's id, and the evidence you compare
-will not mean what you think it means.
-
-So DeadReckon chooses the provider and the model together as one decision, for
-each role in the run, and writes both into the accepted plan. Recovery and replay
-restore those exact strings.
-
-The bug this closes was real. Model discovery used to fall back to a different
-provider's catalogue when a provider's own list could not be read, so a run could
-end up recorded against a model that provider does not serve. Discovery now reads only the list a
-provider publishes for itself. When that read fails, DeadReckon falls back to the
-model list it ships for that same provider, never to another provider's list. The rule is stated in
-`crates/deadreckon-providers/src/model_catalog.rs:36`.
-
-### What this does not prove
-
-The honest boundary belongs in the same section as the claims, because a claim
-about verification that has not itself been verified is the exact failure this
-system exists to prevent.
-
-The mechanisms above are implemented and covered by tests, including a fault
-matrix for torn writes, lease races, receipt tampering and refused promotion.
-That is engineering evidence. It is not the same as an operator outcome.
-
-| Claim | State of the evidence |
-|---|---|
-| Operators can run this on real work | The 24 row live acceptance kit records 2 tasks attempted, 22 not run, 0 verified |
-| The independent judge decides correctly | No measured rate of false acceptance or false rejection. Until those exist, 4.2 is a design and not a result |
-| Recovery works after a worker dies | Proven under Docker, but bound to an older clean commit, so it does not cover the later supervisor and sandbox changes |
-| A verified receipt can be issued on Linux | Only the negative case is recorded. Linux continuous integration proves a smoke run cannot issue a trusted receipt. Nobody has recorded a positive one |
-| Work survives a machine restart | Nobody has run a real reboot recovery |
-| The macOS sandbox confines the process | It denies specific paths rather than denying everything by default, and the network policy is a list checked at approval time rather than a proxy that blocks a domain |
-
-Publishing that table is part of the design. The alternative is a system you have
-to trust on a summary alone, which is what all 25 patterns teach people not to
-do.
-
----
+The fair claim is therefore limited. DeadReckon implements and tests a design
+for durable, independently checked Jobs. It has not yet proved the operator
+outcome that motivated the design.
 
 ## 5. If you wrap agents you did not write
 
-Everything above is easier when you control the inner loop. A layer that
-supervises other people's agents gives you a harder problem, because you cannot
-change them and cannot trust them to report on themselves. These are the parts that
-turned out to be hard, and the ones a second attempt should get right first.
+An outer controller must work with products that use different words and change
+at different speeds. The errors corrected in this revision show the first rule.
+A local product snapshot is not current product documentation, and an adapter is
+not a full account of the product.
 
-**Design for observation, not cooperation.** The inner agent will not tell you it
-is done in a way you can rely on, because its only completion signal is its own
-report. Treat process exit as a reason to go and look at the evidence, never as
-the answer. The module comment at
-`crates/deadreckon/src/commands/supervisor.rs:3` states the rule. "The
-append-only job history is control truth. Process exit is only a wakeup to
-inspect persisted run evidence; it is never accepted as completion."
+The work produces several practical rules.
 
-**There are two kinds of inner loop and you have to cover both.** A direct model
-API returns one structured action per turn, e.g. a shell command, and your
-runtime executes it. A command line agent changes the working tree itself and
-tells you about it afterwards. The first you drive. The second you watch. Only
-the outer contract can be the same for both, and if you design for one shape you
-will rebuild for the other.
+### Record the exact integration
 
-**Every agent uses different event names, so put those names in data.** One
-adapter per agent means a new adapter for every agent, rewritten on every
-release. Describing each agent in a configuration file turns a new agent into
-data rather than code. The DeadReckon repository has seven
-command line routes over six distinct binaries, because Codex appears twice, once
-per transport.
+Store these facts for each attempt.
 
-| Route | How it is driven |
-|---|---|
-| Gemini | Description only |
-| OpenCode | Description only |
-| Copilot | Description only, including how to parse its events |
-| Pi | Description only, including how to parse its events |
-| Claude Code | Hand written Rust. Its event stream is too irregular to describe |
-| Codex | Hand written Rust. Its event stream is too irregular to describe |
-| Codex app server | Hand written Rust. It speaks two way JSON-RPC rather than emitting a stream |
+- The route and product version.
+- The launch arguments.
+- The model choice.
+- The event format.
 
-Four of seven run from a description, which is what I wanted. A description can
-also say how to parse the event stream, but only two of the seven do that.
+Check the product maker's current documentation before making a broad capability
+claim. Keep old test streams as evidence for the adapter version they cover, not
+as evidence about the latest product.
 
-**Assume the contract will break, because you discover capability by guessing.**
-Searching `--help` text for substrings is not a stable interface, and section 2
-shows why. The DeadReckon repository was set up against Pi version 0.79.1. The Pi source tree on the
-same machine is already at 0.83.0 with unreleased work in it. Drift between the
-version you validated and the version installed is the normal state, so do three
-things.
+### Observe more than the agent's final text
 
-- Record which version you checked.
-- Probe the binary before trusting it.
-- Say in the output when you have fallen back, rather than falling back quietly.
+Collect machine readable events when the product has them. Also record these
+facts.
 
-**Running without a person means the approvals are gone.** Running these agents
-without a person means passing a flag that turns off the inner boundary. Codex
-may be the exception, but until you have probed it yourself you should not plan
-around it. Your outer boundary is therefore the only boundary. Assume the agent
-has full authority over everything your sandbox does not deny, because in most
-configurations it does.
+- Process exit.
+- Files changed.
+- Checks run.
+- The exact source and result states.
 
-**Cost is not comparable, so do not pretend it adds up.** Dollars, tokens and
-premium requests are three different quantities. Record what each agent reports
-and convert only where a true conversion exists. Show the operator where each
-number came from rather than one total that is partly invented.
+A product may not offer a completion event that means what the outer controller
+needs. The controller should derive its own Job result from evidence it can
+inspect.
 
-**Keep two clocks.** The inner timeout is per process and resets on every launch.
-Your budget must not. Derive elapsed time from your own durable record of when
-attempts started and stopped, or a crash loop will run forever inside a cap that
-looks like it is working.
+### Treat unattended control as a full policy
 
-**Fail closed, and be specific about what closed means.** A run with no resolved
-sandbox must not be able to produce a trusted receipt. A cancellation that cannot
-prove every child process is dead must record that it could not, rather than
-recording a clean stop. The useful discipline is to have a distinct stop reason
-for "I could not prove this" and to use it.
+Products now offer several forms of unattended work. One can retain a sandbox
+while suppressing prompts. Another can send approval requests to an automatic
+reviewer. Another has no built in permission system. Record the exact sandbox
+settings. Also record the approval and reviewer settings. Probe the boundary
+that the Job depends on.
+Do not turn all of these modes into one `unattended` flag and assume equal
+protection.
 
-**Do not claim two guarantees from one mechanism.** Putting the result in a
-separate working tree keeps the agent's changes away from your checkout. It says
-nothing about what the process can reach on the rest of the machine. Those are
-two properties with two mechanisms, and merging them in the documentation is how
-a system ends up over-promising.
+### Keep each cost in its original unit
 
-**Refuse old paths rather than quietly running them.** A wrapper accumulates
-routes that predate its own guarantees. The choice is to let them run with weaker
-guarantees or to refuse them at the public boundary and print the durable
-equivalent. Refusing is better, and the cost is that your help text has to be
-rewritten to match, which is work DeadReckon has not finished.
+Each product can report cost in a different unit. E.g., a route may report
+tokens instead of dollars. Keep the original value and its source. Any price
+conversion should be a separate record with a dated rate. If a route provides no
+useful cost event, say that the spend is unknown.
 
-**One truth model, or you have built two systems.** Every display should read the
-same event log through the same resolver. If the status output, the interface and
-the report each hold a different record of what happened, an operator has to
-decide which one to believe, and you have recreated the problem you started with.
+### Keep a Job clock outside each attempt
 
-**Measure the judge, or say that you have not.** Using a model to decide whether
-another model's work is acceptable makes a claim about accuracy, and accuracy has
-a number. Until you can state a false acceptance rate and a false rejection rate,
-say so. The Qwen team's 28.57 percent to 0.56 percent result is useful because
-they measured both directions.
+Each product may enforce a limit on one call or process. The outer controller
+still needs a total for the whole Job. It should add completed attempts and the
+current attempt, then apply the approved deadline and attempt limit without
+resetting them after a restart.
 
----
+### Separate result isolation from host control
 
-## Where this leaves things
+A Git worktree keeps one candidate result away from another. It does not limit
+network access or protect secrets. An operating system sandbox can limit those
+actions. It does not decide which commit should enter the shared branch. A
+controller needs both boundaries and should name which claim each one supports.
 
-The agents are good and getting better, and I am not arguing against using them.
-This is an argument about where the remaining work went.
+### Refuse completion when proof is missing
 
-Once the code is cheap, the work is the intent behind it and the proof that it
-holds. The corpus of 1,310 sessions shows what happens when only a person can
-supply that proof. A person supplied it 614 times by interrupting the agent. A
-person supplied it 88 times by writing an instruction not to edit files, added
-after something went wrong. A person supplied it 4 times by writing a full brief
-that carries its own exit condition, which is the form the sources in section 2
-recommend.
+Several facts can be useful evidence.
 
-Software can supply that proof instead. Six pieces do most of it.
+- Process exit.
+- A final message.
+- A passing test.
 
-- A contract that refuses to be empty.
-- A check that runs where the agent could not reach it, with the containment
-  observed and recorded each time.
-- A second reader that returns only three answers.
-- A log that outlives the terminal.
-- A budget computed from that log rather than from a process timer.
-- A promotion step that re-checks everything before it changes your branch.
+None should silently stand in for a required receipt. The Job should stop as
+unproven if a required provider stream is unknown. It should do the same if the
+boundary probe is absent or the judge cannot return a sound decision. A person
+can then review it.
 
-None of those replace judgment. They move the operator's attention to the one
-question where judgment is the only thing that works, which is whether the check
-that passed was the right check.
+### Use one account of Job state
 
-This essay does not settle whether that arrangement is worth its complexity for
-anyone other than me. The mechanisms are built and tested. The live evidence is
-thin, and section 4 says exactly how thin. Closing that gap means running real
-work through the system on other people's repositories and recording what
-happened. That is the next piece of work, and writing more of this will not do
-it.
+Every command that changes a Job's lifecycle should use the same rules. This
+includes commands that start work and commands that publish or undo it. A legacy
+path that can publish without the current checks weakens the whole design. The
+controller should refuse that path or bring it under the same contract.
 
----
+### Measure the judge
+
+A model judge adds a new source of error. Keep its full input and output. Also
+record these facts.
+
+- The route.
+- The model.
+- The version.
+
+Build a reviewed set of good and bad Jobs. Measure false acceptance and false
+rejection before using the judge's confidence as a product claim.
+
+These rules add cost. They make sense when a Job is long or costly. They also
+make sense when work is hard to undo or can affect other people. A short local
+edit may need only the agent's own tools and a person's review. Use the added
+controls only when the task's risk requires them.
+
+## Conclusion
+
+Coding agents have removed much of the effort of producing a candidate change.
+Their tool loops and saved sessions now cover work that required close
+supervision a short time ago. Sandboxes and other agents extend that work.
+
+The remaining burden is more exact than "everything else." The operator must
+approve a useful account of done. The system must preserve limits and history
+when processes fail. A checker outside the worker's control must test the exact
+result. A trusted step must decide whether to apply it.
+
+Current agent products contain parts of that process, and they keep adding more.
+The measured comparisons show that those parts can change outcomes without a
+model change. They do not show that one large harness suits every task.
+
+DeadReckon is an attempt to make the full Job process explicit across different
+agents. Its code now has the main control points, and its focused tests cover
+many hostile cases. Its own records also show what remains. The next proof must
+come from repeated live Jobs and measured judge errors. It must also include
+recovery after machine and process failures. Operators must show that the system
+reduced their work without accepting worse results.
+
+Until then, the right conclusion is modest. A capable coding agent can do the
+work. Predictable delegation also needs a system that records what work was
+approved. It must record what evidence passed. It must explain why the operator
+may trust this exact result.
 
 ## Sources
 
-**On what a harness is**
+### Agent products
 
-- Birgitta Böckeler, [Harness engineering for coding agent users](https://martinfowler.com/articles/harness-engineering.html), martinfowler.com, 2 April 2026.
-- Birgitta Böckeler, [Maintainability sensors for coding agents](https://martinfowler.com/articles/sensors-for-coding-agents.html), martinfowler.com, 27 May 2026.
-- Simon Willison, [How coding agents work](https://simonwillison.net/guides/agentic-engineering-patterns/how-coding-agents-work/), 16 March 2026.
-- Addy Osmani, [Agent Harness Engineering](https://addyosmani.com/blog/agent-harness-engineering/), 19 April 2026, republished by O'Reilly Radar 15 May 2026.
-- Mario Zechner, [Pi](https://github.com/earendil-works/pi). Quotes taken from the README of the source tree at version 0.83.0.
+- Simon Willison, [How coding agents
+  work](https://simonwillison.net/guides/agentic-engineering-patterns/how-coding-agents-work/),
+  16 March 2026.
+- Anthropic, [Sandboxing in Claude
+  Code](https://code.claude.com/docs/en/sandboxing), accessed 5 August 2026.
+- Anthropic, [Keep Claude working toward a
+  goal](https://code.claude.com/docs/en/goal), [Run agents in
+  parallel](https://code.claude.com/docs/en/agents), and [Run parallel sessions
+  with worktrees](https://code.claude.com/docs/en/worktrees), accessed 5 August
+  2026.
+- OpenAI, [Agent approvals and
+  security](https://learn.chatgpt.com/docs/agent-approvals-security), accessed
+  5 August 2026.
+- OpenAI, [Long running
+  work](https://learn.chatgpt.com/docs/long-running-work), [Noninteractive
+  mode](https://learn.chatgpt.com/docs/non-interactive-mode), and
+  [Worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees),
+  accessed 5 August 2026.
+- Mario Zechner and contributors, [Pi coding agent
+  README](https://github.com/earendil-works/pi), accessed 5 August 2026.
 
-**On the harness deciding the outcome**
+### Measured and published evidence
 
-- Sherman Wong and others (Meta, Harvard), [Confucius Code Agent: Scalable Agent Scaffolding for Real-World Codebases](https://arxiv.org/html/2512.10398v6), 3 February 2026.
-- Elvis Saravia (@omarsar0), [post on X](https://x.com/omarsar0/status/2084714744880173451), 4 August 2026. Anecdote, no published method.
-- [The harness around the model decides more of your agent's behaviour than the model does](https://www.reddit.com/r/LLMObservability/comments/1vedbnq/the_harness_around_the_model_decides_more_of_your/), r/LLMObservability, 3 August 2026. Anecdote.
-- Hugo Bowne-Anderson, [Stop Overengineering Your Agent Harness](https://www.oreilly.com/radar/stop-overengineering-your-agent-harness/), O'Reilly Radar, 22 July 2026.
+- Anthropic, [2026 Agentic Coding Trends
+  Report](https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf),
+  2026.
+- Xingyu Li and others, [Your Agent May Not Need to Be So
+  Scaffolded](https://arxiv.org/html/2512.10398v6), revised 3 February 2026.
+- Minghao Yan and others, [When Tests Lie](https://arxiv.org/html/2606.26300v2),
+  revised 29 June 2026.
+- Naman Jain, [Reward hacking coding
+  benchmarks](https://cursor.com/blog/reward-hacking-coding-benchmarks), 25 June
+  2026.
+- Birgitta Böckeler, [Harness
+  engineering](https://martinfowler.com/articles/harness-engineering.html), 2
+  April 2026.
+- Birgitta Böckeler, [Sensors for coding
+  agents](https://martinfowler.com/articles/sensors-for-coding-agents.html), 1
+  July 2026.
+- Addy Osmani, [Agent harness
+  engineering](https://addyosmani.com/blog/agent-harness-engineering/), 19 April
+  2026.
+- Hugo Bowne Anderson, [Stop overengineering your agent
+  harness](https://www.oreilly.com/radar/stop-overengineering-your-agent-harness/),
+  3 June 2026.
+- Simon Willison, [First, run the
+  tests](https://simonwillison.net/guides/agentic-engineering-patterns/first-run-the-tests/)
+  and [Anti
+  patterns](https://simonwillison.net/guides/agentic-engineering-patterns/anti-patterns/),
+  2026.
 
-**On verification**
+### DeadReckon and research evidence
 
-- Qwen Team, [The Verification Horizon: No Silver Bullet for Coding Agent Rewards](https://arxiv.org/html/2606.26300v2), 29 June 2026.
-- Bingchen Zhao and others (Weco AI), [SpecBench: Measuring Reward Hacking in Long-Horizon Coding Agents](https://arxiv.org/html/2605.21384v1), 20 May 2026.
-- Naman Jain, [Reward hacking is swamping model intelligence gains](https://cursor.com/blog/reward-hacking-coding-benchmarks), Cursor, 25 June 2026.
-- Simon Willison, [First run the tests](https://simonwillison.net/guides/agentic-engineering-patterns/first-run-the-tests/), 24 February 2026.
-- Simon Willison, [Anti-patterns: things to avoid](https://simonwillison.net/guides/agentic-engineering-patterns/anti-patterns/), 4 March 2026.
-
-**On what operators do**
-
-- Anthropic, [2026 Agentic Coding Trends Report](https://resources.anthropic.com/hubfs/2026%20Agentic%20Coding%20Trends%20Report.pdf).
-- [25 Patterns in Agentic Engineering](https://specstory.com/books/25-patterns-in-agentic-engineering-book-2026.pdf), SpecStory Press, 2026. Drawn from 1,310 captured sessions and 4,670 commits between September 2025 and May 2026.
-- Paweł Józefiak, [Claude Code vs Codex CLI vs Aider vs OpenCode vs Pi vs Cursor](https://thoughts.jock.pl/p/ai-coding-harness-agents-2026), 15 April 2026.
-
-**In this repository**
-
-- [`README.md`](../README.md) and [`PRODUCT.md`](../PRODUCT.md)
-- [`docs/MAP-OF-DEADRECKON.md`](MAP-OF-DEADRECKON.md)
-- [`docs/HARNESS-ENGINEERING-COMPARISON.md`](HARNESS-ENGINEERING-COMPARISON.md)
-- [`docs/research/harness-essay/CITATIONS.md`](research/harness-essay/CITATIONS.md)
+- [Map of DeadReckon](MAP-OF-DEADRECKON.md), 2 August 2026.
+- [DeadReckon provider descriptions](../crates/deadreckon-providers/descriptors/)
+  and [test streams](../crates/deadreckon-providers/tests/fixtures/), read at
+  commit `75a9a175`.
+- [Credential free adversarial
+  results](../examples/watchkeeper-dogfood/credential-free-results.json) and the
+  [live trial guide](../examples/watchkeeper-dogfood/README.md), read at commit
+  `75a9a175`.
+- [Research brief and source
+  audit](research/harness-essay/), 5 August 2026.

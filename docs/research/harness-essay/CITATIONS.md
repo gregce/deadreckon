@@ -1,4 +1,8 @@
-# Citations gathered for the harness essay
+# Citations gathered for the first harness essay draft
+
+> This file preserves the quotes checked for commit `75a9a175`. The revised
+> essay does not use every quote or claim below. See
+> [`SOURCE-AUDIT.md`](SOURCE-AUDIT.md) for the current claim decisions.
 
 Every quote below was fetched from the named URL during research on 2026-08-05.
 Quotes are verbatim. Where a claim came from a secondary source, that is marked.
