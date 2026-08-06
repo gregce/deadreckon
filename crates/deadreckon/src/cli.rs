@@ -1192,6 +1192,12 @@ pub(crate) enum Commands {
             help = "Schema-capable reviewer route for review work and final done judgment"
         )]
         reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model for the schema-capable reviewer route"
+        )]
+        reviewer_model: Option<String>,
         #[arg(long, help = "Initialize git in a plain directory before planning")]
         init_git: bool,
         #[arg(
@@ -1248,6 +1254,12 @@ pub(crate) enum Commands {
             help = "Schema-capable reviewer route override for final done judgment"
         )]
         reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model override for the schema-capable reviewer route"
+        )]
+        reviewer_model: Option<String>,
         #[arg(long, help = "Debug only: disable automatic dependency merge repair")]
         no_repair: bool,
         #[arg(long, help = "Repair provider route for dependency merge repair")]
@@ -1368,6 +1380,17 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override")]
         model: Option<String>,
+        #[arg(
+            long,
+            help = "Schema-capable reviewer route for each step and final chain judgment"
+        )]
+        reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model override for the schema-capable chain reviewer"
+        )]
+        reviewer_model: Option<String>,
         #[arg(long, default_value = "auto", help = "Sandbox backend")]
         sandbox: String,
         #[arg(
@@ -1746,6 +1769,17 @@ pub(crate) enum Commands {
         provider: Option<String>,
         #[arg(long, help = "Model override for this extended run")]
         model: Option<String>,
+        #[arg(
+            long,
+            help = "Schema-capable provider route for the follow-up's final semantic judgment"
+        )]
+        reviewer_provider: Option<String>,
+        #[arg(
+            long,
+            requires = "reviewer_provider",
+            help = "Model override for the follow-up's semantic reviewer"
+        )]
+        reviewer_model: Option<String>,
         #[arg(long, help = "Sandbox backend override")]
         sandbox: Option<String>,
         #[arg(long, help = "Skip generated run documentation")]
@@ -2318,10 +2352,21 @@ pub(crate) struct OrchestrateFullPlanArgs {
     pub(crate) planner_provider: Option<String>,
     #[arg(long, help = "Default child provider route for full-plan work")]
     pub(crate) provider: Option<String>,
+    #[arg(
+        long,
+        help = "Schema-capable reviewer route for child and final graph judgments"
+    )]
+    pub(crate) reviewer_provider: Option<String>,
     #[arg(long, help = "Planner model for full-plan decomposition")]
     pub(crate) planner_model: Option<String>,
     #[arg(long, help = "Default child model for full-plan work")]
     pub(crate) model: Option<String>,
+    #[arg(
+        long,
+        requires = "reviewer_provider",
+        help = "Model for the schema-capable reviewer route"
+    )]
+    pub(crate) reviewer_model: Option<String>,
     #[arg(
         long,
         value_name = "IDX=MODEL",
@@ -2964,6 +3009,7 @@ pub(crate) struct ForkCommandArgs {
     pub(crate) child_provider: Vec<String>,
     pub(crate) coder_provider: Option<String>,
     pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) no_repair: bool,
     pub(crate) repair_provider: Option<String>,
     pub(crate) yes: bool,
@@ -3009,6 +3055,8 @@ pub(crate) struct ChainCommandArgs {
     pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) sandbox: String,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) base: Option<String>,
@@ -3045,6 +3093,8 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) deadline: Option<DateTime<Utc>>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) reviewer_provider: Option<String>,
+    pub(crate) reviewer_model: Option<String>,
     pub(crate) sandbox: Option<String>,
     pub(crate) no_docs: bool,
     pub(crate) doc_skill: Option<String>,

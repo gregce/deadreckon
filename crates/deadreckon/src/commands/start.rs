@@ -4303,8 +4303,6 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
         replay_args.child_model.clear();
         replay_args.coder_provider = None;
         replay_args.coder_model = None;
-        replay_args.reviewer_provider = None;
-        replay_args.reviewer_model = None;
     }
     // Replays never prompt for setup; the plan is the decision. The accept
     // matrix still applies at dispatch (campaign guardrails included).
@@ -4780,6 +4778,8 @@ fn guided_extension_args(
             .clone()
             .or_else(|| args.provider.clone()),
         model: decision.model.clone().or_else(|| args.model.clone()),
+        reviewer_provider: decision.reviewer_provider_route.clone(),
+        reviewer_model: decision.reviewer_model.clone(),
         sandbox: None,
         no_docs: false,
         doc_skill: None,
@@ -5573,6 +5573,8 @@ mod start_footer_tests {
         decision.selected_mode = StartSelectedMode::Extend;
         decision.base_run_id = Some("1234567890abcdef".to_string());
         decision.provider_route = Some("cli:codex".to_string());
+        decision.reviewer_provider_route = Some("cli:claude-code".to_string());
+        decision.reviewer_model = Some("claude-review".to_string());
         let mut args = start_args();
         args.goal = decision.goal.clone();
         let deadline = chrono::Utc::now() + chrono::TimeDelta::hours(2);
@@ -5582,6 +5584,11 @@ mod start_footer_tests {
         assert_eq!(extension.parent_run_id, "1234567890abcdef");
         assert_eq!(extension.new_goal, "add a durable follow-up");
         assert_eq!(extension.provider.as_deref(), Some("cli:codex"));
+        assert_eq!(
+            extension.reviewer_provider.as_deref(),
+            Some("cli:claude-code")
+        );
+        assert_eq!(extension.reviewer_model.as_deref(), Some("claude-review"));
         assert_eq!(extension.max_spend, Some(3.0));
         assert_eq!(extension.deadline, Some(deadline));
         assert!(extension.yes);
