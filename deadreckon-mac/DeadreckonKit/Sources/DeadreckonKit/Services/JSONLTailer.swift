@@ -58,6 +58,12 @@ public final class JSONLTailer {
     private var retained = Data()
     private var corruptReason: String?
 
+    /// True while the last poll left an unterminated final line retained
+    /// (TAILING.md torn append: an in-flight append or crash residue being
+    /// retried, never parsed and never corruption). Surfaces as the drawer's
+    /// torn-tail badge.
+    public var hasRetainedTail: Bool { !retained.isEmpty }
+
     public init(url: URL, mode: Mode) {
         self.url = url
         self.mode = mode

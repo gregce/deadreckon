@@ -64,6 +64,8 @@ public enum ProofStatus: String, ForgivingStringEnum, CaseIterable
 
 public enum SteerIneligibleReason: String, ForgivingStringEnum, CaseIterable
 // driver_fenced, not_executing, provider_not_steerable, unknown
+// (provider_not_steerable is historical: since the M1 steer widening the
+// binary never emits it — any provider is steerable while Executing)
 
 public enum JobEventKind: String, ForgivingStringEnum, CaseIterable
 // the 31 job-event.schema.json kinds plus unknown
@@ -602,7 +604,200 @@ Behavioral invariants (each has a test in JSONLTailerTests):
 - **Polling is the mechanism.** FSEvents is a wake-up hint only; the read path runs as written regardless.
 - Not thread-safe; exactly one owner polls a given tailer.
 
-Fleet cadence (exemplar WatchSupervisor precedent): the queue home polls `list --all --json` at ~2 s while the window is visible and ~10 s menubar-only (FleetStore.Cadence, injectable). The bounded per-job tail fleet (max ~8 active tails, LRU eviction, focused job at heartbeat cadence) is APP-3 scope: the Gate Queue needs no tailing, only the rollup.
+Fleet cadence (exemplar WatchSupervisor precedent): the queue home polls `list --all --json` at ~2 s while the window is visible and ~10 s menubar-only (FleetStore.Cadence, injectable). The bounded-tails contract, as built in APP-3, is stricter than the design's ~8-tail LRU sketch: ONLY the selected job's `JobDetailStore` holds active tails (nine: six run ledgers + job-events + supervisor.out/err), created on workbench open and dropped on close/selection change. The Gate Queue itself needs no tailing, only the rollup.
+
+### Text tailer (Services/TextFileTailer.swift)
+
+```swift
+/// Plain-text tail for supervisor.out/err (P5 drawer terminals). NOT a
+/// blessed JSONL ledger: no schema, no append-only promise, no corruption
+/// verdicts. A shrink resets honestly to a full fresh read.
+public final class TextFileTailer {
+    public enum PollResult: Equatable, Sendable {
+        case none                 // nothing new (incl. file absent)
+        case appended(String)     // newly appended bytes, may end mid-line
+        case reset(String)        // file shrank: payload is the fresh read
+    }
+    public init(url: URL)
+    public var offset: UInt64 { get }
+    public func poll() -> PollResult
+}
+```
+
+JSONLTailer addition (APP-3): `public var hasRetainedTail: Bool` — true while an unterminated final line is retained (TAILING.md torn append, being retried, never corruption). Feeds the drawer's torn-tail badge.
+
+## APP-3 Chartroom read-models (Models/DetailModels.swift)
+
+Decode-only display shapes; each names its Rust source of truth. All ride `DeadreckonJSON.decoder()`; unknown keys are ignored; absent optionals stay nil, never guessed.
+
+```swift
+public struct RunStateDoc          // state.json (PipelineState subset): status word
+                                   // (kebab-case RunStatus), turn, phases[] (Timeline),
+                                   // spend/wall totals + caps, pause/failure reasons,
+                                   // workingDir; activePhaseName computed.
+                                   // total_wall_seconds serde(default) -> 0 on legacy.
+public struct JobProjectionDoc     // jobs/<id>/projection.json: phase/outcome/stopReason,
+                                   // lastSequence, currentLeaseEpoch, attemptCount,
+                                   // childRunIDs (LAST = current attempt's run root),
+                                   // lastGateAttempt?, caveats.
+public struct JobStatusEnvelope    // status <job> --json subset: status word,
+                                   // nextActions (next_actions, absent decodes []),
+                                   // verifiedProof{status: ProofStatus, error},
+                                   // workClock?, job.job.policy.execution.gate.network,
+                                   // job.attempts[].{id{scope,runID}, status, steerable}.
+                                   // currentSteerable == LAST attempt's steerable{} (G6);
+                                   // there is NO top-level steerable on job envelopes.
+                                   // nextActions feeds the spine's job-altitude NEXT
+                                   // (spine simplification 6).
+public struct JobReportEnvelope    // report <job> --json subset (JobReport): the frozen
+                                   // AcceptanceSpec as ContractCheck rows (no YAML parsing
+                                   // app-side), approved/current sha + matchesApprovedDigest,
+                                   // semantic.judgment (decision word + verbatim summary),
+                                   // deterministicChecks, receipt{status, contained,
+                                   // sandboxBackend, signatureValidationError}, attempts[].
+public struct VerdictEnvelope      // verdict <id> --receipt --json subset: status word
+                                   // (verified|regressed|unverified, rendered verbatim),
+                                   // hadSignedMarker/markerValid, checks[], and
+                                   // receiptAudit.facts[{name, pass, detail}] (G7).
+                                   // MODELED BUT NOT WIRED: the committed binary's
+                                   // verdict refuses JOB refs, so JobDetailStore never
+                                   // invokes it (see the store's verdict invariant and
+                                   // registered Rust-side gap); decode stays tested so
+                                   // the rail can light up the day the verb widens.
+public struct DiffSummaryModel     // show <run> --diff --json (DiffSummary) + patches[]?
+public struct PatchModel           // PatchEntry: unified, truncated (binary's honesty flag), note
+public struct NarrativeStateDoc    // narrative/state.json subset
+public struct NarrativeSnapshotDoc // one snapshots.jsonl beat; isUnverifiedOverlay ==
+                                   // (status != "deterministic"): fails TOWARD the label
+public enum NarrativeStaleness     // fresh/stale/unknown; staleAfterSeconds = 90 (2x the
+                                   // narrator's 45 s cadence window)
+public struct RunEventRecord       // one events.jsonl line; unknown kinds keep raw kind;
+                                   // activityLine renders the ledger's own words
+public struct TraceRow             // one traces.jsonl line (detail deliberately not decoded)
+public struct FlightManifestDoc    // flight-manifest.json subset (sessions)
+public struct CheckpointManifestDoc // checkpoints/<id>/manifest.json subset; fileCount only
+public struct DocEntry             // one file under <working_dir>/.deadreckon/docs
+```
+
+Invariants:
+- `JobStatusEnvelope.currentSteerable` is display eligibility only; a verb refusal after `steerable: true` stays authoritative (trust rule 4).
+- `VerdictEnvelope.status` renders verbatim; it never produces the VERIFIED chip — that stays with the shared proof classifier (trust rule 6).
+- `NarrativeSnapshotDoc.isUnverifiedOverlay` treats every non-"deterministic" status as overlay: unknown vocabulary can only add the unverified label, never remove it.
+
+## APP-3 spine derivation (Models/SpineDerivation.swift)
+
+```swift
+public struct RunSpineInputs       // everything spine_for_run_with_events reads, as values
+public struct SpineSnapshot {      // alive/doing/onTrack/wrong/next + band text helpers
+    public enum Aliveness { case live(lastEventAgeSeconds: Int), stale(ageSeconds: Int),
+                                 dead(reason: String), done }
+    public enum AttentionKind { case pausedAtCap, failure, killed, providerError,
+                                     stall, reshapeProposed, steerPending }
+}
+public enum SpineDerivation {
+    public static let staleAfterSeconds = 30      // SPINE_STALE_AFTER_SECONDS
+    public static func deriveRun(_ inputs: RunSpineInputs, now: Date) -> SpineSnapshot
+}
+```
+
+Mirrors `crates/deadreckon/src/tui/spine.rs` run-surface semantics (aliveness from newest event age falling back to `state.updated_at`; doing = `run_status_label - turn N - active phase`; on-track ceiling = launch-plan budget before `state.max_*`; attention order pause/failure/killed/provider-error/stall then reshape then pending steers; next = attach/resume/finish, reshape wins). Band text (`aliveText`/`onTrackText`/`wrongText`) matches `spine_plain_lines` wording exactly — plain hyphens, `on_track_text`'s `{gate} - {spend} - {turns}` shape with the gate cell built from the same match so a future job-level count slots in — and the exact strings are pinned in SpineDerivationTests. Documented simplifications vs spine.rs:
+1. **Run surface only.** Plan/chain/campaign spines are not ported: the Chartroom observes a durable Job's current attempt, which is always a Run (plan/chain rows open in `attach` per the v1 scope decision).
+2. **Reshape detection** is presence-plus-parses-as-JSON-object; spine.rs additionally validates the file as a launch plan.
+3. **Pending steers** count `steer-inbox.jsonl` rows with `status == "pending"` via a lenient line scan (malformed lines skipped), equivalent to `pending_steers` on well-formed files.
+4. **Gate counts stay `-`** in the on-track cell (run spine parity: spine.rs leaves gate None for runs too; job-level counts render from the signed marker's rollup elsewhere).
+5. An unrecognized status word derives an honest stale/attach spine and renders the raw word, never a guessed live state.
+6. **Job-altitude NEXT override (deliberate deviation, applied by JobDetailStore, not the pure derivation).** Every Chartroom attempt is a job-owned run, and the run-surface fallback's `deadreckon resume <run>` is refused by the ownership fence for exactly those runs (design 1.2 retires public resume for Jobs). Unless a reshape proposal exists (reshape still wins, the spine.rs invariant), the store replaces NEXT with the job status envelope's own `next_actions[0]` (the friendliness contract, `SpineSnapshot.replacingNext`); when the envelope is unavailable and the run is failed/killed, NEXT becomes `deadreckon status <job>` — observe, never suggest a fenced verb. The pure `SpineDerivation.deriveRun` stays exact run-surface parity (resume and all), tested separately.
+
+## APP-3 turns + integrity (Models/TurnsDerivation.swift)
+
+```swift
+public struct TurnModel            // turn, startedAt, token/cost accumulators, entries[]
+public enum TurnsDerivation {
+    /// Persistent incremental grouping: fold newly polled rows as they
+    /// arrive; per-fold cost is proportional to the NEW rows (entries
+    /// re-sort only inside touched turns). Sendable, so a large first fold
+    /// can run off the main actor.
+    public struct Accumulator {
+        public init()
+        public mutating func fold(events: [RunEventRecord], traces: [TraceRow]) -> [TurnModel]
+    }
+    /// One-shot grouping (identical semantics to a single fold): groups
+    /// events.jsonl + traces.jsonl by turn; entries interleave by timestamp
+    /// (ledger-order stable on ties). token_usage_delta/spend_delta
+    /// accumulate as counters; unknown kinds land as raw-kind entries;
+    /// events without a turn number stay in the Activity feed only.
+    public static func group(events: [RunEventRecord], traces: [TraceRow]) -> [TurnModel]
+}
+public enum JobEventsIntegrity {   // .none | .contiguous(count) | .corrupt(String)
+    /// Folds a jobEvents-mode poll into the drawer chip. Corruption is
+    /// sticky, mirroring the tailer. label: "events 1..N contiguous" or the
+    /// tailer's failure words verbatim.
+    public static func derive(previous: JobEventsIntegrity,
+                              poll: JSONLTailer.PollResult,
+                              lastSequence: UInt64) -> JobEventsIntegrity
+}
+```
+
+## APP-3 JobDetailStore (Services/JobDetailStore.swift)
+
+```swift
+@MainActor
+public final class JobDetailStore: ObservableObject {
+    public struct Cadence { poll: TimeInterval = 2; reportEveryTicks: Int = 5 }
+    public struct ActivityEntry { ordinal, timestamp?, line }
+    public struct SpendMeter { loopTotalUSD, narratorTotalUSD, capUSD?, lastLoopTurn, recordCount }
+    public struct FlightState { manifest?, eventCount, lastEventSummary?, checkpoints }
+    public struct NarrativePane { stateDoc?, latestSnapshot?, latestDeterministic?,
+                                  staleness, skippedMalformedRows }
+
+    // Documented ceilings (see the bounded-copies invariant below):
+    public static let rawEventLineCeiling: Int            // 2000 trailing raw drawer lines
+    public static let supervisorTextCeiling: Int          // ~256 KB per supervisor pane
+
+    // Published: status/statusIssue, report/reportIssue, projection/projectionIssue,
+    // lease, runState, spine, activity, rawEventLines/rawEventsDropped,
+    // activityIssue, tracesIssue, spendIssue, flightIssue, turns, spendMeter,
+    // flight, narrative, liveChecks, docs, integrity, jobEventsTornTail,
+    // supervisorOut/Err (+ supervisorOutTruncated/ErrTruncated),
+    // changes/changesIssue, patches/patchIssues, currentRunID, isOpen.
+
+    public var nowProvider: () -> Date                    // injectable clock
+    public var activeTailCount: Int                       // test observability
+    public init(jobID: String, scope: String, goal: String,
+                cli: FleetCLIRunning, home: URL = DeadreckonHome.url(),
+                cadence: Cadence = .standard)
+    public func open()                                    // idempotent; starts the loop
+    public func close()                                   // tears every tail down; reopen-safe
+    public func pollOnce() async                          // one deterministic tick (tests)
+    public func refreshChanges() async                    // show <run> --diff --json, on demand
+    public func loadPatch(path: String) async             // + --patch --file <path>
+}
+```
+
+Invariants (each tested in JobDetailStoreTests):
+- **Per-selected-job lifecycle:** created on workbench open, torn down on close. `close()` drops every tailer (`activeTailCount == 0`), SIGTERMs in-flight CLI children of this store, and fences the loop: no CLI child launches after close. Only the SELECTED job holds active tails (bounded-tails contract).
+- **Reopen-safe teardown:** `close()` also resets run resolution (`currentRunID = nil`), the supervisor text, and the integrity chip, so `open()` on the SAME store resumes cleanly: run tailers rebuild from offset 0 and the re-read supervisor text lands in cleared strings instead of duplicating. Tested open -> close -> open. The window-close path reaches this (see the views section).
+- **Run resolution:** the current attempt is `projection.json.child_run_ids.last`; its run root is `home/runstate/<scope>/runs/<id>`. A new attempt rebuilds the run tailers and resets scrollback/meters (ledgers are per run); no cross-attempt mixing.
+- **Projection reads never fabricate absence:** projection.json distinguishes file-absent (honest nil) from exists-but-unreadable (mid-write/corruption). On a transient failure the last good checkpoint is KEPT, `projectionIssue` carries the reason (rendered in the drawer's Job events pane), and the run tailers do not churn. Only a successfully decoded projection can re-point the current attempt.
+- **Composition:** CLI reads ride the FleetCLIRunning seam only (`status`, `report`, `show --diff [--patch --file]` on demand); ledgers ride JSONLTailer; supervisor.out/err ride TextFileTailer; projection/lease/state/narrative-state/flight-manifest/checkpoints/docs are plain JSON/file reads. Nothing writes under DEADRECKON_HOME; no path touches gate-keys/ (reads are rooted at `jobs/<id>/`, `runstate/<scope>/runs/<id>/`, and `<working_dir>/.deadreckon/docs` by construction, trust rule 3).
+- **`verdict` is deliberately NOT invoked** (tested: zero verdict children for terminal jobs). The committed binary's `verdict` accepts RUN_LIKE references only (reference.rs VERB_REF_SPECS), a Single-shape job's id resolves to the Job kind (the identical-id run match is deduped away), and public verdict on the job-owned child run is refused by the driver fence — so the call can only produce a typed refusal. The evidence rail's receipt band derives from `report --json` (receipt block + recorded deterministic_checks) and says so. **Rust-side gap, needs registering:** teach `verdict` to accept JOB refs (map to the current attempt; `--receipt` audit is read-only, so either skip the driver fence for inspection or make the sidecar write best-effort). The G7 per-digest audit facts and the fresh checks re-run land in the rail with it (VerdictEnvelope stays modeled and tested for that day).
+- **Single-shape `show --diff` aliasing is named, not a generic error** (tested). For a Single-shape job the attempt's run id IS the job id (supervisor.rs stamps run_id = job_id), the resolver hands `show` the Job, and the Job branch returns job status ignoring `--diff`/`--patch` (main.rs show_command). When the diff decode fails and the payload is a job_status envelope, changesIssue/patchIssues explain the aliasing explicitly. **Rust-side gap, needs registering:** `show --diff` handed a Job ref should delegate to the current attempt's run DiffSummary (same shape).
+- **Tail conformance is stated precisely:** eight of the nine tails are TAILING.md-blessed files read with the blessed algorithm (events/traces/spend/flight-events/acceptance-progress/job-events via JSONLTailer, supervisor.out/err via TextFileTailer's documented plain-text semantics). `narrative/snapshots.jsonl` is NOT blessed by docs/TAILING.md ("files not listed here carry no tailing guarantees"), so it deliberately rides the restart-on-anomaly mode: a rewrite/shrink re-folds the fresh content (tested) instead of freezing the operator's primary pane on a sticky corruption verdict the file's contract never earned. **Rust-side gap, needs registering:** bless narrative/snapshots.jsonl (append-only already holds in narrative.rs) in docs/TAILING.md with a conformance-test row; this tail then upgrades to `.standard` in the same change.
+- **Every strict tail surfaces its own corruption** (tested): events -> activityIssue, traces -> tracesIssue, spend -> spendIssue, flight-events -> flightIssue, job-events -> the integrity chip. A `.corrupt` verdict freezes trust in that file but keeps the already-read data visible with the reason rendered in the owning pane; nothing freezes silently.
+- **Acceptance-progress restart rule:** `.restarted` replaces the live band wholesale; rows never mix across gate attempts. Live rows are display only, never evidence (TAILING.md), and the empty state names the strict-gate stream-nothing behavior.
+- **Integrity chip:** derived exclusively from the jobEvents tailer's verification (contiguous claim, sticky corruption verbatim, torn-tail badge from `hasRetainedTail`).
+- **Spend meter:** loop head = LAST `kind == "loop"` row's `total_cost_usd`; narrator split = app-side sum of narrator rows' per-row `cost_usd` (the narrator keeps no head in the shared ledger — documented derivation); the two are never summed together.
+- **Narrative:** the latest deterministic beat is retained separately from provider-refreshed beats, so the pane can always render the projection while the overlay carries the "overlay — unverified" label; malformed snapshot rows are counted, not guessed at.
+- **Typed degradation:** each CLI surface fails independently into its own `*Issue` string (the failing surface's words); file-backed panes stay live through CLI unavailability. Every CLI refresh captures the generation before its await and discards the result if the store was closed/reopened meanwhile, so a SIGTERMed child's exit words never land in a closed (or reopened) store.
+- **Per-tick cost is O(new rows), off-thread when large** (the beachball fix): turns grouping folds only newly polled rows into a persistent `TurnsDerivation.Accumulator` (entries re-sort only inside touched turns); the newest event timestamp and newest error message are running values, never rescans; `steer-inbox.jsonl` re-reads only when its size changed. A fold larger than ~1500 rows (first open of a long history) runs off the main actor with only the `@Published` assignment returning to it. Known residual: the initial backlog's per-line JSON decode still runs on the main actor; a one-time hitch on first open of a very large ledger, revisit if it bites.
+- **Bounded copies with honest ceilings** (tested): the parsed Activity scrollback stays unbounded (the searchable surface the pane promises), but the drawer's raw-line pane keeps only the trailing `rawEventLineCeiling` (2000) lines with `rawEventsDropped` counted and rendered ("N older raw lines dropped ... full ledger in events.jsonl"), and supervisorOut/Err are trimmed at line boundaries to ~`supervisorTextCeiling` (256 KB) each with a visible truncation note. Ledger history is never lost — the files on disk remain the source of truth.
+- **Spine NEXT rides the job altitude** (tested): see the spine derivation section, simplification 6.
+
+## APP-3 views (Sources, app target — views + shell only)
+
+`JobDetailView.swift` (Chartroom three-pane inside the existing window: live fleet sidebar from the SAME FleetStore, `JobWorkbenchView` keyed by `.id(jobID)` so selection change tears down the previous JobDetailStore via onDisappear; a `WindowVisibilityObserver` (NSViewRepresentable) additionally binds the store to the HOSTING WINDOW's lifecycle — the AppDelegate retains the window, so window close does not fire onDisappear; willClose drives `close()` (no tails or CLI cadence survive a closed window) and didBecomeKey drives the idempotent `open()`, which the store's reopen-safe teardown makes correct; `DetailHeaderView` goal/phase/lease-with-WHY (reuses `LeaseDotView` + confirmed-stale verdicts; the rollup row + FleetStore debounce stay the lease FRESHNESS source, while the full lease.json checkpoint renders as evidence facts in the drawer's Job events pane)/spend-vs-cap (plus a visible "spend tail stopped" note on spendIssue)/wall; `SpineBandView`; `SteerBarView` — steer input + Kill are HONEST DISABLED placeholders naming APP-4 with the eligibility reason from `steerable{}`, and 'Open in Terminal' is live), `DetailCenterTabs.swift` (Narrative with deterministic projection + labeled overlay, Activity with search + unbounded scrollback — the filter computes once per body pass — Turns collapsible with a visible tracesIssue note, Timeline phases + event density), `EvidenceRail.swift` (Contract & Checks: frozen spec check-by-check + digest cross-check + network authority + live band + two keys ⚿/⚖ + a RECEIPT EVIDENCE band from `report --json`'s recorded deterministic checks, honestly labeled — no fresh verdict re-run exists for job-owned attempts in the committed binary, see the store's verdict invariant; Changes: diffstat + on-demand per-file patch with truncation honesty; Flight: checkpoint cards + flightIssue note, rewind-apply disabled naming APP-4; Docs: run docs listing or honest empty state), `DetailDrawer.swift` (P5 drawer: Terminal supervisor.out/err with truncation captions | Raw events bounded with a dropped-count note | Job events with integrity chip + torn-tail badge + projectionIssue + lease evidence), `TerminalLauncher.swift` (specstory-mac mechanism: AppleScript into iTerm2/Terminal.app via the apple-events entitlement, executed async on a dedicated serial queue so the Apple-event roundtrip and first-run TCC prompt never block the main thread; TCC denial degrades honestly to pasteboard + open-terminal with a visible note). The narrative overlay NEVER renders in the evidence rail or any promote-adjacent surface; no override affordance exists anywhere in these views.
+
+Accepted transient (documented, not a bug): on sidebar selection change, SwiftUI may fire the incoming workbench's onAppear before the outgoing one's onDisappear, so two JobDetailStores can hold tails for one runloop turn before the old store closes. The bounded-tails wording "only the selected job holds active tails" is therefore steady-state; the overlap is bounded to a single frame by the `.id(jobID)` teardown.
 
 ## Sources (app target)
 
@@ -626,7 +821,7 @@ The app target is views + shell only; anything testable lives in the Kit. Per-do
 }
 ```
 
-APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, `JobDetailStubView` APP-3 placeholder behind NavigationStack, `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Row actions are navigation only: no mutation verbs exist until APP-4's MutationRunner.
+APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, NavigationStack destination -> `JobDetailView` (the APP-3 Chartroom, replacing the APP-2 stub), `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Row actions are navigation only: no mutation verbs exist until APP-4's MutationRunner.
 
 Startup handshake (partial, APP-2): `deadreckon --version` + `doctor --json` land as Harbor facts (version chip, doctor ok/warn/failed chip from the report's own finding counts). The schema-version refusal (refuse to operate on a `DEADRECKON_HOME` written by a newer binary than the vendored one) still needs a committed binary surface that reports the home's schema version; it lands with that surface, and until then the doctor chip is the honest health signal. **Rust-side gap, needs registering:** no gap-register entry (G1-G10) covers a home-schema-version surface; it fits `doctor --json` (a finding whose detail carries the home's schema version). Register it Rust-side before RELEASE so the section 9 refusal has a landing slot; tracked here until then.
 

@@ -33,7 +33,7 @@ struct GateQueueView: View {
                 }
             }
             .navigationDestination(for: QueueItem.self) { item in
-                JobDetailStubView(item: item)
+                JobDetailView(fleet: store, item: item)
             }
         }
         .sheet(isPresented: $layCourseShown) {
@@ -613,82 +613,7 @@ struct HarborStripView: View {
     }
 }
 
-// MARK: - Placeholders (APP-3 / APP-4 arrive later)
-
-/// APP-3 placeholder: honest about what is not built yet, and offers the
-/// escape hatch (`deadreckon attach <id>`) so inspection is never blocked.
-struct JobDetailStubView: View {
-    let item: QueueItem
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text(goal)
-                .font(Theme.display(20))
-                .foregroundStyle(Theme.ink)
-            Text(id)
-                .font(Theme.mono(12))
-                .foregroundStyle(Theme.inkSecondary)
-                .textSelection(.enabled)
-
-            if let row = item.row {
-                HStack(spacing: 6) {
-                    StatusChip(text: GlossaryText.statusWord(row.status), color: Theme.inkSecondary)
-                    if let gate = row.gate {
-                        StatusChip(text: GlossaryText.gateCounts(gate), color: Theme.inkSecondary)
-                    }
-                    if row.receipt?.verified == .valid {
-                        StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
-                    }
-                    if row.receipt?.verified == .invalid {
-                        StatusChip(text: GlossaryText.proofWord(.invalid), color: Theme.danger, filled: true)
-                    }
-                }
-            } else if case .quarantined(let inner) = item.kind {
-                Text(inner.reason)
-                    .font(Theme.body(12))
-                    .foregroundStyle(Theme.warn)
-            }
-
-            Divider().overlay(Theme.hairline)
-
-            Text("The Chartroom workbench (narrative, spine, turns, evidence rail, drawer) arrives in APP-3.")
-                .font(Theme.body(12))
-                .foregroundStyle(Theme.inkSecondary)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Open in Terminal today:")
-                    .font(Theme.body(11))
-                    .foregroundStyle(Theme.inkTertiary)
-                Text("deadreckon attach \(id)")
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.ink)
-                    .textSelection(.enabled)
-            }
-            .padding(12)
-            .cardChrome()
-
-            Spacer()
-        }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Theme.paper)
-        .navigationTitle(goal)
-    }
-
-    private var goal: String {
-        switch item.kind {
-        case .job(let row): return row.goal
-        case .quarantined(let inner): return inner.goal ?? "unreadable row"
-        }
-    }
-
-    private var id: String {
-        switch item.kind {
-        case .job(let row): return row.jobID
-        case .quarantined(let inner): return inner.jobID ?? "unknown id"
-        }
-    }
-}
+// MARK: - Placeholders (APP-4 arrives later)
 
 /// APP-4 placeholder for Command-N: names what is coming and teaches the
 /// CLI path that works today.
