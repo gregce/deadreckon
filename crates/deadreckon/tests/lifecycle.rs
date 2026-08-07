@@ -2046,6 +2046,313 @@ fn done_check_and_show_are_user_facing() {
     assert!(stdout(&show).contains("done criteria"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_declare_json_yes_is_non_interactive_and_emits_def_done_result() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-json-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "done app").expect("readme");
+    let response = json!({
+        "acceptance_yaml": "name: done\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'done app'\"\n    cwd: \"{working_dir}\"\n",
+        "acceptance_md": "# Done Criteria\n\nREADME must contain the expected application marker.",
+        "files": []
+    })
+    .to_string();
+    let server = MockServer::start(vec![
+        FixtureResponse {
+            content: response,
+            prompt_tokens: 20,
+            completion_tokens: 20,
+        },
+        acceptance_critic_pass_response(),
+    ])
+    .await;
+    write_config(paths.home(), &server.base_url());
+
+    // A non-TTY machine caller declares from outside the project: --dir names
+    // the project, --yes approves the write, and stdout is one envelope.
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "README exists",
+            "--provider",
+            "mock",
+            "--yes",
+            "--json",
+            "--dir",
+            workspace.to_str().expect("utf8 workspace"),
+        ])
+        .output()
+        .expect("def-done json declare");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    let envelope: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("stdout must be exactly one JSON envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "def_done_result", "{envelope}");
+    assert_eq!(envelope["status"], "written", "{envelope}");
+    let contract_path = workspace.join(".deadreckon/acceptance.yaml");
+    assert!(contract_path.is_file());
+    assert_eq!(
+        envelope["contract_path"],
+        json!(contract_path),
+        "{envelope}"
+    );
+    // The check shape is the AcceptanceSpec serialization report --json uses.
+    assert_eq!(envelope["checks"][0]["kind"], "shell", "{envelope}");
+    assert_eq!(envelope["checks"][0]["must_pass"], true, "{envelope}");
+    assert_eq!(envelope["check_count"], 1, "{envelope}");
+    assert_eq!(envelope["capabilities"]["network"], "deny", "{envelope}");
+    assert!(
+        envelope["drafted_by"]
+            .as_str()
+            .is_some_and(|drafted_by| drafted_by.contains("mock")),
+        "{envelope}"
+    );
+    assert!(
+        envelope["next_actions"][0]
+            .as_str()
+            .is_some_and(|action| action.starts_with("deadreckon start")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn done_declare_json_without_yes_refuses_with_error_envelope() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-refusal-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+
+    let output = deadreckon(&paths)
+        .current_dir(&workspace)
+        .args(["def-done", "README exists", "--json"])
+        .output()
+        .expect("def-done json refusal");
+
+    assert!(!output.status.success());
+    let out = stdout(&output);
+    let envelope: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("refusal must be one JSON error envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "error", "{envelope}");
+    assert_eq!(envelope["verb"], "def-done", "{envelope}");
+    assert!(
+        envelope["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("--yes")),
+        "{envelope}"
+    );
+    assert!(
+        envelope["try_lines"][0]
+            .as_str()
+            .is_some_and(|line| line.contains("--yes --json")),
+        "{envelope}"
+    );
+    assert!(!workspace.join(".deadreckon").exists());
+}
+
+#[test]
+fn done_show_json_reads_back_the_contract_without_yaml_parsing() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-show-app");
+    fs::create_dir_all(workspace.join(".deadreckon")).expect("workspace");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.yaml"),
+        "name: show contract\ncapabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"curl -sf http://127.0.0.1:4173\"\n    cwd: \"{working_dir}\"\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+    )
+    .expect("yaml");
+    fs::write(
+        workspace.join(".deadreckon/acceptance.md"),
+        "# Done Criteria\n",
+    )
+    .expect("md");
+
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "show",
+            "--json",
+            "--dir",
+            workspace.to_str().expect("utf8 workspace"),
+        ])
+        .output()
+        .expect("def-done show json");
+
+    assert_success(&output);
+    let envelope: Value = serde_json::from_str(stdout(&output).trim()).expect("json");
+    assert_eq!(envelope["kind"], "def_done_result", "{envelope}");
+    assert_eq!(envelope["status"], "declared", "{envelope}");
+    assert_eq!(envelope["name"], "show contract", "{envelope}");
+    assert_eq!(envelope["check_count"], 2, "{envelope}");
+    assert_eq!(envelope["checks"][0]["kind"], "shell", "{envelope}");
+    assert_eq!(envelope["checks"][1]["kind"], "file_exists", "{envelope}");
+    assert_eq!(
+        envelope["checks"][1]["path"], "{working_dir}/README.md",
+        "{envelope}"
+    );
+    assert_eq!(
+        envelope["capabilities"]["network"], "loopback",
+        "{envelope}"
+    );
+    assert!(
+        envelope["notes_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("acceptance.md")),
+        "{envelope}"
+    );
+
+    // An undeclared project is a normal read-back, not a refusal: the app
+    // sees default_gate and offers the declare action.
+    let empty = temp.path().join("done-show-empty");
+    fs::create_dir_all(&empty).expect("empty project");
+    let output = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "show",
+            "--json",
+            "--dir",
+            empty.to_str().expect("utf8 empty project"),
+        ])
+        .output()
+        .expect("def-done show json empty");
+    assert_success(&output);
+    let envelope: Value = serde_json::from_str(stdout(&output).trim()).expect("json");
+    assert_eq!(envelope["status"], "default_gate", "{envelope}");
+    assert_eq!(envelope["contract_path"], Value::Null, "{envelope}");
+    assert_eq!(envelope["checks"], json!([]), "{envelope}");
+}
+
+#[test]
+fn done_add_pack_and_check_json_share_the_envelope() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-add-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+
+    let add = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "add",
+            "basic",
+            "--yes",
+            "--json",
+            "--dir",
+            workspace.to_str().expect("utf8 workspace"),
+        ])
+        .output()
+        .expect("def-done add json");
+    assert_success(&add);
+    let envelope: Value = serde_json::from_str(stdout(&add).trim()).expect("json");
+    assert_eq!(envelope["kind"], "def_done_result", "{envelope}");
+    assert_eq!(envelope["status"], "written", "{envelope}");
+    assert_eq!(envelope["drafted_by"], "basic pack", "{envelope}");
+    assert_eq!(envelope["checks"][0]["kind"], "shell", "{envelope}");
+    assert!(workspace.join(".deadreckon/acceptance.yaml").is_file());
+
+    let check = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "check",
+            "--json",
+            "--dir",
+            workspace.to_str().expect("utf8 workspace"),
+        ])
+        .output()
+        .expect("def-done check json");
+    assert_success(&check);
+    let envelope: Value = serde_json::from_str(stdout(&check).trim()).expect("json");
+    assert_eq!(envelope["kind"], "def_done_result", "{envelope}");
+    assert_eq!(envelope["status"], "passed", "{envelope}");
+    assert_eq!(envelope["results"][0]["passed"], true, "{envelope}");
+    assert_eq!(envelope["results"][0]["must_pass"], true, "{envelope}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn done_declare_json_then_start_from_preview_is_launchable() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let workspace = temp.path().join("done-start-app");
+    fs::create_dir_all(&workspace).expect("workspace");
+    fs::write(workspace.join("README.md"), "done app").expect("readme");
+    let response = json!({
+        "acceptance_yaml": "name: done\nchecks:\n  - kind: shell\n    command: >-\n      python3 -c \"import pathlib; assert pathlib.Path('README.md').read_text() == 'done app'\"\n    cwd: \"{working_dir}\"\n",
+        "acceptance_md": "# Done Criteria\n\nREADME must contain the expected application marker.",
+        "files": []
+    })
+    .to_string();
+    let server = MockServer::start(vec![
+        FixtureResponse {
+            content: response,
+            prompt_tokens: 20,
+            completion_tokens: 20,
+        },
+        acceptance_critic_pass_response(),
+    ])
+    .await;
+    write_start_config(paths.home(), &server.base_url());
+
+    let declare = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "def-done",
+            "README stays correct",
+            "--provider",
+            "mock",
+            "--yes",
+            "--json",
+            "--dir",
+            workspace.to_str().expect("utf8 workspace"),
+        ])
+        .output()
+        .expect("def-done json declare");
+    assert_success(&declare);
+
+    // The Lay Course sheet's exact flow: preview `start --from <dir> --json`
+    // from OUTSIDE the project (the app's CLI children run from the
+    // operator's home, never from inside the repo). The contract root must
+    // follow --from, so the declared contract makes the preview launchable
+    // (will_start:false, no missing-contract refusal) with the resolved
+    // checks in the done_contract block.
+    let preview = deadreckon(&paths)
+        .current_dir(temp.path())
+        .args([
+            "start",
+            "keep the README correct",
+            "--mode",
+            "run",
+            "--from",
+            workspace.to_str().expect("utf8 workspace"),
+            "--json",
+        ])
+        .output()
+        .expect("start json preview");
+    assert_success(&preview);
+    let out = stdout(&preview);
+    let envelope: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("preview must be exactly one JSON envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "start", "{envelope}");
+    assert_eq!(envelope["will_start"], false, "{envelope}");
+    assert_eq!(envelope["verdict"]["kind"], "preview", "{envelope}");
+    // The typed signal the sheet keys on: the PROJECT's contract resolved,
+    // even though the caller's cwd holds no .deadreckon of its own.
+    assert_eq!(envelope["done_criteria_source"], "project", "{envelope}");
+    let checks = envelope["done_contract"]["checks"]
+        .as_array()
+        .expect("resolved done_contract checks");
+    assert!(!checks.is_empty(), "{envelope}");
+    assert_eq!(
+        envelope["done_contract"]["capabilities"]["network"], "deny",
+        "{envelope}"
+    );
+}
+
 #[test]
 fn done_is_not_kept_as_a_compatibility_alias() {
     let temp = repo_tempdir();
@@ -3393,6 +3700,29 @@ fn write_config(home: &std::path::Path, base_url: &str) {
         format!(
             r#"
 fallback = ["mock"]
+
+[providers.mock]
+kind = "open-ai-compatible"
+base_url = "{base_url}"
+model = "mock-agent"
+api_key = "test"
+input_cost_per_million = 1.0
+output_cost_per_million = 1.0
+"#
+        ),
+    )
+    .expect("config");
+}
+
+/// Config for the declare-then-preview flow: `start` rides the keyless smoke
+/// provider while `def-done --provider mock` drafts through the fixture server.
+fn write_start_config(home: &std::path::Path, base_url: &str) {
+    fs::create_dir_all(home).expect("home");
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"
+default_provider = "smoke"
 
 [providers.mock]
 kind = "open-ai-compatible"

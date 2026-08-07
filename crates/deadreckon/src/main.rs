@@ -1043,7 +1043,24 @@ async fn main_inner() -> Result<()> {
             force,
             spec,
             against,
-        } => commands::acceptance::done_command(args, provider, model, force, spec, against).await,
+            dir,
+            yes,
+            json,
+        } => {
+            machine_json::arm("def-done", json);
+            commands::acceptance::done_command(commands::acceptance::DoneCommandRequest {
+                args,
+                provider,
+                model,
+                force,
+                spec,
+                against,
+                dir,
+                yes,
+                json,
+            })
+            .await
+        }
         Commands::Try { plain, json } => {
             ui::set_plain_output(plain || json);
             try_command(plain, json).await

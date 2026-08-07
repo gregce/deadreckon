@@ -14,7 +14,10 @@ import Foundation
 /// --json` (execute, plus `--i-know-its-a-lot` ONLY when the typed-amount
 /// acknowledgment armed it). Refusal envelopes render verbatim in the
 /// sheet; the new job appears via the FleetStore FSEvents path, never
-/// optimistically.
+/// optimistically. The done-contract step rides the same dispatcher:
+/// a preview blocked for a missing contract offers `declareContract`
+/// (def-done --yes --json, the binary writes the project's
+/// .deadreckon/acceptance.yaml) and auto re-runs the preview on success.
 @MainActor
 public final class LayCourseController: ObservableObject {
     public enum PreviewState: Equatable {
@@ -38,9 +41,23 @@ public final class LayCourseController: ObservableObject {
         case failed(String)
     }
 
+    /// The done-contract step's state. Declaration, not silent mutation:
+    /// `.drafting` means the binary's own `def-done --yes --json` verb is
+    /// writing .deadreckon/acceptance.yaml in the project (drafting calls
+    /// the provider), and `.declared` carries the envelope whose rows the
+    /// sheet renders — the app never parses YAML.
+    public enum ContractState: Equatable {
+        case idle
+        case drafting
+        case declared(DefDoneResultEnvelope)
+        case refused(ErrorEnvelope)
+        case failed(String)
+    }
+
     @Published public var request = StartRequest(goal: "")
     @Published public private(set) var preview: PreviewState = .idle
     @Published public private(set) var execution: ExecuteState = .idle
+    @Published public private(set) var contract: ContractState = .idle
     @Published public var acknowledgement = SpendAcknowledgement(capUSD: nil)
 
     /// Test observability: where the execute leg wrote the plan payload.
@@ -64,12 +81,36 @@ public final class LayCourseController: ObservableObject {
             for: .startExecute(planFilePath: path, spendAcknowledged: acknowledgement.armsFlag))
     }
 
+    /// True when the loaded preview is blocked specifically because no done
+    /// contract exists (the typed `done_criteria_source == "missing"`
+    /// signal): the sheet swaps the bare try-line for the inline DONE
+    /// CONTRACT editor.
+    public var previewNeedsContract: Bool {
+        if case .blocked(let envelope) = preview { return envelope.missingDoneContract }
+        return false
+    }
+
+    public func contractCommandLine(criteria: String) -> String {
+        runner.literalCommandLine(for: declareVerb(criteria: criteria))
+    }
+
     public func runPreview() async {
+        // An operator-initiated preview resets the contract band: the
+        // request (project directory included) may have changed, and stale
+        // declared rows from another project would be a lie. The
+        // post-declare auto re-run preserves the freshly declared envelope.
+        await refreshPreview(preservingContract: false)
+    }
+
+    private func refreshPreview(preservingContract: Bool) async {
         // In-flight guard: a double-click enqueues two MainActor tasks
         // before the first suspends; the second must not dispatch again.
         if case .loading = preview { return }
         preview = .loading
         execution = .idle
+        if !preservingContract {
+            contract = .idle
+        }
         // The displayed execute line must never name a plan file from a
         // PREVIOUS preview; the placeholder returns until execute writes one.
         lastPlanFileURL = nil
@@ -90,6 +131,72 @@ public final class LayCourseController: ObservableObject {
         acknowledgement = SpendAcknowledgement(
             capUSD: envelope.planCeilingUSD ?? request.maxSpendUSD)
         preview = envelope.isLaunchable ? .ready(envelope) : .blocked(envelope)
+        // A project-resolved contract renders read-only with its declared
+        // file path: one chained read-only `def-done show --json` fills the
+        // rows. Skipped when richer facts are already held (a fresh
+        // declare's envelope names path, drafted_by, and targets itself).
+        if envelope.doneCriteriaSource == "project", case .idle = contract {
+            await loadDeclaredContract()
+        }
+    }
+
+    private func declareVerb(criteria: String) -> PlannedVerb {
+        .defDoneDeclare(
+            directory: request.projectDirectory, criteria: criteria,
+            provider: request.provider, model: request.model)
+    }
+
+    /// The done-contract declare leg: `def-done [--dir] --yes --json --
+    /// <criteria>` through the one verb dispatcher. The caller's explicit
+    /// click IS the approval `--yes` formalizes — this method must only be
+    /// reached from an operator action. On success the preview re-runs
+    /// automatically, so the sheet flows refusal -> declare -> launchable
+    /// without the operator re-clicking Preview.
+    public func declareContract(criteria: String) async {
+        // In-flight guard (the round-2 discipline): a double-click's second
+        // task must not draft twice — drafting calls the provider and the
+        // write overwrites the contract.
+        if case .drafting = contract { return }
+        let trimmed = criteria.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        contract = .drafting
+        let result = await runner.run(declareVerb(criteria: trimmed))
+        if let refusal = result.refusal {
+            contract = .refused(refusal)
+            return
+        }
+        guard let envelope = result.rawObjects
+            .compactMap({ DefDoneResultEnvelope(data: $0) }).last else {
+            contract = .failed(result.isEnvelopeFree
+                ? result.envelopeFreeWords
+                : "def-done --json did not return a decodable def_done_result envelope")
+            return
+        }
+        contract = .declared(envelope)
+        await refreshPreview(preservingContract: true)
+    }
+
+    /// Read back an already-declared contract (`def-done show --json`,
+    /// read-only). "declared" fills the read-only rows with the contract
+    /// path; "default_gate" leaves the state idle so the declare affordance
+    /// renders; a typed refusal (e.g. corrupt YAML) renders verbatim.
+    public func loadDeclaredContract() async {
+        if case .drafting = contract { return }
+        let result = await runner.run(.defDoneShow(directory: request.projectDirectory))
+        if let refusal = result.refusal {
+            contract = .refused(refusal)
+            return
+        }
+        guard let envelope = result.rawObjects
+            .compactMap({ DefDoneResultEnvelope(data: $0) }).last else {
+            contract = .failed(result.isEnvelopeFree
+                ? result.envelopeFreeWords
+                : "def-done show --json did not return a decodable def_done_result envelope")
+            return
+        }
+        if envelope.status == "declared" {
+            contract = .declared(envelope)
+        }
     }
 
     /// The execute leg. Guarded so the flag cannot be armed by anything but

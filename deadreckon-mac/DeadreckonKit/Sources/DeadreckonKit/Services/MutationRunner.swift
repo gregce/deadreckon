@@ -79,6 +79,20 @@ public enum PlannedVerb: Equatable, Sendable {
     /// here when the preview used one. `spendAcknowledged` may ONLY be fed
     /// from `SpendAcknowledgement.armsFlag` (the typed-amount match).
     case startExecute(planFilePath: String, spendAcknowledged: Bool, fromPath: String? = nil)
+    /// Declare the done contract from plain English: `def-done [--dir D]
+    /// [--provider P] [--model M] --yes --json -- <criteria>`. The binary
+    /// (never the app) writes .deadreckon/acceptance.yaml in the project;
+    /// `--yes` is the operator approval the interactive flow would have
+    /// collected, so this case may ONLY be dispatched from an explicit
+    /// operator action (the sheet's Draft-contract click IS the approval).
+    /// nil directory declares in the client's working directory, exactly as
+    /// the preview leg resolves its source (the binary's --dir default).
+    case defDoneDeclare(directory: String?, criteria: String,
+                        provider: String? = nil, model: String? = nil)
+    /// Read back the declared contract: `def-done show --json [--dir D]`.
+    /// Read-only (no --yes): a missing contract is a normal exit-0
+    /// "default_gate" envelope, never a refusal.
+    case defDoneShow(directory: String?)
 
     public var verbWord: String {
         switch self {
@@ -87,6 +101,7 @@ public enum PlannedVerb: Equatable, Sendable {
         case .finishDryRun, .finish: return "finish"
         case .extendJob: return "extend"
         case .startPreview, .startExecute: return "start"
+        case .defDoneDeclare, .defDoneShow: return "def-done"
         }
     }
 
@@ -144,6 +159,28 @@ public enum PlannedVerb: Equatable, Sendable {
             }
             argv.append("--json")
             return argv
+        case .defDoneDeclare(let directory, let criteria, let provider, let model):
+            var argv = ["def-done"]
+            if let directory {
+                argv.append(contentsOf: ["--dir", directory])
+            }
+            if let provider {
+                argv.append(contentsOf: ["--provider", provider])
+            }
+            if let model {
+                argv.append(contentsOf: ["--model", model])
+            }
+            // The criteria is operator-typed plain English: `--` first, so
+            // pasted text shaped like a flag reaches clap as literal text.
+            argv.append(contentsOf: ["--yes", "--json", "--", criteria])
+            return argv
+        case .defDoneShow(let directory):
+            // "show" is the app-authored subcommand word, not operator text.
+            var argv = ["def-done", "show", "--json"]
+            if let directory {
+                argv.append(contentsOf: ["--dir", directory])
+            }
+            return argv
         }
     }
 
@@ -153,7 +190,10 @@ public enum PlannedVerb: Equatable, Sendable {
         switch self {
         case .steer, .kill, .extendJob: return 60
         case .finishDryRun, .finish: return 600
-        case .startPreview, .startExecute: return 300
+        // Declare drafts through the configured provider inside the
+        // binary's own cumulative authoring budget.
+        case .startPreview, .startExecute, .defDoneDeclare: return 300
+        case .defDoneShow: return 60
         }
     }
 

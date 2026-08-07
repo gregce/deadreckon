@@ -4,6 +4,8 @@ deadreckon.xcodeproj/
 # Vendored CLI binaries (rebuilt from ../crates/deadreckon by
 # scripts/vendor-cli.sh; manifest.json stays tracked as the pin)
 Resources/bin/deadreckon_darwin_*
+Resources/bin/dr-gate
+Resources/libexec/deadreckon/dr-gate
 
 # SwiftPM
 DeadreckonKit/.build/

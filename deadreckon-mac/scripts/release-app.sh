@@ -25,6 +25,17 @@ VENDORED=(Resources/bin/deadreckon_darwin_*)
   echo "error: no vendored CLI under Resources/bin — run scripts/vendor-cli.sh first" >&2
   exit 1
 }
+# The execute leg needs the trusted release helper next to the CLI: without
+# a vendored dr-gate, `start --plan --yes` fails at job admission in the
+# shipped app. vendor-cli.sh places it (bin/dr-gate for arm64,
+# libexec/deadreckon/dr-gate for x86_64).
+GATES=()
+[ -e Resources/bin/dr-gate ] && GATES+=(Resources/bin/dr-gate)
+[ -e Resources/libexec/deadreckon/dr-gate ] && GATES+=(Resources/libexec/deadreckon/dr-gate)
+[ "${#GATES[@]}" -gt 0 ] || {
+  echo "error: no vendored dr-gate next to the CLI — rerun scripts/vendor-cli.sh" >&2
+  exit 1
+}
 
 echo "==> xcodegen + unsigned Release build"
 xcodegen generate
@@ -36,12 +47,14 @@ rm -rf "$DIST"
 mkdir -p "$DIST"
 ditto build/DerivedData/Build/Products/Release/deadreckon.app "$APP"
 
-echo "==> signing the app bundle (the vendored CLI was signed at vendor time;"
-echo "    re-signing it here would break the manifest's sha256 pin)"
-for bin in "$APP"/Contents/Resources/bin/deadreckon_darwin_*; do
+echo "==> signing the app bundle (the vendored CLI and dr-gate were signed at"
+echo "    vendor time; re-signing them here would break the manifest's pins)"
+for bin in "$APP"/Contents/Resources/bin/deadreckon_darwin_* \
+           "$APP"/Contents/Resources/bin/dr-gate \
+           "$APP"/Contents/Resources/libexec/deadreckon/dr-gate; do
   [ -e "$bin" ] || continue
   codesign --verify --strict "$bin" || {
-    echo "error: vendored CLI is not validly signed — rerun scripts/vendor-cli.sh" >&2
+    echo "error: vendored binary $bin is not validly signed — rerun scripts/vendor-cli.sh" >&2
     exit 1
   }
 done

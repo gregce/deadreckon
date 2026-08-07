@@ -995,7 +995,10 @@ pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()>
             provider,
             model,
             force,
-        } => acceptance_add_command(request, provider, model, force).await,
+        } => {
+            let cwd = std::env::current_dir()?;
+            acceptance_add_command(&cwd, request, provider, model, force).await
+        }
         AcceptanceCommand::Init { preset, force } => acceptance_init_command(preset, force),
         AcceptanceCommand::Draft {
             request,
@@ -1030,21 +1033,64 @@ pub(crate) async fn acceptance_command(command: AcceptanceCommand) -> Result<()>
             )
             .await
         }
-        AcceptanceCommand::Explain { spec } => acceptance_explain_command(spec),
-        AcceptanceCommand::Check { spec, against } => acceptance_check_command(spec, against),
+        AcceptanceCommand::Explain { spec } => {
+            let cwd = std::env::current_dir()?;
+            acceptance_explain_command(&cwd, spec)
+        }
+        AcceptanceCommand::Check { spec, against } => {
+            let cwd = std::env::current_dir()?;
+            acceptance_check_command(&cwd, spec, against)
+        }
     }
 }
 
-pub(crate) async fn done_command(
-    args: Vec<String>,
-    provider: Option<String>,
-    model: Option<String>,
-    force: bool,
-    spec: Option<PathBuf>,
-    against: Option<PathBuf>,
-) -> Result<()> {
+/// The full `def-done` invocation as parsed by clap. `dir` selects the
+/// project that owns `.deadreckon/` (default: the current directory), and
+/// `--json` + `--yes` together form the non-interactive machine surface the
+/// Mac app's Lay Course sheet drives.
+pub(crate) struct DoneCommandRequest {
+    pub(crate) args: Vec<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) force: bool,
+    pub(crate) spec: Option<PathBuf>,
+    pub(crate) against: Option<PathBuf>,
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) yes: bool,
+    pub(crate) json: bool,
+}
+
+pub(crate) async fn done_command(request: DoneCommandRequest) -> Result<()> {
+    let DoneCommandRequest {
+        args,
+        provider,
+        model,
+        force,
+        spec,
+        against,
+        dir,
+        yes,
+        json,
+    } = request;
+    let cwd = std::env::current_dir()?;
+    let project_dir = match dir {
+        Some(dir) => {
+            let dir = absolute_from(&cwd, &dir);
+            if !dir.is_dir() {
+                return Err(CliError::Core(deadreckon_core::user_error(
+                    &format!("project directory not found: {}", dir.display()),
+                    "deadreckon def-done --dir <existing-project-dir>",
+                )));
+            }
+            dir
+        }
+        None => cwd,
+    };
     let Some(first) = args.first().map(String::as_str) else {
-        return acceptance_explain_command(spec);
+        if json {
+            return done_show_json(&project_dir, spec.as_deref());
+        }
+        return acceptance_explain_command(&project_dir, spec);
     };
     match first {
         "add" => {
@@ -1055,10 +1101,30 @@ pub(crate) async fn done_command(
                     "deadreckon def-done add \"users can save drawings\"",
                 )));
             }
-            acceptance_add_command(request, provider, model, force).await
+            if json {
+                refuse_unapproved_machine_write(yes)?;
+                let drafted_by =
+                    acceptance_add_outcome(&project_dir, request, provider, model, force).await?;
+                return emit_def_done_contract_envelope(
+                    "written",
+                    Some(&project_acceptance_yaml(&project_dir)),
+                    Some(&drafted_by),
+                );
+            }
+            acceptance_add_command(&project_dir, request, provider, model, force).await
         }
-        "check" => acceptance_check_command(spec, against),
-        "show" | "explain" => acceptance_explain_command(spec),
+        "check" => {
+            if json {
+                return done_check_json(&project_dir, spec.as_deref(), against);
+            }
+            acceptance_check_command(&project_dir, spec, against)
+        }
+        "show" | "explain" => {
+            if json {
+                return done_show_json(&project_dir, spec.as_deref());
+            }
+            acceptance_explain_command(&project_dir, spec)
+        }
         "edit" | "refine" => {
             let request = args.iter().skip(1).cloned().collect::<Vec<_>>();
             if request.is_empty() {
@@ -1067,13 +1133,15 @@ pub(crate) async fn done_command(
                     "deadreckon def-done edit \"also require the gallery to persist\"",
                 )));
             }
-            acceptance_agent_command(
+            done_authoring_command(
+                &project_dir,
                 AcceptanceAgentMode::Refine,
                 request,
-                None,
                 provider,
                 model,
                 force,
+                json,
+                yes,
             )
             .await
         }
@@ -1082,17 +1150,163 @@ pub(crate) async fn done_command(
             Ok(())
         }
         _ => {
-            acceptance_agent_command(
+            done_authoring_command(
+                &project_dir,
                 AcceptanceAgentMode::Draft,
                 args,
-                None,
                 provider,
                 model,
                 true,
+                json,
+                yes,
             )
             .await
         }
     }
+}
+
+/// One declare/refine entry for both surfaces: the prose path keeps its exact
+/// historical output, while `--json` runs the same authoring flow quietly and
+/// emits the `def_done_result` envelope as the only stdout object.
+#[allow(clippy::too_many_arguments)]
+async fn done_authoring_command(
+    project_dir: &Path,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+    json: bool,
+    yes: bool,
+) -> Result<()> {
+    if json {
+        refuse_unapproved_machine_write(yes)?;
+        let outcome = acceptance_agent_outcome_with_review_policy(
+            AcceptanceAuthoringContext {
+                write_root: project_dir,
+                inspect_root: project_dir,
+                goal: None,
+            },
+            mode,
+            request,
+            provider,
+            model,
+            force,
+            false,
+            None,
+        )
+        .await?;
+        return emit_def_done_contract_envelope(
+            "written",
+            Some(&project_acceptance_yaml(project_dir)),
+            Some(&outcome.route_label),
+        );
+    }
+    acceptance_agent_command_in_dir(project_dir, mode, request, None, provider, model, force).await
+}
+
+/// `--json` writes durable state without a human at a terminal, so the
+/// approval the interactive flow would have collected must arrive as `--yes`.
+/// The refusal rides the armed G1 error envelope.
+fn refuse_unapproved_machine_write(yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+    Err(CliError::Core(deadreckon_core::user_error(
+        "def-done --json writes a done contract without prompts and needs --yes to approve it",
+        "deadreckon def-done \"what should count as done\" --yes --json",
+    )))
+}
+
+/// The `def_done_result` success envelope. The `checks` array is the RAW
+/// `AcceptanceSpec` serialization `report --json` already emits (the gate's
+/// compatibility parser produces the same tagged `AcceptanceCheck` values).
+/// Note this is NOT the shape of `start --json`'s `done_contract.checks`,
+/// which carries the COMPILED rows (index/summary/behavioral/…) with these
+/// raw values nested under `raw` — two envelopes, two check shapes.
+fn def_done_contract_envelope(
+    status: &str,
+    contract_path: Option<&Path>,
+    drafted_by: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut name = None;
+    let mut checks: Vec<deadreckon_core::AcceptanceCheck> = Vec::new();
+    let mut capabilities = deadreckon_core::gate::AcceptanceCapabilities::default();
+    let mut notes_path = None;
+    if let Some(path) = contract_path {
+        let raw = fs::read_to_string(path)?;
+        checks = deadreckon_core::gate::acceptance_checks_from_yaml(&raw)?;
+        capabilities = deadreckon_core::gate::acceptance_capabilities_from_yaml(&raw)?;
+        name = yaml_mapping_get(&acceptance_yaml_value(&raw)?, "name")
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_string);
+        notes_path = path
+            .parent()
+            .map(|parent| parent.join(PROJECT_ACCEPTANCE_MD))
+            .filter(|candidate| candidate.is_file());
+    }
+    Ok(json!({
+        "kind": "def_done_result",
+        "status": status,
+        "contract_path": contract_path,
+        "notes_path": notes_path,
+        "name": name,
+        "check_count": checks.len(),
+        "checks": checks,
+        "capabilities": capabilities,
+        "drafted_by": drafted_by,
+        "next_actions": [
+            "deadreckon start \"goal\"",
+            "deadreckon def-done check --json",
+        ],
+    }))
+}
+
+fn emit_def_done_contract_envelope(
+    status: &str,
+    contract_path: Option<&Path>,
+    drafted_by: Option<&str>,
+) -> Result<()> {
+    let envelope = def_done_contract_envelope(status, contract_path, drafted_by)?;
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
+/// `def-done show --json`: read back the current contract in the shared
+/// envelope so the app never parses YAML. A missing contract is a normal
+/// state (`status:"default_gate"`, exit 0), matching the prose surface.
+fn done_show_json(project_dir: &Path, spec: Option<&Path>) -> Result<()> {
+    let path = resolve_acceptance_path_for_command(project_dir, spec)?;
+    match path {
+        Some(path) => emit_def_done_contract_envelope("declared", Some(&path), None),
+        None => emit_def_done_contract_envelope("default_gate", None, None),
+    }
+}
+
+/// `def-done check --json`: dry-run the checks; a pass emits the shared
+/// envelope with per-check `results`, a required failure keeps the exact
+/// fail-closed surface (the armed G1 rule turns it into an error envelope).
+fn done_check_json(
+    project_dir: &Path,
+    spec: Option<&Path>,
+    against: Option<PathBuf>,
+) -> Result<()> {
+    let (working_dir, spec_path, results) = acceptance_check_results(project_dir, spec, against)?;
+    if let Some(failed) = results
+        .iter()
+        .find(|result| result.must_pass && !result.passed)
+    {
+        return Err(CliError::Surface {
+            code: 1,
+            surface: acceptance_check_failure_surface(&working_dir, spec_path.as_ref(), failed)
+                .render_plain(!completion_hints_enabled(false)),
+        });
+    }
+    let mut envelope = def_done_contract_envelope("passed", spec_path.as_deref(), None)?;
+    envelope["working_dir"] = json!(working_dir);
+    envelope["results"] = serde_json::to_value(&results)?;
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
 }
 
 fn print_done_help() {
@@ -1243,6 +1457,17 @@ pub(crate) async fn acceptance_agent_command_with_explicit_review_and_budget(
     .await
 }
 
+/// Everything a caller needs after a successful authoring pass, so surfaces
+/// (prose card vs `def_done_result` envelope) can render without re-running
+/// the flow.
+pub(crate) struct AcceptanceAuthoringOutcome {
+    pub(crate) compiled: CompiledContract,
+    pub(crate) route_label: String,
+    pub(crate) check_count: usize,
+    pub(crate) divergence: Option<ContractDivergence>,
+    pub(crate) stub_would_pass: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn acceptance_agent_command_with_review_policy(
     context: AcceptanceAuthoringContext<'_>,
@@ -1254,6 +1479,45 @@ async fn acceptance_agent_command_with_review_policy(
     explicit_human_review: bool,
     authoring_budget: Option<DoneAuthoringBudget>,
 ) -> Result<()> {
+    let write_root = context.write_root;
+    let outcome = acceptance_agent_outcome_with_review_policy(
+        context,
+        mode,
+        request,
+        provider,
+        model,
+        force,
+        explicit_human_review,
+        authoring_budget,
+    )
+    .await?;
+    print_acceptance_written(
+        write_root,
+        &format!("agent draft via {}", outcome.route_label),
+        outcome.check_count,
+    );
+    if outcome.stub_would_pass {
+        println!(
+            "{}",
+            ui_warn("done contract critic: a keyword-only stub might pass; review before launch")
+        );
+    }
+    println!("{}", ui_heading("compiled done contract"));
+    print_compiled_contract(&outcome.compiled, outcome.divergence.as_ref());
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acceptance_agent_outcome_with_review_policy(
+    context: AcceptanceAuthoringContext<'_>,
+    mode: AcceptanceAgentMode,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+    explicit_human_review: bool,
+    authoring_budget: Option<DoneAuthoringBudget>,
+) -> Result<AcceptanceAuthoringOutcome> {
     let yaml_path = project_acceptance_yaml(context.write_root);
     let md_path = project_acceptance_md(context.write_root);
     let existing_yaml = read_optional_text(&yaml_path)?;
@@ -1386,29 +1650,23 @@ async fn acceptance_agent_command_with_review_policy(
         }
         critic = Some(final_floor);
     }
-    acceptance_check_count(&draft.yaml)?;
+    let check_count = acceptance_check_count(&draft.yaml)?;
     validate_generated_acceptance_draft(&draft, context.inspect_root)?;
     write_project_acceptance(context.write_root, &draft, true, true)?;
     let route_label = route
         .map(|route| format!("{} / {}", route.name, route.model))
         .unwrap_or_else(|| "configured provider".to_string());
-    print_acceptance_written(
-        context.write_root,
-        &format!("agent draft via {route_label}"),
-        acceptance_check_count(&draft.yaml)?,
-    );
     let divergence = context.goal.map(|goal| reconcile(goal, &compiled));
-    if let Some(verdict) = critic.as_ref()
-        && verdict.stub_would_pass
-    {
-        println!(
-            "{}",
-            ui_warn("done contract critic: a keyword-only stub might pass; review before launch")
-        );
-    }
-    println!("{}", ui_heading("compiled done contract"));
-    print_compiled_contract(&compiled, divergence.as_ref());
-    Ok(())
+    let stub_would_pass = critic
+        .as_ref()
+        .is_some_and(|verdict| verdict.stub_would_pass);
+    Ok(AcceptanceAuthoringOutcome {
+        compiled,
+        route_label,
+        check_count,
+        divergence,
+        stub_would_pass,
+    })
 }
 
 fn select_done_authoring_provider(
@@ -1440,25 +1698,75 @@ pub(crate) fn done_authoring_route_label(
 }
 
 async fn acceptance_add_command(
+    cwd: &Path,
     request: Vec<String>,
     provider: Option<String>,
     model: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let cwd = std::env::current_dir()?;
     let joined = request.join(" ");
     if let Some(pack) = AcceptancePack::from_request(&joined) {
-        return acceptance_add_pack_command(&cwd, pack, force);
+        return acceptance_add_pack_command(cwd, pack, force);
     }
-    let mode = if project_acceptance_yaml(&cwd).exists() {
+    let mode = if project_acceptance_yaml(cwd).exists() {
         AcceptanceAgentMode::Refine
     } else {
         AcceptanceAgentMode::Draft
     };
-    acceptance_agent_command_in_dir(&cwd, mode, request, None, provider, model, force).await
+    acceptance_agent_command_in_dir(cwd, mode, request, None, provider, model, force).await
+}
+
+/// The quiet add flow for `--json`: same pack/agent split as the prose
+/// command, nothing printed, returning who drafted the change for the
+/// envelope's `drafted_by` field.
+async fn acceptance_add_outcome(
+    cwd: &Path,
+    request: Vec<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    force: bool,
+) -> Result<String> {
+    let joined = request.join(" ");
+    if let Some(pack) = AcceptancePack::from_request(&joined) {
+        acceptance_add_pack_outcome(cwd, pack, force)?;
+        return Ok(format!("{} pack", pack.name()));
+    }
+    let mode = if project_acceptance_yaml(cwd).exists() {
+        AcceptanceAgentMode::Refine
+    } else {
+        AcceptanceAgentMode::Draft
+    };
+    let outcome = acceptance_agent_outcome_with_review_policy(
+        AcceptanceAuthoringContext {
+            write_root: cwd,
+            inspect_root: cwd,
+            goal: None,
+        },
+        mode,
+        request,
+        provider,
+        model,
+        force,
+        false,
+        None,
+    )
+    .await?;
+    Ok(outcome.route_label)
 }
 
 fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) -> Result<()> {
+    let (compiled, check_count) = acceptance_add_pack_outcome(cwd, pack, force)?;
+    print_acceptance_written(cwd, &format!("{} pack", pack.name()), check_count);
+    println!("{}", ui_heading("compiled done contract"));
+    print_compiled_contract(&compiled, None);
+    Ok(())
+}
+
+fn acceptance_add_pack_outcome(
+    cwd: &Path,
+    pack: AcceptancePack,
+    force: bool,
+) -> Result<(CompiledContract, usize)> {
     let mut draft = if project_acceptance_yaml(cwd).exists() {
         let yaml = fs::read_to_string(project_acceptance_yaml(cwd))?;
         let markdown = read_optional_text(&project_acceptance_md(cwd))?
@@ -1485,19 +1793,13 @@ fn acceptance_add_pack_command(cwd: &Path, pack: AcceptancePack, force: bool) ->
     draft.markdown.push('\n');
     draft.files.extend(pack_draft.files);
     write_project_acceptance(cwd, &draft, force, true)?;
-    print_acceptance_written(
-        cwd,
-        &format!("{} pack", pack.name()),
-        acceptance_check_count(&draft.yaml)?,
-    );
+    let check_count = acceptance_check_count(&draft.yaml)?;
     let compiled = compile_contract_with_source(
         &draft.yaml,
         Some(&draft.markdown),
         project_acceptance_yaml(cwd),
     )?;
-    println!("{}", ui_heading("compiled done contract"));
-    print_compiled_contract(&compiled, None);
-    Ok(())
+    Ok((compiled, check_count))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1556,17 +1858,16 @@ impl AcceptancePack {
 
 // SAFETY: Acceptance paths are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
-fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let path = resolve_acceptance_path_for_command(&cwd, spec.as_deref())?;
+fn acceptance_explain_command(cwd: &Path, spec: Option<PathBuf>) -> Result<()> {
+    let path = resolve_acceptance_path_for_command(cwd, spec.as_deref())?;
     if let Some(path) = path {
         let raw = fs::read_to_string(&path)?;
         let count = acceptance_check_count(&raw)?;
         println!("{}", ui_heading("done criteria"));
         println!("  {}   {}", ui_muted("spec:"), path.display());
         println!("  {} {count}", ui_muted("checks:"));
-        if path == project_acceptance_yaml(&cwd)
-            && let Some(markdown) = read_optional_text(&project_acceptance_md(&cwd))?
+        if path == project_acceptance_yaml(cwd)
+            && let Some(markdown) = read_optional_text(&project_acceptance_md(cwd))?
         {
             println!();
             println!("{}", markdown.trim());
@@ -1591,10 +1892,58 @@ fn acceptance_explain_command(spec: Option<PathBuf>) -> Result<()> {
 
 // SAFETY: Acceptance check paths are owned clap values at the command boundary.
 #[allow(clippy::needless_pass_by_value)]
-fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let working_dir = against.unwrap_or(cwd.clone());
-    let spec_path = resolve_acceptance_path_for_command(&cwd, spec.as_deref())?;
+fn acceptance_check_command(
+    cwd: &Path,
+    spec: Option<PathBuf>,
+    against: Option<PathBuf>,
+) -> Result<()> {
+    let (working_dir, spec_path, results) =
+        acceptance_check_results(cwd, spec.as_deref(), against)?;
+    let failed_required = results
+        .iter()
+        .any(|result| result.must_pass && !result.passed);
+    if failed_required {
+        println!("{} {}", ui_muted("working"), working_dir.display());
+        if let Some(spec_path) = spec_path.as_ref() {
+            println!("{}    {}", ui_muted("spec"), spec_path.display());
+        } else {
+            println!("{}    default dr-gate behavior", ui_muted("spec"));
+        }
+        print_acceptance_results(&results);
+        if let Some(failed) = results
+            .iter()
+            .find(|result| result.must_pass && !result.passed)
+        {
+            return Err(CliError::Surface {
+                code: 1,
+                surface: acceptance_check_failure_surface(&working_dir, spec_path.as_ref(), failed)
+                    .render_plain(!completion_hints_enabled(false)),
+            });
+        }
+    } else {
+        print!(
+            "{}",
+            acceptance_check_success_surface(&working_dir, spec_path.as_ref(), &results)
+                .render_plain(!completion_hints_enabled(false))
+        );
+    }
+    Ok(())
+}
+
+/// The shared dry-run: resolve the spec, evaluate it against the working
+/// directory in a throwaway run root, and return the raw results for either
+/// surface to render.
+fn acceptance_check_results(
+    cwd: &Path,
+    spec: Option<&Path>,
+    against: Option<PathBuf>,
+) -> Result<(
+    PathBuf,
+    Option<PathBuf>,
+    Vec<deadreckon_core::AcceptanceCheckResult>,
+)> {
+    let working_dir = against.unwrap_or_else(|| cwd.to_path_buf());
+    let spec_path = resolve_acceptance_path_for_command(cwd, spec)?;
     let temp_root = std::env::temp_dir().join(format!(
         "deadreckon-acceptance-check-{}",
         Uuid::new_v4().simple()
@@ -1608,41 +1957,7 @@ fn acceptance_check_command(spec: Option<PathBuf>, against: Option<PathBuf>) -> 
     let result = evaluate_acceptance_checks(&temp_root, &working_dir);
     let _ = fs::remove_dir_all(&temp_root);
     match result {
-        Ok(results) => {
-            let failed_required = results
-                .iter()
-                .any(|result| result.must_pass && !result.passed);
-            if failed_required {
-                println!("{} {}", ui_muted("working"), working_dir.display());
-                if let Some(spec_path) = spec_path.as_ref() {
-                    println!("{}    {}", ui_muted("spec"), spec_path.display());
-                } else {
-                    println!("{}    default dr-gate behavior", ui_muted("spec"));
-                }
-                print_acceptance_results(&results);
-                if let Some(failed) = results
-                    .iter()
-                    .find(|result| result.must_pass && !result.passed)
-                {
-                    return Err(CliError::Surface {
-                        code: 1,
-                        surface: acceptance_check_failure_surface(
-                            &working_dir,
-                            spec_path.as_ref(),
-                            failed,
-                        )
-                        .render_plain(!completion_hints_enabled(false)),
-                    });
-                }
-            } else {
-                print!(
-                    "{}",
-                    acceptance_check_success_surface(&working_dir, spec_path.as_ref(), &results)
-                        .render_plain(!completion_hints_enabled(false))
-                );
-            }
-            Ok(())
-        }
+        Ok(results) => Ok((working_dir, spec_path, results)),
         Err(err) => Err(CliError::Core(deadreckon_core::user_error(
             &format!("done criteria check failed: {err}"),
             "fix the project or edit .deadreckon/acceptance.yaml, then rerun `deadreckon def-done check`",

@@ -27,6 +27,12 @@ targets:
       - path: Resources/bin
         type: folder
         buildPhase: resources
+      # Vendored x86_64 dr-gate (vendor-cli.sh): the CLI's helper lookup
+      # walks exe-dir then ../libexec/deadreckon. The folder holds a tracked
+      # README until an x86_64 vendor run drops the binary in.
+      - path: Resources/libexec
+        type: folder
+        buildPhase: resources
     dependencies:
       - package: DeadreckonKit
     settings:

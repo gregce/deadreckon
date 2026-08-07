@@ -951,6 +951,9 @@ public struct StartPreviewEnvelope {
                providerSource, doneCriteria, doneCriteriaSource,
                sourceMode: String?
     public let doneContract: ContractSummary?  // network word + check rows
+                                       // (COMPILED rows: must_pass read from
+                                       // raw.must_pass / !can_fail — the
+                                       // def_done_result raw shape is separate)
     public let requiresConfirmation, willStart: Bool
     public let nextActions, tryLines: [String]
     public let launchPlanData: Data?
@@ -975,6 +978,31 @@ public struct FinishPlanEnvelope: Codable {
     public let diffstat: DiffStat?
     public let destination: Destination?
     public let irreversibleSteps: [String]  // rendered verbatim
+}
+
+/// def-done --json (the non-interactive done-contract surface, acceptance.rs
+/// def_done_contract_envelope). status: "written" (declare/add/edit),
+/// "declared" | "default_gate" (show; a missing contract is a normal exit-0
+/// read), "passed" (check). `checks` is the EXACT serialized AcceptanceSpec
+/// shape report --json emits (serde-tagged kind + must_pass + the
+/// kind-specific fields), so no YAML is ever parsed app-side; drafted_by
+/// names the drafting route ("<provider> / <model>", or "<name> pack").
+/// Every refusal — missing --yes, provider/critic failure, corrupt YAML —
+/// is the shared G1 error envelope with verb "def-done".
+public struct DefDoneResultEnvelope {
+    public struct CheckRow {           // kind, mustPass, and the kind-specific
+        public var target: String?     // target facts raw (path/command/cwd/
+    }                                  // pattern/args); target = the primary one
+    public let kind: String            // "def_done_result"
+    public let status: String
+    public let contractPath: String?   // .deadreckon/acceptance.yaml, binary-written
+    public let notesPath, name: String?
+    public let checkCount: Int
+    public let checks: [CheckRow]
+    public let network: String?        // capabilities.network (deny | loopback | full)
+    public let draftedBy: String?
+    public let nextActions: [String]
+    public init?(data: Data)
 }
 ```
 
@@ -1085,6 +1113,14 @@ public enum PlannedVerb {
     case startPreview(StartRequest)                   // start [--provider..] [--from DIR] --json -- <goal> (NO --yes)
     case startExecute(planFilePath: String, spendAcknowledged: Bool, fromPath: String?)
                                                       // start --plan F --yes [--i-know-its-a-lot] [--from DIR] --json
+    case defDoneDeclare(directory: String?, criteria: String, provider: String?, model: String?)
+                                                      // def-done [--dir D] [--provider P] [--model M]
+                                                      //   --yes --json -- <criteria>
+                                                      // --yes IS the operator's explicit Draft-contract
+                                                      // click (the approval the interactive flow would
+                                                      // have collected); the criteria is operator text,
+                                                      // so it rides after the -- like the goal/note
+    case defDoneShow(directory: String?)              // def-done show --json [--dir D] (read-only, NO --yes)
     public var arguments: [String]                    // argv array, --json always present
     public var timeout: TimeInterval
 }
@@ -1126,7 +1162,24 @@ changed fleet rows arrive from FleetStore/FSEvents observation only.
   sheet's Start is Return-bound, so a preview left .ready would replay the
   same plan file into a duplicate paid Job with one keypress; the queued
   acknowledgment stays visible in the execution state, and another Start
-  requires a fresh preview (tested).
+  requires a fresh preview (tested). **Done-contract step (the
+  non-interactive def-done slice):** `contract: ContractState`
+  (idle/drafting/declared/refused/failed), `previewNeedsContract` (true
+  exactly on a blocked preview whose `done_criteria_source == "missing"`,
+  the typed signal), `declareContract(criteria:)` (dispatches
+  `defDoneDeclare` against `request.projectDirectory` with the sheet's
+  provider/model; in-flight guarded so a double-click drafts once —
+  tested; empty criteria dispatches nothing; refusals verbatim and STOP;
+  on success AUTO RE-RUNS the preview so the flow is refusal -> declare ->
+  launchable without re-clicking Preview — tested), and
+  `loadDeclaredContract()` (`def-done show --json`; "declared" fills the
+  read-only rows + contract path, "default_gate" stays idle so the declare
+  affordance renders). An operator-initiated `runPreview()` resets the
+  contract band (the request may now point at another project); only the
+  post-declare re-run preserves it (tested). A preview that resolved the
+  PROJECT's contract chains exactly one read-only show to fill the
+  declared rows, skipped when a fresh declare already holds richer facts
+  (tested: three children for the declare flow, never four).
 - `LayCourseCatalog` — `providers list --json` + `models --json`; failed
   probes stay visible with `message`/`tryLines` verbatim as fix hints
   (ProviderProbeRow grew those fields, additive); each surface degrades
@@ -1210,16 +1263,28 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
   >$50 swaps Start for the type-the-amount field (border flips only on the
   exact match; Start disabled until `readyToStart`); execute leg shows the
   literal replay line; success says "the row appears when job.json lands".
-  **Done-contract deviation, documented:** the step is READ-ONLY detection
-  through the preview envelope (`done_criteria`/`done_contract` — checks,
-  must_pass, capabilities.network). The app authors no acceptance.yaml:
-  `start` has no `--acceptance` flag to point at an app-written file,
-  `def-done` has no `--json`, and writing into the operator's project
-  would break the single-writer honesty the sheet claims. A missing
-  contract refuses with try lines that teach `def-done`, rendered
-  verbatim. **Rust-side gap, needs registering:** a `--acceptance <path>`
-  (or def-done --json authoring surface) on `start`, so a GUI contract
-  step can author without touching the project tree.
+  **Done-contract step, as built (the registered def-done gap LANDED as
+  the non-interactive def-done slice — the former READ-ONLY deviation is
+  retired):** a preview blocked for a missing contract
+  (`done_criteria_source == "missing"`, the typed signal) swaps the bare
+  try-line for an inline DONE CONTRACT editor: a plain-English "what
+  should count as done" field plus a Draft-contract button dispatching
+  `def-done [--dir <project>] --yes --json -- <text>` through
+  MutationRunner. The click IS the approval `--yes` formalizes, and the
+  sheet states plainly that the BINARY (never the app) writes
+  `.deadreckon/acceptance.yaml` + `acceptance.md` in the project — the
+  single-writer honesty holds because the app still writes nothing.
+  Progress renders while drafting (the verb calls the provider); refusals
+  render verbatim via RefusalView; success renders the envelope's own
+  rows (check kind, target, must_pass, network capability, the declared
+  file path, drafted_by) and AUTO RE-RUNS the preview, so the sheet flows
+  refusal -> declare -> launchable without re-clicking Preview. An
+  already-declared contract renders read-only in the same rows (from the
+  def_done_result envelope when held — one chained `def-done show --json`
+  when the preview resolved the project's contract — else the preview's
+  done_contract block) with a Redefine affordance that reopens the editor
+  (declare overwrites binary-side by design). No YAML is ever parsed
+  app-side: every rendered fact is the binary's own envelope.
 - `KillSheet`: the real semantics verbatim (CancelRequested sticky +
   cancel.marker, SIGTERM process groups, 2s grace, SIGKILL,
   supervisor-proven terminal Cancelled), a separate explicit --escalate
