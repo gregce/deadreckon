@@ -1,0 +1,149 @@
+# Tailing Contract
+
+External observers may watch deadreckon's durable JSONL ledgers directly — no
+daemon, no socket, no CLI subprocess. This document is the supported contract
+for that: which files are blessed for tailing, what every blessed file
+guarantees, and how a correct reader consumes them. Files not listed here carry
+no tailing guarantees, even if they happen to be JSONL today.
+
+The conformance test for this contract is
+`crates/deadreckon/tests/tailing_contract.rs`.
+
+## Blessed files
+
+Per Job, under `$DEADRECKON_HOME/jobs/<job_id>/`:
+
+| file | one line is | checked schema |
+|---|---|---|
+| `job-events.jsonl` | one Job lifecycle fact | [`job-event.schema.json`](schemas/job-event.schema.json) |
+
+Per run, under `$DEADRECKON_HOME/runstate/<scope>/runs/<run_id>/`:
+
+| file | one line is | checked schema |
+|---|---|---|
+| `events.jsonl` | one run event | [`run-event.schema.json`](schemas/run-event.schema.json) |
+| `spend.jsonl` | one spend record | [`spend-record.schema.json`](schemas/spend-record.schema.json) |
+| `traces.jsonl` | one trace record | [`trace-record.schema.json`](schemas/trace-record.schema.json) |
+| `flight-events.jsonl` | one provider flight event | [`flight-event.schema.json`](schemas/flight-event.schema.json) |
+| `notify.jsonl` | one notification delivery attempt | none (see below) |
+| `proofs/acceptance-progress.jsonl` | one advisory gate progress row | none (see below) |
+
+Notes on individual files:
+
+- `spend.jsonl` is a shared ledger: the run loop writes `kind == "loop"` rows
+  and the live narrator writes `kind == "narrator"` rows to the same file.
+  Only `loop` rows are the run's provider spend; do not sum across kinds.
+- `notify.jsonl` rows are `{ts, transition, channel, ok, detail?}` where
+  `transition` is one of `accepted | paused | failed`. Rows record delivery
+  *attempts*, including failures (`ok: false` with a `detail`). The append is
+  best-effort: a notification can be delivered without its row landing, so
+  treat this file as observability, never as an authoritative delivery log.
+- `proofs/acceptance-progress.jsonl` rows are
+  `{checked_at, status, index, total, result?}`. They are display data only —
+  never evidence. The signed acceptance marker is the only trustworthy record
+  of what the gate concluded.
+
+## Invariants
+
+Every blessed file promises, unless the exception below says otherwise:
+
+1. **Append-only.** Writers only append. Files are never rotated, renamed,
+   truncated, or rewritten in place. Byte offsets you have already read stay
+   valid forever.
+2. **One JSON object per newline-terminated line.** Every line that ends in
+   `\n` is one complete JSON object. Where a checked schema exists in
+   [`docs/schemas/`](schemas/README.md), the object conforms to it.
+3. **An unterminated final line is a torn append.** It is either an in-flight
+   append that will complete shortly or residue of a crash mid-append. A
+   reader must ignore it and retry from the same position; it must never parse
+   a partial line, and must never treat one as corruption.
+4. **Appends are fsynced.** Each writer syncs the file after every append, so
+   a line that has fully appeared is durable.
+5. **`job-events.jsonl` is strictly sequenced.** The `sequence` field runs
+   `1..N` with no gaps, no reordering, and no rewrites: the writer refuses any
+   out-of-order append, and it refuses to extend a history whose final row is
+   torn. A gap, or two rows with the same `event_id` but different bytes, is
+   corruption — render "unknown", never a guessed state. The writer also
+   fsyncs each Job event before checkpointing `projection.json`, so the event
+   ledger is never behind the projection it authorizes.
+
+Damage to a *completed* line (invalid JSON before the final line) is
+corruption, not a torn append. deadreckon's own readers fail closed on it;
+external readers should surface it the same way rather than skip the row.
+
+## Exception: `proofs/acceptance-progress.jsonl`
+
+This file deliberately breaks invariant 1, twice:
+
+- **It restarts on each gate attempt.** The trusted controller removes the
+  file (together with the stale acceptance marker) at every gate-attempt
+  entry, fail closed (`clear_stale_gate_attempt_evidence`), so evidence and
+  display rows are always scoped to the current attempt; the evaluator
+  additionally best-effort deletes it before streaming. Stale rows from an
+  earlier attempt never mix with live ones.
+- **It is rewritten once at sign time.** Trusted signing reconstructs the
+  whole file from validated results and overwrites the streamed advisory rows
+  (a plain truncate-and-write, not an atomic rename, and not fsynced). This is
+  intentional: streamed rows come from the sandboxed evaluator and must never
+  be mistaken for evidence, so the trusted controller replaces them. The
+  rewrite happens after the evaluation's structural, contract, and tamper
+  validation but before the acceptance decision: a valid-but-failing
+  evaluation still gets the reconstructed file (with `failed` rows) even
+  though the signer then refuses to write a marker, while an evaluation that
+  fails validation is refused before any write and leaves the file untouched.
+
+**Contained (strict) gate evaluations stream nothing.** The sandbox mounts
+the run root read-only and denies every write under `proofs/` on all
+backends, so a contained evaluator's advisory rows are silently dropped and
+the file first appears whole at sign time. Only uncontained/non-strict
+evaluations and manual `dr-gate evaluate` runs produce live rows; a tailer of
+a strict gate must expect the file to be entirely absent until signing — and
+to stay absent for that attempt if the signer refuses the evaluation before
+reconstruction (see the rewrite bullet above).
+
+Reader rule for this file only: treat ANY anomaly — the file shrinking below
+your offset, disappearing, or a retained-offset read producing a line that
+fails to parse — as a restart, not corruption. The sign-time rewrite reuses
+the same inode and may leave the file the same length or longer than your
+offset, landing your next read mid-line inside new content; reset the offset
+to 0, discard retained rows, and re-read from the top. Within one attempt,
+rows append normally and the other invariants hold. The other blessed files
+keep the strict corruption rule below.
+
+## Recommended reader algorithm
+
+Keep a byte offset per file, initially 0, and on every poll:
+
+1. `stat` the file. Missing file: nothing yet, keep offset 0 and retry later.
+   Length below your offset: the file restarted (only possible for
+   `acceptance-progress.jsonl`) — reset the offset to 0 and discard retained
+   rows.
+2. Open, seek to the offset, read to end of file, and advance the offset by
+   the bytes read.
+3. Prepend any bytes retained from the previous poll, then split at the *last*
+   newline. Everything before it is complete lines; everything after it is a
+   torn append — retain those bytes for the next poll without parsing them.
+4. Parse each complete line as one JSON object. A parse failure here is
+   corruption: report it and stop trusting the file, do not skip the line.
+   Exception: for `acceptance-progress.jsonl` a parse failure means the
+   sign-time rewrite landed under your offset — reset to 0 and re-read
+   instead (see the exception section above).
+5. For `job-events.jsonl`, additionally verify that `sequence` continues
+   exactly `last + 1` from the previous row. Any gap is corruption.
+
+This is the same algorithm deadreckon's own attach surfaces use
+(`TuiEventFeed::file_tail` in `crates/deadreckon/src/tui_events.rs`,
+`AttachJsonlTail` in `crates/deadreckon/src/main.rs`), so an external reader
+built this way can never diverge from what the CLI itself displays.
+
+Polling with a short interval is the supported mechanism. File-watch APIs
+(FSEvents, inotify) are a fine wake-up hint, but the read path above must
+still run as written — watchers can coalesce or drop events.
+
+## What this contract does not grant
+
+Tailing is read-only observation. Rows never confer authority: acceptance is
+proven only by the signed marker and validated receipt, spend rows are
+provider evidence rather than a billing source of truth, and streamed gate
+progress is cosmetic. Writing to any of these files from outside deadreckon
+voids every guarantee above and is treated as corruption by its readers.

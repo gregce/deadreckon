@@ -5310,6 +5310,7 @@ mod tests {
                 attempt_count: 1,
                 child_run_ids: Vec::new(),
                 delivery: None,
+                last_gate_attempt: None,
                 updated_at: Some(Utc::now()),
                 caveats: Vec::new(),
             },

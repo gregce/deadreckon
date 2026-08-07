@@ -1844,6 +1844,7 @@ async fn main_inner() -> Result<()> {
             run_id,
             all,
             limit,
+            receipt,
             json,
             plain,
             quiet,
@@ -1853,6 +1854,7 @@ async fn main_inner() -> Result<()> {
                 run_id,
                 all,
                 limit,
+                receipt,
                 json,
                 plain,
                 quiet,
@@ -1881,6 +1883,7 @@ async fn main_inner() -> Result<()> {
             run_id,
             turn,
             diff,
+            patch,
             raw,
             why_failed,
             plain,
@@ -1893,6 +1896,7 @@ async fn main_inner() -> Result<()> {
                 run_id: &run_id,
                 turn,
                 diff,
+                patch,
                 raw: raw.as_deref(),
                 why_failed,
                 json_output: json,
@@ -13497,6 +13501,7 @@ struct ShowCommandArgs<'a> {
     run_id: &'a str,
     turn: Option<u32>,
     diff: bool,
+    patch: bool,
     raw: Option<&'a str>,
     why_failed: bool,
     json_output: bool,
@@ -13610,6 +13615,12 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
             return Ok(());
         }
     };
+    if args.diff && args.patch {
+        // `--file` normally scopes flight/checkpoint activity; under
+        // `--diff --patch` it selects the single file whose full patch is
+        // exported without the per-file byte budget.
+        return show_run_diff(&state, args.json_output, true, args.file);
+    }
     if args.flight || args.file.is_some() {
         return show_flight(&state, args.turn, args.file, args.json_output);
     }
@@ -13617,7 +13628,7 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
         return show_raw_artifact(&state, raw);
     }
     if args.diff {
-        return show_run_diff(&state, args.json_output);
+        return show_run_diff(&state, args.json_output, false, None);
     }
     if let Some(turn) = args.turn {
         return show_run_turn(&state, turn, args.json_output);
@@ -13648,6 +13659,7 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
                     "artifact": &state.promoted_library_dir,
                 },
                 "run": state,
+                "steerable": deadreckon_core::steer_eligibility(&state),
                 "run_view": run_view,
                 "plan_child": child_context,
                 "plan_result": plan_result,
@@ -13733,7 +13745,12 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
     Ok(())
 }
 
-fn show_run_diff(state: &deadreckon_core::PipelineState, json_output: bool) -> Result<()> {
+fn show_run_diff(
+    state: &deadreckon_core::PipelineState,
+    json_output: bool,
+    patch: bool,
+    file: Option<&Path>,
+) -> Result<()> {
     let view = deadreckon_core::RunView::from_state(state)?;
     if state.turn == 0
         || view.missing.iter().any(|artifact| match artifact {
@@ -13746,12 +13763,61 @@ fn show_run_diff(state: &deadreckon_core::PipelineState, json_output: bool) -> R
             &format!("deadreckon show {}", run_prefix(&state.run_id)),
         )));
     }
+    if patch {
+        // A single selected file is exported in full; the whole-run export
+        // bounds each file's unified text so the surface stays streamable.
+        let budget = file
+            .is_none()
+            .then_some(deadreckon_core::PATCH_UNIFIED_BYTE_BUDGET);
+        let patches = deadreckon_core::patches_from_diff(&view.changed, budget, file);
+        if let Some(file) = file
+            && patches.is_empty()
+        {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("no source change for file {}", file.display()),
+                &format!("deadreckon show {} --diff", run_prefix(&state.run_id)),
+            )));
+        }
+        if json_output {
+            let mut value = serde_json::to_value(&view.changed)?;
+            value["patches"] = serde_json::to_value(&patches)?;
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            return Ok(());
+        }
+        print!("{}", render_patches(&patches));
+        return Ok(());
+    }
     if json_output {
         println!("{}", serde_json::to_string_pretty(&view.changed)?);
         return Ok(());
     }
     print!("{}", render_diff_summary(&view.changed));
     Ok(())
+}
+
+fn render_patches(patches: &[deadreckon_core::PatchEntry]) -> String {
+    let mut out = String::new();
+    if patches.is_empty() {
+        out.push_str("(no source changes)\n");
+        return out;
+    }
+    for patch in patches {
+        out.push_str(&patch.unified);
+        if !patch.unified.is_empty() && !patch.unified.ends_with('\n') {
+            out.push('\n');
+        }
+        if let Some(note) = patch.note.as_deref() {
+            out.push_str(&format!("# {}: {note}\n", patch.path.display()));
+        }
+        if patch.truncated {
+            out.push_str(&format!(
+                "# {}: patch truncated; rerun with --file {} for the full patch\n",
+                patch.path.display(),
+                patch.path.display()
+            ));
+        }
+    }
+    out
 }
 
 fn show_run_turn(
@@ -13993,6 +14059,7 @@ fn status_command(run_id: Option<&str>, all: bool, plain: bool, json_output: boo
                     "artifact": &state.promoted_library_dir,
                 },
                 "run": &state,
+                "steerable": deadreckon_core::steer_eligibility(&state),
                 "status_label": status,
                 "next_action": next_action,
                 "billing": if run_is_subscription_only(&state) {
@@ -14935,6 +15002,7 @@ async fn completion_action_loop(state: &deadreckon_core::PipelineState) -> Resul
                 run_id: &state.run_id,
                 turn: None,
                 diff: false,
+                patch: false,
                 raw: None,
                 why_failed: false,
                 json_output: false,

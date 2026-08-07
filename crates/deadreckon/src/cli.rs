@@ -2020,6 +2020,13 @@ pub(crate) enum Commands {
         all: bool,
         #[arg(long, help = "With --all: how many recent runs (default 10)")]
         limit: Option<usize>,
+        #[arg(
+            long,
+            requires = "json",
+            conflicts_with = "all",
+            help = "With --json: audit the completion receipt fact by fact (read-only)"
+        )]
+        receipt: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
@@ -2065,6 +2072,12 @@ pub(crate) enum Commands {
         diff: bool,
         #[arg(
             long,
+            requires = "diff",
+            help = "With --diff, export per-file unified patches (~64KB per file; --file PATH lifts the budget for one file)"
+        )]
+        patch: bool,
+        #[arg(
+            long,
             value_name = "ARTIFACT",
             help = "Dump a named run artifact verbatim (ledger schemas: docs/schemas/*.schema.json)"
         )]
@@ -2080,7 +2093,7 @@ pub(crate) enum Commands {
         #[arg(
             long,
             value_name = "PATH",
-            help = "Show flight/checkpoint activity for a file"
+            help = "Show flight/checkpoint activity for a file, or with --diff --patch select that file's full patch"
         )]
         file: Option<PathBuf>,
     },

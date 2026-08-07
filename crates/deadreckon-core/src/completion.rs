@@ -298,127 +298,403 @@ pub fn seal_completion_receipt_bounded(
     result
 }
 
+/// One recorded observation from a completion-receipt audit: a named check,
+/// whether it passed, and either a short pass detail or the strict path's
+/// exact error message.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReceiptFact {
+    pub name: String,
+    pub pass: bool,
+    pub detail: String,
+}
+
+/// The fact-collecting form of receipt validation. Where the strict path stops
+/// at the first mismatch, the audit records every independently checkable fact
+/// so an operator can see WHICH digest broke, then reproduces the strict
+/// fail-first result exactly through [`ReceiptAudit::into_result`]. The audit
+/// performs the same kinds of reads as the strict validator and nothing more;
+/// it never writes, signs, or promotes.
+#[derive(Debug)]
+pub struct ReceiptAudit {
+    /// Every audited fact, in the order the strict validator checks them.
+    /// Facts that depend on an earlier failed precondition (an unreadable
+    /// receipt or authority document, an unauthenticated sandbox observation)
+    /// are omitted rather than guessed at.
+    pub facts: Vec<ReceiptFact>,
+    receipt: Option<CompletionReceipt>,
+    first_error: Option<DeadreckonError>,
+    run_id: String,
+}
+
+impl ReceiptAudit {
+    /// True when every audited fact passed.
+    pub fn passed(&self) -> bool {
+        self.first_error.is_none()
+    }
+
+    /// Collapse the audit to the strict fail-first result: the FIRST failing
+    /// fact's error, byte-identical to the historical monolithic validator.
+    pub fn into_result(self) -> Result<CompletionReceipt> {
+        match (self.first_error, self.receipt) {
+            (Some(error), _) => Err(error),
+            (None, Some(receipt)) => Ok(receipt),
+            (None, None) => Err(completion_error(
+                &self.run_id,
+                "receipt audit finished without a receipt",
+            )),
+        }
+    }
+}
+
+struct ReceiptAuditBuilder {
+    facts: Vec<ReceiptFact>,
+    first_error: Option<DeadreckonError>,
+    /// When set, no further checks execute once the first failure is
+    /// recorded — the strict validator's historical short-circuit, so failure
+    /// paths never touch gate-key material or recompute result trees beyond
+    /// the first mismatch.
+    fail_fast: bool,
+}
+
+impl ReceiptAuditBuilder {
+    fn new(fail_fast: bool) -> Self {
+        Self {
+            facts: Vec::new(),
+            first_error: None,
+            fail_fast,
+        }
+    }
+
+    /// Record one fact: on `Ok` the value flows onward with `pass_detail`; on
+    /// `Err` the fact fails with the error's message and the FIRST failure is
+    /// retained verbatim for [`ReceiptAudit::into_result`]. In fail-fast mode
+    /// the check closure is never even invoked after the first failure.
+    fn record<T>(
+        &mut self,
+        name: &str,
+        pass_detail: impl Into<String>,
+        check: impl FnOnce() -> Result<T>,
+    ) -> Option<T> {
+        if self.fail_fast && self.first_error.is_some() {
+            return None;
+        }
+        match check() {
+            Ok(value) => {
+                self.facts.push(ReceiptFact {
+                    name: name.to_string(),
+                    pass: true,
+                    detail: pass_detail.into(),
+                });
+                Some(value)
+            }
+            Err(error) => {
+                self.facts.push(ReceiptFact {
+                    name: name.to_string(),
+                    pass: false,
+                    detail: error.to_string(),
+                });
+                if self.first_error.is_none() {
+                    self.first_error = Some(error);
+                }
+                None
+            }
+        }
+    }
+
+    fn finish(self, run_id: &str, receipt: Option<CompletionReceipt>) -> ReceiptAudit {
+        ReceiptAudit {
+            facts: self.facts,
+            receipt,
+            first_error: self.first_error,
+            run_id: run_id.to_string(),
+        }
+    }
+}
+
+/// Audit a completion receipt fact by fact, in exactly the strict validator's
+/// order, without stopping at the first mismatch. Read-only inspection: it
+/// reads only what the strict validator would read on a fully valid receipt
+/// (including the same gate-key access for signature verification) and never
+/// signs, promotes, or mutates run state.
+pub fn audit_completion_receipt(paths: &DeadreckonPaths, state: &PipelineState) -> ReceiptAudit {
+    audit_completion_receipt_inner(paths, state, false)
+}
+
+fn audit_completion_receipt_inner(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    fail_fast: bool,
+) -> ReceiptAudit {
+    let mut audit = ReceiptAuditBuilder::new(fail_fast);
+    let receipt_path = paths.job_receipt(&state.run_id);
+    let receipt = audit.record("receipt_document", "receipt parsed", || {
+        fs::read(&receipt_path)
+            .with_path(&receipt_path)
+            .and_then(|raw| {
+                serde_json::from_slice::<CompletionReceipt>(&raw).with_json_path(&receipt_path)
+            })
+    });
+    let Some(receipt) = receipt else {
+        return audit.finish(&state.run_id, None);
+    };
+    audit.record("receipt_identity", "receipt names this job and run", || {
+        if receipt.job_id.as_ref() != state.run_id || receipt.run_id.as_ref() != state.run_id {
+            Err(completion_error(
+                &state.run_id,
+                "receipt identity does not match the requested run",
+            ))
+        } else {
+            Ok(())
+        }
+    });
+    audit.record(
+        "receipt_provenance",
+        "supervisor-issued two-key verified result",
+        || {
+            if receipt.outcome != JobOutcome::Verified
+                || receipt.stop_reason != StopReason::Verified
+                || receipt.proof_kind != CompletionProofKind::TwoKeyCompletion
+                || receipt.issuer != CompletionReceiptIssuer::DeadreckonSupervisor
+            {
+                Err(completion_error(
+                    &state.run_id,
+                    "receipt is not a supervisor-issued two-key verified result",
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    );
+
+    let authority_path = paths.job_authority(&state.run_id);
+    let launch_path = paths.job_launch_plan(&state.run_id);
+    let authority_and_job = audit.record(
+        "authority_document",
+        "job authority and job record parsed",
+        || {
+            fs::read(&authority_path)
+                .with_path(&authority_path)
+                .and_then(|raw| {
+                    serde_json::from_slice::<JobAuthority>(&raw).with_json_path(&authority_path)
+                })
+                .and_then(|authority| Ok((authority, load_job(paths, &state.run_id)?)))
+        },
+    );
+    let Some((authority, job)) = authority_and_job else {
+        return audit.finish(&state.run_id, None);
+    };
+    audit.record(
+        "authority_inputs",
+        "approved goal, launch plan, policy, and contract digests match",
+        || verify_authority_inputs(&job, &authority, &authority_path, &launch_path, state),
+    );
+    audit.record(
+        "result_boundary",
+        "worktree result boundary is intact",
+        || validate_worktree_result_boundary(state, &authority, Some(&receipt)).map(|_| ()),
+    );
+    let sandbox_observation = audit.record(
+        "sandbox_observation",
+        "sandbox boundary observation authenticated",
+        || {
+            validate_sandbox_boundary_observation(
+                paths,
+                state,
+                &authority,
+                &receipt.sandbox_backend,
+            )
+        },
+    );
+    if let Some(sandbox_observation) = &sandbox_observation {
+        audit.record(
+            "attempt_identity",
+            format!(
+                "attempt {} launch {}",
+                receipt.attempt, receipt.outer_launch_id
+            ),
+            || {
+                if receipt.attempt == 0
+                    || receipt.attempt != sandbox_observation.attempt
+                    || receipt.outer_launch_id != sandbox_observation.outer_launch_id
+                {
+                    Err(completion_error(
+                        &state.run_id,
+                        "receipt attempt identity does not match its authenticated sandbox observation",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+    }
+    audit.record(
+        "sandbox_observation_digest",
+        receipt.sandbox_boundary_observation_sha256.clone(),
+        || {
+            sandbox_boundary_observation_sha256(paths, &state.run_id).and_then(|actual| {
+                require_digest(
+                    &receipt.sandbox_boundary_observation_sha256,
+                    &actual,
+                    "sandbox boundary observation",
+                    &state.run_id,
+                )
+            })
+        },
+    );
+    audit.record(
+        "execution_evidence",
+        "execution ledgers match the sealed receipt",
+        || {
+            completion_execution_evidence(paths, &state.run_id).and_then(|actual| {
+                if receipt.execution_evidence != actual {
+                    Err(completion_error(
+                        &state.run_id,
+                        "receipt execution ledgers changed after verified completion",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        },
+    );
+    audit.record("authority_digest", receipt.authority_sha256.clone(), || {
+        sha256_file(&authority_path).and_then(|actual| {
+            require_digest(
+                &receipt.authority_sha256,
+                &actual,
+                "authority",
+                &state.run_id,
+            )
+        })
+    });
+    audit.record(
+        "launch_plan_digest",
+        receipt.launch_plan_sha256.clone(),
+        || {
+            sha256_file(&launch_path).and_then(|actual| {
+                require_digest(
+                    &receipt.launch_plan_sha256,
+                    &actual,
+                    "launch plan",
+                    &state.run_id,
+                )
+            })
+        },
+    );
+    audit.record(
+        "deterministic_marker_digest",
+        receipt.deterministic_marker_sha256.clone(),
+        || {
+            sha256_file(&crate::marker_path_for_run_root(&state.run_root)).and_then(|actual| {
+                require_digest(
+                    &receipt.deterministic_marker_sha256,
+                    &actual,
+                    "deterministic marker",
+                    &state.run_id,
+                )
+            })
+        },
+    );
+    let semantic_path = state.run_root.join(SEMANTIC_JUDGMENT_JSON);
+    audit.record(
+        "semantic_judgment_digest",
+        receipt.semantic_judgment_sha256.clone(),
+        || {
+            sha256_file(&semantic_path).and_then(|actual| {
+                require_digest(
+                    &receipt.semantic_judgment_sha256,
+                    &actual,
+                    "semantic judgment",
+                    &state.run_id,
+                )
+            })
+        },
+    );
+    audit.record(
+        "judgment_achieved",
+        "semantic judgment records achieved with evidence-backed coverage",
+        || {
+            fs::read(&semantic_path)
+                .with_path(&semantic_path)
+                .and_then(|raw| {
+                    serde_json::from_slice::<SemanticJudgment>(&raw).with_json_path(&semantic_path)
+                })
+                .and_then(|judgment| {
+                    if judgment.decision != SemanticDecision::Achieved
+                        || judgment.job_id != receipt.job_id
+                        || judgment.run_id != receipt.run_id
+                    {
+                        return Err(completion_error(
+                            &state.run_id,
+                            "semantic judgment no longer records achieved for this job",
+                        ));
+                    }
+                    validate_achieved_judgment(&judgment, &state.run_id)
+                })
+        },
+    );
+    audit.record(
+        "marker_signature",
+        "signed acceptance marker validates for this run",
+        || {
+            validate_parent_repair_lineage_if_present(paths, state).and_then(|parent_repair| {
+                let marker = validate_acceptance_marker_with_parent_repair_bytes(
+                    state,
+                    parent_repair
+                        .as_ref()
+                        .map(|repair| repair.manifest.bytes.as_slice()),
+                    parent_repair
+                        .as_ref()
+                        .map(|repair| repair.candidate.bytes.as_slice()),
+                )?;
+                if !marker.is_native_gate_proof()
+                    || marker.contained != receipt.contained
+                    || marker.sandbox_backend != receipt.sandbox_backend
+                {
+                    return Err(completion_error(
+                        &state.run_id,
+                        "deterministic proof or containment does not match the receipt",
+                    ));
+                }
+                Ok(())
+            })
+        },
+    );
+    audit.record(
+        "result_tree_digest",
+        receipt.result_tree_sha256.clone(),
+        || {
+            result_tree_hash(state).and_then(|actual| {
+                require_digest(
+                    &receipt.result_tree_sha256,
+                    &actual,
+                    "result tree",
+                    &state.run_id,
+                )
+            })
+        },
+    );
+    audit.record(
+        "receipt_signature",
+        "receipt HMAC signature verifies under the gate key",
+        || {
+            read_gate_key(paths, &state.run_id)
+                .and_then(|key| verify_receipt_signature(&receipt, &key))
+        },
+    );
+    audit.finish(&state.run_id, Some(receipt))
+}
+
+/// Strict fail-first receipt validation: stops at the FIRST failing fact,
+/// exactly like the historical monolithic validator — a failure at an early
+/// fact performs none of the later checks (no gate-key reads, no result-tree
+/// hashing). The fact-collecting [`audit_completion_receipt`] is the explicit
+/// inspection surface that keeps checking past failures.
 pub fn validate_completion_receipt(
     paths: &DeadreckonPaths,
     state: &PipelineState,
 ) -> Result<CompletionReceipt> {
-    let receipt_path = paths.job_receipt(&state.run_id);
-    let raw = fs::read(&receipt_path).with_path(&receipt_path)?;
-    let receipt: CompletionReceipt = serde_json::from_slice(&raw).with_json_path(&receipt_path)?;
-    if receipt.job_id.as_ref() != state.run_id || receipt.run_id.as_ref() != state.run_id {
-        return Err(completion_error(
-            &state.run_id,
-            "receipt identity does not match the requested run",
-        ));
-    }
-    if receipt.outcome != JobOutcome::Verified
-        || receipt.stop_reason != StopReason::Verified
-        || receipt.proof_kind != CompletionProofKind::TwoKeyCompletion
-        || receipt.issuer != CompletionReceiptIssuer::DeadreckonSupervisor
-    {
-        return Err(completion_error(
-            &state.run_id,
-            "receipt is not a supervisor-issued two-key verified result",
-        ));
-    }
-
-    let authority_path = paths.job_authority(&state.run_id);
-    let launch_path = paths.job_launch_plan(&state.run_id);
-    let authority_raw = fs::read(&authority_path).with_path(&authority_path)?;
-    let authority: JobAuthority =
-        serde_json::from_slice(&authority_raw).with_json_path(&authority_path)?;
-    let job = load_job(paths, &state.run_id)?;
-    verify_authority_inputs(&job, &authority, &authority_path, &launch_path, state)?;
-    validate_worktree_result_boundary(state, &authority, Some(&receipt))?;
-    let sandbox_observation =
-        validate_sandbox_boundary_observation(paths, state, &authority, &receipt.sandbox_backend)?;
-    if receipt.attempt == 0
-        || receipt.attempt != sandbox_observation.attempt
-        || receipt.outer_launch_id != sandbox_observation.outer_launch_id
-    {
-        return Err(completion_error(
-            &state.run_id,
-            "receipt attempt identity does not match its authenticated sandbox observation",
-        ));
-    }
-    require_digest(
-        &receipt.sandbox_boundary_observation_sha256,
-        &sandbox_boundary_observation_sha256(paths, &state.run_id)?,
-        "sandbox boundary observation",
-        &state.run_id,
-    )?;
-    if receipt.execution_evidence != completion_execution_evidence(paths, &state.run_id)? {
-        return Err(completion_error(
-            &state.run_id,
-            "receipt execution ledgers changed after verified completion",
-        ));
-    }
-    require_digest(
-        &receipt.authority_sha256,
-        &sha256_file(&authority_path)?,
-        "authority",
-        &state.run_id,
-    )?;
-    require_digest(
-        &receipt.launch_plan_sha256,
-        &sha256_file(&launch_path)?,
-        "launch plan",
-        &state.run_id,
-    )?;
-    require_digest(
-        &receipt.deterministic_marker_sha256,
-        &sha256_file(&crate::marker_path_for_run_root(&state.run_root))?,
-        "deterministic marker",
-        &state.run_id,
-    )?;
-    let semantic_path = state.run_root.join(SEMANTIC_JUDGMENT_JSON);
-    require_digest(
-        &receipt.semantic_judgment_sha256,
-        &sha256_file(&semantic_path)?,
-        "semantic judgment",
-        &state.run_id,
-    )?;
-    let semantic_raw = fs::read(&semantic_path).with_path(&semantic_path)?;
-    let judgment: SemanticJudgment =
-        serde_json::from_slice(&semantic_raw).with_json_path(&semantic_path)?;
-    if judgment.decision != SemanticDecision::Achieved
-        || judgment.job_id != receipt.job_id
-        || judgment.run_id != receipt.run_id
-    {
-        return Err(completion_error(
-            &state.run_id,
-            "semantic judgment no longer records achieved for this job",
-        ));
-    }
-    validate_achieved_judgment(&judgment, &state.run_id)?;
-    let parent_repair = validate_parent_repair_lineage_if_present(paths, state)?;
-    let marker = validate_acceptance_marker_with_parent_repair_bytes(
-        state,
-        parent_repair
-            .as_ref()
-            .map(|repair| repair.manifest.bytes.as_slice()),
-        parent_repair
-            .as_ref()
-            .map(|repair| repair.candidate.bytes.as_slice()),
-    )?;
-    if !marker.is_native_gate_proof()
-        || marker.contained != receipt.contained
-        || marker.sandbox_backend != receipt.sandbox_backend
-    {
-        return Err(completion_error(
-            &state.run_id,
-            "deterministic proof or containment does not match the receipt",
-        ));
-    }
-    require_digest(
-        &receipt.result_tree_sha256,
-        &result_tree_hash(state)?,
-        "result tree",
-        &state.run_id,
-    )?;
-    let key = read_gate_key(paths, &state.run_id)?;
-    verify_receipt_signature(&receipt, &key)?;
-    Ok(receipt)
+    audit_completion_receipt_inner(paths, state, true).into_result()
 }
 
 /// Validate a receipt under the same inherited Git boundary used to seal it.
@@ -2781,7 +3057,7 @@ mod tests {
                 .contains("receipt attempt identity does not match")
         );
 
-        let mut tampered = receipt.clone();
+        let mut tampered = receipt;
         tampered.outer_launch_id = Uuid::new_v4().to_string();
         atomic_write_json(&receipt_path, &tampered).expect("tampered receipt launch");
         let error = validate_completion_receipt(&fixture.paths, &fixture.state)
@@ -3605,5 +3881,477 @@ mod tests {
                 .to_string()
                 .contains("result tree digest changed")
         );
+    }
+
+    // ---- G7 characterization: the strict path's exact error strings ----
+    //
+    // These tests pin the fail-first monolith's error messages byte-for-byte
+    // so the fact-collecting `audit_completion_receipt(...).into_result()`
+    // refactor is provably behavior-preserving. Do not loosen them to
+    // `contains`; the whole point is exact equality.
+
+    fn sealed_fixture() -> (Fixture, super::CompletionReceipt) {
+        let fixture = fixture();
+        let receipt = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &fixture.authority,
+            &fixture.marker,
+            &fixture.judgment,
+        )
+        .expect("seal");
+        (fixture, receipt)
+    }
+
+    #[test]
+    fn characterization_bad_marker_digest_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let marker_path = crate::marker_path_for_run_root(&fixture.state.run_root);
+        let mut bytes = fs::read(&marker_path).expect("marker bytes");
+        bytes.push(b'\n');
+        fs::write(&marker_path, bytes).expect("tamper marker");
+        let found = sha256_file(&marker_path).expect("tampered marker digest");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("marker tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: completion receipt for job-1 is invalid: deterministic marker digest changed (expected {}, found {found}); try: deadreckon verdict job-1",
+                receipt.deterministic_marker_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_mutated_result_fails_at_the_boundary_observation_first() {
+        // A mutated deliverable is caught by the authenticated sandbox boundary
+        // observation BEFORE the receipt's own result-tree digest check runs;
+        // this pins that ordering and its exact message.
+        let (fixture, receipt) = sealed_fixture();
+        fs::write(
+            fixture.state.working_dir.join("result.txt"),
+            "changed after sealing\n",
+        )
+        .expect("mutate result");
+        let found = crate::sandbox_boundary_result_tree_sha256(&fixture.state)
+            .expect("tampered tree digest");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("result tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: sandbox boundary observation for job-1 is invalid: result tree digest changed (expected {}, found {found})",
+                receipt.result_tree_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_bad_result_tree_digest_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt.clone();
+        tampered.result_tree_sha256 = format!("sha256:{}", "0".repeat(64));
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("result-tree tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: completion receipt for job-1 is invalid: result tree digest changed (expected sha256:{}, found {}); try: deadreckon verdict job-1",
+                "0".repeat(64),
+                receipt.result_tree_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_bad_receipt_signature_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.signature = "0".repeat(64);
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("forged signature refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt signature verification failed; try: deadreckon verdict job-1"
+        );
+    }
+
+    #[test]
+    fn characterization_bad_receipt_identity_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.run_id = RunId("other-run".to_string());
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("identity tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt identity does not match the requested run; try: deadreckon verdict job-1"
+        );
+    }
+
+    #[test]
+    fn characterization_bad_receipt_provenance_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.stop_reason = deadreckon_protocol::StopReason::SpendCap;
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("provenance tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt is not a supervisor-issued two-key verified result; try: deadreckon verdict job-1"
+        );
+    }
+
+    #[test]
+    fn characterization_bad_authority_inputs_error_is_exact() {
+        let (fixture, _receipt) = sealed_fixture();
+        let launch_path = fixture.paths.job_launch_plan("job-1");
+        let mut launch = fs::read(&launch_path).expect("launch plan");
+        launch.push(b'\n');
+        fs::write(&launch_path, launch).expect("tamper launch plan");
+        let found = sha256_file(&launch_path).expect("tampered launch digest");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("launch plan tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: completion receipt for job-1 is invalid: approved launch plan digest changed (expected {}, found {found}); try: deadreckon verdict job-1",
+                fixture.authority.launch_plan_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_bad_attempt_identity_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.attempt += 1;
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("attempt tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt attempt identity does not match its authenticated sandbox observation; try: deadreckon verdict job-1"
+        );
+    }
+
+    #[test]
+    fn characterization_bad_execution_evidence_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.execution_evidence = Some(deadreckon_protocol::CompletionExecutionEvidence {
+            ordered_candidate_manifest_sha256: sha256_text("forged"),
+            candidate_application_events_sha256: None,
+            chain_hook_events_sha256: None,
+        });
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("execution evidence tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt execution ledgers changed after verified completion; try: deadreckon verdict job-1"
+        );
+    }
+
+    #[test]
+    fn characterization_bad_authority_digest_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt.clone();
+        tampered.authority_sha256 = format!("sha256:{}", "1".repeat(64));
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("authority digest tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: completion receipt for job-1 is invalid: authority digest changed (expected sha256:{}, found {}); try: deadreckon verdict job-1",
+                "1".repeat(64),
+                receipt.authority_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_bad_semantic_judgment_digest_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt.clone();
+        tampered.semantic_judgment_sha256 = format!("sha256:{}", "2".repeat(64));
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("judgment digest tamper refused");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid input: completion receipt for job-1 is invalid: semantic judgment digest changed (expected sha256:{}, found {}); try: deadreckon verdict job-1",
+                "2".repeat(64),
+                receipt.semantic_judgment_sha256
+            )
+        );
+    }
+
+    #[test]
+    fn characterization_unachieved_judgment_error_is_exact() {
+        let (fixture, receipt) = sealed_fixture();
+        let judgment_path = fixture.state.run_root.join(super::SEMANTIC_JUDGMENT_JSON);
+        let mut judgment = fixture.judgment.clone();
+        judgment.decision = SemanticDecision::Revise;
+        atomic_write_json(&judgment_path, &judgment).expect("rewrite judgment");
+        // Keep the digest fact green so the failure lands on the judgment
+        // content itself.
+        let mut tampered = receipt;
+        tampered.semantic_judgment_sha256 =
+            sha256_file(&judgment_path).expect("new judgment digest");
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("unachieved judgment refused");
+
+        assert_eq!(
+            error.to_string(),
+            "invalid input: completion receipt for job-1 is invalid: semantic judgment no longer records achieved for this job; try: deadreckon verdict job-1"
+        );
+    }
+
+    // ---- G7: strict short-circuit and read-only properties ----
+
+    #[test]
+    fn strict_validation_short_circuits_at_the_first_failing_fact() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.run_id = RunId("other-run".to_string());
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+
+        // The strict (fail-fast) walk stops dead at the first failure: no
+        // later checks execute, so a failure at fact 2 never reads gate-key
+        // material or hashes the result tree.
+        let strict = super::audit_completion_receipt_inner(&fixture.paths, &fixture.state, true);
+        let names: Vec<&str> = strict.facts.iter().map(|fact| fact.name.as_str()).collect();
+        assert_eq!(names, ["receipt_document", "receipt_identity"]);
+        assert!(!strict.facts[1].pass);
+
+        // The collecting audit keeps walking yet collapses to the same error.
+        let full = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+        assert!(full.facts.len() > 2, "{:#?}", full.facts);
+        assert_eq!(
+            strict.into_result().expect_err("strict error").to_string(),
+            full.into_result().expect_err("audit error").to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_failure_paths_never_read_the_gate_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.run_id = RunId("other-run".to_string());
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+        let key_store = crate::gate::gate_key_path(&fixture.paths, "job-1")
+            .parent()
+            .expect("key store")
+            .to_path_buf();
+        fs::set_permissions(&key_store, fs::Permissions::from_mode(0o000)).expect("seal key store");
+
+        let error = validate_completion_receipt(&fixture.paths, &fixture.state);
+        fs::set_permissions(&key_store, fs::Permissions::from_mode(0o700))
+            .expect("restore key store");
+
+        assert_eq!(
+            error.expect_err("identity tamper refused").to_string(),
+            "invalid input: completion receipt for job-1 is invalid: receipt identity does not match the requested run; try: deadreckon verdict job-1",
+            "the pre-key failure must be decided without touching the key store"
+        );
+    }
+
+    fn tree_snapshot(root: &std::path::Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                let metadata = entry.metadata().expect("metadata");
+                if metadata.is_dir() {
+                    stack.push(path.clone());
+                }
+                entries.push((path, metadata.len(), metadata.modified().expect("mtime")));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    #[test]
+    fn audit_is_read_only_over_the_run_root_and_home() {
+        let (fixture, receipt) = sealed_fixture();
+        let mut tampered = receipt;
+        tampered.attempt += 1;
+        atomic_write_json(&fixture.paths.job_receipt("job-1"), &tampered)
+            .expect("tampered receipt");
+        let home = fixture.paths.home().to_path_buf();
+        let before_home = tree_snapshot(&home);
+        let before_run = tree_snapshot(&fixture.state.run_root);
+
+        let audit = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+        assert!(!audit.passed());
+        let strict = validate_completion_receipt(&fixture.paths, &fixture.state);
+        assert!(strict.is_err());
+
+        assert_eq!(tree_snapshot(&home), before_home, "home tree mutated");
+        assert_eq!(
+            tree_snapshot(&fixture.state.run_root),
+            before_run,
+            "run root mutated"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_completes_gracefully_when_the_gate_key_store_is_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (fixture, _receipt) = sealed_fixture();
+        let key_store = crate::gate::gate_key_path(&fixture.paths, "job-1")
+            .parent()
+            .expect("key store")
+            .to_path_buf();
+        fs::set_permissions(&key_store, fs::Permissions::from_mode(0o000)).expect("seal key store");
+
+        let audit = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+        fs::set_permissions(&key_store, fs::Permissions::from_mode(0o700))
+            .expect("restore key store");
+
+        assert!(!audit.passed());
+        let last = audit.facts.last().expect("facts collected");
+        assert_eq!(last.name, "receipt_signature");
+        assert!(!last.pass, "unreadable key store fails the signature fact");
+    }
+
+    // ---- G7: fact-collecting audit ----
+
+    #[test]
+    fn audit_on_a_sealed_receipt_passes_every_fact_and_matches_strict() {
+        let (fixture, receipt) = sealed_fixture();
+
+        let audit = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+
+        assert!(audit.passed(), "{:#?}", audit.facts);
+        assert!(
+            audit.facts.iter().all(|fact| fact.pass),
+            "{:#?}",
+            audit.facts
+        );
+        let names: Vec<&str> = audit.facts.iter().map(|fact| fact.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "receipt_document",
+                "receipt_identity",
+                "receipt_provenance",
+                "authority_document",
+                "authority_inputs",
+                "result_boundary",
+                "sandbox_observation",
+                "attempt_identity",
+                "sandbox_observation_digest",
+                "execution_evidence",
+                "authority_digest",
+                "launch_plan_digest",
+                "deterministic_marker_digest",
+                "semantic_judgment_digest",
+                "judgment_achieved",
+                "marker_signature",
+                "result_tree_digest",
+                "receipt_signature",
+            ]
+        );
+        assert_eq!(audit.into_result().expect("strict result"), receipt);
+    }
+
+    #[test]
+    fn audit_keeps_collecting_after_a_failed_digest_and_reproduces_the_strict_error() {
+        let (fixture, _receipt) = sealed_fixture();
+        let marker_path = crate::marker_path_for_run_root(&fixture.state.run_root);
+        let mut bytes = fs::read(&marker_path).expect("marker bytes");
+        bytes.push(b'\n');
+        fs::write(&marker_path, bytes).expect("tamper marker");
+
+        let audit = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+
+        let fact = |name: &str| {
+            audit
+                .facts
+                .iter()
+                .find(|fact| fact.name == name)
+                .unwrap_or_else(|| panic!("missing fact {name}"))
+        };
+        assert!(!fact("deterministic_marker_digest").pass);
+        // Later independent facts are still collected instead of short-circuited.
+        assert!(fact("result_tree_digest").pass);
+        assert!(fact("receipt_signature").pass);
+        assert!(!audit.passed());
+
+        let strict = validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect_err("strict path refuses");
+        assert_eq!(
+            audit
+                .into_result()
+                .expect_err("audit collapses to the strict error")
+                .to_string(),
+            strict.to_string()
+        );
+    }
+
+    #[test]
+    fn audit_without_a_receipt_reports_a_single_failed_document_fact() {
+        let fixture = fixture();
+
+        let audit = super::audit_completion_receipt(&fixture.paths, &fixture.state);
+
+        assert_eq!(audit.facts.len(), 1, "{:#?}", audit.facts);
+        assert_eq!(audit.facts[0].name, "receipt_document");
+        assert!(!audit.facts[0].pass);
+        audit.into_result().expect_err("no receipt to validate");
     }
 }

@@ -19,6 +19,7 @@ use crate::gate::{
 };
 use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, RunStatus, load_state, spend_summary};
+use crate::steer::{SteerEligibility, steer_eligibility};
 use crate::tamper::{AcceptanceTamper, acceptance_tamper_path_for_run_root};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -26,6 +27,8 @@ pub struct RunView {
     pub id: RunIdentity,
     pub goal: String,
     pub status: RunStatus,
+    /// Whether the public `steer` verb would accept this Run right now.
+    pub steerable: SteerEligibility,
     pub verdict: VerdictBand,
     pub signature: SignatureFact,
     pub sandbox: SandboxFact,
@@ -112,6 +115,7 @@ impl RunView {
             },
             goal: state.goal.clone(),
             status: state.status,
+            steerable: steer_eligibility(state),
             verdict: verdict_band(state, &proof),
             signature,
             sandbox,
@@ -964,6 +968,11 @@ mod tests {
         let value = serde_json::to_value(&view).expect("json");
 
         assert_eq!(value["id"]["short"], "run-view");
+        assert_eq!(
+            value["steerable"],
+            serde_json::json!({"steerable": false, "reason": "not_executing"}),
+            "{value}"
+        );
         assert!(value.get("verdict").is_some(), "{value}");
         assert!(value.get("signature").is_some(), "{value}");
         assert!(value.get("changed").is_some(), "{value}");

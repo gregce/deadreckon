@@ -19,8 +19,8 @@ Executes `docs/design/MAC-APP-OPERATOR-CONSOLE.md` (§6.2 composite: Bridge shel
 
 | Phase | Scope | Status |
 |---|---|---|
-| R-M0 | G6 steerable-as-data · G8 live gate progress · G7 receipt audit · G10 diff patches · G3 fleet rollup · TAILING.md contract | in progress |
-| R-M1 | G1 JSON envelopes (9 verbs + global error envelope) · G2 start parity · G9 extend --note · steer widening (all providers) · notify events | pending |
+| R-M0 | G6 steerable-as-data · G8 live gate progress · G7 receipt audit · G10 diff patches · G3 fleet rollup · TAILING.md contract | **done** (trust review fixed 3 HIGH: marker-only attempt-scoped gate counts; fail-fast strict receipt path) |
+| R-M1 | G1 JSON envelopes (9 verbs + global error envelope) · G2 start parity · G9 extend --note · steer widening (all providers) · notify events | in progress |
 | R-M2 | G4 finish --dry-run --json · finish --json | pending |
 | R-M3 | G5 follow verb (merged NDJSON, replay offsets) | pending |
 | APP-1 | Scaffold: project.yml, DeadreckonKit, CONTRACTS.md, vendor-cli.sh + manifest | pending |

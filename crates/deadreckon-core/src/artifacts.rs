@@ -72,6 +72,77 @@ pub enum FileDeltaStatus {
     Modified,
 }
 
+/// Default per-file byte budget for exported unified patches. A single file
+/// selected explicitly (`--file PATH`) is exported without a budget.
+pub const PATCH_UNIFIED_BYTE_BUDGET: usize = 64 * 1024;
+
+/// One exportable per-file unified patch derived from a [`DiffSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct PatchEntry {
+    pub path: PathBuf,
+    pub status: FileDeltaStatus,
+    pub unified: String,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Project a [`DiffSummary`] into per-file unified patches.
+///
+/// `budget` bounds each patch's unified text in bytes (truncation lands on a
+/// line boundary and sets `truncated`); `None` exports full patches. `only`
+/// restricts the export to a single relative path. Binary or unreadable files
+/// keep their status with an empty `unified` body and an explanatory note.
+pub fn patches_from_diff(
+    diff: &DiffSummary,
+    budget: Option<usize>,
+    only: Option<&Path>,
+) -> Vec<PatchEntry> {
+    diff.files
+        .iter()
+        .filter(|file| only.is_none_or(|path| file.path == path))
+        .map(|file| patch_entry(file, budget))
+        .collect()
+}
+
+fn patch_entry(file: &FileDelta, budget: Option<usize>) -> PatchEntry {
+    let Some(unified) = file.unified_diff.as_deref() else {
+        return PatchEntry {
+            path: file.path.clone(),
+            status: file.status,
+            unified: String::new(),
+            truncated: false,
+            note: Some("binary or unreadable diff".to_string()),
+        };
+    };
+    let (unified, truncated) = match budget {
+        Some(budget) if unified.len() > budget => {
+            (truncate_at_line_boundary(unified, budget).to_string(), true)
+        }
+        _ => (unified.to_string(), false),
+    };
+    PatchEntry {
+        path: file.path.clone(),
+        status: file.status,
+        unified,
+        truncated,
+        note: None,
+    }
+}
+
+/// Cut `text` to at most `budget` bytes, preferring the last complete line so
+/// a truncated patch never ends inside a hunk line or a UTF-8 sequence.
+fn truncate_at_line_boundary(text: &str, budget: usize) -> &str {
+    let mut cut = budget.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    match text[..cut].rfind('\n') {
+        Some(newline) => &text[..=newline],
+        None => &text[..cut],
+    }
+}
+
 pub fn append_spend(state: &PipelineState, record: &SpendRecord) -> Result<()> {
     // REPORT.md: Live Context & Spend Meter is durable JSONL, not terminal-only UI.
     append_ledger_item(&state.run_root, LedgerItem::Spend(record.clone()))
@@ -723,9 +794,10 @@ mod tests {
     };
 
     use super::{
-        copy_artifact_path, copy_deliverable_tree, copy_promotable_tree, copy_tree, diff_snapshots,
-        diff_working_trees, inventory_files, inventory_recoverable_files_for_state,
-        restore_snapshot, snapshot_diff, snapshot_working,
+        FileDeltaStatus, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
+        copy_tree, diff_snapshots, diff_working_trees, inventory_files,
+        inventory_recoverable_files_for_state, patches_from_diff, restore_snapshot, snapshot_diff,
+        snapshot_working,
     };
 
     #[test]
@@ -1177,6 +1249,140 @@ mod tests {
         assert_eq!(
             fs::read_to_string(target.join("preserved.txt")).expect("preserved remains"),
             "preserved\n"
+        );
+    }
+
+    fn add_modify_remove_fixture(temp: &TempDir) -> super::DiffSummary {
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir_all(&a).expect("a");
+        fs::create_dir_all(&b).expect("b");
+        fs::write(a.join("modify.txt"), "keep\nold line\n").expect("modify a");
+        fs::write(b.join("modify.txt"), "keep\nnew line\n").expect("modify b");
+        fs::write(a.join("remove.txt"), "gone\n").expect("remove a");
+        fs::write(b.join("add.txt"), "fresh\n").expect("add b");
+        diff_snapshots(&a, &b).expect("diff")
+    }
+
+    #[test]
+    fn patches_carry_unified_hunks_for_add_modify_remove() {
+        let temp = TempDir::new().expect("tempdir");
+        let diff = add_modify_remove_fixture(&temp);
+
+        let patches = patches_from_diff(&diff, Some(super::PATCH_UNIFIED_BYTE_BUDGET), None);
+
+        assert_eq!(patches.len(), 3, "{patches:#?}");
+        let added = patches
+            .iter()
+            .find(|patch| patch.path == Path::new("add.txt"))
+            .expect("added patch");
+        assert_eq!(added.status, FileDeltaStatus::Added);
+        assert!(added.unified.contains("--- /dev/null"), "{}", added.unified);
+        assert!(added.unified.contains("+++ b/add.txt"), "{}", added.unified);
+        assert!(added.unified.contains("@@"), "{}", added.unified);
+        assert!(added.unified.contains("+fresh"), "{}", added.unified);
+        assert!(!added.truncated);
+
+        let modified = patches
+            .iter()
+            .find(|patch| patch.path == Path::new("modify.txt"))
+            .expect("modified patch");
+        assert_eq!(modified.status, FileDeltaStatus::Modified);
+        assert!(
+            modified.unified.contains("--- a/modify.txt"),
+            "{}",
+            modified.unified
+        );
+        assert!(
+            modified.unified.contains("+++ b/modify.txt"),
+            "{}",
+            modified.unified
+        );
+        assert!(
+            modified.unified.contains("-old line"),
+            "{}",
+            modified.unified
+        );
+        assert!(
+            modified.unified.contains("+new line"),
+            "{}",
+            modified.unified
+        );
+        assert!(!modified.truncated);
+
+        let removed = patches
+            .iter()
+            .find(|patch| patch.path == Path::new("remove.txt"))
+            .expect("removed patch");
+        assert_eq!(removed.status, FileDeltaStatus::Removed);
+        assert!(
+            removed.unified.contains("+++ /dev/null"),
+            "{}",
+            removed.unified
+        );
+        assert!(removed.unified.contains("-gone"), "{}", removed.unified);
+        assert!(!removed.truncated);
+    }
+
+    #[test]
+    fn patch_budget_truncates_on_a_line_boundary_and_file_selection_lifts_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir_all(&a).expect("a");
+        fs::create_dir_all(&b).expect("b");
+        let old = (0..200).map(|n| format!("line {n}\n")).collect::<String>();
+        let new = (0..200)
+            .map(|n| format!("line {n} edited\n"))
+            .collect::<String>();
+        fs::write(a.join("big.txt"), &old).expect("big a");
+        fs::write(b.join("big.txt"), &new).expect("big b");
+        let diff = diff_snapshots(&a, &b).expect("diff");
+        let full_len = diff.files[0]
+            .unified_diff
+            .as_deref()
+            .expect("unified")
+            .len();
+
+        let budgeted = patches_from_diff(&diff, Some(256), None);
+        assert_eq!(budgeted.len(), 1);
+        assert!(budgeted[0].truncated);
+        assert!(budgeted[0].unified.len() <= 256, "{}", budgeted[0].unified);
+        assert!(
+            budgeted[0].unified.ends_with('\n'),
+            "truncation must land on a line boundary: {:?}",
+            budgeted[0].unified
+        );
+
+        let selected = patches_from_diff(&diff, None, Some(Path::new("big.txt")));
+        assert_eq!(selected.len(), 1);
+        assert!(!selected[0].truncated);
+        assert_eq!(selected[0].unified.len(), full_len);
+
+        let missing = patches_from_diff(&diff, None, Some(Path::new("absent.txt")));
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn binary_patch_reports_status_with_empty_unified_body() {
+        let temp = TempDir::new().expect("tempdir");
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        fs::create_dir_all(&a).expect("a");
+        fs::create_dir_all(&b).expect("b");
+        fs::write(a.join("image.bin"), [0, 159, 146, 150]).expect("binary a");
+        fs::write(b.join("image.bin"), [0, 159, 146, 151]).expect("binary b");
+        let diff = diff_snapshots(&a, &b).expect("diff");
+
+        let patches = patches_from_diff(&diff, Some(super::PATCH_UNIFIED_BYTE_BUDGET), None);
+
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].status, FileDeltaStatus::Modified);
+        assert_eq!(patches[0].unified, "");
+        assert!(!patches[0].truncated);
+        assert_eq!(
+            patches[0].note.as_deref(),
+            Some("binary or unreadable diff")
         );
     }
 
