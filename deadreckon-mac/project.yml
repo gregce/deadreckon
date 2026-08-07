@@ -1,0 +1,47 @@
+# XcodeGen project for the deadreckon operator console.
+# Mirrors specstory-mac conventions: LSUIElement menubar-first app,
+# CODE_SIGNING_ALLOWED NO for dev builds (distribution signs via the
+# deadreckon release-trust pipeline, Developer ID 4GRQMF5T5U), local
+# SwiftPM Kit package, vendored CLI folder as bundle resources.
+name: deadreckon
+options:
+  bundleIdPrefix: com.itavero
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGN_IDENTITY: "-"
+    SWIFT_VERSION: "5.9"
+    SWIFT_STRICT_CONCURRENCY: minimal
+packages:
+  DeadreckonKit:
+    path: DeadreckonKit
+targets:
+  deadreckon:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+      - path: Resources/bin
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - package: DeadreckonKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.itavero.deadreckon
+        PRODUCT_NAME: deadreckon
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/Deadreckon.entitlements
+        ENABLE_HARDENED_RUNTIME: "NO"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+schemes:
+  deadreckon:
+    build:
+      targets:
+        deadreckon: all
+    run:
+      config: Debug
