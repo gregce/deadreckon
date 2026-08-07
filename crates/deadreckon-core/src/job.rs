@@ -141,27 +141,48 @@ impl LegacyJobView {
         terminal_failure: bool,
         updated_at: DateTime<Utc>,
     ) -> Self {
+        let (outcome, stop_reason) = legacy_outcome_and_stop_reason(phase, terminal_failure);
         Self {
             id,
             kind,
             goal,
             phase,
-            outcome: terminal_failure.then_some(JobOutcome::Failed),
-            stop_reason: (phase == JobPhase::Terminal || phase == JobPhase::Waiting)
-                .then_some(StopReason::LegacyUnknown),
+            outcome,
+            stop_reason,
             updated_at,
             precision: "legacy_snapshot".to_string(),
         }
     }
 }
 
-pub fn legacy_run_job_view(state: &PipelineState) -> LegacyJobView {
-    let (phase, failed) = match state.status {
+/// The one honest terminal classification for a legacy snapshot: `Failed` is
+/// the only outcome the old artifact can prove, and every stopped legacy job
+/// carries the explicit unknown stop reason rather than a guessed cause.
+pub fn legacy_outcome_and_stop_reason(
+    phase: JobPhase,
+    terminal_failure: bool,
+) -> (Option<JobOutcome>, Option<StopReason>) {
+    (
+        terminal_failure.then_some(JobOutcome::Failed),
+        (phase == JobPhase::Terminal || phase == JobPhase::Waiting)
+            .then_some(StopReason::LegacyUnknown),
+    )
+}
+
+/// The one RunStatus → Job-vocabulary mapping for legacy runs. Both the
+/// legacy projection and the `list --json` row labels ride this table so
+/// compatibility surfaces can never disagree about a legacy run's phase.
+pub fn legacy_run_status_phase(status: RunStatus) -> (JobPhase, bool) {
+    match status {
         RunStatus::Pending | RunStatus::Planned => (JobPhase::Queued, false),
         RunStatus::Executing => (JobPhase::Running, false),
         RunStatus::Completed | RunStatus::Killed => (JobPhase::Terminal, false),
         RunStatus::Failed => (JobPhase::Terminal, true),
-    };
+    }
+}
+
+pub fn legacy_run_job_view(state: &PipelineState) -> LegacyJobView {
+    let (phase, failed) = legacy_run_status_phase(state.status);
     LegacyJobView::new(
         state.run_id.clone(),
         LegacyJobKind::Run,

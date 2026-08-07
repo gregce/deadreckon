@@ -302,6 +302,12 @@ fn job_list_row(
 ) -> serde_json::Value {
     let projection = &view.projection;
     let (provider, sandbox) = job_provider_and_sandbox(paths, view);
+    // Glossary user words for the serialized enums below, so app translations
+    // mirror glossary.rs instead of re-authoring vocabulary. Shared with
+    // `status --json`; terminal words are withheld when the sealed receipt
+    // fails validation, so a label can never contradict
+    // `status:"verified_proof_invalid"`.
+    let (phase_label, outcome_label, stop_reason_label) = super::job::job_glossary_labels(view);
     json!({
         "job_id": view.job.job_id,
         "scope": view.job.scope,
@@ -311,6 +317,9 @@ fn job_list_row(
         "attempts": projection.attempt_count,
         "outcome": projection.outcome,
         "stop_reason": projection.stop_reason,
+        "phase_label": phase_label,
+        "outcome_label": outcome_label,
+        "stop_reason_label": stop_reason_label,
         "projection": {
             "phase": projection.phase,
             "outcome": projection.outcome,
@@ -341,6 +350,13 @@ fn job_list_row(
 /// rather than fabricated.
 fn run_list_row(run: &RunListEntry) -> serde_json::Value {
     let state = load_state(&run.state_path).ok();
+    // The sanctioned legacy projection tables (`legacy_run_status_phase`,
+    // `legacy_outcome_and_stop_reason`) map RunStatus onto the Job
+    // vocabulary; label the row through them so legacy rows and durable Job
+    // rows can never disagree about user words.
+    let (phase, terminal_failure) = deadreckon_core::legacy_run_status_phase(run.status);
+    let (outcome, stop_reason) =
+        deadreckon_core::legacy_outcome_and_stop_reason(phase, terminal_failure);
     json!({
         "run_id": &run.run_id,
         "scope": &run.scope,
@@ -348,6 +364,9 @@ fn run_list_row(run: &RunListEntry) -> serde_json::Value {
         "status": run_status_label(run.status),
         "updated_at": run.updated_at,
         "state_path": &run.state_path,
+        "phase_label": deadreckon_core::job_phase_label(phase),
+        "outcome_label": outcome.map(deadreckon_core::job_outcome_label),
+        "stop_reason_label": stop_reason.map(deadreckon_core::stop_reason_label),
         "provider": state.as_ref().and_then(|state| state.provider.clone()),
         "spend": state
             .as_ref()
@@ -1807,6 +1826,79 @@ mod tests {
     }
 
     #[test]
+    fn fleet_rollup_rows_carry_glossary_user_word_labels() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut view) = rollup_fixture(&temp);
+
+        // A live job: phase word present, terminal words honestly null.
+        let running = job_list_row(&paths, &view, Utc::now());
+        assert_eq!(
+            running["phase_label"],
+            json!(deadreckon_core::job_phase_label(JobPhase::Running))
+        );
+        assert_eq!(running["phase_label"], json!("running"));
+        assert!(running["outcome_label"].is_null(), "{running}");
+        assert!(running["stop_reason_label"].is_null(), "{running}");
+
+        // A terminal job: every label equals the glossary mapping for the
+        // serialized enum riding the same row.
+        view.projection.phase = JobPhase::Terminal;
+        view.projection.outcome = Some(JobOutcome::NeedsReview);
+        view.projection.stop_reason = Some(StopReason::SemanticUncertain);
+        let terminal = job_list_row(&paths, &view, Utc::now());
+        assert_eq!(
+            terminal["phase_label"],
+            json!(deadreckon_core::job_phase_label(JobPhase::Terminal))
+        );
+        assert_eq!(
+            terminal["outcome_label"],
+            json!(deadreckon_core::job_outcome_label(JobOutcome::NeedsReview))
+        );
+        assert_eq!(terminal["outcome_label"], json!("needs review"));
+        assert_eq!(
+            terminal["stop_reason_label"],
+            json!(deadreckon_core::stop_reason_label(
+                StopReason::SemanticUncertain
+            ))
+        );
+        assert_eq!(terminal["stop_reason_label"], json!("judge uncertain"));
+        // Additive compatibility: the serialized fields the labels translate
+        // stay untouched next to them.
+        assert_eq!(terminal["status"], json!("needs_review"));
+        assert_eq!(terminal["outcome"], json!("needs_review"));
+        assert_eq!(terminal["stop_reason"], json!("semantic_uncertain"));
+        assert_eq!(terminal["projection"]["phase"], json!("terminal"));
+    }
+
+    /// A Verified projection whose sealed receipt fails validation reports
+    /// `status:"verified_proof_invalid"` — and the glossary words must not
+    /// contradict it: the terminal labels are withheld (null) rather than
+    /// displaying "verified" for a Job whose two-key proof is broken.
+    #[test]
+    fn proof_invalid_job_rows_withhold_the_verified_glossary_words() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut view) = rollup_fixture(&temp);
+        view.projection.phase = JobPhase::Terminal;
+        view.projection.outcome = Some(JobOutcome::Verified);
+        view.projection.stop_reason = Some(StopReason::Verified);
+        view.verified_receipt_error =
+            Some("completion receipt result tree does not match".to_string());
+
+        let row = job_list_row(&paths, &view, Utc::now());
+        assert_eq!(row["status"], json!("verified_proof_invalid"));
+        assert_eq!(row["phase_label"], json!("terminal"));
+        assert!(
+            row["outcome_label"].is_null(),
+            "a broken proof must not display the word verified: {row}"
+        );
+        assert!(row["stop_reason_label"].is_null(), "{row}");
+        // The serialized enums stay untouched — decoders key on these plus
+        // `status`, and the labels are display words only.
+        assert_eq!(row["outcome"], json!("verified"));
+        assert_eq!(row["stop_reason"], json!("verified"));
+    }
+
+    #[test]
     fn fleet_rollup_distinguishes_fresh_from_stale_leases() {
         let temp = TempDir::new().expect("tempdir");
         let (paths, view) = rollup_fixture(&temp);
@@ -1977,6 +2069,7 @@ mod tests {
         // Original fields stay byte-compatible.
         assert_eq!(row["run_id"], json!(state.run_id));
         assert_eq!(row["scope"], json!(state.scope));
+        assert_eq!(row["status"], json!(run_status_label(entry.status)));
         assert_eq!(row["provider"], json!("cli:test"));
         assert_eq!(
             row["spend"],
@@ -1986,6 +2079,41 @@ mod tests {
                 "subscription": false,
                 "wall_time_seconds": 12.5,
             })
+        );
+        // Glossary labels ride the legacy projection tables: a fresh run is
+        // queued with no terminal classification to claim.
+        let (phase, failed) = deadreckon_core::legacy_run_status_phase(entry.status);
+        assert_eq!(
+            row["phase_label"],
+            json!(deadreckon_core::job_phase_label(phase))
+        );
+        assert_eq!(row["phase_label"], json!("queued"));
+        assert!(!failed);
+        assert!(row["outcome_label"].is_null(), "{row}");
+        assert!(row["stop_reason_label"].is_null(), "{row}");
+
+        // A failed legacy run claims exactly what the old artifact can prove:
+        // a failed outcome and the explicit unknown stop reason.
+        let failed_entry = RunListEntry {
+            status: deadreckon_core::RunStatus::Failed,
+            ..entry
+        };
+        let failed_row = run_list_row(&failed_entry);
+        assert_eq!(failed_row["status"], json!("failed"));
+        assert_eq!(failed_row["phase_label"], json!("terminal"));
+        assert_eq!(
+            failed_row["outcome_label"],
+            json!(deadreckon_core::job_outcome_label(JobOutcome::Failed))
+        );
+        assert_eq!(
+            failed_row["stop_reason_label"],
+            json!(deadreckon_core::stop_reason_label(
+                StopReason::LegacyUnknown
+            ))
+        );
+        assert_eq!(
+            failed_row["stop_reason_label"],
+            json!("legacy (unknown reason)")
         );
     }
 

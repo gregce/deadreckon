@@ -1633,6 +1633,7 @@ async fn main_inner() -> Result<()> {
             cleanup,
             no_confirm,
             message,
+            dry_run,
             json,
         } => {
             machine_json::arm("finish", json);
@@ -1647,6 +1648,7 @@ async fn main_inner() -> Result<()> {
                 cleanup,
                 no_confirm,
                 message,
+                dry_run,
             )
         }
         Commands::Materialize {
@@ -1891,6 +1893,7 @@ async fn main_inner() -> Result<()> {
             all,
             limit,
             receipt,
+            rerun_checks,
             json,
             plain,
             quiet,
@@ -1901,6 +1904,7 @@ async fn main_inner() -> Result<()> {
                 all,
                 limit,
                 receipt,
+                rerun_checks,
                 json,
                 plain,
                 quiet,
@@ -13734,7 +13738,17 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
     let mut child_context: Option<PlanChildSelection> = None;
     let state = match resolved {
         commands::reference::ResolvedRef::Job(job) => {
-            return commands::job::print_job_status(&job, args.json_output);
+            // APP-3 follow-up: a Single-shape job's attempt run IS the job id,
+            // so the resolver hands `show <job> --diff` the Job kind and the
+            // diff flags used to be silently dropped into the job-status
+            // envelope. Diff-shaped requests (--diff/--patch/--file/--turn)
+            // resolve the job's CURRENT attempt run — the same rule verdict's
+            // Job path uses — and fall through to the run surfaces below.
+            // Plain `show <job>` stays byte-identical.
+            if !(args.diff || args.turn.is_some() || args.file.is_some()) {
+                return commands::job::print_job_status(&job, args.json_output);
+            }
+            commands::verdict::current_attempt_state(&paths, &job)?
         }
         commands::reference::ResolvedRef::Run(state) => *state,
         commands::reference::ResolvedRef::PlanChild { selection, state } => {

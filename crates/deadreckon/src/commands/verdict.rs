@@ -16,6 +16,7 @@ pub(crate) struct VerdictArgs {
     pub(crate) all: bool,
     pub(crate) limit: Option<usize>,
     pub(crate) receipt: bool,
+    pub(crate) rerun_checks: bool,
     pub(crate) json: bool,
     pub(crate) plain: bool,
     pub(crate) quiet: bool,
@@ -26,14 +27,61 @@ pub(crate) struct VerdictArgs {
 /// P1 wires the verb and resolves the run; live re-evaluation, marker reading,
 /// `VerdictSurface` rendering, `--json`, `--all`, and the sidecar cache land in
 /// P2–P10. For now it prints a placeholder so the command is reachable.
+///
+/// A durable Job reference maps onto the job's current attempt run. Its
+/// DEFAULT behavior is the read-only receipt audit — never a check re-run —
+/// because re-executing checks against a job-owned run root is exactly what
+/// the driver fence exists to prevent. `--rerun-checks` opts into the normal
+/// re-run path, which still passes through the fence and therefore refuses
+/// publicly while the job's driver owns the run.
 pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let _ = args.plain; // applied via ui::set_plain_output at the dispatch site
     let paths = DeadreckonPaths::discover();
     if args.all {
         return verdict_all_command(&paths, args.limit.unwrap_or(10), args.json).await;
     }
-    let state =
-        crate::commands::reference::resolve_run_like(&paths, args.run_id.as_deref(), "verdict")?;
+    let resolved = crate::commands::reference::resolve_ref(
+        &paths,
+        crate::commands::reference::RefQuery {
+            reference: args.run_id.as_deref(),
+            all_scopes: false,
+            verb: "verdict",
+        },
+    )?;
+    let state = match resolved {
+        crate::commands::reference::ResolvedRef::Job(view) => {
+            if !args.rerun_checks {
+                return verdict_job_receipt_audit(&paths, &view, &args);
+            }
+            let state = current_attempt_state(&paths, &view)?;
+            // A Single-shape job's attempt run IS the job (run_id == job_id):
+            // it carries no stamped ownership and no plan/campaign reference,
+            // so the run-level fence below cannot see its owner. The
+            // artifact-level fence (the same one steer uses) closes that gap
+            // with the identical typed "belongs to durable Job" refusal.
+            if paths.job_json(&state.run_id).is_file() {
+                let owner = deadreckon_core::load_job(&paths, &state.run_id)?;
+                super::graph_job::require_current_driver_for_job_artifact(
+                    &paths,
+                    &state.run_id,
+                    owner.shape,
+                    "verdict",
+                )?;
+            }
+            state
+        }
+        crate::commands::reference::ResolvedRef::Run(state) => *state,
+        crate::commands::reference::ResolvedRef::PlanChild { state, .. } => *state,
+        // The resolver already refuses kinds outside verdict's acceptance
+        // matrix; this arm only restates that refusal for exhaustiveness.
+        other => {
+            return Err(crate::commands::reference::refusal_for(
+                other.kind(),
+                "verdict",
+                &crate::commands::reference::resolved_id(&other),
+            ));
+        }
+    };
     super::graph_job::require_current_driver_for_job_owned_run(&paths, &state, "verdict")?;
     let report = evaluate_verdict_report(&state).await?;
     // The sidecar is an additive audit artifact; a read-only filesystem must not
@@ -59,6 +107,179 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
         println!("{}", surface.render_plain(args.quiet));
     }
     Ok(())
+}
+
+/// The job's current attempt run: `projection.json` `child_run_ids`, newest
+/// last — the same rule the fleet rollup and the mac app's Chartroom use. A
+/// job with no linked attempt falls back to its own run id, which is how a
+/// Single-shape job names its one attempt (supervisor.rs stamps run_id =
+/// job_id). `show`'s diff surfaces (G10) share this resolution so a Job ref
+/// and a run ref can never disagree about which attempt is "current".
+pub(crate) fn current_attempt_state(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+) -> Result<deadreckon_core::PipelineState> {
+    let run_id = view
+        .projection
+        .child_run_ids
+        .last()
+        .map(String::as_str)
+        .unwrap_or(view.job.job_id.as_ref());
+    match deadreckon_core::load_run(paths, run_id) {
+        Ok(state) => Ok(state),
+        Err(deadreckon_core::DeadreckonError::NotFound(_)) => {
+            Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "job {} has no attempt run to verify yet",
+                    run_prefix(view.job.job_id.as_ref())
+                ),
+                &format!("deadreckon status {}", run_prefix(view.job.job_id.as_ref())),
+            )))
+        }
+        Err(error) => Err(CliError::Core(error)),
+    }
+}
+
+/// Read-only inspection of a durable Job: audit the recorded proofs of its
+/// current attempt run without re-running checks.
+///
+/// DRIVER-FENCE CARVE-OUT (G7 follow-up). This path deliberately does NOT call
+/// `require_current_driver_for_job_owned_run`, and that is sound only because
+/// it performs reads and nothing else:
+///   - the signed acceptance marker is read and its signature validated
+///     (`legacy_signature_fact` — a pure read, never a rewrite);
+///   - the completion receipt is audited fact by fact
+///     (`audit_completion_receipt` — reads exactly what the strict validator
+///     reads; promotion still runs the strict fail-closed path);
+///   - the verdict sidecar is SKIPPED, not written best-effort: the run root
+///     belongs to the job's driver, so inspection must leave it byte-identical
+///     (`paths.cache` reads `null` in the envelope to say so).
+/// Every path that re-runs checks or writes run-root artifacts — including
+/// `verdict <job> --rerun-checks`, which maps onto this same attempt run —
+/// still goes through the fence and keeps its typed public refusal.
+fn verdict_job_receipt_audit(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+    args: &VerdictArgs,
+) -> Result<()> {
+    let state = current_attempt_state(paths, view)?;
+    let (had_signed_marker, marker_valid) = legacy_signature_fact(&state);
+    let audit = deadreckon_core::audit_completion_receipt(paths, &state);
+    // The same decision rule as `compute_verdict`, with "every receipt audit
+    // fact passes NOW" standing in for the check re-run: this path re-validates
+    // recorded proofs (signatures, digests), it does not re-execute checks.
+    let status = compute_verdict(had_signed_marker, marker_valid, audit.passed());
+    let surface = render_job_audit_surface(view, status, &audit);
+    if args.json {
+        let envelope = verdict_job_audit_json(
+            view,
+            &state,
+            status,
+            had_signed_marker,
+            marker_valid,
+            &audit,
+            &surface.primary_action.command,
+        );
+        println!("{}", serde_json::to_string_pretty(&envelope)?);
+    } else {
+        println!("{}", surface.render_plain(args.quiet));
+    }
+    Ok(())
+}
+
+/// The machine envelope for a Job-reference verdict: the run envelope's shape
+/// plus `job_id`, `mode:"receipt_audit"`, and `checks_rerun:false`. `checks`
+/// is always empty (nothing was re-executed) and `paths.cache` is always
+/// `null` (no sidecar is written into the driver-owned run root).
+fn verdict_job_audit_json(
+    view: &deadreckon_core::JobView,
+    state: &deadreckon_core::PipelineState,
+    status: VerdictState,
+    had_signed_marker: bool,
+    marker_valid: bool,
+    audit: &deadreckon_core::ReceiptAudit,
+    primary_command: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "verdict",
+        "id": state.run_id,
+        "job_id": view.job.job_id.as_ref(),
+        "mode": "receipt_audit",
+        "checks_rerun": false,
+        "status": status,
+        "checks": Vec::<serde_json::Value>::new(),
+        "had_signed_marker": had_signed_marker,
+        "marker_valid": marker_valid,
+        "receipt_audit": { "facts": &audit.facts },
+        "next_actions": [primary_command],
+        "try_lines": Vec::<String>::new(),
+        "paths": {
+            "run_root": state.run_root,
+            "marker": deadreckon_core::gate::marker_path_for_run_root(&state.run_root),
+            "cache": serde_json::Value::Null,
+        },
+    })
+}
+
+/// Render the Job-reference audit as a `VerdictSurface`: one label over the
+/// receipt facts, and one next action. The wording says "recorded proofs",
+/// never "re-running checks" — nothing was re-executed on this path.
+fn render_job_audit_surface(
+    view: &deadreckon_core::JobView,
+    status: VerdictState,
+    audit: &deadreckon_core::ReceiptAudit,
+) -> VerdictSurface {
+    let passed = audit.facts.iter().filter(|fact| fact.pass).count();
+    let total = audit.facts.len();
+    let kind = match status {
+        VerdictState::Verified => VerdictKind::Verified,
+        VerdictState::Regressed => VerdictKind::Failed,
+        VerdictState::Unverified => VerdictKind::Noop,
+    };
+    let what_happened = match status {
+        VerdictState::Verified => {
+            "This job's recorded proofs — signed marker and completion receipt — validate now."
+        }
+        VerdictState::Regressed => {
+            "This job's recorded proofs no longer validate — a signature or digest broke."
+        }
+        VerdictState::Unverified => {
+            "This job's current attempt has no signed marker; its proofs were audited read-only."
+        }
+    };
+    let why_this_verdict = match status {
+        VerdictState::Verified => "Valid signed marker, and every receipt audit fact passes now.",
+        VerdictState::Regressed => "The signed marker or a receipt audit fact fails validation.",
+        VerdictState::Unverified => {
+            "Checks were NOT re-run: a job's run root belongs to its driver."
+        }
+    };
+    let mut evidence = vec![(
+        "receipt facts".to_string(),
+        format!("{passed}/{total} passed"),
+    )];
+    for fact in audit.facts.iter().take(6) {
+        let mark = if fact.pass { "pass" } else { "FAIL" };
+        evidence.push((format!("fact · {mark}"), fact.name.clone()));
+    }
+
+    let short = run_prefix(view.job.job_id.as_ref());
+    let command = match status {
+        VerdictState::Verified => format!("deadreckon finish {short}"),
+        _ => format!("deadreckon status {short}"),
+    };
+    let explanation = ExplanationPanel::new(what_happened, why_this_verdict, evidence);
+    VerdictSurface::must_new(
+        kind,
+        "job",
+        Some(view.job.job_id.as_ref()),
+        explanation,
+        [("Recommended", command)],
+        [
+            ("Inspect", format!("deadreckon show {short}")),
+            ("Report", format!("deadreckon report {short}")),
+        ],
+    )
 }
 
 /// A one-row verdict summary for the `--all` comparison.
@@ -1156,6 +1377,189 @@ mod tests {
         assert_eq!(
             status_before, after.status,
             "verdict must never advance or mutate run status"
+        );
+    }
+
+    // ---- G7 follow-up (APP-3): JOB refs map to the current attempt and
+    // ---- default to the read-only receipt audit ----
+
+    fn job_view_for(
+        job_id: &str,
+        scope: &str,
+        source_cwd: &std::path::Path,
+        child_run_ids: Vec<String>,
+    ) -> deadreckon_core::JobView {
+        use deadreckon_protocol::{
+            Job, JobId, JobPhase, JobPolicy, JobSchemaVersion, JobShape, SemanticJudgeMode,
+        };
+        let id = JobId(job_id.to_string());
+        deadreckon_core::JobView {
+            projection: deadreckon_core::JobProjection {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: id.clone(),
+                phase: JobPhase::Running,
+                outcome: None,
+                stop_reason: None,
+                last_sequence: 1,
+                current_lease_epoch: 0,
+                attempt_count: child_run_ids.len() as u32,
+                child_run_ids,
+                delivery: None,
+                last_gate_attempt: None,
+                updated_at: Some(chrono::Utc::now()),
+                caveats: Vec::new(),
+            },
+            job: Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: id,
+                scope: scope.to_string(),
+                goal: "job audit fixture".to_string(),
+                shape: JobShape::Single,
+                created_at: chrono::Utc::now(),
+                source_cwd: source_cwd.to_path_buf(),
+                launch_plan_sha256: "fixture-launch-plan".to_string(),
+                authority_sha256: "fixture-authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 60,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+            attempts: Vec::new(),
+            missing_attempts: Vec::new(),
+            verified_receipt_error: None,
+        }
+    }
+
+    #[test]
+    fn job_ref_maps_to_the_newest_linked_attempt() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "attempt-run-0001", &repo);
+        fixture_run(&paths, "attempt-run-0002", &repo);
+        let view = job_view_for(
+            "job-mapping-0001",
+            "scope",
+            &repo,
+            vec![
+                "attempt-run-0001".to_string(),
+                "attempt-run-0002".to_string(),
+            ],
+        );
+
+        // `child_run_ids` is newest-last (the same rule the fleet rollup and
+        // the mac app's Chartroom use), so the current attempt is the last.
+        let state = current_attempt_state(&paths, &view).expect("current attempt");
+        assert_eq!(state.run_id, "attempt-run-0002");
+    }
+
+    #[test]
+    fn single_job_without_linked_children_falls_back_to_its_own_run() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        // A Single-shape job's attempt run IS the job id (supervisor.rs stamps
+        // run_id = job_id), so an empty child list still names one run.
+        fixture_run(&paths, "single-job-run-0001", &repo);
+        let view = job_view_for("single-job-run-0001", "scope", &repo, Vec::new());
+
+        let state = current_attempt_state(&paths, &view).expect("backing run");
+        assert_eq!(state.run_id, "single-job-run-0001");
+    }
+
+    #[test]
+    fn job_without_any_attempt_run_refuses_toward_status() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let view = job_view_for("job-no-attempt-01", "scope", &repo, Vec::new());
+
+        let error = current_attempt_state(&paths, &view).expect_err("no attempt run");
+        let message = error.to_string();
+        assert!(
+            message.contains("has no attempt run to verify yet"),
+            "{message}"
+        );
+        assert!(message.contains("deadreckon status"), "{message}");
+    }
+
+    #[test]
+    fn job_audit_envelope_is_inspection_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "job-audit-run-0001", &repo);
+        let view = job_view_for(
+            "job-audit-job-0001",
+            "scope",
+            &repo,
+            vec!["job-audit-run-0001".to_string()],
+        );
+        let state = current_attempt_state(&paths, &view).expect("attempt");
+        let (had_signed_marker, marker_valid) = legacy_signature_fact(&state);
+        let audit = deadreckon_core::audit_completion_receipt(&paths, &state);
+        let status = compute_verdict(had_signed_marker, marker_valid, audit.passed());
+        let surface = render_job_audit_surface(&view, status, &audit);
+
+        let envelope = verdict_job_audit_json(
+            &view,
+            &state,
+            status,
+            had_signed_marker,
+            marker_valid,
+            &audit,
+            &surface.primary_action.command,
+        );
+
+        assert_eq!(envelope["kind"], "verdict");
+        assert_eq!(envelope["id"], "job-audit-run-0001");
+        assert_eq!(envelope["job_id"], "job-audit-job-0001");
+        assert_eq!(envelope["mode"], "receipt_audit");
+        // Nothing is re-executed and nothing is written: checks stay empty and
+        // the sidecar slot reads null — the run root belongs to the driver.
+        assert_eq!(envelope["checks_rerun"], false);
+        assert_eq!(envelope["checks"], serde_json::json!([]));
+        assert_eq!(envelope["paths"]["cache"], serde_json::Value::Null);
+        // No marker and no receipt → honest Unverified, never Verified.
+        assert_eq!(envelope["status"], "unverified");
+        let facts = envelope["receipt_audit"]["facts"]
+            .as_array()
+            .expect("facts array");
+        assert_eq!(facts[0]["name"], "receipt_document");
+        assert_eq!(facts[0]["pass"], false);
+    }
+
+    #[test]
+    fn job_audit_surface_speaks_of_proofs_not_rerun_checks() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "job-surface-run-0001", &repo);
+        let view = job_view_for(
+            "job-surface-job-0001",
+            "scope",
+            &repo,
+            vec!["job-surface-run-0001".to_string()],
+        );
+        let state = current_attempt_state(&paths, &view).expect("attempt");
+        let audit = deadreckon_core::audit_completion_receipt(&paths, &state);
+        let surface = render_job_audit_surface(&view, VerdictState::Unverified, &audit);
+
+        let rendered = surface.render_plain(false);
+        assert!(rendered.contains("NOT re-run"), "{rendered}");
+        assert!(
+            surface.primary_action.command.contains("deadreckon status"),
+            "{}",
+            surface.primary_action.command
         );
     }
 

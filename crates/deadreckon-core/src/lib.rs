@@ -87,10 +87,10 @@ pub use completion::{
 };
 pub use delivery::{
     GitDeliveryTarget, JobOperationLock, ValidatedAppliedGitDeliveryReceipt,
-    ValidatedGitDeliveryIntent, acquire_job_operation_lock, seal_applied_git_delivery_receipt,
-    seal_git_delivery_intent, validate_applied_git_delivery_receipt,
-    validate_applied_git_delivery_receipt_snapshot, validate_git_delivery_intent,
-    validate_git_delivery_intent_snapshot,
+    ValidatedGitDeliveryIntent, acquire_job_operation_lock, probe_job_operation_lock,
+    seal_applied_git_delivery_receipt, seal_git_delivery_intent,
+    validate_applied_git_delivery_receipt, validate_applied_git_delivery_receipt_snapshot,
+    validate_git_delivery_intent, validate_git_delivery_intent_snapshot,
 };
 pub use docs::{
     AS_BUILT_DELTA, DOCS_DIR, DocKind, DocsStatus, FileChange, FrontmatterFields,
@@ -137,14 +137,15 @@ pub use gate::{
 };
 pub use glossary::{
     NOUN_CHAIN, NOUN_CHILD, NOUN_PLAN, NOUN_RUN, StatusLabel, chain_status_label,
-    chain_step_status_label, phase_status_label, plan_status_label, plan_task_status_label,
-    run_status_label, status_label,
+    chain_step_status_label, job_outcome_label, job_phase_label, phase_status_label,
+    plan_status_label, plan_task_status_label, run_status_label, status_label, stop_reason_label,
 };
 pub use job::{
     JOB_CONTROL_LOCK, JOB_EVENTS_JSONL, JOB_JSON, JOB_PROJECTION_JSON, JobDelivery,
     JobDeliveryKind, JobHistory, JobLastGateAttempt, JobProjection, JobView, LegacyJobKind,
     LegacyJobView, append_job_event, legacy_campaign_job_view, legacy_chain_job_view,
-    legacy_plan_job_view, legacy_run_job_view, load_job, load_job_projection, read_job_history,
+    legacy_outcome_and_stop_reason, legacy_plan_job_view, legacy_run_job_view,
+    legacy_run_status_phase, load_job, load_job_projection, read_job_history,
     rebuild_job_projection, reduce_job_history, write_job,
 };
 pub use job_lease::{
@@ -181,7 +182,10 @@ pub use polish_subcalls::{
     DEFAULT_DOC_POLISH_TOKEN_BUDGET, DEFAULT_DOC_SUBSKILLS, DocProviderSelection,
     DocProviderSource, PolishDiffCoverage, PolishSubcallRecord,
 };
-pub use promotion::{PromotionManifest, promote_completed_run, recover_promotion};
+pub use promotion::{
+    PromotionManifest, PromotionPreview, StagedPreviewFile, promote_completed_run,
+    recover_promotion, stage_promotion_preview,
+};
 pub use run_view::{
     Artifact, CheckOutcome, ExchangeRef, Money, ProofBand, RunIdentity, RunView, RunViewDocKind,
     SandboxEvent, SandboxFact, SignatureFact, SignatureStatus, SpendBand, TurnView, VerdictBand,

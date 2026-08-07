@@ -113,6 +113,7 @@ crate: deadreckon-core
   delivery::acquire_job_operation_lock
   delivery::GitDeliveryTarget
   delivery::JobOperationLock
+  delivery::probe_job_operation_lock
   delivery::seal_applied_git_delivery_receipt
   delivery::seal_git_delivery_intent
   delivery::validate_applied_git_delivery_receipt
@@ -250,6 +251,8 @@ crate: deadreckon-core
   gate::write_native_acceptance_marker_with_results_and_key
   glossary::chain_status_label
   glossary::chain_step_status_label
+  glossary::job_outcome_label
+  glossary::job_phase_label
   glossary::NOUN_CHAIN
   glossary::NOUN_CHILD
   glossary::NOUN_PLAN
@@ -260,6 +263,7 @@ crate: deadreckon-core
   glossary::run_status_label
   glossary::status_label
   glossary::StatusLabel
+  glossary::stop_reason_label
   job::append_job_event
   job::JOB_CONTROL_LOCK
   job::JOB_EVENTS_JSONL
@@ -273,8 +277,10 @@ crate: deadreckon-core
   job::JobView
   job::legacy_campaign_job_view
   job::legacy_chain_job_view
+  job::legacy_outcome_and_stop_reason
   job::legacy_plan_job_view
   job::legacy_run_job_view
+  job::legacy_run_status_phase
   job::LegacyJobKind
   job::LegacyJobView
   job::load_job
@@ -372,7 +378,10 @@ crate: deadreckon-core
   polish_subcalls::PolishSubcallRecord
   promotion::promote_completed_run
   promotion::PromotionManifest
+  promotion::PromotionPreview
   promotion::recover_promotion
+  promotion::stage_promotion_preview
+  promotion::StagedPreviewFile
   run_view::Artifact
   run_view::CheckOutcome
   run_view::ExchangeRef

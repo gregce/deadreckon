@@ -181,10 +181,15 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
         verb: "cleanup",
         accepts: RefKinds::JOB.union(RUN_LIKE),
     },
-    // A verdict describes one gated run, so plans and chains redirect.
+    // A verdict describes one gated run, so plans and chains redirect. A
+    // durable Job ref is accepted for READ-ONLY inspection: it maps onto the
+    // job's current attempt run (`projection.json` `child_run_ids`, newest
+    // last; a Single-shape job's attempt run IS the job id), where verdict
+    // audits recorded proofs without re-running checks — see
+    // `verdict::verdict_job_receipt_audit` for the driver-fence carve-out.
     VerbRefSpec {
         verb: "verdict",
-        accepts: RUN_LIKE,
+        accepts: RefKinds::JOB.union(RUN_LIKE),
     },
     VerbRefSpec {
         verb: "report",

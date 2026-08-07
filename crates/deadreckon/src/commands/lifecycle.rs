@@ -112,9 +112,25 @@ pub(crate) fn finish_command(
     cleanup: bool,
     no_confirm: bool,
     message: Option<String>,
+    dry_run: bool,
 ) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     let requested = run_id.unwrap_or_else(|| "latest".to_string());
+    if dry_run {
+        // Gap G4: the report-only preview routes away before any mutation
+        // path — no plan-doc materialization, no export, no git apply.
+        return finish_dry_run_command(
+            &paths,
+            &requested,
+            &FinishPlanRequest {
+                dest,
+                strategy,
+                branch,
+                force,
+                include_manifest,
+            },
+        );
+    }
     let resolved = super::reference::resolve_ref(
         &paths,
         super::reference::RefQuery {
@@ -304,6 +320,18 @@ pub(crate) fn finish_job_state(
     paths: &DeadreckonPaths,
     job: &deadreckon_core::JobView,
 ) -> Result<deadreckon_core::PipelineState> {
+    require_verified_job_outcome(job)?;
+    validate_sealed_job_receipt_document(paths, job)?;
+    let state = load_run(paths, job.job.job_id.as_ref())?;
+    deadreckon_core::validate_completion_receipt(paths, &state)?;
+    Ok(state)
+}
+
+/// The finish gate on the Job projection: only a Verified outcome with a
+/// Verified stop reason has a deliverable receipt at all. This is a target
+/// readiness refusal, not a proof failure — `finish --dry-run` refuses it the
+/// same way the real finish does instead of reporting a blocked plan.
+fn require_verified_job_outcome(job: &deadreckon_core::JobView) -> Result<()> {
     if job.projection.outcome != Some(deadreckon_protocol::JobOutcome::Verified)
         || job.projection.stop_reason != Some(deadreckon_protocol::StopReason::Verified)
     {
@@ -316,6 +344,15 @@ pub(crate) fn finish_job_state(
             &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
         )));
     }
+    Ok(())
+}
+
+/// The sealed receipt document checks finish runs before consulting run
+/// state: present, readable, and proving contained execution.
+fn validate_sealed_job_receipt_document(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_core::JobView,
+) -> Result<()> {
     let receipt_path = paths.job_receipt(job.job.job_id.as_ref());
     let receipt_raw = fs::read(&receipt_path).map_err(|_| {
         CliError::Core(deadreckon_core::user_error(
@@ -339,9 +376,689 @@ pub(crate) fn finish_job_state(
             &format!("deadreckon attach {}", run_prefix(job.job.job_id.as_ref())),
         )));
     }
-    let state = load_run(paths, job.job.job_id.as_ref())?;
-    deadreckon_core::validate_completion_receipt(paths, &state)?;
-    Ok(state)
+    Ok(())
+}
+
+/// Options that shape the reported `finish --dry-run` destination. Mirrors
+/// the real finish routing inputs — including `--overwrite` (which lifts the
+/// non-empty-destination refusal there and here) and `--include-manifest`
+/// (which decides whether the delivered set keeps `manifest.json`) — so the
+/// previewed delivery is the one the recommended command performs.
+/// Confirmation flags stay irrelevant because a preview mutates nothing.
+pub(crate) struct FinishPlanRequest {
+    pub(crate) dest: Option<PathBuf>,
+    pub(crate) strategy: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) force: bool,
+    pub(crate) include_manifest: bool,
+}
+
+/// Which validation authority backs the dry-run's completion proof.
+enum FinishPlanTarget {
+    Job(Box<deadreckon_core::JobView>),
+    Run,
+}
+
+/// Gap G4: `finish <id> --dry-run` — strict receipt validation (or legacy
+/// marker validation), capture-policy staging into scratch, and a
+/// machine-readable `finish_plan` manifest, with zero library or working-dir
+/// mutation. Blocked completion proofs are reported inside the plan
+/// (`status:"blocked"`, `receipt.validated:false` + `receipt.error`); target
+/// readiness failures (unknown id, active operation lock, non-completed run,
+/// unverified Job, missing library) keep the normal fail-closed refusal and
+/// its G1 error envelope semantics.
+fn finish_dry_run_command(
+    paths: &DeadreckonPaths,
+    requested: &str,
+    request: &FinishPlanRequest,
+) -> Result<()> {
+    let (plan, surface) = build_finish_plan(paths, requested, request)?;
+    if machine_json::active().is_some() {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!("{}", surface.render_plain(false));
+    }
+    Ok(())
+}
+
+fn build_finish_plan(
+    paths: &DeadreckonPaths,
+    requested: &str,
+    request: &FinishPlanRequest,
+) -> Result<(Value, VerdictSurface)> {
+    let resolved = super::reference::resolve_ref(
+        paths,
+        super::reference::RefQuery {
+            reference: Some(requested),
+            all_scopes: false,
+            verb: "finish",
+        },
+    )?;
+    // Report-only lock discipline: the operation lock is probed, never
+    // created. A held lock raises the exact refusal the real verbs raise;
+    // when the lock file exists and is free, the probe holds it for the
+    // preview's duration. An ABSENT lock file proves only that no holder
+    // existed at probe time — nothing is held afterwards, and a real finish
+    // may create-and-lock mid-preview. That slack is safe because this
+    // preview is read-only: the worst case under a concurrent mutator is a
+    // torn report, never unsafe reuse, and creating the lock file here would
+    // write into the store this preview promises to leave byte-identical.
+    let _operation_lock;
+    let (state, target, plan_route) = match resolved {
+        super::reference::ResolvedRef::Job(job) => {
+            let job_id = job.job.job_id.as_ref().to_string();
+            _operation_lock = deadreckon_core::probe_job_operation_lock(paths, &job_id)?;
+            let job = deadreckon_core::JobView::load(paths, &job_id)?;
+            require_verified_job_outcome(&job)?;
+            let state = load_run(paths, &job_id)?;
+            (state, FinishPlanTarget::Job(Box::new(job)), None)
+        }
+        super::reference::ResolvedRef::Run(state)
+        | super::reference::ResolvedRef::PlanChild { state, .. } => {
+            let state = *state;
+            super::graph_job::require_current_driver_for_job_owned_run(paths, &state, "finish")?;
+            _operation_lock = deadreckon_core::probe_job_operation_lock(paths, &state.run_id)?;
+            (state, FinishPlanTarget::Run, None)
+        }
+        super::reference::ResolvedRef::Plan(plan) => {
+            let plan_id = plan.plan_id.clone();
+            let Some(result) = resolve_plan_result_run(paths, &plan_id, "finish")? else {
+                return Err(super::reference::refusal_for(
+                    super::reference::RefKind::Plan,
+                    "finish",
+                    &plan_id,
+                ));
+            };
+            super::graph_job::require_current_driver_for_job_owned_run(
+                paths,
+                &result.state,
+                "finish",
+            )?;
+            _operation_lock =
+                deadreckon_core::probe_job_operation_lock(paths, &result.state.run_id)?;
+            (result.state, FinishPlanTarget::Run, Some(result.plan))
+        }
+        other => {
+            return Err(super::reference::refusal_for(
+                other.kind(),
+                "finish",
+                &super::reference::resolved_id(&other),
+            ));
+        }
+    };
+    // The same completed-status gate as the real finish (a hard refusal).
+    match state.status {
+        RunStatus::Completed => {}
+        RunStatus::Pending | RunStatus::Planned | RunStatus::Executing => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("run {} is still {}", state.run_id, state.status),
+                &format!("deadreckon attach {}", run_prefix(&state.run_id)),
+            )));
+        }
+        RunStatus::Failed | RunStatus::Killed => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("run {} is {}", state.run_id, state.status),
+                &format!("deadreckon resume {}", run_prefix(&state.run_id)),
+            )));
+        }
+    }
+    let record = lifecycle_codebase_record(paths, &state)?;
+    let mode = record.mode;
+    let destination =
+        finish_plan_destination(paths, &state, &record, plan_route.as_ref(), request)?;
+    let destination_kind = destination["kind"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string();
+
+    // The completion proof. Job targets and strict runs — a Job control
+    // directory exists for the run id, the exact keying promotion's
+    // `is_strict_job` uses, so this check and the staging validation below
+    // can never disagree — must present a valid two-key receipt; failures
+    // block the plan. An UNOWNED legacy run mirrors the real finish, which
+    // delivers through `MaterializeDeliveryAuthority::LegacyUnowned` without
+    // validating any proof: its signed acceptance marker is reported as
+    // EVIDENCE in `receipt.{validated,error}` but never blocks the plan.
+    let proof = validate_finish_plan_completion_proof(paths, &state, &target);
+    let receipt_validated = proof.validated;
+    let receipt_result_tree = proof.receipt_result_tree_sha256;
+    let evidence_error = proof.evidence_error;
+    let mut block_error = proof.block_error;
+
+    // Delivery-readiness pre-flight, so a "deliverable" plan never claims a
+    // delivery the real finish would refuse. For an export destination this
+    // is the real path's non-empty-destination refusal (`--overwrite` lifts
+    // it there and here); for a worktree apply it is the read-only slice of
+    // the real apply's refusals.
+    if block_error.is_none()
+        && destination_kind == "materialize"
+        && !request.force
+        && let Some(path) = destination["path"].as_str()
+    {
+        let dest = PathBuf::from(path);
+        if path_lexically_present(&dest)? && !path_is_empty_dir(&dest)? {
+            block_error = Some(format!(
+                "dest {} is not empty (use --overwrite or pass a fresh path)",
+                dest.display()
+            ));
+        }
+    }
+    if block_error.is_none()
+        && destination_kind == "apply"
+        && plan_route.is_none()
+        && mode == CodebaseMode::Worktree
+        && let Some(git_root) = destination["path"].as_str().map(PathBuf::from)
+    {
+        block_error =
+            finish_plan_apply_preflight(paths, &state, &record, &target, request, &git_root);
+    }
+
+    // Staging happens only for export destinations — the real export is the
+    // only finish route that publishes a staged file set. An apply delivers
+    // git commits (its `result_tree_sha256` is the receipt-bound digest for
+    // Job targets, null for legacy worktree runs) and an in-place finish is
+    // a guidance no-op, so both report `staged: []` and no diffstat instead
+    // of a file list the delivery would never ship.
+    let mut staged: Vec<deadreckon_core::StagedPreviewFile> = Vec::new();
+    let mut diffstat: Option<deadreckon_core::DiffSummary> = None;
+    let mut result_tree_sha256 = None;
+    if block_error.is_none() {
+        if destination_kind == "materialize" {
+            match stage_finish_preview(paths, &state) {
+                Ok((preview, diff)) => {
+                    staged = preview.staged;
+                    // The default real export removes `manifest.json`; only
+                    // `--include-manifest` delivers it, so only then does the
+                    // preview list it.
+                    if !request.include_manifest {
+                        staged.retain(|file| file.path != Path::new("manifest.json"));
+                    }
+                    result_tree_sha256 = Some(preview.result_tree_sha256);
+                    diffstat = diff;
+                }
+                // A staging failure blocks the plan the same way the real
+                // promotion would fail closed; `receipt.validated` stays honest
+                // about the proof while `receipt.error` carries the blocker.
+                Err(error) => block_error = Some(error.to_string()),
+            }
+        } else if destination_kind == "apply" {
+            result_tree_sha256 = receipt_result_tree;
+        }
+    }
+
+    let prefix = run_prefix(&state.run_id);
+    let irreversible_steps: &[&str] = if destination_kind == "in-place" {
+        // The real in-place finish stages nothing, publishes nothing, and is
+        // a pure guidance no-op — there is nothing irreversible to preview.
+        &[]
+    } else {
+        &["publish", "cleanup"]
+    };
+    let recommended = recommended_finish_plan_command(&prefix, &destination, request);
+    let surface = match block_error.as_deref() {
+        None => deliverable_finish_plan_surface(
+            &prefix,
+            mode,
+            &destination,
+            &destination_kind,
+            staged.len(),
+            diffstat.as_ref(),
+            result_tree_sha256.as_deref(),
+            irreversible_steps,
+            &recommended,
+        ),
+        Some(error) => blocked_finish_plan_surface(&prefix, mode, error),
+    };
+    let mut next_actions = vec![surface.primary_action.command.clone()];
+    next_actions.extend(
+        surface
+            .secondary_actions
+            .iter()
+            .map(|action| action.command.clone()),
+    );
+    let status = if block_error.is_none() {
+        "deliverable"
+    } else {
+        "blocked"
+    };
+    let receipt_error = block_error.or(evidence_error);
+    let plan = json!({
+        "kind": "finish_plan",
+        "id": state.run_id,
+        "status": status,
+        "receipt": {
+            "validated": receipt_validated,
+            "error": receipt_error,
+        },
+        "mode": mode.to_string(),
+        "destination": destination,
+        "staged": staged,
+        // Null when there is no baseline to diff against (no frozen turn-0
+        // snapshot) or the mode stages nothing — distinguishable from a
+        // genuine "nothing changed", which reports zeros.
+        "diffstat": diffstat.map(|diff| json!({
+            "files_changed": diff.files_changed,
+            "added": diff.added,
+            "removed": diff.removed,
+        })),
+        "result_tree_sha256": result_tree_sha256,
+        "irreversible_steps": irreversible_steps,
+        "next_actions": next_actions,
+    });
+    Ok((surface.add_to_json(plan), surface))
+}
+
+/// The dry-run's completion-proof report: what validated, what blocks the
+/// plan, and what rides along as evidence only.
+struct FinishPlanProof {
+    validated: bool,
+    /// A proof failure the real finish would also refuse — blocks the plan.
+    block_error: Option<String>,
+    /// A legacy marker failure on an unowned run — reported, never blocking,
+    /// because the real finish validates nothing for `LegacyUnowned`.
+    evidence_error: Option<String>,
+    /// The sealed receipt's bound result tree, for apply-mode plans that
+    /// stage nothing.
+    receipt_result_tree_sha256: Option<String>,
+}
+
+fn validate_finish_plan_completion_proof(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    target: &FinishPlanTarget,
+) -> FinishPlanProof {
+    let strict =
+        matches!(target, FinishPlanTarget::Job(_)) || paths.job_dir(&state.run_id).is_dir();
+    if strict {
+        let proof = if let FinishPlanTarget::Job(job) = target {
+            validate_sealed_job_receipt_document(paths, job).and_then(|()| {
+                deadreckon_core::validate_completion_receipt(paths, state).map_err(CliError::Core)
+            })
+        } else {
+            deadreckon_core::validate_completion_receipt(paths, state).map_err(CliError::Core)
+        };
+        return match proof {
+            Ok(receipt) => FinishPlanProof {
+                validated: true,
+                block_error: None,
+                evidence_error: None,
+                receipt_result_tree_sha256: Some(receipt.result_tree_sha256),
+            },
+            Err(error) => FinishPlanProof {
+                validated: false,
+                block_error: Some(error.to_string()),
+                evidence_error: None,
+                receipt_result_tree_sha256: None,
+            },
+        };
+    }
+    match deadreckon_core::validate_acceptance_marker(state) {
+        Ok(_) => FinishPlanProof {
+            validated: true,
+            block_error: None,
+            evidence_error: None,
+            receipt_result_tree_sha256: None,
+        },
+        Err(error) => FinishPlanProof {
+            validated: false,
+            block_error: None,
+            evidence_error: Some(error.to_string()),
+            receipt_result_tree_sha256: None,
+        },
+    }
+}
+
+/// Read-only mirror of the refusals the real worktree `apply` raises before
+/// touching Git, so an apply-mode plan never reports "deliverable" for a
+/// delivery the real finish would refuse. Returns the blocking message, if
+/// any. The Job-only checks mirror the verified delivery path exactly; the
+/// deeper reconciliation validations (signed revision topology, applied
+/// receipt binding) still run only in the real finish — they can pass or
+/// fail only against the live Git mutation they validate.
+fn finish_plan_apply_preflight(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    target: &FinishPlanTarget,
+    request: &FinishPlanRequest,
+    git_root: &Path,
+) -> Option<String> {
+    let Some(branch) = record.branch_name.as_deref() else {
+        // The same corrupt-record refusal the real apply raises.
+        return Some("missing branch_name".to_string());
+    };
+    if let Err(error) = refuse_non_deliverable_result_history(state, record, git_root, branch) {
+        return Some(error.to_string());
+    }
+    if !matches!(target, FinishPlanTarget::Job(_)) {
+        // The legacy worktree apply runs none of the verified-path checks.
+        return None;
+    }
+    let strategy = match git_delivery_strategy(&request.strategy) {
+        Ok(strategy) => strategy,
+        Err(error) => return Some(error.to_string()),
+    };
+    if let Err(error) = refuse_in_progress_git_operation(git_root) {
+        return Some(error.to_string());
+    }
+    let observed = match deadreckon_core::GitDeliveryTarget::inspect(git_root) {
+        Ok(observed) => observed,
+        Err(error) => return Some(error.to_string()),
+    };
+    if let Some(requested) = request.branch.as_deref() {
+        let requested = if requested.starts_with("refs/heads/") {
+            requested.to_string()
+        } else {
+            format!("refs/heads/{requested}")
+        };
+        if requested != observed.target_ref {
+            return Some(format!(
+                "verified Job finish requested target {requested}, but the checkout is attached to {}",
+                observed.target_ref
+            ));
+        }
+    }
+    // Read-only slice of the delivery reconciliation: a recorded applied
+    // receipt (or a matching intent) reconciles idempotently in the real
+    // path and does not block, but an intent naming a different repository,
+    // ref, or strategy is a refusal there and a blocker here.
+    let job_id = &state.run_id;
+    if !paths.job_applied_delivery_receipt(job_id).exists()
+        && paths.job_delivery_intent(job_id).exists()
+    {
+        match deadreckon_core::validate_git_delivery_intent(paths, job_id) {
+            Ok(intent) => {
+                if intent.repository != observed.repository
+                    || intent.target_ref != observed.target_ref
+                    || intent.strategy != strategy
+                {
+                    return Some(format!(
+                        "signed delivery intent for Job {job_id} names a different repository, ref, or strategy"
+                    ));
+                }
+            }
+            Err(error) => return Some(error.to_string()),
+        }
+    }
+    None
+}
+
+/// The recommended command reproduces exactly the delivery the plan
+/// describes: the flags that shaped `destination` ride along instead of
+/// being dropped into a bare `finish --yes` that would deliver elsewhere.
+/// The export destination is the REPORTED path (the preview and the real
+/// export default differently, so an explicit `--dest` keeps the command
+/// bound to the previewed plan).
+fn recommended_finish_plan_command(
+    prefix: &str,
+    destination: &Value,
+    request: &FinishPlanRequest,
+) -> String {
+    let mut command = format!("deadreckon finish {prefix} --yes");
+    match destination["kind"].as_str() {
+        Some("materialize") => {
+            if let Some(path) = destination["path"].as_str() {
+                command.push_str(&format!(" --dest {path}"));
+            }
+            if request.force {
+                command.push_str(" --overwrite");
+            }
+            if request.include_manifest {
+                command.push_str(" --include-manifest");
+            }
+        }
+        Some("apply") => {
+            command.push_str(&format!(" --git-strategy {}", request.strategy));
+            if let Some(branch) = request.branch.as_deref() {
+                command.push_str(&format!(" --into {branch}"));
+            }
+        }
+        _ => {}
+    }
+    command
+}
+
+/// Stage the promotion candidate into a scratch directory in the system temp
+/// location — never the DeadReckon home, the library parent (the real staging
+/// path), or the working tree; `stage_promotion_preview` enforces that even
+/// against a redirected `TMPDIR` — compute the plan facts, and delete the
+/// scratch before reporting. The diffstat is `None` when there is no frozen
+/// turn-0 snapshot to baseline against: "no baseline" must never render as
+/// "0 files changed".
+fn stage_finish_preview(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+) -> Result<(
+    deadreckon_core::PromotionPreview,
+    Option<deadreckon_core::DiffSummary>,
+)> {
+    let scratch = tempfile::Builder::new()
+        .prefix(".deadreckon-finish-plan-")
+        .tempdir()
+        .map_err(CliError::Io)?;
+    let candidate = scratch.path().join("candidate");
+    let staged = (|| {
+        let preview = deadreckon_core::stage_promotion_preview(paths, state, &candidate)?;
+        let frozen_source = state.run_root.join("snapshots").join("turn-0");
+        let diffstat = if frozen_source.is_dir() {
+            Some(deadreckon_core::diff_working_trees(
+                &frozen_source,
+                &candidate,
+            )?)
+        } else {
+            None
+        };
+        Ok::<_, DeadreckonError>((preview, diffstat))
+    })();
+    scratch.close().map_err(CliError::Io)?;
+    Ok(staged?)
+}
+
+fn finish_plan_destination(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    record: &CodebaseRecord,
+    plan: Option<&deadreckon_core::plan::Plan>,
+    request: &FinishPlanRequest,
+) -> Result<Value> {
+    if let Some(plan) = plan {
+        // Mirror the real plan routing: apply into the parent checkout when
+        // it exists and no destination was requested, else materialize.
+        if request.dest.is_none()
+            && let Some(git_root) = plan_apply_git_root(plan)?
+        {
+            return Ok(apply_destination(&git_root, request));
+        }
+        let dest = request
+            .dest
+            .clone()
+            .unwrap_or_else(|| default_plan_materialize_dest(plan));
+        return materialize_destination(paths, state, dest);
+    }
+    match record.mode {
+        CodebaseMode::Worktree => match record
+            .source_git_root
+            .clone()
+            .or_else(|| record.source_path.clone())
+        {
+            Some(root) => Ok(apply_destination(&root, request)),
+            // An unreportable target is a hard refusal, not a plan variant:
+            // the real apply refuses this corrupt record the same way, and a
+            // `"kind":"apply"` destination must never carry a null path.
+            None => Err(CliError::Core(DeadreckonError::InvalidInput(
+                "missing source_git_root".to_string(),
+            ))),
+        },
+        CodebaseMode::Copy | CodebaseMode::Fresh => {
+            let dest = request.dest.clone().unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(run_prefix(&state.run_id))
+            });
+            materialize_destination(paths, state, dest)
+        }
+        CodebaseMode::InPlace => Ok(json!({
+            "kind": "in-place",
+            "path": state.working_dir,
+            "branch": Value::Null,
+            "strategy": Value::Null,
+        })),
+    }
+}
+
+fn apply_destination(git_root: &Path, request: &FinishPlanRequest) -> Value {
+    let branch = request
+        .branch
+        .clone()
+        .or_else(|| current_git_branch(git_root));
+    json!({
+        "kind": "apply",
+        "path": git_root,
+        "branch": branch,
+        "strategy": request.strategy,
+    })
+}
+
+fn current_git_branch(git_root: &Path) -> Option<String> {
+    deadreckon_core::git::run_git(git_root, &["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty())
+}
+
+/// The delivery-readiness refusals the real export raises, applied up front
+/// so a "deliverable" plan never claims a finish the real path would refuse.
+fn materialize_destination(
+    paths: &DeadreckonPaths,
+    state: &deadreckon_core::PipelineState,
+    dest: PathBuf,
+) -> Result<Value> {
+    let library_dir = paths.library_dir(&state.scope, &state.run_id);
+    if !library_dir.is_dir() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "library missing for run {}; was promotion successful?",
+                run_prefix(&state.run_id)
+            ),
+            &format!("deadreckon show {}", run_prefix(&state.run_id)),
+        )));
+    }
+    let dest = absolute_dest(dest)?;
+    refuse_dest_inside_home(paths, &dest, "export")?;
+    Ok(json!({
+        "kind": "materialize",
+        "path": dest,
+        "branch": Value::Null,
+        "strategy": Value::Null,
+    }))
+}
+
+fn destination_summary(destination: &Value) -> String {
+    let kind = destination["kind"].as_str().unwrap_or("unknown");
+    let path = destination["path"].as_str().unwrap_or("unknown");
+    match destination["branch"].as_str() {
+        Some(branch) => format!("{kind} {path} (branch {branch})"),
+        None => format!("{kind} {path}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliverable_finish_plan_surface(
+    prefix: &str,
+    mode: CodebaseMode,
+    destination: &Value,
+    destination_kind: &str,
+    staged_files: usize,
+    diffstat: Option<&deadreckon_core::DiffSummary>,
+    result_tree_sha256: Option<&str>,
+    irreversible_steps: &[&str],
+    recommended: &str,
+) -> VerdictSurface {
+    let stages_files = destination_kind == "materialize";
+    let what_happened = if stages_files {
+        "DeadReckon validated the completion proof, staged the exact promotion candidate into scratch, and then discarded the scratch."
+    } else if destination_kind == "in-place" {
+        "DeadReckon validated the completion proof; an in-place finish stages nothing — the changes already live in the checkout."
+    } else {
+        "DeadReckon validated the completion proof; an apply delivers git commits, so no file set is staged."
+    };
+    let mut evidence = vec![
+        ("run".to_string(), prefix.to_string()),
+        ("mode".to_string(), mode.to_string()),
+        ("destination".to_string(), destination_summary(destination)),
+    ];
+    if stages_files {
+        evidence.push(("staged".to_string(), format!("{staged_files} file(s)")));
+        evidence.push((
+            "diffstat".to_string(),
+            match diffstat {
+                Some(diff) => format!(
+                    "{} file(s) changed, +{} -{}",
+                    diff.files_changed, diff.added, diff.removed
+                ),
+                None => "unavailable (no frozen turn-0 baseline)".to_string(),
+            },
+        ));
+    }
+    evidence.push((
+        "result tree".to_string(),
+        result_tree_sha256.unwrap_or("unknown").to_string(),
+    ));
+    evidence.push((
+        "irreversible".to_string(),
+        if irreversible_steps.is_empty() {
+            "none (in-place finish is guidance only)".to_string()
+        } else {
+            irreversible_steps.join(", ")
+        },
+    ));
+    VerdictSurface::must_new(
+        VerdictKind::Preview,
+        "finish plan",
+        Some(prefix),
+        ExplanationPanel::new(
+            what_happened,
+            "The preview is report-only, so publishing requires a real finish, which re-validates and re-stages from nothing kept here.",
+            evidence,
+        ),
+        vec![("Recommended", recommended.to_string())],
+        vec![
+            (
+                "Secondary",
+                format!("deadreckon verdict {prefix} --receipt"),
+            ),
+            ("Secondary", format!("deadreckon show {prefix} --diff")),
+        ],
+    )
+}
+
+fn blocked_finish_plan_surface(prefix: &str, mode: CodebaseMode, error: &str) -> VerdictSurface {
+    let reason = error
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("completion proof validation failed")
+        .trim()
+        .to_string();
+    VerdictSurface::must_new(
+        VerdictKind::Blocked,
+        "finish plan",
+        Some(prefix),
+        ExplanationPanel::new(
+            "DeadReckon refused to plan this delivery because its completion proof did not validate.",
+            "The preview holds the same fail-closed bar as the real finish, which would refuse this run for the same reason.",
+            vec![
+                ("run".to_string(), prefix.to_string()),
+                ("mode".to_string(), mode.to_string()),
+                ("error".to_string(), reason),
+            ],
+        ),
+        vec![(
+            "Recommended",
+            format!("deadreckon verdict {prefix} --receipt"),
+        )],
+        vec![("Secondary", format!("deadreckon attach {prefix}"))],
+    )
 }
 
 fn print_finish_consistency_summary(state: &deadreckon_core::PipelineState) {
@@ -6122,6 +6839,578 @@ mod tests {
             &fs::read(entries[0].path()).expect("trusted export transaction journal"),
         )
         .expect("transaction JSON")
+    }
+
+    /// Byte-level identity of a directory tree: every entry (files by content
+    /// digest, symlinks by target, directories by presence) keyed by relative
+    /// path, so the G4 "dry-run mutates nothing" property is provable as a
+    /// map equality.
+    fn tree_digest(root: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+        fn walk(root: &Path, dir: &Path, digest: &mut std::collections::BTreeMap<PathBuf, String>) {
+            for entry in fs::read_dir(dir).expect("read dir") {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("relative path")
+                    .to_path_buf();
+                let metadata = fs::symlink_metadata(&path).expect("metadata");
+                if metadata.file_type().is_symlink() {
+                    digest.insert(
+                        relative,
+                        format!(
+                            "symlink:{}",
+                            fs::read_link(&path).expect("link target").display()
+                        ),
+                    );
+                } else if metadata.is_dir() {
+                    digest.insert(relative, "directory".to_string());
+                    walk(root, &path, digest);
+                } else {
+                    digest.insert(
+                        relative,
+                        deadreckon_core::flight::sha256_file(&path).expect("file digest"),
+                    );
+                }
+            }
+        }
+        let mut digest = std::collections::BTreeMap::new();
+        walk(root, root, &mut digest);
+        digest
+    }
+
+    fn finish_plan_request(dest: Option<PathBuf>) -> FinishPlanRequest {
+        FinishPlanRequest {
+            dest,
+            strategy: "squash".to_string(),
+            branch: None,
+            force: false,
+            include_manifest: false,
+        }
+    }
+
+    /// G4 trust property 1: the report-only preview validates, stages to
+    /// scratch, and reports a deliverable plan while leaving the entire
+    /// DeadReckon home byte-identical and never creating the destination.
+    #[test]
+    fn finish_dry_run_reports_a_deliverable_plan_without_mutating_the_store() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+        let home = temp.path().join("home");
+        let before = tree_digest(&home);
+        let dest = temp.path().join("planned-export");
+
+        let (plan, surface) =
+            build_finish_plan(&paths, &job_id, &finish_plan_request(Some(dest.clone())))
+                .expect("deliverable plan");
+
+        assert_eq!(plan["kind"], "finish_plan");
+        assert_eq!(plan["id"], json!(job_id));
+        assert_eq!(plan["status"], "deliverable");
+        assert_eq!(plan["receipt"]["validated"], true);
+        assert_eq!(plan["receipt"]["error"], Value::Null);
+        assert_eq!(plan["mode"], "fresh");
+        assert_eq!(plan["destination"]["kind"], "materialize");
+        assert!(
+            plan["destination"]["path"]
+                .as_str()
+                .expect("destination path")
+                .ends_with("planned-export"),
+            "{plan}"
+        );
+        assert_eq!(plan["destination"]["branch"], Value::Null);
+        assert_eq!(plan["irreversible_steps"], json!(["publish", "cleanup"]));
+        // The recommended command reproduces the previewed delivery exactly:
+        // the reported destination rides as an explicit `--dest`.
+        assert_eq!(
+            plan["next_actions"][0],
+            json!(format!(
+                "deadreckon finish {} --yes --dest {}",
+                run_prefix(&job_id),
+                plan["destination"]["path"].as_str().expect("dest path")
+            ))
+        );
+        let staged = plan["staged"].as_array().expect("staged manifest");
+        let result_entry = staged
+            .iter()
+            .find(|entry| entry["path"] == "result.txt")
+            .expect("staged result.txt");
+        assert_eq!(result_entry["bytes"], 16);
+        assert_eq!(
+            result_entry["sha256"],
+            json!(
+                deadreckon_core::flight::sha256_file(&state.working_dir.join("result.txt"))
+                    .expect("result digest")
+            )
+        );
+        // The reported digest is the receipt's bound result-tree digest: the
+        // staged candidate was validated against the sealed receipt.
+        let receipt: Value =
+            serde_json::from_slice(&fs::read(paths.job_receipt(&job_id)).expect("receipt bytes"))
+                .expect("receipt json");
+        assert_eq!(plan["result_tree_sha256"], receipt["result_tree_sha256"]);
+        // The human rendering rides the same VerdictSurface object.
+        assert!(
+            surface.render_plain(false).contains("preview finish plan"),
+            "{}",
+            surface.render_plain(false)
+        );
+        assert!(!dest.exists(), "preview must not create the destination");
+        assert_eq!(
+            before,
+            tree_digest(&home),
+            "dry-run must leave the DeadReckon home byte-identical"
+        );
+    }
+
+    /// G4 trust property 2: a real finish after a successful dry-run
+    /// re-validates and re-stages from scratch — nothing from the preview is
+    /// reused, so tampering the receipt between the two fails closed.
+    #[test]
+    fn real_finish_revalidates_after_a_successful_dry_run() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _state, job_id) = signed_verified_export_fixture(&temp);
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &job_id,
+            &finish_plan_request(Some(temp.path().join("preview-dest"))),
+        )
+        .expect("deliverable plan");
+        assert_eq!(plan["status"], "deliverable");
+
+        let receipt_path = paths.job_receipt(&job_id);
+        let mut receipt: Value =
+            serde_json::from_slice(&fs::read(&receipt_path).expect("receipt bytes"))
+                .expect("receipt json");
+        receipt["result_tree_sha256"] = json!("sha256:tampered-after-dry-run");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&receipt).expect("tampered receipt json"),
+        )
+        .expect("tamper receipt");
+
+        let dest = temp.path().join("real-export");
+        let error =
+            materialize_command_with_paths(&paths, &job_id, Some(dest.clone()), false, false)
+                .expect_err("real finish must fail closed on the tampered receipt");
+        assert!(
+            error.to_string().contains("result tree") || error.to_string().contains("receipt"),
+            "{error}"
+        );
+        assert!(!dest.exists(), "refused delivery created its destination");
+    }
+
+    /// G4 trust property 3: a tampered receipt yields a blocked plan —
+    /// reported inside the envelope, not thrown — and the dry-run still
+    /// writes nothing anywhere.
+    #[test]
+    fn finish_dry_run_reports_blocked_on_a_tampered_receipt_without_writing() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _state, job_id) = signed_verified_export_fixture(&temp);
+        let receipt_path = paths.job_receipt(&job_id);
+        let mut receipt: Value =
+            serde_json::from_slice(&fs::read(&receipt_path).expect("receipt bytes"))
+                .expect("receipt json");
+        receipt["result_tree_sha256"] = json!("sha256:tampered-before-dry-run");
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&receipt).expect("tampered receipt json"),
+        )
+        .expect("tamper receipt");
+        let home = temp.path().join("home");
+        let before = tree_digest(&home);
+
+        let (plan, surface) = build_finish_plan(
+            &paths,
+            &job_id,
+            &finish_plan_request(Some(temp.path().join("blocked-dest"))),
+        )
+        .expect("a blocked plan is still a plan, not a process failure");
+
+        assert_eq!(plan["status"], "blocked");
+        assert_eq!(plan["receipt"]["validated"], false);
+        let blocked_error = plan["receipt"]["error"].as_str().expect("blocking error");
+        assert!(!blocked_error.trim().is_empty());
+        assert_eq!(plan["staged"], json!([]));
+        assert_eq!(plan["result_tree_sha256"], Value::Null);
+        // Nothing was staged, so there is nothing to diff — null, never a
+        // fabricated "0 files changed".
+        assert_eq!(plan["diffstat"], Value::Null);
+        assert!(
+            surface.render_plain(false).contains("blocked finish plan"),
+            "{}",
+            surface.render_plain(false)
+        );
+        assert_eq!(
+            before,
+            tree_digest(&home),
+            "a blocked dry-run must write nothing"
+        );
+    }
+
+    /// G4 trust property 4: a held operation lock yields the exact locked
+    /// refusal the real finish raises, which the armed `--json` path converts
+    /// into the normal error envelope.
+    #[test]
+    fn finish_dry_run_refuses_while_an_operation_lock_is_held() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _state, job_id) = signed_verified_export_fixture(&temp);
+        let held = deadreckon_core::acquire_job_operation_lock(&paths, &job_id)
+            .expect("hold the operation lock");
+
+        let error = build_finish_plan(&paths, &job_id, &finish_plan_request(None))
+            .expect_err("held lock must refuse the preview");
+        assert!(
+            error
+                .to_string()
+                .contains("already has an active finish, undo, abandon, or cleanup operation"),
+            "{error}"
+        );
+        let envelope = crate::machine_json::error_envelope(
+            "finish",
+            error.exit_code(),
+            &error.to_string(),
+            "",
+        );
+        assert_eq!(envelope["kind"], "error");
+        assert_eq!(envelope["verb"], "finish");
+        assert_eq!(envelope["code"], 1);
+
+        drop(held);
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &job_id,
+            &finish_plan_request(Some(temp.path().join("after-lock"))),
+        )
+        .expect("released lock allows the preview");
+        assert_eq!(plan["status"], "deliverable");
+    }
+
+    /// The real export refuses a non-empty destination without `--overwrite`;
+    /// the preview must report the same delivery as blocked with the same
+    /// message instead of claiming "deliverable" — and `--overwrite` lifts
+    /// the blocker here exactly as it does there.
+    #[test]
+    fn finish_dry_run_blocks_a_non_empty_destination_and_overwrite_lifts_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, _state, job_id) = signed_verified_export_fixture(&temp);
+        let dest = temp.path().join("occupied-dest");
+        fs::create_dir_all(&dest).expect("occupied destination");
+        fs::write(dest.join("keep.txt"), "occupant\n").expect("occupant");
+
+        let (plan, _surface) =
+            build_finish_plan(&paths, &job_id, &finish_plan_request(Some(dest.clone())))
+                .expect("blocked plan is still a plan");
+        assert_eq!(plan["status"], "blocked");
+        // The proof itself validated; the destination is what blocks.
+        assert_eq!(plan["receipt"]["validated"], true);
+        assert!(
+            plan["receipt"]["error"]
+                .as_str()
+                .expect("blocking error")
+                .contains("is not empty (use --overwrite or pass a fresh path)"),
+            "{plan}"
+        );
+        assert_eq!(plan["staged"], json!([]));
+
+        let overwrite = FinishPlanRequest {
+            force: true,
+            ..finish_plan_request(Some(dest.clone()))
+        };
+        let (plan, _surface) =
+            build_finish_plan(&paths, &job_id, &overwrite).expect("overwrite plan");
+        assert_eq!(plan["status"], "deliverable");
+        assert!(
+            plan["next_actions"][0]
+                .as_str()
+                .expect("recommended command")
+                .contains(" --overwrite"),
+            "{plan}"
+        );
+        assert!(
+            dest.join("keep.txt").is_file(),
+            "the preview must never clear the destination"
+        );
+    }
+
+    /// The diffstat is real when the frozen turn-0 snapshot exists — and only
+    /// then: "no baseline" reports `diffstat: null`, never fabricated zeros.
+    #[test]
+    fn finish_dry_run_reports_a_real_diffstat_against_the_frozen_turn0_baseline() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, job_id) = signed_verified_export_fixture(&temp);
+
+        // Without a snapshot the plan says "no baseline", not "no changes".
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &job_id,
+            &finish_plan_request(Some(temp.path().join("nodiff-dest"))),
+        )
+        .expect("deliverable plan");
+        assert_eq!(plan["status"], "deliverable");
+        assert_eq!(plan["diffstat"], Value::Null);
+
+        let snapshot = state.run_root.join("snapshots").join("turn-0");
+        fs::create_dir_all(&snapshot).expect("turn-0 snapshot");
+        fs::write(snapshot.join("result.txt"), "original starting line\n")
+            .expect("frozen baseline file");
+
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &job_id,
+            &finish_plan_request(Some(temp.path().join("diff-dest"))),
+        )
+        .expect("deliverable plan");
+        assert_eq!(plan["status"], "deliverable");
+        assert!(
+            plan["diffstat"]["files_changed"].as_u64().expect("count") >= 1,
+            "{plan}"
+        );
+        assert!(
+            plan["diffstat"]["added"].as_u64().expect("added") >= 1,
+            "{plan}"
+        );
+    }
+
+    /// The real in-place finish stages nothing, publishes nothing, and is a
+    /// guidance no-op; its preview must describe exactly that — no staging
+    /// I/O over the operator's live checkout, no irreversible steps.
+    #[test]
+    fn in_place_finish_dry_run_stages_nothing_and_claims_no_irreversible_steps() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("live-checkout");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("operator.txt"), "live operator file\n").expect("operator file");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "preview an in-place finish".to_string(),
+                cwd: source.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("11223344556677881122334455667788".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let record = CodebaseRecord {
+            mode: CodebaseMode::InPlace,
+            source_path: Some(source.clone()),
+            ..CodebaseRecord::fresh()
+        };
+        deadreckon_core::write_trusted_codebase_record(&state.run_root, &record)
+            .expect("in-place record");
+        state.status = RunStatus::Completed;
+        save_state(&state).expect("completed state");
+        let home = temp.path().join("home");
+        let before = tree_digest(&home);
+        let source_before = tree_digest(&source);
+
+        let (plan, _surface) = build_finish_plan(&paths, &state.run_id, &finish_plan_request(None))
+            .expect("in-place plan");
+
+        assert_eq!(plan["status"], "deliverable");
+        assert_eq!(plan["destination"]["kind"], "in-place");
+        assert_eq!(plan["staged"], json!([]));
+        assert_eq!(plan["diffstat"], Value::Null);
+        assert_eq!(plan["result_tree_sha256"], Value::Null);
+        assert_eq!(plan["irreversible_steps"], json!([]));
+        assert_eq!(
+            before,
+            tree_digest(&home),
+            "an in-place dry-run must write nothing"
+        );
+        assert_eq!(
+            source_before,
+            tree_digest(&source),
+            "the operator's live checkout must stay byte-identical"
+        );
+    }
+
+    fn promoted_legacy_run_fixture(
+        temp: &TempDir,
+        run_id: &str,
+    ) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("legacy-source");
+        fs::create_dir_all(&source).expect("source");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "legacy delivery preview".to_string(),
+                cwd: source,
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some(run_id.to_string()),
+                codebase: None,
+            },
+        )
+        .expect("legacy run");
+        fs::write(state.working_dir.join("result.txt"), "legacy result\n").expect("result");
+        deadreckon_core::gate::write_acceptance_marker(
+            &state.run_root,
+            state.run_id.clone(),
+            state.working_dir.clone(),
+            1,
+        )
+        .expect("signed legacy marker");
+        state.status = RunStatus::Completed;
+        save_state(&state).expect("completed state");
+        deadreckon_core::promote_completed_run(&paths, &mut state).expect("legacy promotion");
+        (paths, state)
+    }
+
+    /// Finding-of-record for the preview/real split on legacy runs: the real
+    /// finish delivers an unowned legacy run WITHOUT validating any proof
+    /// (`MaterializeDeliveryAuthority::LegacyUnowned`), so the preview must
+    /// never report `blocked` for a marker problem — the marker is evidence.
+    /// A Job control DIRECTORY (even without job.json) flips the run onto the
+    /// strict path, exactly as promotion's `is_strict_job` keys it.
+    #[test]
+    fn legacy_dry_run_reports_the_marker_as_evidence_and_never_blocks_on_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state) = promoted_legacy_run_fixture(&temp, "aaaabbbbccccddddaaaabbbbccccdddd");
+
+        // (a) valid marker: deliverable with validated evidence.
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &state.run_id,
+            &finish_plan_request(Some(temp.path().join("legacy-dest-a"))),
+        )
+        .expect("legacy plan");
+        assert_eq!(plan["status"], "deliverable");
+        assert_eq!(plan["receipt"]["validated"], true);
+        assert_eq!(plan["receipt"]["error"], Value::Null);
+
+        // (b) missing marker: the real finish would still deliver, so the
+        // plan stays deliverable — the marker failure is reported as
+        // evidence, not as a blocker.
+        let marker = deadreckon_core::gate::marker_path_for_run_root(&state.run_root);
+        fs::remove_file(&marker).expect("remove marker");
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &state.run_id,
+            &finish_plan_request(Some(temp.path().join("legacy-dest-b"))),
+        )
+        .expect("legacy plan without marker");
+        assert_eq!(plan["status"], "deliverable", "{plan}");
+        assert_eq!(plan["receipt"]["validated"], false);
+        assert!(
+            plan["receipt"]["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "{plan}"
+        );
+
+        // (c) a Job control directory without job.json makes the run strict
+        // (promotion's `is_strict_job` keying): the missing receipt now
+        // fails closed as a blocked plan.
+        fs::create_dir_all(paths.job_dir(&state.run_id)).expect("bare job dir");
+        let (plan, _surface) = build_finish_plan(
+            &paths,
+            &state.run_id,
+            &finish_plan_request(Some(temp.path().join("legacy-dest-c"))),
+        )
+        .expect("strict-keyed plan");
+        assert_eq!(plan["status"], "blocked", "{plan}");
+        assert_eq!(plan["receipt"]["validated"], false);
+    }
+
+    /// A worktree run's finish is an apply of git commits, not a file export:
+    /// the plan reports `destination.kind:"apply"` with the parent checkout
+    /// and carries NO staged file list (the library payload is not what an
+    /// apply delivers), and the recommended command carries the strategy that
+    /// shaped the plan.
+    #[test]
+    fn worktree_finish_dry_run_reports_an_apply_plan_without_staging() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        let (base, base_branch) = git_repo(&repo);
+        git_status(&repo, &["switch", "-c", "result"]).expect("result branch");
+        fs::write(repo.join("feature.txt"), "worktree result\n").expect("result file");
+        git_status(&repo, &["add", "feature.txt"]).expect("add result");
+        git_status(&repo, &["commit", "-m", "deliverable result"]).expect("commit result");
+        git_status(&repo, &["switch", &base_branch]).expect("back to target");
+
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "preview a worktree apply".to_string(),
+                cwd: repo.clone(),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("99887766554433229988776655443322".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("worktree run");
+        deadreckon_core::write_trusted_codebase_record(
+            &state.run_root,
+            &worktree_record(&repo, &base, "result"),
+        )
+        .expect("worktree record");
+        state.status = RunStatus::Completed;
+        save_state(&state).expect("completed state");
+        let home = temp.path().join("home");
+        let before = tree_digest(&home);
+
+        let (plan, _surface) = build_finish_plan(&paths, &state.run_id, &finish_plan_request(None))
+            .expect("apply plan");
+
+        assert_eq!(plan["status"], "deliverable", "{plan}");
+        assert_eq!(plan["destination"]["kind"], "apply");
+        assert_eq!(
+            plan["destination"]["path"],
+            json!(repo.display().to_string())
+        );
+        assert_eq!(plan["staged"], json!([]), "an apply delivers git commits");
+        assert_eq!(plan["diffstat"], Value::Null);
+        assert_eq!(
+            plan["next_actions"][0],
+            json!(format!(
+                "deadreckon finish {} --yes --git-strategy squash",
+                run_prefix(&state.run_id)
+            ))
+        );
+        assert_eq!(
+            before,
+            tree_digest(&home),
+            "an apply-mode dry-run must write nothing"
+        );
+    }
+
+    /// The core preview refuses a scratch inside any tree it promises to
+    /// leave untouched — a redirected TMPDIR can never stage into the home.
+    #[test]
+    fn promotion_preview_refuses_a_scratch_inside_the_deadreckon_home() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, state, _job_id) = signed_verified_export_fixture(&temp);
+        let home = temp.path().join("home");
+        let before = tree_digest(&home);
+
+        let error = deadreckon_core::stage_promotion_preview(
+            &paths,
+            &state,
+            &paths.home().join("preview-scratch").join("candidate"),
+        )
+        .expect_err("a scratch inside the home must refuse");
+        assert!(error.to_string().contains("must live outside"), "{error}");
+        assert_eq!(
+            before,
+            tree_digest(&home),
+            "the refused preview must not touch the home"
+        );
     }
 
     #[test]

@@ -486,6 +486,30 @@ pub(crate) fn job_status_label(view: &deadreckon_core::JobView) -> String {
         .unwrap_or_else(|| serialized_label(view.projection.phase))
 }
 
+/// The glossary user-word labels a Job's machine rows carry
+/// (`status --json` and the `list --json` fleet rollup ride this one helper
+/// so they can never disagree). The terminal words are WITHHELD (null) when
+/// the sealed receipt fails validation: `job_status_label` reports
+/// `verified_proof_invalid` in exactly that case, and a display label must
+/// never say "verified" for a Job whose two-key proof is broken.
+pub(crate) fn job_glossary_labels(
+    view: &deadreckon_core::JobView,
+) -> (&'static str, Option<&'static str>, Option<&'static str>) {
+    let phase = deadreckon_core::job_phase_label(view.projection.phase);
+    if view.verified_receipt_error.is_some() {
+        return (phase, None, None);
+    }
+    (
+        phase,
+        view.projection
+            .outcome
+            .map(deadreckon_core::job_outcome_label),
+        view.projection
+            .stop_reason
+            .map(deadreckon_core::stop_reason_label),
+    )
+}
+
 pub(crate) fn print_job_status(view: &deadreckon_core::JobView, json_output: bool) -> Result<()> {
     print_job_status_with_open_action(view, json_output, "attach")
 }
@@ -836,10 +860,19 @@ pub(crate) fn print_job_status_with_facts(
     let proof_status = job_proof_status(view);
     let machine_verb = machine_json::active();
     if json_output || machine_verb.is_some() {
+        // Glossary user words for the serialized projection enums
+        // (`job.projection` below), so app translations mirror glossary.rs
+        // instead of re-authoring vocabulary. Terminal words are withheld
+        // when the sealed receipt fails validation, so a label can never
+        // contradict `status:"verified_proof_invalid"`.
+        let (phase_label, outcome_label, stop_reason_label) = job_glossary_labels(view);
         let mut payload = json!({
                 "kind": machine_verb.unwrap_or("job_status"),
                 "id": id,
                 "status": status,
+                "phase_label": phase_label,
+                "outcome_label": outcome_label,
+                "stop_reason_label": stop_reason_label,
                 "verified_proof": {
                     "status": proof_status,
                     "error": view.verified_receipt_error.as_deref(),
@@ -3754,6 +3787,19 @@ mod tests {
 
         assert_eq!(job_status_label(&view), "verified_proof_invalid");
         assert_eq!(job_primary_action(&view, "attach"), "status");
+        // The glossary words ride the same rule: a broken proof withholds the
+        // terminal labels so no surface can display "verified" beside
+        // `verified_proof_invalid`.
+        let (phase_label, outcome_label, stop_reason_label) = job_glossary_labels(&view);
+        assert_eq!(phase_label, "terminal");
+        assert_eq!(outcome_label, None);
+        assert_eq!(stop_reason_label, None);
+
+        // With a valid proof the same projection carries the words.
+        view.verified_receipt_error = None;
+        let (_, outcome_label, stop_reason_label) = job_glossary_labels(&view);
+        assert_eq!(outcome_label, Some("verified"));
+        assert_eq!(stop_reason_label, Some("verified"));
     }
 
     #[test]
