@@ -23,7 +23,7 @@ Executes `docs/design/MAC-APP-OPERATOR-CONSOLE.md` (§6.2 composite: Bridge shel
 | R-M1 | G1 JSON envelopes (9 verbs + global error envelope) · G2 start parity · G9 extend --note · steer widening (all providers) · notify events | in progress |
 | R-M2 | G4 finish --dry-run --json · finish --json | pending |
 | R-M3 | G5 follow verb (merged NDJSON, replay offsets) | pending |
-| APP-1 | Scaffold: project.yml, DeadreckonKit, CONTRACTS.md, vendor-cli.sh + manifest | pending |
+| APP-1 | Scaffold: project.yml, DeadreckonKit, CONTRACTS.md, vendor-cli.sh + manifest | **done** (BUILD SUCCEEDED; 35 Kit tests; exemplar-fidelity reviewed) |
 | APP-2 | Menubar shell + Gate Queue home + Harbor + ⌘K | pending |
 | APP-3 | Chartroom workbench (narrative/spine/turns, evidence rail, drawer) | pending |
 | APP-4 | Write parity: Lay Course, steer, kill, Binnacle promote, send-back, popover writes | pending |
