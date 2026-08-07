@@ -602,6 +602,7 @@ Every "today" claim below was verified against source by the gap pass. Guiding r
 
 **Today:** rows carry only job_id/scope/goal/status/updated_at/attempts/outcome/stop_reason (inspection.rs:86–99), though `list_command` already loads full JobViews. A poller opens ~6 files per job per tick.
 **Proposal:** enrich each row: `projection{phase,outcome,stop_reason,attempt_count,caveats}`, `lease{owner_id,epoch,heartbeat_age_seconds,fresh}`, `spend{total_cost_usd,cap_usd,subscription,wall_time_seconds}`, `provider`, `sandbox`, `receipt{present,verified,error}`, `gate{attempt,n_passed,n_total}` (rides G8). Keep the verb; no new `fleet` command.
+**As built (M0), for decoder authors:** `receipt.verified` is NOT a boolean — it is the shared proof-status enum `"valid"|"invalid"|"not-applicable"` (the same classifier `status --json` uses, `job_proof_status`), so model it as a string. `lease` additionally carries `expires_at` (RFC 3339) beyond the proposed fields. `gate` is present only when a signature-verified acceptance marker exists for the run: failed gate attempts carry **no counts** (the only durable per-check evidence is the signed marker; raw progress rows are untrusted display data — see G8), so rank failed attempts on phase/stop_reason, not counts.
 
 ### G4 — `finish --dry-run --json` (M)
 
@@ -617,6 +618,7 @@ Every "today" claim below was verified against source by the gap pass. Guiding r
 
 **Today:** the predicate lives only inside steer's guard (steer.rs:53–75: `cli:codex-server` + `Executing` + driver fence); no `steerable` field exists anywhere.
 **Proposal:** extract `steer_eligibility(&PipelineState) -> {steerable, reason}` into deadreckon-core, call it from the steer path *and* embed `steerable{}` in `status --json`, `show --json`, and RunView — CLI and app can never disagree, and the apps update for free when steer widens.
+**As built (M0), legacy caveat:** the JSON surfaces derive `driver_fenced` from the `PipelineState.ownership` stamp; the steer verb additionally runs the full plan-lineage fence. Job-owned runs created before ownership stamping can therefore read `steerable:true` yet still receive the typed fence refusal from the verb. The app must treat a steer refusal after `steerable:true` as authoritative and downgrade the control. Modern job-created runs are stamped at first state write and cannot diverge.
 
 ### G7 — Per-digest receipt audit (M)
 
@@ -627,6 +629,7 @@ Every "today" claim below was verified against source by the gap pass. Guiding r
 
 **Today:** the plumbing exists but is unwired — `emit_acceptance_progress` + `evaluate_acceptance_checks_with_progress` exist with only a test caller; dr-gate evaluate prints to stdout only; `acceptance-progress.jsonl` is written *reconstructed at sign time*; attach already tails that exact path, so today its acceptance band lights up only after signing.
 **Proposal:** have `dr-gate evaluate` emit per-check started/passed rows through the existing writer (advisory display data only — sign's reconstruction still overwrites with trusted rows, so anti-self-attestation is untouched); stamp `last_gate_attempt{attempt,n_passed,n_total,finished_at}` into projection.json. Also improves the current TUI.
+**As built (M0), two trust-preserving deviations:** (a) contained/strict gate evaluations stream no live rows — the sandbox write-denies `proofs/` on every backend, so the live acceptance band applies only to uncontained/non-strict gates and manual `dr-gate evaluate`; the file appears whole at sign time (see docs/TAILING.md). (b) `last_gate_attempt` counts are sourced exclusively from the signature-verified acceptance marker: failed attempts (no signed marker) stamp no counts into the ledger, because raw progress-file bytes cannot prove controller authorship and must never reach job-events.jsonl.
 
 ### G9 — Send-back as a typed action (S)
 

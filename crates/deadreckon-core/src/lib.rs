@@ -34,6 +34,7 @@ pub mod promotion;
 pub mod run_view;
 pub mod sandbox_observation;
 pub mod state;
+pub mod steer;
 pub mod steer_inbox;
 pub mod tamper;
 pub mod update_cache;
@@ -45,13 +46,14 @@ pub use artifact_policy::{
     is_promotable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
 };
 pub use artifacts::{
-    DiffSummary, FileDelta, FileDeltaStatus, ProvenanceRecord, SNAPSHOT_CAPTURE_MANIFESTS_DIR,
-    append_provenance, append_spend, append_trace, copy_artifact_path, copy_deliverable_tree,
-    copy_promotable_tree, copy_recoverable_tree, copy_recoverable_tree_with_policy, copy_tree,
-    diff_snapshots, diff_working_trees, inventory_files, inventory_recoverable_files,
+    DiffSummary, FileDelta, FileDeltaStatus, PATCH_UNIFIED_BYTE_BUDGET, PatchEntry,
+    ProvenanceRecord, SNAPSHOT_CAPTURE_MANIFESTS_DIR, append_provenance, append_spend,
+    append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
+    copy_recoverable_tree, copy_recoverable_tree_with_policy, copy_tree, diff_snapshots,
+    diff_working_trees, inventory_files, inventory_recoverable_files,
     inventory_recoverable_files_for_state, inventory_recoverable_files_with_policy,
-    remove_artifact_path, restore_snapshot, snapshot_capture_manifest_path, snapshot_diff,
-    snapshot_working,
+    patches_from_diff, remove_artifact_path, restore_snapshot, snapshot_capture_manifest_path,
+    snapshot_diff, snapshot_working,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -73,8 +75,9 @@ pub use codebase::{
     write_codebase_record, write_trusted_codebase_record,
 };
 pub use completion::{
-    SEMANTIC_JUDGMENT_JSON, seal_completion_receipt, seal_completion_receipt_bounded,
-    validate_completion_receipt, validate_completion_receipt_bounded, validate_strict_contract,
+    ReceiptAudit, ReceiptFact, SEMANTIC_JUDGMENT_JSON, audit_completion_receipt,
+    seal_completion_receipt, seal_completion_receipt_bounded, validate_completion_receipt,
+    validate_completion_receipt_bounded, validate_strict_contract,
 };
 pub use delivery::{
     GitDeliveryTarget, JobOperationLock, ValidatedAppliedGitDeliveryReceipt,
@@ -119,7 +122,7 @@ pub use gate::{
     acceptance_spec_path_for_run_root, create_gate_key, decode_gate_key, encode_gate_key,
     evaluate_acceptance, evaluate_acceptance_checks, evaluate_acceptance_checks_with_progress,
     evaluate_gate, gate_key_path, gate_key_path_for_run_root, gate_nonce_path_for_run_root,
-    marker_path_for_run_root, parent_repair_candidate_path_for_run_root,
+    last_gate_attempt_counts, marker_path_for_run_root, parent_repair_candidate_path_for_run_root,
     parent_repair_manifest_path_for_run_root, read_gate_key, read_gate_key_for_run_root,
     sign_gate_evaluation_with_key, validate_acceptance_marker, validate_gate_evaluation,
     validate_gate_evaluation_integrity, verify_v2_marker_signature, write_acceptance_marker,
@@ -133,10 +136,10 @@ pub use glossary::{
 };
 pub use job::{
     JOB_CONTROL_LOCK, JOB_EVENTS_JSONL, JOB_JSON, JOB_PROJECTION_JSON, JobDelivery,
-    JobDeliveryKind, JobHistory, JobProjection, JobView, LegacyJobKind, LegacyJobView,
-    append_job_event, legacy_campaign_job_view, legacy_chain_job_view, legacy_plan_job_view,
-    legacy_run_job_view, load_job, load_job_projection, read_job_history, rebuild_job_projection,
-    reduce_job_history, write_job,
+    JobDeliveryKind, JobHistory, JobLastGateAttempt, JobProjection, JobView, LegacyJobKind,
+    LegacyJobView, append_job_event, legacy_campaign_job_view, legacy_chain_job_view,
+    legacy_plan_job_view, legacy_run_job_view, load_job, load_job_projection, read_job_history,
+    rebuild_job_projection, reduce_job_history, write_job,
 };
 pub use job_lease::{
     CreateFencedJobJsonDisposition, FencedJobJsonEvent, LeaseClaim, LeaseClaimDisposition,
@@ -187,6 +190,10 @@ pub use state::{
     CurrentRunPointer, MergeRepairOwnership, PhaseId, PhaseState, PhaseStatus, PipelineState,
     ProviderFailureDisposition, RunListEntry, RunOptions, RunOwnership, RunOwnershipArtifact,
     RunStatus, create_owned_run, create_run, list_runs, load_run, save_state,
+};
+pub use steer::{
+    STEERABLE_PROVIDER_ROUTE, SteerEligibility, SteerIneligibleReason, steer_eligibility,
+    steer_eligibility_with_driver_fence,
 };
 pub use workspace_capture::{
     CaptureBudgets, CaptureEntry, CaptureEntryKind, CaptureMaterialization, CaptureOmission,

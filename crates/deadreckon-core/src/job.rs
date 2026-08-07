@@ -40,6 +40,16 @@ pub enum JobDeliveryKind {
     Exported,
 }
 
+/// The most recent deterministic gate attempt folded from the Job event
+/// history — a display and ranking checkpoint, never a trust surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLastGateAttempt {
+    pub attempt: u32,
+    pub n_passed: u32,
+    pub n_total: u32,
+    pub finished_at: DateTime<Utc>,
+}
+
 /// A rebuildable checkpoint over the append-only job lifecycle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobProjection {
@@ -54,6 +64,8 @@ pub struct JobProjection {
     pub child_run_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery: Option<JobDelivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_gate_attempt: Option<JobLastGateAttempt>,
     pub updated_at: Option<DateTime<Utc>>,
     pub caveats: Vec<String>,
 }
@@ -71,6 +83,7 @@ impl JobProjection {
             attempt_count: 0,
             child_run_ids: Vec::new(),
             delivery: None,
+            last_gate_attempt: None,
             updated_at: None,
             caveats: Vec::new(),
         }
@@ -615,8 +628,14 @@ fn reduce_event(
                 projection.stop_reason = None;
             }
         }
-        DeterministicGatePassed => projection.phase = JobPhase::VerifyingMeaning,
-        DeterministicGateFailed => projection.phase = JobPhase::Running,
+        DeterministicGatePassed => {
+            projection.phase = JobPhase::VerifyingMeaning;
+            stamp_last_gate_attempt(projection, event);
+        }
+        DeterministicGateFailed => {
+            projection.phase = JobPhase::Running;
+            stamp_last_gate_attempt(projection, event);
+        }
         SemanticJudgeAchieved | SemanticJudgeUncertain => {
             projection.phase = JobPhase::VerifyingMeaning;
         }
@@ -808,6 +827,31 @@ fn detail_string<'a>(detail: &'a Value, name: &str) -> Option<&'a str> {
     detail.get(name).and_then(Value::as_str)
 }
 
+fn detail_count(detail: &Value, name: &str) -> Option<u32> {
+    detail
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+/// Fold the advisory gate-attempt counts a gate event carries into the
+/// rebuildable checkpoint. Events recorded before the counts existed leave any
+/// earlier stamp untouched.
+fn stamp_last_gate_attempt(projection: &mut JobProjection, event: &JobEvent) {
+    let (Some(n_passed), Some(n_total)) = (
+        detail_count(&event.detail, "n_passed"),
+        detail_count(&event.detail, "n_total"),
+    ) else {
+        return;
+    };
+    projection.last_gate_attempt = Some(JobLastGateAttempt {
+        attempt: projection.attempt_count,
+        n_passed,
+        n_total,
+        finished_at: event.timestamp,
+    });
+}
+
 fn detail_stop_reason(event: &JobEvent) -> Result<Option<StopReason>> {
     let Some(value) = event.detail.get("stop_reason") else {
         return Ok(None);
@@ -956,6 +1000,57 @@ mod tests {
         let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
         assert_eq!(projection.attempt_count, 1);
         assert_eq!(projection.phase, deadreckon_protocol::JobPhase::Running);
+    }
+
+    #[test]
+    fn gate_events_stamp_a_rebuildable_last_gate_attempt_checkpoint() {
+        let mut failed_gate = event(3, "gate-failed", JobEventKind::DeterministicGateFailed);
+        failed_gate.detail =
+            json!({ "error": "acceptance check failed", "n_passed": 2, "n_total": 5 });
+        let events = vec![
+            event(1, "created", JobEventKind::Created),
+            event(2, "started", JobEventKind::AttemptStarted),
+            failed_gate.clone(),
+        ];
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+
+        let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
+        let stamp = projection.last_gate_attempt.expect("last gate attempt");
+        assert_eq!(stamp.attempt, 1);
+        assert_eq!(stamp.n_passed, 2);
+        assert_eq!(stamp.n_total, 5);
+        assert_eq!(stamp.finished_at, failed_gate.timestamp);
+
+        // A later gate event recorded without counts (legacy history) leaves
+        // the earlier stamp untouched instead of erasing it.
+        let mut events = history.events;
+        events.push(event(4, "retry", JobEventKind::RetryScheduled));
+        events.push(event(5, "restarted", JobEventKind::AttemptStarted));
+        events.push(event(
+            6,
+            "gate-passed",
+            JobEventKind::DeterministicGatePassed,
+        ));
+        let history = JobHistory {
+            raw_lines: events
+                .iter()
+                .map(|event| serde_json::to_vec(event).expect("serialize event"))
+                .collect(),
+            events,
+            caveats: Vec::new(),
+        };
+        let projection = reduce_job_history(&JobId("job-1".into()), &history).expect("projection");
+        let stamp = projection
+            .last_gate_attempt
+            .expect("stamp survives legacy event");
+        assert_eq!((stamp.attempt, stamp.n_passed, stamp.n_total), (1, 2, 5));
     }
 
     #[test]

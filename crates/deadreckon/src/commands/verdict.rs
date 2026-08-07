@@ -15,6 +15,7 @@ pub(crate) struct VerdictArgs {
     pub(crate) run_id: Option<String>,
     pub(crate) all: bool,
     pub(crate) limit: Option<usize>,
+    pub(crate) receipt: bool,
     pub(crate) json: bool,
     pub(crate) plain: bool,
     pub(crate) quiet: bool,
@@ -40,11 +41,18 @@ pub(crate) async fn verdict_command(args: VerdictArgs) -> Result<()> {
     let cached = cache_verdict_report(&state, &report).ok();
     let surface = render_verdict_surface(&report, &state);
     if args.json {
+        // The per-digest receipt audit is inspection only: it performs the
+        // same reads as the strict validator (promotion still runs the strict
+        // fail-closed path) and never mutates run state.
+        let receipt_audit = args
+            .receipt
+            .then(|| deadreckon_core::audit_completion_receipt(&paths, &state));
         let envelope = verdict_json(
             &report,
             &state,
             &surface.primary_action.command,
             cached.as_deref(),
+            receipt_audit.as_ref(),
         );
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
@@ -158,8 +166,9 @@ pub(crate) fn verdict_json(
     state: &deadreckon_core::PipelineState,
     primary_command: &str,
     cached: Option<&std::path::Path>,
+    receipt_audit: Option<&deadreckon_core::ReceiptAudit>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut envelope = serde_json::json!({
         "kind": "verdict",
         "id": report.run_id,
         "status": report.state,
@@ -175,7 +184,11 @@ pub(crate) fn verdict_json(
             "marker": deadreckon_core::gate::marker_path_for_run_root(&state.run_root),
             "cache": cached,
         },
-    })
+    });
+    if let Some(audit) = receipt_audit {
+        envelope["receipt_audit"] = serde_json::json!({ "facts": &audit.facts });
+    }
+    envelope
 }
 
 /// Render the verdict as a `VerdictSurface` — one label, an Explanation/Evidence
@@ -967,7 +980,13 @@ mod tests {
     #[test]
     fn verdict_json_envelope_shape_is_stable() {
         let report = report_for(VerdictState::Verified);
-        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render", None);
+        let envelope = verdict_json(
+            &report,
+            &dummy_state(),
+            "deadreckon finish render",
+            None,
+            None,
+        );
         for key in [
             "kind",
             "id",
@@ -987,11 +1006,63 @@ mod tests {
     #[test]
     fn verdict_json_includes_per_check_results() {
         let report = report_for(VerdictState::Verified);
-        let envelope = verdict_json(&report, &dummy_state(), "deadreckon finish render", None);
+        let envelope = verdict_json(
+            &report,
+            &dummy_state(),
+            "deadreckon finish render",
+            None,
+            None,
+        );
         let checks = envelope["checks"].as_array().expect("checks array");
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0]["command"], "go test ./...");
         assert_eq!(checks[0]["passed"], true);
+    }
+
+    #[test]
+    fn verdict_json_omits_receipt_audit_without_the_flag() {
+        let report = report_for(VerdictState::Verified);
+        let envelope = verdict_json(
+            &report,
+            &dummy_state(),
+            "deadreckon finish render",
+            None,
+            None,
+        );
+        assert!(envelope.get("receipt_audit").is_none());
+    }
+
+    #[test]
+    fn verdict_json_receipt_audit_lists_per_digest_facts() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        fixture_run(&paths, "audit-run-0001", &repo);
+        let state = deadreckon_core::load_run(&paths, "audit-run-0001").expect("load");
+
+        // A run with no sealed receipt yields one failed receipt_document fact;
+        // the envelope carries it verbatim under receipt_audit.facts.
+        let audit = deadreckon_core::audit_completion_receipt(&paths, &state);
+        let report = build_verdict_report(&state);
+        let envelope = verdict_json(
+            &report,
+            &state,
+            "deadreckon show audit-run-0001",
+            None,
+            Some(&audit),
+        );
+
+        let facts = envelope["receipt_audit"]["facts"]
+            .as_array()
+            .expect("facts array");
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert_eq!(facts[0]["name"], "receipt_document");
+        assert_eq!(facts[0]["pass"], false);
+        assert!(
+            facts[0]["detail"].as_str().expect("detail").len() > 0,
+            "failed facts carry the strict error message"
+        );
     }
 
     // ---- V-P8: --all comparison ----

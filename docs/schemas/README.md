@@ -13,6 +13,8 @@ The protocol ledger schemas are:
 
 `projections/run-view.schema.json` describes the JSON emitted by `deadreckon report --json`. Other named artifacts accepted by `deadreckon show --raw` are not Keel protocol ledgers and keep their existing formats.
 
+External observers may tail the JSONL ledgers these schemas describe directly; the per-file guarantees (append-only, torn-tail handling, strict sequencing on `job-events.jsonl`) are the supported contract in [`docs/TAILING.md`](../TAILING.md).
+
 ## Regenerating schemas
 
 Set `DEADRECKON_UPDATE_SCHEMAS=1` only when an intentional Rust type change should update the checked files. The tests fail on schema drift and print the relevant regeneration command.

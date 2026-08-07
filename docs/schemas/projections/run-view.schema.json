@@ -825,6 +825,54 @@
       ],
       "type": "object"
     },
+    "SteerEligibility": {
+      "description": "Whether a Run can accept steering, as data.\n\nSerializes as `{\"steerable\": bool, \"reason\": string|null}` with snake_case reason labels, the shape published on every JSON surface.",
+      "properties": {
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SteerIneligibleReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "steerable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "steerable"
+      ],
+      "type": "object"
+    },
+    "SteerIneligibleReason": {
+      "description": "Why a Run cannot accept steering right now.",
+      "oneOf": [
+        {
+          "description": "The Run is owned by a durable Job, so a public caller's steer is refused; only the live job driver may mutate it.",
+          "enum": [
+            "driver_fenced"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The Run is not currently executing a provider turn.",
+          "enum": [
+            "not_executing"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The Run's provider route cannot accept live steering.",
+          "enum": [
+            "provider_not_steerable"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "SuppressionFinding": {
       "properties": {
         "check_kind": {
@@ -986,6 +1034,14 @@
     "status": {
       "$ref": "#/definitions/RunStatus"
     },
+    "steerable": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/SteerEligibility"
+        }
+      ],
+      "description": "Whether the public `steer` verb would accept this Run right now."
+    },
     "turns": {
       "items": {
         "$ref": "#/definitions/TurnView"
@@ -1018,6 +1074,7 @@
     "signature",
     "spend",
     "status",
+    "steerable",
     "turns",
     "verdict",
     "why"

@@ -1098,6 +1098,10 @@ mod tests {
             },
             goal: "goal".to_string(),
             status: RunStatus::Completed,
+            steerable: deadreckon_core::SteerEligibility {
+                steerable: false,
+                reason: Some(deadreckon_core::SteerIneligibleReason::NotExecuting),
+            },
             verdict: deadreckon_core::VerdictBand {
                 state: "VERIFIED".to_string(),
                 summary: "verified".to_string(),
@@ -1423,6 +1427,7 @@ mod tests {
                 attempt_count: 1,
                 child_run_ids: Vec::new(),
                 delivery: None,
+                last_gate_attempt: None,
                 updated_at: Some(now),
                 caveats: Vec::new(),
             },

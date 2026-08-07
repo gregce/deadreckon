@@ -4339,6 +4339,13 @@ pub async fn run_deterministic_completion_gate(
     // The keyless evaluator is deliberately read-only outside `working_dir`
     // and refuses to create or replace this approved input.
     deadreckon_core::gate::compiled_acceptance_checks(&state.run_root, &state.working_dir)?;
+    // Attempt binding: clear the previous attempt's signed marker (and its
+    // advisory progress rows) before this attempt evaluates, so any marker
+    // that exists after this point was signed during THIS attempt. Without
+    // this, a stale passing marker from an earlier turn could label a later
+    // failed gate attempt as passed. Controller-only work — the sandboxed
+    // evaluator cannot be trusted (or relied on) to do it.
+    deadreckon_core::gate::clear_stale_gate_attempt_evidence(&state.run_root)?;
     let gate_network_access = approved_gate_network_access(state, strict_job)?;
 
     let boundary_observation = if let Some(launch_owner) = launch_owner {

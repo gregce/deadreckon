@@ -7,7 +7,8 @@ use std::str::FromStr as _;
 
 use deadreckon_core::gate::{
     AcceptanceContainment, GATE_CONTAINED_ENV, GATE_KEY_ENV, GATE_SANDBOX_BACKEND_ENV,
-    GateEvaluation, decode_gate_key, evaluate_gate_with_identity, sign_gate_evaluation_with_key,
+    GateEvaluation, decode_gate_key, evaluate_gate_with_identity_and_progress,
+    sign_gate_evaluation_with_key,
 };
 use deadreckon_core::{
     SupervisedProcessIdentity, SupervisedProcessPhase, read_supervised_process_record,
@@ -163,7 +164,11 @@ struct GuardedExecArgs {
 fn evaluate(args: &CommonArgs) -> Result<(), Box<dyn std::error::Error>> {
     reject_evaluator_gate_environment(|name| std::env::var_os(name).is_some())
         .map_err(|message| format!("dr-gate evaluate refused unsafe environment: {message}"))?;
-    let evaluation = evaluate_gate_with_identity(
+    // Streams advisory per-check rows to proofs/acceptance-progress.jsonl when
+    // the environment permits the write (a contained evaluator is denied and
+    // stays silent). Trusted signing later overwrites the file with rows
+    // reconstructed from validated results.
+    let evaluation = evaluate_gate_with_identity_and_progress(
         &args.run_id,
         &args.run_root,
         &args.working_dir,

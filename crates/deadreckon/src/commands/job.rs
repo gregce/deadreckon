@@ -820,14 +820,7 @@ fn print_job_status_with_open_action(
         .as_ref()
         .map(|delivery| delivery.destination.display().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let proof_status = match (
-        view.projection.outcome,
-        view.verified_receipt_error.as_deref(),
-    ) {
-        (Some(deadreckon_protocol::JobOutcome::Verified), None) => "valid",
-        (Some(deadreckon_protocol::JobOutcome::Verified), Some(_)) => "invalid",
-        _ => "not-applicable",
-    };
+    let proof_status = job_proof_status(view);
     if json_output {
         println!(
             "{}",
@@ -894,6 +887,21 @@ fn print_job_status_with_open_action(
     println!();
     println!("  {} {}", ui_muted("next:"), ui_command(next_action));
     Ok(())
+}
+
+/// One shared classification of a Job's external completion proof. `status
+/// --json` and the `list --json` fleet rollup both ride this helper so the two
+/// surfaces can never disagree about whether a Verified outcome still has a
+/// valid signed receipt behind it.
+pub(crate) fn job_proof_status(view: &deadreckon_core::JobView) -> &'static str {
+    match (
+        view.projection.outcome,
+        view.verified_receipt_error.as_deref(),
+    ) {
+        (Some(deadreckon_protocol::JobOutcome::Verified), None) => "valid",
+        (Some(deadreckon_protocol::JobOutcome::Verified), Some(_)) => "invalid",
+        _ => "not-applicable",
+    }
 }
 
 fn job_status_paths(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> Value {
@@ -3622,6 +3630,7 @@ mod tests {
                 attempt_count: 1,
                 child_run_ids: Vec::new(),
                 delivery: None,
+                last_gate_attempt: None,
                 updated_at: Some(now),
                 caveats: Vec::new(),
             },
@@ -4111,15 +4120,20 @@ mod tests {
         ]);
         let (mut child, _terminator) =
             deadreckon_core::spawn_grouped(command).expect("grouped provider fixture");
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !grandchild_path.exists() && std::time::Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let grandchild = loop {
+            if let Some(pid) = fs::read_to_string(&grandchild_path)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild pidfile never contained a numeric pid"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let grandchild = fs::read_to_string(&grandchild_path)
-            .expect("grandchild pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric grandchild pid");
+        };
         let pid = child.id();
         let path = state
             .run_root

@@ -1406,6 +1406,7 @@ async fn run_completion_action(
             run_id: &state.run_id,
             turn: None,
             diff: false,
+            patch: false,
             raw: None,
             why_failed: false,
             json_output: false,

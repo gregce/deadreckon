@@ -683,6 +683,37 @@ fn write_acceptance_marker_with_context_and_key(
     Ok(marker)
 }
 
+/// Remove the previous gate attempt's marker and advisory progress rows
+/// before a new attempt evaluates.
+///
+/// This is the trusted controller's attempt binding for gate evidence: every
+/// gate attempt begins by clearing the prior attempt's signed marker, so any
+/// marker that exists afterwards was signed DURING the current attempt. A
+/// later failed attempt can therefore never be labeled by a stale passing
+/// marker — its refusal to sign leaves no marker at all, and readers such as
+/// [`last_gate_attempt_counts`] and `validate_acceptance_marker` fail closed.
+/// The keyless evaluator cannot own this reset: it runs sandboxed and its
+/// writes under `proofs/` are advisory, so only the controller (which calls
+/// this before launching the evaluator) can guarantee it. Mirrors the parent
+/// flow, where `finalize_parent_repair_request` removes the marker when a
+/// repair round begins.
+///
+/// Fail closed: an unremovable stale marker is an error, because leaving it
+/// in place would let a previous attempt's pass masquerade as this one's.
+pub fn clear_stale_gate_attempt_evidence(run_root: &Path) -> Result<()> {
+    for path in [
+        marker_path_for_run_root(run_root),
+        acceptance_progress_path_for_run_root(run_root),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(DeadreckonError::Io { path, source }),
+        }
+    }
+    Ok(())
+}
+
 pub fn run_acceptance_gate_and_write_marker(
     run_root: &Path,
     run_id: &str,
@@ -692,6 +723,7 @@ pub fn run_acceptance_gate_and_write_marker(
     // generated default is a trusted-controller action; the keyless evaluator
     // itself only ever reads an already-approved contract.
     compiled_acceptance_checks(run_root, working_dir)?;
+    clear_stale_gate_attempt_evidence(run_root)?;
     let evaluation = evaluate_gate(run_id, run_root, working_dir)?;
     let key = read_gate_key_for_run_root(run_root, run_id)?;
     sign_gate_evaluation_with_key(
@@ -724,12 +756,72 @@ pub fn evaluate_gate_with_identity(
     working_dir: &Path,
     gate_evaluator_sha256: Option<String>,
 ) -> Result<GateEvaluation> {
+    evaluate_gate_with_identity_inner(run_id, run_root, working_dir, gate_evaluator_sha256, None)
+}
+
+/// Evaluate like [`evaluate_gate_with_identity`] while streaming advisory
+/// per-check progress rows to `proofs/acceptance-progress.jsonl` as each check
+/// runs, so live surfaces tailing that path light up before signing.
+///
+/// The rows are display data only. Progress write failures never fail the
+/// evaluation: a contained evaluator is denied writes under `proofs/` and
+/// simply runs silent. Trusted signing later overwrites the file with rows
+/// reconstructed from validated results, so nothing downstream may treat the
+/// streamed rows as evidence.
+pub fn evaluate_gate_with_identity_and_progress(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    gate_evaluator_sha256: Option<String>,
+) -> Result<GateEvaluation> {
+    let progress_path = acceptance_progress_path_for_run_root(run_root);
+    // Best-effort: stale rows from an earlier attempt are cosmetic, and a
+    // read-only mount must not turn display plumbing into a gate failure.
+    let _ = std::fs::remove_file(&progress_path);
+    evaluate_gate_with_identity_inner(
+        run_id,
+        run_root,
+        working_dir,
+        gate_evaluator_sha256,
+        Some(&progress_path),
+    )
+}
+
+fn evaluate_gate_with_identity_inner(
+    run_id: &str,
+    run_root: &Path,
+    working_dir: &Path,
+    gate_evaluator_sha256: Option<String>,
+    progress_path: Option<&Path>,
+) -> Result<GateEvaluation> {
     let canonical_working_dir = canonical_working_dir(working_dir)?;
     let (checks, contract_sha256) = approved_acceptance_contract(run_root)?;
+    let total = checks.len();
+    emit_advisory_acceptance_progress(progress_path, "started", 0, total, None);
     let mut results = Vec::with_capacity(checks.len());
-    for check in checks.iter().cloned() {
-        results.push(evaluate_check(working_dir, check)?);
+    for (idx, check) in checks.iter().cloned().enumerate() {
+        let index = idx + 1;
+        emit_advisory_acceptance_progress(progress_path, "running", index, total, None);
+        let result = evaluate_check(working_dir, check)?;
+        let status = if result.passed { "passed" } else { "failed" };
+        emit_advisory_acceptance_progress(
+            progress_path,
+            status,
+            index,
+            total,
+            Some(result.clone()),
+        );
+        results.push(result);
     }
+    let overall = if results
+        .iter()
+        .any(|result| result.must_pass && !result.passed)
+    {
+        "failed"
+    } else {
+        "passed"
+    };
+    emit_advisory_acceptance_progress(progress_path, overall, total, total, None);
     let tamper = crate::tamper::evaluate(run_id, run_root, working_dir, &checks)?;
     Ok(GateEvaluation {
         schema_version: GATE_EVALUATION_SCHEMA_VERSION,
@@ -740,6 +832,53 @@ pub fn evaluate_gate_with_identity(
         results,
         tamper,
     })
+}
+
+/// Advisory wrapper over the canonical progress writer: swallow every write
+/// error so the keyless evaluator behaves identically whether or not the
+/// sandbox lets the display row through.
+fn emit_advisory_acceptance_progress(
+    progress_path: Option<&Path>,
+    status: &str,
+    index: usize,
+    total: usize,
+    result: Option<AcceptanceCheckResult>,
+) {
+    let _ = emit_acceptance_progress(progress_path, status, index, total, result);
+}
+
+/// Advisory `(n_passed, n_total)` counts for the most recent gate attempt
+/// recorded under `run_root`, bound to `run_id`.
+///
+/// Counts come ONLY from the acceptance marker, and only after its HMAC
+/// signature verifies for this run under the protected gate key. Raw
+/// `proofs/acceptance-progress.jsonl` bytes are never consulted: the keyless
+/// evaluator (and, uncontained, any repository-controlled check subprocess)
+/// can stream arbitrary display rows there, so nothing that feeds the job
+/// ledger may trust them. The marker is also attempt-scoped: every gate
+/// attempt begins with [`clear_stale_gate_attempt_evidence`], so a verified
+/// marker always describes the current attempt and a failed attempt — whose
+/// signer refused, leaving no marker — reports no counts; a stale pass from
+/// an earlier attempt can never label a later failure. Defensively, a marker
+/// whose recorded `check_count` disagrees with its result rows is refused
+/// outright and `n_passed` is clamped to `n_total`. Display and read-model
+/// data only; never an input to signing or promotion.
+pub fn last_gate_attempt_counts(run_root: &Path, run_id: &str) -> Option<(u32, u32)> {
+    let raw = std::fs::read(marker_path_for_run_root(run_root)).ok()?;
+    let marker = serde_json::from_slice::<AcceptanceMarker>(&raw).ok()?;
+    if marker.run_id != run_id
+        || marker.checks.is_empty()
+        || marker.check_count != marker.checks.len()
+    {
+        return None;
+    }
+    let key = read_gate_key_for_run_root(run_root, run_id).ok()?;
+    verify_v2_marker_signature(run_root, &marker, &key).ok()?;
+    let n_total = u32::try_from(marker.checks.len()).unwrap_or(u32::MAX);
+    let n_passed = u32::try_from(marker.checks.iter().filter(|check| check.passed).count())
+        .map(|count| count.min(n_total))
+        .unwrap_or(n_total);
+    Some((n_passed, n_total))
 }
 
 /// Validate a keyless evaluation against current trusted inputs.
@@ -2392,6 +2531,369 @@ mod tests {
         )
         .expect_err("wrong tamper refused");
         assert!(err.to_string().contains("tamper evidence"), "{err}");
+    }
+
+    #[test]
+    fn keyless_evaluation_with_progress_streams_advisory_rows_live() {
+        let (_temp, state, _) = keyless_evaluation_fixture();
+        let progress_path = super::acceptance_progress_path_for_run_root(&state.run_root);
+        assert!(!progress_path.exists());
+
+        let evaluation = super::evaluate_gate_with_identity_and_progress(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            None,
+        )
+        .expect("keyless evaluation with progress");
+
+        assert_eq!(evaluation.results.len(), 1);
+        let raw = std::fs::read_to_string(&progress_path).expect("progress rows");
+        let progress = raw
+            .lines()
+            .map(|line| serde_json::from_str::<super::AcceptanceProgressEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress
+                .iter()
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["started", "running", "passed", "passed"],
+            "{progress:?}"
+        );
+        assert!(
+            progress[2]
+                .result
+                .as_ref()
+                .is_some_and(|result| result.passed)
+        );
+        // Advisory rows only: the evaluator still writes no proof artifacts.
+        assert!(!super::marker_path(&state).exists());
+        assert!(!crate::tamper::acceptance_tamper_path_for_run_root(&state.run_root).exists());
+    }
+
+    #[test]
+    fn trusted_signer_overwrites_advisory_progress_rows_with_reconstructed_evidence() {
+        let (temp, state, _) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+        let progress_path = super::acceptance_progress_path_for_run_root(&state.run_root);
+
+        let evaluation = super::evaluate_gate_with_identity_and_progress(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            None,
+        )
+        .expect("keyless evaluation with progress");
+        // A hostile writer could append arbitrary display rows before signing.
+        let junk = "{\"status\":\"passed\",\"index\":99,\"total\":99}\n";
+        let mut advisory = std::fs::read_to_string(&progress_path).expect("advisory rows");
+        advisory.push_str(junk);
+        std::fs::write(&progress_path, &advisory).expect("tampered advisory rows");
+
+        super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            evaluation,
+            &key,
+            AcceptanceContainment::uncontained("none"),
+        )
+        .expect("sign");
+
+        let raw = std::fs::read_to_string(&progress_path).expect("reconstructed rows");
+        assert!(!raw.contains("\"index\":99"), "{raw}");
+        let progress = raw
+            .lines()
+            .map(|line| serde_json::from_str::<super::AcceptanceProgressEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        // One check reconstructs as started + (running, passed) + overall.
+        assert_eq!(
+            progress
+                .iter()
+                .map(|entry| entry.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["started", "running", "passed", "passed"],
+            "{progress:?}"
+        );
+        validate_acceptance_marker(&state).expect("marker validates");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_style_denied_progress_writes_leave_the_evaluation_identical() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A contained evaluator is denied writes under proofs/. Simulate the
+        // denial with a read-only proofs directory and prove the advisory
+        // plumbing stays silent: same evaluation results, no progress file,
+        // no error.
+        let (_temp, state, _) = keyless_evaluation_fixture();
+        let proofs = state.run_root.join("proofs");
+        std::fs::create_dir_all(&proofs).expect("proofs dir");
+        std::fs::set_permissions(&proofs, std::fs::Permissions::from_mode(0o555))
+            .expect("deny proofs writes");
+
+        let with_progress = super::evaluate_gate_with_identity_and_progress(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            None,
+        );
+        std::fs::set_permissions(&proofs, std::fs::Permissions::from_mode(0o755))
+            .expect("restore proofs");
+        let with_progress = with_progress.expect("denied progress writes never fail evaluation");
+        let mut silent = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect("no-progress evaluation");
+
+        assert!(!super::acceptance_progress_path_for_run_root(&state.run_root).exists());
+        // Byte-for-byte identical evaluations: `tamper.evaluated_at` is the
+        // only field the wall clock reaches, so align it and compare the full
+        // serialized value. Denied progress writes must not perturb anything
+        // else — not results, not detail strings, not field presence.
+        silent.tamper.evaluated_at = with_progress.tamper.evaluated_at;
+        assert_eq!(
+            serde_json::to_vec(&with_progress).expect("serialize with-progress"),
+            serde_json::to_vec(&silent).expect("serialize silent"),
+            "denied-progress evaluation must be byte-identical to the no-progress variant"
+        );
+    }
+
+    #[test]
+    fn last_gate_attempt_counts_require_a_signature_verified_marker() {
+        let (temp, state, _) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None
+        );
+
+        // A failed attempt signs no marker. The controller-reconstructed
+        // progress rows written before the acceptance refusal are raw display
+        // bytes indistinguishable from evaluator output, so they must never
+        // become counts.
+        std::fs::remove_file(state.working_dir.join("README.md")).expect("break check");
+        let failed = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect("failed evaluation");
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+        super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            failed,
+            &key,
+            AcceptanceContainment::uncontained("none"),
+        )
+        .expect_err("failed evaluation refused");
+        assert!(
+            super::acceptance_progress_path_for_run_root(&state.run_root).is_file(),
+            "reconstructed rows exist on disk"
+        );
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None,
+            "raw progress rows must never become counts"
+        );
+
+        std::fs::write(state.working_dir.join("README.md"), "approved\n").expect("restore");
+        let passing = super::evaluate_gate(&state.run_id, &state.run_root, &state.working_dir)
+            .expect("passing evaluation");
+        super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            passing,
+            &key,
+            AcceptanceContainment::uncontained("none"),
+        )
+        .expect("sign");
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            Some((1, 1))
+        );
+        // The verified marker is bound to this run; another run id refuses.
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, "other-run"),
+            None
+        );
+    }
+
+    #[test]
+    fn last_gate_attempt_counts_refuse_a_forged_marker() {
+        let (_temp, state, evaluation) = keyless_evaluation_fixture();
+
+        // An agent with write access to proofs/ plants an all-green marker
+        // without holding the gate key. Parse succeeds; the HMAC does not.
+        let forged = super::AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: super::AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: evaluation.working_dir.clone(),
+            contained: false,
+            sandbox_backend: "none".to_string(),
+            signature: "0".repeat(64),
+            check_count: evaluation.results.len(),
+            checks: evaluation.results,
+        };
+        let marker_path = super::marker_path(&state);
+        std::fs::create_dir_all(marker_path.parent().expect("proofs dir")).expect("proofs");
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&forged).expect("forged marker"),
+        )
+        .expect("plant forged marker");
+
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None,
+            "a forged marker must never become counts"
+        );
+    }
+
+    #[test]
+    fn evaluator_streamed_rows_never_become_counts_when_signing_refuses_early() {
+        // The exact G8 boundary: the keyless evaluator streams all-passed
+        // advisory rows, then signing refuses BEFORE reconstruction (contract
+        // mutated under it), leaving the evaluator's rows as the surviving
+        // bytes of proofs/acceptance-progress.jsonl. Those rows must never
+        // surface as gate counts.
+        let (temp, state, _) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let progress_path = super::acceptance_progress_path_for_run_root(&state.run_root);
+
+        let evaluation = super::evaluate_gate_with_identity_and_progress(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            None,
+        )
+        .expect("keyless evaluation with progress");
+        // A hostile appender pads the stream with extra "passed" rows too.
+        let junk = format!(
+            "{}\n",
+            serde_json::json!({
+                "checked_at": Utc::now(),
+                "status": "passed",
+                "index": 99,
+                "total": 99,
+                "result": evaluation.results[0],
+            })
+        );
+        let mut advisory = std::fs::read_to_string(&progress_path).expect("advisory rows");
+        advisory.push_str(&junk);
+        std::fs::write(&progress_path, &advisory).expect("tampered advisory rows");
+
+        let contract_path = state.run_root.join("acceptance.yaml");
+        let contract = std::fs::read_to_string(&contract_path).expect("contract");
+        std::fs::write(&contract_path, format!("{contract}\n# changed\n"))
+            .expect("mutate contract");
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+        let err = super::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            evaluation,
+            &key,
+            AcceptanceContainment::uncontained("none"),
+        )
+        .expect_err("contract mismatch refused before reconstruction");
+        assert!(err.to_string().contains("contract digest"), "{err}");
+
+        // The evaluator's streamed rows survive as raw bytes...
+        let surviving = std::fs::read_to_string(&progress_path).expect("surviving rows");
+        assert!(surviving.contains("\"index\":99"), "{surviving}");
+        // ...but no marker exists, so no counts reach the job ledger.
+        assert!(!super::marker_path(&state).exists());
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None,
+            "evaluator-streamed rows must never reach the ledger"
+        );
+    }
+
+    #[test]
+    fn a_stale_passing_marker_never_labels_a_later_failed_attempt() {
+        // Attempt N passes and signs a genuine marker; attempt N+1's gate
+        // fails. Because every gate attempt begins with
+        // clear_stale_gate_attempt_evidence, the earlier pass cannot label
+        // the later failure all-green: no marker survives the failed
+        // attempt, and counts fail closed.
+        let (_temp, state, _) = keyless_evaluation_fixture();
+
+        super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("attempt N passes and signs");
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            Some((1, 1))
+        );
+
+        std::fs::remove_file(state.working_dir.join("README.md")).expect("break check");
+        super::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("attempt N+1 gate refused");
+
+        assert!(
+            !super::marker_path(&state).exists(),
+            "the stale passing marker must not survive into the failed attempt"
+        );
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None,
+            "a stale pass must never label a later failed attempt"
+        );
+    }
+
+    #[test]
+    fn counts_refuse_a_marker_whose_check_count_disagrees_with_its_rows() {
+        // Defense in depth: even a marker signed under the real gate key is
+        // refused when its recorded check_count disagrees with its result
+        // rows, so no signer regression can ever inflate or shrink the
+        // ledger totals.
+        let (temp, state, evaluation) = keyless_evaluation_fixture();
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let key = super::read_gate_key(&paths, &state.run_id).expect("gate key");
+        let mut marker = super::AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: super::AcceptanceProofKind::NativeGate,
+            checked_at: Utc::now(),
+            working_dir: evaluation.working_dir.clone(),
+            contained: false,
+            sandbox_backend: "none".to_string(),
+            signature: String::new(),
+            check_count: 5,
+            checks: evaluation.results,
+        };
+        marker.signature = super::v2_marker_signature(&state.run_root, &marker, &key)
+            .expect("sign crafted marker");
+        let marker_path = super::marker_path(&state);
+        std::fs::create_dir_all(marker_path.parent().expect("proofs dir")).expect("proofs");
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec(&marker).expect("marker json"),
+        )
+        .expect("plant marker");
+
+        assert_eq!(
+            super::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            None,
+            "a disagreeing check_count must be refused before counting"
+        );
     }
 
     #[test]

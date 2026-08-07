@@ -1742,6 +1742,71 @@ fn json_inspection_surfaces_emit_named_payloads() {
     }
 }
 
+/// Gap G6: steerability is published as data on every run JSON surface, and
+/// every surface reads the one predicate in deadreckon-core, so the CLI and
+/// any app polling the JSON can never disagree about the Rudder.
+#[test]
+fn status_and_show_json_publish_the_steer_eligibility_predicate() {
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let mut state = create_run(
+        &paths,
+        RunOptions {
+            goal: "steerable data run".to_string(),
+            cwd: cwd.clone(),
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: None,
+            max_wall_seconds: None,
+            run_id: Some("ccccddddeeee11112222333344445555".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("run");
+    let prefix = &state.run_id[..8].to_string();
+    let status_json = || -> Value {
+        let output = deadreckon(&paths)
+            .args(["status", prefix, "--json"])
+            .output()
+            .expect("status json");
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_str(&stdout(&output)).expect("valid status json")
+    };
+
+    let pending = status_json();
+    assert_eq!(
+        pending["steerable"],
+        json!({"steerable": false, "reason": "not_executing"}),
+        "{pending}"
+    );
+
+    state.status = RunStatus::Executing;
+    state.provider = Some("cli:codex-server".to_string());
+    save_state(&state).expect("save");
+
+    let executing = status_json();
+    assert_eq!(
+        executing["steerable"],
+        json!({"steerable": true, "reason": null}),
+        "{executing}"
+    );
+
+    let show = deadreckon(&paths)
+        .args(["show", prefix, "--json"])
+        .output()
+        .expect("show json");
+    assert!(show.status.success(), "{}", stderr(&show));
+    let shown: Value = serde_json::from_str(&stdout(&show)).expect("valid show json");
+    assert_eq!(shown["steerable"], executing["steerable"], "{shown}");
+    assert_eq!(
+        shown["run_view"]["steerable"], shown["steerable"],
+        "RunView and the show envelope must agree: {shown}"
+    );
+}
+
 fn help<const N: usize>(args: [&str; N]) -> String {
     help_slice(&args)
 }
@@ -2725,4 +2790,88 @@ fn list_json_shape_is_unchanged_by_folding() {
         runs.iter().all(|run| run["goal"].is_string()),
         "run goals stay verbatim in --json: {value}"
     );
+}
+
+/// Gap G3/G6/G10 (M0 fix pass): the fleet-poll inspection surfaces are pure
+/// reads. A 2-second poll cadence over `list --json` / `status --json` /
+/// `show --json` must never mutate DEADRECKON_HOME; this pins the property so
+/// a future enrichment cannot silently add a write to a hot path.
+#[test]
+fn fleet_poll_inspection_surfaces_never_write_to_deadreckon_home() {
+    // File list plus full contents: a same-length in-place rewrite (which
+    // len+mtime alone can miss on coarse filesystem timestamps) still fails
+    // the byte-identical comparison.
+    #[allow(clippy::type_complexity)]
+    fn tree_snapshot(
+        root: &std::path::Path,
+    ) -> Vec<(std::path::PathBuf, u64, std::time::SystemTime, Vec<u8>)> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read_dir) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read_dir {
+                let entry = entry.expect("dir entry");
+                let path = entry.path();
+                let metadata = entry.metadata().expect("metadata");
+                let contents = if metadata.is_dir() {
+                    stack.push(path.clone());
+                    Vec::new()
+                } else {
+                    fs::read(&path).expect("file contents")
+                };
+                entries.push((
+                    path,
+                    metadata.len(),
+                    metadata.modified().expect("mtime"),
+                    contents,
+                ));
+            }
+        }
+        entries.sort();
+        entries
+    }
+
+    let temp = repo_tempdir();
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let state = create_run(
+        &paths,
+        RunOptions {
+            goal: "read-only poll run".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: None,
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: Some("readonlypoll1111222233334444aaaa".to_string()),
+            codebase: None,
+        },
+    )
+    .expect("run");
+    let home = paths.home().to_path_buf();
+    let before = tree_snapshot(&home);
+
+    for args in [
+        vec!["list", "--json"],
+        vec!["list", "--all", "--json"],
+        vec!["status", &state.run_id[..8], "--json"],
+        vec!["show", &state.run_id[..8], "--json"],
+        vec!["show", &state.run_id[..8], "--diff", "--json"],
+        vec!["show", &state.run_id[..8], "--diff", "--patch", "--json"],
+    ] {
+        // Every surface must leave the tree untouched whether it succeeds or
+        // refuses (e.g. --diff on a run without a captured snapshot).
+        let described = args.join(" ");
+        let output = deadreckon(&paths).args(args).output().expect("command");
+        drop(output);
+        assert_eq!(
+            tree_snapshot(&home),
+            before,
+            "`deadreckon {described}` mutated DEADRECKON_HOME"
+        );
+    }
 }

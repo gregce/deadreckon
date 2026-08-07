@@ -2788,6 +2788,86 @@ fn show_diff_excludes_target_from_output() {
 }
 
 #[test]
+fn show_diff_patch_json_exports_per_file_unified_patches() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args([
+            "show",
+            &state.run_id,
+            "--diff",
+            "--patch",
+            "--json",
+            "--plain",
+        ])
+        .output()
+        .expect("show diff patch");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let patches = value["patches"].as_array().expect("patches array");
+    let readme = patches
+        .iter()
+        .find(|patch| patch["path"] == "README.md")
+        .expect("README patch");
+    assert_eq!(readme["status"], "modified", "{readme}");
+    assert_eq!(readme["truncated"], false, "{readme}");
+    let unified = readme["unified"].as_str().expect("unified text");
+    assert!(unified.contains("--- a/README.md"), "{unified}");
+    assert!(unified.contains("+++ b/README.md"), "{unified}");
+    assert!(unified.contains("@@"), "{unified}");
+    assert!(unified.contains("+after"), "{unified}");
+}
+
+#[test]
+fn show_diff_patch_file_selects_a_single_full_patch() {
+    let temp = repo_tempdir();
+    let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);
+
+    let output = deadreckon(&paths)
+        .args([
+            "show",
+            &state.run_id,
+            "--diff",
+            "--patch",
+            "--file",
+            "README.md",
+            "--json",
+            "--plain",
+        ])
+        .output()
+        .expect("show diff patch file");
+
+    assert_success(&output);
+    let value: Value = serde_json::from_str(&stdout(&output)).expect("json");
+    let patches = value["patches"].as_array().expect("patches array");
+    assert_eq!(patches.len(), 1, "{value}");
+    assert_eq!(patches[0]["path"], "README.md", "{value}");
+    assert_eq!(patches[0]["truncated"], false, "{value}");
+
+    let missing = deadreckon(&paths)
+        .args([
+            "show",
+            &state.run_id,
+            "--diff",
+            "--patch",
+            "--file",
+            "absent.txt",
+            "--json",
+            "--plain",
+        ])
+        .output()
+        .expect("show diff patch missing file");
+    assert!(!missing.status.success(), "{}", stdout(&missing));
+    let err = stderr(&missing);
+    assert!(
+        err.contains("no source change for file absent.txt"),
+        "{err}"
+    );
+}
+
+#[test]
 fn show_turn_renders_diff_exchange_and_sandbox_events() {
     let temp = repo_tempdir();
     let (paths, state) = logbook_fixture_run(&temp, RunStatus::Completed);

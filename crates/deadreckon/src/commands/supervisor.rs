@@ -3759,12 +3759,16 @@ async fn classify_advanced_attempt(
                                 token,
                                 JobEventKind::DeterministicGatePassed,
                                 format!("graph-gate-passed:{}", token.epoch),
-                                json!({
-                                    "marker": deadreckon_core::marker_path_for_run_root(
-                                        &load_run(paths, job.job_id.as_ref())?.run_root
-                                    ),
-                                    "merged_run_id": plan.merged_run_id,
-                                }),
+                                with_job_gate_attempt_counts(
+                                    paths,
+                                    job.job_id.as_ref(),
+                                    json!({
+                                        "marker": deadreckon_core::marker_path_for_run_root(
+                                            &load_run(paths, job.job_id.as_ref())?.run_root
+                                        ),
+                                        "merged_run_id": plan.merged_run_id,
+                                    }),
+                                ),
                             )?;
                             if let Some(decision) = decision {
                                 let kind = match decision {
@@ -3862,10 +3866,14 @@ async fn classify_advanced_attempt(
                                 token,
                                 JobEventKind::DeterministicGateFailed,
                                 format!("graph-gate-failed:{}", token.epoch),
-                                json!({
-                                    "reason": reason,
-                                    "merged_run_id": plan.merged_run_id,
-                                }),
+                                with_job_gate_attempt_counts(
+                                    paths,
+                                    job.job_id.as_ref(),
+                                    json!({
+                                        "reason": reason,
+                                        "merged_run_id": plan.merged_run_id,
+                                    }),
+                                ),
                             )?;
                             fail_advanced_attempt(
                                 paths,
@@ -4143,12 +4151,16 @@ async fn classify_advanced_attempt(
                                 token,
                                 JobEventKind::DeterministicGatePassed,
                                 format!("campaign-gate-passed:{}", token.epoch),
-                                json!({
-                                    "marker": deadreckon_core::marker_path_for_run_root(
-                                        &load_run(paths, job.job_id.as_ref())?.run_root
-                                    ),
-                                    "merged_run_id": campaign.merged_run_id,
-                                }),
+                                with_job_gate_attempt_counts(
+                                    paths,
+                                    job.job_id.as_ref(),
+                                    json!({
+                                        "marker": deadreckon_core::marker_path_for_run_root(
+                                            &load_run(paths, job.job_id.as_ref())?.run_root
+                                        ),
+                                        "merged_run_id": campaign.merged_run_id,
+                                    }),
+                                ),
                             )?;
                             if let Some(decision) = decision {
                                 let kind = match decision {
@@ -4246,10 +4258,14 @@ async fn classify_advanced_attempt(
                                 token,
                                 JobEventKind::DeterministicGateFailed,
                                 format!("campaign-gate-failed:{}", token.epoch),
-                                json!({
-                                    "reason": reason,
-                                    "merged_run_id": campaign.merged_run_id,
-                                }),
+                                with_job_gate_attempt_counts(
+                                    paths,
+                                    job.job_id.as_ref(),
+                                    json!({
+                                        "reason": reason,
+                                        "merged_run_id": campaign.merged_run_id,
+                                    }),
+                                ),
                             )?;
                             fail_advanced_attempt(
                                 paths,
@@ -4378,6 +4394,36 @@ fn campaign_budget_exhaustion(campaign_dir: &Path) -> Result<Option<(StopReason,
     Ok(Some((stop_reason, reason)))
 }
 
+/// Merge advisory `n_passed`/`n_total` counts for the observed gate attempt
+/// into a gate event detail so the Job projection can fold its rebuildable
+/// `last_gate_attempt` checkpoint. Counts come only from the acceptance
+/// marker after its HMAC signature verifies for this run — never from raw
+/// progress-file bytes, which any keyless evaluator or uncontained check
+/// subprocess can write. The marker is attempt-scoped: the controller clears
+/// it via `clear_stale_gate_attempt_evidence` before every gate attempt
+/// evaluates, so a verified marker was signed during the attempt being
+/// classified and a stale pass can never label a later failure. When no
+/// marker verifies (every failed attempt) the detail is recorded unchanged.
+fn with_gate_attempt_counts(run_root: &Path, run_id: &str, mut detail: Value) -> Value {
+    if let Some((n_passed, n_total)) = deadreckon_core::last_gate_attempt_counts(run_root, run_id)
+        && let Some(object) = detail.as_object_mut()
+    {
+        object.insert("n_passed".to_string(), json!(n_passed));
+        object.insert("n_total".to_string(), json!(n_total));
+    }
+    detail
+}
+
+/// [`with_gate_attempt_counts`] for parent completions that have not already
+/// loaded the job's result run. A missing or unreadable run never blocks the
+/// lifecycle event; the detail is simply recorded without counts.
+fn with_job_gate_attempt_counts(paths: &DeadreckonPaths, job_id: &str, detail: Value) -> Value {
+    match load_run(paths, job_id) {
+        Ok(run) => with_gate_attempt_counts(&run.run_root, &run.run_id, detail),
+        Err(_) => detail,
+    }
+}
+
 fn append_parent_gate_passed_if_present(
     paths: &DeadreckonPaths,
     job: &Job,
@@ -4396,10 +4442,14 @@ fn append_parent_gate_passed_if_present(
         token,
         JobEventKind::DeterministicGatePassed,
         format!("{artifact}-gate-passed:{}", token.epoch),
-        json!({
-            "marker": marker_path,
-            "merged_run_id": merged_run_id,
-        }),
+        with_gate_attempt_counts(
+            &parent.run_root,
+            &parent.run_id,
+            json!({
+                "marker": marker_path,
+                "merged_run_id": merged_run_id,
+            }),
+        ),
     )?;
     Ok(())
 }
@@ -5009,9 +5059,13 @@ fn classify_persisted_attempt(
                     &receipt,
                     &state.run_id,
                     format!("deterministic-gate-passed:{}:{}", token.epoch, state.turn),
-                    json!({
-                        "marker": deadreckon_core::marker_path_for_run_root(&state.run_root)
-                    }),
+                    with_gate_attempt_counts(
+                        &state.run_root,
+                        &state.run_id,
+                        json!({
+                            "marker": deadreckon_core::marker_path_for_run_root(&state.run_root)
+                        }),
+                    ),
                     format!("semantic-judge-achieved:{}:{}", token.epoch, state.turn),
                     json!({
                         "judgment": state
@@ -5031,7 +5085,11 @@ fn classify_persisted_attempt(
                     token,
                     JobEventKind::DeterministicGateFailed,
                     format!("deterministic-gate-failed:{}:{}", token.epoch, state.turn),
-                    json!({ "error": error.to_string() }),
+                    with_gate_attempt_counts(
+                        &state.run_root,
+                        &state.run_id,
+                        json!({ "error": error.to_string() }),
+                    ),
                 )?;
                 append_attempt_stopped(
                     paths,
@@ -5052,7 +5110,13 @@ fn classify_persisted_attempt(
                     token,
                     JobEventKind::DeterministicGatePassed,
                     format!("deterministic-gate-passed:{}:{}", token.epoch, state.turn),
-                    json!({ "marker": deadreckon_core::marker_path_for_run_root(&state.run_root) }),
+                    with_gate_attempt_counts(
+                        &state.run_root,
+                        &state.run_id,
+                        json!({
+                            "marker": deadreckon_core::marker_path_for_run_root(&state.run_root)
+                        }),
+                    ),
                 )?;
                 let semantic = append_persisted_semantic_event(paths, token, &state)?;
                 let stop_reason = super::graph_job::semantic_decision_stop_reason(semantic)
@@ -5114,7 +5178,11 @@ fn classify_persisted_attempt(
                     token,
                     JobEventKind::DeterministicGateFailed,
                     format!("deterministic-gate-failed:{}:{}", token.epoch, state.turn),
-                    json!({ "error": error.to_string() }),
+                    with_gate_attempt_counts(
+                        &state.run_root,
+                        &state.run_id,
+                        json!({ "error": error.to_string() }),
+                    ),
                 )?;
                 append_attempt_stopped(
                     paths,
@@ -5135,7 +5203,13 @@ fn classify_persisted_attempt(
                     token,
                     JobEventKind::DeterministicGatePassed,
                     format!("deterministic-gate-passed:{}:{}", token.epoch, state.turn),
-                    json!({ "marker": deadreckon_core::marker_path_for_run_root(&state.run_root) }),
+                    with_gate_attempt_counts(
+                        &state.run_root,
+                        &state.run_id,
+                        json!({
+                            "marker": deadreckon_core::marker_path_for_run_root(&state.run_root)
+                        }),
+                    ),
                 )?;
                 let semantic = append_persisted_semantic_event(paths, token, &state)?;
                 let stop_reason = super::graph_job::semantic_decision_stop_reason(semantic)
@@ -7571,6 +7645,21 @@ mod tests {
                 .expect("replacement supervisor projects single receipt");
 
             assert_exact_verified_projection(&paths, &job);
+            if matches!(boundary, VerifiedCrashBoundary::ReceiptAvailable) {
+                // The supervisor observed the completed gate attempt itself,
+                // so the durable projection carries the rebuildable
+                // last_gate_attempt checkpoint with counts from the marker.
+                let projection = deadreckon_core::load_job_projection(&paths, job.job_id.as_ref())
+                    .expect("durable projection");
+                let stamp = projection
+                    .last_gate_attempt
+                    .expect("last gate attempt stamp");
+                assert_eq!(
+                    (stamp.attempt, stamp.n_passed, stamp.n_total),
+                    (1, 1, 1),
+                    "{projection:?}"
+                );
+            }
         }
     }
 
@@ -12099,6 +12188,190 @@ mod tests {
                 .iter()
                 .all(|event| event.kind != JobEventKind::RetryScheduled)
         );
+    }
+
+    #[test]
+    fn evaluator_streamed_progress_never_reaches_a_failed_gate_ledger_event() {
+        // G8 boundary, supervisor edition: the keyless evaluator streams
+        // all-passed advisory rows, then signing refuses at
+        // validated_gate_evaluation_checks (the approved contract was mutated
+        // under it), leaving the evaluator's rows as the surviving progress
+        // bytes and no marker. The DeterministicGateFailed event stamped into
+        // job-events.jsonl must carry NO counts: evaluator rows never reach
+        // the ledger or the `list --json` gate projection.
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        executing_attempt(&paths, &job);
+        let mut state = load_run(&paths, job.job_id.as_ref()).expect("attempt state");
+        fs::write(state.working_dir.join("README.md"), "approved\n").expect("readme");
+        let contract_path = state.run_root.join("acceptance.yaml");
+        fs::write(
+            &contract_path,
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("approved contract");
+        let evaluation = deadreckon_core::gate::evaluate_gate_with_identity_and_progress(
+            &state.run_id,
+            &state.run_root,
+            &state.working_dir,
+            None,
+        )
+        .expect("keyless evaluation streams all-passed rows");
+        let progress_path = deadreckon_core::acceptance_progress_path_for_run_root(&state.run_root);
+        assert!(
+            fs::read_to_string(&progress_path)
+                .expect("streamed rows")
+                .contains("\"status\":\"passed\""),
+            "the evaluator streamed passing display rows"
+        );
+        // Tamper so signing refuses before any evidence reconstruction.
+        let contract = fs::read_to_string(&contract_path).expect("contract");
+        fs::write(&contract_path, format!("{contract}\n# changed\n")).expect("mutate contract");
+        let key = deadreckon_core::read_gate_key(&paths, &state.run_id).expect("gate key");
+        let error = deadreckon_core::sign_gate_evaluation_with_key(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+            evaluation,
+            &key,
+            deadreckon_core::AcceptanceContainment::uncontained("none"),
+        )
+        .expect_err("sign refuses the tampered contract");
+        assert!(error.to_string().contains("contract digest"), "{error}");
+        assert!(
+            fs::read_to_string(&progress_path)
+                .expect("surviving rows")
+                .contains("\"status\":\"passed\""),
+            "the all-passed evaluator rows survive on disk"
+        );
+
+        state.status = RunStatus::Failed;
+        state.failure_reason =
+            Some("NEEDS_REVIEW: deterministic gate failed on the final turn".to_string());
+        save_state(&state).expect("failed gate state");
+        let token = claim_started_attempt(&paths, &job, 1);
+        classify_persisted_attempt(
+            &paths,
+            &job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: false,
+            },
+            false,
+        )
+        .expect("classification");
+
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        let gate_failed = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::DeterministicGateFailed)
+            .expect("gate failed event");
+        assert!(
+            gate_failed.detail.get("n_passed").is_none()
+                && gate_failed.detail.get("n_total").is_none(),
+            "evaluator-streamed rows must never become ledger counts: {}",
+            gate_failed.detail
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::DeterministicGatePassed)
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert_eq!(view.projection.stop_reason, Some(StopReason::FatalGate));
+        assert!(
+            view.projection.last_gate_attempt.is_none(),
+            "no controller-authored counts exist for a refused attempt"
+        );
+    }
+
+    #[test]
+    fn a_stale_passing_marker_cannot_label_a_later_failed_attempt() {
+        // Attempt N's gate passed and signed a genuine marker. Attempt N+1's
+        // gate begins — clearing the stale marker — and fails, so signing
+        // never re-issues one. Classification must record
+        // DeterministicGateFailed with NO counts (the stale all-green pass
+        // from attempt N must not relabel attempt N+1) and must not record a
+        // deterministic gate pass at all.
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        executing_attempt(&paths, &job);
+        let mut state = load_run(&paths, job.job_id.as_ref()).expect("attempt state");
+        fs::write(state.working_dir.join("README.md"), "approved\n").expect("readme");
+        fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "checks:\n  - kind: file_exists\n    path: \"{working_dir}/README.md\"\n",
+        )
+        .expect("approved contract");
+        deadreckon_core::gate::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect("attempt N gate passes and signs");
+        assert_eq!(
+            deadreckon_core::last_gate_attempt_counts(&state.run_root, &state.run_id),
+            Some((1, 1)),
+            "attempt N's verified marker yields counts"
+        );
+
+        // Attempt N+1: the gate re-runs against a broken deliverable.
+        fs::remove_file(state.working_dir.join("README.md")).expect("break check");
+        deadreckon_core::gate::run_acceptance_gate_and_write_marker(
+            &state.run_root,
+            &state.run_id,
+            &state.working_dir,
+        )
+        .expect_err("attempt N+1 gate refused");
+        assert!(
+            !deadreckon_core::marker_path_for_run_root(&state.run_root).exists(),
+            "the stale passing marker must not survive into the failed attempt"
+        );
+
+        state.status = RunStatus::Failed;
+        state.failure_reason =
+            Some("NEEDS_REVIEW: deterministic gate failed on the final turn".to_string());
+        save_state(&state).expect("failed gate state");
+        let token = claim_started_attempt(&paths, &job, 1);
+        classify_persisted_attempt(
+            &paths,
+            &job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: false,
+            },
+            false,
+        )
+        .expect("classification");
+
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::DeterministicGatePassed),
+            "a stale marker must not label the failed attempt as passed"
+        );
+        let gate_failed = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::DeterministicGateFailed)
+            .expect("gate failed event");
+        assert!(
+            gate_failed.detail.get("n_passed").is_none()
+                && gate_failed.detail.get("n_total").is_none(),
+            "a stale pass must never label a later failed attempt: {}",
+            gate_failed.detail
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("view");
+        assert_eq!(view.projection.stop_reason, Some(StopReason::FatalGate));
+        assert!(view.projection.last_gate_attempt.is_none());
     }
 
     #[test]

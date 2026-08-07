@@ -641,8 +641,9 @@ pub(crate) fn footer_for_state(
         items.push(("q/Esc/Ctrl-D".to_string(), "detach".to_string()));
     }
 
-    if state.status == RunStatus::Executing && state.provider.as_deref() == Some("cli:codex-server")
-    {
+    // Attach runs its steer through the same fence-resolving queue path, so
+    // the hint mirrors the shared predicate with the fence treated as settled.
+    if deadreckon_core::steer_eligibility_with_driver_fence(state, false).steerable {
         items.push((":".to_string(), "steer".to_string()));
     }
 

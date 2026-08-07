@@ -26,6 +26,9 @@ crate: deadreckon-core
   artifacts::inventory_recoverable_files
   artifacts::inventory_recoverable_files_for_state
   artifacts::inventory_recoverable_files_with_policy
+  artifacts::PATCH_UNIFIED_BYTE_BUDGET
+  artifacts::PatchEntry
+  artifacts::patches_from_diff
   artifacts::ProvenanceRecord
   artifacts::remove_artifact_path
   artifacts::restore_snapshot
@@ -89,6 +92,9 @@ crate: deadreckon-core
   codebase::write_codebase_record
   codebase::write_trusted_codebase_record
   completion::validate_strict_contract
+  completion::audit_completion_receipt
+  completion::ReceiptAudit
+  completion::ReceiptFact
   completion::seal_completion_receipt
   completion::seal_completion_receipt_bounded
   completion::SEMANTIC_JUDGMENT_JSON
@@ -215,6 +221,7 @@ crate: deadreckon-core
   gate::gate_key_path
   gate::gate_key_path_for_run_root
   gate::gate_nonce_path_for_run_root
+  gate::last_gate_attempt_counts
   gate::marker_path_for_run_root
   gate::PARENT_REPAIR_CANDIDATE_JSON
   gate::PARENT_REPAIR_MANIFEST_JSON
@@ -250,6 +257,7 @@ crate: deadreckon-core
   job::JOB_CONTROL_LOCK
   job::JOB_EVENTS_JSONL
   job::JOB_JSON
+  job::JobLastGateAttempt
   job::JobProjection
   job::JOB_PROJECTION_JSON
   job::JobView
@@ -394,6 +402,11 @@ crate: deadreckon-core
   state::RunOwnershipArtifact
   state::RunStatus
   state::save_state
+  steer::steer_eligibility
+  steer::steer_eligibility_with_driver_fence
+  steer::STEERABLE_PROVIDER_ROUTE
+  steer::SteerEligibility
+  steer::SteerIneligibleReason
   workspace_capture::capture_workspace
   workspace_capture::capture_workspace_strict
   workspace_capture::CaptureBudgets

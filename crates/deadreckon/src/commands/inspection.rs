@@ -1,5 +1,5 @@
 use super::super::*;
-use deadreckon_protocol::{RunEvent, TraceRecord};
+use deadreckon_protocol::{JobLease, RunEvent, TraceRecord};
 
 pub(crate) fn list_command(
     scope: Option<String>,
@@ -31,19 +31,7 @@ pub(crate) fn list_command(
         .collect::<Vec<_>>();
     let chains = super::chain::list_chain_records(&paths, effective_scope.clone())?;
     if json_output {
-        let runs = runs
-            .iter()
-            .map(|run| {
-                json!({
-                    "run_id": &run.run_id,
-                    "scope": &run.scope,
-                    "goal": &run.goal,
-                    "status": run_status_label(run.status),
-                    "updated_at": run.updated_at,
-                    "state_path": &run.state_path,
-                })
-            })
-            .collect::<Vec<_>>();
+        let runs = runs.iter().map(run_list_row).collect::<Vec<_>>();
         let plans = plans
             .iter()
             .map(|plan| {
@@ -83,20 +71,10 @@ pub(crate) fn list_command(
                 })
             })
             .collect::<Vec<_>>();
+        let now = Utc::now();
         let jobs = jobs
             .iter()
-            .map(|view| {
-                json!({
-                    "job_id": view.job.job_id,
-                    "scope": view.job.scope,
-                    "goal": view.job.goal,
-                    "status": super::job::job_status_label(view),
-                    "updated_at": view.projection.updated_at.unwrap_or(view.job.created_at),
-                    "attempts": view.projection.attempt_count,
-                    "outcome": view.projection.outcome,
-                    "stop_reason": view.projection.stop_reason,
-                })
-            })
+            .map(|view| job_list_row(&paths, view, now))
             .collect::<Vec<_>>();
         let empty = runs.is_empty() && plans.is_empty() && chains.is_empty() && jobs.is_empty();
         let empty_surface = empty.then(|| empty_list_surface(effective_scope.as_deref(), all));
@@ -311,6 +289,157 @@ pub(crate) fn list_command(
     append_list_action_footer(&mut output);
     print!("{output}");
     Ok(())
+}
+
+/// G3 fleet rollup: one `list --json` job row carries what a fleet poller
+/// would otherwise open ~6 files per job per tick to learn. Every enrichment
+/// is additive over the original row shape and strictly read-only display
+/// data — nothing here is a fence, an authority, or a promotion input.
+fn job_list_row(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let projection = &view.projection;
+    let (provider, sandbox) = job_provider_and_sandbox(paths, view);
+    json!({
+        "job_id": view.job.job_id,
+        "scope": view.job.scope,
+        "goal": view.job.goal,
+        "status": super::job::job_status_label(view),
+        "updated_at": projection.updated_at.unwrap_or(view.job.created_at),
+        "attempts": projection.attempt_count,
+        "outcome": projection.outcome,
+        "stop_reason": projection.stop_reason,
+        "projection": {
+            "phase": projection.phase,
+            "outcome": projection.outcome,
+            "stop_reason": projection.stop_reason,
+            "attempt_count": projection.attempt_count,
+            "caveats": projection.caveats,
+        },
+        "lease": job_lease_rollup(paths, view.job.job_id.as_ref(), now),
+        "spend": job_spend_rollup(paths, view),
+        "provider": provider,
+        "sandbox": sandbox,
+        "receipt": {
+            "present": paths.job_receipt(view.job.job_id.as_ref()).is_file(),
+            "verified": super::job::job_proof_status(view),
+            "error": view.verified_receipt_error,
+        },
+        "gate": projection.last_gate_attempt.map(|gate| json!({
+            "attempt": gate.attempt,
+            "n_passed": gate.n_passed,
+            "n_total": gate.n_total,
+        })),
+    })
+}
+
+/// Legacy `state.json` rows get the same additive enrichment where the old
+/// artifact can honestly answer: provider and the spend head. Leases,
+/// receipts, and gate stamps are durable-Job facts, so they stay absent
+/// rather than fabricated.
+fn run_list_row(run: &RunListEntry) -> serde_json::Value {
+    let state = load_state(&run.state_path).ok();
+    json!({
+        "run_id": &run.run_id,
+        "scope": &run.scope,
+        "goal": &run.goal,
+        "status": run_status_label(run.status),
+        "updated_at": run.updated_at,
+        "state_path": &run.state_path,
+        "provider": state.as_ref().and_then(|state| state.provider.clone()),
+        "spend": state
+            .as_ref()
+            .map_or(serde_json::Value::Null, |state| spend_rollup(&state.run_root)),
+    })
+}
+
+/// Read the lease checkpoint without claiming any authority over it. A
+/// missing or unreadable checkpoint is `null`; freshness is display data for
+/// a fleet board, never a reclamation decision — `claim_job_lease` remains
+/// the only judge of ownership.
+fn job_lease_rollup(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> serde_json::Value {
+    let Ok(raw) = fs::read(paths.job_lease(job_id)) else {
+        return serde_json::Value::Null;
+    };
+    let Ok(lease) = serde_json::from_slice::<JobLease>(&raw) else {
+        return serde_json::Value::Null;
+    };
+    // Each heartbeat writes `expires_at = heartbeat_at + TTL`, so "heartbeat
+    // age within TTL" is exactly "now before expires_at".
+    json!({
+        "owner_id": lease.owner_id,
+        "epoch": lease.epoch,
+        "heartbeat_age_seconds": (now - lease.heartbeat_at).num_seconds().max(0),
+        "expires_at": lease.expires_at,
+        "fresh": now < lease.expires_at,
+    })
+}
+
+/// The newest attempt owns the live spend ledger; a Job with no attempt yet
+/// reads its own run root so single-shape Jobs still report a spend head.
+fn job_spend_rollup(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> serde_json::Value {
+    let run_id = view
+        .projection
+        .child_run_ids
+        .last()
+        .map(String::as_str)
+        .unwrap_or(view.job.job_id.as_ref());
+    spend_rollup(&paths.run_root(&view.job.scope, run_id))
+}
+
+/// Tail the newest run-loop spend row. `total_cost_usd` is a running total,
+/// so the last `kind == "loop"` row is the spend head; narrator rows share
+/// the ledger but carry the narrator's own totals and must not be reported
+/// as run spend (mirroring `spend_summary`).
+fn spend_rollup(run_root: &Path) -> serde_json::Value {
+    let Ok(raw) = fs::read_to_string(run_root.join("spend.jsonl")) else {
+        return serde_json::Value::Null;
+    };
+    raw.lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<SpendRecord>(line).ok())
+        .find(|record| record.kind == "loop")
+        .map_or(serde_json::Value::Null, |record| {
+            json!({
+                "total_cost_usd": record.total_cost_usd,
+                "cap_usd": record.cap_usd,
+                "subscription": record.subscription,
+                "wall_time_seconds": record.wall_time_seconds,
+            })
+        })
+}
+
+/// Provider and sandbox exactly as the JobView already resolves them: the
+/// newest attempt's RunView when one exists, else the frozen launch inputs
+/// (launch-plan providers, approved execution policy sandbox).
+fn job_provider_and_sandbox(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+) -> (Option<String>, Option<String>) {
+    if let Some(attempt) = view.attempts.last() {
+        return (
+            Some(attempt.provider.clone()),
+            Some(attempt.sandbox.backend.clone()),
+        );
+    }
+    let provider =
+        super::course::load_launch_plan(&paths.job_launch_plan(view.job.job_id.as_ref()))
+            .ok()
+            .and_then(|plan| plan.providers.coder.or(plan.providers.default_child));
+    let sandbox = view
+        .job
+        .policy
+        .execution
+        .as_ref()
+        .map(|execution| execution.sandbox_requested.clone());
+    (provider, sandbox)
 }
 
 fn empty_list_surface(scope: Option<&str>, all: bool) -> VerdictSurface {
@@ -1531,7 +1660,330 @@ fn print_library_entry(entry: &LibraryEntry) {
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeDelta;
+    use deadreckon_protocol::{
+        Job, JobExecutionPolicy, JobId, JobOutcome, JobPhase, JobPolicy, JobSchemaVersion,
+        JobShape, SemanticJudgeMode, StopReason,
+    };
+    use tempfile::TempDir;
+
     use super::*;
+
+    /// A synthesized durable Job plus its view: the rollup readers only touch
+    /// the job directory and run roots, so no supervisor has to run.
+    fn rollup_fixture(temp: &TempDir) -> (DeadreckonPaths, deadreckon_core::JobView) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let now = Utc::now();
+        let job_id = JobId("rollup-fixture-job".to_string());
+        fs::create_dir_all(paths.job_dir(job_id.as_ref())).expect("job dir");
+        let job = Job {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: job_id.clone(),
+            scope: "rollup-scope".to_string(),
+            goal: "prove the fleet rollup".to_string(),
+            shape: JobShape::Graph,
+            created_at: now,
+            source_cwd: temp.path().join("source"),
+            launch_plan_sha256: "sha256:launch".to_string(),
+            authority_sha256: "sha256:authority".to_string(),
+            policy: JobPolicy {
+                max_spend_usd: 5.0,
+                max_wall_seconds: 600,
+                max_attempts: 2,
+                deadline: None,
+                semantic_judge: SemanticJudgeMode::Required,
+                execution: None,
+            },
+        };
+        let view = deadreckon_core::JobView {
+            projection: deadreckon_core::JobProjection {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id,
+                phase: JobPhase::Running,
+                outcome: None,
+                stop_reason: None,
+                last_sequence: 3,
+                current_lease_epoch: 1,
+                attempt_count: 1,
+                child_run_ids: vec!["attempt-run-1".to_string()],
+                delivery: None,
+                last_gate_attempt: None,
+                updated_at: Some(now),
+                caveats: Vec::new(),
+            },
+            job,
+            attempts: Vec::new(),
+            missing_attempts: Vec::new(),
+            verified_receipt_error: None,
+        };
+        (paths, view)
+    }
+
+    fn write_lease(
+        paths: &DeadreckonPaths,
+        view: &deadreckon_core::JobView,
+        heartbeat_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) {
+        let lease = JobLease {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id: view.job.job_id.clone(),
+            owner_id: "supervisor-1".to_string(),
+            epoch: 7,
+            acquired_at: heartbeat_at,
+            heartbeat_at,
+            expires_at,
+            boot_id: "boot-1".to_string(),
+            pid: 4242,
+            process_start_identity: None,
+            process_group: 4242,
+            child_pid: None,
+        };
+        fs::write(
+            paths.job_lease(view.job.job_id.as_ref()),
+            serde_json::to_vec(&lease).expect("lease json"),
+        )
+        .expect("lease checkpoint");
+    }
+
+    fn spend_line(total: f64, cap: Option<f64>, subscription: bool, kind: &str) -> String {
+        serde_json::to_string(&SpendRecord {
+            timestamp: Utc::now(),
+            turn: 1,
+            provider: "cli:test".to_string(),
+            model: "test-model".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cost_usd: 0.01,
+            total_cost_usd: total,
+            cap_usd: cap,
+            subscription,
+            estimated: false,
+            wall_time_seconds: Some(12.5),
+            wall_time_cap_seconds: None,
+            kind: kind.to_string(),
+        })
+        .expect("spend row")
+    }
+
+    #[test]
+    fn fleet_rollup_keeps_original_fields_and_reports_absent_facts_as_null() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, view) = rollup_fixture(&temp);
+
+        let row = job_list_row(&paths, &view, Utc::now());
+
+        // Original row fields stay byte-compatible.
+        assert_eq!(row["job_id"], json!("rollup-fixture-job"));
+        assert_eq!(row["scope"], json!("rollup-scope"));
+        assert_eq!(row["status"], json!("running"));
+        assert_eq!(row["attempts"], json!(1));
+        assert!(row["outcome"].is_null());
+        // A Job with no lease checkpoint, no ledger, no receipt, and no gate
+        // stamp reports null rather than a fabricated value.
+        assert!(row["lease"].is_null(), "{row}");
+        assert!(row["spend"].is_null(), "{row}");
+        assert!(row["gate"].is_null(), "{row}");
+        assert!(row["provider"].is_null(), "{row}");
+        assert!(row["sandbox"].is_null(), "{row}");
+        assert_eq!(
+            row["projection"],
+            json!({
+                "phase": "running",
+                "outcome": null,
+                "stop_reason": null,
+                "attempt_count": 1,
+                "caveats": [],
+            })
+        );
+        assert_eq!(
+            row["receipt"],
+            json!({ "present": false, "verified": "not-applicable", "error": null })
+        );
+    }
+
+    #[test]
+    fn fleet_rollup_distinguishes_fresh_from_stale_leases() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, view) = rollup_fixture(&temp);
+        let now = Utc::now();
+
+        write_lease(
+            &paths,
+            &view,
+            now - TimeDelta::seconds(120),
+            now - TimeDelta::seconds(60),
+        );
+        let stale = job_list_row(&paths, &view, now);
+        assert_eq!(stale["lease"]["owner_id"], json!("supervisor-1"));
+        assert_eq!(stale["lease"]["epoch"], json!(7));
+        assert_eq!(stale["lease"]["heartbeat_age_seconds"], json!(120));
+        assert_eq!(
+            stale["lease"]["fresh"],
+            json!(false),
+            "an expired heartbeat window must read as stale: {stale}"
+        );
+
+        write_lease(&paths, &view, now, now + TimeDelta::seconds(60));
+        let fresh = job_list_row(&paths, &view, now);
+        assert_eq!(fresh["lease"]["heartbeat_age_seconds"], json!(0));
+        assert_eq!(fresh["lease"]["fresh"], json!(true), "{fresh}");
+    }
+
+    #[test]
+    fn fleet_rollup_reads_the_capped_spend_head_from_loop_rows_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, view) = rollup_fixture(&temp);
+        let run_root = paths.run_root(&view.job.scope, "attempt-run-1");
+        fs::create_dir_all(&run_root).expect("attempt run root");
+        // The trailing narrator row carries the narrator's own running total;
+        // the spend head must come from the last loop row instead.
+        let ledger = [
+            spend_line(1.0, Some(5.0), false, "loop"),
+            spend_line(5.0, Some(5.0), true, "loop"),
+            spend_line(0.02, None, false, "narrator"),
+        ]
+        .join("\n");
+        fs::write(run_root.join("spend.jsonl"), ledger).expect("spend ledger");
+
+        let row = job_list_row(&paths, &view, Utc::now());
+
+        assert_eq!(
+            row["spend"],
+            json!({
+                "total_cost_usd": 5.0,
+                "cap_usd": 5.0,
+                "subscription": true,
+                "wall_time_seconds": 12.5,
+            })
+        );
+    }
+
+    #[test]
+    fn fleet_rollup_receipt_tracks_proof_validity() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut view) = rollup_fixture(&temp);
+        view.projection.phase = JobPhase::Terminal;
+        view.projection.outcome = Some(JobOutcome::Verified);
+        view.projection.stop_reason = Some(StopReason::Verified);
+        fs::write(paths.job_receipt(view.job.job_id.as_ref()), b"{}\n").expect("receipt");
+
+        let valid = job_list_row(&paths, &view, Utc::now());
+        assert_eq!(
+            valid["receipt"],
+            json!({ "present": true, "verified": "valid", "error": null })
+        );
+        assert_eq!(valid["status"], json!("verified"));
+
+        view.verified_receipt_error = Some("receipt signature is invalid".to_string());
+        let invalid = job_list_row(&paths, &view, Utc::now());
+        assert_eq!(invalid["receipt"]["present"], json!(true));
+        assert_eq!(invalid["receipt"]["verified"], json!("invalid"));
+        assert_eq!(
+            invalid["receipt"]["error"],
+            json!("receipt signature is invalid")
+        );
+        // The row status must agree with the receipt verdict, exactly as
+        // `status --json` reports it.
+        assert_eq!(invalid["status"], json!("verified_proof_invalid"));
+    }
+
+    #[test]
+    fn fleet_rollup_rides_the_last_gate_attempt_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut view) = rollup_fixture(&temp);
+        view.projection.last_gate_attempt = Some(deadreckon_core::JobLastGateAttempt {
+            attempt: 2,
+            n_passed: 3,
+            n_total: 5,
+            finished_at: Utc::now(),
+        });
+
+        let row = job_list_row(&paths, &view, Utc::now());
+
+        assert_eq!(
+            row["gate"],
+            json!({ "attempt": 2, "n_passed": 3, "n_total": 5 })
+        );
+    }
+
+    #[test]
+    fn fleet_rollup_falls_back_to_frozen_launch_inputs_for_provider_and_sandbox() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut view) = rollup_fixture(&temp);
+        view.job.policy.execution = Some(JobExecutionPolicy::workspace_only("docker"));
+        let mut plan = super::super::course::LaunchPlan::new(
+            &view.job.goal,
+            super::super::course::CourseShape::Single,
+            super::super::course::CourseResolution {
+                source: super::super::course::ResolutionSource::Operator,
+                confidence: 1.0,
+                rationale: "fixture".to_string(),
+                clamps_applied: Vec::new(),
+            },
+        );
+        plan.providers.coder = Some("cli:codex".to_string());
+        fs::write(
+            paths.job_launch_plan(view.job.job_id.as_ref()),
+            serde_json::to_vec(&plan).expect("plan json"),
+        )
+        .expect("launch plan");
+
+        let row = job_list_row(&paths, &view, Utc::now());
+
+        assert_eq!(row["provider"], json!("cli:codex"));
+        assert_eq!(row["sandbox"], json!("docker"));
+    }
+
+    #[test]
+    fn legacy_run_rows_carry_provider_and_spend_head() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "legacy rollup".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("cli:test".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(
+            state.run_root.join("spend.jsonl"),
+            spend_line(0.25, Some(1.0), false, "loop"),
+        )
+        .expect("spend ledger");
+        let entry = RunListEntry {
+            run_id: state.run_id.clone(),
+            scope: state.scope.clone(),
+            goal: state.goal.clone(),
+            status: state.status,
+            updated_at: state.updated_at,
+            state_path: state.state_path(),
+        };
+
+        let row = run_list_row(&entry);
+
+        // Original fields stay byte-compatible.
+        assert_eq!(row["run_id"], json!(state.run_id));
+        assert_eq!(row["scope"], json!(state.scope));
+        assert_eq!(row["provider"], json!("cli:test"));
+        assert_eq!(
+            row["spend"],
+            json!({
+                "total_cost_usd": 0.25,
+                "cap_usd": 1.0,
+                "subscription": false,
+                "wall_time_seconds": 12.5,
+            })
+        );
+    }
 
     #[test]
     fn list_and_library_use_shared_columns() {
