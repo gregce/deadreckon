@@ -11,7 +11,6 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::artifacts::ProvenanceRecord;
 use crate::artifacts::inventory_files;
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::gate::ACCEPTANCE_SPEC;
@@ -452,8 +451,13 @@ fn provenance_files(run_root: &Path) -> Result<Vec<PathBuf>> {
     let raw = fs::read_to_string(&path).with_path(&path)?;
     let mut files = Vec::new();
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let record: ProvenanceRecord = serde_json::from_str(line).with_json_path(&path)?;
-        files.extend(record.files);
+        // Gap G9: operator send-back rows are typed non-turn provenance; they
+        // name no files, so tamper coverage reads only the turn rows.
+        let entry: crate::artifacts::ProvenanceEntry =
+            serde_json::from_str(line).with_json_path(&path)?;
+        if let crate::artifacts::ProvenanceEntry::Turn(record) = entry {
+            files.extend(record.files);
+        }
     }
     Ok(files)
 }
@@ -833,6 +837,28 @@ mod tests {
             },
         )
         .expect("provenance");
+    }
+
+    /// Gap G9: an operator send-back row on a parent run's provenance names
+    /// no files; tamper coverage must read past it instead of erroring.
+    #[test]
+    fn provenance_files_skips_typed_operator_sendback_rows() {
+        let (_temp, state) = fixture_run("sendback rows stay out of tamper coverage");
+        record_files(&state, vec![PathBuf::from("src/lib.rs")]);
+        crate::artifacts::append_operator_sendback(
+            &state,
+            &crate::artifacts::OperatorSendbackRecord {
+                kind: crate::artifacts::OperatorSendbackKind::OperatorSendback,
+                note: "tighten the follow-up".to_string(),
+                parent_job_id: state.run_id.clone(),
+                new_job_id: "child-job".to_string(),
+                at: Utc::now(),
+            },
+        )
+        .expect("sendback");
+
+        let files = super::provenance_files(&state.run_root).expect("provenance files");
+        assert_eq!(files, vec![PathBuf::from("src/lib.rs")]);
     }
 
     /// The cross-attempt blind spot self-healing introduced: a retry resumes

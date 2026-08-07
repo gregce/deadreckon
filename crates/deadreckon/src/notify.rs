@@ -10,7 +10,8 @@ use deadreckon_core::{DeadreckonPaths, PipelineState};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-pub const NOTIFY_JSONL: &str = "notify.jsonl";
+pub use deadreckon_core::attention::NOTIFY_JSONL;
+
 const NOTIFY_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub type NotifyFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -421,5 +422,5 @@ pub fn append_notify_attempt(
 }
 
 pub fn notify_jsonl_path(state: &PipelineState) -> PathBuf {
-    state.run_root.join(NOTIFY_JSONL)
+    deadreckon_core::attention::notify_jsonl_path(&state.run_root)
 }

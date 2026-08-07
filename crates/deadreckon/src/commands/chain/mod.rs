@@ -3548,10 +3548,24 @@ fn chain_kill_command_inner(
     )?;
     let _ = fs::remove_file(paths.conductor_json(&chain.chain_id));
     if print_verdict {
-        print!(
-            "{}",
-            chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
-        );
+        if let Some(verb) = machine_json::active() {
+            machine_json::emit_success(
+                verb,
+                &chain.chain_id,
+                &chain_verdict_surface(paths, &chain),
+                json!({
+                    "signal": if force { "SIGKILL" } else { "SIGTERM" },
+                    "escalated": force,
+                    "terminal_phase_observed": true,
+                    "processes_signalled": signaled_pids.len(),
+                }),
+            )?;
+        } else {
+            print!(
+                "{}",
+                chain_verdict_surface(paths, &chain).render_plain(!completion_hints_enabled(false))
+            );
+        }
     }
     Ok(())
 }

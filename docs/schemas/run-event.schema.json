@@ -202,6 +202,40 @@
           }
         },
         {
+          "description": "A queued steer-inbox entry was consumed and delivered to the run: the turn loop injected it into turn `turn`'s prompt frame as advisory operator guidance (between-turn delivery, any provider). `queued_at` is the durable inbox timestamp, so a consumer can render queued→ack.",
+          "type": "object",
+          "required": [
+            "kind",
+            "preview",
+            "queued_at",
+            "source",
+            "turn"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "steer_delivered"
+              ]
+            },
+            "preview": {
+              "type": "string"
+            },
+            "queued_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "source": {
+              "type": "string"
+            },
+            "turn": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
           "type": "object",
           "required": [
             "kind",

@@ -42,6 +42,16 @@ pub enum RunEventKind {
         path: PathBuf,
         status: String,
     },
+    /// A queued steer-inbox entry was consumed and delivered to the run: the
+    /// turn loop injected it into turn `turn`'s prompt frame as advisory
+    /// operator guidance (between-turn delivery, any provider). `queued_at`
+    /// is the durable inbox timestamp, so a consumer can render queued→ack.
+    SteerDelivered {
+        turn: u32,
+        source: String,
+        queued_at: DateTime<Utc>,
+        preview: String,
+    },
     RunCompleted {
         status: String,
     },

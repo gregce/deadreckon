@@ -4055,10 +4055,40 @@ fn start_launch_intent(args: &StartCommandArgs) -> StartLaunchIntent {
     }
 }
 
+/// The >$50 spend acknowledgment, with `run` parity: `--yes` approves the
+/// launch preview but never the budget; a large ceiling needs its own
+/// explicit `--i-know-its-a-lot` (or an interactive confirm in a TTY).
+/// Read-only previews never reach this gate.
+fn confirm_start_spend_cap(max_spend: Option<f64>, i_know_its_a_lot: bool) -> Result<()> {
+    let Some(max_spend) = max_spend else {
+        return Ok(());
+    };
+    if max_spend <= 50.0 || i_know_its_a_lot {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "max spend above $50 requires --i-know-its-a-lot in scripts".to_string(),
+        )));
+    }
+    eprintln!("{} --max-spend is ${max_spend:.2}", ui_warn("warning:"));
+    if prompt::confirm(
+        &format!("continue with --max-spend ${max_spend:.2}?"),
+        false,
+    )? {
+        Ok(())
+    } else {
+        Err(CliError::Core(DeadreckonError::InvalidInput(
+            "start cancelled by spend confirmation".to_string(),
+        )))
+    }
+}
+
 fn emit_start_read_only_result(
     decision: &StartLaunchDecision,
     args: &StartCommandArgs,
     paths: &DeadreckonPaths,
+    launch_plan: Option<&commands::course::LaunchPlan>,
 ) -> Result<bool> {
     if args.json && !args.yes {
         let surface = start_preview_surface(decision, args, paths)?;
@@ -4073,7 +4103,7 @@ fn emit_start_read_only_result(
                 }
             }
         }
-        let payload = surface.add_to_json(json!({
+        let mut preview = json!({
             "kind": "start",
             "goal": &decision.goal,
             "selected_mode": decision.selected_mode.label(),
@@ -4093,7 +4123,14 @@ fn emit_start_read_only_result(
             "history_actions": &decision.history_next_actions,
             "next_actions": next_actions,
             "try_lines": &decision.try_lines
-        }));
+        });
+        // G2 GUI launch protocol: the read-only preview embeds the exact
+        // replayable launch-plan payload — write `launch_plan` to disk and
+        // `deadreckon start --plan <file> --yes --json` executes it verbatim.
+        if let Some(plan) = launch_plan {
+            preview["launch_plan"] = serde_json::to_value(plan)?;
+        }
+        let payload = surface.add_to_json(preview);
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(true);
     }
@@ -4320,7 +4357,9 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
         )));
     }
     let paths = DeadreckonPaths::discover();
-    if emit_start_read_only_result(&decision, &replay_args, &paths)? {
+    // A replay preview embeds the resolved plan itself — the payload that
+    // `--yes` would dispatch — not a reconstruction from the decision.
+    if emit_start_read_only_result(&decision, &replay_args, &paths, Some(&plan))? {
         return Ok(());
     }
     let eligibility = StartPromptEligibility::from_args(&replay_args, io::stdin().is_terminal());
@@ -4329,10 +4368,9 @@ async fn start_replay_command(mut args: StartCommandArgs, plan_path: &Path) -> R
         .allows_prompts()
         .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
     materialize_start_done_criteria(&mut decision, None, None).await?;
+    confirm_start_spend_cap(plan.budget.ceiling_usd, replay_args.i_know_its_a_lot)?;
     require_start_supervisor_service(prompter)?;
-    dispatch_start_command(replay_args, &decision, plan)
-        .await
-        .map(|_| ())
+    dispatch_start_with_launch_envelope(replay_args, &decision, plan).await
 }
 
 pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
@@ -4426,7 +4464,18 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             .and_then(|defaults| defaults.start_confirm_contract)
             .unwrap_or(false);
     apply_forced_contract_review_guard(&mut decision, eligibility, force_contract_review);
-    if emit_start_read_only_result(&decision, &args, &paths)? {
+    // A launchable JSON preview embeds the same plan payload the execute
+    // path would build, so a GUI can persist it and replay it verbatim.
+    let preview_plan = (args.json && !args.yes && decision.recovery.is_none()).then(|| {
+        let mut plan = commands::course::launch_plan_from_decision(
+            &decision,
+            args.max_spend.or(defaults.max_spend),
+            "preview",
+        );
+        plan.budget.deadline = args.deadline;
+        plan
+    });
+    if emit_start_read_only_result(&decision, &args, &paths, preview_plan.as_ref())? {
         return Ok(());
     }
     if decision.recovery.is_some() {
@@ -4448,6 +4497,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     // only after provider-backed contract authoring and the operator's final
     // launch confirmation have both succeeded.
     if decision.recovery.is_none() && start_launch_intent(&args) == StartLaunchIntent::Launch {
+        confirm_start_spend_cap(args.max_spend.or(defaults.max_spend), args.i_know_its_a_lot)?;
         let service_prompter = eligibility
             .allows_prompts()
             .then_some(&mut terminal_prompter as &mut dyn StartPrompter);
@@ -4532,14 +4582,26 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
     let mut launch_plan =
         commands::course::launch_plan_from_decision(&decision, ceiling, accepted_by);
     launch_plan.budget.deadline = args.deadline;
+    dispatch_start_with_launch_envelope(args, &decision, launch_plan).await
+}
+
+/// Dispatch an approved launch, honoring C-P10 launch JSON parity: with
+/// `--json --yes` the dispatch runs quietly and one machine envelope carries
+/// the plan and what actually launched. Both the guided path and a `--plan`
+/// replay ride this, so the GUI protocol's execute leg
+/// (`start --plan <file> --yes --json`) answers with the same envelope as a
+/// direct `start ... --yes --json`.
+async fn dispatch_start_with_launch_envelope(
+    args: StartCommandArgs,
+    decision: &StartLaunchDecision,
+    launch_plan: commands::course::LaunchPlan,
+) -> Result<()> {
     if args.json && args.yes {
-        // C-P10: launch JSON parity — dispatch quietly, then emit one
-        // machine envelope carrying the plan and what actually launched.
         let goal = decision.goal.clone();
         let mode_label = decision.selected_mode.label().to_string();
         let mut quiet_args = args;
         quiet_args.quiet = true;
-        let dispatched = dispatch_start_command(quiet_args, &decision, launch_plan.clone()).await?;
+        let dispatched = dispatch_start_command(quiet_args, decision, launch_plan.clone()).await?;
         pause_before_json_launch_envelope_for_test();
         let dispatched_ids = dispatched.ids;
         let next_actions: Vec<String> = dispatched_ids
@@ -4558,7 +4620,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
             "goal": goal,
             "mode": mode_label,
             "plan": &launch_plan,
-            "done_contract": start_done_contract_json(&decision),
+            "done_contract": start_done_contract_json(decision),
             "dispatched": { "mode": mode_label, "ids": dispatched_ids },
             "durability": {
                 "process": process_durability,
@@ -4569,7 +4631,7 @@ pub(crate) async fn start_command(args: StartCommandArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&envelope)?);
         return Ok(());
     }
-    dispatch_start_command(args, &decision, launch_plan)
+    dispatch_start_command(args, decision, launch_plan)
         .await
         .map(|_| ())
 }
@@ -4768,6 +4830,7 @@ fn guided_extension_args(
             .as_ref()
             .map(|contract| contract.source_path.clone()),
         yes: true,
+        note: None,
         max_context_turns: None,
         no_context: false,
         max_spend: args.max_spend,
@@ -5306,6 +5369,7 @@ mod start_footer_tests {
             preview: false,
             review_done: false,
             yes: true,
+            i_know_its_a_lot: false,
             no_seams: false,
             fresh: false,
             worktree: false,

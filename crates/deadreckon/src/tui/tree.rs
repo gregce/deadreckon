@@ -771,6 +771,7 @@ fn run_event_node_status(event: &RunEvent) -> NodeStatus {
         | RunEventKind::TokenUsageDelta { .. }
         | RunEventKind::SpendDelta { .. }
         | RunEventKind::DocsCheckpoint { .. }
+        | RunEventKind::SteerDelivered { .. }
         | RunEventKind::RunPromoted { .. } => NodeStatus::Running,
     }
 }

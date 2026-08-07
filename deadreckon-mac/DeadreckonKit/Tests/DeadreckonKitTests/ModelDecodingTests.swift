@@ -421,19 +421,51 @@ final class ModelDecodingTests: XCTestCase {
     // MARK: - NotifyRecord
 
     func testDecodesNotifyRecords() throws {
-        let delivered = try decode(
+        // Historical delivery-attempt rows carry no `kind` field.
+        guard case .deliveryAttempt(let delivered) = try decode(
             NotifyRecord.self,
             #"{"ts": "2026-08-06T02:19:42Z", "transition": "paused", "channel": "webhook", "ok": true}"#)
+        else {
+            return XCTFail("expected a delivery-attempt row")
+        }
         XCTAssertEqual(delivered.transition, .paused)
         XCTAssertTrue(delivered.ok)
         XCTAssertNil(delivered.detail)
 
-        let failed = try decode(
+        guard case .deliveryAttempt(let failed) = try decode(
             NotifyRecord.self,
             #"{"ts": "2026-08-06T02:19:43Z", "transition": "failed", "channel": "webhook", "ok": false, "detail": "connection refused"}"#)
+        else {
+            return XCTFail("expected a delivery-attempt row")
+        }
         XCTAssertEqual(failed.transition, .failed)
         XCTAssertFalse(failed.ok)
         XCTAssertEqual(failed.detail, "connection refused")
+    }
+
+    func testDecodesOperatorAttentionRows() throws {
+        // M1 typed rows are discriminated by the presence of `kind`.
+        guard case .attention(let attention) = try decode(
+            NotifyRecord.self,
+            #"{"schema_version": 1, "kind": "operator_attention", "reason": "verified_awaiting_promote", "job_id": "job-1", "run_id": "run-1", "scope": null, "at": "2026-08-06T02:20:00Z", "summary": "verified run awaits promote", "next_actions": ["deadreckon finish run-1"]}"#)
+        else {
+            return XCTFail("expected an operator-attention row")
+        }
+        XCTAssertEqual(attention.reason, .verifiedAwaitingPromote)
+        XCTAssertEqual(attention.jobID, "job-1")
+        XCTAssertEqual(attention.runID, "run-1")
+        XCTAssertNil(attention.scope)
+        XCTAssertEqual(attention.summary, "verified run awaits promote")
+        XCTAssertEqual(attention.nextActions, ["deadreckon finish run-1"])
+
+        // A widened future reason decodes to .unknown rather than failing.
+        guard case .attention(let widened) = try decode(
+            NotifyRecord.self,
+            #"{"schema_version": 1, "kind": "operator_attention", "reason": "gate_flapping", "at": "2026-08-06T02:21:00Z", "summary": "gate is flapping", "next_actions": []}"#)
+        else {
+            return XCTFail("expected an operator-attention row")
+        }
+        XCTAssertEqual(widened.reason, .unknown)
     }
 
     // MARK: - AcceptanceProgressRow

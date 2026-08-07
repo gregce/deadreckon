@@ -3,16 +3,22 @@
 //! The predicate that decides whether a Run can accept live steering lives
 //! here, in exactly one place. The `steer` command guard and the JSON
 //! projections (`status --json`, `show --json`, `RunView`) all call it, so
-//! the CLI and any app reading the JSON can never disagree. Widening
-//! steering to more providers later is a change to this module only.
+//! the CLI and any app reading the JSON can never disagree. M1 widened
+//! steering to every supported provider: any Executing run accepts a steer.
+//! The `cli:codex-server` route still delivers mid-turn inside its driver;
+//! every other provider consumes the queued inbox at the next turn boundary
+//! in the run loop.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::state::{PipelineState, RunStatus};
 
-/// The only provider route that accepts live mid-turn steering today.
-pub const STEERABLE_PROVIDER_ROUTE: &str = "cli:codex-server";
+/// The only provider route whose driver consumes the steer inbox mid-turn.
+/// Every other provider consumes queued entries at the next turn boundary,
+/// so the run loop must not drain the inbox for this route (it would
+/// double-deliver).
+pub const MID_TURN_STEER_PROVIDER_ROUTE: &str = "cli:codex-server";
 
 /// Why a Run cannot accept steering right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -23,7 +29,11 @@ pub enum SteerIneligibleReason {
     DriverFenced,
     /// The Run is not currently executing a provider turn.
     NotExecuting,
-    /// The Run's provider route cannot accept live steering.
+    /// Historical (pre-M1): the Run's provider route could not accept live
+    /// steering. The predicate no longer produces it — every provider is
+    /// steerable while Executing — but the variant stays so serialized
+    /// eligibility records and JSON consumers decoding the closed reason
+    /// set survive.
     ProviderNotSteerable,
 }
 
@@ -51,7 +61,10 @@ pub fn steer_eligibility(state: &PipelineState) -> SteerEligibility {
 /// Steer eligibility with the driver-fence outcome supplied by the caller.
 ///
 /// Reason precedence mirrors the historical steer guard: driver fence,
-/// then run status, then provider route.
+/// then run status. The historical provider-route check is gone (M1):
+/// every provider is steerable while the run is Executing — the
+/// `cli:codex-server` driver delivers mid-turn, every other provider
+/// consumes the queued inbox at its next turn boundary.
 pub fn steer_eligibility_with_driver_fence(
     state: &PipelineState,
     driver_fenced: bool,
@@ -60,8 +73,6 @@ pub fn steer_eligibility_with_driver_fence(
         Some(SteerIneligibleReason::DriverFenced)
     } else if state.status != RunStatus::Executing {
         Some(SteerIneligibleReason::NotExecuting)
-    } else if state.provider.as_deref() != Some(STEERABLE_PROVIDER_ROUTE) {
-        Some(SteerIneligibleReason::ProviderNotSteerable)
     } else {
         None
     };
@@ -79,7 +90,7 @@ mod tests {
     use crate::{DeadreckonPaths, PipelineState};
 
     use super::{
-        STEERABLE_PROVIDER_ROUTE, SteerIneligibleReason, steer_eligibility,
+        MID_TURN_STEER_PROVIDER_ROUTE, SteerIneligibleReason, steer_eligibility,
         steer_eligibility_with_driver_fence,
     };
 
@@ -91,7 +102,7 @@ mod tests {
                 goal: "steer eligibility fixture".to_string(),
                 cwd: std::env::current_dir().expect("cwd"),
                 sandbox: "none".to_string(),
-                provider: Some(STEERABLE_PROVIDER_ROUTE.to_string()),
+                provider: Some(MID_TURN_STEER_PROVIDER_ROUTE.to_string()),
                 skill_name: "default-coding".to_string(),
                 max_spend_usd: None,
                 max_wall_seconds: None,
@@ -129,8 +140,11 @@ mod tests {
         );
     }
 
+    /// M1 widening: any provider is steerable while Executing. Non-codex
+    /// routes consume the queued inbox at the next turn boundary, so the
+    /// predicate no longer refuses on the provider route.
     #[test]
-    fn non_codex_server_provider_reports_provider_not_steerable() {
+    fn any_provider_is_steerable_while_executing() {
         let temp = TempDir::new().expect("tempdir");
         let mut state = fixture_state(&temp);
         state.status = RunStatus::Executing;
@@ -138,15 +152,15 @@ mod tests {
 
         let eligibility = steer_eligibility(&state);
 
-        assert!(!eligibility.steerable);
-        assert_eq!(
-            eligibility.reason,
-            Some(SteerIneligibleReason::ProviderNotSteerable)
-        );
+        assert!(eligibility.steerable);
+        assert_eq!(eligibility.reason, None);
     }
 
+    /// Even a run with no recorded provider route is steerable while
+    /// Executing: whichever provider the loop selects consumes the inbox
+    /// at its next turn boundary.
     #[test]
-    fn missing_provider_route_reports_provider_not_steerable() {
+    fn missing_provider_route_is_steerable_while_executing() {
         let temp = TempDir::new().expect("tempdir");
         let mut state = fixture_state(&temp);
         state.status = RunStatus::Executing;
@@ -154,10 +168,8 @@ mod tests {
 
         let eligibility = steer_eligibility(&state);
 
-        assert_eq!(
-            eligibility.reason,
-            Some(SteerIneligibleReason::ProviderNotSteerable)
-        );
+        assert!(eligibility.steerable);
+        assert_eq!(eligibility.reason, None);
     }
 
     #[test]

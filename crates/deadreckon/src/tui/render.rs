@@ -878,7 +878,9 @@ pub(crate) fn help_overlay_lines(mode: AttachHelpMode) -> Vec<(&'static str, &'s
 
 fn command_mode_help_text(mode: AttachHelpMode) -> &'static str {
     match mode {
-        AttachHelpMode::Run => ":steer <instruction> (executing cli:codex-server runs)",
+        AttachHelpMode::Run => {
+            ":steer <instruction> (executing runs; mid-turn on codex-server, else next turn)"
+        }
         AttachHelpMode::Chain => {
             ":attach <id> · :kill [id] · :motion full|reduced|off · :q · :reshape [id] · :resume [id] · :verdict [id] · :why [id]"
         }

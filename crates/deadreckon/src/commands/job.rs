@@ -797,6 +797,19 @@ fn print_job_status_with_open_action(
     json_output: bool,
     open_action: &str,
 ) -> Result<()> {
+    print_job_status_with_facts(view, json_output, open_action, serde_json::Map::new())
+}
+
+/// Gap G1: when a state-changing verb was armed with `--json`, a Job-backed
+/// terminal status (queued extension, queued fork, cancelled job) becomes the
+/// verb's machine envelope instead of the prose card. `facts` carries the
+/// verb-specific outcome fields.
+pub(crate) fn print_job_status_with_facts(
+    view: &deadreckon_core::JobView,
+    json_output: bool,
+    open_action: &str,
+    facts: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let id = view.job.job_id.as_ref();
     let status = job_status_label(view);
     let paths = DeadreckonPaths::discover();
@@ -821,11 +834,10 @@ fn print_job_status_with_open_action(
         .map(|delivery| delivery.destination.display().to_string())
         .unwrap_or_else(|| "-".to_string());
     let proof_status = job_proof_status(view);
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "kind": "job_status",
+    let machine_verb = machine_json::active();
+    if json_output || machine_verb.is_some() {
+        let mut payload = json!({
+                "kind": machine_verb.unwrap_or("job_status"),
                 "id": id,
                 "status": status,
                 "verified_proof": {
@@ -841,8 +853,13 @@ fn print_job_status_with_open_action(
                 },
                 "work_clock": work_clock,
                 "job": view,
-            }))?
-        );
+        });
+        if let serde_json::Value::Object(object) = &mut payload {
+            for (key, fact) in facts {
+                object.entry(key).or_insert(fact);
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     println!("{}", ui_heading("job"));
@@ -943,7 +960,12 @@ pub(crate) fn cancel_job(
     force: bool,
 ) -> Result<()> {
     if view.projection.is_terminal() {
-        return print_job_status(view, false);
+        return print_job_status_with_facts(
+            view,
+            false,
+            "attach",
+            kill_job_facts(force, true, false),
+        );
     }
     let sequence = JobEventSequence::new(view.projection.last_sequence + 1).ok_or_else(|| {
         CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -1019,7 +1041,39 @@ pub(crate) fn cancel_job(
     }
     reconcile_job_docker_executions(paths, &view.job)?;
     let updated = deadreckon_core::JobView::load(paths, view.job.job_id.as_ref())?;
-    print_job_status(&updated, false)
+    let terminal_phase_observed = updated.projection.is_terminal();
+    print_job_status_with_facts(
+        &updated,
+        false,
+        "attach",
+        kill_job_facts(force, terminal_phase_observed, true),
+    )
+}
+
+/// Verb-specific facts for a `kill --json` envelope on a Job-owned target.
+fn kill_job_facts(
+    escalated: bool,
+    terminal_phase_observed: bool,
+    signalled: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut facts = serde_json::Map::new();
+    if machine_json::active() != Some("kill") {
+        return facts;
+    }
+    facts.insert(
+        "signal".to_string(),
+        json!(if signalled {
+            if escalated { "SIGKILL" } else { "SIGTERM" }
+        } else {
+            "none"
+        }),
+    );
+    facts.insert("escalated".to_string(), json!(escalated));
+    facts.insert(
+        "terminal_phase_observed".to_string(),
+        json!(terminal_phase_observed),
+    );
+    facts
 }
 
 pub(crate) fn reconcile_run_supervised_processes(

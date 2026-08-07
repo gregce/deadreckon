@@ -82,7 +82,9 @@ fn materialize_command_with_paths(
         }
     };
     if let Some(plan) = plan_context.as_ref() {
-        print_plan_result_context(plan, &state);
+        if machine_json::active().is_none() {
+            print_plan_result_context(plan, &state);
+        }
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
         materialize_plan_docs_to_working(paths, plan, &library_dir, None)?;
     }
@@ -171,7 +173,9 @@ pub(crate) fn finish_command(
         }
     };
     if let Some(plan) = plan_context.as_ref() {
-        print_plan_result_context(plan, &state);
+        if machine_json::active().is_none() {
+            print_plan_result_context(plan, &state);
+        }
         let library_dir = paths.library_dir(&state.scope, &state.run_id);
         materialize_plan_docs_to_working(&paths, plan, &library_dir, None)?;
     }
@@ -191,7 +195,9 @@ pub(crate) fn finish_command(
         }
     }
 
-    print_finish_consistency_summary(&state);
+    if machine_json::active().is_none() {
+        print_finish_consistency_summary(&state);
+    }
 
     let mode = lifecycle_codebase_record(&paths, &state)?.mode;
     match mode {
@@ -220,38 +226,57 @@ pub(crate) fn finish_command(
         }
         CodebaseMode::InPlace => {
             let prefix = run_prefix(&state.run_id);
+            let surface = VerdictSurface::must_new(
+                VerdictKind::Completed,
+                "run",
+                Some(&prefix),
+                ExplanationPanel::new(
+                    "DeadReckon finished the in-place run and left the checkout as the result.",
+                    "The safest next command is inspection because the changes already live in the working tree.",
+                    vec![
+                        ("run".to_string(), prefix.clone()),
+                        (
+                            "status".to_string(),
+                            run_status_label(state.status).to_string(),
+                        ),
+                        (
+                            "working".to_string(),
+                            state.working_dir.display().to_string(),
+                        ),
+                    ],
+                ),
+                vec![("Recommended", format!("deadreckon show {prefix}"))],
+                vec![
+                    (
+                        "Secondary",
+                        format!("deadreckon doc {prefix} --kind decisions"),
+                    ),
+                    ("Secondary", format!("deadreckon undo --run {prefix}")),
+                ],
+            );
+            if let Some(verb) = machine_json::active() {
+                machine_json::emit_success(
+                    verb,
+                    &state.run_id,
+                    &surface,
+                    json!({
+                        "destination": {
+                            "kind": "in-place",
+                            "path": state.working_dir,
+                        },
+                        "staged_file_count": Value::Null,
+                        "receipt_validated": finished_job_id.is_some(),
+                    }),
+                )?;
+                return Ok(());
+            }
             println!(
                 "{} {}",
                 ui_ok("finished in-place run"),
                 ui_id(&state.run_id)
             );
             println!("  {} {}", ui_muted("working:"), state.working_dir.display());
-            println!(
-                "{}",
-                VerdictSurface::must_new(
-                    VerdictKind::Completed,
-                    "run",
-                    Some(&prefix),
-                    ExplanationPanel::new(
-                        "DeadReckon finished the in-place run and left the checkout as the result.",
-                        "The safest next command is inspection because the changes already live in the working tree.",
-                        vec![
-                            ("run".to_string(), prefix.clone()),
-                            ("status".to_string(), run_status_label(state.status).to_string()),
-                            ("working".to_string(), state.working_dir.display().to_string()),
-                        ],
-                    ),
-                    vec![("Recommended", format!("deadreckon show {prefix}"))],
-                    vec![
-                        (
-                            "Secondary",
-                            format!("deadreckon doc {prefix} --kind decisions"),
-                        ),
-                        ("Secondary", format!("deadreckon undo --run {prefix}")),
-                    ],
-                )
-                .render_plain(false)
-            );
+            println!("{}", surface.render_plain(false));
             Ok(())
         }
     }
@@ -1580,6 +1605,32 @@ fn verified_export_refusal(authority: &VerifiedDeliveryAuthority, detail: &str) 
 }
 
 pub(crate) fn print_materialized(materialized: &MaterializedRun) {
+    if let Some(verb) = machine_json::active() {
+        // Export delivery only succeeds after the delivery authority was
+        // validated; for Job-owned runs that includes the sealed completion
+        // receipt (`finish_job_state` / `VerifiedDeliveryAuthority`).
+        let receipt_validated = DeadreckonPaths::discover()
+            .job_json(&materialized.run_id)
+            .is_file();
+        let staged_file_count = inventory_files(&materialized.dest)
+            .map(|files| json!(files.len()))
+            .unwrap_or(Value::Null);
+        let _ = machine_json::emit_success(
+            verb,
+            &materialized.run_id,
+            &materialized_surface(materialized),
+            json!({
+                "destination": {
+                    "kind": "export",
+                    "path": materialized.dest,
+                },
+                "source": materialized.source,
+                "staged_file_count": staged_file_count,
+                "receipt_validated": receipt_validated,
+            }),
+        );
+        return;
+    }
     println!(
         "{}",
         materialized_surface(materialized).render_plain(!completion_hints_enabled(false))
@@ -1814,7 +1865,7 @@ fn apply_command_inner(
         )?;
         verified_intent = reconciliation.intent;
         if reconciliation.applied.is_some() {
-            if !quiet {
+            if !quiet && machine_json::active().is_none() {
                 print_already_applied(&state, branch, &target);
             }
             let cleaned = finish_apply_cleanup(
@@ -1826,11 +1877,29 @@ fn apply_command_inner(
                 job_operation_lock,
             )?;
             if !quiet {
-                print!(
-                    "{}",
-                    apply_completed_surface(&state, &record, &target, cleaned)
-                        .render_plain(!completion_hints_enabled(false))
-                );
+                let strategy_name = match strategy {
+                    deadreckon_protocol::GitDeliveryStrategy::Merge => "merge",
+                    deadreckon_protocol::GitDeliveryStrategy::Squash => "squash",
+                    deadreckon_protocol::GitDeliveryStrategy::CherryPick => "cherry-pick",
+                };
+                let surface = apply_completed_surface(&state, &record, &target, cleaned);
+                if let Some(verb) = machine_json::active() {
+                    machine_json::emit_success(
+                        verb,
+                        &state.run_id,
+                        &surface,
+                        apply_outcome_facts(
+                            strategy_name,
+                            &target,
+                            cleaned,
+                            true,
+                            true,
+                            Value::Null,
+                        ),
+                    )?;
+                } else {
+                    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
+                }
             }
             return Ok(());
         }
@@ -1841,7 +1910,7 @@ fn apply_command_inner(
     )
     .unwrap_or_default();
     if diff_stat.trim().is_empty() {
-        if !quiet {
+        if !quiet && machine_json::active().is_none() {
             print_already_applied(&state, branch, &target);
         }
         let cleaned = finish_apply_cleanup(
@@ -1853,11 +1922,24 @@ fn apply_command_inner(
             job_operation_lock,
         )?;
         if !quiet {
-            print!(
-                "{}",
-                apply_completed_surface(&state, &record, &target, cleaned)
-                    .render_plain(!completion_hints_enabled(false))
-            );
+            let surface = apply_completed_surface(&state, &record, &target, cleaned);
+            if let Some(verb) = machine_json::active() {
+                machine_json::emit_success(
+                    verb,
+                    &state.run_id,
+                    &surface,
+                    apply_outcome_facts(
+                        &strategy,
+                        &target,
+                        cleaned,
+                        verified_job_id.is_some(),
+                        true,
+                        Value::Null,
+                    ),
+                )?;
+            } else {
+                print!("{}", surface.render_plain(!completion_hints_enabled(false)));
+            }
         }
         return Ok(());
     }
@@ -1941,7 +2023,7 @@ fn apply_command_inner(
                 if let Some(stash) = autostash.as_ref() {
                     restore_apply_autostash(git_root, &state.run_id, stash)?;
                 }
-                if !quiet {
+                if !quiet && machine_json::active().is_none() {
                     print_already_applied(&state, branch, &target);
                 }
                 let cleaned = finish_apply_cleanup(
@@ -1953,11 +2035,24 @@ fn apply_command_inner(
                     job_operation_lock,
                 )?;
                 if !quiet {
-                    print!(
-                        "{}",
-                        apply_completed_surface(&state, &record, &target, cleaned)
-                            .render_plain(!completion_hints_enabled(false))
-                    );
+                    let surface = apply_completed_surface(&state, &record, &target, cleaned);
+                    if let Some(verb) = machine_json::active() {
+                        machine_json::emit_success(
+                            verb,
+                            &state.run_id,
+                            &surface,
+                            apply_outcome_facts(
+                                &strategy,
+                                &target,
+                                cleaned,
+                                verified_job_id.is_some(),
+                                true,
+                                Value::Null,
+                            ),
+                        )?;
+                    } else {
+                        print!("{}", surface.render_plain(!completion_hints_enabled(false)));
+                    }
                 }
                 return Ok(());
             }
@@ -2050,7 +2145,7 @@ fn apply_command_inner(
     if let Some(stash) = autostash.as_ref() {
         restore_apply_autostash(git_root, &state.run_id, stash)?;
     }
-    if !quiet {
+    if !quiet && machine_json::active().is_none() {
         println!(
             "{} {} into {}",
             ui_ok("applied"),
@@ -2068,13 +2163,56 @@ fn apply_command_inner(
         job_operation_lock,
     )?;
     if !quiet {
-        print!(
-            "{}",
-            apply_completed_surface(&state, &record, &target, cleaned)
-                .render_plain(!completion_hints_enabled(false))
-        );
+        let surface = apply_completed_surface(&state, &record, &target, cleaned);
+        if let Some(verb) = machine_json::active() {
+            let staged_file_count = git_stdout(
+                git_root,
+                &["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            )
+            .map(|names| json!(names.lines().filter(|line| !line.trim().is_empty()).count()))
+            .unwrap_or(Value::Null);
+            machine_json::emit_success(
+                verb,
+                &state.run_id,
+                &surface,
+                apply_outcome_facts(
+                    &strategy,
+                    &target,
+                    cleaned,
+                    verified_job_id.is_some(),
+                    false,
+                    staged_file_count,
+                ),
+            )?;
+        } else {
+            print!("{}", surface.render_plain(!completion_hints_enabled(false)));
+        }
     }
     Ok(())
+}
+
+/// Verb-specific outcome facts shared by `apply --json` and the worktree
+/// branch of `finish --json`.
+fn apply_outcome_facts(
+    strategy: &str,
+    target: &str,
+    cleaned: bool,
+    receipt_validated: bool,
+    already_applied: bool,
+    staged_file_count: Value,
+) -> Value {
+    let mut facts = json!({
+        "destination": {
+            "kind": "git-branch",
+            "target": target,
+        },
+        "strategy": strategy,
+        "cleaned": cleaned,
+        "receipt_validated": receipt_validated,
+        "already_applied": already_applied,
+    });
+    facts["staged_file_count"] = staged_file_count;
+    facts
 }
 
 struct VerifiedDeliveryReconciliation {
@@ -3124,16 +3262,17 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
             return Err(CliError::Core(error));
         }
         Err(_) => {
-            print!(
-            "{}",
-            cleanup_noop_surface(
+            let surface = cleanup_noop_surface(
                 "abandon",
                 Some(&run_prefix(&state.run_id)),
                 "DeadReckon did not find a temporary worktree record for this run.",
                 "There is no worktree or temporary branch for abandon to remove; inspect the run before choosing another cleanup command.",
                 vec![
                     ("run".to_string(), run_prefix(&state.run_id)),
-                    ("status".to_string(), run_status_label(state.status).to_string()),
+                    (
+                        "status".to_string(),
+                        run_status_label(state.status).to_string(),
+                    ),
                     (
                         "workspace".to_string(),
                         state.working_dir.display().to_string(),
@@ -3141,9 +3280,21 @@ pub(crate) fn abandon_command(run_id: String, keep_branch: bool, force: bool) ->
                 ],
                 format!("deadreckon show {}", run_prefix(&state.run_id)),
                 Vec::<String>::new(),
-            )
-            .render_plain(!completion_hints_enabled(false))
-        );
+            );
+            if let Some(verb) = machine_json::active() {
+                machine_json::emit_success(
+                    verb,
+                    &state.run_id,
+                    &surface,
+                    json!({
+                        "removed": Vec::<String>::new(),
+                        "kept_branch": keep_branch,
+                        "worktree_found": false,
+                    }),
+                )?;
+                return Ok(());
+            }
+            print!("{}", surface.render_plain(!completion_hints_enabled(false)));
             return Ok(());
         }
     };
@@ -3718,9 +3869,24 @@ fn cleanup_incomplete_error(
 
 fn print_cleanup_results(results: &[CleanupRunResult]) {
     if results.len() == 1 {
+        let result = &results[0];
+        if let Some(verb) = machine_json::active() {
+            let _ = machine_json::emit_success(
+                verb,
+                &result.run_id,
+                &cleanup_result_surface(result),
+                json!({
+                    "removed": result.removed,
+                    "kept_branch": result.keep_branch,
+                    "run_status": run_status_label(result.status),
+                    "worktree_found": true,
+                }),
+            );
+            return;
+        }
         print!(
             "{}",
-            cleanup_result_surface(&results[0]).render_plain(!completion_hints_enabled(false))
+            cleanup_result_surface(result).render_plain(!completion_hints_enabled(false))
         );
         return;
     }
@@ -3947,6 +4113,7 @@ pub(crate) async fn extend_command_with_launch_plan(
         dest,
         acceptance,
         yes,
+        note,
         max_context_turns,
         no_context,
         max_spend,
@@ -3971,6 +4138,14 @@ pub(crate) async fn extend_command_with_launch_plan(
     if new_goal.is_empty() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(
             "--goal must be non-empty".to_string(),
+        )));
+    }
+    // Gap G9: the send-back note becomes a typed provenance row on the
+    // parent at queue time; an empty note would record nothing worth reading.
+    let note = note.map(|note| note.trim().to_string());
+    if note.as_deref().is_some_and(str::is_empty) {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(
+            "--note must be non-empty".to_string(),
         )));
     }
 
@@ -4021,6 +4196,7 @@ pub(crate) async fn extend_command_with_launch_plan(
             dest,
             acceptance,
             yes,
+            note,
             max_spend,
             max_wall_seconds,
             deadline,
@@ -4040,6 +4216,15 @@ pub(crate) async fn extend_command_with_launch_plan(
             quiet,
         })
         .await;
+    }
+    // Gap G9: the note is recorded at durable queue time; an internal
+    // characterization extension never queues a Job, so a note here would
+    // silently vanish instead of landing in the parent's provenance.
+    if note.is_some() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            "--note records an operator send-back when the durable continuation Job is queued; internal characterization extensions do not queue one",
+            "drop --note or queue the durable extension",
+        )));
     }
 
     let defaults = config_defaults(&paths)?;
@@ -4313,6 +4498,7 @@ struct DurableExtensionRequest {
     dest: Option<PathBuf>,
     acceptance: Option<PathBuf>,
     yes: bool,
+    note: Option<String>,
     max_spend: Option<f64>,
     max_wall_seconds: Option<f64>,
     deadline: Option<DateTime<Utc>>,
@@ -4342,6 +4528,7 @@ async fn schedule_durable_extension(
         dest,
         acceptance,
         yes,
+        note,
         max_spend,
         max_wall_seconds,
         deadline,
@@ -4373,6 +4560,10 @@ async fn schedule_durable_extension(
     } else {
         operator_cwd.clone()
     };
+    // Gap G9: an explicit --acceptance replaces the parent's frozen contract;
+    // the fallback below inherits it. Frozen into the continuation spec so the
+    // queued envelope reports which one the follow-up runs under.
+    let contract_replaced = acceptance.is_some();
     let acceptance = acceptance
         .map(|path| {
             if path.is_absolute() {
@@ -4395,6 +4586,8 @@ async fn schedule_durable_extension(
         .tree_hash(),
         parent_receipt_sha256,
         context_turns,
+        operator_sendback_note: note,
+        contract_replaced,
     };
 
     let run_args = RunCommandArgs {
@@ -4844,6 +5037,19 @@ pub(crate) async fn fire_lifecycle_notification(
     state: &deadreckon_core::PipelineState,
     outcome: &RunLoopOutcome,
 ) {
+    if matches!(outcome, RunLoopOutcome::PausedAtCap) {
+        // Typed operator-attention row owned by this run-loop process
+        // (docs/TAILING.md). Display-only, so it is appended regardless of
+        // the notify delivery config; a failed append never fails the run.
+        let _ = deadreckon_core::append_operator_attention(
+            &state.run_root,
+            &deadreckon_core::paused_at_cap_event(
+                &state.run_id,
+                &state.scope,
+                state.pause_reason.as_deref(),
+            ),
+        );
+    }
     let Some(transition) = notify_transition_for_outcome(outcome) else {
         return;
     };
@@ -5212,6 +5418,203 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The typed `paused_at_cap` operator-attention row is owned by this
+    /// run-loop process and is display-only, so it lands even when notify
+    /// delivery is disabled — and only for the cap-pause outcome.
+    #[tokio::test]
+    async fn cap_pause_appends_operator_attention_row_even_with_notify_disabled() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let cwd = temp.path().join("repo");
+        std::fs::create_dir_all(&cwd).expect("repo");
+        let mut state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "hit the cap".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        state.pause_reason = Some("spend cap $1.00 reached".to_string());
+
+        fire_lifecycle_notification(&paths, &state, &RunLoopOutcome::PausedAtCap).await;
+
+        let notify_path = deadreckon_core::notify_jsonl_path(&state.run_root);
+        let rows = std::fs::read_to_string(&notify_path)
+            .expect("notify.jsonl")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<deadreckon_protocol::OperatorAttentionEvent>(line)
+                    .expect("operator attention row")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.reason,
+            deadreckon_protocol::OperatorAttentionReason::PausedAtCap
+        );
+        assert_eq!(row.run_id.as_deref(), Some(state.run_id.as_str()));
+        assert_eq!(row.scope.as_deref(), Some(state.scope.as_str()));
+        assert!(row.summary.contains("paused at cap"), "{}", row.summary);
+        assert!(
+            row.summary.contains("spend cap $1.00 reached"),
+            "{}",
+            row.summary
+        );
+        assert!(
+            row.next_actions
+                .contains(&format!("deadreckon resume {}", state.run_id)),
+            "{:?}",
+            row.next_actions
+        );
+
+        // Non-cap outcomes announce nothing here: `Done` belongs to the
+        // sealing path and delivery stays gated on the notify config.
+        fire_lifecycle_notification(&paths, &state, &RunLoopOutcome::Done).await;
+        fire_lifecycle_notification(&paths, &state, &RunLoopOutcome::Failed).await;
+        let lines = std::fs::read_to_string(&notify_path)
+            .expect("notify.jsonl")
+            .lines()
+            .count();
+        assert_eq!(lines, 1, "only the cap pause appends an attention row");
+    }
+
+    /// G1 byte-compat: the no-`--json` materialize/finish export prose comes
+    /// from this exact surface rendering; pin it so wiring the envelope
+    /// through the same surface object provably changed no prose byte.
+    #[test]
+    fn materialized_prose_surface_is_byte_stable_without_json() {
+        let materialized = MaterializedRun {
+            run_id: "materialize-envelope-fixture".to_string(),
+            source: PathBuf::from("/library/source"),
+            dest: PathBuf::from("/tmp/dest"),
+        };
+        assert_eq!(
+            materialized_surface(&materialized).render_plain(true),
+            "completed materialize material\n\n\
+             Explanation\n\
+             DeadReckon exported run output into the requested destination.\n\
+             Materialize completed because the run was already completed, the destination was safe to write, and the library artifact was copied.\n\n\
+             Evidence\n\
+             run: material\n\
+             source: /library/source\n\
+             dest: /tmp/dest\n\n\
+             Recommended\n\
+             deadreckon show material\n"
+        );
+    }
+
+    /// G1 success envelope: the materialize/finish export envelope reports the
+    /// destination and rides the same `VerdictSurface` as the prose.
+    #[test]
+    fn materialize_success_envelope_reports_the_destination() {
+        let materialized = MaterializedRun {
+            run_id: "materialize-envelope-fixture".to_string(),
+            source: PathBuf::from("/library/source"),
+            dest: PathBuf::from("/tmp/dest"),
+        };
+        let envelope = crate::machine_json::success_envelope(
+            "materialize",
+            &materialized.run_id,
+            &materialized_surface(&materialized),
+            json!({
+                "destination": { "kind": "export", "path": materialized.dest },
+                "staged_file_count": 3,
+                "receipt_validated": false,
+            }),
+        );
+
+        assert_eq!(envelope["kind"], "materialize");
+        assert_eq!(envelope["id"], "materialize-envelope-fixture");
+        assert_eq!(envelope["status"], "completed");
+        assert_eq!(envelope["destination"]["kind"], "export");
+        assert_eq!(envelope["destination"]["path"], "/tmp/dest");
+        assert_eq!(envelope["staged_file_count"], 3);
+        assert_eq!(envelope["receipt_validated"], false);
+        assert_eq!(envelope["next_actions"][0], "deadreckon show material");
+        assert_eq!(envelope["primary_action"], "deadreckon show material");
+    }
+
+    /// G1 refusal envelope: finish's still-running refusal is built with
+    /// `user_error`, so the machine envelope lifts its packed `try:` line and
+    /// keeps exit code 1.
+    #[test]
+    fn finish_still_running_refusal_converts_to_a_machine_error_envelope() {
+        let refusal = CliError::Core(deadreckon_core::user_error(
+            "run finish-envelope-fixture is still executing",
+            "deadreckon attach finish-e",
+        ));
+        let envelope = crate::machine_json::error_envelope(
+            "finish",
+            refusal.exit_code(),
+            &refusal.to_string(),
+            "",
+        );
+
+        assert_eq!(envelope["kind"], "error");
+        assert_eq!(envelope["verb"], "finish");
+        assert_eq!(envelope["code"], 1);
+        assert_eq!(
+            envelope["message"],
+            "invalid input: run finish-envelope-fixture is still executing"
+        );
+        assert_eq!(envelope["try_lines"], json!(["deadreckon attach finish-e"]));
+    }
+
+    /// G1 refusal envelope: extend's incomplete-parent refusal is a
+    /// `CliError::Surface` carrying a full rendered card; the envelope keeps
+    /// the surface text as the message and the surface's exit code.
+    #[test]
+    fn extend_incomplete_parent_refusal_converts_to_a_machine_error_envelope() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let parent = create_run(
+            &paths,
+            RunOptions {
+                goal: "extend envelope fixture".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("extend-envelope-refusal".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        assert_ne!(parent.status, RunStatus::Completed);
+
+        let refusal = CliError::Surface {
+            code: 1,
+            surface: incomplete_parent_extend_surface(&parent).render_plain(true),
+        };
+        let envelope = crate::machine_json::error_envelope(
+            "extend",
+            refusal.exit_code(),
+            &refusal.to_string(),
+            "",
+        );
+
+        assert_eq!(envelope["kind"], "error");
+        assert_eq!(envelope["verb"], "extend");
+        assert_eq!(envelope["code"], 1);
+        let message = envelope["message"].as_str().expect("message");
+        assert!(message.contains("cannot be extended yet"), "{message}");
+        assert!(
+            message.contains("deadreckon resume extend-e"),
+            "the recommended recovery action stays visible: {message}"
+        );
+    }
 
     #[test]
     fn parent_summary_never_accepts_a_tampered_marker() {
@@ -6706,6 +7109,8 @@ mod tests {
                     .expect("parent receipt digest"),
             ),
             context_turns: Some(2),
+            operator_sendback_note: None,
+            contract_replaced: false,
         };
         (paths, parent, child, continuation, job_id)
     }

@@ -147,10 +147,77 @@ public struct SteerEligibility: Codable, Equatable, Sendable {
     }
 }
 
-/// One line of `notify.jsonl` (docs/TAILING.md). Rows record delivery
-/// attempts, including failures; the append is best-effort, so treat this
-/// file as observability, never as an authoritative delivery log.
-public struct NotifyRecord: Codable, Equatable, Sendable {
+/// One line of `notify.jsonl` (docs/TAILING.md,
+/// docs/schemas/notify-event.schema.json). Since M1 the file carries TWO row
+/// shapes, distinguished by the presence of the `kind` field: typed
+/// operator-attention signals (`kind: "operator_attention"`) and the
+/// historical delivery-attempt rows (no `kind`). Every append is best-effort
+/// and the binary never reads the rows back, so treat this file as
+/// display-only observability — never as an authoritative delivery log, and
+/// never as evidence of the state it describes (`status --json` and the
+/// signed markers stay the source of truth). Dedupe app-side with stable
+/// notification IDs.
+public enum NotifyRecord: Equatable, Sendable {
+    case attention(OperatorAttentionRow)
+    case deliveryAttempt(NotifyDeliveryAttempt)
+}
+
+extension NotifyRecord: Codable {
+    private enum DiscriminatorKeys: String, CodingKey {
+        case kind
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DiscriminatorKeys.self)
+        if container.contains(.kind) {
+            self = .attention(try OperatorAttentionRow(from: decoder))
+        } else {
+            self = .deliveryAttempt(try NotifyDeliveryAttempt(from: decoder))
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        switch self {
+        case .attention(let row): try row.encode(to: encoder)
+        case .deliveryAttempt(let row): try row.encode(to: encoder)
+        }
+    }
+}
+
+/// A typed operator-attention signal (notify-event.schema.json
+/// OperatorAttentionEvent): one row per operator-relevant transition,
+/// appended once by the process that owns the fact. `summary` is one
+/// glossary-worded line and `nextActions` are real runnable CLI commands —
+/// render both verbatim.
+public struct OperatorAttentionRow: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    /// Always "operator_attention" (the discriminator).
+    public let kind: String
+    public let reason: OperatorAttentionReason
+    public let jobID: String?
+    public let runID: String?
+    public let scope: String?
+    public let at: Date
+    public let summary: String
+    public let nextActions: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion = "schema_version"
+        case kind
+        case reason
+        case jobID = "job_id"
+        case runID = "run_id"
+        case scope
+        case at
+        case summary
+        case nextActions = "next_actions"
+    }
+}
+
+/// One notification delivery attempt — the historical `notify.jsonl` row
+/// shape. Rows record *attempts*, including failures (`ok: false` with a
+/// `detail`).
+public struct NotifyDeliveryAttempt: Codable, Equatable, Sendable {
     public let ts: Date
     public let transition: NotifyTransition
     public let channel: String

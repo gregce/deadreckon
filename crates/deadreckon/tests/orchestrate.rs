@@ -8481,6 +8481,221 @@ fn replay_with_smaller_budget_refuses_naming_numbers() {
 }
 
 #[test]
+fn start_high_spend_refuses_without_acknowledgment_in_scripts() {
+    // G2: the >$50 acknowledgment has `run` parity on `start` — `--yes`
+    // approves the launch preview, never the budget. Without the flag a
+    // non-TTY launch fails closed before any durable Job or service work.
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "too rich to launch quietly",
+            "--mode",
+            "run",
+            "--max-spend",
+            "51",
+            "--yes",
+            "--plain",
+        ])
+        .output()
+        .expect("high spend refusal");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    let err = stderr(&output);
+    assert!(
+        err.contains("max spend above $50 requires --i-know-its-a-lot"),
+        "{err}"
+    );
+    assert!(
+        !paths.jobs_dir().exists(),
+        "high-spend refusal allocated durable Job state"
+    );
+}
+
+#[test]
+fn start_high_spend_refusal_with_json_emits_error_envelope() {
+    // G1 x G2: a machine start refusal is also a machine refusal envelope on
+    // stdout with the preserved exit code — this is the GUI's error surface.
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let output = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "too rich for a machine launch",
+            "--mode",
+            "run",
+            "--max-spend",
+            "51",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("high spend json refusal");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let out = stdout(&output);
+    let envelope: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("stdout must be one JSON error envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "error", "{envelope}");
+    assert_eq!(envelope["verb"], "start", "{envelope}");
+    assert_eq!(envelope["code"], 1, "{envelope}");
+    assert!(
+        envelope["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("max spend above $50")),
+        "{envelope}"
+    );
+    assert!(
+        envelope["try_lines"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty()),
+        "{envelope}"
+    );
+    assert!(
+        !paths.jobs_dir().exists(),
+        "json high-spend refusal allocated durable Job state"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_high_spend_with_acknowledgment_launches() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+    let service = characterization_service(&paths);
+
+    let output = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "high spend acknowledged launch",
+            "--mode",
+            "run",
+            "--max-spend",
+            "51",
+            "--i-know-its-a-lot",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("acknowledged high spend launch");
+
+    assert_success(&output);
+    let out = stdout(&output);
+    let envelope: Value = serde_json::from_str(out.trim())
+        .unwrap_or_else(|err| panic!("stdout must be one JSON envelope: {err}\n{out}"));
+    assert_eq!(envelope["kind"], "launch", "{envelope}");
+    assert_eq!(
+        envelope["plan"]["budget"]["ceiling_usd"], 51.0,
+        "{envelope}"
+    );
+    assert!(
+        envelope["dispatched"]["ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "{envelope}"
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn start_preview_embeds_replayable_launch_plan_round_trip() {
+    // The G2 GUI launch protocol: `start --json` (preview) embeds the exact
+    // replayable launch-plan payload; writing it to disk and replaying it
+    // with `start --plan <file> --yes --json` executes the same resolved
+    // launch.
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    write_start_ready_setup(&paths, &repo);
+
+    let preview = deadreckon(&paths)
+        .current_dir(&repo)
+        .args([
+            "start",
+            "replay round trip goal",
+            "--mode",
+            "run",
+            "--max-spend",
+            "7",
+            "--json",
+        ])
+        .output()
+        .expect("json preview");
+    assert_success(&preview);
+    let preview_out = stdout(&preview);
+    let preview_envelope: Value = serde_json::from_str(preview_out.trim())
+        .unwrap_or_else(|err| panic!("preview must be JSON: {err}\n{preview_out}"));
+    assert_eq!(preview_envelope["will_start"], false, "{preview_envelope}");
+    let plan = &preview_envelope["launch_plan"];
+    assert!(plan.is_object(), "{preview_envelope}");
+    assert_eq!(plan["goal"], "replay round trip goal", "{plan}");
+    assert_eq!(plan["shape"], "single", "{plan}");
+    assert_eq!(plan["budget"]["ceiling_usd"], 7.0, "{plan}");
+    assert_eq!(plan["accepted_by"], "preview", "{plan}");
+    assert!(
+        !paths.jobs_dir().exists(),
+        "json preview allocated durable Job state"
+    );
+
+    // The embedded payload replays byte-for-byte as written.
+    let saved = temp.path().join("previewed-launch-plan.json");
+    fs::write(&saved, serde_json::to_vec_pretty(plan).expect("plan bytes")).expect("write plan");
+
+    let service = characterization_service(&paths);
+    let replay = service
+        .deadreckon()
+        .current_dir(&repo)
+        .args([
+            "start",
+            "--plan",
+            saved.to_str().expect("utf8 plan path"),
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("replay execute");
+    assert_success(&replay);
+    let replay_out = stdout(&replay);
+    let replay_envelope: Value = serde_json::from_str(replay_out.trim())
+        .unwrap_or_else(|err| panic!("replay must be JSON: {err}\n{replay_out}"));
+    assert_eq!(replay_envelope["kind"], "launch", "{replay_envelope}");
+    let executed = &replay_envelope["plan"];
+    // Same resolved launch: goal, shape, providers, and budget survive the
+    // preview -> file -> replay round trip untouched.
+    assert_eq!(executed["goal"], plan["goal"], "{replay_envelope}");
+    assert_eq!(executed["shape"], plan["shape"], "{replay_envelope}");
+    assert_eq!(
+        executed["providers"], plan["providers"],
+        "{replay_envelope}"
+    );
+    assert_eq!(
+        executed["budget"]["ceiling_usd"], plan["budget"]["ceiling_usd"],
+        "{replay_envelope}"
+    );
+    assert_eq!(executed["accepted_by"], "replay", "{replay_envelope}");
+    assert!(
+        replay_envelope["dispatched"]["ids"]
+            .as_array()
+            .is_some_and(|ids| !ids.is_empty()),
+        "{replay_envelope}"
+    );
+}
+
+#[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_json_emits_launch_envelope_no_card() {
     let temp = repo_tempdir();

@@ -35,6 +35,37 @@ pub struct ProvenanceRecord {
     pub files: Vec<PathBuf>,
 }
 
+/// Gap G9: the discriminant of an operator send-back provenance row. A single
+/// serialized value keeps the row self-describing (`"kind":
+/// "operator_sendback"`) while turn rows stay kind-less for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorSendbackKind {
+    OperatorSendback,
+}
+
+/// Gap G9: a typed send-back. When an operator queues `extend --note`, the
+/// note becomes a durable provenance row on the PARENT run, binding the
+/// operator's reason to the continuation Job it produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorSendbackRecord {
+    pub kind: OperatorSendbackKind,
+    pub note: String,
+    pub parent_job_id: String,
+    pub new_job_id: String,
+    pub at: DateTime<Utc>,
+}
+
+/// One row of `provenance.jsonl`. Historical turn rows carry no `kind` field;
+/// operator send-back rows are discriminated by their required
+/// `"kind":"operator_sendback"` value, so the untagged order is unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProvenanceEntry {
+    OperatorSendback(OperatorSendbackRecord),
+    Turn(ProvenanceRecord),
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DiffSummary {
     pub files_changed: usize,
@@ -151,6 +182,17 @@ pub fn append_spend(state: &PipelineState, record: &SpendRecord) -> Result<()> {
 pub fn append_provenance(state: &PipelineState, record: &ProvenanceRecord) -> Result<()> {
     // REPORT.md: Prompt-To-Code Provenance Audit Trail records prompt, model,
     // tool call, session, and changed files per coding turn.
+    append_json_line(&state.run_root.join("provenance.jsonl"), record)
+}
+
+/// Gap G9: append a typed operator send-back row to this run's provenance.
+/// Written at durable queue time against the completed parent run, after its
+/// promotion lifecycle has finished; the row records why the operator sent
+/// the result back and which continuation Job carries the follow-up.
+pub fn append_operator_sendback(
+    state: &PipelineState,
+    record: &OperatorSendbackRecord,
+) -> Result<()> {
     append_json_line(&state.run_root.join("provenance.jsonl"), record)
 }
 
@@ -821,6 +863,38 @@ mod tests {
         let unified = answer.unified_diff.as_deref().expect("text diff");
         assert!(unified.contains("-before"), "{unified}");
         assert!(unified.contains("+after"), "{unified}");
+    }
+
+    #[test]
+    fn operator_sendback_row_is_a_typed_provenance_entry() {
+        // Gap G9: a send-back row carries exactly the typed shape and stays
+        // distinguishable from historical kind-less turn rows on read-back.
+        let record = super::OperatorSendbackRecord {
+            kind: super::OperatorSendbackKind::OperatorSendback,
+            note: "gate accepted a stub; replace with a real implementation".to_string(),
+            parent_job_id: "parent-job".to_string(),
+            new_job_id: "child-job".to_string(),
+            at: chrono::Utc::now(),
+        };
+        let line = serde_json::to_string(&record).expect("encode");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("value");
+        assert_eq!(value["kind"], "operator_sendback");
+        assert_eq!(
+            value.as_object().expect("object").len(),
+            5,
+            "row keeps the exact typed shape: kind, note, parent_job_id, new_job_id, at"
+        );
+
+        match serde_json::from_str::<super::ProvenanceEntry>(&line).expect("entry") {
+            super::ProvenanceEntry::OperatorSendback(parsed) => assert_eq!(parsed, record),
+            super::ProvenanceEntry::Turn(_) => panic!("send-back row must not parse as a turn row"),
+        }
+
+        let turn = r#"{"timestamp":"2026-08-07T00:00:00Z","prompt_id":"turn-1","model":"fixture","tool_call_id":"tool","session_id":"session","files":["src/lib.rs"]}"#;
+        assert!(matches!(
+            serde_json::from_str::<super::ProvenanceEntry>(turn).expect("turn entry"),
+            super::ProvenanceEntry::Turn(_)
+        ));
     }
 
     #[test]

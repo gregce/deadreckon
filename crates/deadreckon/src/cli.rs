@@ -487,9 +487,12 @@ Lifecycle:
   deadreckon attach latest
   deadreckon kill latest
 
-Steer queues one instruction for an executing run that uses the opt-in
-`cli:codex-server` provider route. Delivery begins on the active Codex turn,
-or on the next turn if there is no active turn yet.";
+Steer queues one instruction for any executing run. On the opt-in
+`cli:codex-server` provider route delivery begins mid-turn, on the active
+Codex turn (or the next one if no turn is active). On every other provider
+the run consumes the note at its next turn boundary, injecting it into that
+turn's prompt as advisory operator guidance; the frozen goal, contract, and
+acceptance criteria are unchanged either way.";
 
 const KILL_HELP: &str = "\
 Lifecycle:
@@ -819,6 +822,11 @@ pub(crate) enum Commands {
         deadline: Option<DateTime<Utc>>,
         #[arg(long, help = "Confirm the launch preview without prompting")]
         yes: bool,
+        #[arg(
+            long,
+            help = "Allow a launch budget above $50 without the spend confirmation"
+        )]
+        i_know_its_a_lot: bool,
         #[arg(long, help = "Force built-in governance seams for this launch")]
         no_seams: bool,
         #[arg(long, help = "Start from an empty workspace")]
@@ -1272,6 +1280,8 @@ pub(crate) enum Commands {
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1314,6 +1324,8 @@ pub(crate) enum Commands {
         quiet: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1612,10 +1624,16 @@ pub(crate) enum Commands {
             help = "Remove the temporary worktree/branch after a successful worktree apply"
         )]
         cleanup: bool,
-        #[arg(long, help = "Skip destructive or follow-up confirmations")]
+        #[arg(
+            long,
+            visible_alias = "yes",
+            help = "Skip destructive or follow-up confirmations"
+        )]
         no_confirm: bool,
         #[arg(long, help = "Commit message override for worktree apply")]
         message: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -1637,6 +1655,8 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Keep manifest.json in the exported output")]
         include_manifest: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -1662,7 +1682,11 @@ pub(crate) enum Commands {
             help = "Target branch for apply; defaults to the current branch"
         )]
         branch: Option<String>,
-        #[arg(long, help = "Skip destructive or follow-up confirmations")]
+        #[arg(
+            long,
+            visible_alias = "yes",
+            help = "Skip destructive or follow-up confirmations"
+        )]
         no_confirm: bool,
         #[arg(
             long,
@@ -1678,6 +1702,8 @@ pub(crate) enum Commands {
         message: Option<String>,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
@@ -1697,6 +1723,8 @@ pub(crate) enum Commands {
             help = "Clean even if the run is still marked running"
         )]
         force: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
@@ -1713,7 +1741,11 @@ pub(crate) enum Commands {
         completed: bool,
         #[arg(long, help = "Include stale running runs")]
         stale: bool,
-        #[arg(long, help = "Skip destructive or follow-up confirmations")]
+        #[arg(
+            long,
+            visible_alias = "yes",
+            help = "Skip destructive or follow-up confirmations"
+        )]
         no_confirm: bool,
         #[arg(
             long = "escalate",
@@ -1750,6 +1782,12 @@ pub(crate) enum Commands {
         acceptance: Option<PathBuf>,
         #[arg(long, help = "Approve and queue the immutable continuation Job")]
         yes: bool,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "Operator send-back note recorded as typed provenance on the parent run at queue time"
+        )]
+        note: Option<String>,
         #[arg(long, help = "Maximum parent turns to include in context")]
         max_context_turns: Option<u32>,
         #[arg(long, help = "Do not include parent context")]
@@ -1798,6 +1836,8 @@ pub(crate) enum Commands {
             help = "Pin the narrator model id (keeps provider preference order)"
         )]
         narrator_model: Option<String>,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -1898,6 +1938,8 @@ pub(crate) enum Commands {
         run_id: String,
         #[arg(help = "One concrete instruction for the running agent")]
         text: String,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1916,6 +1958,8 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",
@@ -1980,6 +2024,7 @@ pub(crate) enum Commands {
         turn: Option<u32>,
         #[arg(
             long,
+            visible_alias = "yes",
             help = "Skip confirmation when reverting a verified applied Job or chain delivery"
         )]
         no_confirm: bool,
@@ -2973,6 +3018,7 @@ pub(crate) struct StartCommandArgs {
     pub(crate) preview: bool,
     pub(crate) review_done: bool,
     pub(crate) yes: bool,
+    pub(crate) i_know_its_a_lot: bool,
     pub(crate) no_seams: bool,
     pub(crate) fresh: bool,
     pub(crate) worktree: bool,
@@ -3099,6 +3145,7 @@ pub(crate) struct ExtendCommandArgs {
     pub(crate) dest: Option<PathBuf>,
     pub(crate) acceptance: Option<PathBuf>,
     pub(crate) yes: bool,
+    pub(crate) note: Option<String>,
     pub(crate) max_context_turns: Option<u32>,
     pub(crate) no_context: bool,
     pub(crate) max_spend: Option<f64>,
@@ -3128,6 +3175,37 @@ mod tests {
         let parsed = parse_rfc3339_deadline("2026-08-01T00:00:00-04:00").expect("RFC3339 deadline");
         assert_eq!(parsed.to_rfc3339(), "2026-08-01T04:00:00+00:00");
         assert!(parse_rfc3339_deadline("tomorrow morning").is_err());
+    }
+
+    #[test]
+    fn extend_parses_the_typed_sendback_note_with_json_and_yes() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli = Cli::try_parse_from([
+                    "deadreckon",
+                    "extend",
+                    "parent",
+                    "tighten the tests",
+                    "--note",
+                    "gate accepted a stub",
+                    "--json",
+                    "--yes",
+                ])
+                .expect("extend with --note parses");
+                let Some(Commands::Extend {
+                    note, json, yes, ..
+                }) = cli.command
+                else {
+                    panic!("expected the extend command");
+                };
+                assert_eq!(note.as_deref(), Some("gate accepted a stub"));
+                assert!(json);
+                assert!(yes);
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
     }
 
     #[test]
@@ -3241,6 +3319,86 @@ mod tests {
                     };
                     assert_eq!(parsed.expect("deadline").to_rfc3339(), expected);
                 }
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
+    }
+
+    #[test]
+    fn yes_is_accepted_where_only_no_confirm_exists() {
+        // The documented confirmation contract: `--yes` approves a launch
+        // preview, `--no-confirm` skips destructive follow-up confirmations.
+        // On the follow-up verbs that never grew a `--yes`, it is accepted as
+        // an alias for `--no-confirm` so machine callers can speak one flag.
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cases: [(&[&str], fn(Commands) -> bool); 4] = [
+                    (&["deadreckon", "finish", "latest", "--yes"], |command| {
+                        matches!(
+                            command,
+                            Commands::Finish {
+                                no_confirm: true,
+                                ..
+                            }
+                        )
+                    }),
+                    (&["deadreckon", "apply", "latest", "--yes"], |command| {
+                        matches!(
+                            command,
+                            Commands::Apply {
+                                no_confirm: true,
+                                ..
+                            }
+                        )
+                    }),
+                    (&["deadreckon", "cleanup", "--yes"], |command| {
+                        matches!(
+                            command,
+                            Commands::Cleanup {
+                                no_confirm: true,
+                                ..
+                            }
+                        )
+                    }),
+                    (&["deadreckon", "undo", "latest", "--yes"], |command| {
+                        matches!(
+                            command,
+                            Commands::Undo {
+                                no_confirm: true,
+                                ..
+                            }
+                        )
+                    }),
+                ];
+                for (argv, sets_no_confirm) in cases {
+                    let cli = Cli::try_parse_from(argv.iter().copied())
+                        .unwrap_or_else(|err| panic!("{argv:?} must parse: {err}"));
+                    let command = cli.command.expect("subcommand");
+                    assert!(sets_no_confirm(command), "{argv:?} must set no_confirm");
+                }
+
+                let cli = Cli::try_parse_from([
+                    "deadreckon",
+                    "start",
+                    "expensive goal",
+                    "--max-spend",
+                    "60",
+                    "--i-know-its-a-lot",
+                    "--yes",
+                ])
+                .expect("start accepts the high-spend acknowledgment");
+                let Some(Commands::Start {
+                    i_know_its_a_lot,
+                    yes,
+                    ..
+                }) = cli.command
+                else {
+                    panic!("start command");
+                };
+                assert!(i_know_its_a_lot);
+                assert!(yes);
             })
             .expect("spawn parser test")
             .join()

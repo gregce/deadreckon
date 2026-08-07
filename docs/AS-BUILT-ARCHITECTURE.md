@@ -2851,6 +2851,17 @@ verdict, spend, and narrative path. Each attempt appends to run-local
 Notifications do not need their own daemon. Watchkeeper later added the
 separate, opt-in per-user supervisor service described in §58.8.
 
+`notify.jsonl` additionally carries typed `kind: "operator_attention"` rows so
+a desktop companion can post real user notifications by tailing the file.
+Each row is appended by the process that owns the transition — the sealing
+path on a newly sealed two-key receipt (`verified_awaiting_promote`), the
+run-loop process at a cap stop (`paused_at_cap`, appended regardless of
+`[notify]` delivery config), and the supervisor at terminal classification
+(`blocked`/`failed`/`cancelled`, plus `waiting_input` for NeedsReview). Rows
+are display-only, never consumed by the binary, and conform to the checked
+`docs/schemas/notify-event.schema.json`; see docs/TAILING.md for the tailing
+contract.
+
 ### 37.7 Provider-backed goal-shape routing
 
 `start` performs one bounded read-only classifier call through the existing
@@ -4012,13 +4023,36 @@ turn.
 ### 51.2 Durable steering inbox
 
 Both `deadreckon steer <run-id> "instruction"` and the run-only Helm command
-`:steer <instruction>` validate that the run is executing on
-`cli:codex-server`. They append an entry to `<run_root>/steer-inbox.jsonl` with
+`:steer <instruction>` validate that the run is executing; any provider route
+qualifies (the M1 operator-console widening — the historical
+`cli:codex-server`-only guard is gone). They append an entry to
+`<run_root>/steer-inbox.jsonl` with
 timestamp, source (`cli` or `tui`), text and `pending` status. The file is an
 append-only ledger. Reading it folds updates by timestamp and text to recover
 the effective pending or delivered state after a restart.
 
-Delivery is at-least-once. The provider sends pending entries with
+Consumption depends on the route. `cli:codex-server` keeps its mid-turn path
+exactly as described below. Every other provider consumes the inbox at the
+next turn boundary: the run loop drains pending entries at the top of each
+turn, injects them into that turn's prompt frame as a clearly-labeled
+advisory operator-guidance block (it cannot alter the frozen goal, contract
+or policy and never reaches gate evaluation inputs), appends the `delivered`
+update with the loop turn id (`turn-N`), and appends one typed
+`steer_delivered` event per note to `events.jsonl` so attach and external
+apps can render queued→ack. The shared file-backed bookkeeping means the two
+paths can never double-deliver the same entry. The between-turn path is
+at-most-once by design: the note is durably marked `delivered` at the drain,
+before the provider attempt, so a crash or provider failure between the drain
+and the prompt actually reaching the provider consumes the note without the
+model ever seeing it — the ledger records consumption, not model receipt. The
+deliberate trade is that a note is never re-delivered to a later turn, so an
+operator instruction can never land twice under a changed context. The drain
+decision follows the route that actually executed the previous turn, so a run
+that persistently falls back away from `cli:codex-server` still drains at the
+next boundary. Only the mid-turn path below is at-least-once.
+
+Mid-turn delivery (`cli:codex-server` only) is at-least-once. The provider
+sends pending entries with
 `turn/steer`, including the current `expectedTurnId`, once after `turn/start`
 and again while polling the live turn. It appends the `delivered` update only
 after the server returns the same turn ID. A stale-turn precondition or process

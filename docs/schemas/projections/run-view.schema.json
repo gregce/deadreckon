@@ -865,7 +865,7 @@
           "type": "string"
         },
         {
-          "description": "The Run's provider route cannot accept live steering.",
+          "description": "Historical (pre-M1): the Run's provider route could not accept live steering. The predicate no longer produces it — every provider is steerable while Executing — but the variant stays so serialized eligibility records and JSON consumers decoding the closed reason set survive.",
           "enum": [
             "provider_not_steerable"
           ],

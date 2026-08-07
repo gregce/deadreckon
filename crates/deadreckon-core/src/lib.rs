@@ -6,6 +6,7 @@
 pub mod acceptance_defaults;
 pub mod artifact_policy;
 pub mod artifacts;
+pub mod attention;
 pub mod campaign;
 pub mod cancel;
 pub mod chain;
@@ -46,14 +47,19 @@ pub use artifact_policy::{
     is_promotable_workspace_path, is_recoverable_workspace_path, runtime_output_root,
 };
 pub use artifacts::{
-    DiffSummary, FileDelta, FileDeltaStatus, PATCH_UNIFIED_BYTE_BUDGET, PatchEntry,
-    ProvenanceRecord, SNAPSHOT_CAPTURE_MANIFESTS_DIR, append_provenance, append_spend,
+    DiffSummary, FileDelta, FileDeltaStatus, OperatorSendbackKind, OperatorSendbackRecord,
+    PATCH_UNIFIED_BYTE_BUDGET, PatchEntry, ProvenanceEntry, ProvenanceRecord,
+    SNAPSHOT_CAPTURE_MANIFESTS_DIR, append_operator_sendback, append_provenance, append_spend,
     append_trace, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
     copy_recoverable_tree, copy_recoverable_tree_with_policy, copy_tree, diff_snapshots,
     diff_working_trees, inventory_files, inventory_recoverable_files,
     inventory_recoverable_files_for_state, inventory_recoverable_files_with_policy,
     patches_from_diff, remove_artifact_path, restore_snapshot, snapshot_capture_manifest_path,
     snapshot_diff, snapshot_working,
+};
+pub use attention::{
+    NOTIFY_JSONL, append_operator_attention, notify_jsonl_path, paused_at_cap_event,
+    supervisor_classified_event, verified_awaiting_promote_event,
 };
 pub use cancel::{
     CANCEL_MARKER, CancelMarker, cancel_marker_path, cancel_marker_path_for_run_root,
@@ -192,7 +198,7 @@ pub use state::{
     RunStatus, create_owned_run, create_run, list_runs, load_run, save_state,
 };
 pub use steer::{
-    STEERABLE_PROVIDER_ROUTE, SteerEligibility, SteerIneligibleReason, steer_eligibility,
+    MID_TURN_STEER_PROVIDER_ROUTE, SteerEligibility, SteerIneligibleReason, steer_eligibility,
     steer_eligibility_with_driver_fence,
 };
 pub use workspace_capture::{

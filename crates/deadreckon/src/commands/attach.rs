@@ -363,7 +363,14 @@ pub(crate) fn dispatch_run_command_mode(
                 deadreckon_core::steer_inbox::SteerSource::Tui,
                 text,
             )?;
-            Ok("delivery will begin on the active or next Codex turn".to_string())
+            Ok(
+                if state.provider.as_deref() == Some(deadreckon_core::MID_TURN_STEER_PROVIDER_ROUTE)
+                {
+                    "delivery will begin on the active or next Codex turn".to_string()
+                } else {
+                    "queued; the run consumes it at the start of its next turn".to_string()
+                },
+            )
         }
     }
 }

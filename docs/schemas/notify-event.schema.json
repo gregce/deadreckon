@@ -1,0 +1,167 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NotifyEvent",
+  "description": "One line of `notify.jsonl`: either row shape, distinguished by the presence of the `kind` field.",
+  "anyOf": [
+    {
+      "$ref": "#/definitions/OperatorAttentionEvent"
+    },
+    {
+      "$ref": "#/definitions/NotifyDeliveryAttempt"
+    }
+  ],
+  "definitions": {
+    "NotifyDeliveryAttempt": {
+      "description": "One notification delivery attempt — the historical `notify.jsonl` shape. Rows record *attempts*, including failures (`ok: false` with a `detail`).",
+      "type": "object",
+      "required": [
+        "channel",
+        "ok",
+        "transition",
+        "ts"
+      ],
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "transition": {
+          "$ref": "#/definitions/NotifyDeliveryTransition"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "NotifyDeliveryTransition": {
+      "description": "Delivery outcome vocabulary of the historical attempt rows.",
+      "type": "string",
+      "enum": [
+        "accepted",
+        "paused",
+        "failed"
+      ]
+    },
+    "OperatorAttentionEvent": {
+      "description": "One display-only operator-attention signal.\n\nThe row is a rendering aid for external observers (see `docs/TAILING.md`): it never carries authority, and deadreckon itself never reads it back.",
+      "type": "object",
+      "required": [
+        "at",
+        "kind",
+        "next_actions",
+        "reason",
+        "schema_version",
+        "summary"
+      ],
+      "properties": {
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/definitions/OperatorAttentionKind"
+        },
+        "next_actions": {
+          "description": "Real CLI commands the operator can run next.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reason": {
+          "$ref": "#/definitions/OperatorAttentionReason"
+        },
+        "run_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0.0
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "One operator-readable line in glossary user words.",
+          "type": "string"
+        }
+      }
+    },
+    "OperatorAttentionKind": {
+      "description": "Literal `kind` discriminator of an operator-attention row. Delivery attempt rows carry no `kind` field at all.",
+      "type": "string",
+      "enum": [
+        "operator_attention"
+      ]
+    },
+    "OperatorAttentionReason": {
+      "description": "Why the operator's attention is requested.",
+      "oneOf": [
+        {
+          "description": "A two-key completion receipt was sealed: the result is verified and waits for the operator to promote it.",
+          "type": "string",
+          "enum": [
+            "verified_awaiting_promote"
+          ]
+        },
+        {
+          "description": "The run loop stopped at a spend or wall-time cap.",
+          "type": "string",
+          "enum": [
+            "paused_at_cap"
+          ]
+        },
+        {
+          "description": "The supervisor classified the Job as blocked.",
+          "type": "string",
+          "enum": [
+            "blocked"
+          ]
+        },
+        {
+          "description": "The supervisor classified the Job as failed.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "The supervisor classified the Job as cancelled.",
+          "type": "string",
+          "enum": [
+            "cancelled"
+          ]
+        },
+        {
+          "description": "The Job waits for operator review before it can continue.",
+          "type": "string",
+          "enum": [
+            "waiting_input"
+          ]
+        }
+      ]
+    }
+  }
+}

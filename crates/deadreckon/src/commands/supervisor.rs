@@ -5441,7 +5441,7 @@ fn append_terminal_event(
         merge_stop_reason(effective_reason, effective_extra),
     )?;
     if !projection.is_terminal() && projection.stop_reason == Some(StopReason::CancelRequested) {
-        return append_control_event(
+        let projection = append_control_event(
             paths,
             token,
             JobEventKind::Cancelled,
@@ -5453,9 +5453,40 @@ fn append_terminal_event(
                     "suppressed_terminal_kind": suppressed_kind,
                 }),
             ),
-        );
+        )?;
+        append_supervisor_attention(paths, &view.job, &projection);
+        return Ok(projection);
     }
+    append_supervisor_attention(paths, &view.job, &projection);
     Ok(projection)
+}
+
+/// Display-only operator-attention row for a terminal classification this
+/// supervisor just recorded (docs/TAILING.md). Best-effort by design: the
+/// job-events ledger is the authoritative record, so a failed append never
+/// fails classification, and outcomes announced elsewhere (`Verified` by the
+/// sealing path, `BudgetExhausted` by the run loop's own `paused_at_cap`)
+/// emit nothing here.
+fn append_supervisor_attention(paths: &DeadreckonPaths, job: &Job, projection: &JobProjection) {
+    let Some(outcome) = projection.outcome else {
+        return;
+    };
+    let run_id = fs::read(paths.job_authority(job.job_id.as_ref()))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<JobAuthority>(&raw).ok())
+        .map(|authority| authority.run_id.as_ref().to_string())
+        .unwrap_or_else(|| job.job_id.as_ref().to_string());
+    let Some(event) = deadreckon_core::supervisor_classified_event(
+        job.job_id.as_ref(),
+        Some(&run_id),
+        &job.scope,
+        outcome,
+        projection.stop_reason,
+    ) else {
+        return;
+    };
+    let _ =
+        deadreckon_core::append_operator_attention(&paths.run_root(&job.scope, &run_id), &event);
 }
 
 fn finish_cancel_requested(
@@ -6570,6 +6601,81 @@ mod tests {
                     .to_string()
                     .contains("synthetic scheduler task error"))
         );
+
+        // The classification also appends one display-only operator-attention
+        // row to the run's notify.jsonl (docs/TAILING.md).
+        let rows = notify_attention_rows(&paths, &job);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].reason,
+            deadreckon_protocol::OperatorAttentionReason::Failed
+        );
+        assert_eq!(rows[0].job_id.as_deref(), Some(job.job_id.as_ref()));
+        assert!(rows[0].summary.contains("failed"), "{}", rows[0].summary);
+        assert!(
+            rows[0]
+                .next_actions
+                .contains(&format!("deadreckon status {}", job.job_id.as_ref())),
+            "{:?}",
+            rows[0].next_actions
+        );
+    }
+
+    #[test]
+    fn needs_review_classification_appends_waiting_input_attention_row() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        let token = claim_started_attempt(&paths, &job, 1);
+        append_attempt_stopped(
+            &paths,
+            &token,
+            StopReason::SemanticUncertain,
+            json!({ "reason": "the semantic judge was uncertain" }),
+        )
+        .expect("attempt stop");
+        append_terminal_event(
+            &paths,
+            &token,
+            JobEventKind::NeedsReview,
+            StopReason::SemanticUncertain,
+            json!({ "reason": "the semantic judge was uncertain" }),
+        )
+        .expect("needs-review classification");
+
+        let rows = notify_attention_rows(&paths, &job);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.reason,
+            deadreckon_protocol::OperatorAttentionReason::WaitingInput
+        );
+        assert_eq!(row.job_id.as_deref(), Some(job.job_id.as_ref()));
+        assert_eq!(row.scope.as_deref(), Some(job.scope.as_str()));
+        assert!(row.summary.contains("needs your review"), "{}", row.summary);
+        assert!(
+            row.next_actions
+                .contains(&format!("deadreckon verdict {}", job.job_id.as_ref())),
+            "{:?}",
+            row.next_actions
+        );
+    }
+
+    /// Load the operator-attention rows the supervisor appended for `job`.
+    /// The fixtures approve `run_id == job_id`, so the run root is fixed.
+    fn notify_attention_rows(
+        paths: &DeadreckonPaths,
+        job: &Job,
+    ) -> Vec<deadreckon_protocol::OperatorAttentionEvent> {
+        let path =
+            deadreckon_core::notify_jsonl_path(&paths.run_root(&job.scope, job.job_id.as_ref()));
+        if !path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(&path)
+            .expect("notify.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("operator attention row"))
+            .collect()
     }
 
     #[test]
@@ -9437,6 +9543,14 @@ mod tests {
                 .filter(|event| is_terminal_kind(event.kind))
                 .count(),
             1
+        );
+        // The suppressed budget terminal announces the winning cancellation,
+        // never the losing classification, and exactly once.
+        let rows = notify_attention_rows(&paths, &job);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].reason,
+            deadreckon_protocol::OperatorAttentionReason::Cancelled
         );
         assert!(
             history

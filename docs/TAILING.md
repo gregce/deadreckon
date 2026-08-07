@@ -25,7 +25,7 @@ Per run, under `$DEADRECKON_HOME/runstate/<scope>/runs/<run_id>/`:
 | `spend.jsonl` | one spend record | [`spend-record.schema.json`](schemas/spend-record.schema.json) |
 | `traces.jsonl` | one trace record | [`trace-record.schema.json`](schemas/trace-record.schema.json) |
 | `flight-events.jsonl` | one provider flight event | [`flight-event.schema.json`](schemas/flight-event.schema.json) |
-| `notify.jsonl` | one notification delivery attempt | none (see below) |
+| `notify.jsonl` | one notify line (attention signal or delivery attempt) | [`notify-event.schema.json`](schemas/notify-event.schema.json) |
 | `proofs/acceptance-progress.jsonl` | one advisory gate progress row | none (see below) |
 
 Notes on individual files:
@@ -33,11 +33,28 @@ Notes on individual files:
 - `spend.jsonl` is a shared ledger: the run loop writes `kind == "loop"` rows
   and the live narrator writes `kind == "narrator"` rows to the same file.
   Only `loop` rows are the run's provider spend; do not sum across kinds.
-- `notify.jsonl` rows are `{ts, transition, channel, ok, detail?}` where
-  `transition` is one of `accepted | paused | failed`. Rows record delivery
-  *attempts*, including failures (`ok: false` with a `detail`). The append is
-  best-effort: a notification can be delivered without its row landing, so
-  treat this file as observability, never as an authoritative delivery log.
+- `notify.jsonl` carries two row shapes, both described by the checked
+  schema and distinguished by the presence of a `kind` field. Rows with
+  `kind: "operator_attention"` are typed operator-attention signals
+  `{schema_version, kind, reason, job_id?, run_id?, scope?, at, summary,
+  next_actions}` where `reason` is one of `verified_awaiting_promote |
+  paused_at_cap | blocked | failed | cancelled | waiting_input`; each is
+  appended once by the process that owns the transition, and a desktop
+  companion may turn one row into one user notification. Rows without `kind`
+  are delivery attempts `{ts, transition, channel, ok, detail?}` where
+  `transition` is one of `accepted | paused | failed`; they record delivery
+  *attempts*, including failures (`ok: false` with a `detail`). The file is
+  append-only like every blessed file, but each append is best-effort: a
+  transition can happen without its row landing, so treat this file as
+  display-only observability — never as an authoritative delivery log, and
+  never as evidence of the state it describes (`status --json` and the
+  signed markers stay the source of truth). The converse also holds: a row
+  can outlive the state it describes. In particular
+  `verified_awaiting_promote` is appended when a receipt is newly sealed,
+  and a bounded sealing attempt that is rolled back afterwards leaves the
+  row behind; the successful reseal then appends a second row. Readers must
+  dedupe (e.g. on `{reason, job_id}`) and re-check `status --json` before
+  acting on any row.
 - `proofs/acceptance-progress.jsonl` rows are
   `{checked_at, status, index, total, result?}`. They are display data only —
   never evidence. The signed acceptance marker is the only trustworthy record
