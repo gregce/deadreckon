@@ -160,7 +160,7 @@ fn steer_refuses_dead_run_with_extend_try() {
 }
 
 #[test]
-fn steer_refuses_exec_route_with_config_try() {
+fn steer_queues_on_exec_route_for_next_turn_delivery() {
     let temp = repo_tempdir();
     let (paths, state) = logbook_fixture_run(&temp, RunStatus::Executing);
 
@@ -169,16 +169,16 @@ fn steer_refuses_exec_route_with_config_try() {
         .output()
         .expect("steer exec route");
 
-    assert!(!output.status.success());
-    let stderr = stderr(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("try: deadreckon config provider cli:codex-server"),
-        "{stderr}"
+        stdout.contains("queued; the run consumes it at the start of its next turn"),
+        "{stdout}"
     );
-    assert!(
-        !state.run_root.join("steer-inbox.jsonl").exists(),
-        "a refused steer must not mutate the inbox"
-    );
+    let inbox = state.run_root.join("steer-inbox.jsonl");
+    assert!(inbox.exists(), "a queued steer must land in the inbox");
+    let contents = fs::read_to_string(&inbox).expect("inbox contents");
+    assert!(contents.contains("prefer the smaller change"), "{contents}");
 }
 
 #[test]
