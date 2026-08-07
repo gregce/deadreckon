@@ -14,22 +14,100 @@ public enum ProviderProbeStatus: String, ForgivingStringEnum, CaseIterable {
 }
 
 /// One entry of `providers[]` from `providers list --json`
-/// (ProviderProbeResult). Only the chip-relevant subset is decoded.
+/// (ProviderProbeResult). The chip subset plus, since APP-4, the probe's own
+/// failure words and try lines: the Lay Course provider picker shows failed
+/// probes visible-but-disabled with these as the fix hints, verbatim.
 public struct ProviderProbeRow: Codable, Equatable, Sendable {
     public let id: String
     public let displayName: String?
     public let status: ProviderProbeStatus
+    public let message: String?
+    public let tryLines: [String]
 
     enum CodingKeys: String, CodingKey {
         case id
         case displayName = "display_name"
         case status
+        case message
+        case tryLines = "try_lines"
     }
 
-    public init(id: String, displayName: String?, status: ProviderProbeStatus) {
+    public init(id: String, displayName: String?, status: ProviderProbeStatus,
+                message: String? = nil, tryLines: [String] = []) {
         self.id = id
         self.displayName = displayName
         self.status = status
+        self.message = message
+        self.tryLines = tryLines
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+        status = try container.decode(ProviderProbeStatus.self, forKey: .status)
+        message = try container.decodeIfPresent(String.self, forKey: .message)
+        tryLines = try container.decodeIfPresent([String].self, forKey: .tryLines) ?? []
+    }
+}
+
+/// `models --json` (models_command, commands/providers.rs): per-provider
+/// model catalogs for the Lay Course model picker. `default` marks the
+/// configured default; `recommended` is the registry's own flag.
+public struct ModelsEnvelope: Codable, Equatable, Sendable {
+    public struct Entry: Codable, Equatable, Sendable {
+        public let id: String
+        public let recommended: Bool
+        public let isDefault: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case id, recommended
+            case isDefault = "default"
+        }
+
+        public init(id: String, recommended: Bool, isDefault: Bool) {
+            self.id = id
+            self.recommended = recommended
+            self.isDefault = isDefault
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            recommended = try container.decodeIfPresent(Bool.self, forKey: .recommended) ?? false
+            isDefault = try container.decodeIfPresent(Bool.self, forKey: .isDefault) ?? false
+        }
+    }
+
+    public struct ProviderModels: Codable, Equatable, Sendable {
+        public let provider: String
+        public let displayName: String?
+        public let models: [Entry]
+
+        enum CodingKeys: String, CodingKey {
+            case provider
+            case displayName = "display_name"
+            case models
+        }
+
+        public init(provider: String, displayName: String?, models: [Entry]) {
+            self.provider = provider
+            self.displayName = displayName
+            self.models = models
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            provider = try container.decode(String.self, forKey: .provider)
+            displayName = try container.decodeIfPresent(String.self, forKey: .displayName)
+            models = try container.decodeIfPresent([Entry].self, forKey: .models) ?? []
+        }
+    }
+
+    public let providers: [ProviderModels]
+
+    public init(providers: [ProviderModels]) {
+        self.providers = providers
     }
 }
 

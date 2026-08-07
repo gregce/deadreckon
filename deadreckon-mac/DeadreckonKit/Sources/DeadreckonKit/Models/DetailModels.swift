@@ -657,6 +657,10 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
         public let totalCostUSD: Double?
         public let message: String?
         public let path: String?
+        /// steer_delivered events echo the inbox entry's queued_at back;
+        /// kept as the raw string because it is the correlator against the
+        /// steer envelope's queued_at (SteerDeliveryTracker).
+        public let queuedAt: String?
 
         enum CodingKeys: String, CodingKey {
             case kind, turn
@@ -668,6 +672,7 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
             case costUSD = "cost_usd"
             case totalCostUSD = "total_cost_usd"
             case message, path
+            case queuedAt = "queued_at"
         }
 
         public init(kind: String, turn: Int? = nil, toolName: String? = nil,
@@ -675,7 +680,7 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
                     preview: String? = nil, inputTokens: Int? = nil,
                     outputTokens: Int? = nil, costUSD: Double? = nil,
                     totalCostUSD: Double? = nil, message: String? = nil,
-                    path: String? = nil) {
+                    path: String? = nil, queuedAt: String? = nil) {
             self.kind = kind
             self.turn = turn
             self.toolName = toolName
@@ -688,6 +693,7 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
             self.totalCostUSD = totalCostUSD
             self.message = message
             self.path = path
+            self.queuedAt = queuedAt
         }
     }
 
@@ -721,6 +727,11 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
             return "docs \(detail.status ?? "") \(detail.path ?? "")"
         case "error":
             return "error \(detail.message ?? "")"
+        case "steer_delivered":
+            let preview = (detail.preview ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            return preview.isEmpty
+                ? "steer delivered"
+                : "steer delivered \u{00B7} \(preview)"
         default:
             return detail.kind
         }

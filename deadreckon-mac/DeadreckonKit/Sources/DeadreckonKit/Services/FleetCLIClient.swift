@@ -67,6 +67,13 @@ public final class DeadreckonCLIClient: FleetCLIRunning {
         inFlight[ObjectIdentifier(runner)] = runner
         lock.unlock()
         defer {
+            // Early exit (task cancellation ends the events iteration) can
+            // leave the child alive; deregistering it then would orphan it
+            // beyond both this client's terminate sweep and the quit-time
+            // teardown. Terminate before letting go.
+            if runner.isRunning {
+                runner.terminate(patience: 2)
+            }
             lock.lock()
             inFlight[ObjectIdentifier(runner)] = nil
             lock.unlock()

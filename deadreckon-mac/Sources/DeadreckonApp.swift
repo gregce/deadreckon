@@ -14,14 +14,31 @@ import SwiftUI
 ///
 /// Deliberately NOT copied from the exemplar: its debug env-var UI hooks in
 /// the app delegate (a named scar in the design doc).
+/// APP-4 fix pass: ONE production CLI client for every write surface (the
+/// sheets, the workbench rudder, the popover quick-steer). Per-sheet clients
+/// would each hold their own in-flight children invisible to the quit-time
+/// teardown sweep — a `finish --yes` child could be orphaned. One shared
+/// client keeps every write child inside `applicationShouldTerminate`'s
+/// SIGTERM sweep and in-flight count. (FleetStore keeps its own read client,
+/// already swept via `fleet.shutdown`.)
+@MainActor
+enum WriteCLI {
+    static let client = DeadreckonCLIClient()
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let fleet = FleetStore()
+    /// APP-4: one router for every write surface — the queue, the workbench,
+    /// and the popover all open the same confirmation sheets through it.
+    let writeRouter = WriteSurfaceRouter()
     var mainWindow: NSWindow?
     private var terminationPrepared = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         fleet.start()
+        // Housekeeping: launch-plan scratch files from earlier sessions.
+        MutationRunner.sweepLaunchPlanFiles()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -38,7 +55,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !terminationPrepared else { return .terminateNow }
         terminationPrepared = true
         let patience: TimeInterval = 2
+        // Both clients: the fleet's read children AND the shared write
+        // client's children (a mid-flight `finish --yes` must meet its
+        // SIGTERM/SIGKILL here, never be orphaned).
         let signaled = fleet.shutdown(patience: patience)
+            + WriteCLI.client.terminateInFlight(patience: patience)
         guard signaled > 0 else { return .terminateNow }
         // 0.5s past patience gives the SIGKILL (scheduled at +patience) room
         // to be delivered before the process goes away.
@@ -47,7 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func replyWhenChildrenExit(deadline: Date) {
-        if fleet.inFlightChildren == 0 || Date() >= deadline {
+        if (fleet.inFlightChildren + WriteCLI.client.inFlightCount) == 0 || Date() >= deadline {
             NSApp.reply(toApplicationShouldTerminate: true)
             return
         }
@@ -59,7 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Builds the window lazily so it never depends on launch ordering.
     private func makeWindowIfNeeded() {
         guard mainWindow == nil else { return }
-        let hostingController = NSHostingController(rootView: GateQueueView(store: fleet))
+        let hostingController = NSHostingController(
+            rootView: GateQueueView(store: fleet, router: writeRouter))
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
@@ -111,13 +133,18 @@ struct DeadreckonApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            MenuBarContent(store: appDelegate.fleet) {
+            // APP-4 (operator decision 4): the popover carries the same
+            // write verbs as the window — quick-steer inline, and
+            // Kill/Promote/Send back items that open the window directly
+            // onto the respective confirmation sheet. The .window style
+            // hosts the real controls a menu cannot.
+            MenuBarPopover(store: appDelegate.fleet, router: appDelegate.writeRouter) {
                 appDelegate.showMainWindow()
             }
         } label: {
             MenuBarGlyph(store: appDelegate.fleet)
         }
-        .menuBarExtraStyle(.menu)
+        .menuBarExtraStyle(.window)
     }
 }
 
@@ -181,66 +208,6 @@ struct MenuBarGlyph: View {
     }
 }
 
-/// The status item menu: top queue rows (decision-ready first), then Open
-/// and Quit. The full triage popover is APP-5; each row here just opens the
-/// main window on the queue.
-struct MenuBarContent: View {
-    @ObservedObject var store: FleetStore
-    let openMainWindow: () -> Void
-
-    var body: some View {
-        Group {
-            Text(statusLine)
-
-            let top = topRows
-            if !top.isEmpty {
-                Divider()
-                ForEach(top) { item in
-                    Button {
-                        openMainWindow()
-                    } label: {
-                        Text(menuTitle(for: item))
-                    }
-                }
-            }
-
-            Divider()
-            Button("Open deadreckon") {
-                openMainWindow()
-            }
-            .keyboardShortcut("o")
-
-            Divider()
-            Button("Quit deadreckon") {
-                NSApp.terminate(nil)
-            }
-            .keyboardShortcut("q")
-        }
-    }
-
-    private var statusLine: String {
-        switch store.fleet {
-        case .loading: return "Reading the fleet"
-        case .unavailable: return "Fleet unavailable"
-        case .loaded(let queue): return queue.summaryLine
-        }
-    }
-
-    /// Queue order already ranks decision-readiness first per section; walk
-    /// the sections in taxonomy order and take the first five.
-    private var topRows: [QueueItem] {
-        Array(store.queue.allItems.prefix(5))
-    }
-
-    private func menuTitle(for item: QueueItem) -> String {
-        switch item.kind {
-        case .job(let row):
-            let word = item.section == .atTheGate
-                ? "at the gate"
-                : GlossaryText.statusWord(row.status)
-            return "\(row.goal) \u{00B7} \(word)"
-        case .quarantined(let inner):
-            return "\(inner.goal ?? inner.jobID ?? "row") \u{00B7} \(GlossaryText.unknownState)"
-        }
-    }
-}
+// MenuBarContent (the APP-2 plain menu) was replaced by MenuBarPopover in
+// APP-4: operator decision 4 gives the popover real write affordances, which
+// a .menu-style status item cannot host.

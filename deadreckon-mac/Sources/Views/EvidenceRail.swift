@@ -618,7 +618,7 @@ struct FlightView: View {
                 .font(Theme.body(9.5, weight: .medium))
                 .foregroundStyle(Theme.inkTertiary)
                 .disabled(true)
-                .help("Rewind (hash-guarded, preview before apply) arrives with APP-4.")
+                .help("Rewind is not among the M1 machine verbs (no --json envelope yet); it stays CLI-only until the binary grows one. Open in Terminal to rewind.")
         }
         .padding(8)
         .cardChrome()

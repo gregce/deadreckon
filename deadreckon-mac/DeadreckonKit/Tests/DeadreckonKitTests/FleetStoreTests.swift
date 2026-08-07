@@ -59,6 +59,62 @@ final class FakeCLI: FleetCLIRunning {
     var inFlightCount: Int { 0 }
 }
 
+/// A CLI that parks calls mid-flight until `release()`: the double-submit
+/// guard tests suspend the first dispatch here and prove a second dispatch
+/// never reaches the binary. `serveImmediately` scripts set-up legs (e.g. a
+/// launch preview) that must complete without gating.
+final class GatedCLI: FleetCLIRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var calls: [[String]] = []
+    private var immediate: [CLIRunResult] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    var gatedResult = CLIRunResult(stdout: "", stderr: "", exitCode: 0)
+
+    /// How many calls are currently suspended at the gate.
+    var parkedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return waiters.count
+    }
+
+    /// The next `times` calls return `result` without gating.
+    func serveImmediately(_ result: CLIRunResult, times: Int = 1) {
+        lock.lock()
+        immediate.append(contentsOf: Array(repeating: result, count: times))
+        lock.unlock()
+    }
+
+    func release() {
+        lock.lock()
+        let parked = waiters
+        waiters = []
+        lock.unlock()
+        parked.forEach { $0.resume() }
+    }
+
+    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+        lock.lock()
+        calls.append(arguments)
+        if !immediate.isEmpty {
+            let result = immediate.removeFirst()
+            lock.unlock()
+            return result
+        }
+        lock.unlock()
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            waiters.append(continuation)
+            lock.unlock()
+        }
+        return gatedResult
+    }
+
+    @discardableResult
+    func terminateInFlight(patience: TimeInterval) -> Int { 0 }
+
+    var inFlightCount: Int { 0 }
+}
+
 final class FakeWatcher: FleetWatching {
     private(set) var startCount = 0
     private(set) var stopCount = 0

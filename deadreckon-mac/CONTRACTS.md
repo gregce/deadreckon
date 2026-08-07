@@ -821,7 +821,7 @@ Invariants (each tested in JobDetailStoreTests):
 
 ## APP-3 views (Sources, app target — views + shell only)
 
-`JobDetailView.swift` (Chartroom three-pane inside the existing window: live fleet sidebar from the SAME FleetStore, `JobWorkbenchView` keyed by `.id(jobID)` so selection change tears down the previous JobDetailStore via onDisappear; a `WindowVisibilityObserver` (NSViewRepresentable) additionally binds the store to the HOSTING WINDOW's lifecycle — the AppDelegate retains the window, so window close does not fire onDisappear; willClose drives `close()` (no tails or CLI cadence survive a closed window) and didBecomeKey drives the idempotent `open()`, which the store's reopen-safe teardown makes correct; `DetailHeaderView` goal/phase/lease-with-WHY (reuses `LeaseDotView` + confirmed-stale verdicts; the rollup row + FleetStore debounce stay the lease FRESHNESS source, while the full lease.json checkpoint renders as evidence facts in the drawer's Job events pane)/spend-vs-cap (plus a visible "spend tail stopped" note on spendIssue)/wall; `SpineBandView`; `SteerBarView` — steer input + Kill are HONEST DISABLED placeholders naming APP-4 with the eligibility reason from `steerable{}`, and 'Open in Terminal' is live), `DetailCenterTabs.swift` (Narrative with deterministic projection + labeled overlay, Activity with search + unbounded scrollback — the filter computes once per body pass — Turns collapsible with a visible tracesIssue note, Timeline phases + event density), `EvidenceRail.swift` (Contract & Checks: frozen spec check-by-check + digest cross-check + network authority + live band + two keys ⚿/⚖ + a RECEIPT EVIDENCE band from `report --json`'s recorded deterministic checks, honestly labeled — no fresh verdict re-run exists for job-owned attempts in the committed binary, see the store's verdict invariant; Changes: diffstat + on-demand per-file patch with truncation honesty; Flight: checkpoint cards + flightIssue note, rewind-apply disabled naming APP-4; Docs: run docs listing or honest empty state), `DetailDrawer.swift` (P5 drawer: Terminal supervisor.out/err with truncation captions | Raw events bounded with a dropped-count note | Job events with integrity chip + torn-tail badge + projectionIssue + lease evidence), `TerminalLauncher.swift` (specstory-mac mechanism: AppleScript into iTerm2/Terminal.app via the apple-events entitlement, executed async on a dedicated serial queue so the Apple-event roundtrip and first-run TCC prompt never block the main thread; TCC denial degrades honestly to pasteboard + open-terminal with a visible note). The narrative overlay NEVER renders in the evidence rail or any promote-adjacent surface; no override affordance exists anywhere in these views.
+`JobDetailView.swift` (Chartroom three-pane inside the existing window: live fleet sidebar from the SAME FleetStore, `JobWorkbenchView` keyed by `.id(jobID)` so selection change tears down the previous JobDetailStore via onDisappear; a `WindowVisibilityObserver` (NSViewRepresentable) additionally binds the store to the HOSTING WINDOW's lifecycle — the AppDelegate retains the window, so window close does not fire onDisappear; willClose drives `close()` (no tails or CLI cadence survive a closed window) and didBecomeKey drives the idempotent `open()`, which the store's reopen-safe teardown makes correct; `DetailHeaderView` goal/phase/lease-with-WHY (reuses `LeaseDotView` + confirmed-stale verdicts; the rollup row + FleetStore debounce stay the lease FRESHNESS source, while the full lease.json checkpoint renders as evidence facts in the drawer's Job events pane)/spend-vs-cap (plus a visible "spend tail stopped" note on spendIssue)/wall; `SpineBandView`; `SteerBarView` — LIVE since APP-4 (see the APP-4 views section): steer submit gated on `steerable{}`, kill/promote/send-back route to their confirmation sheets, and 'Open in Terminal' is live), `DetailCenterTabs.swift` (Narrative with deterministic projection + labeled overlay, Activity with search + unbounded scrollback — the filter computes once per body pass — Turns collapsible with a visible tracesIssue note, Timeline phases + event density), `EvidenceRail.swift` (Contract & Checks: frozen spec check-by-check + digest cross-check + network authority + live band + two keys ⚿/⚖ + a RECEIPT EVIDENCE band from `report --json`'s recorded deterministic checks, honestly labeled — no fresh verdict re-run exists for job-owned attempts in the committed binary, see the store's verdict invariant; Changes: diffstat + on-demand per-file patch with truncation honesty; Flight: checkpoint cards + flightIssue note, rewind-apply disabled naming APP-4; Docs: run docs listing or honest empty state), `DetailDrawer.swift` (P5 drawer: Terminal supervisor.out/err with truncation captions | Raw events bounded with a dropped-count note | Job events with integrity chip + torn-tail badge + projectionIssue + lease evidence), `TerminalLauncher.swift` (specstory-mac mechanism: AppleScript into iTerm2/Terminal.app via the apple-events entitlement, executed async on a dedicated serial queue so the Apple-event roundtrip and first-run TCC prompt never block the main thread; TCC denial degrades honestly to pasteboard + open-terminal with a visible note). The narrative overlay NEVER renders in the evidence rail or any promote-adjacent surface; no override affordance exists anywhere in these views.
 
 Accepted transient (documented, not a bug): on sidebar selection change, SwiftUI may fire the incoming workbench's onAppear before the outgoing one's onDisappear, so two JobDetailStores can hold tails for one runloop turn before the old store closes. The bounded-tails wording "only the selected job holds active tails" is therefore steady-state; the overlap is bounded to a single frame by the `.id(jobID)` teardown.
 
@@ -847,101 +847,428 @@ The app target is views + shell only; anything testable lives in the Kit. Per-do
 }
 ```
 
-APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, NavigationStack destination -> `JobDetailView` (the APP-3 Chartroom, replacing the APP-2 stub), `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Row actions are navigation only: no mutation verbs exist until APP-4's MutationRunner.
+APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, NavigationStack destination -> `JobDetailView` (the APP-3 Chartroom, replacing the APP-2 stub), `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Since APP-4, rows also carry contextual write verbs (context menu: Promote/Send back/Kill per durable facts) that open the confirmation sheets through WriteSurfaceRouter — every mutation still flows through MutationRunner, never from a row directly.
 
 Startup handshake (partial, APP-2): `deadreckon --version` + `doctor --json` land as Harbor facts (version chip, doctor ok/warn/failed chip from the report's own finding counts). The schema-version refusal (refuse to operate on a `DEADRECKON_HOME` written by a newer binary than the vendored one) still needs a committed binary surface that reports the home's schema version; it lands with that surface, and until then the doctor chip is the honest health signal. **Rust-side gap, needs registering:** no gap-register entry (G1-G10) covers a home-schema-version surface; it fits `doctor --json` (a finding whose detail carries the home's schema version). Register it Rust-side before RELEASE so the section 9 refusal has a landing slot; tracked here until then.
 
-## PENDING-M1 (do not build against until R-M1 lands)
+## APP-4 write parity (as built against the committed M1 binary)
 
-R-M1 (G1 + G2 + G9 + steer widening + notify events) is in progress in the Rust workspace. Expected shapes from the design doc section 7; they slot into the Kit as one `Envelopes.swift` + one `MutationRunner.swift` without touching anything above.
+The R-M1 shapes landed and APP-4 built against them. Ground truth:
+`crates/deadreckon/src/machine_json.rs` (emitter), the per-verb fact
+builders (`kill_outcome_facts` main.rs / `kill_job_facts` job.rs, steer.rs,
+`print_materialized` + `apply_outcome_facts` lifecycle.rs,
+`extend_queue_facts` run.rs, `emit_start_read_only_result` start.rs), and
+HOWTO.md "Confirmation flags and the machine launch protocol".
 
-### PENDING-M1: global error envelope (G1)
-
-Every state-changing verb invoked with `--json` that refuses or fails emits one envelope on stdout before exiting with the unchanged exit code:
-
-```json
-{"kind": "error", "code": <exit code>, "verb": "<verb>", "message": "<prose>", "try_lines": ["deadreckon ..."]}
-```
+### Envelope models (Models/MutationEnvelopes.swift)
 
 ```swift
-public struct ErrorEnvelope: Codable, Equatable, Sendable {   // PENDING-M1
+/// Splits concatenated pretty-printed JSON objects (campaign kill emits one
+/// envelope per killed sub-plan, then the campaign envelope). Brace-walk
+/// outside strings; returns each object's exact bytes.
+public enum EnvelopeStreamParser {
+    public static func objects(in text: String) -> [Data]
+}
+
+public struct ErrorEnvelope: Codable, Equatable, Sendable {   // G1 refusal
     public let kind: String        // "error"
-    public let code: Int           // the process exit code, as built (1/2)
+    public let code: Int           // the process exit code, unchanged (1/2)
     public let verb: String
     public let message: String
-    public let tryLines: [String]
+    public let tryLines: [String]  // "try_lines", absent decodes []
+}
+
+/// Verb facts, decoded eagerly via JSONSerialization (integers never
+/// laundered into doubles). Facts a verb did not emit stay nil.
+public struct KillFacts       // signal "SIGTERM"|"SIGKILL"|"none" (job kill with
+                              // nothing to signal), escalated,
+                              // terminalPhaseObserved ("terminal_phase_observed"
+                              // as built — NOT the sketched "terminal_phase"),
+                              // processesSignalled? (plan kills)
+public struct SteerFacts      // queuedAtRaw (verbatim: the correlator against the
+                              // typed steer_delivered event), queuedAt: Date?,
+                              // inboxSeq, source?, delivery? ("active or next
+                              // provider turn" | "next turn boundary")
+public struct DeliveryFacts   // finish/materialize/apply: destinationKind
+                              // ("export"|"in-place"|"git-branch"), destination
+                              // (path or target), stagedFileCount?,
+                              // receiptValidated? (DERIVED, see G1 honesty note),
+                              // strategy?, cleaned?, alreadyApplied?, source?
+public struct ExtendFacts     // parentID?, parentRunID?, contract
+                              // ("inherited"|"replaced"), noteRecorded?, queued?
+
+/// One G1 success envelope: shared scaffold + the armed verb's facts.
+public struct MutationEnvelope {
+    public let kind: String    // the VERB word ("kill","steer","extend","finish",
+                               // "launch","job_status" never spoofable: facts
+                               // cannot overwrite the scaffold, machine_json.rs)
+    public let id, status: String?
+    public let nextActions, tryLines: [String]
+    public let primaryAction: String?
+    public let kill: KillFacts?; public let steer: SteerFacts?
+    public let delivery: DeliveryFacts?; public let extend: ExtendFacts?
+    public let queued: Bool?
+    public init?(data: Data)
+}
+
+/// One invocation's complete machine result.
+public struct MutationResult {
+    public let envelopes: [MutationEnvelope]  // stream order; campaign kill
+                                              // surfaces ALL of them
+    public let refusal: ErrorEnvelope?        // authoritative when present
+    public let rawObjects: [Data]             // for richer decodes (preview, plan)
+    public let exitCode: Int32; public let stdout, stderr: String
+    public var primary: MutationEnvelope?     // the LAST success envelope
+    public var isSuccess, isEnvelopeFree: Bool
+    public var envelopeFreeWords: String
+    public static func classify(stdout:stderr:exitCode:) -> MutationResult
 }
 ```
 
-Rendering rule (trust rule 2): `message` and `tryLines` verbatim. A refusal envelope is authoritative (trust rule 4).
+Invariants (MutationEnvelopeTests):
+- The G1 carve-out is modeled honestly: clap parse failures (exit 2, prose,
+  no envelope — including flags the vendored binary predates, like
+  `--dry-run` before R-M2) classify as `isEnvelopeFree`; no envelope is ever
+  invented from prose.
+- Campaign kill streams decode as concatenated objects; every envelope is
+  surfaced; the campaign envelope is `primary`.
+- `message`/`tryLines` render verbatim (trust rule 2); a refusal envelope is
+  authoritative (trust rule 4).
 
-### PENDING-M1: verb outcome envelopes (G1)
-
-Verb-specific outcome objects, routed through the same `VerdictSurface` the inspection surfaces already use. Known shapes so far:
-
-- `kill --json`: `{"signal": ..., "escalated": Bool, "terminal_phase": ...}`
-- `steer --json`: `{"queued_at": RFC3339, "inbox_seq": Int}`
+### Launch protocol models (G2)
 
 ```swift
-public enum VerbOutcome: Equatable, Sendable {                // PENDING-M1
-    case kill(signal: String, escalated: Bool, terminalPhase: JobPhase)
-    case steer(queuedAt: Date, inboxSeq: Int)
-    case extend(ExtendOutcome)
-    // one case per landed verb; decoded by verb, not by guessing kinds
+/// start --json read-only preview (will_start always false). Decoded via
+/// JSONSerialization; launchPlanData is the embedded `launch_plan` payload
+/// re-serialized with JSONSerialization (NSNumber integer-ness preserved —
+/// never through Codable where 60 would become 60.0) for byte-honest replay.
+/// Blocked previews omit the plan and are not launchable. planCeilingUSD is
+/// budget.ceiling_usd from the embedded plan: the >$50 acknowledgment keys
+/// off the RESOLVED plan, not the form field.
+public struct StartPreviewEnvelope {
+    public let kind: String            // "start"
+    public let goal, selectedMode, selectionSource, reason, provider,
+               providerSource, doneCriteria, doneCriteriaSource,
+               sourceMode: String?
+    public let doneContract: ContractSummary?  // network word + check rows
+    public let requiresConfirmation, willStart: Bool
+    public let nextActions, tryLines: [String]
+    public let launchPlanData: Data?
+    public let planCeilingUSD: Double?
+    public var isLaunchable: Bool
+    public init?(data: Data)
+}
+
+/// finish --dry-run --json (G4), decoded EXACTLY as the design doc section
+/// 7 G4 specifies: staged[{path,bytes,sha256}], diffstat, destination,
+/// irreversible_steps. R-M2 lands the verb concurrently; against the
+/// committed M1 binary the flag is a clap parse error and the promote sheet
+/// degrades honestly ("promote preview requires the M2 binary") instead of
+/// guessing. Report-only either way.
+public struct FinishPlanEnvelope: Codable {
+    public struct StagedFile { path: String; bytes: Int; sha256: String }
+    public struct DiffStat { filesChanged, added, removed: Int? }
+    public struct Destination { kind, path, target: String? }
+    public let kind: String            // "finish_plan"
+    public let id: String?
+    public let staged: [StagedFile]    // absent decodes []
+    public let diffstat: DiffStat?
+    public let destination: Destination?
+    public let irreversibleSteps: [String]  // rendered verbatim
 }
 ```
 
-### PENDING-M1: launch protocol (G2)
-
-The supported GUI launch protocol: `start --json` (read-only preview, `will_start: false`, embeds the exact replayable launch-plan payload) then `start --plan <file> --yes --json` (execute). `--i-know-its-a-lot` unlocks >$50 launches. Confirmation contract: `--yes` approves the launch preview; `--no-confirm` skips destructive follow-up confirmations.
-
-### PENDING-M1: send-back (G9)
-
-`extend <parent> "goal" --note "..." --json` appends a typed provenance record to the PARENT run's `provenance.jsonl` and reports the queued continuation. As built, the provenance row is (additive `at` timestamp; `parent_job_id` carries the parent RUN id — for Job-owned parents the two coincide):
-
-```json
-{"kind": "operator_sendback", "note": "...", "parent_job_id": "...", "new_job_id": "...", "at": "RFC3339"}
-```
-
-As built, the extend envelope keeps `kind: "extend"` (the G1 armed-verb convention — there is no `extend_result` kind) and carries the G9 facts as top-level fields alongside the shared Job-status payload (`verified_proof`, `paths`, `work_clock`, `job`). The note text is NOT echoed back — the app keeps it app-side (it knows what it sent) and decodes only the acknowledgment:
+### Write-flow state machines (Models/WriteFlow.swift)
 
 ```swift
-public struct ExtendOutcome: Codable, Equatable, Sendable {   // PENDING-M1
-    public let id: String              // the NEW job id
-    public let parentID: String        // "parent_id"
-    public let parentRunID: String     // "parent_run_id"
-    public let contract: Contract      // "inherited" | "replaced" (--acceptance explicit)
-    public let noteRecorded: Bool      // "note_recorded"
-    public let queued: Bool            // always true on success
-    public enum Contract: String, Codable, Equatable, Sendable {
-        case inherited, replaced
-    }
+/// The GUI-honest --i-know-its-a-lot. Bypass impossible by construction:
+/// `armsFlag` (required AND typed-amount matches the cap within $0.005) is
+/// the ONLY expression that authorizes the flag; nothing settable overrides.
+public struct SpendAcknowledgement {
+    public static let ceilingUSD: Double  // 50
+    public var capUSD: Double?; public var typedAmount: String
+    public var required, typedMatches, armsFlag, readyToStart: Bool
+    public static func parseAmount(_ text: String) -> Double?
+}
+
+extension JobEventKind {
+    /// cancelled, failed, blocked, needs_review, verified,
+    /// budget_exhausted, deadline_reached.
+    public var isTerminalClassification: Bool
+}
+
+/// Kill state machine. Amber cancel-requested ONLY from the envelope
+/// acceptance; `.terminal` ONLY from fold(jobEventKind:) — there is no
+/// exit-code fold on the type, and the tests pin that a clean exit (even an
+/// envelope claiming terminal_phase_observed) never resolves. A refusal is
+/// sticky. cascadeEnvelopes carries the campaign sub-plan kills. A corrupt
+/// ledger folds into resolutionUnavailable (the sheet says file-backed
+/// resolution is impossible) instead of waiting in amber forever.
+public struct KillProgress {
+    public enum Phase { idle, dispatching, cancelRequested(KillFacts),
+                        refused(ErrorEnvelope),
+                        envelopeFree(exitCode: Int32, words: String),
+                        resolutionUnavailable(reason: String),
+                        terminal(JobEventKind) }
+    public mutating func dispatched()
+    public mutating func fold(result: MutationResult)
+    public mutating func fold(jobEventKind: JobEventKind)
+    public mutating func fold(tailCorruption reason: String)
+}
+
+/// Steer chip machine: queued renders the envelope facts (inboxSeq); flips
+/// to delivered ONLY on a typed steer_delivered event whose queued_at
+/// matches (raw-string equality first, parsed-date within 1 ms fallback).
+/// Deliveries observed while the envelope is still in flight are BUFFERED
+/// and re-matched the moment .queued lands: arrival order cannot lose the
+/// delivered flip (tested).
+public struct SteerDeliveredFact { turn: Int?; queuedAtRaw, preview: String? }
+public struct SteerDeliveryTracker {
+    public enum Phase { idle, submitting, queued(SteerFacts),
+                        delivered(SteerFacts, turn: Int?),
+                        refused(ErrorEnvelope), envelopeFree(words: String) }
+    public mutating func submitted()
+    public mutating func fold(result: MutationResult)
+    public mutating func fold(deliveries: [SteerDeliveredFact])
+    public mutating func reset()
+}
+
+/// Binnacle gating from durable facts only: rollup receipt.verified ==
+/// .valid (trust rule 6) AND report --json records the receipt block (key
+/// 1) AND the semantic judgment (key 2). disabledReason names the FIRST
+/// missing fact. The band's label states honestly that the keys are
+/// report's RECORDED facts, not a fresh verdict --receipt re-validation —
+/// the verdict-on-JOB-refs Rust gap already registered above stands.
+public struct PromoteGate {
+    public let proofValid, markerKeyPresent, judgmentKeyPresent: Bool
+    public let judgmentDecision: String?
+    public let promoteEnabled: Bool
+    public let disabledReason: String?
+    public static func evaluate(receipt: FleetRow.Receipt?,
+                                report: JobReportEnvelope?) -> PromoteGate
 }
 ```
 
-Refusals (typed error envelopes): empty `--note`, and `--note` on a path that queues no durable Job.
-
-### PENDING-M1: verb dispatcher
-
-One choke point for every mutation, so trust rules 1, 2, 8, and 9 are enforced in exactly one place:
+### Verb dispatcher (Services/MutationRunner.swift)
 
 ```swift
-/// The ONLY path that runs state-changing verbs. Builds argv, always appends
-/// --json, exposes the literal CLI line for the sheet to display, decodes
-/// success into VerbOutcome and refusal into ErrorEnvelope. It refuses to
-/// construct dr-gate invocations by design (no such verb constructor).
-public final class MutationRunner {                           // PENDING-M1
-    public init(binary: URL, home: URL?)
+public struct StartRequest { goal: String; provider, model: String?;
+                             maxSpendUSD: Double?; projectDirectory: String? }
+public enum FinishDestinationChoice {           // mapped 1:1 to documented flags
+    case apply(autostash: Bool, cleanup: Bool)  // --autostash / --cleanup
+    case export(path: String)                   // --dest DIR (tilde-expanded app-side:
+                                                // the runner is shell-free and the Rust
+                                                // side takes the path verbatim, so a
+                                                // typed "~" must expand here — tested)
+}
+
+/// The complete verb surface. There is deliberately no dr-gate case, no
+/// sign case, and no parameter that could express "force past a failed
+/// digest": the enum is the proof that no code path retries a mutation with
+/// different authority (tested: refused finish redispatches byte-identical
+/// argv; no --force/--overwrite can appear).
+///
+/// Flag-injection rule (fix pass): flags come FIRST and a literal `--`
+/// terminates the flag section before every OPERATOR-TYPED positional (a
+/// goal or note). Pasted text like "--plan=/path/evil.json" or a bullet
+/// "- fix login" reaches clap as literal text, never as a flag (tested).
+/// The extend note rides a single `--note=<text>` token so dash-values
+/// survive clap value parsing. IDs decoded from the binary's own envelopes
+/// are not operator text and stay in place.
+public enum PlannedVerb {
+    case steer(id: String, note: String)              // steer --json -- <id> <note>
+    case kill(id: String, escalate: Bool)             // kill <id> [--escalate] --json
+    case finishDryRun(id: String, destination: ...)   // finish <id> --dry-run <dest> --json (NO --yes)
+    case finish(id: String, destination: ...)         // finish <id> <dest> --yes --json
+    case extendJob(parentID: String, goal: String, note: String?)
+                                                      // extend [--note=N] --yes --json -- <p> <goal>
+    case startPreview(StartRequest)                   // start [--provider..] [--from DIR] --json -- <goal> (NO --yes)
+    case startExecute(planFilePath: String, spendAcknowledged: Bool, fromPath: String?)
+                                                      // start --plan F --yes [--i-know-its-a-lot] [--from DIR] --json
+    public var arguments: [String]                    // argv array, --json always present
+    public var timeout: TimeInterval
+}
+
+/// The ONLY path that runs state-changing verbs: argv through the
+/// FleetCLIRunning seam (never a shell string), literal CLI line exposed
+/// for sheets (display-only), result classified into MutationResult.
+public final class MutationRunner {
+    public init(cli: FleetCLIRunning)
     public func literalCommandLine(for verb: PlannedVerb) -> String
-    public func run(_ verb: PlannedVerb) async throws -> Swift.Result<VerbOutcome, ErrorEnvelope>
+    public func run(_ verb: PlannedVerb) async -> MutationResult
+    /// Plan scratch file for the execute leg — app temp dir, NEVER under
+    /// DEADRECKON_HOME (trust rule 8; tested).
+    public static func writeLaunchPlanFile(_ data: Data) throws -> URL
 }
 ```
 
-### PENDING-M1: operator-attention notify events
+### Write coordinators (Services/WriteCoordinators.swift)
 
-Operator decision 6: real user notifications ride typed operator-attention events emitted by the binary (R-M1, landed), not app-side inference. The `notify.jsonl` tail (`NotifyRecord`, now the two-case union above mirroring `notify-event.schema.json`) stays observability-only. Stable notification IDs plus a launch-time catch-up scan (exemplar pattern) are APP-5 scope.
+`@MainActor ObservableObject` engines the sheets bind to; all injectable
+via FleetCLIRunning, all tested with fakes; none renders optimism — new or
+changed fleet rows arrive from FleetStore/FSEvents observation only.
 
-### PENDING-M2/M3 (noted so nothing squats on the names)
+- `LayCourseController` — the G2 protocol exactly: `runPreview()` (sets the
+  acknowledgment cap from `planCeilingUSD ?? request.maxSpendUSD`),
+  `execute()` writes `launchPlanData` verbatim to the scratch plan file and
+  replays it; guarded so an unmatched required acknowledgment dispatches
+  NOTHING (tested), and the flag rides `acknowledgement.armsFlag` only.
+  `lastPlanFileURL` is test observability (reset to nil on every
+  `runPreview()` so the displayed execute line never names a previous
+  preview's plan file; stale scratch files are swept at app launch via
+  `MutationRunner.sweepLaunchPlanFiles`). `request.projectDirectory` rides
+  `--from` on BOTH legs (the launch plan does not embed the source; tested).
+  Both verbs carry an in-flight guard: a double-click's second task
+  dispatches nothing (tested). An envelope-free execute failure states that
+  the Job may or may not have queued, points at the file-backed fleet, and
+  DROPS the armed preview — a fresh preview is required before another
+  Start (tested).
+- `LayCourseCatalog` — `providers list --json` + `models --json`; failed
+  probes stay visible with `message`/`tryLines` verbatim as fix hints
+  (ProviderProbeRow grew those fields, additive); each surface degrades
+  into its own failure words independently.
+- `KillCoordinator` — dispatch + fold; owns ONE transient sheet-scoped
+  jobEvents tail over `jobs/<id>/job-events.jsonl` polled while the sheet
+  is open (stop() on dismissal). This is a documented exception to "only
+  the selected job's JobDetailStore holds tails": bounded to the sheet's
+  lifetime, read-only, strict-seq verified like every jobEvents tail.
+  The tail is PRIMED to end-of-file at dispatch time: only rows appended
+  after this dispatch can resolve the sheet, so a historical terminal
+  classification already in the ledger (a prior attempt's budget_exhausted
+  on a paused job, needs_review, an earlier failed) never resolves THIS
+  kill — design 2.4.5, tested. A corrupt ledger (strict-sequence violation
+  or the file vanishing beneath the tail) folds to resolutionUnavailable
+  and the sheet says resolution is impossible (tested). Dispatch is
+  guarded: at most one kill per sheet (tested).
+- `SteerCoordinator` — submit + `observe(deliveries:)` fed from
+  JobDetailStore.steerDeliveries (the workbench's events tail). The tracker
+  BUFFERS deliveries observed while the envelope is in flight and
+  re-matches the moment .queued lands, so arrival order cannot stick the
+  chip at "queued" against a file-backed delivered fact (tested); the view
+  additionally replays the store's current array right after submit. An
+  in-flight guard drops a second submit while one is running (tested).
+- `QuickSteerController` — popover quick-steer: lazy
+  `checkEligibility()` via `status <id> --json` steerable{} (disabled
+  states name the envelope's reason); submit shares the tracker. The
+  popover holds no events tail, so its chip honestly stays "queued ·
+  delivery shows in the workbench".
+- `PromoteCoordinator` — `loadPreview()` (finish --dry-run; decodes the G4
+  finish_plan spec-true INCLUDING `status` "deliverable"|"blocked" and
+  `receipt`{validated,error}: a blocked plan renders receipt.error verbatim
+  as a refusal-styled band, never as "0 files · +0 −0" — tested) and
+  `promote(gate:)` (guarded: a disabled gate never reaches the binary —
+  tested; refusal renders verbatim and STOPS; an in-flight guard drops a
+  second promote while one finish runs — tested). The `.unsupported` M2-gap
+  classification is reserved for the G1 carve-out signature (exit 2, clap
+  prose); every OTHER envelope-free result — watchdog SIGTERM, crash,
+  locator failure, task cancellation — is `.failed` with the words alone
+  plus the exit code, never a fabricated version-gap diagnosis (tested).
+  `previewDestination` names the destination the current plan was computed
+  for, so the sheet flags a stale preview instead of silently pairing it
+  with new flags.
+- `SendBackCoordinator` — goal + note editors; `--note` omitted when the
+  note is empty; decodes the extend acknowledgment (`noteRecorded`,
+  `contract`); empty goal never dispatches; in-flight guard (tested). An
+  envelope-free failure sets `mayHaveQueued`: the continuation Job may
+  already have queued, so the dispatch stays DISARMED (canSubmit false)
+  until the operator explicitly `rearmAfterPossibleQueue()`s after
+  checking the file-backed fleet (tested).
 
-- `finish --dry-run --json` preview envelope (G4): report-only; real finish re-validates from scratch; `irreversible_steps` rendered verbatim.
-- `follow <id> --json` merged NDJSON `{"source", "offset", "record"}` with replay offsets (G5 step 2): replaces the per-job tail fleet; `JSONLTailer` stays for the pre-M3 world and as the fallback.
+### JobDetailStore additions (APP-4, additive)
+
+- `steerDeliveries: [SteerDeliveredFact]` — typed steer_delivered events
+  decoded off the events tail (RunEventRecord.Detail grew `queuedAt`
+  decoding `queued_at` as the raw string). Per-run, reset on attempt
+  rebuild and on close (tested).
+- (Fix pass) A `terminalJobEventKind` surface was removed: kill resolution
+  has exactly ONE source — the KillCoordinator's own dispatch-primed tail.
+  A second store-scoped fold (which resets per attempt and replays full
+  history) would invite a future caller to bind kill state to the wrong
+  tail.
+
+### APP-4 views (Sources, app target)
+
+`WriteSurfaceRouter` (one `@Published pending: PendingSurface?` — layCourse
+/ kill(FleetRow) / promote(FleetRow) / sendBack(FleetRow)); the queue, the
+workbench (via environmentObject), and the menubar popover all open the
+same sheets through it. `RefusalView` renders every typed refusal verbatim
+(message + try lines, selectable) with NO override control anywhere;
+`CommandLineView` shows the literal CLI line each sheet will run (2.4.3).
+
+- `LayCourseSheet` (Command-N, replacing the placeholder): goal editor;
+  provider rows from the catalog (failed probes visible-but-disabled with
+  message + try lines); model picker per provider; spend-cap field;
+  preview leg with the resolved plan facts and the done-contract band;
+  >$50 swaps Start for the type-the-amount field (border flips only on the
+  exact match; Start disabled until `readyToStart`); execute leg shows the
+  literal replay line; success says "the row appears when job.json lands".
+  **Done-contract deviation, documented:** the step is READ-ONLY detection
+  through the preview envelope (`done_criteria`/`done_contract` — checks,
+  must_pass, capabilities.network). The app authors no acceptance.yaml:
+  `start` has no `--acceptance` flag to point at an app-written file,
+  `def-done` has no `--json`, and writing into the operator's project
+  would break the single-writer honesty the sheet claims. A missing
+  contract refuses with try lines that teach `def-done`, rendered
+  verbatim. **Rust-side gap, needs registering:** a `--acceptance <path>`
+  (or def-done --json authoring surface) on `start`, so a GUI contract
+  step can author without touching the project tree.
+- `KillSheet`: the real semantics verbatim (CancelRequested sticky +
+  cancel.marker, SIGTERM process groups, 2s grace, SIGKILL,
+  supervisor-proven terminal Cancelled), a separate explicit --escalate
+  toggle, amber only from the envelope, resolution only from the job-events
+  terminal event (KillCoordinator).
+- `PromoteSheet` (the converged Binnacle): TWO-KEY band labeled "recorded
+  by report --json · fresh verdict on JOB refs is a registered Rust gap";
+  CONTRACT table (frozen checkRows crossed with recorded
+  deterministic_checks: status, duration, expandable clipped output —
+  pairing is positional but VERIFIED on check kind, degrading to the
+  unpaired "not recorded" glyph on any identity mismatch so a reordered or
+  wrong-revision results list never shows a result against the wrong
+  check); digest/receipt chips; CANDIDATE band (dry-run states: plan /
+  BLOCKED plan rendered as a refusal band quoting receipt.error verbatim /
+  refused / unsupported-M2 (exit-2 carve-out only) / failed, plus a
+  stale-preview notice whenever the selected destination differs from the
+  one the shown plan was computed for); destination radio mapped 1:1 to
+  flags — export has NO invented default path: PROMOTE and the preview
+  stay disabled with "no export destination entered" named until the
+  operator types one (tilde-expanded app-side); the literal finish line;
+  decision bar Promote (gated, disabled reason named) / Send back / Kill
+  (each swapping the routed sheet directly — no dismiss()-then-set race)
+  reading the gate from the LIVE FleetStore row, not the sheet-open
+  snapshot; success shows the envelope's own `deadreckon undo` next-action
+  and says the row updates from the files. Opens its own transient
+  JobDetailStore for report evidence (sheet-scoped, closed on dismissal —
+  same documented exception as the kill tail).
+- `SendBackSheet`: follow-up goal + note editors, literal extend line,
+  queued acknowledgment (contract inherited/replaced, note recorded). After
+  an envelope-free failure the sheet shows the may-have-queued words and an
+  explicit "I checked the fleet — re-arm" button (the coordinator keeps the
+  dispatch disarmed until it is pressed).
+- `MenuBarPopover` (decision 4, replacing the APP-2 menu; MenuBarExtra is
+  `.window` style now): NEEDS DECISION rows carry Promote…/Send
+  back…/Kill…/Inspect, UNDERWAY rows carry inline quick-steer (lazy
+  eligibility) and Kill…. Every destructive item opens the main window
+  directly onto the confirmation sheet; the popover NEVER fires a
+  destructive verb itself.
+- `SteerBarView` (workbench, now live): gated on
+  `status.currentSteerable`, tracker refusal downgrades (trust rule 4),
+  queued chip -> delivered flip on `detail.steerDeliveries`; decision
+  verbs contextual on phase (terminal: Promote/Send back; else Kill).
+
+### Still pending (so nothing squats on the names)
+
+- Operator-attention notify events (operator decision 6): the binary-side
+  rows landed in R-M1; real user notifications (stable IDs + launch-time
+  catch-up scan) are APP-5 scope. The `notify.jsonl` tail stays
+  observability-only.
+- `finish --dry-run --json` (G4): the decode model above is spec-true and
+  tested; the vendored binary gains the verb when R-M2 lands and the
+  CANDIDATE band lights up with no app change beyond re-vendoring.
+- `finish --json` on the real path also lands with R-M2; the promote
+  success path already decodes the G1 finish envelope shape.
+- `follow <id> --json` merged NDJSON `{"source","offset","record"}` (G5
+  step 2, M3): replaces the per-job tail fleet; `JSONLTailer` stays for
+  the pre-M3 world and as the fallback.
+- Rewind has no machine envelope in the M1 binary (it is not one of the
+  nine G1 verbs); the Flight tab's rewind affordance stays honestly
+  disabled pointing at the CLI until one exists.
