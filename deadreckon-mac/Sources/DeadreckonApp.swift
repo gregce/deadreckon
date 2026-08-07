@@ -52,6 +52,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var terminationPrepared = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Dark only (DESIGN.md §1): the app never reads system appearance.
+        // Forcing darkAqua here keeps AppKit-owned chrome (sheets, pickers,
+        // toggles, menus) inside the one committed world.
+        NSApp.appearance = NSAppearance(named: .darkAqua)
         fleet.start()
         // Housekeeping: launch-plan scratch files from earlier sessions.
         MutationRunner.sweepLaunchPlanFiles()
@@ -145,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func makeWindowIfNeeded() {
         guard mainWindow == nil else { return }
         let hostingController = NSHostingController(
-            rootView: GateQueueView(
+            rootView: MainWindowView(
                 store: fleet, router: writeRouter, shell: shell, attention: attention))
 
         let window = NSWindow(
@@ -159,7 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 760, height: 480)
+        // §B1: the split window's floor — 240px tree + a center that can
+        // hold the run detail's bands.
+        window.minSize = NSSize(width: 980, height: 620)
         window.delegate = self
         window.setFrameAutosaveName("DeadreckonMainWindow")
         if !window.setFrameUsingName("DeadreckonMainWindow") {
@@ -229,9 +235,10 @@ struct DeadreckonApp: App {
     }
 }
 
-/// State-driven menubar glyph (the exemplar's five-state enum pattern):
-/// template anchor when idle, live variant while anything runs, badged when
-/// a decision waits at the gate, honest error mark when the binary is gone.
+/// State-driven menubar glyph (the exemplar's five-state enum pattern) in
+/// the diamond brand family (DESIGN.md §8): idle `diamond`, live
+/// `diamond.fill`, attention `diamond.fill` + count, degraded
+/// `exclamationmark.circle`, unavailable `exclamationmark.triangle`.
 struct MenuBarGlyph: View {
     @ObservedObject var store: FleetStore
 
@@ -246,60 +253,45 @@ struct MenuBarGlyph: View {
         case .unavailable:
             Image(systemName: "exclamationmark.triangle")
         case .attention(let count):
-            // The helm keeps the app's identity in the state the operator
-            // most needs to FIND it; the decision count rides beside it as
-            // the honest badge (a number, never a colored guess). An
-            // anonymous "N.circle" glyph read as a different app entirely.
+            // The diamond keeps the app's identity in the state the
+            // operator most needs to FIND it; the needs-you count rides
+            // beside it as the honest badge (a number, never a colored
+            // guess). An anonymous "N.circle" glyph reads as a different
+            // app entirely.
             HStack(spacing: 2) {
-                identityGlyph
+                Image(systemName: "diamond.fill")
                 Text("\(min(count, 50))")
                     .font(.system(size: 11, weight: .semibold))
                     .monospacedDigit()
             }
         case .degraded:
-            // Amber-class attention without a decision count: a confirmed
-            // stale lease or the Watchkeeper down (design 2.4.1). Distinct
-            // from the unavailable triangle; the tooltip says which.
+            // Warn-class attention without a needs-you count: a confirmed
+            // stale lease or the service down (design 2.4.1). Distinct from
+            // the unavailable triangle; the tooltip says which.
             Image(systemName: "exclamationmark.circle")
         case .live:
-            // The live variant: visually distinct from the idle helm while
-            // anything runs or verifies (the exemplar's live-icon pattern).
-            // The helm-to-sailboat shape swap is a deliberate divergence,
-            // recorded in CONTRACTS.md.
-            Image(systemName: "sailboat.fill")
+            // The live variant: visually distinct from the idle diamond
+            // while anything runs or verifies.
+            Image(systemName: "diamond.fill")
         case .idle, .loading:
-            identityGlyph
+            Image(systemName: "diamond")
         }
-    }
-
-    /// The brand anchor: the helm, or the anchor text glyph where the SF
-    /// symbol is unavailable.
-    @ViewBuilder private var identityGlyph: some View {
-        if anchorSymbolAvailable {
-            Image(systemName: "helm")
-        } else {
-            Text("\u{2693}\u{FE0E}")
-        }
-    }
-
-    private var anchorSymbolAvailable: Bool {
-        NSImage(systemSymbolName: "helm", accessibilityDescription: nil) != nil
     }
 
     private var helpText: String {
         switch store.menuBarState {
-        case .unavailable: return "deadreckon: fleet unavailable"
-        case .attention(let count): return "deadreckon: \(count) decision\(count == 1 ? "" : "s") waiting"
+        case .unavailable: return "deadreckon: can\u{2019}t read runs"
+        case .attention(let count): return "deadreckon: \(count) need\(count == 1 ? "s" : "") you"
         case .degraded(let staleLeases, let supervisorDown):
             var parts: [String] = []
             if staleLeases > 0 {
-                parts.append("\(staleLeases) stale lease\(staleLeases == 1 ? "" : "s")")
+                parts.append("\(staleLeases) run\(staleLeases == 1 ? "" : "s") quiet too long")
             }
-            if supervisorDown { parts.append("supervisor stopped") }
+            if supervisorDown { parts.append("service stopped") }
             return "deadreckon: " + parts.joined(separator: ", ")
         case .live(let count): return "deadreckon: \(count) running"
-        case .idle: return "deadreckon: fleet quiet"
-        case .loading: return "deadreckon: reading the fleet"
+        case .idle: return "deadreckon: all quiet"
+        case .loading: return "deadreckon: reading runs"
         }
     }
 }

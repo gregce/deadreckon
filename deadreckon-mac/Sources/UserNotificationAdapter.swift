@@ -96,7 +96,7 @@ final class UserNotificationAdapter: NSObject, UserNotifying, UNUserNotification
             options: [.foreground])
         let reviewAtGate = UNNotificationAction(
             identifier: NotificationIdentity.reviewAtGateActionID,
-            title: "Review at Gate",
+            title: "Review & Approve",
             options: [.foreground])
         let general = UNNotificationCategory(
             identifier: NotificationIdentity.generalCategoryID,

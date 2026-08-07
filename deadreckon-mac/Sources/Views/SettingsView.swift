@@ -29,16 +29,24 @@ struct SettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 Text("Settings")
-                    .font(Theme.display(24))
-                    .foregroundStyle(Theme.ink)
+                    .font(Theme.display)
+                    .foregroundStyle(Theme.textPrimary)
 
-                Picker("Settings section", selection: $tab) {
-                    ForEach(SettingsTab.allCases) { tab in
-                        Text(tab.rawValue).tag(tab)
+                // The one tab grammar (DESIGN.md §5): text tabs in a panel
+                // strip, active = textPrimary on well.
+                HStack(spacing: 2) {
+                    ForEach(SettingsTab.allCases) { candidate in
+                        TabButton(title: candidate.rawValue, active: tab == candidate) {
+                            tab = candidate
+                        }
                     }
+                    Spacer()
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+                .padding(4)
+                .background(Theme.panel,
+                            in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+                    .strokeBorder(Theme.border, lineWidth: 1))
 
                 switch tab {
                 case .general:
@@ -53,7 +61,7 @@ struct SettingsView: View {
             .frame(maxWidth: 560, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .center)
         }
-        .background(Theme.paper)
+        .background(Theme.windowBg)
         .frame(minWidth: 620, minHeight: 460)
     }
 
@@ -65,7 +73,7 @@ struct SettingsView: View {
             Toggle(isOn: $launchAtLogin) {
                 settingLabel(
                     "Launch at login",
-                    detail: "Keep deadreckon in your menu bar so the fleet is watched and decisions reach you.")
+                    detail: "Keep deadreckon in your menu bar so your runs are watched and decisions reach you.")
             }
             .toggleStyle(.switch)
             .onChange(of: launchAtLogin) { _, enabled in
@@ -92,12 +100,12 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
 
             settingsGroupTitle("Appearance")
-            Text("deadreckon follows the system appearance. Every color is a light/dark dynamic pair; there is no separate theme setting.")
-                .font(Theme.body(11))
-                .foregroundStyle(Theme.inkSecondary)
+            Text("deadreckon is dark by design. There is no light mode.")
+                .font(Theme.small)
+                .foregroundStyle(Theme.textSecondary)
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -111,12 +119,12 @@ struct SettingsView: View {
             settingsGroupTitle("Notifications")
             Toggle(isOn: masterBinding) {
                 settingLabel(
-                    "Notify me when a job needs attention",
-                    detail: "Derived from the typed operator_attention rows the binary appends to notify.jsonl. Display-only signals; the app re-reads the durable files when you open it.")
+                    "Notify me when a run needs attention",
+                    detail: "Derived from the attention entries the CLI writes to `notify.jsonl`. Signals only \u{2014} the app re-reads the files when you open it.")
             }
             .toggleStyle(.switch)
 
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
 
             ForEach(AttentionPreferences.notifiableReasons, id: \.self) { reason in
                 Toggle(isOn: reasonBinding(reason)) {
@@ -127,25 +135,25 @@ struct SettingsView: View {
                 .disabled(!preferences.masterEnabled)
             }
 
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
 
             Text("macOS permission is requested the first time a notification is delivered. If you declined it, enable deadreckon under System Settings > Notifications; a grant there takes effect on the next notification, no relaunch needed.")
                 .font(Theme.body(10.5))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
 
             // Honest degradation surface: a corrupt notify.jsonl stops that
             // job's notifications permanently (sticky per attempt). The
             // operator must be able to SEE that silence.
             if !attention.issues.isEmpty {
-                Divider().overlay(Theme.hairline)
-                settingsGroupTitle("Notify tail trouble")
+                Divider().overlay(Theme.border)
+                settingsGroupTitle("Notification trouble")
                 ForEach(attention.issues.sorted(by: { $0.key < $1.key }), id: \.key) { jobID, reason in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(jobID)
-                            .font(Theme.mono(11))
-                            .foregroundStyle(Theme.ink)
+                            .font(Theme.monoM)
+                            .foregroundStyle(Theme.textPrimary)
                             .textSelection(.enabled)
-                        Text("Notifications from this job's current attempt are stopped: \(reason)")
+                        Text("Notifications from this run are stopped: \(reason)")
                             .font(Theme.body(10.5))
                             .foregroundStyle(Theme.warn)
                             .textSelection(.enabled)
@@ -184,19 +192,19 @@ struct SettingsView: View {
     private func reasonDetail(_ reason: OperatorAttentionReason) -> String {
         switch reason {
         case .verifiedAwaitingPromote:
-            return "A two-key receipt sealed; the result waits at the gate for your promote."
+            return "Both sign-offs landed; the result waits for your approval."
         case .pausedAtCap:
-            return "The run loop stopped at a spend or wall-time cap."
+            return "The run paused at a budget or time limit."
         case .waitingInput:
-            return "The job waits for your review before it can continue."
+            return "The run waits for your review before it can continue."
         case .blocked:
-            return "The supervisor classified the job as blocked."
+            return "The service classified the run as blocked."
         case .failed:
-            return "The supervisor classified the job as failed."
+            return "The service classified the run as failed."
         case .cancelled:
-            return "The supervisor classified the job as cancelled."
+            return "The service classified the run as stopped."
         case .unknown:
-            return GlossaryText.unknownState
+            return "unknown"
         }
     }
 
@@ -207,8 +215,8 @@ struct SettingsView: View {
             settingsGroupTitle("Read-only facts")
 
             infoRow("App version", appVersion)
-            infoRow("Binary reports", fleet.binaryVersion ?? "not read yet",
-                    detail: "Live deadreckon --version from the Harbor poll.")
+            infoRow("CLI reports", fleet.binaryVersion ?? "not read yet",
+                    detail: "Live `deadreckon --version` from the health poll.")
 
             if let override = ProcessInfo.processInfo.environment["DEADRECKON_BIN"],
                !override.isEmpty {
@@ -218,18 +226,18 @@ struct SettingsView: View {
                 vendoredRows
             }
 
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
 
             infoRow("DEADRECKON_HOME", DeadreckonHome.url().path,
                     detail: ProcessInfo.processInfo.environment["DEADRECKON_HOME"]
                         .map { _ in "From the DEADRECKON_HOME environment variable." }
                         ?? "Default: ~/.deadreckon (no DEADRECKON_HOME set).")
 
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
 
-            settingsGroupTitle("Schema handshake")
+            settingsGroupTitle("CLI handshake")
             infoRow("Status", schemaHandshakeStatus,
-                    detail: "The committed binary has no surface reporting the home's schema version yet (registered Rust-side gap). Until it lands, doctor --json is the honest health signal.")
+                    detail: "The bundled CLI has no schema-version report yet (registered gap); the health check is the honest signal until it lands.")
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -258,10 +266,8 @@ struct SettingsView: View {
 
     private var schemaHandshakeStatus: String {
         switch fleet.harbor.doctor {
-        case .ok(let warnings) where warnings == 0: return "doctor ok"
-        case .ok(let warnings): return "doctor ok, \(warnings) warning\(warnings == 1 ? "" : "s")"
-        case .failed(let count): return "doctor: \(count) finding\(count == 1 ? "" : "s") failed"
-        case .unknown(let reason): return "doctor unknown: \(reason)"
+        case .unknown(let reason): return "\(Lexicon.healthWord(fleet.harbor.doctor)): \(reason)"
+        default: return Lexicon.healthWord(fleet.harbor.doctor)
         }
     }
 
@@ -290,21 +296,20 @@ struct SettingsView: View {
 
     // MARK: - Shared chrome
 
-    /// Settings' deliberate 11pt sub-scale of the shared section-title
-    /// token — named distinctly so it cannot shadow `Theme.sectionTitle`,
-    /// and delegating to it so the metric lives in one place.
+    /// Settings group titles are scan-first headers: the one shared section
+    /// title in textSecondary (DESIGN.md §5).
     private func settingsGroupTitle(_ text: String) -> some View {
-        Theme.sectionTitle(text, size: 11, kerning: 0.5)
+        Theme.sectionTitle(text, color: Theme.textSecondary)
     }
 
     private func settingLabel(_ title: String, detail: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
                 .font(Theme.body(13, weight: .medium))
-                .foregroundStyle(Theme.ink)
+                .foregroundStyle(Theme.textPrimary)
             Text(detail)
                 .font(Theme.body(11))
-                .foregroundStyle(Theme.inkSecondary)
+                .foregroundStyle(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -315,11 +320,11 @@ struct SettingsView: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(label)
                     .font(Theme.body(11, weight: .semibold))
-                    .foregroundStyle(Theme.inkSecondary)
+                    .foregroundStyle(Theme.textSecondary)
                     .frame(width: 170, alignment: .leading)
                 Text(value)
                     .font(mono ? Theme.mono(10.5) : Theme.body(12))
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.textPrimary)
                     .textSelection(.enabled)
                     .lineLimit(2)
                     .truncationMode(.middle)
@@ -327,7 +332,7 @@ struct SettingsView: View {
             if let detail {
                 Text(detail)
                     .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                     .padding(.leading, 178)
                     .fixedSize(horizontal: false, vertical: true)
             }

@@ -90,16 +90,17 @@ public enum AttentionDerivation {
                 : NotificationIdentity.generalCategoryID)
     }
 
-    /// App-authored reason labels. One word set per reason, no readiness or
-    /// prediction language (operator decision 8); the summary itself stays
-    /// the binary's verbatim words.
+    /// App-authored reason labels (REDESIGN-SPEC.md §A3.11 — the one
+    /// permitted Kit wording change). One word set per reason, no readiness
+    /// or prediction language (operator decision 8); the summary itself
+    /// stays the binary's verbatim words.
     public static func title(for reason: OperatorAttentionReason) -> String {
         switch reason {
-        case .verifiedAwaitingPromote: return "Verified, awaiting your promote"
-        case .pausedAtCap: return "Paused at cap"
-        case .blocked: return "Job blocked"
-        case .failed: return "Job failed"
-        case .cancelled: return "Job cancelled"
+        case .verifiedAwaitingPromote: return "Verified \u{2014} ready to approve"
+        case .pausedAtCap: return "Paused at a limit"
+        case .blocked: return "Run blocked"
+        case .failed: return "Run failed"
+        case .cancelled: return "Run stopped"
         case .waitingInput: return "Needs your review"
         case .unknown: return GlossaryText.unknownState
         }
