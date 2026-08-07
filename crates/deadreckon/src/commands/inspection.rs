@@ -1170,9 +1170,13 @@ fn history_line_timestamp(kind: HistoryKind, line: &str) -> Option<DateTime<Utc>
         HistoryKind::Trace => serde_json::from_str::<TraceRecord>(line)
             .ok()
             .map(|record| record.timestamp),
-        HistoryKind::Provenance => serde_json::from_str::<ProvenanceRecord>(line)
+        HistoryKind::Provenance => serde_json::from_str::<deadreckon_core::ProvenanceEntry>(line)
             .ok()
-            .map(|record| record.timestamp),
+            .map(|entry| match entry {
+                deadreckon_core::ProvenanceEntry::Turn(record) => record.timestamp,
+                // Gap G9: typed send-back rows are stamped at queue time.
+                deadreckon_core::ProvenanceEntry::OperatorSendback(record) => record.at,
+            }),
         HistoryKind::Events => serde_json::from_str::<RunEvent>(line)
             .ok()
             .map(|record| record.timestamp),

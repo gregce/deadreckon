@@ -120,6 +120,7 @@ use uuid::Uuid;
 mod cli;
 mod commands;
 mod friendliness_contract;
+mod machine_json;
 mod narrative;
 mod narrator;
 mod plan_event_bus;
@@ -947,6 +948,21 @@ async fn main() {
             std::process::exit(130);
         }
         let exit_code = err.exit_code();
+        // Gap G1's one global rule: when the parsed subcommand carried
+        // `--json`, every fail-closed refusal also lands as one machine
+        // refusal envelope on stdout, with the same exit code. The stderr
+        // prose below is unchanged so humans watching a machine invocation
+        // still see the surface.
+        if let Some(verb) = machine_json::active()
+            && let Ok(rendered) = serde_json::to_string_pretty(&machine_json::error_envelope(
+                verb,
+                exit_code,
+                &err.to_string(),
+                &error_hint(&err),
+            ))
+        {
+            println!("{rendered}");
+        }
         print_error(&err);
         print_error_hint(&err);
         std::process::exit(exit_code);
@@ -1049,6 +1065,7 @@ async fn main_inner() -> Result<()> {
             preview,
             review_done,
             yes,
+            i_know_its_a_lot,
             no_seams,
             fresh,
             worktree,
@@ -1059,6 +1076,7 @@ async fn main_inner() -> Result<()> {
             json,
         } => {
             ui::set_plain_output(plain || json);
+            machine_json::arm("start", json);
             let resolved_goal = resolve_optional_goal_input("start", goal, goal_file)?;
             let allows_prompts =
                 std::io::stdin().is_terminal() && !yes && !json && !plain && !quiet;
@@ -1088,6 +1106,7 @@ async fn main_inner() -> Result<()> {
                 preview,
                 review_done,
                 yes,
+                i_know_its_a_lot,
                 no_seams,
                 fresh,
                 worktree,
@@ -1421,8 +1440,10 @@ async fn main_inner() -> Result<()> {
             no_hints,
             quiet,
             plain,
+            json,
         } => {
             ui::set_plain_output(plain);
+            machine_json::arm("fork", json);
             commands::plan::fork_command_from_cli(ForkCommandArgs {
                 plan_id,
                 max_spend,
@@ -1459,8 +1480,10 @@ async fn main_inner() -> Result<()> {
             no_hints,
             quiet,
             plain,
+            json,
         } => {
             ui::set_plain_output(plain);
+            machine_json::arm("merge", json);
             commands::merge::merge_command(MergeCommandArgs {
                 plan_id,
                 strategy,
@@ -1610,24 +1633,30 @@ async fn main_inner() -> Result<()> {
             cleanup,
             no_confirm,
             message,
-        } => commands::lifecycle::finish_command(
-            run_id,
-            dest,
-            force,
-            include_manifest,
-            strategy,
-            branch,
-            autostash,
-            cleanup,
-            no_confirm,
-            message,
-        ),
+            json,
+        } => {
+            machine_json::arm("finish", json);
+            commands::lifecycle::finish_command(
+                run_id,
+                dest,
+                force,
+                include_manifest,
+                strategy,
+                branch,
+                autostash,
+                cleanup,
+                no_confirm,
+                message,
+            )
+        }
         Commands::Materialize {
             run_id,
             dest,
             force,
             include_manifest,
+            json,
         } => {
+            machine_json::arm("materialize", json);
             let paths = DeadreckonPaths::discover();
             let dest = resolve_external_dest(&paths, dest, "export")?;
             commands::lifecycle::materialize_command(run_id, dest, force, include_manifest)
@@ -1641,14 +1670,22 @@ async fn main_inner() -> Result<()> {
             cleanup,
             message,
             plain,
-        } => commands::lifecycle::apply_command(
-            run_id, strategy, branch, no_confirm, autostash, cleanup, message, plain,
-        ),
+            json,
+        } => {
+            machine_json::arm("apply", json);
+            commands::lifecycle::apply_command(
+                run_id, strategy, branch, no_confirm, autostash, cleanup, message, plain,
+            )
+        }
         Commands::Abandon {
             run_id,
             keep_branch,
             force,
-        } => commands::lifecycle::abandon_command(run_id, keep_branch, force),
+            json,
+        } => {
+            machine_json::arm("abandon", json);
+            commands::lifecycle::abandon_command(run_id, keep_branch, force)
+        }
         Commands::Cleanup {
             run_id,
             all,
@@ -1674,6 +1711,7 @@ async fn main_inner() -> Result<()> {
             dest,
             acceptance,
             yes,
+            note,
             max_context_turns,
             no_context,
             max_spend,
@@ -1689,7 +1727,9 @@ async fn main_inner() -> Result<()> {
             narrate,
             no_narrate,
             narrator_model,
+            json,
         } => {
+            machine_json::arm("extend", json);
             let paths = DeadreckonPaths::discover();
             let dest = resolve_external_dest(&paths, dest, "extend")?;
             commands::lifecycle::extend_command(ExtendCommandArgs {
@@ -1698,6 +1738,7 @@ async fn main_inner() -> Result<()> {
                 dest,
                 acceptance,
                 yes,
+                note,
                 max_context_turns,
                 no_context,
                 max_spend,
@@ -1772,13 +1813,18 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
-        Commands::Steer { run_id, text } => commands::steer::steer_command(&run_id, text),
+        Commands::Steer { run_id, text, json } => {
+            machine_json::arm("steer", json);
+            commands::steer::steer_command(&run_id, text)
+        }
         Commands::Kill {
             run_id,
             force,
             plain,
+            json,
         } => {
             ui::set_plain_output(plain);
+            machine_json::arm("kill", json);
             kill_command(run_id, force, plain)
         }
         Commands::Reshape {
@@ -10360,35 +10406,53 @@ fn print_merge_finished(
         .iter()
         .filter(|task| task.status == PlanTaskStatus::Completed)
         .count();
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Completed,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            "DeadReckon merged the child artifacts into a promoted result run.",
+            "The plan now has a completed result; finish is the canonical next command for landing or exporting it.",
+            vec![
+                ("plan".to_string(), id.clone()),
+                ("result run".to_string(), run_prefix(&merged_run.run_id)),
+                (
+                    "artifact library".to_string(),
+                    library_dir.display().to_string(),
+                ),
+                (
+                    "status".to_string(),
+                    plan_status_label(plan.status).to_string(),
+                ),
+                (
+                    "tasks".to_string(),
+                    format!("{completed}/{} completed", plan.tasks.len()),
+                ),
+            ],
+        ),
+        vec![("Recommended", finish.as_str())],
+        secondary
+            .iter()
+            .map(|command| ("Secondary", command.as_str())),
+    );
+    if let Some(verb) = machine_json::active() {
+        let _ = machine_json::emit_success(
+            verb,
+            &plan.plan_id,
+            &surface,
+            json!({
+                "result_run_id": merged_run.run_id,
+                "artifact_library": library_dir,
+                "plan_status": plan_status_label(plan.status),
+                "tasks_completed": completed,
+                "tasks_total": plan.tasks.len(),
+            }),
+        );
+        return;
+    }
     println!(
         "{}",
-        VerdictSurface::must_new(
-            VerdictKind::Completed,
-            "plan",
-            Some(&id),
-            ExplanationPanel::new(
-                "DeadReckon merged the child artifacts into a promoted result run.",
-                "The plan now has a completed result; finish is the canonical next command for landing or exporting it.",
-                vec![
-                    ("plan".to_string(), id.clone()),
-                    ("result run".to_string(), run_prefix(&merged_run.run_id)),
-                    (
-                        "artifact library".to_string(),
-                        library_dir.display().to_string(),
-                    ),
-                    ("status".to_string(), plan_status_label(plan.status).to_string()),
-                    (
-                        "tasks".to_string(),
-                        format!("{completed}/{} completed", plan.tasks.len()),
-                    ),
-                ],
-            ),
-            vec![("Recommended", finish.as_str())],
-            secondary
-                .iter()
-                .map(|command| ("Secondary", command.as_str())),
-        )
-        .render_plain(!completion_hints_enabled(no_hints))
+        surface.render_plain(!completion_hints_enabled(no_hints))
     );
     commands::plan::print_orchestration_role_table(plan, true, None);
     commands::plan::print_orchestration_dependency_summary(plan);
@@ -11972,11 +12036,18 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
                 "campaign_killed",
                 serde_json::json!({ "subs": campaign.n }),
             )?;
-            print!(
-                "{}",
-                commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, None)
-                    .render_plain(false)
-            );
+            let surface =
+                commands::campaign::campaign_verdict_surface(Some(&paths), &campaign, None);
+            if let Some(verb) = machine_json::active() {
+                machine_json::emit_success(
+                    verb,
+                    &campaign.campaign_id,
+                    &surface,
+                    kill_outcome_facts(force, true),
+                )?;
+            } else {
+                print!("{}", surface.render_plain(false));
+            }
             return Ok(());
         }
         commands::reference::ResolvedRef::Plan(plan) => {
@@ -12005,8 +12076,140 @@ fn kill_command(run_id: String, force: bool, plain: bool) -> Result<()> {
         }
     };
     kill_loaded_run(&paths, &mut state, force)?;
+    if let Some(verb) = machine_json::active() {
+        machine_json::emit_success(
+            verb,
+            &state.run_id,
+            &killed_run_surface(&state),
+            kill_outcome_facts(force, state.status == RunStatus::Killed),
+        )?;
+        return Ok(());
+    }
     print_exit_summary_card(&state, &RunLoopOutcome::Killed, plain, true);
     Ok(())
+}
+
+/// Verb-specific outcome facts for `kill --json`: which signal class was
+/// sent, whether termination was escalated, and whether the target was
+/// observed in a terminal phase after the signal round.
+fn kill_outcome_facts(escalated: bool, terminal_phase_observed: bool) -> Value {
+    json!({
+        "signal": if escalated { "SIGKILL" } else { "SIGTERM" },
+        "escalated": escalated,
+        "terminal_phase_observed": terminal_phase_observed,
+    })
+}
+
+fn killed_run_surface(state: &deadreckon_core::PipelineState) -> VerdictSurface {
+    let prefix = run_prefix(&state.run_id);
+    VerdictSurface::must_new(
+        VerdictKind::Killed,
+        "run",
+        Some(&prefix),
+        ExplanationPanel::new(
+            "DeadReckon stopped the run and released its lock.",
+            "The run is no longer advancing; inspect the failure record before cleanup or relaunch.",
+            vec![
+                ("run".to_string(), prefix.clone()),
+                (
+                    "status".to_string(),
+                    run_status_label(state.status).to_string(),
+                ),
+            ],
+        ),
+        vec![(
+            "Recommended",
+            format!("deadreckon show {prefix} --why-failed"),
+        )],
+        vec![("Secondary", format!("deadreckon cleanup {prefix}"))],
+    )
+}
+
+#[cfg(test)]
+mod kill_machine_envelope_tests {
+    use super::*;
+
+    /// G1: `kill --json` reports `{signal, escalated, terminal_phase_observed}`
+    /// inside the shared envelope, riding the same surface as the prose.
+    #[test]
+    fn kill_success_envelope_carries_signal_escalation_and_terminal_phase() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "kill envelope fixture goal".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("kill-envelope-fixture".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        state.status = RunStatus::Killed;
+
+        let envelope = machine_json::success_envelope(
+            "kill",
+            &state.run_id,
+            &killed_run_surface(&state),
+            kill_outcome_facts(false, state.status == RunStatus::Killed),
+        );
+
+        assert_eq!(envelope["kind"], "kill");
+        assert_eq!(envelope["id"], "kill-envelope-fixture");
+        assert_eq!(envelope["status"], "killed");
+        assert_eq!(envelope["signal"], "SIGTERM");
+        assert_eq!(envelope["escalated"], false);
+        assert_eq!(envelope["terminal_phase_observed"], true);
+        assert_eq!(
+            envelope["next_actions"][0],
+            "deadreckon show kill-env --why-failed"
+        );
+
+        let escalated = kill_outcome_facts(true, true);
+        assert_eq!(escalated["signal"], "SIGKILL");
+        assert_eq!(escalated["escalated"], true);
+    }
+
+    /// G1: refusal envelopes preserve every exit code the CLI already used —
+    /// including code 2 refusals — so machine consumers and shell callers
+    /// observe the same contract.
+    #[test]
+    fn kill_error_envelope_preserves_existing_exit_codes() {
+        let not_found = CliError::Core(DeadreckonError::NotFound(
+            "no run matches prefix zzz".to_string(),
+        ));
+        let envelope = machine_json::error_envelope(
+            "kill",
+            not_found.exit_code(),
+            &not_found.to_string(),
+            &error_hint(&not_found),
+        );
+        assert_eq!(envelope["code"], 1);
+        assert_eq!(envelope["verb"], "kill");
+        assert_eq!(
+            envelope["try_lines"],
+            json!(["run `deadreckon list` to find valid run ids or config keys"])
+        );
+
+        let typed_exit = CliError::Exit {
+            code: 2,
+            message: "gate refused".to_string(),
+            hint: "deadreckon verdict latest".to_string(),
+        };
+        let envelope = machine_json::error_envelope(
+            "kill",
+            typed_exit.exit_code(),
+            &typed_exit.to_string(),
+            &error_hint(&typed_exit),
+        );
+        assert_eq!(envelope["code"], 2, "exit code 2 refusals stay code 2");
+        assert_eq!(envelope["try_lines"], json!(["deadreckon verdict latest"]));
+    }
 }
 
 fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Result<()> {
@@ -12140,22 +12343,27 @@ fn kill_plan_command(paths: &DeadreckonPaths, plan_id: &str, force: bool) -> Res
     }
     let primary = format!("deadreckon show {id} --why-failed");
     let secondary = format!("deadreckon attach {id}");
-    print!(
-        "{}",
-        VerdictSurface::must_new(
-            VerdictKind::Killed,
-            "plan",
-            Some(&id),
-            ExplanationPanel::new(
-                "DeadReckon stopped the plan coordinator and any known live child work.",
-                "The plan is no longer advancing; inspect the failure record before cleanup or relaunch.",
-                evidence,
-            ),
-            vec![("Recommended", primary.as_str())],
-            vec![("Secondary", secondary.as_str())],
-        )
-        .render_plain(false)
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Killed,
+        "plan",
+        Some(&id),
+        ExplanationPanel::new(
+            "DeadReckon stopped the plan coordinator and any known live child work.",
+            "The plan is no longer advancing; inspect the failure record before cleanup or relaunch.",
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
     );
+    if let Some(verb) = machine_json::active() {
+        let mut facts = kill_outcome_facts(force, true);
+        if let Value::Object(object) = &mut facts {
+            object.insert("processes_signalled".to_string(), json!(killed));
+        }
+        machine_json::emit_success(verb, plan_id, &surface, facts)?;
+        return Ok(());
+    }
+    print!("{}", surface.render_plain(false));
     Ok(())
 }
 
@@ -13720,14 +13928,24 @@ fn show_command(args: ShowCommandArgs<'_>) -> Result<()> {
         println!("provenance:");
         let raw = std::fs::read_to_string(provenance_path)?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-            let record: ProvenanceRecord = serde_json::from_str(line)?;
-            if args
-                .turn
-                .is_some_and(|turn| record.prompt_id != format!("turn-{turn}"))
-            {
-                continue;
+            match serde_json::from_str::<deadreckon_core::ProvenanceEntry>(line)? {
+                deadreckon_core::ProvenanceEntry::Turn(record) => {
+                    if args
+                        .turn
+                        .is_some_and(|turn| record.prompt_id != format!("turn-{turn}"))
+                    {
+                        continue;
+                    }
+                    println!("{}", serde_json::to_string_pretty(&record)?);
+                }
+                // Gap G9: typed send-back rows have no turn; show them only
+                // on the unfiltered listing.
+                deadreckon_core::ProvenanceEntry::OperatorSendback(record) => {
+                    if args.turn.is_none() {
+                        println!("{}", serde_json::to_string_pretty(&record)?);
+                    }
+                }
             }
-            println!("{}", serde_json::to_string_pretty(&record)?);
         }
     }
     let traces_path = state.run_root.join("traces.jsonl");
@@ -15173,6 +15391,7 @@ async fn prompt_extend_action(state: &deadreckon_core::PipelineState) -> Result<
         dest: None,
         acceptance: None,
         yes: true,
+        note: None,
         max_context_turns: None,
         no_context: false,
         max_spend: state.max_spend_usd,
@@ -17816,6 +18035,9 @@ fn event_line(event: &RunEvent, show_cost: bool) -> String {
         }
         RunEventKind::DocsCheckpoint { turn, path, status } => {
             format!("turn {turn} docs {status} {}", path.display())
+        }
+        RunEventKind::SteerDelivered { turn, preview, .. } => {
+            format!("turn {turn} steer delivered: {preview}")
         }
         RunEventKind::RunCompleted { status } => {
             format!("run {status}")

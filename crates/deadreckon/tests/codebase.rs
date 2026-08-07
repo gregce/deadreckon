@@ -1800,6 +1800,39 @@ fn apply_cleanup_after_already_applied_removes_worktree_and_branch() {
 }
 
 #[test]
+fn apply_json_on_already_applied_run_emits_one_envelope() {
+    let temp = repo_tempdir();
+    let repo = clean_git_repo(&temp);
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let run_id = run_worktree_smoke(&paths, &repo);
+
+    let first_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .output()
+        .expect("first apply");
+    assert_success(&first_apply);
+
+    let second_apply = deadreckon(&paths)
+        .current_dir(&repo)
+        .arg("apply")
+        .arg(&run_id)
+        .arg("--no-confirm")
+        .arg("--json")
+        .output()
+        .expect("second apply");
+
+    assert_success(&second_apply);
+    let stdout = stdout(&second_apply);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("stdout is not one JSON object ({err}):\n{stdout}"));
+    assert_eq!(envelope["kind"], "apply", "{stdout}");
+    assert_eq!(envelope["already_applied"], true, "{stdout}");
+}
+
+#[test]
 fn dirty_apply_cleanup_reports_incomplete_and_same_id_job_cleanup_recovers() {
     let temp = repo_tempdir();
     let repo = clean_git_repo(&temp);

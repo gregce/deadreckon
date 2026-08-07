@@ -484,8 +484,34 @@ public struct SteerEligibility: Codable, Equatable, Sendable {
     public let reason: SteerIneligibleReason?   // absent when steerable
 }
 
-/// One notify.jsonl line (TAILING.md). Best-effort observability.
-public struct NotifyRecord: Codable, Equatable, Sendable {
+/// One notify.jsonl line (TAILING.md, notify-event.schema.json). Since M1
+/// the file carries TWO row shapes, distinguished by the presence of `kind`:
+/// typed operator-attention signals and the historical delivery-attempt
+/// rows. Best-effort, display-only observability — never authority.
+public enum NotifyRecord: Codable, Equatable, Sendable {
+    case attention(OperatorAttentionRow)        // rows WITH kind: "operator_attention"
+    case deliveryAttempt(NotifyDeliveryAttempt) // rows WITHOUT kind
+}
+
+/// notify-event.schema.json OperatorAttentionEvent. `summary`/`nextActions`
+/// verbatim (trust rule 2); dedupe app-side with stable notification IDs.
+public struct OperatorAttentionRow: Codable, Equatable, Sendable {
+    public let schemaVersion: Int
+    public let kind: String                     // "operator_attention"
+    public let reason: OperatorAttentionReason  // forgiving enum: verified_awaiting_promote |
+                                                // paused_at_cap | blocked | failed | cancelled |
+                                                // waiting_input | unknown
+    public let jobID: String?
+    public let runID: String?
+    public let scope: String?
+    public let at: Date
+    public let summary: String
+    public let nextActions: [String]
+}
+
+/// The historical delivery-attempt shape. Rows record *attempts*,
+/// including failures (`ok: false` with a `detail`).
+public struct NotifyDeliveryAttempt: Codable, Equatable, Sendable {
     public let ts: Date
     public let transition: NotifyTransition
     public let channel: String
@@ -834,13 +860,13 @@ R-M1 (G1 + G2 + G9 + steer widening + notify events) is in progress in the Rust 
 Every state-changing verb invoked with `--json` that refuses or fails emits one envelope on stdout before exiting with the unchanged exit code:
 
 ```json
-{"kind": "error", "code": "<machine code>", "verb": "<verb>", "message": "<prose>", "try_lines": ["deadreckon ..."]}
+{"kind": "error", "code": <exit code>, "verb": "<verb>", "message": "<prose>", "try_lines": ["deadreckon ..."]}
 ```
 
 ```swift
 public struct ErrorEnvelope: Codable, Equatable, Sendable {   // PENDING-M1
     public let kind: String        // "error"
-    public let code: String
+    public let code: Int           // the process exit code, as built (1/2)
     public let verb: String
     public let message: String
     public let tryLines: [String]
@@ -871,19 +897,29 @@ The supported GUI launch protocol: `start --json` (read-only preview, `will_star
 
 ### PENDING-M1: send-back (G9)
 
-`extend <parent> "goal" --note "..." --json` appends a typed provenance record and reports the queued continuation:
+`extend <parent> "goal" --note "..." --json` appends a typed provenance record to the PARENT run's `provenance.jsonl` and reports the queued continuation. As built, the provenance row is (additive `at` timestamp; `parent_job_id` carries the parent RUN id — for Job-owned parents the two coincide):
 
 ```json
-{"kind": "operator_sendback", "note": "...", "parent_job_id": "...", "new_job_id": "..."}
+{"kind": "operator_sendback", "note": "...", "parent_job_id": "...", "new_job_id": "...", "at": "RFC3339"}
 ```
+
+As built, the extend envelope keeps `kind: "extend"` (the G1 armed-verb convention — there is no `extend_result` kind) and carries the G9 facts as top-level fields alongside the shared Job-status payload (`verified_proof`, `paths`, `work_clock`, `job`). The note text is NOT echoed back — the app keeps it app-side (it knows what it sent) and decodes only the acknowledgment:
 
 ```swift
 public struct ExtendOutcome: Codable, Equatable, Sendable {   // PENDING-M1
-    public let parentJobID: String
-    public let newJobID: String
-    public let note: String?
+    public let id: String              // the NEW job id
+    public let parentID: String        // "parent_id"
+    public let parentRunID: String     // "parent_run_id"
+    public let contract: Contract      // "inherited" | "replaced" (--acceptance explicit)
+    public let noteRecorded: Bool      // "note_recorded"
+    public let queued: Bool            // always true on success
+    public enum Contract: String, Codable, Equatable, Sendable {
+        case inherited, replaced
+    }
 }
 ```
+
+Refusals (typed error envelopes): empty `--note`, and `--note` on a path that queues no durable Job.
 
 ### PENDING-M1: verb dispatcher
 
@@ -903,7 +939,7 @@ public final class MutationRunner {                           // PENDING-M1
 
 ### PENDING-M1: operator-attention notify events
 
-Operator decision 6: real user notifications ride typed operator-attention events emitted by the binary (R-M1 scope), not app-side inference. The `notify.jsonl` tail (`NotifyRecord`) stays observability-only; the typed event stream's shape lands here when the Rust side commits it. Stable notification IDs plus a launch-time catch-up scan (exemplar pattern) are APP-5 scope.
+Operator decision 6: real user notifications ride typed operator-attention events emitted by the binary (R-M1, landed), not app-side inference. The `notify.jsonl` tail (`NotifyRecord`, now the two-case union above mirroring `notify-event.schema.json`) stays observability-only. Stable notification IDs plus a launch-time catch-up scan (exemplar pattern) are APP-5 scope.
 
 ### PENDING-M2/M3 (noted so nothing squats on the names)
 

@@ -629,7 +629,8 @@ fn run_event_turn(event: &RunEventKind) -> Option<u32> {
         | RunEventKind::ToolCallResult { turn, .. }
         | RunEventKind::TokenUsageDelta { turn, .. }
         | RunEventKind::SpendDelta { turn, .. }
-        | RunEventKind::DocsCheckpoint { turn, .. } => Some(*turn),
+        | RunEventKind::DocsCheckpoint { turn, .. }
+        | RunEventKind::SteerDelivered { turn, .. } => Some(*turn),
         RunEventKind::RunCompleted { .. } | RunEventKind::RunPromoted { .. } => None,
         RunEventKind::Error { turn, .. } => *turn,
     }
@@ -643,6 +644,7 @@ fn run_event_kind_label(event: &RunEventKind) -> &'static str {
         RunEventKind::TokenUsageDelta { .. } => "token_usage_delta",
         RunEventKind::SpendDelta { .. } => "spend_delta",
         RunEventKind::DocsCheckpoint { .. } => "docs_checkpoint",
+        RunEventKind::SteerDelivered { .. } => "steer_delivered",
         RunEventKind::RunCompleted { .. } => "run_completed",
         RunEventKind::RunPromoted { .. } => "run_promoted",
         RunEventKind::Error { .. } => "error",
@@ -677,6 +679,9 @@ fn run_event_summary(event: &RunEventKind) -> String {
         } => format!("turn {turn} spend +{cost_usd:.4} total {total_cost_usd:.4}"),
         RunEventKind::DocsCheckpoint { turn, status, path } => {
             format!("turn {turn} docs {status} {}", path.display())
+        }
+        RunEventKind::SteerDelivered { turn, preview, .. } => {
+            format!("turn {turn} steer delivered: {}", one_line(preview, 80))
         }
         RunEventKind::RunCompleted { status } => format!("run completed {status}"),
         RunEventKind::RunPromoted { library_dir } => {

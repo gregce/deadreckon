@@ -61,6 +61,37 @@ deadreckon def-done check
 deadreckon def-done "what should count as done"
 ```
 
+### Confirmation flags and the machine launch protocol
+
+DeadReckon's confirmation flags mean exactly one thing each:
+
+- `--yes` approves the launch preview: it answers "should this work start?"
+  on the launch verbs (`start`, `run`, `orchestrate`, `fork`, `extend`, and
+  friends). It never acknowledges spend.
+- `--no-confirm` skips destructive or follow-up confirmations on the verbs
+  that act on existing work. On `finish`, `apply`, `cleanup`, and `undo` —
+  which have no separate launch preview — `--yes` is accepted as an alias
+  for `--no-confirm`, so machine callers can speak one flag everywhere.
+  (`doc --polish` also honors `--no-confirm` for its spend confirmation.)
+- A launch budget above $50 additionally requires `--i-know-its-a-lot` in
+  scripts, on `start` and `run` alike. In a TTY it prompts; `--yes` and
+  `--no-confirm` never silence it on `start`.
+
+A GUI or script launches through a read-only preview, then an explicit
+replay of exactly what it inspected:
+
+```bash
+deadreckon start "goal" --json                        # preview; will_start=false
+deadreckon start --plan launch-plan.json --yes --json # execute verbatim
+```
+
+A launchable preview envelope embeds `launch_plan`: the exact replayable
+payload `--plan` accepts. Write it to disk unchanged and replay it. The
+execute leg answers with the same `{"kind":"launch",...}` envelope as a
+direct `start ... --yes --json`, and every `start --json` refusal also
+lands as a `{"kind":"error",...}` envelope on stdout with the exit code
+preserved.
+
 ### Durable guided-start posture
 
 When `start` selects a single, review, full-plan, or campaign shape, it freezes

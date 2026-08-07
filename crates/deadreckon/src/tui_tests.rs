@@ -2404,6 +2404,7 @@ fn start_args_for_test(goal: &str) -> StartCommandArgs {
         preview: true,
         review_done: false,
         yes: false,
+        i_know_its_a_lot: false,
         no_seams: false,
         fresh: false,
         worktree: false,

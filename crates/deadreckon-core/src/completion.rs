@@ -264,7 +264,21 @@ pub fn seal_completion_receipt(
     }
     let key = read_gate_key(paths, &state.run_id)?;
     receipt.signature = sign_receipt(&receipt, &key)?;
-    atomic_write_json(&paths.job_receipt(authority.job_id.as_ref()), &receipt)?;
+    let receipt_path = paths.job_receipt(authority.job_id.as_ref());
+    let newly_sealed = !receipt_path.exists();
+    atomic_write_json(&receipt_path, &receipt)?;
+    if newly_sealed {
+        // Display-only operator-attention signal owned by this sealing path
+        // (docs/TAILING.md). Best-effort: the sealed receipt is the fact.
+        let _ = crate::attention::append_operator_attention(
+            &state.run_root,
+            &crate::attention::verified_awaiting_promote_event(
+                authority.job_id.as_ref(),
+                &state.run_id,
+                &state.scope,
+            ),
+        );
+    }
     Ok(receipt)
 }
 

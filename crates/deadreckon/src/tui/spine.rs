@@ -945,6 +945,7 @@ fn newest_run_error(events: &[RunEvent]) -> Option<String> {
         | RunEventKind::TokenUsageDelta { .. }
         | RunEventKind::SpendDelta { .. }
         | RunEventKind::DocsCheckpoint { .. }
+        | RunEventKind::SteerDelivered { .. }
         | RunEventKind::RunCompleted { .. }
         | RunEventKind::RunPromoted { .. } => None,
     })

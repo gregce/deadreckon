@@ -828,6 +828,13 @@ printf 'changed notes\n'
         let spend = fs::read_to_string(spend_path).expect("provider spend");
         assert!(spend.contains("wall_time_seconds"));
     }
+    // The cap pause appends one typed display-only operator-attention row
+    // (docs/TAILING.md) even though [notify] delivery is not configured.
+    let notify_rows = jsonl_values(&state.run_root.join("notify.jsonl"));
+    assert_eq!(notify_rows.len(), 1, "{notify_rows:?}");
+    assert_eq!(notify_rows[0]["kind"], "operator_attention");
+    assert_eq!(notify_rows[0]["reason"], "paused_at_cap");
+    assert_eq!(notify_rows[0]["run_id"], serde_json::json!(state.run_id));
     let state_before = fs::read(state.state_path()).expect("state before refused resume");
     let resume_provider_sentinel = temp.path().join("resume-provider-started");
     fs::write(

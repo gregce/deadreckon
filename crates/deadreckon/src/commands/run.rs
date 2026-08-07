@@ -25,6 +25,13 @@ pub(crate) struct DurableContinuationSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent_receipt_sha256: Option<String>,
     pub(crate) context_turns: Option<u32>,
+    /// Gap G9: the operator's send-back note, appended to the PARENT run's
+    /// provenance as a typed row when the continuation Job is queued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operator_sendback_note: Option<String>,
+    /// Gap G9: whether an explicit contract replaced the parent's frozen one.
+    #[serde(default)]
+    pub(crate) contract_replaced: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -744,12 +751,78 @@ async fn schedule_direct_run(
         sandbox_requested,
         accepted_by,
     )?;
+    let note_recorded = match args.continuation.as_ref() {
+        Some(continuation) => record_operator_sendback(&paths, continuation, job.job_id.as_ref())?,
+        None => false,
+    };
     commands::job::launch_detached_supervisor(&paths, &job.job_id)?;
-    if !args.quiet {
+    // Machine mode always emits the success envelope: --quiet suppresses
+    // prose, never the machine result (errors already envelope regardless,
+    // so success must too or the contract turns asymmetric).
+    if !args.quiet || machine_json::active().is_some() {
         let view = deadreckon_core::JobView::load(&paths, job.job_id.as_ref())?;
-        commands::job::print_job_status(&view, false)?;
+        let mut facts = serde_json::Map::new();
+        if machine_json::active().is_some() {
+            facts.insert("queued".to_string(), json!(true));
+            if let Some(continuation) = args.continuation.as_ref() {
+                facts.extend(extend_queue_facts(continuation, note_recorded));
+            }
+        }
+        commands::job::print_job_status_with_facts(&view, false, "attach", facts)?;
     }
     Ok(Some(job.job_id))
+}
+
+/// Gap G9: at queue time, an operator send-back note becomes a typed
+/// `operator_sendback` provenance row on the PARENT run, binding the
+/// operator's reason to the continuation Job that carries the follow-up.
+/// Returns whether a note was recorded; the no-note path writes nothing.
+fn record_operator_sendback(
+    paths: &DeadreckonPaths,
+    continuation: &DurableContinuationSpec,
+    new_job_id: &str,
+) -> Result<bool> {
+    let Some(note) = continuation.operator_sendback_note.as_deref() else {
+        return Ok(false);
+    };
+    let parent = deadreckon_core::load_run(paths, &continuation.parent_run_id)?;
+    deadreckon_core::append_operator_sendback(
+        &parent,
+        &deadreckon_core::OperatorSendbackRecord {
+            kind: deadreckon_core::OperatorSendbackKind::OperatorSendback,
+            note: note.to_string(),
+            parent_job_id: continuation.parent_run_id.clone(),
+            new_job_id: new_job_id.to_string(),
+            at: Utc::now(),
+        },
+    )?;
+    Ok(true)
+}
+
+/// Gap G9 outcome facts for the queued-extension envelope: parent identity,
+/// whether the follow-up runs under the parent's inherited frozen contract or
+/// an explicit replacement, and whether a send-back note landed in the
+/// parent's provenance.
+fn extend_queue_facts(
+    continuation: &DurableContinuationSpec,
+    note_recorded: bool,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut facts = serde_json::Map::new();
+    facts.insert(
+        "parent_run_id".to_string(),
+        json!(continuation.parent_run_id),
+    );
+    facts.insert("parent_id".to_string(), json!(continuation.parent_run_id));
+    facts.insert(
+        "contract".to_string(),
+        json!(if continuation.contract_replaced {
+            "replaced"
+        } else {
+            "inherited"
+        }),
+    );
+    facts.insert("note_recorded".to_string(), json!(note_recorded));
+    facts
 }
 
 fn schema_only_reviewer_refusal(goal: &str, worker: &str, reviewer: &str) -> CliError {
@@ -2573,5 +2646,123 @@ mod durable_direct_tests {
             plan.signals[UNTRUSTED_FOREGROUND_SIGNAL]["trusted_job_receipt"],
             false
         );
+    }
+
+    fn sendback_fixture_parent(
+        temp: &TempDir,
+    ) -> (DeadreckonPaths, deadreckon_core::PipelineState) {
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let parent = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "parent for typed send-back".to_string(),
+                cwd: temp.path().to_path_buf(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: Some("sendback-parent".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("parent run");
+        (paths, parent)
+    }
+
+    fn sendback_continuation(
+        parent: &deadreckon_core::PipelineState,
+        note: Option<&str>,
+        contract_replaced: bool,
+    ) -> DurableContinuationSpec {
+        DurableContinuationSpec {
+            parent_run_id: parent.run_id.clone(),
+            parent_scope: parent.scope.clone(),
+            parent_state_sha256: "state-sha".to_string(),
+            parent_library_tree_sha256: "tree-sha".to_string(),
+            parent_receipt_sha256: None,
+            context_turns: None,
+            operator_sendback_note: note.map(ToString::to_string),
+            contract_replaced,
+        }
+    }
+
+    /// Gap G9: queueing a continuation with a note appends exactly one typed
+    /// `operator_sendback` row to the PARENT run's provenance, bound to the
+    /// new Job id.
+    #[test]
+    fn sendback_note_lands_in_parent_provenance_with_the_typed_shape() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, parent) = sendback_fixture_parent(&temp);
+        let continuation =
+            sendback_continuation(&parent, Some("gate accepted a stub; do it for real"), false);
+
+        let recorded = record_operator_sendback(&paths, &continuation, "child-job-id")
+            .expect("record send-back");
+        assert!(recorded);
+
+        let raw = std::fs::read_to_string(parent.run_root.join("provenance.jsonl"))
+            .expect("parent provenance");
+        let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let value: serde_json::Value = serde_json::from_str(lines[0]).expect("row");
+        assert_eq!(value["kind"], "operator_sendback");
+        assert_eq!(value["note"], "gate accepted a stub; do it for real");
+        assert_eq!(value["parent_job_id"], parent.run_id);
+        assert_eq!(value["new_job_id"], "child-job-id");
+        assert!(value["at"].is_string());
+        match serde_json::from_str::<deadreckon_core::ProvenanceEntry>(lines[0]).expect("entry") {
+            deadreckon_core::ProvenanceEntry::OperatorSendback(_) => {}
+            deadreckon_core::ProvenanceEntry::Turn(_) => {
+                panic!("send-back row must parse as the typed variant")
+            }
+        }
+    }
+
+    /// Gap G9: the no-note path stays byte-identical — nothing is appended to
+    /// the parent's provenance and the envelope fact reports false.
+    #[test]
+    fn sendback_without_a_note_writes_nothing_to_parent_provenance() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, parent) = sendback_fixture_parent(&temp);
+        let continuation = sendback_continuation(&parent, None, false);
+
+        let recorded =
+            record_operator_sendback(&paths, &continuation, "child-job-id").expect("no-note path");
+        assert!(!recorded);
+        assert!(!parent.run_root.join("provenance.jsonl").exists());
+
+        let facts = extend_queue_facts(&continuation, recorded);
+        assert_eq!(facts["note_recorded"], json!(false));
+    }
+
+    /// Gap G9: the queued-extension envelope facts name the parent and say
+    /// whether the follow-up inherited the parent's frozen contract or runs
+    /// under an explicit replacement.
+    #[test]
+    fn extend_queue_facts_report_inherited_versus_replaced_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, parent) = sendback_fixture_parent(&temp);
+
+        let inherited = extend_queue_facts(&sendback_continuation(&parent, None, false), false);
+        assert_eq!(inherited["parent_id"], json!(parent.run_id));
+        assert_eq!(inherited["parent_run_id"], json!(parent.run_id));
+        assert_eq!(inherited["contract"], json!("inherited"));
+        assert_eq!(inherited["note_recorded"], json!(false));
+
+        let replaced =
+            extend_queue_facts(&sendback_continuation(&parent, Some("note"), true), true);
+        assert_eq!(replaced["contract"], json!("replaced"));
+        assert_eq!(replaced["note_recorded"], json!(true));
+    }
+
+    /// A continuation spec queued by an older binary (no G9 fields) must
+    /// still deserialize; the new fields default to the no-note path.
+    #[test]
+    fn legacy_continuation_spec_without_g9_fields_still_parses() {
+        let legacy = r#"{"parent_run_id":"parent","parent_scope":"scope","parent_state_sha256":"state","parent_library_tree_sha256":"tree","context_turns":3}"#;
+        let spec: DurableContinuationSpec = serde_json::from_str(legacy).expect("legacy spec");
+        assert_eq!(spec.operator_sendback_note, None);
+        assert!(!spec.contract_replaced);
     }
 }

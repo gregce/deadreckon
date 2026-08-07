@@ -136,3 +136,15 @@ public enum NotifyTransition: String, ForgivingStringEnum, CaseIterable {
     case failed
     case unknown
 }
+
+/// Why an `operator_attention` row in `notify.jsonl` requests the operator's
+/// attention (docs/schemas/notify-event.schema.json OperatorAttentionReason).
+public enum OperatorAttentionReason: String, ForgivingStringEnum, CaseIterable {
+    case verifiedAwaitingPromote = "verified_awaiting_promote"
+    case pausedAtCap = "paused_at_cap"
+    case blocked
+    case failed
+    case cancelled
+    case waitingInput = "waiting_input"
+    case unknown
+}

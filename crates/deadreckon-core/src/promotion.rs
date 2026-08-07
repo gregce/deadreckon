@@ -960,6 +960,62 @@ mod tests {
     }
 
     #[test]
+    fn sealing_a_two_key_receipt_appends_one_operator_attention_row() {
+        let fixture = strict_fixture();
+        let notify_path = crate::attention::notify_jsonl_path(&fixture.state.run_root);
+        let rows = || -> Vec<deadreckon_protocol::OperatorAttentionEvent> {
+            fs::read_to_string(&notify_path)
+                .expect("notify.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("operator attention row"))
+                .collect()
+        };
+
+        let sealed = rows();
+        assert_eq!(sealed.len(), 1);
+        let row = &sealed[0];
+        assert_eq!(
+            row.reason,
+            deadreckon_protocol::OperatorAttentionReason::VerifiedAwaitingPromote
+        );
+        assert_eq!(row.job_id.as_deref(), Some(fixture.state.run_id.as_str()));
+        assert_eq!(row.run_id.as_deref(), Some(fixture.state.run_id.as_str()));
+        assert_eq!(row.scope.as_deref(), Some(fixture.state.scope.as_str()));
+        assert!(
+            row.summary.contains(crate::glossary::NOUN_VERIFIED_RUN),
+            "{}",
+            row.summary
+        );
+        assert!(
+            row.next_actions
+                .contains(&format!("deadreckon finish {}", fixture.state.run_id)),
+            "{:?}",
+            row.next_actions
+        );
+
+        // Recovery reseal of an already-sealed receipt announces nothing new:
+        // one sealed completion is one operator notification.
+        let authority: JobAuthority = serde_json::from_slice(
+            &fs::read(fixture.paths.job_authority(&fixture.state.run_id)).expect("authority"),
+        )
+        .expect("authority json");
+        let marker = validate_acceptance_marker(&fixture.state).expect("marker");
+        let judgment: SemanticJudgment = serde_json::from_slice(
+            &fs::read(fixture.state.run_root.join(SEMANTIC_JUDGMENT_JSON)).expect("judgment"),
+        )
+        .expect("judgment json");
+        seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &authority,
+            &marker,
+            &judgment,
+        )
+        .expect("reseal receipt");
+        assert_eq!(rows().len(), 1, "reseal must not append a second row");
+    }
+
+    #[test]
     fn promotion_retains_lifecycle_metadata_but_excludes_specstory_and_runtime_output() {
         let temp = TempDir::new().expect("tempdir");
         let paths = DeadreckonPaths::from_home(temp.path().join("home"));

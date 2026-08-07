@@ -10,6 +10,7 @@ use crate::job::{
 use crate::ledger::{
     FlightEvent, LedgerItem, NarrativeSnapshotRef, RunEvent, SpendRecord, TraceRecord,
 };
+use crate::notify::NotifyEvent;
 use crate::operator_capture::{
     OperatorCaptureBinding, OperatorCaptureEvent, OperatorCaptureReceipt,
 };
@@ -23,6 +24,7 @@ pub fn all_schemas() -> Vec<(&'static str, RootSchema)> {
         ("trace-record", schema_for!(TraceRecord)),
         ("flight-event", schema_for!(FlightEvent)),
         ("narrative-snapshot-ref", schema_for!(NarrativeSnapshotRef)),
+        ("notify-event", schema_for!(NotifyEvent)),
         ("job", schema_for!(Job)),
         ("job-event", schema_for!(JobEvent)),
         ("job-lease", schema_for!(JobLease)),

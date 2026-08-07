@@ -8,6 +8,7 @@ crate: deadreckon-core
   artifact_policy::is_recoverable_workspace_path
   artifact_policy::runtime_output_root
   artifact_policy::WorkspacePathClass
+  artifacts::append_operator_sendback
   artifacts::append_provenance
   artifacts::append_spend
   artifacts::append_trace
@@ -26,16 +27,25 @@ crate: deadreckon-core
   artifacts::inventory_recoverable_files
   artifacts::inventory_recoverable_files_for_state
   artifacts::inventory_recoverable_files_with_policy
+  artifacts::OperatorSendbackKind
+  artifacts::OperatorSendbackRecord
   artifacts::PATCH_UNIFIED_BYTE_BUDGET
   artifacts::PatchEntry
   artifacts::patches_from_diff
+  artifacts::ProvenanceEntry
   artifacts::ProvenanceRecord
   artifacts::remove_artifact_path
   artifacts::restore_snapshot
-  artifacts::SNAPSHOT_CAPTURE_MANIFESTS_DIR
   artifacts::snapshot_capture_manifest_path
+  artifacts::SNAPSHOT_CAPTURE_MANIFESTS_DIR
   artifacts::snapshot_diff
   artifacts::snapshot_working
+  attention::append_operator_attention
+  attention::NOTIFY_JSONL
+  attention::notify_jsonl_path
+  attention::paused_at_cap_event
+  attention::supervisor_classified_event
+  attention::verified_awaiting_promote_event
   cancel::CANCEL_MARKER
   cancel::cancel_marker_path
   cancel::cancel_marker_path_for_run_root
@@ -68,8 +78,8 @@ crate: deadreckon-core
   chain::save_chain
   chain::validate_goal_count
   chain::write_chain_step_marker
-  codebase::CODEBASE_RECORD_PATH
   codebase::codebase_record_path
+  codebase::CODEBASE_RECORD_PATH
   codebase::CodebaseMode
   codebase::CodebaseRecord
   codebase::copy_source_to_working
@@ -86,12 +96,11 @@ crate: deadreckon-core
   codebase::record_for_resolved_mode
   codebase::resolve_mode
   codebase::ResolvedMode
-  codebase::user_error
   codebase::TRUSTED_CODEBASE_RECORD
+  codebase::user_error
   codebase::WorktreeOptions
   codebase::write_codebase_record
   codebase::write_trusted_codebase_record
-  completion::validate_strict_contract
   completion::audit_completion_receipt
   completion::ReceiptAudit
   completion::ReceiptFact
@@ -100,6 +109,7 @@ crate: deadreckon-core
   completion::SEMANTIC_JUDGMENT_JSON
   completion::validate_completion_receipt
   completion::validate_completion_receipt_bounded
+  completion::validate_strict_contract
   delivery::acquire_job_operation_lock
   delivery::GitDeliveryTarget
   delivery::JobOperationLock
@@ -107,9 +117,9 @@ crate: deadreckon-core
   delivery::seal_git_delivery_intent
   delivery::validate_applied_git_delivery_receipt
   delivery::validate_applied_git_delivery_receipt_snapshot
-  delivery::ValidatedAppliedGitDeliveryReceipt
   delivery::validate_git_delivery_intent
   delivery::validate_git_delivery_intent_snapshot
+  delivery::ValidatedAppliedGitDeliveryReceipt
   delivery::ValidatedGitDeliveryIntent
   docs::append_parent_narrative_update
   docs::append_turn_doc
@@ -166,16 +176,16 @@ crate: deadreckon-core
   docs::TurnDocInput
   docs::TurnRecord
   error::DeadreckonError
+  error::is_retryable_io_kind
   error::ProcessBoundaryKind
   error::Result
-  error::is_retryable_io_kind
   events::emit_event
   events::event_preview
   events::RUN_EVENTS_JSONL
   events::RunEventBus
-  exec::ChildTerminator
   exec::boot_identities_match
   exec::boot_identity
+  exec::ChildTerminator
   exec::HeadTailBuffer
   exec::normalize_boot_identity
   exec::process_start_identity
@@ -185,8 +195,8 @@ crate: deadreckon-core
   exec::read_supervised_process_record
   exec::remove_supervised_process_record_if_matches
   exec::remove_supervised_process_record_if_same
-  exec::SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
   exec::spawn_grouped
+  exec::SUPERVISED_PROCESS_RECORD_SCHEMA_VERSION
   exec::SupervisedProcess
   exec::SupervisedProcessIdentity
   exec::SupervisedProcessPhase
@@ -216,16 +226,16 @@ crate: deadreckon-core
   gate::GATE_CONTAINED_ENV
   gate::GATE_EVALUATION_SCHEMA_VERSION
   gate::GATE_KEY_ENV
-  gate::GATE_SANDBOX_BACKEND_ENV
-  gate::GateEvaluation
   gate::gate_key_path
   gate::gate_key_path_for_run_root
   gate::gate_nonce_path_for_run_root
+  gate::GATE_SANDBOX_BACKEND_ENV
+  gate::GateEvaluation
   gate::last_gate_attempt_counts
   gate::marker_path_for_run_root
   gate::PARENT_REPAIR_CANDIDATE_JSON
-  gate::PARENT_REPAIR_MANIFEST_JSON
   gate::parent_repair_candidate_path_for_run_root
+  gate::PARENT_REPAIR_MANIFEST_JSON
   gate::parent_repair_manifest_path_for_run_root
   gate::read_gate_key
   gate::read_gate_key_for_run_root
@@ -248,18 +258,18 @@ crate: deadreckon-core
   glossary::plan_status_label
   glossary::plan_task_status_label
   glossary::run_status_label
-  glossary::StatusLabel
   glossary::status_label
+  glossary::StatusLabel
   job::append_job_event
-  job::JobDelivery
-  job::JobDeliveryKind
-  job::JobHistory
   job::JOB_CONTROL_LOCK
   job::JOB_EVENTS_JSONL
   job::JOB_JSON
+  job::JOB_PROJECTION_JSON
+  job::JobDelivery
+  job::JobDeliveryKind
+  job::JobHistory
   job::JobLastGateAttempt
   job::JobProjection
-  job::JOB_PROJECTION_JSON
   job::JobView
   job::legacy_campaign_job_view
   job::legacy_chain_job_view
@@ -298,9 +308,9 @@ crate: deadreckon-core
   operator_capture::append_operator_capture_event
   operator_capture::load_operator_capture_binding
   operator_capture::OPERATOR_CAPTURE_BINDING_JSON
+  operator_capture::operator_capture_binding_sha256
   operator_capture::OPERATOR_CAPTURE_EVENTS_JSONL
   operator_capture::OPERATOR_CAPTURE_RECEIPT_JSON
-  operator_capture::operator_capture_binding_sha256
   operator_capture::OperatorCaptureEventDraft
   operator_capture::OperatorCaptureHistory
   operator_capture::OperatorCapturePassLineage
@@ -323,12 +333,12 @@ crate: deadreckon-core
   plan::CoordinatorState
   plan::load_plan
   plan::NetworkCapability
+  plan::Plan
   plan::PLAN_CHILD_PARENT_JSON
   plan::PLAN_EVENTS_JSONL
-  plan::plan_task_key
   plan::PLAN_JSON
   plan::PLAN_MESSAGES_JSONL
-  plan::Plan
+  plan::plan_task_key
   plan::PlanChildMarker
   plan::PlanEvent
   plan::PlanEventKind
@@ -379,8 +389,8 @@ crate: deadreckon-core
   run_view::TurnView
   run_view::VerdictBand
   run_view::WhyBand
-  sandbox_observation::SANDBOX_BOUNDARY_OBSERVATION_JSON
   sandbox_observation::gate_evaluator_identity_sha256
+  sandbox_observation::SANDBOX_BOUNDARY_OBSERVATION_JSON
   sandbox_observation::sandbox_boundary_observation_sha256
   sandbox_observation::sandbox_boundary_result_tree_sha256
   sandbox_observation::seal_sandbox_boundary_observation
@@ -402,9 +412,9 @@ crate: deadreckon-core
   state::RunOwnershipArtifact
   state::RunStatus
   state::save_state
+  steer::MID_TURN_STEER_PROVIDER_ROUTE
   steer::steer_eligibility
   steer::steer_eligibility_with_driver_fence
-  steer::STEERABLE_PROVIDER_ROUTE
   steer::SteerEligibility
   steer::SteerIneligibleReason
   workspace_capture::capture_workspace
@@ -433,50 +443,13 @@ crate: deadreckon-core
   workspace_capture::require_frozen_git_hydration
   workspace_capture::require_workspace_capture_policy
   workspace_capture::SOURCE_HYDRATION_MANIFEST_JSON
+  workspace_capture::WORKSPACE_BLOBS_DIR
   workspace_capture::workspace_capture_policy_path
   workspace_capture::WorkspaceCaptureManifest
   workspace_capture::WorkspaceCapturePlan
   workspace_capture::WorkspaceCapturePolicy
-  workspace_capture::WORKSPACE_BLOBS_DIR
   workspace_capture::write_capture_manifest
   workspace_capture::write_workspace_capture_policy
-crate: deadreckon-providers
-  auth_probe::CliAuthStatus
-  auth_probe::probe_cli_auth
-  config::default_config_path
-  config::read_config
-  deadreckon_sandbox::WorkspaceAccess
-  error::ProviderError
-  error::Result
-  http::ProviderAdapter
-  model_catalog::ModelCatalogSource
-  model_catalog::ResolvedModelCatalog
-  model_catalog::resolve_model_catalog
-  narrator::NarratorBackend
-  narrator::NarratorCandidate
-  narrator::narrator_route_available
-  narrator::select_narrator_backend
-  narrator::select_narrator_route
-  output_schema::validate_openai_strict_output_schema
-  phase_boundary::complete_provider_phase
-  phase_boundary::ProviderCleanup
-  phase_boundary::ProviderPhaseDeadline
-  phase_boundary::ProviderPhaseOutcome
-  registry::ModelCatalogOverride
-  registry::ModelEntry
-  router::ModelContextWindowSource
-  router::ProviderRouter
-  types::Provider
-  types::ProviderConfigFile
-  types::ProviderEntry
-  types::ProviderFuture
-  types::ProviderKind
-  types::ProviderProcessLifetime
-  types::ProviderRequest
-  types::ProviderResponse
-  types::ProviderRouteInfo
-  types::ProviderUsage
-  types::SpendEstimate
 crate: deadreckon-protocol
   ids::JobId
   ids::PlanId
@@ -519,8 +492,8 @@ crate: deadreckon-protocol
   job::SandboxBoundaryObservation
   job::SandboxBoundaryObservationIssuer
   job::SemanticDecision
-  job::SemanticJudgment
   job::SemanticJudgeMode
+  job::SemanticJudgment
   job::StopReason
   ledger::EventLine
   ledger::FlightEvent
@@ -533,19 +506,26 @@ crate: deadreckon-protocol
   ledger::NarrativeSnapshotRefLine
   ledger::RunEvent
   ledger::RunEventKind
+  ledger::spend_kind_loop
   ledger::SpendLine
   ledger::SpendRecord
   ledger::TraceLine
   ledger::TraceRecord
-  ledger::spend_kind_loop
+  notify::NOTIFY_EVENT_SCHEMA_VERSION
+  notify::NotifyDeliveryAttempt
+  notify::NotifyDeliveryTransition
+  notify::NotifyEvent
+  notify::OperatorAttentionEvent
+  notify::OperatorAttentionKind
+  notify::OperatorAttentionReason
   operator_capture::OPERATOR_CAPTURE_SCHEMA_VERSION
   operator_capture::OperatorCaptureBinding
   operator_capture::OperatorCaptureCompletionLineage
+  operator_capture::OperatorCaptureConnectivity
   operator_capture::OperatorCaptureEvent
   operator_capture::OperatorCaptureEventKind
   operator_capture::OperatorCaptureEventSequence
   operator_capture::OperatorCaptureExpectedJobResult
-  operator_capture::OperatorCaptureConnectivity
   operator_capture::OperatorCaptureNetworkAttempt
   operator_capture::OperatorCaptureNetworkErrorKind
   operator_capture::OperatorCaptureNetworkObservation
@@ -562,10 +542,47 @@ crate: deadreckon-protocol
   policy::ledger_file_for
   policy::redact_for_persistence
   schema::all_schemas
+crate: deadreckon-providers
+  auth_probe::CliAuthStatus
+  auth_probe::probe_cli_auth
+  config::default_config_path
+  config::read_config
+  deadreckon_sandbox::WorkspaceAccess
+  error::ProviderError
+  error::Result
+  http::ProviderAdapter
+  model_catalog::ModelCatalogSource
+  model_catalog::resolve_model_catalog
+  model_catalog::ResolvedModelCatalog
+  narrator::narrator_route_available
+  narrator::NarratorBackend
+  narrator::NarratorCandidate
+  narrator::select_narrator_backend
+  narrator::select_narrator_route
+  output_schema::validate_openai_strict_output_schema
+  phase_boundary::complete_provider_phase
+  phase_boundary::ProviderCleanup
+  phase_boundary::ProviderPhaseDeadline
+  phase_boundary::ProviderPhaseOutcome
+  registry::ModelCatalogOverride
+  registry::ModelEntry
+  router::ModelContextWindowSource
+  router::ProviderRouter
+  types::Provider
+  types::ProviderConfigFile
+  types::ProviderEntry
+  types::ProviderFuture
+  types::ProviderKind
+  types::ProviderProcessLifetime
+  types::ProviderRequest
+  types::ProviderResponse
+  types::ProviderRouteInfo
+  types::ProviderUsage
+  types::SpendEstimate
 crate: deadreckon-runtime
   compaction::append_compaction_record
-  compaction::COMPACTION_JSONL
   compaction::compact_history
+  compaction::COMPACTION_JSONL
   compaction::CompactionConfig
   compaction::CompactionRecord
   compaction::estimate_tokens
@@ -607,8 +624,8 @@ crate: deadreckon-runtime
   semantic_judge::run_semantic_judge_against_source_with_budget_and_cancellation
   semantic_judge::run_semantic_judge_against_source_with_deadline_and_cancellation
   semantic_judge::run_semantic_judge_with_budget
-  semantic_judge::SEMANTIC_JUDGMENT_PATH
   semantic_judge::semantic_judgment_path
+  semantic_judge::SEMANTIC_JUDGMENT_PATH
   semantic_judge::SemanticBudgetExhaustion
   semantic_judge::SemanticEvidencePack
   semantic_judge::SemanticJudgeBudget

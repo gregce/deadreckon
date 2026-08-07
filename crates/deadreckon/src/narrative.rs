@@ -3454,6 +3454,9 @@ fn run_event_summary(event: &RunEventKind) -> String {
         RunEventKind::DocsCheckpoint { turn, status, .. } => {
             format!("turn {turn} docs {status}")
         }
+        RunEventKind::SteerDelivered { turn, preview, .. } => {
+            format!("turn {turn} steer delivered: {}", one_line(preview, 120))
+        }
         RunEventKind::RunCompleted { status } => format!("run {status}"),
         RunEventKind::RunPromoted { library_dir } => {
             format!("promoted {}", library_dir.display())

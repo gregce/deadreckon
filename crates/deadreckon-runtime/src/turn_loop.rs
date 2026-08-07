@@ -63,6 +63,10 @@ use deadreckon_core::promotion::promote_completed_run_bounded;
 use deadreckon_core::state::{
     PhaseId, PhaseStatus, PipelineState, RunStatus, append_json_line, save_state,
 };
+use deadreckon_core::steer::MID_TURN_STEER_PROVIDER_ROUTE;
+use deadreckon_core::steer_inbox::{
+    SteerInboxEntry, SteerSource, mark_steer_delivered, pending_steers,
+};
 
 use crate::seam::{
     SeamKind, SeamOutcome, SeamPhaseOutcome, SeamRunCtx, SeamsConfig, dispatch_seam_phase,
@@ -560,6 +564,16 @@ async fn run_turn_loop_inner(
         work_clock.save(state)?;
     }
 
+    // M1 steer widening: the between-turn drain decision below keys off the
+    // PREFERRED route, but the router can fall back to another provider
+    // mid-phase. Remember which route actually executed the previous turn so
+    // a run whose preferred route is `cli:codex-server` but which persistently
+    // executes on a fallback provider still drains queued steers at the next
+    // turn boundary instead of starving them while waiting for a mid-turn
+    // delivery that will never happen. The file-backed inbox bookkeeping only
+    // delivers Pending entries, so a recovered codex-server turn after a drain
+    // cannot double-deliver.
+    let mut last_executed_provider: Option<String> = None;
     for _ in 0..config.max_turns {
         if should_cancel_run(state, &run_token) {
             state.status = deadreckon_core::state::RunStatus::Killed;
@@ -631,13 +645,29 @@ async fn run_turn_loop_inner(
             }
             prompt_history = compacted;
         }
+        // Between-turn steer delivery (M1 widening): every provider except
+        // the mid-turn `cli:codex-server` route consumes the durable steer
+        // inbox here, at the turn boundary, and receives the notes inside
+        // this turn's prompt frame as advisory operator guidance.
+        let operator_guidance = if should_drain_steer_inbox(
+            selected_provider.as_deref(),
+            last_executed_provider.as_deref(),
+        ) {
+            drain_steer_inbox_for_turn(state, turn, config.event_sender.as_ref())?
+        } else {
+            // cli:codex-server's driver delivers pending steers mid-turn
+            // over `turn/steer`; draining here would double-deliver. This
+            // branch is only reachable when the previous turn (if any)
+            // actually executed on the codex-server route.
+            None
+        };
         let prompt = if selected_provider
             .as_deref()
             .is_some_and(is_cli_provider_name)
         {
-            build_cli_subagent_prompt(state, &history)
+            build_cli_subagent_prompt(state, &history, operator_guidance.as_deref())
         } else {
-            build_prompt(state, &prompt_history)
+            build_prompt(state, &prompt_history, operator_guidance.as_deref())
         };
         let turn_dir = state.run_root.join("turns").join(format!("turn-{turn}"));
         let stdout_name = selected_provider
@@ -844,6 +874,7 @@ async fn run_turn_loop_inner(
                 return Err(provider_error(&err));
             }
         };
+        last_executed_provider = Some(response.provider.clone());
         if should_cancel_run(state, &run_token) {
             if let Some(recorder) = flight_recorder.take() {
                 recorder
@@ -2827,7 +2858,111 @@ fn emit_run_completed(
     )
 }
 
-fn build_prompt(state: &PipelineState, history: &[String]) -> String {
+/// Whether the run loop drains the steer inbox at the turn boundary for the
+/// selected provider. Exactly one route says no: `cli:codex-server`, whose
+/// driver delivers pending steers mid-turn over `turn/steer`; draining for
+/// it here would double-deliver the same inbox entry.
+fn consumes_steer_inbox_between_turns(selected_provider: Option<&str>) -> bool {
+    selected_provider != Some(MID_TURN_STEER_PROVIDER_ROUTE)
+}
+
+/// The drain decision for one turn boundary. `selected_provider` is the
+/// PREFERRED route (config override or first credentialed route); the router
+/// may fall back to a different provider mid-phase, so the decision also
+/// consults the route that ACTUALLY executed the previous turn. If either
+/// says between-turn consumption, drain: a run preferring `cli:codex-server`
+/// but persistently executing on a fallback provider must not starve queued
+/// steers waiting for a mid-turn delivery that never happens. Draining is
+/// safe even if this turn recovers onto codex-server — the inbox bookkeeping
+/// only delivers Pending entries, so nothing double-delivers.
+fn should_drain_steer_inbox(
+    selected_provider: Option<&str>,
+    last_executed_provider: Option<&str>,
+) -> bool {
+    consumes_steer_inbox_between_turns(selected_provider)
+        || last_executed_provider
+            .is_some_and(|provider| consumes_steer_inbox_between_turns(Some(provider)))
+}
+
+/// Between-turn steer consumption (M1 widening): drain every pending
+/// steer-inbox entry at the top of the turn and return the advisory
+/// operator-guidance frame to inject into this turn's prompt.
+///
+/// Consumption reuses the codex-server driver's file-backed bookkeeping —
+/// `mark_steer_delivered` appends a Delivered row to steer-inbox.jsonl (the
+/// loop's turn id, `turn-N`) — so an entry is recorded consumed exactly once
+/// no matter which path drains it. Each delivery also appends a typed
+/// `steer_delivered` event to events.jsonl so attach and the app can render
+/// queued→ack.
+///
+/// The returned frame is ADVISORY prompt content only. It is injected into
+/// the prompt frame beside the goal/skill sections and never touches the
+/// frozen goal, contract, or policy (authority.json), nor any gate
+/// evaluation input.
+fn drain_steer_inbox_for_turn(
+    state: &PipelineState,
+    turn: u32,
+    sender: Option<&broadcast::Sender<RunEvent>>,
+) -> Result<Option<String>> {
+    let pending = pending_steers(&state.run_root)?;
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    let turn_id = format!("turn-{turn}");
+    for entry in &pending {
+        // Durable consumption first: once the note is bound for this turn's
+        // prompt it must never be re-delivered to a later turn or another
+        // consumer, even if this provider attempt fails afterwards.
+        mark_steer_delivered(&state.run_root, &entry.identity(), &turn_id)?;
+        emit_event(
+            state,
+            sender,
+            RunEventKind::SteerDelivered {
+                turn,
+                source: steer_source_label(entry.source).to_string(),
+                queued_at: entry.ts,
+                preview: event_preview(&entry.text),
+            },
+        )?;
+    }
+    Ok(Some(operator_guidance_frame(&pending)))
+}
+
+fn steer_source_label(source: SteerSource) -> &'static str {
+    match source {
+        SteerSource::Cli => "cli",
+        SteerSource::Tui => "tui",
+    }
+}
+
+/// The clearly-labeled operator-guidance block injected into a turn's prompt
+/// frame. Advisory by construction: it names itself advisory and states that
+/// the frozen goal, contract, and acceptance criteria are unchanged.
+fn operator_guidance_frame(entries: &[SteerInboxEntry]) -> String {
+    let mut frame = String::from(
+        "Operator guidance (advisory steering from the human operator, queued while you were working; it refines how you pursue the SPEC and does not change the frozen goal, contract, or acceptance criteria):\n",
+    );
+    for entry in entries {
+        frame.push_str("- ");
+        frame.push_str(&entry.text);
+        frame.push('\n');
+    }
+    frame
+}
+
+/// The optional operator-guidance segment of a prompt frame: empty when no
+/// steers were drained, so prompts without steering stay byte-identical.
+fn operator_guidance_segment(operator_guidance: Option<&str>) -> String {
+    operator_guidance
+        .map(|frame| format!("{frame}\n"))
+        .unwrap_or_default()
+}
+
+fn build_prompt(
+    state: &PipelineState,
+    history: &[String],
+    operator_guidance: Option<&str>,
+) -> String {
     let history_text = if history.is_empty() {
         "none".to_string()
     } else {
@@ -2836,15 +2971,20 @@ fn build_prompt(state: &PipelineState, history: &[String]) -> String {
     let spec_text = spec_prompt_text(state);
     let skill_text = run_skill_text(state);
     format!(
-        "You are deadreckon running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nHistory:\n{}\n\nReturn exactly one JSON object with action bash, write_file, reshape (propose splitting the goal into 2-6 independent pieces: {{\"action\":\"reshape\",\"tool_call_id\":\"...\",\"pieces\":[{{\"goal\":\"...\",\"done_hint\":\"...\"}}]}} - recorded for the operator, never executed by you), or done.",
+        "You are deadreckon running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\n{}History:\n{}\n\nReturn exactly one JSON object with action bash, write_file, reshape (propose splitting the goal into 2-6 independent pieces: {{\"action\":\"reshape\",\"tool_call_id\":\"...\",\"pieces\":[{{\"goal\":\"...\",\"done_hint\":\"...\"}}]}} - recorded for the operator, never executed by you), or done.",
         state.working_dir.display(),
         spec_text,
         skill_text,
+        operator_guidance_segment(operator_guidance),
         history_text
     )
 }
 
-fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> String {
+fn build_cli_subagent_prompt(
+    state: &PipelineState,
+    history: &[String],
+    operator_guidance: Option<&str>,
+) -> String {
     let history_text = if history.is_empty() {
         "none".to_string()
     } else {
@@ -2853,10 +2993,11 @@ fn build_cli_subagent_prompt(state: &PipelineState, history: &[String]) -> Strin
     let spec_text = spec_prompt_text(state);
     let skill_text = run_skill_text(state);
     format!(
-        "You are a deadreckon CLI sub-agent running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\nModify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
+        "You are a deadreckon CLI sub-agent running unattended coding work.\nWorking directory: {}\nSPEC:\n{}\n\nSkill and implementation-notes contract:\n{}\n\n{}Modify files directly in the working directory. Do not write outside it. Do not ask questions. When finished, print a concise summary of changed files.\nHistory:\n{}",
         state.working_dir.display(),
         spec_text,
         skill_text,
+        operator_guidance_segment(operator_guidance),
         history_text
     )
 }
@@ -7647,19 +7788,20 @@ mod tests {
         build_cli_subagent_prompt, build_prompt, capture_trusted_turn_head,
         capture_trusted_turn_head_bounded, changed_files_since_snapshot,
         classify_cli_no_deliverable_changes, commit_finalized_turn, commit_worktree_turn,
-        complete_verification, deliverable_changed_files, ensure_sandbox_toml,
-        event_sink_must_stop, fail_verification, implementation_notes_contract,
-        implementation_notes_ready_or_request_followup, is_direct_api_provider_kind,
-        load_or_reconstruct_history, load_tool_policy_from_sandbox_toml, load_trusted_git_control,
-        non_deliverable_history_paths, persist_parent_repair_candidate, persist_work_boundary,
-        policy_seam_refusal, policy_seam_refusal_message, promote_if_ready,
+        complete_verification, consumes_steer_inbox_between_turns, deliverable_changed_files,
+        drain_steer_inbox_for_turn, ensure_sandbox_toml, event_sink_must_stop, fail_verification,
+        implementation_notes_contract, implementation_notes_ready_or_request_followup,
+        is_direct_api_provider_kind, load_or_reconstruct_history,
+        load_tool_policy_from_sandbox_toml, load_trusted_git_control,
+        non_deliverable_history_paths, operator_guidance_frame, persist_parent_repair_candidate,
+        persist_work_boundary, policy_seam_refusal, policy_seam_refusal_message, promote_if_ready,
         provider_failure_disposition, provider_output_name, read_turn_codebase_record,
         record_provider_interruption, record_semantic_judge_accounting, refuse_gitlinks,
         revise_verification, run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop,
         safe_working_path, safe_working_path_with_policy, save_history,
         seal_achieved_semantic_completion, semantic_completion_disposition,
-        snapshot_working_bounded, spawn_event_sink_forwarder, wait_for_provider_retry,
-        write_workspace_file_no_follow,
+        should_drain_steer_inbox, snapshot_working_bounded, spawn_event_sink_forwarder,
+        wait_for_provider_retry, write_workspace_file_no_follow,
     };
 
     fn load_history_with_work_clock(
@@ -9424,6 +9566,276 @@ fallback_context_window = 80
         assert!(is_direct_api_provider_kind(&ProviderKind::OpenAi));
     }
 
+    /// M1 widening guard: exactly one route opts out of the between-turn
+    /// steer drain — `cli:codex-server`, whose driver consumes the inbox
+    /// mid-turn. Draining for it at the boundary would double-deliver the
+    /// same entry to the same run.
+    #[test]
+    fn only_the_codex_server_route_skips_the_between_turn_steer_drain() {
+        assert!(!consumes_steer_inbox_between_turns(Some(
+            "cli:codex-server"
+        )));
+        assert!(consumes_steer_inbox_between_turns(Some("smoke")));
+        assert!(consumes_steer_inbox_between_turns(Some("cli:codex")));
+        assert!(consumes_steer_inbox_between_turns(Some("cli:claude-code")));
+        assert!(consumes_steer_inbox_between_turns(Some("anthropic")));
+        assert!(consumes_steer_inbox_between_turns(None));
+    }
+
+    /// Router-fallback guard: the drain decision keys off the PREFERRED route
+    /// AND the route that actually executed the previous turn. A run whose
+    /// first credentialed route is `cli:codex-server` but which actually
+    /// executed the previous turn on a fallback provider must drain at the
+    /// boundary — otherwise queued steers starve as Pending waiting for a
+    /// mid-turn delivery no codex driver will ever perform.
+    #[test]
+    fn drain_decision_follows_the_route_that_actually_executed() {
+        // First turn, codex-server preferred: no execution evidence yet, so
+        // defer to the mid-turn path.
+        assert!(!should_drain_steer_inbox(Some("cli:codex-server"), None));
+        // Codex-server preferred AND executing: mid-turn delivery owns it.
+        assert!(!should_drain_steer_inbox(
+            Some("cli:codex-server"),
+            Some("cli:codex-server")
+        ));
+        // Codex-server preferred but the previous turn actually executed on a
+        // fallback provider: drain so the notes land in the fallback prompt.
+        assert!(should_drain_steer_inbox(
+            Some("cli:codex-server"),
+            Some("anthropic")
+        ));
+        // Any other preferred route always drains at the boundary.
+        assert!(should_drain_steer_inbox(Some("anthropic"), None));
+        assert!(should_drain_steer_inbox(None, None));
+    }
+
+    /// The between-turn drain consumes each pending note exactly once: it is
+    /// marked delivered in steer-inbox.jsonl with the loop's turn id (the
+    /// same file-backed bookkeeping the codex-server driver uses), one typed
+    /// `steer_delivered` event lands in events.jsonl per note, and the next
+    /// boundary finds nothing to re-deliver.
+    #[test]
+    fn between_turn_drain_marks_delivered_once_and_appends_the_typed_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "drain the steer inbox");
+        deadreckon_core::steer_inbox::append_steer(
+            &state.run_root,
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "prefer sqlite",
+        )
+        .expect("queue first");
+        deadreckon_core::steer_inbox::append_steer(
+            &state.run_root,
+            deadreckon_core::steer_inbox::SteerSource::Tui,
+            "keep the public API stable",
+        )
+        .expect("queue second");
+
+        let frame = drain_steer_inbox_for_turn(&state, 3, None)
+            .expect("drain")
+            .expect("guidance frame");
+
+        assert!(frame.starts_with("Operator guidance (advisory"), "{frame}");
+        assert!(frame.contains("- prefer sqlite\n"), "{frame}");
+        assert!(frame.contains("- keep the public API stable\n"), "{frame}");
+        let inbox = deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root).expect("inbox");
+        assert_eq!(inbox.len(), 2, "each note is recorded once");
+        for entry in &inbox {
+            assert_eq!(
+                entry.status,
+                deadreckon_core::steer_inbox::SteerStatus::Delivered
+            );
+            assert_eq!(entry.delivered_turn_id.as_deref(), Some("turn-3"));
+        }
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert_eq!(events.matches("\"steer_delivered\"").count(), 2, "{events}");
+        assert_eq!(events.matches("prefer sqlite").count(), 1, "{events}");
+
+        assert_eq!(
+            drain_steer_inbox_for_turn(&state, 4, None).expect("second drain"),
+            None,
+            "a consumed note must never be re-delivered"
+        );
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert_eq!(events.matches("\"steer_delivered\"").count(), 2, "{events}");
+    }
+
+    /// Both prompt frames carry the drained notes as one clearly-labeled
+    /// advisory block between the skill frame and the history; without
+    /// guidance the frames stay byte-identical to the historical prompts.
+    #[test]
+    fn prompt_frames_carry_operator_guidance_only_when_present() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "label the guidance");
+        let entry = deadreckon_core::steer_inbox::SteerInboxEntry {
+            ts: chrono::Utc::now(),
+            source: deadreckon_core::steer_inbox::SteerSource::Cli,
+            text: "prefer sqlite".to_string(),
+            status: deadreckon_core::steer_inbox::SteerStatus::Pending,
+            delivered_turn_id: None,
+            delivered_at: None,
+        };
+        let frame = operator_guidance_frame(std::slice::from_ref(&entry));
+        assert!(
+            frame.contains("does not change the frozen goal, contract, or acceptance criteria"),
+            "the label must declare the frame advisory: {frame}"
+        );
+
+        for (with, without) in [
+            (
+                build_prompt(&state, &[], Some(&frame)),
+                build_prompt(&state, &[], None),
+            ),
+            (
+                build_cli_subagent_prompt(&state, &[], Some(&frame)),
+                build_cli_subagent_prompt(&state, &[], None),
+            ),
+        ] {
+            assert!(with.contains("Operator guidance (advisory"), "{with}");
+            assert!(with.contains("- prefer sqlite\n"), "{with}");
+            let guidance_at = with.find("Operator guidance").expect("guidance");
+            let skill_at = with
+                .find("Skill and implementation-notes contract:")
+                .expect("skill frame");
+            let history_at = with.find("History:").expect("history");
+            assert!(
+                skill_at < guidance_at && guidance_at < history_at,
+                "guidance sits beside the goal/skill frame, before history: {with}"
+            );
+            assert!(!without.contains("Operator guidance"), "{without}");
+        }
+    }
+
+    /// Operator decision (M1): steer works for ANY supported provider. A
+    /// note queued before the boundary is consumed at the top of the next
+    /// smoke-provider turn — delivered exactly once, acked with the typed
+    /// event — and the advisory frame cannot touch frozen authority: the
+    /// Job authority.json bytes and the run goal survive the steered turn
+    /// unchanged.
+    #[tokio::test]
+    async fn between_turn_drain_consumes_a_queued_note_on_the_smoke_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "consume the queued note");
+        deadreckon_core::steer_inbox::append_steer(
+            &state.run_root,
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "prefer sqlite over postgres",
+        )
+        .expect("queue note");
+        let authority_path = paths.job_authority(&state.run_id);
+        std::fs::create_dir_all(authority_path.parent().expect("job dir")).expect("job dir");
+        let frozen = r#"{"goal":"consume the queued note","policy":"frozen"}"#;
+        std::fs::write(&authority_path, frozen).expect("authority fixture");
+        let goal_before = state.goal.clone();
+
+        let _ = run_smoke_turn(&mut state, &paths, None, true).await;
+
+        let inbox = deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root).expect("inbox");
+        assert_eq!(inbox.len(), 1, "the note is recorded once");
+        assert_eq!(
+            inbox[0].status,
+            deadreckon_core::steer_inbox::SteerStatus::Delivered
+        );
+        assert_eq!(inbox[0].delivered_turn_id.as_deref(), Some("turn-1"));
+        let events = std::fs::read_to_string(state.run_root.join("events.jsonl")).expect("events");
+        assert_eq!(events.matches("\"steer_delivered\"").count(), 1, "{events}");
+        assert!(events.contains("prefer sqlite over postgres"), "{events}");
+        assert_eq!(
+            std::fs::read_to_string(&authority_path).expect("authority"),
+            frozen,
+            "the advisory prompt frame must never mutate frozen authority"
+        );
+        assert_eq!(state.goal, goal_before, "the frozen goal is untouched");
+    }
+
+    /// End-to-end prompt evidence for the widened path: a queued note lands
+    /// inside the NEXT turn's prompt frame of a generic CLI provider (the
+    /// scripted provider echoes its prompt argument into a capture file).
+    #[tokio::test]
+    async fn queued_note_lands_in_the_next_turn_prompt_frame_of_a_cli_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        std::fs::create_dir_all(paths.home().join("providers.d")).expect("providers");
+        let capture = temp.path().join("prompt-capture.txt");
+        let script = temp.path().join("echo-prompt.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "printf '%s' \"$1\" > \"{}\"\nmkdir -p src\nprintf 'pub fn value() -> u8 {{ 7 }}\\n' > src/lib.rs\nprintf 'changed src/lib.rs\\n'\n",
+                capture.display()
+            ),
+        )
+        .expect("script");
+        std::fs::write(
+            paths.home().join("providers.d/test-steer.toml"),
+            format!(
+                r#"
+id = "cli:test-steer"
+display_name = "Test Steer"
+kind = "cli"
+default_binary = "/bin/sh"
+subscription = true
+
+[auth]
+kind = "subscription"
+
+[exec_template]
+args_template = ["{}", "{{prompt}}"]
+"#,
+                script.display()
+            ),
+        )
+        .expect("descriptor");
+        let config_path = paths.home().join("config.toml");
+        std::fs::write(&config_path, "default_provider = \"cli:test-steer\"\n").expect("config");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut state = create_run(
+            &paths,
+            RunOptions {
+                goal: "steer a generic cli provider".to_string(),
+                cwd,
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        deadreckon_core::steer_inbox::append_steer(
+            &state.run_root,
+            deadreckon_core::steer_inbox::SteerSource::Cli,
+            "focus on the failing integration test",
+        )
+        .expect("queue note");
+        let router = ProviderRouter::from_config_path(&config_path, None).expect("router");
+        let mut config = base_run_loop_config();
+        config.provider = None;
+        config.max_spend_usd = Some(1.0);
+        config.no_seams = false;
+        config.docs.home = paths.home().to_path_buf();
+        config.docs.config_path = Some(config_path);
+
+        let _ = run_turn_loop(&mut state, &router, config).await;
+
+        let prompt = std::fs::read_to_string(&capture).expect("captured prompt frame");
+        assert!(prompt.contains("Operator guidance (advisory"), "{prompt}");
+        assert!(
+            prompt.contains("- focus on the failing integration test\n"),
+            "{prompt}"
+        );
+        let inbox = deadreckon_core::steer_inbox::read_steer_inbox(&state.run_root).expect("inbox");
+        assert_eq!(inbox.len(), 1, "the note is recorded once");
+        assert_eq!(
+            inbox[0].status,
+            deadreckon_core::steer_inbox::SteerStatus::Delivered
+        );
+        assert_eq!(inbox[0].delivered_turn_id.as_deref(), Some("turn-1"));
+    }
+
     #[test]
     fn run_prompt_names_implement_spec_and_implementation_notes_contract() {
         let temp = TempDir::new().expect("tempdir");
@@ -9443,7 +9855,7 @@ fallback_context_window = 80
             },
         )
         .expect("run");
-        let prompt = build_prompt(&state, &[]);
+        let prompt = build_prompt(&state, &[], None);
         assert!(prompt.contains("Implement the SPEC"), "{prompt}");
         assert!(prompt.contains("implementation-notes.html"), "{prompt}");
         assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
@@ -9481,7 +9893,7 @@ fallback_context_window = 80
             },
         )
         .expect("run");
-        let prompt = build_cli_subagent_prompt(&state, &[]);
+        let prompt = build_cli_subagent_prompt(&state, &[], None);
         assert!(prompt.contains("Implement the SPEC"), "{prompt}");
         assert!(prompt.contains("implementation-notes.html"), "{prompt}");
         assert!(prompt.contains("RUN-DECISIONS.md"), "{prompt}");
@@ -11380,7 +11792,7 @@ network = []
         )
         .expect("acceptance");
 
-        let prompt = build_cli_subagent_prompt(&state, &[]);
+        let prompt = build_cli_subagent_prompt(&state, &[], None);
 
         assert!(prompt.contains("Acceptance criteria:"));
         assert!(prompt.contains("acceptance.yaml:"));

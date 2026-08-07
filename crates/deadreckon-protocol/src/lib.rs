@@ -9,6 +9,7 @@
 pub mod ids;
 pub mod job;
 pub mod ledger;
+pub mod notify;
 pub mod operator_capture;
 pub mod policy;
 pub mod schema;
@@ -30,6 +31,10 @@ pub use ledger::{
     EventLine, FlightEvent, FlightEventKind, FlightLine, FlightUsage, LedgerFile, LedgerItem,
     NarrativeSnapshotRef, NarrativeSnapshotRefLine, RunEvent, RunEventKind, SpendLine, SpendRecord,
     TraceLine, TraceRecord, spend_kind_loop,
+};
+pub use notify::{
+    NOTIFY_EVENT_SCHEMA_VERSION, NotifyDeliveryAttempt, NotifyDeliveryTransition, NotifyEvent,
+    OperatorAttentionEvent, OperatorAttentionKind, OperatorAttentionReason,
 };
 pub use operator_capture::{
     OPERATOR_CAPTURE_SCHEMA_VERSION, OperatorCaptureBinding, OperatorCaptureCompletionLineage,

@@ -221,6 +221,103 @@ fn emitted_job_events_conform_to_checked_schema() {
     );
 }
 
+#[test]
+fn emitted_notify_lines_conform_to_checked_schema_and_append_only() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+    let cwd = temp.path().join("repo");
+    fs::create_dir_all(&cwd).expect("repo");
+    let state = deadreckon_core::create_run(
+        &paths,
+        deadreckon_core::RunOptions {
+            goal: "tail the notify ledger".to_string(),
+            cwd,
+            sandbox: "none".to_string(),
+            provider: Some("smoke".to_string()),
+            skill_name: "default-coding".to_string(),
+            max_spend_usd: Some(1.0),
+            max_wall_seconds: None,
+            run_id: None,
+            codebase: None,
+        },
+    )
+    .expect("run");
+
+    let schema: Value = serde_json::from_slice(
+        &fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("docs/schemas/notify-event.schema.json"),
+        )
+        .expect("checked notify-event schema must exist"),
+    )
+    .expect("checked notify-event schema must be JSON");
+
+    let mut tail = ContractTail::new(deadreckon::notify::notify_jsonl_path(&state));
+
+    // The historical row shape: one delivery attempt from the CLI writer.
+    deadreckon::notify::append_notify_attempt(
+        &state,
+        &deadreckon::notify::NotifyAttempt {
+            ts: Utc::now(),
+            transition: deadreckon::notify::NotifyTransition::Paused,
+            channel: "native".to_string(),
+            ok: false,
+            detail: Some("osascript exited with 1".to_string()),
+        },
+    )
+    .expect("delivery attempt row");
+    let attempts = tail.poll();
+    assert_eq!(attempts.len(), 1);
+
+    // The typed operator-attention shape from the owning-process emitters.
+    deadreckon_core::append_operator_attention(
+        &state.run_root,
+        &deadreckon_core::verified_awaiting_promote_event("job-tail", &state.run_id, &state.scope),
+    )
+    .expect("verified attention row");
+    deadreckon_core::append_operator_attention(
+        &state.run_root,
+        &deadreckon_core::paused_at_cap_event(
+            &state.run_id,
+            &state.scope,
+            Some("spend cap $1.00 reached"),
+        ),
+    )
+    .expect("paused attention row");
+
+    // Append-only: the retained offset stays valid and sees only new rows.
+    let attention = tail.poll();
+    assert_eq!(attention.len(), 2);
+    assert_eq!(attention[0]["kind"], json!("operator_attention"));
+    assert_eq!(attention[0]["reason"], json!("verified_awaiting_promote"));
+    assert_eq!(attention[1]["reason"], json!("paused_at_cap"));
+
+    for row in attempts.iter().chain(attention.iter()) {
+        if let Err(error) = json_matches_schema(row, &schema, &schema, "$") {
+            panic!("emitted notify line does not match checked schema: {error}");
+        }
+    }
+
+    // The validator has teeth: a reason outside the schema vocabulary and a
+    // truncated attempt row must both fail.
+    let mut unknown_reason = attention[0].clone();
+    unknown_reason["reason"] = json!("totally_new_reason");
+    assert!(
+        json_matches_schema(&unknown_reason, &schema, &schema, "$").is_err(),
+        "schema validator must reject an unknown operator-attention reason"
+    );
+    let mut truncated_attempt = attempts[0].clone();
+    truncated_attempt
+        .as_object_mut()
+        .expect("attempt row object")
+        .remove("transition");
+    assert!(
+        json_matches_schema(&truncated_attempt, &schema, &schema, "$").is_err(),
+        "schema validator must reject an attempt row missing a required field"
+    );
+}
+
 // The minimal draft-07 walker used by the report schema test
 // (`report_json_validates_against_generated_schema` in
 // crates/deadreckon/src/commands/report.rs), applied here to the checked
