@@ -110,7 +110,7 @@ struct KillSheet: View {
         case .cancelRequested(let facts):
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    StatusChip(text: "cancel requested", color: Theme.warn, filled: true)
+                    StatusChip(text: "cancel requested", color: Theme.warnFill, filled: true)
                     Text("signal \(facts.signal)\(facts.escalated ? " (escalated)" : "")"
                         + (facts.processesSignalled.map { " \u{00B7} \($0) processes" } ?? ""))
                         .font(Theme.body(10.5))

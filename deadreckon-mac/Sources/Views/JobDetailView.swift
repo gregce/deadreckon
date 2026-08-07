@@ -55,20 +55,14 @@ struct FleetSidebarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("FLEET")
-                .font(Theme.body(10, weight: .bold))
-                .kerning(0.8)
-                .foregroundStyle(Theme.inkTertiary)
+            Theme.sectionTitle("FLEET")
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
             Divider().overlay(Theme.hairline)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     ForEach(fleet.queue.nonEmptySections, id: \.self) { section in
-                        Text(section.title)
-                            .font(Theme.body(9, weight: .bold))
-                            .kerning(0.5)
-                            .foregroundStyle(Theme.inkTertiary)
+                        Theme.sectionTitle(section.title)
                             .padding(.horizontal, 10)
                             .padding(.top, 8)
                         ForEach(fleet.queue.items(in: section)) { item in
@@ -104,7 +98,7 @@ struct FleetSidebarView: View {
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tactileCard)
     }
 
     private func rowGoal(_ item: QueueItem) -> String {
@@ -267,6 +261,7 @@ struct DetailHeaderView: View {
                 }
                 if let provider = row.provider {
                     dot
+                    ProviderIcon(provider: provider, size: 13)
                     Text(provider).font(Theme.body(10.5)).foregroundStyle(Theme.inkSecondary)
                 }
                 if let lease = row.lease {
@@ -510,6 +505,12 @@ struct SteerBarView: View {
         // gating (and any verb refusal after it) stays authoritative.
         .onReceive(NotificationCenter.default.publisher(for: .deadreckonFocusSteer)) { _ in
             steerFieldFocused = true
+        }
+        // Job > Open in Terminal (menu path): a TCC Automation denial there
+        // degrades to pasteboard + open-terminal, and the note renders HERE
+        // — the same visible surface the workbench button's fallback uses.
+        .onReceive(NotificationCenter.default.publisher(for: .deadreckonTerminalFallback)) { _ in
+            copiedNote = true
         }
     }
 

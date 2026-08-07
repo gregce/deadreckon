@@ -125,10 +125,7 @@ private struct PaletteRow: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 10) {
-                Text(item.section.title)
-                    .font(Theme.body(9, weight: .bold))
-                    .kerning(0.4)
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle(item.section.title)
                     .frame(width: 130, alignment: .leading)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(goal)
@@ -140,6 +137,7 @@ private struct PaletteRow: View {
                             .font(Theme.mono(10))
                         if let provider = item.row?.provider {
                             Text("\u{00B7}")
+                            ProviderIcon(provider: provider, size: 12)
                             Text(provider).font(Theme.body(10))
                         }
                     }
@@ -161,7 +159,7 @@ private struct PaletteRow: View {
                 in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             .onHover { hovering = $0 }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.tactileCard)
     }
 
     private var goal: String {

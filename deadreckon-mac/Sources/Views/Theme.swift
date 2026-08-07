@@ -39,6 +39,13 @@ enum Theme {
     /// Amber warnings: stale leases, decision-needed badges, uncertain facts.
     static let warn = dynamicColor(light: NSColor(red: 0.78, green: 0.55, blue: 0.10, alpha: 1),
                                    dark: NSColor(red: 0.92, green: 0.72, blue: 0.32, alpha: 1))
+    /// Filled-chip amber. `warn`'s light-mode value is tuned for TEXT on
+    /// paper; as a FILL under white `onFill` text it lands near 2.9:1.
+    /// Filled amber chips use this darker light-mode fill (white text
+    /// clears 4.5:1); the dark-mode value matches `warn`, where the dark
+    /// `onFill` ink already clears contrast on the lighter amber.
+    static let warnFill = dynamicColor(light: NSColor(red: 0.60, green: 0.42, blue: 0.05, alpha: 1),
+                                       dark: NSColor(red: 0.92, green: 0.72, blue: 0.32, alpha: 1))
     /// Failure red: wrecked rows, proof-invalid chips, unavailable banners.
     static let danger = dynamicColor(light: NSColor(red: 0.78, green: 0.24, blue: 0.20, alpha: 1),
                                      dark: NSColor(red: 0.94, green: 0.45, blue: 0.40, alpha: 1))
@@ -77,10 +84,81 @@ enum Theme {
     static let cardRadius: CGFloat = 10
     static let queueWidth: CGFloat = 860
 
+    // MARK: Section titles
+
+    /// The one kerned-uppercase section title (10pt bold, kerning 0.6,
+    /// tertiary ink). Every band/section header renders through this; the
+    /// per-view re-implementations drifted metrics and are gone.
+    static func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(body(10, weight: .bold))
+            .kerning(0.6)
+            .foregroundStyle(inkTertiary)
+    }
+
+    // MARK: Provider marks
+
+    /// Stable per-provider color pairs for `ProviderIcon`. Known route ids
+    /// get brand-adjacent dynamic pairs; anything else picks
+    /// deterministically from the accent-class palette by scalar sum
+    /// (String.hashValue is process-seeded and would repaint marks every
+    /// launch).
+    static func providerColor(_ provider: String) -> Color {
+        switch provider.lowercased() {
+        case "claude", "anthropic", "claude-code":
+            return dynamicColor(light: NSColor(red: 0.80, green: 0.42, blue: 0.18, alpha: 1),
+                                dark: NSColor(red: 0.92, green: 0.58, blue: 0.34, alpha: 1))
+        case "codex", "openai":
+            return dynamicColor(light: NSColor(red: 0.16, green: 0.52, blue: 0.47, alpha: 1),
+                                dark: NSColor(red: 0.36, green: 0.72, blue: 0.66, alpha: 1))
+        case "gemini", "google":
+            return dynamicColor(light: NSColor(red: 0.26, green: 0.42, blue: 0.82, alpha: 1),
+                                dark: NSColor(red: 0.50, green: 0.64, blue: 0.98, alpha: 1))
+        case "opencode":
+            return dynamicColor(light: NSColor(red: 0.48, green: 0.32, blue: 0.72, alpha: 1),
+                                dark: NSColor(red: 0.68, green: 0.55, blue: 0.92, alpha: 1))
+        default:
+            let palette = [accent, verified, warn, live]
+            let sum = provider.unicodeScalars.reduce(0) { $0 &+ Int($1.value) }
+            return palette[sum % palette.count]
+        }
+    }
+
     static func dynamicColor(light: NSColor, dark: NSColor) -> Color {
         Color(nsColor: NSColor(name: nil) { appearance in
             appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
         })
+    }
+}
+
+/// Provider badge iconography (design doc section 9's copy-outright
+/// exemplar pattern): a rounded-rect brand mark anchoring every surface
+/// that names a provider. The glyph is the route's initial — brand logos
+/// are not SF Symbols and an invented glyph would be a guess. Decorative
+/// identity only: the provider word stays printed beside it wherever facts
+/// are listed, so the mark is hidden from accessibility.
+struct ProviderIcon: View {
+    let provider: String
+    var size: CGFloat = 16
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: size * 0.3, style: .continuous)
+            .fill(color.opacity(0.12))
+            .frame(width: size, height: size)
+            .overlay(
+                Text(initial)
+                    .font(.system(size: size * 0.6, weight: .bold, design: .rounded))
+                    .foregroundStyle(color)
+            )
+            .accessibilityHidden(true)
+    }
+
+    private var initial: String {
+        provider.first.map { String($0).uppercased() } ?? "?"
+    }
+
+    private var color: Color {
+        Theme.providerColor(provider)
     }
 }
 

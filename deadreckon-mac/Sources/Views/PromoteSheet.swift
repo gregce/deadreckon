@@ -106,7 +106,7 @@ struct PromoteSheet: View {
     @ViewBuilder private var twoKeyBand: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                sectionTitle("TWO-KEY COMPLETION (Binnacle)")
+                Theme.sectionTitle("TWO-KEY COMPLETION (Binnacle)")
                 Spacer()
                 // The honesty label the design requires: these are report's
                 // RECORDED facts; a fresh verdict --receipt on a JOB ref is
@@ -178,7 +178,7 @@ struct PromoteSheet: View {
 
     @ViewBuilder private var contractBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("CONTRACT \u{00B7} frozen acceptance.yaml")
+            Theme.sectionTitle("CONTRACT \u{00B7} frozen acceptance.yaml")
             if let contract = evidence.report?.contract {
                 HStack(spacing: 6) {
                     if let approved = contract.approvedSHA256 {
@@ -288,7 +288,7 @@ struct PromoteSheet: View {
 
     @ViewBuilder private var receiptBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("RECEIPT")
+            Theme.sectionTitle("RECEIPT")
             HStack(spacing: 6) {
                 if let receipt = liveRow.receipt {
                     StatusChip(
@@ -325,7 +325,7 @@ struct PromoteSheet: View {
     @ViewBuilder private var candidateBand: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                sectionTitle("CANDIDATE \u{00B7} preview before mutate")
+                Theme.sectionTitle("CANDIDATE \u{00B7} preview before mutate")
                 Spacer()
                 Button("Refresh preview") {
                     Task { await coordinator.loadPreview() }
@@ -467,7 +467,7 @@ struct PromoteSheet: View {
 
     @ViewBuilder private var destinationBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("DESTINATION")
+            Theme.sectionTitle("DESTINATION")
             destinationRadio(
                 selected: isApply,
                 title: "Apply to the working tree",
@@ -590,7 +590,17 @@ struct PromoteSheet: View {
                             .font(Theme.body(11.5, weight: .medium))
                             .foregroundStyle(Theme.ink)
                     }
-                    Text("one-command rollback: deadreckon undo \u{00B7} the row updates from the files, not from this sheet")
+                    // The envelope's own next actions, verbatim (trust rule
+                    // 2): an apply success offers `deadreckon undo`; an
+                    // export (--dest) success offers show/status. The sheet
+                    // never asserts an affordance the binary did not offer.
+                    ForEach(envelope.nextActions, id: \.self) { action in
+                        Text("next: \(action)")
+                            .font(Theme.mono(10))
+                            .foregroundStyle(Theme.accent)
+                            .textSelection(.enabled)
+                    }
+                    Text(successLifecycleLine(envelope))
                         .font(Theme.body(10))
                         .foregroundStyle(Theme.inkTertiary)
                 }
@@ -669,12 +679,17 @@ struct PromoteSheet: View {
         return nil
     }
 
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(Theme.body(10, weight: .bold))
-            .kerning(0.6)
-            .foregroundStyle(Theme.inkTertiary)
+    /// The lifecycle hint under a promote success. "one-command rollback"
+    /// is claimed ONLY when `deadreckon undo` appears among the envelope's
+    /// own next actions (apply destinations); an export success gets no
+    /// rollback claim, because the binary offers none (trust rule 2).
+    private func successLifecycleLine(_ envelope: MutationEnvelope) -> String {
+        let offersUndo = envelope.nextActions.contains { $0.contains("deadreckon undo") }
+        return (offersUndo ? "one-command rollback: deadreckon undo \u{00B7} " : "")
+            + "the row updates from the files, not from this sheet"
     }
+    // Section titles render through Theme.sectionTitle (the one shared
+    // kerned-uppercase style).
 }
 
 /// The send-back sheet (Quarterdeck's middle button, G9): a follow-up goal
@@ -704,9 +719,7 @@ struct SendBackSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("FOLLOW-UP GOAL")
-                    .font(Theme.body(10, weight: .bold))
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle("FOLLOW-UP GOAL")
                 TextEditor(text: $coordinator.goal)
                     .font(Theme.body(12))
                     .scrollContentBackground(.hidden)
@@ -718,9 +731,7 @@ struct SendBackSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("OPERATOR NOTE (--note, recorded on the parent)")
-                    .font(Theme.body(10, weight: .bold))
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle("OPERATOR NOTE (--note, recorded on the parent)")
                 TextEditor(text: $coordinator.note)
                     .font(Theme.body(12))
                     .scrollContentBackground(.hidden)

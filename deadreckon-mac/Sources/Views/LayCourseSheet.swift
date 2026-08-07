@@ -19,6 +19,9 @@ struct LayCourseSheet: View {
     @State private var goalText = ""
     @State private var capText = ""
     @State private var projectPath = ""
+    /// Autofocus on open (the CommandPalette discipline): Command-N then
+    /// type, no mouse click between.
+    @FocusState private var goalFocused: Bool
 
     init() {
         _controller = StateObject(wrappedValue: LayCourseController(cli: WriteCLI.client))
@@ -45,6 +48,7 @@ struct LayCourseSheet: View {
         .frame(width: 640, height: 640)
         .background(Theme.paper)
         .task { await catalog.load() }
+        .onAppear { goalFocused = true }
     }
 
     private var header: some View {
@@ -77,9 +81,10 @@ struct LayCourseSheet: View {
 
     private var goalSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("GOAL")
+            Theme.sectionTitle("GOAL")
             TextEditor(text: $goalText)
                 .font(Theme.body(12.5))
+                .focused($goalFocused)
                 .scrollContentBackground(.hidden)
                 .padding(8)
                 .frame(minHeight: 64, maxHeight: 110)
@@ -99,7 +104,7 @@ struct LayCourseSheet: View {
     /// source fact line shows what the binary resolved.
     private var projectSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("PROJECT")
+            Theme.sectionTitle("PROJECT")
             HStack(spacing: 8) {
                 TextField("resolved from the app's working directory unless set",
                           text: $projectPath)
@@ -143,7 +148,7 @@ struct LayCourseSheet: View {
 
     @ViewBuilder private var routeSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("ROUTE (Pennant)")
+            Theme.sectionTitle("ROUTE (Pennant)")
             switch catalog.providers {
             case .idle, .loading:
                 Text("probing provider routes\u{2026}")
@@ -254,7 +259,7 @@ struct LayCourseSheet: View {
 
     private var limitsSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            sectionTitle("LIMITS")
+            Theme.sectionTitle("LIMITS")
             HStack(spacing: 8) {
                 Text("spend cap $")
                     .font(Theme.body(11))
@@ -280,7 +285,7 @@ struct LayCourseSheet: View {
     @ViewBuilder private var previewSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                sectionTitle("LAUNCH PLAN PREVIEW")
+                Theme.sectionTitle("LAUNCH PLAN PREVIEW")
                 Spacer()
                 Button("Preview course") {
                     controller.request.goal = goalText
@@ -482,10 +487,6 @@ struct LayCourseSheet: View {
         return false
     }
 
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(Theme.body(10, weight: .bold))
-            .kerning(0.6)
-            .foregroundStyle(Theme.inkTertiary)
-    }
+    // Section titles render through Theme.sectionTitle (the one shared
+    // kerned-uppercase style).
 }
