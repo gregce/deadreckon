@@ -24,3 +24,6 @@ __pycache__/
 
 # macOS Finder metadata
 .DS_Store
+
+# Rust crate-local target dirs (workspace target already ignored)
+crates/*/target/
