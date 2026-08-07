@@ -231,8 +231,10 @@ public struct RunRow: Codable, Equatable, Sendable {
 }
 
 /// The `list --json` top-level envelope (`{kind:"list", ...}`). Plans and
-/// chains ride the same envelope; their read-models land with APP-2's
-/// screens, and unknown keys are ignored by JSONDecoder until then.
+/// chains ride the same envelope undecoded (the rows-with-child-counts
+/// surface is v1.x per design 6.2 scope); unknown keys are ignored by
+/// JSONDecoder until then. The queue path decodes leniently through
+/// `FleetDecoder.decodeList` instead of this strict envelope.
 public struct ListEnvelope: Codable, Equatable, Sendable {
     public let kind: String
     public let id: String

@@ -76,6 +76,269 @@ Invariants:
 - Rendering `.unknown` shows the words "unknown state" (or the raw string in evidence panes), never a guessed state.
 - New words the binary grows land here as cases in the same change that bumps the vendored manifest.
 
+### Glossary words (Models/GlossaryText.swift)
+
+Mirrors `crates/deadreckon-core/src/glossary.rs`: the ONLY source of user-facing status words. Raw enum names never reach the UI.
+
+```swift
+public enum GlossaryText {
+    public static let nounRun, nounChain, nounPlan, nounChild, nounVerifiedRun: String
+    public static let phraseVerifiedByDrGate, nounDoneContract: String
+    public static let verdictVerified: String       // "VERIFIED", trust rule 6
+    public static let unknownState: String          // "unknown state"
+    public static func phaseWord(_ phase: JobPhase) -> String
+    public static func outcomeWord(_ outcome: JobOutcome) -> String
+    public static func stopReasonWord(_ reason: StopReason) -> String
+    public static func proofWord(_ proof: ProofStatus) -> String
+    public static func statusWord(_ raw: String) -> String  // job_status_label words
+    public static func spendLine(_ spend: FleetRow.Spend) -> String     // "$9.12 / $25.00"
+    public static func leaseStaleReason(_ lease: FleetRow.Lease) -> String  // "no heartbeat 71s"
+    public static func gateCounts(_ gate: FleetRow.Gate) -> String      // "5/5 checks"
+}
+```
+
+Invariants:
+- `statusWord("verified_proof_invalid")` renders "proof invalid", its own state, never any variant of plain Verified (trust rule 5).
+- `proofWord(.valid)` is the only expression that returns VERIFIED.
+- Provenance is two-tier and stated honestly: the named constants mirror glossary.rs verbatim, but the phase/outcome/stop-reason words are APP-AUTHORED translations — glossary.rs has no vocabulary for JobPhase/JobOutcome/StopReason yet (the CLI renders raw snake_case). One word-per-label, nothing predictive, no readiness language (decision 8). **Rust-side gap, needs registering:** `job_phase_label`/`job_outcome_label`/`stop_reason_label` in glossary.rs (same pattern as `run_status_label`), ridden by job.rs and mirrored here, so the two vocabularies cannot drift.
+
+### Harbor read-models (Models/HarborModels.swift)
+
+```swift
+public enum ProviderProbeStatus: String, ForgivingStringEnum   // ok, failed, skipped, unknown
+public struct ProviderProbeRow: Codable, Equatable, Sendable {  // providers[] subset
+    public let id: String
+    public let displayName: String?    // display_name
+    public let status: ProviderProbeStatus
+}
+public struct ProvidersEnvelope: Codable, Equatable, Sendable { // providers list --json
+    public let kind: String            // "providers"
+    public let providers: [ProviderProbeRow]
+    public let missingProviders: [String]
+    public let active: String?
+    public var okCount: Int            // status == ok
+    public var totalCount: Int         // providers.count + missing
+}
+public struct DoctorEnvelope: Codable, Equatable, Sendable {    // doctor --json subset
+    public struct Finding: Codable, Equatable, Sendable { status, subject, detail: String }
+    public let kind: String            // "doctor"
+    public let status: String          // verdict word, rendered not interpreted
+    public let findings: [Finding]
+    public var failedCount, warningCount: Int
+}
+public enum SupervisorInstallState: String, ForgivingStringEnum
+// unsupported, not_installed, stale, current, unknown
+public struct SupervisorStatusReport: Codable, Equatable, Sendable { // supervisor status --json subset
+    public let schemaVersion: Int
+    public let manager: String
+    public let installed: SupervisorInstallState
+    public let loaded: Bool?
+    public let active: String?
+    public var isRunning: Bool  // mirrors Rust ServiceManagerRuntime::is_running exactly
+}
+```
+
+Invariant: these are quiet-chip facts. `isRunning` is display data; the `checkpoint` live-evidence block is deliberately not modeled until a surface needs it (validate_supervisor_service_live_evidence stays a Rust-side authority).
+
+### Queue derivation (Models/QueueDerivation.swift)
+
+Pure functions from rollup rows to the Quarterdeck taxonomy. Unit-tested in QueueDerivationTests/MenuBarStateTests.
+
+```swift
+public struct QuarantinedRow: Equatable, Hashable, Sendable {
+    public let jobID: String?          // salvaged from the raw object when present
+    public let goal: String?
+    public let reason: String          // decode failure, the error's words
+    public let ordinal: Int            // index in jobs[]: stable identity when jobID is nil
+}
+
+public enum QueueSection: String, CaseIterable, Sendable {
+    case atTheGate, needsReview, approaching, underway, wrecked, unknown
+    public var title: String           // "AT THE GATE", "NEEDS REVIEW", ...
+    public var subtitle: String?
+}
+
+public struct QueueItem: Equatable, Hashable, Sendable, Identifiable {
+    public enum Kind: Equatable, Sendable { case job(FleetRow), quarantined(QuarantinedRow) }
+    public let kind: Kind
+    public let section: QueueSection
+    public let needsDecision: Bool     // waiting + decision-shaped stop reason, or needsReview
+    public var id: String              // jobID, else "quarantined-<ordinal>"
+    public var row: FleetRow?
+}
+
+public struct GateQueue: Equatable, Sendable {
+    public let atTheGate, needsReview, approaching, underway, wrecked, unknown: [QueueItem]
+    public static let empty: GateQueue
+    public func items(in section: QueueSection) -> [QueueItem]
+    public var allItems: [QueueItem]           // taxonomy order
+    public var nonEmptySections: [QueueSection]
+    public var isEmpty: Bool
+    public var jobCount: Int
+    public var decisionCount: Int      // gate rows + needsReview rows + decision-shaped waiting rows
+    public var liveCount: Int          // running | verifying_* rows
+    public var summaryLine: String     // "2 at the gate · 1 approaching · 3 underway" (counts, not prose)
+    // summaryLine deviates from the C1 mock on purpose: APPROACHING is its own
+    // count, never folded into "underway", so the verifying stage survives the
+    // ten-second glance. Documented deviation, tested.
+}
+
+public enum QueueDerivation {
+    public static let decisionShapedStopReasons: Set<StopReason>
+    // operator_input_required, spend_cap, wall_cap
+    public static func derive(rows: [FleetRow], quarantined: [QuarantinedRow]) -> GateQueue
+    public static func classify(_ row: FleetRow) -> QueueSection
+    public static func isDecisionShaped(_ row: FleetRow) -> Bool
+    /// staleLeaseCount MUST be the debounced count (FleetStore's confirmed set,
+    /// never one raw poll); supervisorDown only for a positively-reported
+    /// stopped Watchkeeper (an unknown chip never badges).
+    public static func menuBarState(_ fleet: FleetStore.FleetState,
+                                    staleLeaseCount: Int = 0,
+                                    supervisorDown: Bool = false) -> MenuBarFleetState
+}
+
+public enum MenuBarFleetState: Equatable, Sendable {
+    case unavailable          // binary missing / scan failed: error glyph
+    case attention(Int)       // decisionCount > 0: badge wins over everything below
+    case degraded(staleLeases: Int, supervisorDown: Bool)
+                              // design 2.4.1 badge: confirmed-stale lease or
+                              // Watchkeeper stopped; outranks live, below attention
+    case live(Int)            // liveCount > 0
+    case idle
+    case loading              // nothing fetched yet
+}
+
+public struct FleetDecodeResult: Equatable, Sendable {
+    public let rows: [FleetRow]
+    public let quarantined: [QuarantinedRow]
+    public let runs: [RunRow]
+}
+public enum FleetDecodeError: Error, LocalizedError, Equatable { case notAnObject, wrongKind(String) }
+public enum FleetDecoder {
+    /// Row-by-row lenient decode of the list envelope (JSONSerialization
+    /// split, so integers are never laundered into doubles).
+    public static func decodeList(_ data: Data) throws -> FleetDecodeResult
+}
+```
+
+Invariants (each tested):
+- AT THE GATE requires all three durable facts: `projection.phase == terminal` AND `projection.outcome == verified` AND `receipt.verified == valid`. An invalid or absent proof lands the row in WRECKED, unconditionally.
+- NEEDS REVIEW is terminal + `outcome == needs_review` (judge uncertain / asked for revision): an operator decision by definition (design C1: "ranked lower and painted amber, never hidden"). Its rows carry `needsDecision == true`, count into `decisionCount`, badge the menubar, and never claim a VERIFIED chip. The receipt.valid gate for AT THE GATE is unchanged.
+- WRECKED is every other terminal row (failed/blocked/cancelled/exhausted/proof-invalid); the row's own glossary words say which.
+- Unknown phase quarantines into the `unknown` section, never guessed, never crashed. A row that fails FleetRow decode costs exactly that row.
+- Ranking is durable facts only: decision-readiness first (decision-shaped waiting outranks within UNDERWAY; verifying_meaning outranks verifying_checks within APPROACHING as pipeline position), then recency. Gate counts NEVER rank (failed attempts have no marker and no counts).
+- Decision-shaped requires `phase == waiting`; the same stop reason on any other phase does not badge.
+- The rollup carries no semantic-judgment field, so the C1 judge chip is dropped (not re-derived from raw files). If `list --json` grows a judgment field, add it to FleetRow and surface the chip in the same change.
+- Legacy runs are counted, not queued: RunRow lacks the durable-Job facts the taxonomy speaks, so runs surface as a count until the v1.x voyage-tree/legacy surface. Plans/chains ride the envelope undecoded until then (unknown keys ignored).
+
+### Fleet engine (Services/FleetCLIClient.swift, Services/JobsWatcher.swift)
+
+```swift
+public protocol FleetCLIRunning: AnyObject {
+    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult
+    @discardableResult
+    func terminateInFlight(patience: TimeInterval) -> Int
+    /// Children still running; quit-time teardown polls this so the process
+    /// outlives its children (or their SIGKILL escalation).
+    var inFlightCount: Int { get }
+}
+public enum FleetCLIError: Error, LocalizedError, Equatable {
+    case binaryUnavailable(String)     // typed: locator failure words, verbatim
+}
+/// Locates via BinaryLocator (fail closed), tracks live CLIRunner children,
+/// SIGTERMs them all on demand. A hung child is terminated after `timeout`
+/// and reports its real exit.
+public final class DeadreckonCLIClient: FleetCLIRunning {
+    public init(workingDirectory: String, environment: [String: String])
+}
+
+public enum DeadreckonHome {                 // mirrors DeadreckonPaths::discover
+    public static func url() -> URL          // non-empty DEADRECKON_HOME env, else ~/.deadreckon
+    public static func jobsDirectory() -> URL
+}
+public protocol FleetWatching: AnyObject {
+    func start(onChange: @escaping () -> Void)
+    func stop()
+    var isActive: Bool { get }   // false after a no-op start (directory absent): retry later
+}
+/// FSEventStream over DEADRECKON_HOME/jobs only; a wake-up hint, never a
+/// read path (TAILING.md: polling is the mechanism). Watching the jobs
+/// subtree keeps gate-keys/ outside the watched path by construction
+/// (trust rule 3). Inert when the directory does not exist yet
+/// (isActive == false); FleetStore retries start after successful polls.
+/// Thread discipline: stream and onChange are confined to the private
+/// FSEvents delivery queue (start/stop/deinit tear down via queue.sync), so
+/// the callback's onChange read is ordered against mutation and no callback
+/// can outlive stop() — the unretained stream context is safe by construction.
+public final class JobsDirectoryWatcher: FleetWatching {
+    public init(directory: URL, latency: CFTimeInterval)
+}
+```
+
+### FleetStore (Services/FleetStore.swift)
+
+```swift
+@MainActor
+public final class FleetStore: ObservableObject {
+    public struct Cadence: Equatable, Sendable {   // injectable for tests
+        public var windowVisible: TimeInterval     // default 2 s
+        public var menubarOnly: TimeInterval       // default 10 s
+        public var harbor: TimeInterval            // default 60 s
+        public static let standard: Cadence
+    }
+    public enum FleetState: Equatable {
+        case loading
+        case loaded(GateQueue)
+        case unavailable(reason: String)   // typed; never fake rows
+    }
+    public struct HarborState: Equatable {
+        public enum Providers: Equatable { case unknown(String), counted(ok: Int, total: Int) }
+        public enum Supervisor: Equatable { case unknown(String), running, stopped(SupervisorInstallState) }
+        public enum Doctor: Equatable { case unknown(String), ok(warnings: Int), failed(Int) }
+        public var providers: Providers
+        public var supervisor: Supervisor
+        public var doctor: Doctor
+        public static let initial: HarborState
+    }
+
+    @Published public private(set) var fleet: FleetState
+    @Published public private(set) var harbor: HarborState
+    @Published public private(set) var lastRefreshed: Date?
+    @Published public private(set) var legacyRunCount: Int
+    @Published public private(set) var binaryVersion: String?
+    /// Debounced stale-lease verdicts: a job appears only after
+    /// staleLeaseConfirmationPolls consecutive stale reports of the same
+    /// epoch. Feeds LeaseDotView amber and the menubar degraded badge.
+    @Published public private(set) var confirmedStaleLeaseJobIDs: Set<String>
+    public static let staleLeaseConfirmationPolls: Int   // 2
+    public private(set) var windowVisible: Bool
+    public var menuBarState: MenuBarFleetState
+    public var supervisorDown: Bool                // true only for .stopped, never .unknown
+    public var inFlightChildren: Int               // cli.inFlightCount passthrough
+    public var queue: GateQueue                    // .empty unless loaded
+
+    public init(cli: FleetCLIRunning, watcher: FleetWatching?, cadence: Cadence)
+    public convenience init()                      // DeadreckonCLIClient + JobsDirectoryWatcher
+    public func start()
+    public func stop()
+    @discardableResult
+    public func shutdown(patience: TimeInterval) -> Int  // fence + stop + SIGTERM in-flight children
+    public func setWindowVisible(_ visible: Bool)  // reschedules cadence, refreshes immediately
+    public func refreshNow() async                 // one list --all --json poll, coalescing
+    public func refreshHarborNow() async           // providers + supervisor + doctor + --version
+}
+```
+
+Invariants (each tested in FleetStoreTests):
+- Polls `list --all --json`; FSEvents hints coalesce through refreshNow's in-flight guard so a burst cannot stack children.
+- Degradation ladder: binary missing / launch failure / nonzero list exit / undecodable envelope -> `.unavailable` with the failing surface's own words; one bad row -> quarantined, siblings survive; one bad Harbor surface -> that chip `.unknown` with THAT failure's words (a timeout says timeout, a decode failure says decode), independently.
+- The store reflects the latest poll: an unavailable poll replaces stale rows rather than presenting them as live.
+- Every fleet fact rendered comes off the M0 rollup row; nothing is re-derived from raw files that the rollup already joins.
+- Stale-lease debounce (design Bridge risk): one raw `fresh == false` poll never paints amber or badges; confirmation requires consecutive stale polls of the same job+epoch (an epoch change or fresh report resets). The unconfirmed render still says "no heartbeat Ns" in neutral ink — honest words, no false alarm, never an optimistic "fresh".
+- Teardown fence: after `shutdown()` no code path launches a child — queued follow-up refreshes, direct refresh calls, and mid-sweep Harbor stages are all guarded. The caller must keep the process alive until `inFlightChildren == 0` or past `patience` so the SIGKILL escalation can fire.
+- Poll loops re-bind `self` weakly each iteration and exit when the store is gone: a FleetStore discarded without stop() leaks no immortal sleep loop.
+- Watcher retry: after a successful poll, an inert watcher (`isActive == false`, jobs/ absent at launch) is started again, so the first job of a fresh home upgrades menubar latency from slow-cadence to FSEvents without a relaunch.
+
 ### Fleet read-models (Models/FleetRow.swift)
 
 ```swift
@@ -142,7 +405,8 @@ public struct RunRow: Codable, Equatable, Sendable {
     public let spend: FleetRow.Spend?
 }
 
-/// `list --json` top-level envelope. Plans/chains read-models land with APP-2.
+/// `list --json` top-level envelope. Plans/chains ride the envelope
+/// undecoded (rows-with-child-counts surface is v1.x per design 6.2 scope).
 public struct ListEnvelope: Codable, Equatable, Sendable {
     public let kind: String               // "list"
     public let id: String
@@ -291,7 +555,9 @@ public struct CLIRunResult: Sendable {
 /// One child process per invocation, never a pool. stdout/stderr parsed
 /// line-wise into one AsyncStream (trailing partial lines flushed at EOF).
 /// terminate() sends SIGTERM synchronously and escalates to SIGKILL only
-/// after `patience` (default 5 s).
+/// after `patience` (default 5 s). Mutable runner state (`launched`) is
+/// confined to the private queue (launch/terminate/isRunning all
+/// synchronize), ahead of the move to strict concurrency.
 public final class CLIRunner {
     public init(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String])
     public var events: AsyncStream<CLIRunnerEvent> { get }
@@ -336,7 +602,7 @@ Behavioral invariants (each has a test in JSONLTailerTests):
 - **Polling is the mechanism.** FSEvents is a wake-up hint only; the read path runs as written regardless.
 - Not thread-safe; exactly one owner polls a given tailer.
 
-Fleet cadence (APP-2, exemplar WatchSupervisor precedent): bounded tail fleet, max ~8 active tails with LRU eviction; background rows poll `list --json` at ~5 s; the focused job tails at heartbeat cadence.
+Fleet cadence (exemplar WatchSupervisor precedent): the queue home polls `list --all --json` at ~2 s while the window is visible and ~10 s menubar-only (FleetStore.Cadence, injectable). The bounded per-job tail fleet (max ~8 active tails, LRU eviction, focused job at heartbeat cadence) is APP-3 scope: the Gate Queue needs no tailing, only the rollup.
 
 ## Sources (app target)
 
@@ -345,16 +611,24 @@ The app target is views + shell only; anything testable lives in the Kit. Per-do
 ```swift
 /// LSUIElement menubar shell. Lazily-built NSWindow via NSHostingController;
 /// activation policy flips .accessory <-> .regular so the Dock icon appears
-/// only while the desktop window is open. No debug env-var UI hooks in the
-/// app delegate (a named exemplar scar).
+/// only while the desktop window is open. Owns the FleetStore: window
+/// visibility drives poll cadence (showMainWindow -> setWindowVisible(true),
+/// windowWillClose -> false). No debug env-var UI hooks in the app delegate
+/// (a named exemplar scar).
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    let fleet: FleetStore
     func showMainWindow()
+    // applicationShouldTerminate: fleet.shutdown(patience: 2); when children
+    // were signaled, .terminateLater and the reply waits until
+    // fleet.inFlightChildren == 0 or patience + 0.5 s has passed — so a
+    // SIGTERM-ignoring child still meets its in-process SIGKILL escalation
+    // instead of being orphaned by an early reply. Else .terminateNow.
 }
 ```
 
-Startup handshake (APP-2): `deadreckon --version` + `doctor --json` + schema-version check; refuse to operate on a `DEADRECKON_HOME` written by a newer binary than the vendored one.
+APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, `JobDetailStubView` APP-3 placeholder behind NavigationStack, `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Row actions are navigation only: no mutation verbs exist until APP-4's MutationRunner.
 
-Quit-time teardown (reserved; lands with the first phase that ships a long-running child): on quit, every live `CLIRunner` gets `terminate()` (synchronous SIGTERM, SIGKILL after patience) before the app exits — the exemplar `applicationShouldTerminate` pattern: return `.terminateLater`, reply once the fleet is down or the grace expires. APP-1 spawns nothing, so the hook is deliberately absent; any phase that adds a long-running child (APP-2 tail fleet helpers, APP-4 `MutationRunner`) must land it in the same change so children are never orphaned on quit.
+Startup handshake (partial, APP-2): `deadreckon --version` + `doctor --json` land as Harbor facts (version chip, doctor ok/warn/failed chip from the report's own finding counts). The schema-version refusal (refuse to operate on a `DEADRECKON_HOME` written by a newer binary than the vendored one) still needs a committed binary surface that reports the home's schema version; it lands with that surface, and until then the doctor chip is the honest health signal. **Rust-side gap, needs registering:** no gap-register entry (G1-G10) covers a home-schema-version surface; it fits `doctor --json` (a finding whose detail carries the home's schema version). Register it Rust-side before RELEASE so the section 9 refusal has a landing slot; tracked here until then.
 
 ## PENDING-M1 (do not build against until R-M1 lands)
 
