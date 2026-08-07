@@ -81,7 +81,17 @@ struct DeadreckonCommands: Commands {
             Button("Open in Terminal") {
                 if let row = liveOpenedRow {
                     let command = "deadreckon attach \(row.jobID)"
-                    Task { _ = await TerminalLauncher.launch(command: command) }
+                    Task {
+                        // The TCC Automation fallback must be visible on the
+                        // menu path too (CONTRACTS.md honesty standard): the
+                        // workbench rudder bar renders the copied note. This
+                        // item is enabled only with a workbench open, so the
+                        // surface exists whenever the note can fire.
+                        if await TerminalLauncher.launch(command: command) == .copiedToPasteboard {
+                            NotificationCenter.default.post(
+                                name: .deadreckonTerminalFallback, object: nil)
+                        }
+                    }
                 }
             }
             .keyboardShortcut("t", modifiers: .command)

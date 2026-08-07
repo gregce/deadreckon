@@ -11,6 +11,10 @@ import SwiftUI
 struct MenuBarPopover: View {
     @ObservedObject var store: FleetStore
     @ObservedObject var router: WriteSurfaceRouter
+    /// Deep-links: Inspect (and an underway row tap) open the main window
+    /// directly onto the job's workbench via `.openJob`, whose
+    /// pending-while-loading resolution GateQueueView already owns.
+    @ObservedObject var shell: ShellModel
     let openMainWindow: () -> Void
 
     var body: some View {
@@ -29,6 +33,11 @@ struct MenuBarPopover: View {
         }
         .frame(width: 360)
         .background(Theme.paper)
+        // A just-summoned popover must not ride the 10 s menubar-only
+        // cadence into the ten-second triage budget: refresh immediately.
+        // FleetStore's in-flight/queued coalescing makes this safe against
+        // poll overlap, mirroring showMainWindow's immediate refresh.
+        .task { await store.refreshNow() }
     }
 
     private var headerLine: some View {
@@ -64,7 +73,7 @@ struct MenuBarPopover: View {
             ForEach(decisions.prefix(4)) { item in
                 if let row = item.row {
                     PopoverDecisionRow(item: item, row: row, router: router,
-                                       openMainWindow: openMainWindow)
+                                       shell: shell, openMainWindow: openMainWindow)
                 }
             }
         }
@@ -73,7 +82,7 @@ struct MenuBarPopover: View {
             ForEach(underway.prefix(5)) { item in
                 if let row = item.row {
                     PopoverUnderwayRow(item: item, row: row, router: router,
-                                       openMainWindow: openMainWindow)
+                                       shell: shell, openMainWindow: openMainWindow)
                 }
             }
         }
@@ -86,10 +95,7 @@ struct MenuBarPopover: View {
     }
 
     private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(Theme.body(9.5, weight: .bold))
-            .kerning(0.6)
-            .foregroundStyle(Theme.inkTertiary)
+        Theme.sectionTitle(title)
             .padding(.horizontal, 6)
             .padding(.top, 6)
     }
@@ -169,11 +175,16 @@ private struct PopoverDecisionRow: View {
     let item: QueueItem
     let row: FleetRow
     @ObservedObject var router: WriteSurfaceRouter
+    @ObservedObject var shell: ShellModel
     let openMainWindow: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
+                if let provider = row.provider {
+                    ProviderIcon(provider: provider, size: 14)
+                        .help(provider)
+                }
                 Text(row.goal)
                     .font(Theme.body(11.5, weight: .medium))
                     .foregroundStyle(Theme.ink)
@@ -214,10 +225,16 @@ private struct PopoverDecisionRow: View {
                     .foregroundStyle(Theme.danger)
                     .help("Opens the kill confirmation with the real semantics. The popover never kills directly.")
                 }
-                Button("Inspect") { openMainWindow() }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.inkSecondary)
+                Button("Inspect") {
+                    // Deep-link onto THIS job's workbench, not whatever the
+                    // NavigationStack last showed (design A2's per-row
+                    // Inspect, the exemplar's two-click inspect path).
+                    openMainWindow()
+                    shell.request = .openJob(row.jobID)
+                }
+                .buttonStyle(.tactile)
+                .font(Theme.body(10.5))
+                .foregroundStyle(Theme.inkSecondary)
                 Spacer()
             }
         }
@@ -234,6 +251,7 @@ private struct PopoverUnderwayRow: View {
     let item: QueueItem
     let row: FleetRow
     @ObservedObject var router: WriteSurfaceRouter
+    @ObservedObject var shell: ShellModel
     let openMainWindow: () -> Void
 
     @StateObject private var quickSteer: QuickSteerController
@@ -241,10 +259,11 @@ private struct PopoverUnderwayRow: View {
     @State private var note = ""
 
     init(item: QueueItem, row: FleetRow, router: WriteSurfaceRouter,
-         openMainWindow: @escaping () -> Void) {
+         shell: ShellModel, openMainWindow: @escaping () -> Void) {
         self.item = item
         self.row = row
         self.router = router
+        self.shell = shell
         self.openMainWindow = openMainWindow
         _quickSteer = StateObject(
             wrappedValue: QuickSteerController(targetID: row.jobID, cli: WriteCLI.client))
@@ -252,15 +271,28 @@ private struct PopoverUnderwayRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text(row.goal)
-                    .font(Theme.body(11.5, weight: .medium))
-                    .foregroundStyle(Theme.ink)
-                    .lineLimit(1)
-                Spacer()
-                StatusChip(text: GlossaryText.phaseWord(row.projection.phase),
-                           color: Theme.inkSecondary)
+            // The row tap IS the inspect path (design A2): the window opens
+            // directly onto this job's workbench.
+            Button {
+                inspect()
+            } label: {
+                HStack(spacing: 6) {
+                    if let provider = row.provider {
+                        ProviderIcon(provider: provider, size: 14)
+                            .help(provider)
+                    }
+                    Text(row.goal)
+                        .font(Theme.body(11.5, weight: .medium))
+                        .foregroundStyle(Theme.ink)
+                        .lineLimit(1)
+                    Spacer()
+                    StatusChip(text: GlossaryText.phaseWord(row.projection.phase),
+                               color: Theme.inkSecondary)
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.tactileCard)
+            .help("Open the workbench on this job")
             HStack(spacing: 8) {
                 if let spend = row.spend {
                     Text(GlossaryText.spendLine(spend))
@@ -284,6 +316,10 @@ private struct PopoverUnderwayRow: View {
                 .buttonStyle(.tactile)
                 .font(Theme.body(10.5))
                 .foregroundStyle(Theme.danger)
+                Button("Inspect") { inspect() }
+                    .buttonStyle(.tactile)
+                    .font(Theme.body(10.5))
+                    .foregroundStyle(Theme.inkSecondary)
                 Spacer()
             }
             if expanded {
@@ -292,6 +328,11 @@ private struct PopoverUnderwayRow: View {
         }
         .padding(8)
         .cardChrome()
+    }
+
+    private func inspect() {
+        openMainWindow()
+        shell.request = .openJob(row.jobID)
     }
 
     @ViewBuilder private var quickSteerBody: some View {

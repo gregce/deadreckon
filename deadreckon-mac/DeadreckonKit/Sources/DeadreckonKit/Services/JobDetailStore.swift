@@ -172,6 +172,9 @@ public final class JobDetailStore: ObservableObject {
     private let home: URL
     private let cadence: Cadence
     private var pollTask: Task<Void, Never>?
+    /// Serializes ticks (loop and direct test calls alike) so the
+    /// single-owner tailer contract holds across the off-main-actor reads.
+    private var pollChain: Task<Void, Never>?
     private var tick = 0
     private var generation = 0
 
@@ -194,6 +197,10 @@ public final class JobDetailStore: ObservableObject {
     private var lastEventTimestamp: Date?
     private var newestErrorMessage: String?
     private var steerInboxCache: (size: UInt64, count: Int)?
+    /// Mtime-keyed (the steerInboxCache pattern): checkpoint creation adds
+    /// a subdirectory, bumping the directory mtime, so an unchanged mtime
+    /// skips up to 60 manifest re-reads per tick.
+    private var checkpointsCache: (mtime: Date, values: [CheckpointManifestDoc])?
     private var launchPlanCeilings: (runID: String, spendUSD: Double?, wallSeconds: Double?)?
 
     /// Test observability: how many tailers are currently live. The
@@ -270,6 +277,7 @@ public final class JobDetailStore: ObservableObject {
         lastEventTimestamp = nil
         newestErrorMessage = nil
         steerInboxCache = nil
+        checkpointsCache = nil
         supervisorOut = ""
         supervisorErr = ""
         supervisorOutTruncated = false
@@ -281,13 +289,47 @@ public final class JobDetailStore: ObservableObject {
 
     // MARK: - One tick (public for deterministic tests)
 
+    /// One tick, serialized through `pollChain`: the loop and any direct
+    /// test call run strictly one after another, so the single-owner tailer
+    /// contract holds across the off-main-actor reads. The generation is
+    /// captured at CALL time, so a tick queued behind an in-flight one when
+    /// close() lands becomes a no-op instead of launching a CLI child after
+    /// close.
     public func pollOnce() async {
         let myGeneration = generation
-        pollJobFiles()
+        let previous = pollChain
+        let task = Task { [weak self] in
+            await previous?.value
+            await self?.performPoll(myGeneration: myGeneration)
+        }
+        pollChain = task
+        await task.value
+    }
+
+    private func performPoll(myGeneration: Int) async {
+        guard generation == myGeneration else { return }
+
+        // Stage 1, off the main actor: the job-level file reads.
+        let jobDir = self.jobDir
+        let jobReads = await Task.detached(priority: .userInitiated) {
+            () -> (projection: JSONReadOutcome<JobProjectionDoc>, lease: JobLease?) in
+            (Self.readJSONOutcome(jobDir.appendingPathComponent("projection.json")),
+             Self.readJSON(jobDir.appendingPathComponent("lease.json")))
+        }.value
+        guard generation == myGeneration else { return }
+        applyProjectionOutcome(jobReads.projection)
+        lease = jobReads.lease
         resolveRunRootIfNeeded()
-        pollRunFiles()
-        pollTails()
-        deriveSpine()
+
+        // Stage 2, off the main actor: run-file reads, every tail poll, and
+        // all per-line JSONL decoding in one detached hop. Only derivation
+        // and the @Published assignments run back on the main actor — a
+        // multi-MB ledger's first read never beachballs workbench open.
+        let reads = await gatherTickReads()
+        guard generation == myGeneration else { return }
+        apply(reads)
+        deriveSpine(hasReshape: reads.hasReshape,
+                    pendingSteerCount: reads.pendingSteerCount)
         await foldPendingTurns(myGeneration: myGeneration)
         guard generation == myGeneration else { return }
 
@@ -352,6 +394,7 @@ public final class JobDetailStore: ObservableObject {
         lastEventTimestamp = nil
         newestErrorMessage = nil
         steerInboxCache = nil
+        checkpointsCache = nil
         activity = []
         rawEventLines = []
         rawEventsDropped = 0
@@ -372,9 +415,7 @@ public final class JobDetailStore: ObservableObject {
 
     // MARK: - File polls
 
-    private func pollJobFiles() {
-        let outcome: JSONReadOutcome<JobProjectionDoc> =
-            readJSONOutcome(jobDir.appendingPathComponent("projection.json"))
+    private func applyProjectionOutcome(_ outcome: JSONReadOutcome<JobProjectionDoc>) {
         switch outcome {
         case .absent:
             projection = nil
@@ -388,7 +429,6 @@ public final class JobDetailStore: ObservableObject {
             // wipe/rebuild every run tailer over a one-tick fs hiccup.
             projectionIssue = "projection.json unreadable this poll, keeping the last good read: \(reason)"
         }
-        lease = readJSON(jobDir.appendingPathComponent("lease.json"))
     }
 
     private func resolveRunRootIfNeeded() {
@@ -409,48 +449,412 @@ public final class JobDetailStore: ObservableObject {
         }
     }
 
-    private func pollRunFiles() {
-        guard let root = runRoot else { return }
-        runState = readJSON(root.appendingPathComponent("state.json"))
+    // MARK: - The gathered tick (all file I/O and line decode off-main)
 
-        if let runID = currentRunID, launchPlanCeilings?.runID != runID {
-            let plan = readRawJSON(root.appendingPathComponent("launch-plan.json"))
-            let budget = (plan?["budget"] as? [String: Any])
-            launchPlanCeilings = (
-                runID: runID,
-                spendUSD: (budget?["ceiling_usd"] as? NSNumber)?.doubleValue,
-                wallSeconds: (budget?["wall_seconds"] as? NSNumber)?.doubleValue)
+    /// Everything one stage-2 hop reads and decodes: run-root JSON docs,
+    /// all nine tail polls with their lines already decoded, and the
+    /// spine's file facts. Values only; the @Published assignments happen
+    /// back on the main actor in `apply(_:)`.
+    private func gatherTickReads() async -> DetailTickReads {
+        let root = runRoot
+        let runID = currentRunID
+        let needsLaunchPlan = runID != nil && launchPlanCeilings?.runID != runID
+        let priorLaunchPlan = launchPlanCeilings
+        let priorCheckpointsCache = checkpointsCache
+        let priorSteerCache = steerInboxCache
+        let jobEventsTailer = self.jobEventsTailer
+        let eventsTailer = self.eventsTailer
+        let tracesTailer = self.tracesTailer
+        let spendTailer = self.spendTailer
+        let flightEventsTailer = self.flightEventsTailer
+        let snapshotsTailer = self.snapshotsTailer
+        let progressTailer = self.progressTailer
+        let supervisorOutTailer = self.supervisorOutTailer
+        let supervisorErrTailer = self.supervisorErrTailer
+
+        return await Task.detached(priority: .userInitiated) { () -> DetailTickReads in
+            var reads = DetailTickReads()
+            if let root {
+                reads.hasRunRoot = true
+                reads.runState = Self.readJSON(root.appendingPathComponent("state.json"))
+                if needsLaunchPlan, let runID {
+                    let plan = Self.readRawJSON(root.appendingPathComponent("launch-plan.json"))
+                    let budget = plan?["budget"] as? [String: Any]
+                    reads.launchPlanCeilings = (
+                        runID: runID,
+                        spendUSD: (budget?["ceiling_usd"] as? NSNumber)?.doubleValue,
+                        wallSeconds: (budget?["wall_seconds"] as? NSNumber)?.doubleValue)
+                } else {
+                    reads.launchPlanCeilings = priorLaunchPlan
+                }
+                reads.narrativeStateDoc = Self.readJSON(
+                    root.appendingPathComponent("narrative").appendingPathComponent("state.json"))
+                reads.flightManifest = Self.readJSON(root.appendingPathComponent("flight-manifest.json"))
+                let checkpoints = Self.listCheckpoints(root: root, cache: priorCheckpointsCache)
+                reads.checkpoints = checkpoints.values
+                reads.checkpointsCache = checkpoints.cache
+                reads.docs = Self.listDocs(workingDir: reads.runState?.workingDir)
+                reads.hasReshape = Self.hasReshapeProposal(root: root)
+                let steers = Self.pendingSteers(root: root, cache: priorSteerCache)
+                reads.pendingSteerCount = steers.count
+                reads.steerInboxCache = steers.cache
+            }
+            if let tailer = jobEventsTailer {
+                let poll = tailer.poll()
+                reads.jobEvents = (poll, tailer.lastSequence, tailer.hasRetainedTail)
+            }
+            if let tailer = eventsTailer { reads.events = Self.decodeEventsPoll(tailer.poll()) }
+            if let tailer = tracesTailer { reads.traces = Self.decodeTracesPoll(tailer.poll()) }
+            if let tailer = spendTailer { reads.spend = Self.decodeSpendPoll(tailer.poll()) }
+            if let tailer = flightEventsTailer {
+                reads.flightEvents = Self.decodeFlightPoll(tailer.poll())
+            }
+            if let tailer = snapshotsTailer {
+                reads.snapshots = Self.decodeSnapshotsPoll(tailer.poll())
+            }
+            if let tailer = progressTailer {
+                reads.progress = Self.decodeProgressPoll(tailer.poll())
+            }
+            reads.supervisorOut = supervisorOutTailer?.poll()
+            reads.supervisorErr = supervisorErrTailer?.poll()
+            return reads
+        }.value
+    }
+
+    /// Fold one tick's gathered values into the published state (main
+    /// actor, O(new rows), no file I/O and no JSON parsing here).
+    private func apply(_ reads: DetailTickReads) {
+        if reads.hasRunRoot {
+            runState = reads.runState
+            launchPlanCeilings = reads.launchPlanCeilings
+            checkpointsCache = reads.checkpointsCache
+            steerInboxCache = reads.steerInboxCache
+            docs = reads.docs
+
+            var pane = narrative
+            pane.stateDoc = reads.narrativeStateDoc
+            pane.staleness = NarrativeStaleness.from(
+                createdAt: pane.latestSnapshot?.createdAt ?? pane.stateDoc?.latestCreatedAt,
+                now: nowProvider())
+            narrative = pane
+
+            var flightState = flight
+            flightState.manifest = reads.flightManifest
+            flightState.checkpoints = reads.checkpoints
+            flight = flightState
         }
+        if let jobEvents = reads.jobEvents {
+            integrity = JobEventsIntegrity.derive(
+                previous: integrity, poll: jobEvents.poll, lastSequence: jobEvents.lastSequence)
+            jobEventsTornTail = jobEvents.tornTail
+        }
+        if let events = reads.events { applyEvents(events) }
+        if let traces = reads.traces { applyTraces(traces) }
+        if let spend = reads.spend { applySpend(spend) }
+        if let flightEvents = reads.flightEvents { applyFlightEvents(flightEvents) }
+        if let snapshots = reads.snapshots { applySnapshots(snapshots) }
+        if let progress = reads.progress { applyProgress(progress) }
+        applySupervisor(out: reads.supervisorOut, err: reads.supervisorErr)
+    }
 
+    private func applyEvents(_ payload: DetailEventsPayload) {
+        if let corrupt = payload.corrupt {
+            // Strict file: report, stop trusting; existing scrollback stays.
+            activityIssue = corrupt
+        }
+        guard !payload.rows.isEmpty else { return }
+        for row in payload.rows {
+            rawEventLines.append(row.line)
+            let ordinal = activity.count + 1
+            if let record = row.record {
+                pendingTurnEvents.append(record)
+                lastEventTimestamp = record.timestamp
+                if record.event.kind == "error" {
+                    newestErrorMessage = record.event.message
+                }
+                if record.event.kind == "steer_delivered" {
+                    steerDeliveries.append(SteerDeliveredFact(
+                        turn: record.event.turn,
+                        queuedAtRaw: record.event.queuedAt,
+                        preview: record.event.preview))
+                }
+                activity.append(ActivityEntry(
+                    ordinal: ordinal, timestamp: record.timestamp, line: record.activityLine))
+            } else {
+                // A schema-conformant ledger line we cannot model yet:
+                // show the raw fact rather than dropping or guessing.
+                activity.append(ActivityEntry(ordinal: ordinal, timestamp: nil, line: row.line))
+            }
+        }
+        trimRawEventLines()
+    }
+
+    private func trimRawEventLines() {
+        guard rawEventLines.count > Self.rawEventLineCeiling + Self.rawEventLineSlack else { return }
+        let overflow = rawEventLines.count - Self.rawEventLineCeiling
+        rawEventLines.removeFirst(overflow)
+        rawEventsDropped += overflow
+    }
+
+    private func applyTraces(_ payload: DetailTracesPayload) {
+        if let corrupt = payload.corrupt { tracesIssue = corrupt }
+        pendingTurnTraces.append(contentsOf: payload.rows)
+    }
+
+    private func applySpend(_ payload: DetailSpendPayload) {
+        if let corrupt = payload.corrupt { spendIssue = corrupt }
+        guard !payload.records.isEmpty else { return }
+        var meter = spendMeter
+        for record in payload.records {
+            meter.recordCount += 1
+            if record.kind == "narrator" {
+                meter.narratorTotalUSD += record.costUSD
+            } else if record.kind == "loop" {
+                meter.loopTotalUSD = record.totalCostUSD
+                meter.lastLoopTurn = record.turn
+                if let cap = record.capUSD { meter.capUSD = cap }
+            }
+        }
+        spendMeter = meter
+    }
+
+    private func applyFlightEvents(_ payload: DetailFlightPayload) {
+        if let corrupt = payload.corrupt {
+            flightIssue = corrupt
+            return
+        }
+        guard payload.lineCount > 0 else { return }
+        var flightState = flight
+        flightState.eventCount += payload.lineCount
+        if let summary = payload.lastSummary {
+            flightState.lastEventSummary = summary
+        }
+        flight = flightState
+    }
+
+    private func applySnapshots(_ payload: DetailSnapshotsPayload) {
         var pane = narrative
-        pane.stateDoc = readJSON(
-            root.appendingPathComponent("narrative").appendingPathComponent("state.json"))
+        if payload.restarted {
+            // The unblessed file was rewritten or shrank: re-fold the whole
+            // fresh read instead of freezing (self-healing, still honest:
+            // the pane reflects exactly what the file now says).
+            pane.latestSnapshot = nil
+            pane.latestDeterministic = nil
+            pane.skippedMalformedRows = 0
+        }
+        for row in payload.rows {
+            guard let snapshot = row else {
+                pane.skippedMalformedRows += 1
+                continue
+            }
+            pane.latestSnapshot = snapshot
+            if !snapshot.isUnverifiedOverlay {
+                pane.latestDeterministic = snapshot
+            }
+        }
         pane.staleness = NarrativeStaleness.from(
             createdAt: pane.latestSnapshot?.createdAt ?? pane.stateDoc?.latestCreatedAt,
             now: nowProvider())
         narrative = pane
-
-        var flightState = flight
-        flightState.manifest = readJSON(root.appendingPathComponent("flight-manifest.json"))
-        flightState.checkpoints = listCheckpoints(root: root)
-        flight = flightState
-
-        docs = listDocs()
     }
 
-    private func listCheckpoints(root: URL) -> [CheckpointManifestDoc] {
-        let dir = root.appendingPathComponent("checkpoints")
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
-            return []
+    private func applyProgress(_ payload: DetailProgressPayload) {
+        if payload.restarted {
+            // New gate attempt or sign-time rewrite: discard retained rows,
+            // the fresh read is the whole current attempt (TAILING.md rule).
+            liveChecks = payload.rows
+        } else {
+            liveChecks.append(contentsOf: payload.rows)
         }
-        return names.sorted().suffix(60).compactMap { name in
-            readJSON(dir.appendingPathComponent(name).appendingPathComponent("manifest.json"))
+    }
+
+    private func applySupervisor(out: TextFileTailer.PollResult?,
+                                 err: TextFileTailer.PollResult?) {
+        if let out {
+            switch out {
+            case .none: break
+            case .appended(let text):
+                let (trimmed, dropped) = Self.trimSupervisorText(supervisorOut + text)
+                supervisorOut = trimmed
+                supervisorOutTruncated = supervisorOutTruncated || dropped
+            case .reset(let text):
+                let (trimmed, dropped) = Self.trimSupervisorText(text)
+                supervisorOut = trimmed
+                supervisorOutTruncated = dropped
+            }
+        }
+        if let err {
+            switch err {
+            case .none: break
+            case .appended(let text):
+                let (trimmed, dropped) = Self.trimSupervisorText(supervisorErr + text)
+                supervisorErr = trimmed
+                supervisorErrTruncated = supervisorErrTruncated || dropped
+            case .reset(let text):
+                let (trimmed, dropped) = Self.trimSupervisorText(text)
+                supervisorErr = trimmed
+                supervisorErrTruncated = dropped
+            }
+        }
+    }
+
+    // MARK: - Off-main decode helpers (values in, values out)
+
+    nonisolated private static func decodeEventsPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailEventsPayload? {
+        switch poll {
+        case .none, .restarted:
+            return nil
+        case .corrupt(let reason):
+            return DetailEventsPayload(corrupt: reason, rows: [])
+        case .lines(let lines):
+            let decoder = DeadreckonJSON.decoder()
+            let rows = lines.map { line -> DetailEventsPayload.Row in
+                guard let data = line.data(using: .utf8),
+                      let record = try? decoder.decode(RunEventRecord.self, from: data) else {
+                    return DetailEventsPayload.Row(line: line, record: nil)
+                }
+                return DetailEventsPayload.Row(line: line, record: record)
+            }
+            return DetailEventsPayload(corrupt: nil, rows: rows)
+        }
+    }
+
+    nonisolated private static func decodeTracesPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailTracesPayload? {
+        switch poll {
+        case .none, .restarted:
+            return nil
+        case .corrupt(let reason):
+            return DetailTracesPayload(corrupt: reason, rows: [])
+        case .lines(let lines):
+            let decoder = DeadreckonJSON.decoder()
+            let rows = lines.compactMap { line -> TraceRow? in
+                guard let data = line.data(using: .utf8) else { return nil }
+                return try? decoder.decode(TraceRow.self, from: data)
+            }
+            return DetailTracesPayload(corrupt: nil, rows: rows)
+        }
+    }
+
+    nonisolated private static func decodeSpendPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailSpendPayload? {
+        switch poll {
+        case .none, .restarted:
+            return nil
+        case .corrupt(let reason):
+            return DetailSpendPayload(corrupt: reason, records: [])
+        case .lines(let lines):
+            let decoder = DeadreckonJSON.decoder()
+            let records = lines.compactMap { line -> SpendRecord? in
+                guard let data = line.data(using: .utf8) else { return nil }
+                return try? decoder.decode(SpendRecord.self, from: data)
+            }
+            return DetailSpendPayload(corrupt: nil, records: records)
+        }
+    }
+
+    nonisolated private static func decodeFlightPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailFlightPayload? {
+        switch poll {
+        case .none, .restarted:
+            return nil
+        case .corrupt(let reason):
+            return DetailFlightPayload(corrupt: reason)
+        case .lines(let lines):
+            var payload = DetailFlightPayload()
+            payload.lineCount = lines.count
+            if let last = lines.last,
+               let data = last.data(using: .utf8),
+               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let summary = object["summary"] as? String {
+                payload.lastSummary = summary
+            }
+            return payload
+        }
+    }
+
+    nonisolated private static func decodeSnapshotsPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailSnapshotsPayload? {
+        switch poll {
+        case .none, .corrupt:
+            // .corrupt cannot happen in restart-on-anomaly mode; ignore.
+            return nil
+        case .lines(let lines):
+            return DetailSnapshotsPayload(restarted: false, rows: decodeSnapshotRows(lines))
+        case .restarted(let lines):
+            return DetailSnapshotsPayload(restarted: true, rows: decodeSnapshotRows(lines))
+        }
+    }
+
+    nonisolated private static func decodeSnapshotRows(_ lines: [String]) -> [NarrativeSnapshotDoc?] {
+        let decoder = DeadreckonJSON.decoder()
+        return lines.map { line -> NarrativeSnapshotDoc? in
+            guard let data = line.data(using: .utf8) else { return nil }
+            return try? decoder.decode(NarrativeSnapshotDoc.self, from: data)
+        }
+    }
+
+    nonisolated private static func decodeProgressPoll(
+        _ poll: JSONLTailer.PollResult
+    ) -> DetailProgressPayload? {
+        switch poll {
+        case .none, .corrupt:
+            // .corrupt cannot happen in acceptanceProgress mode; ignore.
+            return nil
+        case .lines(let lines):
+            return DetailProgressPayload(restarted: false, rows: decodeProgress(lines))
+        case .restarted(let lines):
+            return DetailProgressPayload(restarted: true, rows: decodeProgress(lines))
+        }
+    }
+
+    nonisolated private static func decodeProgress(_ lines: [String]) -> [AcceptanceProgressRow] {
+        let decoder = DeadreckonJSON.decoder()
+        return lines.compactMap { line in
+            guard let data = line.data(using: .utf8) else { return nil }
+            return try? decoder.decode(AcceptanceProgressRow.self, from: data)
+        }
+    }
+
+    // MARK: - Off-main file facts
+
+    nonisolated private static func listCheckpoints(
+        root: URL, cache: (mtime: Date, values: [CheckpointManifestDoc])?
+    ) -> (values: [CheckpointManifestDoc], cache: (mtime: Date, values: [CheckpointManifestDoc])?) {
+        let dir = root.appendingPathComponent("checkpoints")
+        let mtime = (try? FileManager.default.attributesOfItem(atPath: dir.path))?[
+            .modificationDate] as? Date
+        // Mtime-keyed cache (the steerInboxCache pattern): a new checkpoint
+        // adds a subdirectory and bumps the directory mtime, so an unchanged
+        // mtime skips up to 60 manifest re-reads per tick.
+        if let cache, let mtime, cache.mtime == mtime {
+            return (cache.values, cache)
+        }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
+            return ([], nil)
+        }
+        let considered = names.sorted().suffix(60)
+        let values = considered.compactMap { name in
+            Self.readJSON(dir.appendingPathComponent(name).appendingPathComponent("manifest.json"))
                 as CheckpointManifestDoc?
         }
+        // Cache only a fully-decoded listing: a checkpoint whose manifest is
+        // still landing keeps being re-read until it decodes (the directory
+        // mtime moved at subdirectory creation, not at manifest write).
+        if let mtime, values.count == considered.count {
+            return (values, (mtime, values))
+        }
+        return (values, nil)
     }
 
-    private func listDocs() -> [DocEntry] {
-        guard let workingDir = runState?.workingDir, !workingDir.isEmpty else { return [] }
+    nonisolated private static func listDocs(workingDir: String?) -> [DocEntry] {
+        guard let workingDir, !workingDir.isEmpty else { return [] }
         let dir = URL(fileURLWithPath: workingDir)
             .appendingPathComponent(".deadreckon").appendingPathComponent("docs")
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else {
@@ -465,229 +869,6 @@ public final class JobDetailStore: ObservableObject {
                 path: path,
                 bytes: (attributes[.size] as? NSNumber)?.intValue ?? 0,
                 modifiedAt: attributes[.modificationDate] as? Date)
-        }
-    }
-
-    // MARK: - Tail polls
-
-    private func pollTails() {
-        pollJobEvents()
-        pollActivity()
-        pollTraces()
-        pollSpend()
-        pollFlightEvents()
-        pollSnapshots()
-        pollAcceptanceProgress()
-        pollSupervisorTails()
-    }
-
-    private func pollJobEvents() {
-        guard let tailer = jobEventsTailer else { return }
-        let result = tailer.poll()
-        integrity = JobEventsIntegrity.derive(
-            previous: integrity, poll: result, lastSequence: tailer.lastSequence)
-        jobEventsTornTail = tailer.hasRetainedTail
-    }
-
-    private func pollActivity() {
-        guard let tailer = eventsTailer else { return }
-        switch tailer.poll() {
-        case .none, .restarted:
-            break
-        case .corrupt(let reason):
-            // Strict file: report, stop trusting; existing scrollback stays.
-            activityIssue = reason
-        case .lines(let lines):
-            let decoder = DeadreckonJSON.decoder()
-            for line in lines {
-                rawEventLines.append(line)
-                let ordinal = activity.count + 1
-                if let data = line.data(using: .utf8),
-                   let record = try? decoder.decode(RunEventRecord.self, from: data) {
-                    pendingTurnEvents.append(record)
-                    lastEventTimestamp = record.timestamp
-                    if record.event.kind == "error" {
-                        newestErrorMessage = record.event.message
-                    }
-                    if record.event.kind == "steer_delivered" {
-                        steerDeliveries.append(SteerDeliveredFact(
-                            turn: record.event.turn,
-                            queuedAtRaw: record.event.queuedAt,
-                            preview: record.event.preview))
-                    }
-                    activity.append(ActivityEntry(
-                        ordinal: ordinal, timestamp: record.timestamp, line: record.activityLine))
-                } else {
-                    // A schema-conformant ledger line we cannot model yet:
-                    // show the raw fact rather than dropping or guessing.
-                    activity.append(ActivityEntry(ordinal: ordinal, timestamp: nil, line: line))
-                }
-            }
-            trimRawEventLines()
-        }
-    }
-
-    private func trimRawEventLines() {
-        guard rawEventLines.count > Self.rawEventLineCeiling + Self.rawEventLineSlack else { return }
-        let overflow = rawEventLines.count - Self.rawEventLineCeiling
-        rawEventLines.removeFirst(overflow)
-        rawEventsDropped += overflow
-    }
-
-    private func pollTraces() {
-        guard let tailer = tracesTailer else { return }
-        switch tailer.poll() {
-        case .none, .restarted:
-            break
-        case .corrupt(let reason):
-            tracesIssue = reason
-        case .lines(let lines):
-            let decoder = DeadreckonJSON.decoder()
-            for line in lines {
-                if let data = line.data(using: .utf8),
-                   let row = try? decoder.decode(TraceRow.self, from: data) {
-                    pendingTurnTraces.append(row)
-                }
-            }
-        }
-    }
-
-    private func pollSpend() {
-        guard let tailer = spendTailer else { return }
-        switch tailer.poll() {
-        case .none, .restarted:
-            break
-        case .corrupt(let reason):
-            spendIssue = reason
-        case .lines(let lines):
-            let decoder = DeadreckonJSON.decoder()
-            var meter = spendMeter
-            for line in lines {
-                guard let data = line.data(using: .utf8),
-                      let record = try? decoder.decode(SpendRecord.self, from: data) else { continue }
-                meter.recordCount += 1
-                if record.kind == "narrator" {
-                    meter.narratorTotalUSD += record.costUSD
-                } else if record.kind == "loop" {
-                    meter.loopTotalUSD = record.totalCostUSD
-                    meter.lastLoopTurn = record.turn
-                    if let cap = record.capUSD { meter.capUSD = cap }
-                }
-            }
-            spendMeter = meter
-        }
-    }
-
-    private func pollFlightEvents() {
-        guard let tailer = flightEventsTailer else { return }
-        switch tailer.poll() {
-        case .none, .restarted:
-            break
-        case .corrupt(let reason):
-            flightIssue = reason
-        case .lines(let lines):
-            var flightState = flight
-            flightState.eventCount += lines.count
-            if let last = lines.last,
-               let data = last.data(using: .utf8),
-               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let summary = object["summary"] as? String {
-                flightState.lastEventSummary = summary
-            }
-            flight = flightState
-        }
-    }
-
-    private func pollSnapshots() {
-        guard let tailer = snapshotsTailer else { return }
-        switch tailer.poll() {
-        case .none, .corrupt:
-            // .corrupt cannot happen in restart-on-anomaly mode; ignore.
-            break
-        case .lines(let lines):
-            var pane = narrative
-            foldSnapshots(lines, into: &pane)
-            narrative = pane
-        case .restarted(let lines):
-            // The unblessed file was rewritten or shrank: re-fold the whole
-            // fresh read instead of freezing (self-healing, still honest:
-            // the pane reflects exactly what the file now says).
-            var pane = narrative
-            pane.latestSnapshot = nil
-            pane.latestDeterministic = nil
-            pane.skippedMalformedRows = 0
-            foldSnapshots(lines, into: &pane)
-            narrative = pane
-        }
-    }
-
-    private func foldSnapshots(_ lines: [String], into pane: inout NarrativePane) {
-        let decoder = DeadreckonJSON.decoder()
-        for line in lines {
-            guard let data = line.data(using: .utf8),
-                  let snapshot = try? decoder.decode(NarrativeSnapshotDoc.self, from: data) else {
-                pane.skippedMalformedRows += 1
-                continue
-            }
-            pane.latestSnapshot = snapshot
-            if !snapshot.isUnverifiedOverlay {
-                pane.latestDeterministic = snapshot
-            }
-        }
-        pane.staleness = NarrativeStaleness.from(
-            createdAt: pane.latestSnapshot?.createdAt ?? pane.stateDoc?.latestCreatedAt,
-            now: nowProvider())
-    }
-
-    private func pollAcceptanceProgress() {
-        guard let tailer = progressTailer else { return }
-        switch tailer.poll() {
-        case .none, .corrupt:
-            // .corrupt cannot happen in acceptanceProgress mode; ignore.
-            break
-        case .lines(let lines):
-            liveChecks.append(contentsOf: decodeProgress(lines))
-        case .restarted(let lines):
-            // New gate attempt or sign-time rewrite: discard retained rows,
-            // the fresh read is the whole current attempt (TAILING.md rule).
-            liveChecks = decodeProgress(lines)
-        }
-    }
-
-    private func decodeProgress(_ lines: [String]) -> [AcceptanceProgressRow] {
-        let decoder = DeadreckonJSON.decoder()
-        return lines.compactMap { line in
-            guard let data = line.data(using: .utf8) else { return nil }
-            return try? decoder.decode(AcceptanceProgressRow.self, from: data)
-        }
-    }
-
-    private func pollSupervisorTails() {
-        if let tailer = supervisorOutTailer {
-            switch tailer.poll() {
-            case .none: break
-            case .appended(let text):
-                let (trimmed, dropped) = Self.trimSupervisorText(supervisorOut + text)
-                supervisorOut = trimmed
-                supervisorOutTruncated = supervisorOutTruncated || dropped
-            case .reset(let text):
-                let (trimmed, dropped) = Self.trimSupervisorText(text)
-                supervisorOut = trimmed
-                supervisorOutTruncated = dropped
-            }
-        }
-        if let tailer = supervisorErrTailer {
-            switch tailer.poll() {
-            case .none: break
-            case .appended(let text):
-                let (trimmed, dropped) = Self.trimSupervisorText(supervisorErr + text)
-                supervisorErr = trimmed
-                supervisorErrTruncated = supervisorErrTruncated || dropped
-            case .reset(let text):
-                let (trimmed, dropped) = Self.trimSupervisorText(text)
-                supervisorErr = trimmed
-                supervisorErrTruncated = dropped
-            }
         }
     }
 
@@ -731,12 +912,13 @@ public final class JobDetailStore: ObservableObject {
 
     // MARK: - Spine
 
-    private func deriveSpine() {
+    /// Main-actor derivation over this tick's gathered file facts (the
+    /// reshape presence and pending-steer count were read off-main).
+    private func deriveSpine(hasReshape: Bool, pendingSteerCount: Int) {
         guard let state = runState else {
             spine = nil
             return
         }
-        let hasReshape = hasReshapeProposal()
         let inputs = RunSpineInputs(
             runID: state.runID,
             status: state.status,
@@ -754,7 +936,7 @@ public final class JobDetailStore: ObservableObject {
             newestEventTimestamp: lastEventTimestamp,
             newestErrorMessage: newestErrorMessage,
             hasReshapeProposal: hasReshape,
-            pendingSteerCount: pendingSteerCount())
+            pendingSteerCount: pendingSteerCount)
         var snapshot = SpineDerivation.deriveRun(inputs, now: nowProvider())
         // Job altitude for NEXT (design 1.2): every Chartroom attempt is a
         // job-owned run, and public `resume` on a job-owned run is refused
@@ -773,35 +955,33 @@ public final class JobDetailStore: ObservableObject {
         spine = snapshot
     }
 
-    private func hasReshapeProposal() -> Bool {
-        guard let root = runRoot else { return false }
+    nonisolated private static func hasReshapeProposal(root: URL) -> Bool {
         let url = root.appendingPathComponent("reshape-proposal.json")
         guard let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) else { return false }
         return object is [String: Any]
     }
 
-    private func pendingSteerCount() -> Int {
-        guard let root = runRoot else { return 0 }
+    nonisolated private static func pendingSteers(
+        root: URL, cache: (size: UInt64, count: Int)?
+    ) -> (count: Int, cache: (size: UInt64, count: Int)?) {
         let url = root.appendingPathComponent("steer-inbox.jsonl")
         guard let size = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size]
             as? NSNumber)?.uint64Value else {
-            steerInboxCache = nil
-            return 0
+            return (0, nil)
         }
         // Size-keyed cache: the inbox is append-only and status flips change
         // the byte count, so an unchanged size skips the full re-read.
-        if let cache = steerInboxCache, cache.size == size { return cache.count }
+        if let cache, cache.size == size { return (cache.count, cache) }
         guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return 0 }
+              let text = String(data: data, encoding: .utf8) else { return (0, nil) }
         let count = text.split(separator: "\n").reduce(into: 0) { count, line in
             guard let lineData = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   (object["status"] as? String) == "pending" else { return }
             count += 1
         }
-        steerInboxCache = (size, count)
-        return count
+        return (count, (size, count))
     }
 
     // MARK: - CLI reads
@@ -926,18 +1106,12 @@ public final class JobDetailStore: ObservableObject {
         }
     }
 
-    // MARK: - JSON file helpers
-
-    private enum JSONReadOutcome<T> {
-        case absent
-        case value(T)
-        case unreadable(String)
-    }
+    // MARK: - JSON file helpers (nonisolated: they run in the detached hops)
 
     /// Typed read distinguishing "file does not exist" (an honest absence)
     /// from "exists but unreadable/undecodable" (a transient to ride out
     /// with the last good value, never a fabricated absence).
-    private func readJSONOutcome<T: Decodable>(_ url: URL) -> JSONReadOutcome<T> {
+    nonisolated private static func readJSONOutcome<T: Decodable>(_ url: URL) -> JSONReadOutcome<T> {
         let data: Data
         do {
             data = try Data(contentsOf: url)
@@ -956,13 +1130,85 @@ public final class JobDetailStore: ObservableObject {
         }
     }
 
-    private func readJSON<T: Decodable>(_ url: URL) -> T? {
+    nonisolated private static func readJSON<T: Decodable>(_ url: URL) -> T? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? DeadreckonJSON.decoder().decode(T.self, from: data)
     }
 
-    private func readRawJSON(_ url: URL) -> [String: Any]? {
+    nonisolated private static func readRawJSON(_ url: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
+}
+
+// MARK: - Tick payloads (file scope: constructed inside the detached hops,
+// so they carry no main-actor isolation)
+
+private enum JSONReadOutcome<T> {
+    case absent
+    case value(T)
+    case unreadable(String)
+}
+
+/// One stage-2 hop's gathered values (see JobDetailStore.gatherTickReads).
+private struct DetailTickReads {
+    var hasRunRoot = false
+    var runState: RunStateDoc?
+    var launchPlanCeilings: (runID: String, spendUSD: Double?, wallSeconds: Double?)?
+    var narrativeStateDoc: NarrativeStateDoc?
+    var flightManifest: FlightManifestDoc?
+    var checkpoints: [CheckpointManifestDoc] = []
+    var checkpointsCache: (mtime: Date, values: [CheckpointManifestDoc])?
+    var docs: [DocEntry] = []
+    var hasReshape = false
+    var pendingSteerCount = 0
+    var steerInboxCache: (size: UInt64, count: Int)?
+    var jobEvents: (poll: JSONLTailer.PollResult, lastSequence: UInt64, tornTail: Bool)?
+    var events: DetailEventsPayload?
+    var traces: DetailTracesPayload?
+    var spend: DetailSpendPayload?
+    var flightEvents: DetailFlightPayload?
+    var snapshots: DetailSnapshotsPayload?
+    var progress: DetailProgressPayload?
+    var supervisorOut: TextFileTailer.PollResult?
+    var supervisorErr: TextFileTailer.PollResult?
+}
+
+private struct DetailEventsPayload {
+    struct Row {
+        let line: String
+        /// nil when the line does not model yet: shown raw rather than
+        /// dropped or guessed.
+        let record: RunEventRecord?
+    }
+
+    var corrupt: String?
+    var rows: [Row] = []
+}
+
+private struct DetailTracesPayload {
+    var corrupt: String?
+    var rows: [TraceRow] = []
+}
+
+private struct DetailSpendPayload {
+    var corrupt: String?
+    var records: [SpendRecord] = []
+}
+
+private struct DetailFlightPayload {
+    var corrupt: String?
+    var lineCount = 0
+    var lastSummary: String?
+}
+
+private struct DetailSnapshotsPayload {
+    var restarted = false
+    /// nil element = malformed row (counted, never guessed at).
+    var rows: [NarrativeSnapshotDoc?] = []
+}
+
+private struct DetailProgressPayload {
+    var restarted = false
+    var rows: [AcceptanceProgressRow] = []
 }

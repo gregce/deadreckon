@@ -172,7 +172,8 @@ struct DeadreckonApp: App {
             // Kill/Promote/Send back items that open the window directly
             // onto the respective confirmation sheet. The .window style
             // hosts the real controls a menu cannot.
-            MenuBarPopover(store: appDelegate.fleet, router: appDelegate.writeRouter) {
+            MenuBarPopover(store: appDelegate.fleet, router: appDelegate.writeRouter,
+                           shell: appDelegate.shell) {
                 appDelegate.showMainWindow()
             }
         } label: {
@@ -215,9 +216,16 @@ struct MenuBarGlyph: View {
         case .unavailable:
             Image(systemName: "exclamationmark.triangle")
         case .attention(let count):
-            // A template glyph with a count is the honest badge: the number
-            // of decisions waiting, not a colored guess.
-            Image(systemName: "\(min(count, 50)).circle.fill")
+            // The helm keeps the app's identity in the state the operator
+            // most needs to FIND it; the decision count rides beside it as
+            // the honest badge (a number, never a colored guess). An
+            // anonymous "N.circle" glyph read as a different app entirely.
+            HStack(spacing: 2) {
+                identityGlyph
+                Text("\(min(count, 50))")
+                    .font(.system(size: 11, weight: .semibold))
+                    .monospacedDigit()
+            }
         case .degraded:
             // Amber-class attention without a decision count: a confirmed
             // stale lease or the Watchkeeper down (design 2.4.1). Distinct
@@ -226,13 +234,21 @@ struct MenuBarGlyph: View {
         case .live:
             // The live variant: visually distinct from the idle helm while
             // anything runs or verifies (the exemplar's live-icon pattern).
+            // The helm-to-sailboat shape swap is a deliberate divergence,
+            // recorded in CONTRACTS.md.
             Image(systemName: "sailboat.fill")
         case .idle, .loading:
-            if anchorSymbolAvailable {
-                Image(systemName: "helm")
-            } else {
-                Text("\u{2693}\u{FE0E}")
-            }
+            identityGlyph
+        }
+    }
+
+    /// The brand anchor: the helm, or the anchor text glyph where the SF
+    /// symbol is unavailable.
+    @ViewBuilder private var identityGlyph: some View {
+        if anchorSymbolAvailable {
+            Image(systemName: "helm")
+        } else {
+            Text("\u{2693}\u{FE0E}")
         }
     }
 

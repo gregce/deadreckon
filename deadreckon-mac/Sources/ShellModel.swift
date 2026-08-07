@@ -39,4 +39,8 @@ final class ShellModel: ObservableObject {
 extension Notification.Name {
     /// Posted by the shell when Job > Steer wants the rudder field focused.
     static let deadreckonFocusSteer = Notification.Name("deadreckonFocusSteer")
+    /// Posted when a menu-path terminal launch degraded to the pasteboard
+    /// fallback (TCC Automation denied), so the workbench bar shows the
+    /// same "Automation denied — command copied" note the button path does.
+    static let deadreckonTerminalFallback = Notification.Name("deadreckonTerminalFallback")
 }

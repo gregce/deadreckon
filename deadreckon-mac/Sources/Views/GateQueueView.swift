@@ -23,29 +23,46 @@ struct GateQueueView: View {
     @State private var paletteShown = false
 
     var body: some View {
-        NavigationStack(path: $path) {
-            ZStack {
-                Theme.paper.ignoresSafeArea()
+        ZStack {
+            NavigationStack(path: $path) {
+                ZStack {
+                    Theme.paper.ignoresSafeArea()
 
-                VStack(spacing: 0) {
-                    QueueHeaderView(store: store, attention: attention,
-                                    onLayCourse: { router.pending = .layCourse },
-                                    onPalette: { paletteShown = true })
-                    Divider().overlay(Theme.hairline)
-                    content
-                    Divider().overlay(Theme.hairline)
-                    HarborStripView(store: store)
-                }
-
-                if paletteShown {
-                    CommandPalette(store: store, isShown: $paletteShown) { item in
-                        path.append(item)
+                    VStack(spacing: 0) {
+                        QueueHeaderView(store: store, attention: attention,
+                                        onLayCourse: { router.pending = .layCourse },
+                                        onPalette: { paletteShown = true })
+                        Divider().overlay(Theme.hairline)
+                        content
+                        Divider().overlay(Theme.hairline)
+                        HarborStripView(store: store)
                     }
                 }
+                .navigationDestination(for: QueueItem.self) { item in
+                    JobDetailView(fleet: store, item: item)
+                        .environmentObject(router)
+                }
             }
-            .navigationDestination(for: QueueItem.self) { item in
-                JobDetailView(fleet: store, item: item)
-                    .environmentObject(router)
+
+            // The window-level overlay layer (the exemplar MainWindowView
+            // pattern): the palette renders ABOVE the NavigationStack, so
+            // Command-K or View > Search Fleet from the workbench shows a
+            // visible palette instead of arming an invisible one under a
+            // pushed view. Opening a match lands on that job's workbench.
+            if paletteShown {
+                CommandPalette(store: store, isShown: $paletteShown) { item in
+                    path = [item]
+                }
+            }
+        }
+        // Layered Escape at the window level: the palette's own handler
+        // consumes it first while shown (its field holds focus); otherwise
+        // Escape steps the workbench back toward the queue.
+        .onExitCommand {
+            if paletteShown {
+                paletteShown = false
+            } else if !path.isEmpty {
+                path.removeLast()
             }
         }
         .sheet(item: $router.pending) { surface in
@@ -423,6 +440,7 @@ struct QueueRowView: View {
             if let row = item.row {
                 if let provider = row.provider {
                     dotSeparator
+                    ProviderIcon(provider: provider, size: 13)
                     Text(provider)
                         .foregroundStyle(Theme.inkSecondary)
                 }
@@ -533,10 +551,13 @@ struct QueueRowView: View {
         }
     }
 
+    /// No ⏎ glyph: the LazyVStack has no selection model or Return
+    /// handling, and a key hint that does nothing teaches distrust — only
+    /// keys that work get advertised (the exemplar's discipline).
     private var actionTitle: String {
         switch item.section {
-        case .atTheGate, .needsReview: return "Review at Gate \u{23CE}"
-        default: return "Inspect \u{23CE}"
+        case .atTheGate, .needsReview: return "Review at Gate"
+        default: return "Inspect"
         }
     }
 

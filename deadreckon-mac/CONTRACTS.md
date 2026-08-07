@@ -794,7 +794,7 @@ public final class JobDetailStore: ObservableObject {
                 cadence: Cadence = .standard)
     public func open()                                    // idempotent; starts the loop
     public func close()                                   // tears every tail down; reopen-safe
-    public func pollOnce() async                          // one deterministic tick (tests)
+    public func pollOnce() async                          // one deterministic tick (tests); serialized
     public func refreshChanges() async                    // show <run> --diff --json, on demand
     public func loadPatch(path: String) async             // + --patch --file <path>
 }
@@ -815,7 +815,7 @@ Invariants (each tested in JobDetailStoreTests):
 - **Spend meter:** loop head = LAST `kind == "loop"` row's `total_cost_usd`; narrator split = app-side sum of narrator rows' per-row `cost_usd` (the narrator keeps no head in the shared ledger — documented derivation); the two are never summed together.
 - **Narrative:** the latest deterministic beat is retained separately from provider-refreshed beats, so the pane can always render the projection while the overlay carries the "overlay — unverified" label; malformed snapshot rows are counted, not guessed at.
 - **Typed degradation:** each CLI surface fails independently into its own `*Issue` string (the failing surface's words); file-backed panes stay live through CLI unavailability. Every CLI refresh captures the generation before its await and discards the result if the store was closed/reopened meanwhile, so a SIGTERMed child's exit words never land in a closed (or reopened) store.
-- **Per-tick cost is O(new rows), off-thread when large** (the beachball fix): turns grouping folds only newly polled rows into a persistent `TurnsDerivation.Accumulator` (entries re-sort only inside touched turns); the newest event timestamp and newest error message are running values, never rescans; `steer-inbox.jsonl` re-reads only when its size changed. A fold larger than ~1500 rows (first open of a long history) runs off the main actor with only the `@Published` assignment returning to it. Known residual: the initial backlog's per-line JSON decode still runs on the main actor; a one-time hitch on first open of a very large ledger, revisit if it bites.
+- **Per-tick cost is O(new rows), and the tick's I/O runs off the main actor** (the beachball fix, completed in the VALIDATE fix pass): every file read and every tailer poll — including all per-line JSONL decoding — runs in two awaited detached hops per tick (job files first, then run files + the nine tails), with only derivation and the `@Published` assignments on the main actor. `pollOnce` is serialized through an internal chain (the loop and direct test calls run strictly one after another, so the single-owner tailer contract holds across the off-actor reads), and the tick's generation is captured at call time so a tick queued behind an in-flight one when `close()` lands is a no-op — no CLI child launches after close. Turns grouping folds only newly polled rows into a persistent `TurnsDerivation.Accumulator` (entries re-sort only inside touched turns); the newest event timestamp and newest error message are running values, never rescans; `steer-inbox.jsonl` re-reads only when its size changed; the checkpoints listing re-reads only when the directory mtime changed (a new checkpoint adds a subdirectory and bumps it; a listing with a still-landing manifest is deliberately not cached). A fold larger than ~1500 rows still runs off the main actor as before. The former "initial backlog decode on main" residual is gone.
 - **Bounded copies with honest ceilings** (tested): the parsed Activity scrollback stays unbounded (the searchable surface the pane promises), but the drawer's raw-line pane keeps only the trailing `rawEventLineCeiling` (2000) lines with `rawEventsDropped` counted and rendered ("N older raw lines dropped ... full ledger in events.jsonl"), and supervisorOut/Err are trimmed at line boundaries to ~`supervisorTextCeiling` (256 KB) each with a visible truncation note. Ledger history is never lost — the files on disk remain the source of truth.
 - **Spine NEXT rides the job altitude** (tested): see the spine derivation section, simplification 6.
 
@@ -847,7 +847,7 @@ The app target is views + shell only; anything testable lives in the Kit. Per-do
 }
 ```
 
-APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, and the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, NavigationStack destination -> `JobDetailView` (the APP-3 Chartroom, replacing the APP-2 stub), `LayCoursePlaceholderSheet` for Command-N), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match). Since APP-4, rows also carry contextual write verbs (context menu: Promote/Send back/Kill per durable facts) that open the confirmation sheets through WriteSurfaceRouter — every mutation still flows through MutationRunner, never from a row directly.
+APP-2 views (Sources/Views, views + shell only, all facts from the Kit): `Theme.swift` (paper/card/hairline/ink tiers, `dynamicColor(light:dark:)`, display/body/mono, card chrome, tactile styles, `StatusChip`, the overlay tokens `scrim`/`overlayShadow`/`onFill` — no view invents its own colors, including filled-chip text — plus, since the VALIDATE fix pass: `warnFill` (the darker light-mode amber for FILLED chips, because `warn` as a fill under white `onFill` text fell below 4.5:1), `Theme.sectionTitle(_:)` (THE one kerned-uppercase section title, 10pt bold / kerning 0.6 / inkTertiary — the per-view re-implementations with drifting metrics are gone), and `ProviderIcon` (design doc section 9's provider badge iconography: rounded-rect mark, per-provider stable `dynamicColor` pairs with a deterministic scalar-sum palette pick for unknown routes, initial as the glyph since brand logos are not SF Symbols; rendered in queue rows, palette rows, both popover row types, and the workbench header, always BESIDE the provider word, never replacing it)), `GateQueueView.swift` (queue home: section list per the Quarterdeck taxonomy including the amber NEEDS REVIEW section, Bridge column discipline per row, `LeaseDotView` amber only on FleetStore's confirmed-stale verdict, header counts + doctor/providers/supervisor chips, P7 empty state, typed-unavailable banner, NavigationStack destination -> `JobDetailView` (the APP-3 Chartroom, replacing the APP-2 stub), `LayCoursePlaceholderSheet` for Command-N; row action labels advertise NO key glyph — the LazyVStack has no selection model, and only keys that work get advertised), `CommandPalette.swift` (Command-K text filter over goal/id/provider; Enter opens the first match; since the VALIDATE fix pass the palette is hosted in a WINDOW-LEVEL ZStack layer ABOVE the NavigationStack, so Command-K / View > Search Fleet from the workbench shows a visible palette instead of arming an invisible one under a pushed view, and a match opens that job's workbench; layered Escape lives at the same level — the palette consumes it first, otherwise Escape pops the workbench back toward the queue). Since APP-4, rows also carry contextual write verbs (context menu: Promote/Send back/Kill per durable facts) that open the confirmation sheets through WriteSurfaceRouter — every mutation still flows through MutationRunner, never from a row directly.
 
 Startup handshake (partial, APP-2): `deadreckon --version` + `doctor --json` land as Harbor facts (version chip, doctor ok/warn/failed chip from the report's own finding counts). The schema-version refusal (refuse to operate on a `DEADRECKON_HOME` written by a newer binary than the vendored one) still needs a committed binary surface that reports the home's schema version; it lands with that surface, and until then the doctor chip is the honest health signal. **Rust-side gap, needs registering:** no gap-register entry (G1-G10) covers a home-schema-version surface; it fits `doctor --json` (a finding whose detail carries the home's schema version). Register it Rust-side before RELEASE so the section 9 refusal has a landing slot; tracked here until then.
 
@@ -1195,8 +1195,9 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
 (message + try lines, selectable) with NO override control anywhere;
 `CommandLineView` shows the literal CLI line each sheet will run (2.4.3).
 
-- `LayCourseSheet` (Command-N, replacing the placeholder): goal editor;
-  provider rows from the catalog (failed probes visible-but-disabled with
+- `LayCourseSheet` (Command-N, replacing the placeholder): goal editor
+  (autofocused on open, the CommandPalette discipline — Command-N then
+  type); provider rows from the catalog (failed probes visible-but-disabled with
   message + try lines); model picker per provider; spend-cap field;
   preview leg with the resolved plan facts and the done-contract band;
   >$50 swaps Start for the type-the-amount field (border flips only on the
@@ -1235,8 +1236,11 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
   decision bar Promote (gated, disabled reason named) / Send back / Kill
   (each swapping the routed sheet directly — no dismiss()-then-set race)
   reading the gate from the LIVE FleetStore row, not the sheet-open
-  snapshot; success shows the envelope's own `deadreckon undo` next-action
-  and says the row updates from the files. Opens its own transient
+  snapshot; success renders the envelope's own next actions VERBATIM
+  (trust rule 2) and claims "one-command rollback: deadreckon undo" ONLY
+  when `deadreckon undo` appears among them — apply offers it, export
+  (--dest) offers show/status and gets no rollback claim — then says the
+  row updates from the files. Opens its own transient
   JobDetailStore for report evidence (sheet-scoped, closed on dismissal —
   same documented exception as the kill tail).
 - `SendBackSheet`: follow-up goal + note editors, literal extend line,
@@ -1247,9 +1251,16 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
 - `MenuBarPopover` (decision 4, replacing the APP-2 menu; MenuBarExtra is
   `.window` style now): NEEDS DECISION rows carry Promote…/Send
   back…/Kill…/Inspect, UNDERWAY rows carry inline quick-steer (lazy
-  eligibility) and Kill…. Every destructive item opens the main window
-  directly onto the confirmation sheet; the popover NEVER fires a
-  destructive verb itself.
+  eligibility), Kill…, and Inspect (plus the row header itself as a tap
+  target). Inspect and the row tap DEEP-LINK: open the main window AND
+  file ShellModel `.openJob(jobID)` so the window lands on THAT job's
+  workbench (GateQueueView's pending-while-loading resolution handles the
+  rest), never on whatever the NavigationStack last showed. Opening the
+  popover triggers an immediate `refreshNow()` (coalesced by FleetStore's
+  in-flight guard) so triage rows are never up to a menubar-cadence
+  interval stale. Every destructive item opens the main window directly
+  onto the confirmation sheet; the popover NEVER fires a destructive verb
+  itself.
 - `SteerBarView` (workbench, now live): gated on
   `status.currentSteerable`, tracker refusal downgrades (trust rule 4),
   queued chip -> delivered flip on `detail.steerDeliveries`; decision
@@ -1493,8 +1504,13 @@ Invariants (each tested in AttentionCenterTests):
   rudder's steerable{} gate and any verb refusal after it stay
   authoritative (Job > Steer only focuses the field, via
   `.deadreckonFocusSteer`). Kill routes to the confirmation sheet, never
-  fires. The hidden in-window Cmd-N/Cmd-K shortcut buttons remain as a
-  fallback; the menu's key equivalents win when the menu exists.
+  fires. Job > Open in Terminal meets the same fallback-honesty standard
+  as the workbench button (VALIDATE fix pass): a TCC Automation denial's
+  pasteboard degrade posts `.deadreckonTerminalFallback`, and the rudder
+  bar — present whenever the item is enabled, since it requires an open
+  workbench — renders the "Automation denied — command copied" note. The
+  hidden in-window Cmd-N/Cmd-K shortcut buttons remain as a fallback; the
+  menu's key equivalents win when the menu exists.
 - `SettingsView` (Settings scene, Cmd-comma; exemplar's segmented-cards
   simplicity): General (launch-at-login via SMAppService with the failure
   rendered and the toggle reflecting the REAL state — the onChange handler
@@ -1522,7 +1538,14 @@ Invariants (each tested in AttentionCenterTests):
   1024 master + all standard macOS sizes) from `scripts/app-icon.svg` via
   rsvg-convert; regenerate with
   `rsvg-convert -w <size> -h <size> scripts/app-icon.svg -o icon_<n>.png`.
-  Menubar glyphs remain SF Symbols template images.
+  Menubar glyphs remain SF Symbols template images. Glyph identity across
+  the five states (VALIDATE fix pass): `.attention` keeps the helm and
+  puts the decision count BESIDE it (the helm is the identity the operator
+  scans for in exactly the state that needs finding; a bare "N.circle"
+  read as a different app), `.idle`/`.loading` are the helm (anchor text
+  fallback where the symbol is missing), and `.live`'s helm-to-sailboat
+  shape swap is a DELIBERATE divergence kept as the running-state marker —
+  recorded here so it reads as intent, not drift.
 
 Wiring: AppDelegate owns the adapter and the AttentionCenter
 (`rowsProvider` = the loaded queue's rows; empty while loading, which the

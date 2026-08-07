@@ -31,7 +31,7 @@ struct DetailDrawerView: View {
                     .foregroundStyle(Theme.inkTertiary)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.tactile)
 
                 if shown {
                     ForEach(Tab.allCases, id: \.self) { candidate in

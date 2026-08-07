@@ -133,7 +133,7 @@ struct NarrativePaneView: View {
     private func overlayBlock(_ snapshot: NarrativeSnapshotDoc) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
-                StatusChip(text: "overlay \u{2014} unverified", color: Theme.warn, filled: true)
+                StatusChip(text: "overlay \u{2014} unverified", color: Theme.warnFill, filled: true)
                 Text("provider-refreshed prose; not evidence")
                     .font(Theme.body(10))
                     .foregroundStyle(Theme.inkTertiary)
@@ -389,10 +389,7 @@ struct TimelinePaneView: View {
             VStack(alignment: .leading, spacing: 14) {
                 if let state = detail.runState {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("PHASES")
-                            .font(Theme.body(9, weight: .bold))
-                            .kerning(0.5)
-                            .foregroundStyle(Theme.inkTertiary)
+                        Theme.sectionTitle("PHASES")
                         ForEach(state.phases, id: \.id.raw) { phase in
                             HStack(spacing: 8) {
                                 Circle()
@@ -434,10 +431,7 @@ struct TimelinePaneView: View {
     @ViewBuilder private var densityBand: some View {
         if !detail.turns.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
-                Text("EVENT DENSITY \u{00B7} \(detail.activity.count) events")
-                    .font(Theme.body(9, weight: .bold))
-                    .kerning(0.5)
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle("EVENT DENSITY \u{00B7} \(detail.activity.count) events")
                 HStack(alignment: .bottom, spacing: 2) {
                     let maxCount = max(detail.turns.map { $0.entries.count }.max() ?? 1, 1)
                     ForEach(detail.turns.suffix(60)) { turn in

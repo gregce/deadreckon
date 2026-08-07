@@ -1,5 +1,4 @@
 import Foundation
-import SwiftUI
 
 /// The fleet read-model for the Gate Queue home and the menubar: polls
 /// `deadreckon list --all --json` (fast cadence while the window shows,
