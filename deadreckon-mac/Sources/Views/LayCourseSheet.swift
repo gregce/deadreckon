@@ -302,9 +302,17 @@ struct LayCourseSheet: View {
 
             switch controller.preview {
             case .idle:
-                Text("nothing has run yet \u{2014} the preview is read-only (will_start: false)")
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.inkTertiary)
+                // After a launch the armed preview is deliberately dropped
+                // (round-2 disarm); say so instead of "nothing has run yet".
+                if case .launched = controller.execution {
+                    Text("course queued \u{2014} run a fresh preview to lay another")
+                        .font(Theme.body(10.5))
+                        .foregroundStyle(Theme.inkTertiary)
+                } else {
+                    Text("nothing has run yet \u{2014} the preview is read-only (will_start: false)")
+                        .font(Theme.body(10.5))
+                        .foregroundStyle(Theme.inkTertiary)
+                }
             case .loading:
                 ProgressView().controlSize(.small)
             case .refused(let refusal):
