@@ -8,6 +8,7 @@ pub(crate) mod course;
 pub(crate) mod detect;
 pub(crate) mod doc;
 pub(crate) mod doctor;
+pub(crate) mod follow;
 pub(crate) mod graph_job;
 pub(crate) mod import;
 pub(crate) mod infer_contract;

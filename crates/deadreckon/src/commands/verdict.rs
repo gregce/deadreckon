@@ -119,6 +119,25 @@ pub(crate) fn current_attempt_state(
     paths: &DeadreckonPaths,
     view: &deadreckon_core::JobView,
 ) -> Result<deadreckon_core::PipelineState> {
+    try_current_attempt_state(paths, view)?.ok_or_else(|| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "job {} has no attempt run to verify yet",
+                run_prefix(view.job.job_id.as_ref())
+            ),
+            &format!("deadreckon status {}", run_prefix(view.job.job_id.as_ref())),
+        ))
+    })
+}
+
+/// The resolution rule of [`current_attempt_state`] with the no-attempt case
+/// surfaced as `Ok(None)` instead of a verdict-worded refusal, so other verbs
+/// (follow) can attach their own wording to the same rule instead of
+/// borrowing verdict's.
+pub(crate) fn try_current_attempt_state(
+    paths: &DeadreckonPaths,
+    view: &deadreckon_core::JobView,
+) -> Result<Option<deadreckon_core::PipelineState>> {
     let run_id = view
         .projection
         .child_run_ids
@@ -126,16 +145,8 @@ pub(crate) fn current_attempt_state(
         .map(String::as_str)
         .unwrap_or(view.job.job_id.as_ref());
     match deadreckon_core::load_run(paths, run_id) {
-        Ok(state) => Ok(state),
-        Err(deadreckon_core::DeadreckonError::NotFound(_)) => {
-            Err(CliError::Core(deadreckon_core::user_error(
-                &format!(
-                    "job {} has no attempt run to verify yet",
-                    run_prefix(view.job.job_id.as_ref())
-                ),
-                &format!("deadreckon status {}", run_prefix(view.job.job_id.as_ref())),
-            )))
-        }
+        Ok(state) => Ok(Some(state)),
+        Err(deadreckon_core::DeadreckonError::NotFound(_)) => Ok(None),
         Err(error) => Err(CliError::Core(error)),
     }
 }

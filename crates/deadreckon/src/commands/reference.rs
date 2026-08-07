@@ -152,6 +152,15 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
         verb: "attach",
         accepts: RefKinds::ALL,
     },
+    // Follow streams one artifact's blessed JSONL ledgers (gap G5). A durable
+    // Job ref maps onto the job's current attempt run — the same resolution
+    // verdict and show use — with the job-events ledger merged in; plans,
+    // chains, and campaigns have no single run root to tail, so they redirect
+    // to attach.
+    VerbRefSpec {
+        verb: "follow",
+        accepts: RefKinds::JOB.union(RUN_LIKE),
+    },
     VerbRefSpec {
         verb: "kill",
         accepts: RefKinds::ALL,
@@ -235,6 +244,9 @@ pub(crate) fn redirect_verb_for(kind: RefKind, verb: &str) -> &'static str {
         // Steering targets one executing run; watching is the nearest thing a
         // plan or campaign can offer.
         ("steer", _) => "attach",
+        // Follow streams one run root; attach is the surface that can watch a
+        // plan, chain, or campaign live.
+        ("follow", _) => "attach",
         // A pending plan is advanced by forking it, not by resuming a run.
         ("resume" | "extend", RefKind::Plan) => "fork",
         ("resume", RefKind::Chain) => "chain resume",

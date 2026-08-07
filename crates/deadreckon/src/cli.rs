@@ -486,6 +486,26 @@ The default activity view keeps raw logs visible.
 `--view narrative` shows cited prose plus an evidence-backed visual map.
 `q`, Esc, and Ctrl-D detach without killing the work.";
 
+const FOLLOW_HELP: &str = "\
+Lifecycle:
+  deadreckon follow latest --json
+  deadreckon follow <job-id> --json
+  deadreckon follow <run-id> --json --from events=1024,spend=0
+  deadreckon status latest
+  deadreckon finish latest
+
+Follow is the machine sibling of attach: it merges the artifact's blessed
+JSONL ledgers (docs/TAILING.md) into one NDJSON stream of
+{\"source\",\"offset\",\"generation\",\"record\"} lines, where offset is the
+byte offset after the record — pass offset@generation back via --from to
+resume without duplication or loss (the generation token pins the cursor to
+the file it came from). A durable Job follows its current attempt run (plus
+its job-events ledger); following across attempt boundaries means
+reconnecting. The stream ends with one {\"terminal\":true,\"phase\":...}
+line once the artifact is terminal and the tails are drained, or earlier on
+Ctrl-C / stdin close; a dead-runner run gets one advisory
+{\"stalled\":true,...} line. Read-only.";
+
 const STEER_HELP: &str = "\
 Lifecycle:
   deadreckon steer latest \"focus on the failing integration test\"
@@ -1937,6 +1957,29 @@ pub(crate) enum Commands {
         no_hints: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
         plain: bool,
+    },
+    #[command(
+        next_help_heading = "Run Lifecycle",
+        about = "Stream a Job or run's blessed ledgers as merged NDJSON",
+        after_help = FOLLOW_HELP
+    )]
+    Follow {
+        #[arg(
+            value_name = "ID",
+            help = "Job id, run id, plan-id:task-id, unique prefix, or latest"
+        )]
+        run_id: String,
+        #[arg(
+            long,
+            help = "Emit NDJSON on stdout (required; follow is a machine surface)"
+        )]
+        json: bool,
+        #[arg(
+            long,
+            value_name = "SOURCE=OFFSET[,SOURCE=OFFSET...]",
+            help = "Resume named sources from previously emitted byte offsets"
+        )]
+        from: Option<String>,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

@@ -952,16 +952,20 @@ async fn main() {
         // `--json`, every fail-closed refusal also lands as one machine
         // refusal envelope on stdout, with the same exit code. The stderr
         // prose below is unchanged so humans watching a machine invocation
-        // still see the surface.
-        if let Some(verb) = machine_json::active()
-            && let Ok(rendered) = serde_json::to_string_pretty(&machine_json::error_envelope(
-                verb,
-                exit_code,
-                &err.to_string(),
-                &error_hint(&err),
-            ))
-        {
-            println!("{rendered}");
+        // still see the surface. Streaming verbs (follow) get the envelope
+        // compact: their stdout is one NDJSON stream and a refusal can land
+        // mid-stream, so it must itself be one parseable line.
+        if let Some(verb) = machine_json::active() {
+            let envelope =
+                machine_json::error_envelope(verb, exit_code, &err.to_string(), &error_hint(&err));
+            let rendered = if machine_json::ndjson_stream() {
+                serde_json::to_string(&envelope)
+            } else {
+                serde_json::to_string_pretty(&envelope)
+            };
+            if let Ok(rendered) = rendered {
+                println!("{rendered}");
+            }
         }
         print_error(&err);
         print_error_hint(&err);
@@ -1815,6 +1819,11 @@ async fn main_inner() -> Result<()> {
             })
             .await
         }
+        Commands::Follow { run_id, json, from } => {
+            machine_json::arm_ndjson("follow", json);
+            commands::follow::follow_command(commands::follow::FollowArgs { run_id, json, from })
+                .await
+        }
         Commands::Steer { run_id, text, json } => {
             machine_json::arm("steer", json);
             commands::steer::steer_command(&run_id, text)
@@ -2258,6 +2267,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         audience: CommandAudience::Primary,
         top_group: Some(TopHelpGroup::StartWatchKeep),
         all_group: Some(HelpAllGroup::ProductionFlow),
+    },
+    CommandHelpEntry {
+        display: "follow",
+        clap_name: Some("follow"),
+        purpose: "stream a Job or run's ledgers as NDJSON",
+        audience: CommandAudience::Advanced,
+        top_group: None,
+        all_group: Some(HelpAllGroup::ResultsInspect),
     },
     CommandHelpEntry {
         display: "status",
@@ -15577,6 +15594,147 @@ where
             self.rows.drain(0..overflow);
         }
     }
+
+    /// Headless follow read (gap G5), the same torn-tail algorithm as
+    /// `refresh` and docs/TAILING.md's recommended reader: read from the
+    /// retained offset, split at the last newline, parse only complete lines,
+    /// and leave torn bytes on disk to retry next poll. Two deliberate
+    /// differences, both demanded by the follow contract: only the NEWLY
+    /// appended records are returned — each with the byte offset after its
+    /// terminating newline, the replay cursor `follow --from` accepts — and
+    /// anomalies are typed instead of silently smoothed over. For the one
+    /// blessed file allowed to rewrite (`restartable`, i.e.
+    /// `proofs/acceptance-progress.jsonl`), a shrink, a disappearance, a
+    /// same-length rewrite, or a retained-offset parse failure is a restart:
+    /// the tail resets to offset 0 and the caller re-emits behind its restart
+    /// marker. On every other blessed file the same anomalies are corruption,
+    /// and the poll fails closed rather than re-emit or skip a row.
+    fn poll_follow(&mut self, restartable: bool) -> Result<AttachTailFollowPoll<T>> {
+        let mut restarted = false;
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.offset == 0 {
+                    // Nothing yet: blessed files appear on first append.
+                    return Ok(AttachTailFollowPoll::empty(false));
+                }
+                if !restartable {
+                    return Err(follow_tail_corruption(
+                        &self.path,
+                        "the ledger disappeared under a retained offset",
+                    ));
+                }
+                self.offset = 0;
+                self.signature = None;
+                return Ok(AttachTailFollowPoll::empty(true));
+            }
+            // Only NotFound means "not yet appeared" / "disappeared". Any
+            // other stat failure (EACCES, EMFILE, I/O) is a stream failure:
+            // treating it as lifecycle would stream an unreadable ledger as
+            // eternally empty (offset 0) or trigger a bogus restart.
+            Err(error) => return Err(error.into()),
+        };
+        let modified = metadata.modified().ok();
+        let len = metadata.len();
+        if self.signature == Some(AttachJsonlSignature { len, modified }) {
+            return Ok(AttachTailFollowPoll::empty(false));
+        }
+        if len < self.offset
+            || (len == self.offset
+                && self
+                    .signature
+                    .is_some_and(|previous| previous.modified != modified))
+        {
+            if !restartable {
+                return Err(follow_tail_corruption(
+                    &self.path,
+                    "the ledger shrank below a retained offset",
+                ));
+            }
+            self.offset = 0;
+            self.signature = None;
+            restarted = true;
+        }
+        if len == self.offset {
+            self.signature = Some(AttachJsonlSignature { len, modified });
+            return Ok(AttachTailFollowPoll::empty(restarted));
+        }
+        let mut file = fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let Some(complete_len) = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+        else {
+            // Torn-only append: keep the offset before it and retry.
+            return Ok(AttachTailFollowPoll::empty(restarted));
+        };
+        let mut records = Vec::new();
+        let mut consumed = 0u64;
+        for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
+            consumed += line.len() as u64;
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<T>(text) {
+                Ok(record) => records.push((self.offset + consumed, record)),
+                // The sign-time rewrite reused the inode and left the file at
+                // or beyond the retained offset, landing this read mid-line
+                // inside new content (docs/TAILING.md): reset to the top. At
+                // offset 0 there is no retained position to blame, so a parse
+                // failure there is corruption even for the restartable file —
+                // restarting would loop forever over the same bad bytes.
+                Err(_) if restartable && self.offset > 0 => {
+                    self.offset = 0;
+                    self.signature = None;
+                    return Ok(AttachTailFollowPoll::empty(true));
+                }
+                Err(error) => {
+                    return Err(follow_tail_corruption(
+                        &self.path,
+                        &format!("a completed line failed to parse: {error}"),
+                    ));
+                }
+            }
+        }
+        self.offset = self.offset.saturating_add(complete_len as u64);
+        self.signature = Some(AttachJsonlSignature {
+            len: self.offset,
+            modified,
+        });
+        Ok(AttachTailFollowPoll { restarted, records })
+    }
+}
+
+/// One `follow` poll: whether the file restarted since the previous poll, and
+/// the newly appended records with the byte offset after each one.
+#[derive(Debug)]
+struct AttachTailFollowPoll<T> {
+    restarted: bool,
+    records: Vec<(u64, T)>,
+}
+
+impl<T> AttachTailFollowPoll<T> {
+    fn empty(restarted: bool) -> Self {
+        Self {
+            restarted,
+            records: Vec::new(),
+        }
+    }
+}
+
+/// A blessed ledger broke the tailing contract mid-stream. Follow fails
+/// closed (docs/TAILING.md: report corruption, never skip or re-emit a row),
+/// so the refusal names the file and the reader rule it violated.
+fn follow_tail_corruption(path: &Path, detail: &str) -> CliError {
+    CliError::Core(deadreckon_core::user_error(
+        &format!("tailing contract violation in {}: {detail}", path.display()),
+        "stop trusting this stream; docs/TAILING.md documents the fail-closed corruption rule",
+    ))
 }
 
 #[derive(Debug)]
