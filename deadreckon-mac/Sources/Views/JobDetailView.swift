@@ -436,6 +436,8 @@ struct SteerBarView: View {
     @StateObject private var steer: SteerCoordinator
     @State private var draft = ""
     @State private var copiedNote = false
+    /// APP-5: Job > Steer focuses this field via the shell notification.
+    @FocusState private var steerFieldFocused: Bool
 
     init(row: FleetRow, detail: JobDetailStore) {
         self.row = row
@@ -454,6 +456,7 @@ struct SteerBarView: View {
                 TextField(steerPrompt, text: $draft)
                     .textFieldStyle(.plain)
                     .font(Theme.body(11.5))
+                    .focused($steerFieldFocused)
                     .disabled(!steerEnabled)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
@@ -502,6 +505,11 @@ struct SteerBarView: View {
         // rows surfaced by JobDetailStore), never a timer or a guess.
         .onChange(of: detail.steerDeliveries) { _, deliveries in
             steer.observe(deliveries: deliveries)
+        }
+        // Job > Steer (APP-5): focus lands here; the field's steerable{}
+        // gating (and any verb refusal after it) stays authoritative.
+        .onReceive(NotificationCenter.default.publisher(for: .deadreckonFocusSteer)) { _ in
+            steerFieldFocused = true
         }
     }
 
