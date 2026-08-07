@@ -97,34 +97,39 @@ public final class CLIRunner {
         process.standardInput = FileHandle.nullDevice
     }
 
+    /// `launched` is confined to `queue` (written in launch, read here and
+    /// in terminate) so nothing depends on unsynchronized cross-thread
+    /// visibility once the project moves to strict concurrency.
     public var isRunning: Bool {
-        launched && process.isRunning
+        queue.sync { launched } && process.isRunning
     }
 
     public func launch() throws {
-        guard !launched else { throw CLIRunnerError.alreadyLaunched }
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            self?.queue.async { self?.consume(data, stderr: false) }
+        try queue.sync {
+            guard !launched else { throw CLIRunnerError.alreadyLaunched }
+            stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                self?.queue.async { self?.consume(data, stderr: false) }
+            }
+            stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData
+                self?.queue.async { self?.consume(data, stderr: true) }
+            }
+            process.terminationHandler = { [weak self] process in
+                let status = process.terminationStatus
+                self?.queue.async { self?.processExited(status) }
+            }
+            do {
+                try process.run()
+            } catch {
+                stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                stderrPipe.fileHandleForReading.readabilityHandler = nil
+                process.terminationHandler = nil
+                throw CLIRunnerError.launchFailed(error.localizedDescription)
+            }
+            launched = true
+            keepAliveWhileRunning = self
         }
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            self?.queue.async { self?.consume(data, stderr: true) }
-        }
-        process.terminationHandler = { [weak self] process in
-            let status = process.terminationStatus
-            self?.queue.async { self?.processExited(status) }
-        }
-        do {
-            try process.run()
-        } catch {
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            process.terminationHandler = nil
-            throw CLIRunnerError.launchFailed(error.localizedDescription)
-        }
-        launched = true
-        keepAliveWhileRunning = self
     }
 
     /// SIGTERM first so the CLI can run its own graceful teardown; escalate

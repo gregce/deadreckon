@@ -20,11 +20,11 @@ Executes `docs/design/MAC-APP-OPERATOR-CONSOLE.md` (§6.2 composite: Bridge shel
 | Phase | Scope | Status |
 |---|---|---|
 | R-M0 | G6 steerable-as-data · G8 live gate progress · G7 receipt audit · G10 diff patches · G3 fleet rollup · TAILING.md contract | **done** (trust review fixed 3 HIGH: marker-only attempt-scoped gate counts; fail-fast strict receipt path) |
-| R-M1 | G1 JSON envelopes (9 verbs + global error envelope) · G2 start parity · G9 extend --note · steer widening (all providers) · notify events | in progress |
+| R-M1 | G1 JSON envelopes (9 verbs + global error envelope) · G2 start parity · G9 extend --note · steer widening (all providers) · notify events | in progress (G1 landed: `--json` on all nine verbs, global stdout error envelope with preserved exit codes; see §7 G1 "As built". G2 landed: `start --i-know-its-a-lot`, `--yes` alias on finish/apply/cleanup/undo, preview envelope embeds replayable `launch_plan`; see §7 G2 "As built") |
 | R-M2 | G4 finish --dry-run --json · finish --json | pending |
 | R-M3 | G5 follow verb (merged NDJSON, replay offsets) | pending |
 | APP-1 | Scaffold: project.yml, DeadreckonKit, CONTRACTS.md, vendor-cli.sh + manifest | **done** (BUILD SUCCEEDED; 35 Kit tests; exemplar-fidelity reviewed) |
-| APP-2 | Menubar shell + Gate Queue home + Harbor + ⌘K | pending |
+| APP-2 | Menubar shell + Gate Queue home + Harbor + ⌘K | **done** (96 Kit tests; NEEDS REVIEW section + degraded menubar state added by review; Rust follow-up registered: glossary labels in list --json) |
 | APP-3 | Chartroom workbench (narrative/spine/turns, evidence rail, drawer) | pending |
 | APP-4 | Write parity: Lay Course, steer, kill, Binnacle promote, send-back, popover writes | pending |
 | APP-5 | User notifications (stable IDs, catch-up), popover, polish | pending |
