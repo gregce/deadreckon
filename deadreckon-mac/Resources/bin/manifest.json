@@ -1,7 +1,7 @@
 {
-  "cliVersion": "v0.8.4-14-g3ee46b2",
-  "gitCommit": "3ee46b249775779aed059a1a9e99767cff557291",
+  "cliVersion": "v0.8.4-16-gddfc0ee",
+  "gitCommit": "ddfc0eeb791f2429b93b26bb4eeb96be5f330a57",
   "sha256": {
-    "arm64": "6431860f898b5ff0ec12e38f70ef0bc36df8cefba4922c2ef6c66bf7787f9358"
+    "arm64": "dff07160ffce65261c8d303d1020957f8780dc136c28656256b39a54528a8df8"
   }
 }

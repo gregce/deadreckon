@@ -4,6 +4,18 @@
 # (gitignored) selected at runtime by BinaryLocator, with a COMMITTED
 # manifest.json pinning version + commit + sha256, verified at launch.
 #
+# dr-gate rides along: `start --plan --yes` freezes gate artifacts by
+# locating the trusted release helper NEXT TO the running CLI (job.rs
+# installed_gate_candidates: the exe dir, then ../libexec[/deadreckon]),
+# and validates it as a thin Mach-O of the host arch from the SAME build
+# bundle. So each vendor run builds dr-gate in the same cargo invocation
+# (same DEADRECKON_BUNDLE_BUILD_ID), signs it the same way, and places:
+#   arm64  -> Resources/bin/dr-gate            (first lookup candidate)
+#   x86_64 -> Resources/libexec/deadreckon/dr-gate  (later candidate; the
+#             CLI rejects a wrong-arch dr-gate and keeps searching)
+# Without this the app's execute leg fails at job admission ("not found:
+# trusted release helper dr-gate next to the DeadReckon installation").
+#
 # Do not run this while another workflow holds the cargo build lock.
 set -euo pipefail
 
@@ -43,20 +55,37 @@ echo "Vendoring deadreckon $VERSION ($COMMIT) from $CLI_SRC for: ${ARCHS[*]}"
 SIGN_IDENTITY="${DEADRECKON_SIGN_IDENTITY:-Developer ID Application: Gregory Ceccarelli (4GRQMF5T5U)}"
 VENDOR_SIGN="${DEADRECKON_VENDOR_SIGN:-1}"
 
+# The per-arch destination for the vendored dr-gate. The lookup name is
+# fixed ("dr-gate") and the CLI validates a THIN Mach-O of its own arch, so
+# a dual-arch bundle needs one copy per candidate directory: the CLI
+# rejects the wrong-arch copy and keeps searching the candidate list.
+typeset -A GATE_DESTS
+GATE_DESTS[arm64]="$BIN_DIR/dr-gate"
+GATE_DESTS[x86_64]="$ROOT/Resources/libexec/deadreckon/dr-gate"
+
 typeset -A SHAS
+typeset -A GATE_SHAS
 for arch in "${ARCHS[@]}"; do
   triple="${TRIPLES[$arch]}"
-  (cd "$CLI_SRC" && cargo build --release -p "$CRATE" --bin "$CRATE" --target "$triple")
+  # One cargo invocation for both binaries: dr-gate must carry the SAME
+  # DEADRECKON_BUNDLE_BUILD_ID as the CLI or job admission refuses it as
+  # belonging to a different build bundle.
+  (cd "$CLI_SRC" && cargo build --release -p "$CRATE" --bin "$CRATE" --bin dr-gate --target "$triple")
+  gate_dest="${GATE_DESTS[$arch]}"
+  mkdir -p "${gate_dest:h}"
   cp "$CLI_SRC/target/$triple/release/$CRATE" "$BIN_DIR/deadreckon_darwin_$arch"
-  chmod +x "$BIN_DIR/deadreckon_darwin_$arch"
+  cp "$CLI_SRC/target/$triple/release/dr-gate" "$gate_dest"
+  chmod +x "$BIN_DIR/deadreckon_darwin_$arch" "$gate_dest"
   if [[ "$VENDOR_SIGN" == 1 ]]; then
-    codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp \
-      "$BIN_DIR/deadreckon_darwin_$arch"
-    codesign --verify --strict "$BIN_DIR/deadreckon_darwin_$arch"
+    for vendored in "$BIN_DIR/deadreckon_darwin_$arch" "$gate_dest"; do
+      codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$vendored"
+      codesign --verify --strict "$vendored"
+    done
   else
     echo "note: DEADRECKON_VENDOR_SIGN=0 — unsigned vendor; not releasable" >&2
   fi
   SHAS[$arch]="$(shasum -a 256 "$BIN_DIR/deadreckon_darwin_$arch" | cut -d' ' -f1)"
+  GATE_SHAS[$arch]="$(shasum -a 256 "$gate_dest" | cut -d' ' -f1)"
 done
 
 # A partial-arch run (DEADRECKON_VENDOR_ARCHS) must not silently drop the
@@ -69,10 +98,10 @@ for arch in "${FULL_ARCHS[@]}"; do
   [[ -n "${SHAS[$arch]:-}" ]] && continue
   PARTIAL=1
   if [[ -f "$BIN_DIR/manifest.json" ]]; then
-    existing="$(python3 - "$BIN_DIR/manifest.json" "$arch" <<'PY'
+    existing="$(python3 - "$BIN_DIR/manifest.json" "sha256" "$arch" <<'PY'
 import json, sys
 try:
-    print(json.load(open(sys.argv[1])).get("sha256", {}).get(sys.argv[2], ""))
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get(sys.argv[3], ""))
 except Exception:
     pass
 PY
@@ -80,6 +109,18 @@ PY
     if [[ -n "$existing" ]]; then
       SHAS[$arch]="$existing"
       echo "note: carried over existing sha256 pin for $arch (not rebuilt this run)"
+    fi
+    existing_gate="$(python3 - "$BIN_DIR/manifest.json" "gateSha256" "$arch" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], {}).get(sys.argv[3], ""))
+except Exception:
+    pass
+PY
+)"
+    if [[ -n "$existing_gate" ]]; then
+      GATE_SHAS[$arch]="$existing_gate"
+      echo "note: carried over existing dr-gate sha256 pin for $arch (not rebuilt this run)"
     fi
   fi
 done
@@ -89,6 +130,15 @@ for arch in "${FULL_ARCHS[@]}"; do
   [[ -n "${SHAS[$arch]:-}" ]] && OUT_ARCHS+=("$arch")
 done
 
+GATE_OUT_ARCHS=()
+for arch in "${FULL_ARCHS[@]}"; do
+  [[ -n "${GATE_SHAS[$arch]:-}" ]] && GATE_OUT_ARCHS+=("$arch")
+done
+
+# gateSha256 is a provenance pin for review/diffing: the CLI itself refuses
+# any dr-gate whose embedded protocol marker or bundle build id mismatches,
+# so launch-time integrity does not depend on this entry (BinaryLocator's
+# decoder ignores unknown manifest keys).
 {
   echo '{'
   echo "  \"cliVersion\": \"$VERSION\","
@@ -99,6 +149,15 @@ done
     $first || echo ','
     first=false
     printf '    "%s": "%s"' "$arch" "${SHAS[$arch]}"
+  done
+  echo ''
+  echo '  },'
+  echo '  "gateSha256": {'
+  first=true
+  for arch in "${GATE_OUT_ARCHS[@]}"; do
+    $first || echo ','
+    first=false
+    printf '    "%s": "%s"' "$arch" "${GATE_SHAS[$arch]}"
   done
   echo ''
   echo '  }'

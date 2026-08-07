@@ -266,6 +266,15 @@ Common actions:
   deadreckon def-done check
   deadreckon def-done show
 
+Machine callers (GUI/scripts):
+  deadreckon def-done \"what should count as done\" --yes --json --dir <project>
+  deadreckon def-done add \"one more thing\" --yes --json --dir <project>
+  deadreckon def-done show --json --dir <project>
+  deadreckon def-done check --json --dir <project>
+  With --json, stdout is one def_done_result envelope (or one error envelope);
+  declaring or adding without --yes refuses, because --yes is the approval the
+  interactive flow would have collected.
+
 What it means:
   Write done criteria in English. deadreckon compiles them into checks for dr-gate.
   Start/run/orchestrate prompts should show, check, and update these criteria
@@ -750,6 +759,16 @@ pub(crate) enum Commands {
             help = "Working directory to check; defaults to current directory"
         )]
         against: Option<PathBuf>,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Project directory owning .deadreckon/; defaults to current directory"
+        )]
+        dir: Option<PathBuf>,
+        #[arg(long, help = "Approve writing the contract without prompts")]
+        yes: bool,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Run Lifecycle",

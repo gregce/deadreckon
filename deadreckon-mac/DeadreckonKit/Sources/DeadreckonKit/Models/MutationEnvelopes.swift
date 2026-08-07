@@ -411,8 +411,18 @@ public struct StartPreviewEnvelope: Equatable, Sendable {
             let checkObjects = contract["checks"] as? [[String: Any]] ?? []
             let rows = checkObjects.compactMap { check -> ContractSummary.CheckRow? in
                 guard let kind = check["kind"] as? String else { return nil }
-                return ContractSummary.CheckRow(
-                    kind: kind, mustPass: check["must_pass"] as? Bool ?? true)
+                // start.rs emits the COMPILED check rows (acceptance.rs
+                // CompiledCheck): no top-level must_pass — the raw
+                // AcceptanceCheck nests under "raw" and the compiled row
+                // carries the inverse as can_fail. Read whichever the
+                // emitter provided; only a shapeless row defaults to the
+                // strict reading (must pass).
+                let raw = check["raw"] as? [String: Any]
+                let mustPass = (check["must_pass"] as? Bool)
+                    ?? (raw?["must_pass"] as? Bool)
+                    ?? (check["can_fail"] as? Bool).map { !$0 }
+                    ?? true
+                return ContractSummary.CheckRow(kind: kind, mustPass: mustPass)
             }
             if capabilities != nil || !rows.isEmpty {
                 doneContract = ContractSummary(
@@ -433,6 +443,96 @@ public struct StartPreviewEnvelope: Equatable, Sendable {
             launchPlanData = nil
             planCeilingUSD = nil
         }
+    }
+
+    /// The typed missing-contract signal: start.rs sets
+    /// `done_criteria_source` to StartDoneCriteriaSource::Missing ("missing")
+    /// exactly when no done contract exists for the project, and the preview
+    /// comes back blocked with try lines teaching `def-done`. The Lay Course
+    /// sheet swaps the bare try-line for the inline contract editor on this.
+    public var missingDoneContract: Bool { doneCriteriaSource == "missing" }
+}
+
+// MARK: - def-done --json (the done-contract authoring surface)
+
+/// The `def_done_result` success envelope (`def-done --json`, acceptance.rs
+/// `def_done_contract_envelope`): `status` is "written" after declare/add/
+/// edit, "declared" or "default_gate" from show (a missing contract is a
+/// normal exit-0 read, never a refusal), "passed" from check. `checks` is
+/// the EXACT serialized `AcceptanceSpec` shape `report --json` already
+/// emits (serde-tagged `kind` + `must_pass` + the kind-specific fields), so
+/// the app never parses YAML — every row here comes from the binary's own
+/// envelope, with the kind-specific target facts surfaced raw, never
+/// interpreted. `drafted_by` names the drafting route ("<provider> /
+/// <model>", or "<name> pack" for provider-free pack adds); nil on reads.
+/// Every refusal — missing --yes, provider/critic failures, corrupt YAML —
+/// arrives as the shared G1 error envelope with verb "def-done" instead.
+public struct DefDoneResultEnvelope: Equatable, Sendable {
+    public struct CheckRow: Equatable, Sendable {
+        public let kind: String
+        public let mustPass: Bool
+        /// Kind-specific target facts, raw (gate.rs AcceptanceCheck):
+        /// file_exists/content_match carry `path`, shell carries `command`
+        /// (+ optional `cwd`), build_success carries `cwd`, content_match
+        /// adds `pattern`, cargo_test carries `args`. Fields a kind does
+        /// not declare stay nil/empty, never guessed.
+        public let path: String?
+        public let command: String?
+        public let cwd: String?
+        public let pattern: String?
+        public let args: [String]
+
+        /// The one-line target for a display row: the kind's own primary
+        /// fact, verbatim. Nothing is derived or interpreted.
+        public var target: String? {
+            if let command { return command }
+            if let path { return path }
+            if let cwd { return cwd }
+            if !args.isEmpty { return args.joined(separator: " ") }
+            return nil
+        }
+    }
+
+    public let kind: String
+    public let status: String
+    /// Where the binary declared the contract: .deadreckon/acceptance.yaml
+    /// in the project. nil on a default_gate read (nothing declared).
+    public let contractPath: String?
+    public let notesPath: String?
+    public let name: String?
+    public let checkCount: Int
+    public let checks: [CheckRow]
+    /// capabilities.network: deny | loopback | full (deny is the default).
+    public let network: String?
+    public let draftedBy: String?
+    public let nextActions: [String]
+
+    public init?(data: Data) {
+        guard let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let kind = object["kind"] as? String, kind == "def_done_result",
+              let status = object["status"] as? String else { return nil }
+        self.kind = kind
+        self.status = status
+        contractPath = object["contract_path"] as? String
+        notesPath = object["notes_path"] as? String
+        name = object["name"] as? String
+        checkCount = (object["check_count"] as? NSNumber)?.intValue ?? 0
+        let checkObjects = object["checks"] as? [[String: Any]] ?? []
+        checks = checkObjects.compactMap { check -> CheckRow? in
+            guard let kind = check["kind"] as? String else { return nil }
+            return CheckRow(
+                kind: kind,
+                mustPass: check["must_pass"] as? Bool ?? true,
+                path: check["path"] as? String,
+                command: check["command"] as? String,
+                cwd: check["cwd"] as? String,
+                pattern: check["pattern"] as? String,
+                args: check["args"] as? [String] ?? [])
+        }
+        let capabilities = object["capabilities"] as? [String: Any]
+        network = capabilities?["network"] as? String
+        draftedBy = object["drafted_by"] as? String
+        nextActions = object["next_actions"] as? [String] ?? []
     }
 }
 

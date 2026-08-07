@@ -5,10 +5,12 @@ import SwiftUI
 /// The Lay Course sheet (Command-N; design B4 composed per section 6.2 and
 /// the G2 "As built" launch protocol): goal, route (providers/models from
 /// the binary's own catalogs, failed probes visible-but-disabled with their
-/// try lines), limits, the done contract as the PREVIEW resolves it
-/// (read-only detection — see the CONTRACTS.md note on why the app authors
-/// no acceptance.yaml), the resolved launch preview, and the execute leg
-/// replaying the embedded plan verbatim. A cap over $50 swaps Start for a
+/// try lines), limits, the done-contract step (read-only rows when the
+/// preview resolves one; an inline declare editor when the preview is
+/// blocked for a missing contract — the binary's own `def-done --yes
+/// --json` writes .deadreckon/acceptance.yaml in the project, never the
+/// app), the resolved launch preview, and the execute leg replaying the
+/// embedded plan verbatim. A cap over $50 swaps Start for a
 /// type-the-amount confirmation (SpendAcknowledgement: the flag cannot be
 /// passed any other way). The new job appears via FleetStore/FSEvents when
 /// job.json lands — never optimistically from this sheet.
@@ -19,6 +21,11 @@ struct LayCourseSheet: View {
     @State private var goalText = ""
     @State private var capText = ""
     @State private var projectPath = ""
+    /// The done-contract editor's plain-English criteria.
+    @State private var criteriaText = ""
+    /// True while the operator has explicitly reopened the editor over an
+    /// existing contract (declare overwrites binary-side by design).
+    @State private var redefining = false
     /// Autofocus on open (the CommandPalette discipline): Command-N then
     /// type, no mouse click between.
     @FocusState private var goalFocused: Bool
@@ -291,6 +298,7 @@ struct LayCourseSheet: View {
                     controller.request.goal = goalText
                     controller.request.maxSpendUSD = SpendAcknowledgement.parseAmount(capText)
                     controller.request.projectDirectory = resolvedProjectDirectory
+                    redefining = false
                     Task { await controller.runPreview() }
                 }
                 .buttonStyle(.tactile)
@@ -324,11 +332,33 @@ struct LayCourseSheet: View {
                     .textSelection(.enabled)
             case .blocked(let envelope):
                 previewFacts(envelope)
-                Text("this preview is not launchable \u{2014} the binary's try lines above are the fix")
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.warn)
+                if envelope.missingDoneContract {
+                    // The auto re-preview after a successful declare can
+                    // still come back "missing" (e.g. an older vendored
+                    // binary resolving the contract from the app's working
+                    // directory instead of --from). Say so plainly instead
+                    // of silently re-offering the editor as if nothing
+                    // happened — the declared file path above is real.
+                    if case .declared = controller.contract {
+                        Text("the contract was declared (see the declared file above), but the re-run preview still reports it missing \u{2014} the binary's try lines above are the fix")
+                            .font(Theme.body(10.5))
+                            .foregroundStyle(Theme.warn)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    contractEditor
+                } else {
+                    Text("this preview is not launchable \u{2014} the binary's try lines above are the fix")
+                        .font(Theme.body(10.5))
+                        .foregroundStyle(Theme.warn)
+                    if redefining {
+                        contractEditor
+                    }
+                }
             case .ready(let envelope):
                 previewFacts(envelope)
+                if redefining {
+                    contractEditor
+                }
             }
         }
     }
@@ -358,15 +388,20 @@ struct LayCourseSheet: View {
         .cardChrome()
     }
 
-    /// The done-contract step, as the binary resolved it (read-only
-    /// detection through the preview envelope; `capabilities.network`
-    /// defaults deny in the compiled contract). Authoring stays with the
-    /// CLI (`def-done`) — the refusal try lines teach it when missing.
+    /// The done-contract step. Rows always come from the binary's own
+    /// envelopes (the def_done_result declare/show envelope when held, else
+    /// the preview's done_contract block; `capabilities.network` defaults
+    /// deny in the compiled contract) — no YAML is ever parsed app-side. An
+    /// existing contract renders read-only with a Redefine affordance that
+    /// reopens the editor (declare overwrites binary-side by design).
     @ViewBuilder private func doneContractBand(_ envelope: StartPreviewEnvelope) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             factLine("done contract", (envelope.doneCriteria ?? "none resolved")
                 + (envelope.doneCriteriaSource.map { " (\($0))" } ?? ""))
-            if let contract = envelope.doneContract {
+            if case .declared(let declared) = controller.contract {
+                declaredContractRows(declared)
+                redefineButton
+            } else if let contract = envelope.doneContract {
                 if let network = contract.network {
                     factLine("network", network + (network == "deny" ? " (default)" : ""))
                 }
@@ -381,8 +416,121 @@ struct LayCourseSheet: View {
                     }
                     .padding(.leading, 12)
                 }
+                redefineButton
             }
         }
+    }
+
+    /// The declared contract's own facts, verbatim from the def_done_result
+    /// envelope: check rows (kind, target, must_pass), network capability,
+    /// the declared file path, and who drafted.
+    @ViewBuilder private func declaredContractRows(_ declared: DefDoneResultEnvelope) -> some View {
+        if let network = declared.network {
+            factLine("network", network + (network == "deny" ? " (default)" : ""))
+        }
+        ForEach(Array(declared.checks.enumerated()), id: \.offset) { _, check in
+            HStack(spacing: 6) {
+                Text(check.kind)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.ink)
+                if let target = check.target {
+                    Text(target)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.inkSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if check.mustPass {
+                    StatusChip(text: "must pass", color: Theme.inkSecondary)
+                }
+            }
+            .padding(.leading, 12)
+        }
+        if let path = declared.contractPath {
+            factLine("declared file", path)
+        }
+        if let draftedBy = declared.draftedBy {
+            factLine("drafted by", draftedBy)
+        }
+    }
+
+    private var redefineButton: some View {
+        Button("Redefine\u{2026}") { redefining = true }
+            .buttonStyle(.tactile)
+            .font(Theme.body(10))
+            .foregroundStyle(Theme.accent)
+            .disabled(redefining)
+            .padding(.leading, 12)
+            .help("Reopens the plain-English editor; declaring again overwrites the contract via the binary's own def-done verb.")
+    }
+
+    // MARK: Done-contract editor (declare leg)
+
+    /// The inline DONE CONTRACT editor: declaration, not silent mutation.
+    /// The operator says in plain English what should count as done;
+    /// Draft contract dispatches the binary's own `def-done --yes --json`
+    /// verb against the chosen project — the click IS the approval `--yes`
+    /// formalizes, the binary (never the app) writes
+    /// .deadreckon/acceptance.yaml, and on success the preview re-runs by
+    /// itself so the sheet flows refusal -> declare -> launchable.
+    @ViewBuilder private var contractEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Theme.sectionTitle("DONE CONTRACT")
+            Text("what should count as done, in plain English")
+                .font(Theme.body(10.5))
+                .foregroundStyle(Theme.inkSecondary)
+            HStack(spacing: 8) {
+                TextField("builds, opens in a browser, and has no console errors",
+                          text: $criteriaText)
+                    .textFieldStyle(.plain)
+                    .font(Theme.body(11.5))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.hairline, lineWidth: 1))
+                Button("Draft contract") {
+                    Task {
+                        await controller.declareContract(criteria: criteriaText)
+                        if case .declared = controller.contract {
+                            redefining = false
+                        }
+                    }
+                }
+                .buttonStyle(.tactile)
+                .font(Theme.body(11, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+                .disabled(criteriaText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || controller.contract == .drafting)
+            }
+            CommandLineView(command: controller.contractCommandLine(criteria: criteriaText))
+            Text("drafts checks from your words via the configured provider, then the binary writes .deadreckon/acceptance.yaml (and acceptance.md) in the project \u{2014} the app itself writes nothing; on success the preview re-runs automatically")
+                .font(Theme.body(9.5))
+                .foregroundStyle(Theme.inkTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            switch controller.contract {
+            case .idle, .declared:
+                EmptyView()
+            case .drafting:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("drafting the contract\u{2026} the binary is calling the provider")
+                        .font(Theme.body(10.5))
+                        .foregroundStyle(Theme.inkSecondary)
+                }
+            case .refused(let refusal):
+                RefusalView(refusal: refusal)
+            case .failed(let words):
+                Text(words)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.warn)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .cardChrome()
     }
 
     private func factLine(_ label: String, _ value: String) -> some View {

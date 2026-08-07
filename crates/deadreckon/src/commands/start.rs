@@ -3132,9 +3132,14 @@ fn resolve_start_source_mode(
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("copy from {}", source_path.display());
             decision.source_from = Some(source_path.clone());
+            // The done contract belongs to the PROJECT being launched, not
+            // to wherever the caller happens to sit: `--from <dir>` must
+            // read (and, when start drafts one, write) <dir>/.deadreckon,
+            // or a GUI caller running from $HOME would silently resolve the
+            // wrong contract while the sheet shows the project's.
             set_resolved_start_source(
                 decision,
-                cwd,
+                &source_path,
                 commands::job::DurableSourceMode::Copy,
                 Some(source_path.clone()),
                 &source_path,
@@ -3160,9 +3165,11 @@ fn resolve_start_source_mode(
             decision.source_mode = StartSourceMode::Copy;
             decision.source_mode_label = format!("in-place from {}", source_path.display());
             decision.source_from = Some(source_path.clone());
+            // Same contract-root rule as Copy (here source_path is the
+            // canonicalized cwd, so this is the identical directory).
             set_resolved_start_source(
                 decision,
-                cwd,
+                &source_path,
                 commands::job::DurableSourceMode::Copy,
                 Some(source_path.clone()),
                 &source_path,
