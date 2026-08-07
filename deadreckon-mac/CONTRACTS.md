@@ -1257,10 +1257,6 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
 
 ### Still pending (so nothing squats on the names)
 
-- Operator-attention notify events (operator decision 6): the binary-side
-  rows landed in R-M1; real user notifications (stable IDs + launch-time
-  catch-up scan) are APP-5 scope. The `notify.jsonl` tail stays
-  observability-only.
 - `finish --dry-run --json` (G4): the decode model above is spec-true and
   tested; the vendored binary gains the verb when R-M2 lands and the
   CANDIDATE band lights up with no app change beyond re-vendoring.
@@ -1272,3 +1268,267 @@ same sheets through it. `RefusalView` renders every typed refusal verbatim
 - Rewind has no machine envelope in the M1 binary (it is not one of the
   nine G1 verbs); the Flight tab's rewind affordance stays honestly
   disabled pointing at the CLI until one exists.
+
+## APP-5 notifications + shell polish (as built)
+
+Ground truth: `docs/schemas/notify-event.schema.json`,
+`crates/deadreckon-protocol/src/notify.rs`,
+`crates/deadreckon-core/src/attention.rs`, and the docs/TAILING.md notify
+entry. Trust rule 7 restated as law here: notify rows are display-only
+observability. A notification never carries authority — it opens the app
+onto the real surfaces, and every gate (PromoteGate, steerable{}, verb
+refusals) stays exactly where it was.
+
+### Attention derivation (Models/AttentionDerivation.swift)
+
+```swift
+/// One intended user notification, derived purely from an
+/// operator_attention row. All identity comes from the record's own
+/// fields — NEVER the time of observation.
+public struct NotificationIntent: Equatable, Sendable, Identifiable {
+    public let recordIdentity: String   // attention|<reason>|<job|- >|<run|- >|<at ms>
+    public let deliveryIdentity: String // attention|<reason>|<subject>: replaces, never stacks
+    public let reason: OperatorAttentionReason
+    public let title: String            // app-authored reason label (glossary provenance rule)
+    public let body: String             // record summary VERBATIM
+    public let jobID: String?           // record job_id ?? owning job of the tailed run root
+    public let runID, scope: String?
+    public let at: Date
+    public let categoryID: String       // verified gets the Review at Gate action
+}
+
+public enum NotificationRoute: Equatable, Sendable {
+    case openJob(jobID: String)         // banner tap / Open action
+    case reviewAtGate(jobID: String)    // verified_awaiting_promote extra action
+}
+
+public enum NotificationIdentity      // action/category/userInfo string constants
+public enum AttentionDerivation {
+    /// nil for .unknown reasons: observed (and marked seen), never posted.
+    public static func intent(from: OperatorAttentionRow, owningJobID: String?) -> NotificationIntent?
+    public static func title(for: OperatorAttentionReason) -> String
+    public static func userInfo(for: NotificationIntent) -> [String: String]
+    /// Pure response router (tested without UserNotifications).
+    public static func route(actionIdentifier: String, userInfo: [String: String]) -> NotificationRoute?
+}
+
+/// Per-reason prefs; missing defaults read enabled; .unknown never allowed.
+public struct AttentionPreferences {
+    public static let notifiableReasons: [OperatorAttentionReason]  // the six, no .unknown
+    public var masterEnabled: Bool
+    public var enabledReasons: Set<OperatorAttentionReason>
+    public func allows(_ reason: OperatorAttentionReason) -> Bool
+    public static func load(from: UserDefaults) -> AttentionPreferences
+    public func save(to: UserDefaults)
+}
+
+/// Bounded-tail selection, pure: active = non-terminal rows plus terminal
+/// rows updated within recentTerminalWindow (900 s), newest first, capped;
+/// everything else is fallback (covered by the slow sweep).
+public enum AttentionTailPlan {
+    public struct Plan { public let active, fallback: [FleetRow] }
+    public static let recentTerminalWindow: TimeInterval  // 900
+    public static func select(rows: [FleetRow], limit: Int, now: Date,
+                              recentTerminalWindow: TimeInterval) -> Plan
+}
+```
+
+### Seen store (Services/NotificationSeenStore.swift)
+
+```swift
+/// UserDefaults-backed bounded LRU of processed record identities. Survives
+/// relaunch — that IS the launch catch-up dedupe.
+public final class NotificationSeenStore {
+    public init(defaults: UserDefaults = .standard, key: String = "attention.seen",
+                capacity: Int = 512)
+    public func contains(_ identity: String) -> Bool
+    public func markSeen(_ identity: String)   // refreshes LRU position, trims, persists
+    public var count: Int
+}
+```
+
+The LRU is real, not nominal: AttentionCenter calls `markSeen` on EVERY
+observation (including already-seen identities), so an identity still
+present in a swept file refreshes its recency and can never age out of the
+bounded store and re-fire — eviction pressure only ever drops identities
+whose files no longer carry them.
+
+### AttentionCenter (Services/AttentionCenter.swift, @MainActor)
+
+```swift
+/// The posting seam. The app adapter wraps UNUserNotificationCenter; tests
+/// record intents. No Kit code touches the framework.
+public protocol UserNotifying: AnyObject {
+    func post(_ intent: NotificationIntent)
+}
+
+@MainActor public final class AttentionCenter: ObservableObject {
+    public struct Cadence { poll: TimeInterval = 5; fallbackSweepEveryTicks: Int = 12 }
+    public static let activeTailLimit = 12
+    public static let catchUpWindow: TimeInterval    // 48 h
+    @Published public private(set) var issues: [String: String]  // per-job tail trouble, verbatim
+    public var activeTailJobIDs: Set<String>          // test observability
+    public var nowProvider: () -> Date                // injectable clock
+    public init(home: URL, notifier: UserNotifying, seenStore: NotificationSeenStore,
+                preferences: @escaping () -> AttentionPreferences,
+                rowsProvider: @escaping () -> [FleetRow], cadence: Cadence)
+    public func start()              // catch-up scan + tick loop; idempotent
+    public func stop()
+    public func pollOnce() async     // one deterministic tick (tests); serialized
+    public func catchUpScan() async  // full sweep of the current fleet
+}
+```
+
+Main-actor hygiene (fix pass): every file read — projection-based run-root
+resolution, tail polls, sweep reads — runs off the main actor in an awaited
+detached task; only the pure derivation over gathered lines and the
+`@Published` writes run on the MainActor. `pollOnce` is serialized by an
+in-flight guard so the single-owner JSONLTailer contract holds across the
+off-actor reads (a tick arriving mid-tick is dropped, not stacked).
+
+Invariants (each tested in AttentionCenterTests):
+
+- **Stable identity:** the same record bytes derive the same
+  recordIdentity across decoders, polls, tails rebuilt from offset 0, and
+  relaunches; a different `at` is a NEW event (fires again) while the
+  deliveryIdentity stays stable so the platform banner replaces instead of
+  stacking (the exemplar stable-ID pattern; also the TAILING.md
+  reseal-after-rollback dedupe guidance).
+- **Catch-up dedupe:** `start()` scans the current fleet's notify files
+  and fires only unseen identities; the seen-set persists in UserDefaults
+  (bounded LRU 512), so a relaunch fires nothing already seen. Because the
+  fleet is usually still loading at `start()`, the catch-up completes on
+  the first tick whose rows snapshot is non-empty — a fallback-only row
+  does not wait out a sweep interval (tested).
+- **Recency window, uniform at fire time:** an unseen record older than
+  `catchUpWindow` (48 h) is marked seen WITHOUT firing, at every fire site
+  (catch-up, live tail, sweep). Stale news is not a banner; live appends
+  are always recent, so nothing live is ever lost. ONE deliberate waiver
+  (fix pass, tested): approval-class reasons (`verified_awaiting_promote`,
+  `waiting_input`) fire regardless of age when the current rollup row still
+  shows the decision waiting (terminal + verified + valid receipt, or
+  phase == waiting) — return-because-it-notified-me must survive a
+  weekend-plus absence, and a decision-queue row is a decision-queue row
+  however old (design A1). A record whose decision has since been resolved
+  stays silent (and marked seen).
+- **Per-reason filtering:** preferences are read through the injected
+  closure at post time (Settings toggles apply immediately); master off
+  silences everything; a filtered row is still marked seen, so re-enabling
+  a reason does not replay old news (tested).
+- **Bounded tails:** only AttentionTailPlan.active rows (cap 12) hold a
+  JSONLTailer; everything else rides the fallback sweep every 12 ticks.
+  Selection is pure and tested (recently-terminal in, old wrecks out but
+  still swept, nothing dropped).
+- **Run root resolution** reuses the JobDetailStore convention plus the
+  verdict-on-JOB fallback: `projection.json` `child_run_ids.last`, else
+  the job's own id (Single-shape: run_id == job_id), root
+  `home/runstate/<scope>/runs/<id>`, file `notify.jsonl`. Reads stay
+  inside `jobs/<id>/` and `runstate/` by construction (trust rule 3).
+- **Honest degradation:** notify.jsonl is a blessed standard tail, so a
+  corrupt verdict is sticky PER (job, runID) and recorded in
+  `issues[jobID]` verbatim: the corrupt run's file stops producing
+  notifications — it is neither tailed NOR swept, and leaving/re-entering
+  the active tail set cannot un-stick the verdict (tested). Only a NEW
+  attempt (projection pointing at a different runID) clears it; siblings
+  are unaffected. Issues for jobs that leave the fleet are pruned against
+  a non-empty rows snapshot (a still-loading fleet is not evidence of
+  absence). `issues` is RENDERED (fix pass): a warn chip in the Gate Queue
+  header (count, per-job verbatim reasons in the tooltip) and per-job rows
+  in Settings > Notifications — silence has a visible signal.
+  Delivery-attempt rows and unknown-reason rows are observed, never
+  posted. Sweeps skip torn final lines (retried next sweep) and skip
+  undecodable lines without a corruption verdict — a sweep is a catch-up
+  read, not a corruption judge; the live tail keeps the strict verdict.
+- **paused_at_cap rows carry no job_id:** the owning job of the tailed
+  run root fills `intent.jobID` so Open can route; identity still uses
+  only the record's own fields.
+- **Cancelled echo, accepted noise (documented decision):** a kill
+  confirmed in the app's own kill sheet still produces the `cancelled`
+  banner when the supervisor's attention row lands — the sheet resolves on
+  the file-backed terminal event, the banner follows seconds later.
+  Suppressing it would need cross-coordinator state (KillCoordinator
+  pre-marking seen identities it cannot derive yet) and would also risk
+  silencing CLI-side cancellations the operator DOES want; the per-reason
+  toggle is the mitigation. Revisit only if the echo bites in use.
+- **lease-stale is badge-only (documented decision):** the design A2 mock
+  lists "lease-stale" among notification triggers, but the as-built R-M1
+  vocabulary has no `lease_stale` operator_attention reason, so APP-5
+  cannot (and does not) notify on it. The menubar degraded badge (design
+  2.4.1, FleetStore's confirmed-stale debounce) remains the stale-lease
+  signal. Not a missed requirement; a reason would need to be registered
+  Rust-side first.
+
+### APP-5 views + shell (Sources, app target)
+
+- `UserNotificationAdapter` (UserNotifications side of the seam, exemplar
+  pattern): authorization requested lazily before the first delivery, and
+  RESOLVED FRESH on every post via getNotificationSettings (which never
+  prompts and is cheap) — a denial is not cached for the process lifetime,
+  so enabling deadreckon later in System Settings > Notifications takes
+  effect on the next post without a relaunch (fix pass; a menubar login
+  item may not relaunch for days). The system prompt fires only while the
+  status is notDetermined, so the user is never re-prompted after
+  deciding; concurrent posts coalesce onto one in-flight resolution (a
+  launch catch-up burst triggers one settings read, never parallel
+  requestAuthorization calls). Banners shown while frontmost,
+  `deliveryIdentity` as the platform identifier. Categories:
+  general (Open) and verified (Open + Review at Gate). Responses go
+  stringly-userInfo -> `AttentionDerivation.route` (the Kit's tested pure
+  router) -> AppDelegate, which shows the window and files a ShellModel
+  request.
+- `ShellModel`: pending navigation requests (gateQueue / search / openJob /
+  reviewAtGate / focusSteer) consumed by GateQueueView (which owns the
+  NavigationStack), plus the opened workbench item published for menu
+  enablement. openJob/reviewAtGate stay pending while the fleet loads,
+  then resolve or drop once a loaded queue can answer. reviewAtGate
+  navigates onto the job AND opens the promote sheet; the sheet's own
+  PromoteGate stays authoritative.
+- `DeadreckonCommands` (real menu bar via SwiftUI Commands on the Settings
+  scene): File > New Job (Cmd-N); View > Gate Queue (Cmd-1), Search Fleet
+  (Cmd-K); Job > Steer / Kill (Cmd-Delete) / Promote / Open in Terminal
+  (Cmd-T); About panel with the vendored CLI version in credits. Enabled
+  states re-read the LIVE FleetStore row by id (never the navigation-time
+  snapshot): Kill and Steer enable on phase != terminal, Promote on
+  phase == terminal — the same facts the workbench decision bar uses; the
+  rudder's steerable{} gate and any verb refusal after it stay
+  authoritative (Job > Steer only focuses the field, via
+  `.deadreckonFocusSteer`). Kill routes to the confirmation sheet, never
+  fires. The hidden in-window Cmd-N/Cmd-K shortcut buttons remain as a
+  fallback; the menu's key equivalents win when the menu exists.
+- `SettingsView` (Settings scene, Cmd-comma; exemplar's segmented-cards
+  simplicity): General (launch-at-login via SMAppService with the failure
+  rendered and the toggle reflecting the REAL state — the onChange handler
+  guards no-op transitions, so the programmatic revert after a failure
+  cannot re-enter SMAppService or clobber the rendered error; fix pass),
+  Notifications (master + six per-reason toggles writing through to
+  UserDefaults — the AttentionCenter reads them live — plus the
+  AttentionCenter `issues` rendered as per-job "notify tail trouble" rows,
+  verbatim reasons), Info (read-only:
+  app version, live `--version`, vendored manifest cliVersion/commit/sha256
+  per arch — or the DEADRECKON_BIN override named honestly as skipping
+  verification — DEADRECKON_HOME in effect with its provenance, and the
+  schema-handshake row stating the registered Rust-side gap with doctor as
+  the honest health signal).
+- **Appearance needs nothing from Theme:** every color is already a
+  `dynamicColor(light:dark:)` pair; Settings states this instead of
+  offering a lying toggle.
+- `MenuBarPopover` footer (final Bridge treatment): supervisor line from
+  the Harbor poll + refresh recency, then Open (Cmd-O) / Start Job (Cmd-N)
+  / Quit (Cmd-Q). **Documented drop:** the A2 mock's "spend today" line is
+  NOT rendered — per-day spend is not derivable from the rollup's
+  cumulative heads and would need fleet-wide spend tails, which the
+  bounded-tails contract forbids for a footer.
+- **App icon:** real AppIcon set generated (flat anchor on deep blue,
+  1024 master + all standard macOS sizes) from `scripts/app-icon.svg` via
+  rsvg-convert; regenerate with
+  `rsvg-convert -w <size> -h <size> scripts/app-icon.svg -o icon_<n>.png`.
+  Menubar glyphs remain SF Symbols template images.
+
+Wiring: AppDelegate owns the adapter and the AttentionCenter
+(`rowsProvider` = the loaded queue's rows; empty while loading, which the
+deferred catch-up covers), starts it at launch, and stops it at
+termination; the center is passed into GateQueueView (header notify-tail
+chip) and SettingsView (per-job issue rows) so `issues` always has an
+operator-visible surface. AttentionCenter tails are read-only; the
+quit-time SIGTERM sweep continues to cover only CLI children (fleet +
+shared write client).

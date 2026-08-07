@@ -32,6 +32,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// APP-4: one router for every write surface — the queue, the workbench,
     /// and the popover all open the same confirmation sheets through it.
     let writeRouter = WriteSurfaceRouter()
+    /// APP-5: navigation requests + the opened workbench item, shared
+    /// between the main menu, the notification router, and the window.
+    let shell = ShellModel()
+    /// APP-5: the UNUserNotificationCenter side of the Kit's posting seam
+    /// (lazy auth resolved per post, stable IDs — exemplar pattern).
+    let notificationAdapter = UserNotificationAdapter()
+    /// APP-5: tails notify.jsonl across the fleet and derives notifications
+    /// with stable identities; all logic in the Kit, tested with fakes.
+    private(set) lazy var attention = AttentionCenter(
+        notifier: notificationAdapter,
+        seenStore: NotificationSeenStore(),
+        preferences: { AttentionPreferences.load(from: .standard) },
+        rowsProvider: { [weak self] in
+            guard let self, case .loaded = self.fleet.fleet else { return [] }
+            return self.fleet.queue.allItems.compactMap(\.row)
+        })
     var mainWindow: NSWindow?
     private var terminationPrepared = false
 
@@ -39,6 +55,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fleet.start()
         // Housekeeping: launch-plan scratch files from earlier sessions.
         MutationRunner.sweepLaunchPlanFiles()
+        // Notification taps route through the Kit's pure derivation: Open
+        // lands on the job, Review at Gate lands on the promote sheet.
+        notificationAdapter.onRoute = { [weak self] route in
+            guard let self else { return }
+            self.showMainWindow()
+            switch route {
+            case .openJob(let jobID):
+                self.shell.request = .openJob(jobID)
+            case .reviewAtGate(let jobID):
+                self.shell.request = .reviewAtGate(jobID)
+            }
+        }
+        // Launch-time catch-up runs once the fleet first loads (the center
+        // defers it while the rows provider is empty); the seen-set keeps
+        // relaunches from re-firing anything.
+        attention.start()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -54,6 +86,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminationPrepared else { return .terminateNow }
         terminationPrepared = true
+        // Read-only notify tails; stopped for symmetry, nothing to signal.
+        attention.stop()
         let patience: TimeInterval = 2
         // Both clients: the fleet's read children AND the shared write
         // client's children (a mid-flight `finish --yes` must meet its
@@ -81,7 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func makeWindowIfNeeded() {
         guard mainWindow == nil else { return }
         let hostingController = NSHostingController(
-            rootView: GateQueueView(store: fleet, router: writeRouter))
+            rootView: GateQueueView(
+                store: fleet, router: writeRouter, shell: shell, attention: attention))
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
@@ -108,10 +143,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let mainWindow else { return }
         NSApp.setActivationPolicy(.regular)
         // An LSUIElement app that flips to .regular gets the generic Dock
-        // tile unless the icon is set at runtime. The AppIcon set ships
-        // empty until APP-5 polish, so this lookup returns nil (generic
-        // tile) today; the assignment is wired now so dropping in the PNGs
-        // later fixes the Dock icon with no code change.
+        // tile unless the icon is set at runtime. APP-5 filled the AppIcon
+        // set (flat anchor on deep blue; master SVG in scripts/app-icon.svg,
+        // rendered via rsvg-convert), so this resolves the real icon.
         NSApp.applicationIconImage = NSImage(named: "AppIcon")
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -145,6 +179,22 @@ struct DeadreckonApp: App {
             MenuBarGlyph(store: appDelegate.fleet)
         }
         .menuBarExtraStyle(.window)
+
+        // APP-5: the Settings scene (Command-comma lands in the app menu
+        // automatically) and the real main-menu bar. The commands read the
+        // LIVE fleet row for the opened job, so menu enablement follows the
+        // same durable facts the on-screen buttons use.
+        Settings {
+            SettingsView(fleet: appDelegate.fleet, attention: appDelegate.attention)
+        }
+        .commands {
+            DeadreckonCommands(
+                fleet: appDelegate.fleet,
+                router: appDelegate.writeRouter,
+                shell: appDelegate.shell) {
+                appDelegate.showMainWindow()
+            }
+        }
     }
 }
 

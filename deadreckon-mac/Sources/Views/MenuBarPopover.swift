@@ -94,27 +94,72 @@ struct MenuBarPopover: View {
             .padding(.top, 6)
     }
 
+    /// The Bridge footer (design A2): the supervisor fact from the Harbor
+    /// poll, then Open / Start Job / Quit. The mock's "spend today" line is
+    /// deliberately dropped: per-day spend is not derivable from the rollup
+    /// heads and would need fleet-wide spend tails (documented in
+    /// CONTRACTS.md).
     private var footer: some View {
-        HStack(spacing: 10) {
-            Button("Open deadreckon") { openMainWindow() }
+        VStack(alignment: .leading, spacing: 0) {
+            supervisorLine
+            Divider().overlay(Theme.hairline)
+            HStack(spacing: 10) {
+                Button("Open") { openMainWindow() }
+                    .buttonStyle(.tactile)
+                    .font(Theme.body(11, weight: .medium))
+                    .keyboardShortcut("o")
+                Button("Start Job") {
+                    openMainWindow()
+                    router.pending = .layCourse
+                }
                 .buttonStyle(.tactile)
                 .font(Theme.body(11, weight: .medium))
-                .keyboardShortcut("o")
-            Button("Lay Course") {
-                openMainWindow()
-                router.pending = .layCourse
+                .keyboardShortcut("n")
+                Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+                    .buttonStyle(.tactile)
+                    .font(Theme.body(11))
+                    .keyboardShortcut("q")
             }
-            .buttonStyle(.tactile)
-            .font(Theme.body(11, weight: .medium))
-            .keyboardShortcut("n")
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var supervisorLine: some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(supervisorColor)
+                .frame(width: 6, height: 6)
+            Text(supervisorText)
+                .font(Theme.body(10.5))
+                .foregroundStyle(Theme.inkSecondary)
             Spacer()
-            Button("Quit") { NSApp.terminate(nil) }
-                .buttonStyle(.tactile)
-                .font(Theme.body(11))
-                .keyboardShortcut("q")
+            if let refreshed = store.lastRefreshed {
+                Text("updated \(QueueRowView.relativeTime(refreshed))")
+                    .font(Theme.body(10))
+                    .foregroundStyle(Theme.inkTertiary)
+                    .monospacedDigit()
+            }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
+    }
+
+    private var supervisorText: String {
+        switch store.harbor.supervisor {
+        case .running: return "supervisor running"
+        case .stopped: return "supervisor stopped"
+        case .unknown: return "supervisor unknown"
+        }
+    }
+
+    private var supervisorColor: Color {
+        switch store.harbor.supervisor {
+        case .running: return Theme.verified
+        case .stopped: return Theme.warn
+        case .unknown: return Theme.inkTertiary
+        }
     }
 }
 

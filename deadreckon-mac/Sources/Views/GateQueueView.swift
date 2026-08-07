@@ -11,6 +11,14 @@ struct GateQueueView: View {
     /// APP-4: every write surface (queue rows, workbench, popover) opens its
     /// confirmation sheet through this router.
     @ObservedObject var router: WriteSurfaceRouter
+    /// APP-5: pending navigation requests (menu bar, notification actions)
+    /// consumed here — this view owns the NavigationStack — and the opened
+    /// item published back so menu enablement can follow the live row.
+    @ObservedObject var shell: ShellModel
+    /// APP-5 fix pass: per-job notify-tail trouble surfaces as a header
+    /// chip — a corrupt notify.jsonl silences that job's notifications
+    /// (sticky per attempt), and silence needs a visible signal.
+    @ObservedObject var attention: AttentionCenter
     @State private var path: [QueueItem] = []
     @State private var paletteShown = false
 
@@ -20,7 +28,8 @@ struct GateQueueView: View {
                 Theme.paper.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    QueueHeaderView(store: store, onLayCourse: { router.pending = .layCourse },
+                    QueueHeaderView(store: store, attention: attention,
+                                    onLayCourse: { router.pending = .layCourse },
                                     onPalette: { paletteShown = true })
                     Divider().overlay(Theme.hairline)
                     content
@@ -56,6 +65,49 @@ struct GateQueueView: View {
             }
         }
         .background(shortcutButtons)
+        // The opened workbench item, published for menu enablement (APP-5).
+        .onChange(of: path) { _, newPath in
+            shell.openedItem = newPath.last
+        }
+        // Navigation requests from the menu bar and notification actions.
+        // openJob/reviewAtGate stay pending while the fleet is loading and
+        // resolve (or drop, honestly) once a loaded queue can answer.
+        .onChange(of: shell.request) { _, _ in consumeShellRequest() }
+        .onChange(of: store.lastRefreshed) { _, _ in consumeShellRequest() }
+        .onAppear { consumeShellRequest() }
+    }
+
+    private func consumeShellRequest() {
+        guard let request = shell.request else { return }
+        switch request {
+        case .gateQueue:
+            path = []
+            shell.request = nil
+        case .search:
+            paletteShown = true
+            shell.request = nil
+        case .focusSteer:
+            if path.last != nil {
+                NotificationCenter.default.post(name: .deadreckonFocusSteer, object: nil)
+            }
+            shell.request = nil
+        case .openJob(let jobID):
+            guard case .loaded = store.fleet else { return }  // retry on next poll
+            if let item = store.queue.allItems.first(where: { $0.id == jobID }) {
+                path = [item]
+            }
+            shell.request = nil
+        case .reviewAtGate(let jobID):
+            guard case .loaded = store.fleet else { return }  // retry on next poll
+            if let item = store.queue.allItems.first(where: { $0.id == jobID }),
+               let row = item.row {
+                path = [item]
+                // The promote sheet's own gate (PromoteGate, live row) stays
+                // authoritative; this only navigates onto it.
+                router.pending = .promote(row)
+            }
+            shell.request = nil
+        }
     }
 
     /// Hidden buttons so the shortcuts work regardless of focus.
@@ -136,6 +188,7 @@ struct GateQueueView: View {
 /// Fleet counts plus the Harbor chips (P8: counts and states, not prose).
 struct QueueHeaderView: View {
     @ObservedObject var store: FleetStore
+    @ObservedObject var attention: AttentionCenter
     let onLayCourse: () -> Void
     let onPalette: () -> Void
 
@@ -153,6 +206,7 @@ struct QueueHeaderView: View {
 
             Spacer()
 
+            notifyTailChip
             HarborChips(store: store)
 
             Button(action: onPalette) {
@@ -176,6 +230,20 @@ struct QueueHeaderView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
+    }
+
+    /// AttentionCenter honest degradation, rendered: a corrupt notify.jsonl
+    /// stops that job's notifications (sticky per attempt), so the silence
+    /// gets a chip here — count in the chip, per-job verbatim reasons in the
+    /// tooltip; the full list also renders in Settings > Notifications.
+    @ViewBuilder private var notifyTailChip: some View {
+        if !attention.issues.isEmpty {
+            let count = attention.issues.count
+            StatusChip(text: "notify tail \(count) corrupt", color: Theme.warn)
+                .help(attention.issues.sorted(by: { $0.key < $1.key })
+                    .map { "\($0.key): \($0.value)" }
+                    .joined(separator: "\n"))
+        }
     }
 
     private var summary: String {

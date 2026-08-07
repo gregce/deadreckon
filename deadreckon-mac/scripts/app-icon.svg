@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- deadreckon app icon: flat anchor on deep blue, macOS icon-grid
+       rounded rect (824x824 centered, r=186), no gradients, no shadows. -->
+  <rect x="100" y="100" width="824" height="824" rx="186" ry="186" fill="#12395C"/>
+  <g stroke="#F6F3EC" stroke-width="46" fill="none" stroke-linecap="round">
+    <!-- ring -->
+    <circle cx="512" cy="296" r="52"/>
+    <!-- shank -->
+    <line x1="512" y1="352" x2="512" y2="712"/>
+    <!-- stock -->
+    <line x1="398" y1="442" x2="626" y2="442"/>
+    <!-- arms: semicircular sweep through the bottom -->
+    <path d="M 306 574 A 206 206 0 0 0 718 574"/>
+  </g>
+  <!-- fluke barbs, flat filled triangles pointing up-out -->
+  <g fill="#F6F3EC">
+    <path d="M 306 574 L 246 522 L 366 502 Z"/>
+    <path d="M 718 574 L 778 522 L 658 502 Z"/>
+  </g>
+</svg>
