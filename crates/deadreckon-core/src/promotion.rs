@@ -268,6 +268,155 @@ fn expected_source_working_dir(
     }
 }
 
+/// One file of a report-only promotion preview's staged candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StagedPreviewFile {
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+/// The staged manifest of a report-only promotion preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionPreview {
+    /// Every file the promotion candidate stages, exactly as the real
+    /// publication would deliver it (including lifecycle metadata such as
+    /// `manifest.json` and `.deadreckon/`).
+    pub staged: Vec<StagedPreviewFile>,
+    /// The deliverable result identity of the staged candidate: the same
+    /// projection a completion receipt binds as `result_tree_sha256`
+    /// (deliverable files minus the promotion manifest and export marker), so
+    /// on strict Jobs this digest equals the receipt's bound digest — proved
+    /// by the candidate validation this preview runs — and on legacy runs it
+    /// is the digest a receipt would bind.
+    pub result_tree_sha256: String,
+}
+
+/// Stage the exact promotion candidate for `state` into caller-owned
+/// `scratch` and validate it exactly as the real promotion pipeline would
+/// ([`prepare_candidate`] followed by the candidate-bound strict receipt
+/// validation), without ever touching the real staging path, the library, run
+/// state, or the working tree.
+///
+/// Report-only by construction: the caller deletes `scratch` afterwards, and
+/// a later real promotion re-validates and re-stages from nothing produced
+/// here. `scratch` must live outside the DeadReckon home, the library parent
+/// (the real staging path), the run root, and the run's working tree — this
+/// is ENFORCED (hard refusal), not just documented, so a redirected system
+/// temp dir (e.g. `TMPDIR` pointed inside the home) can never make a preview
+/// stage into, or leave interrupted residue inside, the store it promises to
+/// leave byte-identical.
+pub fn stage_promotion_preview(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    scratch: &Path,
+) -> Result<PromotionPreview> {
+    if !state.working_dir.exists() {
+        return Err(DeadreckonError::NotFound(format!(
+            "working directory {}",
+            state.working_dir.display()
+        )));
+    }
+    refuse_contained_preview_scratch(paths, state, scratch)?;
+    let codebase = promotion_codebase_record(paths, state, &state.working_dir, false)?;
+    let source_working_dir = expected_source_working_dir(state, &codebase)?;
+    prepare_candidate(
+        state,
+        &codebase,
+        &state.working_dir,
+        &source_working_dir,
+        scratch,
+    )?;
+    // The same candidate-bound receipt validation the real pipeline runs
+    // between staging and publication (a no-op for legacy marker runs).
+    validate_strict_candidate(paths, state, scratch)?;
+    let policy = require_workspace_capture_policy(state)?;
+    let staged_index = crate::flight::build_promotable_file_index_with_policy(scratch, &policy)?;
+    let staged = staged_index
+        .files
+        .iter()
+        .map(|(path, fingerprint)| StagedPreviewFile {
+            path: path.clone(),
+            bytes: fingerprint.size,
+            sha256: fingerprint.hash.clone(),
+        })
+        .collect();
+    let mut deliverable = crate::flight::build_deliverable_file_index(scratch)?;
+    deliverable.files.remove(Path::new("manifest.json"));
+    deliverable.files.remove(Path::new(".materialized-to"));
+    Ok(PromotionPreview {
+        staged,
+        result_tree_sha256: deliverable.tree_hash(),
+    })
+}
+
+/// Enforce [`stage_promotion_preview`]'s scratch precondition: the scratch
+/// must not live inside the DeadReckon home, the library parent (the real
+/// staging path), the run root, or the run's working tree. Runs BEFORE any
+/// filesystem mutation (`prepare_candidate` starts by deleting the candidate
+/// path), so a violating scratch is refused without touching a byte.
+fn refuse_contained_preview_scratch(
+    paths: &DeadreckonPaths,
+    state: &PipelineState,
+    scratch: &Path,
+) -> Result<()> {
+    let scratch_identity = nearest_existing_canonical(scratch);
+    let library_parent = paths
+        .library_dir(&state.scope, &state.run_id)
+        .parent()
+        .map(Path::to_path_buf);
+    let forbidden = [
+        Some(paths.home().to_path_buf()),
+        library_parent,
+        Some(state.run_root.clone()),
+        Some(state.working_dir.clone()),
+    ];
+    for root in forbidden.into_iter().flatten() {
+        // An absent root cannot contain any existing path, and a scratch that
+        // merely extends lexically through an absent root is still caught by
+        // the existing ancestor that root lives under (the home rule).
+        let Ok(root_identity) = fs::canonicalize(&root) else {
+            continue;
+        };
+        if scratch_identity.starts_with(&root_identity) {
+            return Err(DeadreckonError::InvalidInput(format!(
+                "promotion preview scratch {} must live outside {}",
+                scratch.display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize the nearest existing ancestor of `path` and re-append the
+/// not-yet-created remainder, so containment checks see through symlinked
+/// temp locations (e.g. macOS `/var` -> `/private/var`) for paths that do
+/// not exist yet.
+fn nearest_existing_canonical(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(&existing) {
+            let mut identity = canonical;
+            for component in tail.iter().rev() {
+                identity.push(component);
+            }
+            return identity;
+        }
+        match (
+            existing.parent().map(Path::to_path_buf),
+            existing.file_name().map(std::ffi::OsStr::to_os_string),
+        ) {
+            (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+                tail.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn prepare_candidate(
     state: &PipelineState,
     codebase: &CodebaseRecord,

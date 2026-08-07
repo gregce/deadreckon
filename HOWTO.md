@@ -622,6 +622,30 @@ deadreckon resume <run-id> --max-wall-seconds 3600
 `apply`; for a fresh/copy run it routes to `export`; for an in-place run it
 prints review, docs, and undo guidance.
 
+`finish <id> --dry-run` previews that delivery without doing it: it runs the
+same completion-proof validation as the real finish (the sealed two-key
+receipt on Job-backed work; a legacy run's signed acceptance marker is
+reported as evidence, since the real finish delivers legacy runs without a
+proof gate), checks the delivery-readiness refusals the real path would
+raise (a non-empty destination, an apply target mid-git-operation), and for
+an export it stages the exact promotion candidate into a scratch directory
+and reports every staged file with its size and digest plus a diffstat
+against the frozen starting tree (when that snapshot exists), the
+result-tree digest, mode, and destination — then deletes the scratch. A git
+apply or in-place finish stages no files, and the plan says so honestly.
+Nothing under `~/.deadreckon/` or your working tree is touched, and a later
+real `finish` re-validates and re-stages from scratch; the preview is a
+report, never a shortcut. The recommended command in the plan reproduces the
+previewed delivery exactly (destination and flags included). Add `--json`
+for the machine-readable `finish_plan` envelope (a failed proof or blocked
+delivery reports `status: "blocked"` with the exact fail-closed reason
+instead of erroring):
+
+```bash
+deadreckon finish latest --dry-run
+deadreckon finish <job-id> --dry-run --json
+```
+
 Re-running `deadreckon apply <run-id>` after the changes are already on the
 target branch is safe: deadreckon reports `already applied` instead of creating
 or failing an empty commit. Add `--cleanup` to remove the temporary worktree and

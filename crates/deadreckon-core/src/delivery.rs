@@ -104,6 +104,62 @@ pub fn acquire_job_operation_lock(
     }
 }
 
+/// Probe-acquire the per-Job operation lock for a report-only preview.
+///
+/// Behaves like [`acquire_job_operation_lock`] against an existing lock file
+/// (same non-regular-file refusal, same active-operation refusal on
+/// contention, and on success the returned guard holds the lock), but when
+/// the lock file does not exist it acquires nothing and creates nothing.
+/// Precisely: holders create the file before locking and never unlink it, so
+/// an absent file proves only that no holder existed AT PROBE TIME — with
+/// `Ok(None)` nothing is held afterwards, and a mutator may create-and-lock
+/// mid-preview. That is deliberate slack, not a hole: the callers are
+/// read-only previews whose worst case under a concurrent mutator is a torn
+/// *report*, never unsafe reuse (a real finish re-validates and re-stages
+/// from nothing the preview produced). Today the verbs that actually acquire
+/// this lock are `finish`/`apply` and `undo`; the shared refusal text names
+/// the historical operation set and is kept byte-identical to
+/// [`acquire_job_operation_lock`]'s so previews raise the exact refusal the
+/// real verbs raise. Creating the lock file here instead would both break
+/// the preview's byte-identical guarantee and, for a legacy run, silently
+/// flip it onto the strict promotion path via the Job-dir probe.
+pub fn probe_job_operation_lock(
+    paths: &DeadreckonPaths,
+    job_id: &str,
+) -> Result<Option<JobOperationLock>> {
+    require_nonempty(job_id, "Job ID")?;
+    let path = paths.job_operation_lock(job_id);
+    let file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(DeadreckonError::Io { path, source }),
+    };
+    let opened = file.metadata().with_path(&path)?;
+    let metadata = fs::symlink_metadata(&path).with_path(&path)?;
+    if !opened.is_file()
+        || !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || !same_open_file(&opened, &metadata)
+    {
+        return Err(delivery_error(format!(
+            "Job operation lock is not a regular file: {}",
+            path.display()
+        )));
+    }
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(JobOperationLock {
+            file,
+            job_id: job_id.to_string(),
+        })),
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(DeadreckonError::InvalidInput(format!(
+                "Job {job_id} already has an active finish, undo, abandon, or cleanup operation"
+            )))
+        }
+        Err(source) => Err(DeadreckonError::Io { path, source }),
+    }
+}
+
 /// Controller-observed identity and current attached revision of one Git
 /// delivery target.
 #[derive(Debug, Clone, PartialEq, Eq)]

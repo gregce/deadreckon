@@ -3416,6 +3416,7 @@ async fn dispatch_chain_command_mode(
                 all: false,
                 limit: None,
                 receipt: false,
+                rerun_checks: false,
                 json: false,
                 plain: false,
                 quiet: true,

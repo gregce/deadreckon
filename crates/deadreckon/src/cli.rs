@@ -383,6 +383,7 @@ Lifecycle:
   deadreckon finish <plan-id>
   deadreckon finish latest --autostash --cleanup
   deadreckon finish latest --dest ./finished-project
+  deadreckon finish <job-id> --dry-run --json
 
 Finish chooses the right completed-work action:
   verified Job -> validate its two-key receipt, then apply or export its result
@@ -390,6 +391,10 @@ Finish chooses the right completed-work action:
   fresh/copy run -> export
   completed plan -> apply to source git, or export with --dest / non-git source
   in-place run -> show review guidance
+
+`--dry-run` previews the delivery without doing it: the same proof validation,
+staged to scratch and discarded, reported as a plan. A later real finish
+re-validates and re-stages from scratch.
 
 It still respects confirmations unless you pass `--no-confirm`. When finish routes
 to apply, --git-strategy selects squash, merge, or cherry-pick.";
@@ -1632,6 +1637,11 @@ pub(crate) enum Commands {
         no_confirm: bool,
         #[arg(long, help = "Commit message override for worktree apply")]
         message: Option<String>,
+        #[arg(
+            long,
+            help = "Report-only preview: validate the completion proof, stage to scratch, report the plan, and discard without mutating anything"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
         json: bool,
     },
@@ -2059,7 +2069,7 @@ pub(crate) enum Commands {
         about = "Re-verify a run NOW: VERIFIED / REGRESSED / UNVERIFIED with evidence and one next action (read-only)"
     )]
     Verdict {
-        #[arg(help = "Run id, unique prefix, or latest (default: latest)")]
+        #[arg(help = "Run id, Job id, unique prefix, or latest (default: latest)")]
         run_id: Option<String>,
         #[arg(long, help = "Compare several recent runs side by side")]
         all: bool,
@@ -2072,6 +2082,14 @@ pub(crate) enum Commands {
             help = "With --json: audit the completion receipt fact by fact (read-only)"
         )]
         receipt: bool,
+        #[arg(
+            long,
+            conflicts_with = "all",
+            help = "For a Job reference: re-run the current attempt's checks instead of \
+                    the default read-only receipt audit (refused while the job's driver \
+                    owns the run)"
+        )]
+        rerun_checks: bool,
         #[arg(long, help = "Emit machine-readable JSON")]
         json: bool,
         #[arg(long, help = "Plain output without TUI, spinner, or ANSI affordances")]
@@ -3399,6 +3417,36 @@ mod tests {
                 };
                 assert!(i_know_its_a_lot);
                 assert!(yes);
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test");
+    }
+
+    /// Gap G4: `finish --dry-run` is the report-only preview and must parse
+    /// with and without `--json` (the human plan rendering is a first-class
+    /// surface, not a JSON-only mode).
+    #[test]
+    fn finish_dry_run_flag_parses_with_and_without_json() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let cli =
+                    Cli::try_parse_from(["deadreckon", "finish", "latest", "--dry-run", "--json"])
+                        .expect("finish --dry-run --json parses");
+                let Some(Commands::Finish { dry_run, json, .. }) = cli.command else {
+                    panic!("finish command");
+                };
+                assert!(dry_run);
+                assert!(json);
+
+                let cli = Cli::try_parse_from(["deadreckon", "finish", "latest", "--dry-run"])
+                    .expect("finish --dry-run parses without --json");
+                let Some(Commands::Finish { dry_run, json, .. }) = cli.command else {
+                    panic!("finish command");
+                };
+                assert!(dry_run);
+                assert!(!json);
             })
             .expect("spawn parser test")
             .join()
