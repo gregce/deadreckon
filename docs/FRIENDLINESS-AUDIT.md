@@ -219,6 +219,12 @@ verb.
 | `attach` | One-command rollback | n-a | Read-only watch surface. |
 | `attach` | One verdict + ONE primary action | pass | Attach post-action notices and paused/plan TUI footers now derive one verdict or one subordinate `next` command. |
 | `attach` | Lifecycle hint | pass | Footer points at finish/show/apply or detach. |
+| `follow` | Auto-detect, don't ask | pass | `latest`, prefixes, and JOB refs resolve through the shared resolver; a Job maps onto its current attempt run without prompting. |
+| `follow` | Preview before mutate | n-a | Follow is a read-only NDJSON stream; it never writes anything. |
+| `follow` | Refuse with try: | pass | Missing `--json`, unknown `--from` sources, malformed offsets, and wrong-kind refs all refuse with a runnable `try:` (as `try_lines` in the G1 envelope). |
+| `follow` | One-command rollback | n-a | Read-only streaming surface. |
+| `follow` | One verdict + ONE primary action | n-a | Machine-only NDJSON stream; there is no human card, and refusals carry their single recovery path via the error envelope. |
+| `follow` | Lifecycle hint | n-a | The stream is pure data ending in one terminal line; the consuming surface owns any hints. |
 | `steer` | Auto-detect, don't ask | pass | Run prefixes and `latest` resolve through the shared run loader; the recorded route decides whether steering is supported. |
 | `steer` | Preview before mutate | n-a | The explicit instruction is the append operation; no workspace files are changed. |
 | `steer` | Refuse with try: | pass | Empty text, dead runs, and exec routes point at a concrete steer, extend, or provider-config command. |

@@ -6,8 +6,15 @@ for that: which files are blessed for tailing, what every blessed file
 guarantees, and how a correct reader consumes them. Files not listed here carry
 no tailing guarantees, even if they happen to be JSONL today.
 
+Consumers that prefer one merged stream over per-file tails can instead let
+the binary run this contract for them: `deadreckon follow <id> --json` is the
+blessed streaming reader over these same files (see
+["The blessed streaming reader"](#the-blessed-streaming-reader-deadreckon-follow)
+below). Direct file tailing remains fully supported either way.
+
 The conformance test for this contract is
-`crates/deadreckon/tests/tailing_contract.rs`.
+`crates/deadreckon/tests/tailing_contract.rs`; the follow stream's contract is
+pinned by `crates/deadreckon/tests/follow_stream.rs`.
 
 ## Blessed files
 
@@ -156,6 +163,81 @@ built this way can never diverge from what the CLI itself displays.
 Polling with a short interval is the supported mechanism. File-watch APIs
 (FSEvents, inotify) are a fine wake-up hint, but the read path above must
 still run as written — watchers can coalesce or drop events.
+
+## The blessed streaming reader: `deadreckon follow`
+
+`deadreckon follow <id> --json [--from <spec>]` runs the exact reader
+algorithm above headlessly over every blessed file for one artifact and emits
+the result as one merged NDJSON stream on stdout. It is the supported way to
+consume these ledgers without implementing seven tails; everything above
+stays the contract for readers that tail files directly.
+
+- **References.** `<id>` resolves like every other read verb: durable JOB and
+  RUN refs (plus plan-child refs; plans, chains, and campaigns redirect to
+  `attach`). A Job follows its **current attempt run** — `projection.json`
+  `child_run_ids`, newest last, the same rule `verdict` and `show` use — with
+  the job's `job-events.jsonl` merged in. Following across attempt boundaries
+  is out of scope: the stream stays on the attempt that was current at start
+  (a retry is still visible as `job-events` rows), and following the new
+  attempt means reconnecting.
+- **Line shape.** Each line is one record:
+  `{"source": <name>, "offset": <byte offset AFTER this record>,
+  "generation": <file-generation token>, "record": <the parsed row
+  verbatim>}` where `source` is one of
+  `job-events | events | spend | traces | flight | acceptance-progress |
+  notify` (`flight` is `flight-events.jsonl`; `job-events` appears only when
+  the reference named a durable Job). `generation` is a short opaque token
+  identifying the exact file the offset was read from (it changes when the
+  file is replaced — a new attempt, or the acceptance-progress rewrite).
+  Lines are merged in arrival order at poll granularity: appends to
+  different files that land within one poll window are emitted in the fixed
+  source order listed above, not true cross-file append order; per-source
+  ordering is exact.
+- **Replay.** `--from source=offset[@generation][,…]` resumes each named
+  source from a previously emitted cursor, so a reconnect neither duplicates
+  nor loses rows. Carry the `generation` token from the last line you
+  consumed: follow verifies it before streaming, and a nonzero offset whose
+  generation no longer matches the file refuses (append-only sources — the
+  ledger the cursor came from no longer exists, e.g. a new attempt) or emits
+  the restart marker (`acceptance-progress`) instead of silently skipping
+  the new file's head. A bare `source=offset` is accepted but unverified —
+  safe only for offset 0. Only cursors follow itself emitted are valid;
+  sources not named in `--from` restart from 0. Unknown or unfollowed
+  sources, malformed offsets, duplicate cursors, and an empty spec refuse
+  with `try_lines`. A stale or mid-record nonzero offset that fails its
+  first read is refused as an invalid cursor (reconnect that source from 0)
+  rather than reported as ledger corruption.
+- **Restart marker.** `proofs/acceptance-progress.jsonl` keeps its documented
+  exception: on any rewrite anomaly under a retained offset follow emits one
+  `{"source":"acceptance-progress","restart":true}` marker line, resets that
+  source's offset to 0, and re-emits the file from the top — discard rows you
+  retained for that source when you see the marker. One carve-out: a parse
+  failure with no retained offset (offset 0) is corruption and fails closed
+  even for this file — restarting would loop forever over the same bad
+  bytes. Every other source keeps the strict corruption rule: follow fails
+  closed (nonzero exit; with the armed `--json`, a `{"kind":"error",…}`
+  envelope, serialized compactly so it is itself one valid NDJSON line even
+  mid-stream) rather than skip or re-emit a row. `job-events` rows are
+  additionally held to invariant 5: a `sequence` discontinuity fails the
+  stream closed.
+- **End of stream.** Once the artifact reaches a terminal phase (run:
+  `completed`/`failed`/`killed`; job: projection phase `terminal`, plus the
+  job's typed `outcome`) AND a poll drains nothing new, follow emits one
+  final `{"terminal": true, "phase": …}` line and exits 0. Ctrl-C ends the
+  stream with no final line (exit 130). When stdin is a pipe, closing it ends
+  the stream quietly (exit 0): spawn follow with a piped stdin you hold open
+  and drop it to disconnect — a supervising app that dies can never leak
+  followers. Corollary: stdin from `/dev/null` is already closed, so follow
+  emits one full drain of the backlog and exits — a snapshot, not a hang.
+- **Dead-runner signal.** A run stuck at an executing phase with no live
+  runner process behind it (the same pid-liveness/staleness rule `status`
+  uses) gets one advisory `{"stalled": true, "phase": …, "run_id": …,
+  "detail": …}` line. The stream stays open — cleanup or a resume can still
+  move the state — but the consumer is told the terminal line may never
+  arrive on its own and can apply its own timeout.
+- **Read-only, poll-driven.** Follow never writes anything, anywhere. Its
+  cadence is attach's budgeted idle backoff (16 ms doubling to 250 ms while
+  idle, reset on activity).
 
 ## What this contract does not grant
 

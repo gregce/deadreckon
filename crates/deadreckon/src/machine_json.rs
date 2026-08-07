@@ -10,12 +10,14 @@
 //! prose path stays byte-identical whenever `--json` was not given.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 
 use deadreckon::verdict_surface::VerdictSurface;
 
 static ARMED_VERB: OnceLock<&'static str> = OnceLock::new();
+static NDJSON_STREAM: AtomicBool = AtomicBool::new(false);
 
 /// Record at dispatch time that this invocation's subcommand carried
 /// `--json`. Arming is one-shot per process, matching one CLI invocation.
@@ -28,6 +30,25 @@ pub(crate) fn arm(verb: &'static str, json: bool) {
         crate::ui::set_plain_output(true);
         let _ = ARMED_VERB.set(verb);
     }
+}
+
+/// Arm a verb whose armed stdout is one NDJSON stream (`follow`). Every
+/// machine envelope the process later prints — including `main()`'s
+/// fail-closed refusal envelope — must then be serialized compactly so it is
+/// itself one valid NDJSON line: a mid-stream refusal lands after valid
+/// stream records on the same fd, and a line-oriented decoder must be able to
+/// parse it (docs/TAILING.md).
+pub(crate) fn arm_ndjson(verb: &'static str, json: bool) {
+    if json {
+        NDJSON_STREAM.store(true, Ordering::SeqCst);
+    }
+    arm(verb, json);
+}
+
+/// True when the armed verb's stdout is an NDJSON stream, so envelopes must
+/// stay single-line.
+pub(crate) fn ndjson_stream() -> bool {
+    NDJSON_STREAM.load(Ordering::SeqCst)
 }
 
 /// The verb that was armed with `--json`, if any. Terminal surfaces branch on
