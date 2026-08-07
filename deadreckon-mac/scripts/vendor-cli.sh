@@ -33,12 +33,29 @@ VERSION="$(git -C "$CLI_SRC" describe --tags --always 2>/dev/null || echo dev)"
 
 echo "Vendoring deadreckon $VERSION ($COMMIT) from $CLI_SRC for: ${ARCHS[*]}"
 
+# Signing happens BEFORE the sha256 pin: codesign rewrites the binary, so a
+# pin taken over unsigned bytes fails BinaryLocator's integrity check the
+# moment a release build signs the bundle (found the hard way — the app
+# refused its own vendored CLI). Release signing must never re-sign the CLI;
+# release-app.sh signs only the outer bundle. Set DEADRECKON_VENDOR_SIGN=0
+# for contributors without the Developer ID certificate (dev-only vendoring;
+# do not commit that manifest for a release).
+SIGN_IDENTITY="${DEADRECKON_SIGN_IDENTITY:-Developer ID Application: Gregory Ceccarelli (4GRQMF5T5U)}"
+VENDOR_SIGN="${DEADRECKON_VENDOR_SIGN:-1}"
+
 typeset -A SHAS
 for arch in "${ARCHS[@]}"; do
   triple="${TRIPLES[$arch]}"
   (cd "$CLI_SRC" && cargo build --release -p "$CRATE" --bin "$CRATE" --target "$triple")
   cp "$CLI_SRC/target/$triple/release/$CRATE" "$BIN_DIR/deadreckon_darwin_$arch"
   chmod +x "$BIN_DIR/deadreckon_darwin_$arch"
+  if [[ "$VENDOR_SIGN" == 1 ]]; then
+    codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp \
+      "$BIN_DIR/deadreckon_darwin_$arch"
+    codesign --verify --strict "$BIN_DIR/deadreckon_darwin_$arch"
+  else
+    echo "note: DEADRECKON_VENDOR_SIGN=0 — unsigned vendor; not releasable" >&2
+  fi
   SHAS[$arch]="$(shasum -a 256 "$BIN_DIR/deadreckon_darwin_$arch" | cut -d' ' -f1)"
 done
 
