@@ -91,6 +91,33 @@ final class SendBackTests: XCTestCase {
         XCTAssertTrue(coordinator.canSubmit, "the explicit re-arm restores the dispatch")
     }
 
+    /// Success disarms too: after .queued the still-armed button would
+    /// dispatch extend again and queue a DUPLICATE continuation Job. One
+    /// extend per open sheet (a fresh sheet re-arms), mirroring the
+    /// mayHaveQueued disarm and PromoteSheet's disabled-after-.succeeded.
+    func testSecondSubmitAfterQueuedDispatchesNothing() async {
+        let cli = FakeCLI()
+        cli.scriptStdout("extend", """
+        {"kind": "extend", "id": "job-new", "status": "queued", "next_actions": [],
+         "try_lines": [], "queued": true, "parent_id": "run-parent",
+         "parent_run_id": "run-parent", "contract": "inherited", "note_recorded": false}
+        """)
+        let coordinator = SendBackCoordinator(parentID: "run-parent", cli: cli)
+        coordinator.goal = "continue"
+        await coordinator.submit()
+        guard case .queued = coordinator.state else {
+            return XCTFail("expected queued: \(coordinator.state)")
+        }
+        XCTAssertFalse(coordinator.canSubmit, "the dispatch disarms after success")
+
+        await coordinator.submit()
+        XCTAssertEqual(cli.calls.count, 1,
+                       "a second submit after .queued must not queue a duplicate continuation Job")
+        guard case .queued = coordinator.state else {
+            return XCTFail("the queued acknowledgment stays visible: \(coordinator.state)")
+        }
+    }
+
     /// The in-flight guard: a double-click's second submit while the first
     /// extend is still running must not queue a second continuation Job.
     func testInFlightSubmitGuardDispatchesOnce() async {

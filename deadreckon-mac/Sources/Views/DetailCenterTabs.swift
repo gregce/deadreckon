@@ -162,10 +162,7 @@ struct NarrativePaneView: View {
     @ViewBuilder private func claims(_ title: String, _ claims: [NarrativeSnapshotDoc.Claim]) -> some View {
         if !claims.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
-                Text(title.uppercased())
-                    .font(Theme.body(9, weight: .bold))
-                    .kerning(0.5)
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle(title.uppercased(), size: 9, kerning: 0.5)
                 ForEach(Array(claims.enumerated()), id: \.offset) { _, claim in
                     HStack(alignment: .top, spacing: 6) {
                         Text("\u{2022}").foregroundStyle(Theme.inkTertiary)
@@ -194,6 +191,13 @@ struct NarrativePaneView: View {
 struct ActivityPaneView: View {
     @ObservedObject var detail: JobDetailStore
     @State private var query = ""
+    /// Whether the operator is at (or near) the tail: tracked by the
+    /// sentinel row's visibility. Auto-follow on append only when pinned —
+    /// this pane's purpose is unbounded scrollback READING, and yanking a
+    /// scrolled-up operator to the bottom every 2 s tick defeats it
+    /// (Console.app/Terminal behavior; the drawer's terminal panes stay
+    /// tail-convention always-follow).
+    @State private var pinnedToTail = true
 
     var body: some View {
         // Computed ONCE per body pass: the counter and the ForEach share the
@@ -241,12 +245,19 @@ struct ActivityPaneView: View {
                             }
                             .id(entry.id)
                         }
+                        // The tail sentinel: instantiated by the LazyVStack
+                        // only when the bottom is on screen, so its
+                        // appear/disappear IS the was-at-bottom fact.
+                        Color.clear
+                            .frame(height: 1)
+                            .onAppear { pinnedToTail = true }
+                            .onDisappear { pinnedToTail = false }
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: detail.activity.count) { _ in
-                    if query.isEmpty, let last = detail.activity.last {
+                    if query.isEmpty, pinnedToTail, let last = detail.activity.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }

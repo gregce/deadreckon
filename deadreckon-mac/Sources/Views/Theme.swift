@@ -46,6 +46,15 @@ enum Theme {
     /// `onFill` ink already clears contrast on the lighter amber.
     static let warnFill = dynamicColor(light: NSColor(red: 0.60, green: 0.42, blue: 0.05, alpha: 1),
                                        dark: NSColor(red: 0.92, green: 0.72, blue: 0.32, alpha: 1))
+    /// Filled-chip green, mirroring `warnFill`: `verified`'s light-mode
+    /// value under white `onFill` text computes to ~3.6:1 as a FILL —
+    /// below the 4.5:1 bar for filled chips, on the app's single most
+    /// trust-critical signal. Filled VERIFIED chips use this darker
+    /// light-mode green (~5.8:1 under white); the dark value matches
+    /// `verified`, where the near-ink dark `onFill` already clears
+    /// contrast on the lighter green.
+    static let verifiedFill = dynamicColor(light: NSColor(red: 0.16, green: 0.45, blue: 0.26, alpha: 1),
+                                           dark: NSColor(red: 0.38, green: 0.75, blue: 0.50, alpha: 1))
     /// Failure red: wrecked rows, proof-invalid chips, unavailable banners.
     static let danger = dynamicColor(light: NSColor(red: 0.78, green: 0.24, blue: 0.20, alpha: 1),
                                      dark: NSColor(red: 0.94, green: 0.45, blue: 0.40, alpha: 1))
@@ -86,13 +95,17 @@ enum Theme {
 
     // MARK: Section titles
 
-    /// The one kerned-uppercase section title (10pt bold, kerning 0.6,
-    /// tertiary ink). Every band/section header renders through this; the
-    /// per-view re-implementations drifted metrics and are gone.
-    static func sectionTitle(_ text: String) -> some View {
+    /// The one kerned-uppercase section title (10pt bold / kerning 0.6 /
+    /// tertiary ink by default). Every band/section header renders through
+    /// this; deliberate sub-scales (the evidence rail's and center-pane
+    /// claims' 9pt bands, the drawer toggle's 9.5pt, Settings' 11pt group
+    /// titles) pass size/kerning explicitly so the metric still lives in
+    /// exactly one place.
+    static func sectionTitle(_ text: String, size: CGFloat = 10,
+                             kerning: CGFloat = 0.6) -> some View {
         Text(text)
-            .font(body(10, weight: .bold))
-            .kerning(0.6)
+            .font(body(size, weight: .bold))
+            .kerning(kerning)
             .foregroundStyle(inkTertiary)
     }
 

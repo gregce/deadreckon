@@ -121,6 +121,14 @@ public final class LayCourseController: ObservableObject {
             execution = .refused(refusal)
         } else if let primary = result.primary {
             execution = .launched(primary)
+            // Success disarms the one-click dispatch too: the sheet's Start
+            // is Return-bound, and a preview left .ready would let one
+            // keypress replay the same plan file into a DUPLICATE paid Job.
+            // The queued acknowledgment stays visible (execution state); a
+            // fresh Preview course is required before another Start — the
+            // same discipline as the envelope-free path below and the other
+            // sheets' after-verb disarms.
+            preview = .idle
         } else {
             // The binary died mid-verb with no envelope: it may have queued
             // the durable Job BEFORE dying, and this side cannot tell. Say
@@ -589,7 +597,14 @@ public final class SendBackCoordinator: ObservableObject {
     }
 
     public var canSubmit: Bool {
-        !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // A queued continuation disarms the dispatch: a second click on the
+        // still-armed button would queue a DUPLICATE continuation Job. One
+        // extend per open sheet — the same discipline as PromoteSheet's
+        // disabled-after-.succeeded and this coordinator's own mayHaveQueued
+        // disarm (a fresh sheet re-arms; so does the explicit re-arm).
+        if case .running = state { return false }
+        if case .queued = state { return false }
+        return !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !mayHaveQueued
     }
 

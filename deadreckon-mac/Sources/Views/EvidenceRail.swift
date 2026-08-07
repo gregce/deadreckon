@@ -167,10 +167,7 @@ struct ContractChecksView: View {
     @ViewBuilder private var liveBand: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 6) {
-                Text("LIVE CHECKS")
-                    .font(Theme.body(9, weight: .bold))
-                    .kerning(0.5)
-                    .foregroundStyle(Theme.inkTertiary)
+                Theme.sectionTitle("LIVE CHECKS", size: 9, kerning: 0.5)
                 Text("advisory rows \u{00B7} not evidence")
                     .font(Theme.body(9))
                     .foregroundStyle(Theme.inkTertiary)
@@ -228,10 +225,7 @@ struct ContractChecksView: View {
     /// the rollup's proof classifier.
     @ViewBuilder private var twoKeysBand: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("TWO KEYS")
-                .font(Theme.body(9, weight: .bold))
-                .kerning(0.5)
-                .foregroundStyle(Theme.inkTertiary)
+            Theme.sectionTitle("TWO KEYS", size: 9, kerning: 0.5)
 
             HStack(spacing: 6) {
                 Text("\u{26BF}")
@@ -277,7 +271,7 @@ struct ContractChecksView: View {
             }
 
             if row.receipt?.verified == .valid {
-                StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
+                StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
                     .help(GlossaryText.phraseVerifiedByDrGate)
             }
             if row.receipt?.verified == .invalid {
@@ -300,10 +294,7 @@ struct ContractChecksView: View {
     /// CONTRACTS.md; the G7 per-digest audit facts land here with it.
     @ViewBuilder private var receiptAuditBand: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("RECEIPT EVIDENCE")
-                .font(Theme.body(9, weight: .bold))
-                .kerning(0.5)
-                .foregroundStyle(Theme.inkTertiary)
+            Theme.sectionTitle("RECEIPT EVIDENCE", size: 9, kerning: 0.5)
 
             if let report = detail.report {
                 if report.deterministicChecks.isEmpty {
@@ -561,10 +552,7 @@ struct FlightView: View {
                 }
                 if let manifest = detail.flight.manifest {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("FLIGHT RECORDER")
-                            .font(Theme.body(9, weight: .bold))
-                            .kerning(0.5)
-                            .foregroundStyle(Theme.inkTertiary)
+                        Theme.sectionTitle("FLIGHT RECORDER", size: 9, kerning: 0.5)
                         Text("\(detail.flight.eventCount) events this session \u{00B7} \(manifest.sessions.count) sessions")
                             .font(Theme.body(10.5))
                             .foregroundStyle(Theme.inkSecondary)

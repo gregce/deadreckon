@@ -38,6 +38,17 @@ struct MenuBarPopover: View {
         // FleetStore's in-flight/queued coalescing makes this safe against
         // poll overlap, mirroring showMainWindow's immediate refresh.
         .task { await store.refreshNow() }
+        // .task alone re-fires only if SwiftUI unmounts the
+        // MenuBarExtra(.window) content between opens — a lifecycle that
+        // has been version-fragile historically (onAppear/task firing only
+        // on the first open on some macOS builds). This bridge observes the
+        // hosting panel's own show/key notifications (the
+        // WindowVisibilityObserver pattern from JobDetailView), so every
+        // open refreshes regardless; the coalescing absorbs the overlap
+        // when both paths fire.
+        .background(PopoverOpenObserver {
+            Task { await store.refreshNow() }
+        })
     }
 
     private var headerLine: some View {
@@ -87,6 +98,29 @@ struct MenuBarPopover: View {
             }
         }
         if decisions.isEmpty && underway.isEmpty {
+            // Degraded-state honesty: the empty-state words key off the
+            // FLEET state, not the derived queue — when the fleet is
+            // unavailable or still loading, its queue is empty for reasons
+            // that are anything but quiet, and this is the app's primary
+            // trust surface.
+            emptyStateLine
+        }
+    }
+
+    @ViewBuilder private var emptyStateLine: some View {
+        switch store.fleet {
+        case .loading:
+            Text("reading the fleet")
+                .font(Theme.body(11))
+                .foregroundStyle(Theme.inkTertiary)
+                .padding(8)
+        case .unavailable(let reason):
+            Text("fleet unavailable \u{2014} \(reason)")
+                .font(Theme.body(11))
+                .foregroundStyle(Theme.warn)
+                .lineLimit(3)
+                .padding(8)
+        case .loaded:
             Text(store.queue.isEmpty ? "fleet quiet" : "nothing needs you right now")
                 .font(Theme.body(11))
                 .foregroundStyle(Theme.inkTertiary)
@@ -191,7 +225,7 @@ private struct PopoverDecisionRow: View {
                     .lineLimit(1)
                 Spacer()
                 if row.receipt?.verified == .valid {
-                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
+                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
                 } else {
                     StatusChip(text: GlossaryText.statusWord(row.status), color: Theme.warn)
                 }
@@ -413,6 +447,63 @@ private struct PopoverUnderwayRow: View {
         Task {
             await quickSteer.submit(note: text)
             if case .queued = quickSteer.tracker.phase { note = "" }
+        }
+    }
+}
+
+/// Bridges the MenuBarExtra(.window) panel's own lifecycle into SwiftUI:
+/// fires `onOpen` when the hosting panel becomes key or de-occludes (each
+/// popover summon), independent of whether SwiftUI unmounts the content
+/// between opens. Same NSViewRepresentable pattern as JobDetailView's
+/// WindowVisibilityObserver.
+private struct PopoverOpenObserver: NSViewRepresentable {
+    let onOpen: () -> Void
+
+    func makeNSView(context: Context) -> TrackingView {
+        let view = TrackingView()
+        view.onOpen = onOpen
+        return view
+    }
+
+    func updateNSView(_ view: TrackingView, context: Context) {
+        view.onOpen = onOpen
+    }
+
+    final class TrackingView: NSView {
+        var onOpen: (() -> Void)?
+        private var observers: [NSObjectProtocol] = []
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeObservers()
+            guard let window else { return }
+            let center = NotificationCenter.default
+            observers.append(center.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                self?.onOpen?()
+            })
+            // The panel may show without becoming key; occlusion flipping
+            // to visible covers that path. Guarded so hide events fire
+            // nothing.
+            observers.append(center.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                guard let self, let window = self.window,
+                      window.occlusionState.contains(.visible) else { return }
+                self.onOpen?()
+            })
+        }
+
+        private func removeObservers() {
+            for observer in observers {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            observers = []
+        }
+
+        deinit {
+            removeObservers()
         }
     }
 }
