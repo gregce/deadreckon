@@ -1,20 +1,20 @@
 import DeadreckonKit
 import SwiftUI
 
-/// The converged Binnacle promote sheet (design A4/B3/C2/C4 per 6.2 item 4):
-/// TWO-KEY band, CONTRACT table, receipt chips, CANDIDATE preview
-/// (`finish --dry-run --json`, degrading honestly until the M2 binary
-/// lands), destination radio mapped 1:1 to flags, the literal finish line,
-/// and Quarterdeck's decision bar (Promote / Send back / Kill). Every
-/// fail-closed refusal renders verbatim with NO override control — the only
-/// recovery affordances are the envelope's try lines and next actions.
-struct PromoteSheet: View {
+/// The Review & Approve sheet: TWO SIGN-OFFS band, WHAT DONE MEANS table,
+/// PROOF chips, RESULT PREVIEW (`finish --dry-run --json`, degrading
+/// honestly until the M2 binary lands), destination radio mapped 1:1 to
+/// flags, the literal finish line, and the decision bar (Approve / Send
+/// back / Stop). Every fail-closed refusal renders verbatim with NO
+/// override control — the only recovery affordances are the envelope's try
+/// lines and next actions.
+struct ReviewApproveSheet: View {
     let row: FleetRow
     /// The live fleet store: the gate must ride the FRESHEST receipt facts,
     /// not the row snapshot captured at sheet-open (a long-lived sheet's
     /// enablement would otherwise derive from facts no longer on disk).
     @ObservedObject var fleet: FleetStore
-    /// Routes Send back / Kill to their own confirmation sheets.
+    /// Routes Send back / Stop to their own confirmation sheets.
     let onSendBack: () -> Void
     let onKill: () -> Void
 
@@ -32,14 +32,15 @@ struct PromoteSheet: View {
         self.onKill = onKill
         _coordinator = StateObject(
             wrappedValue: PromoteCoordinator(jobID: row.jobID, cli: WriteCLI.client))
-        // The evidence engine: report --json for the two keys and the frozen
-        // contract (the APP-3 receipt fallback — see the gate band's label).
+        // The evidence engine: report --json for the two sign-offs and the
+        // frozen definition (the APP-3 receipt fallback — see the gate
+        // band's label).
         _evidence = StateObject(wrappedValue: JobDetailStore(
             jobID: row.jobID, scope: row.scope, goal: row.goal,
             cli: WriteCLI.client))
     }
 
-    /// The freshest rollup row for this job (falling back to the open-time
+    /// The freshest rollup row for this run (falling back to the open-time
     /// snapshot only while the fleet has no loaded row for it).
     private var liveRow: FleetRow {
         fleet.queue.allItems.compactMap(\.row).first(where: { $0.jobID == row.jobID }) ?? row
@@ -52,7 +53,7 @@ struct PromoteSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     twoKeyBand
@@ -61,13 +62,13 @@ struct PromoteSheet: View {
                     candidateBand
                     destinationBand
                 }
-                .padding(18)
+                .padding(20)
             }
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
             decisionBar
         }
         .frame(width: 680, height: 700)
-        .background(Theme.paper)
+        .background(Theme.windowBg)
         .onAppear { evidence.open() }
         .onDisappear { evidence.close() }
         .task { await coordinator.loadPreview() }
@@ -78,58 +79,61 @@ struct PromoteSheet: View {
     private var header: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Promote \(row.jobID)")
-                    .font(Theme.display(18))
-                    .foregroundStyle(Theme.ink)
+                Text("Review & Approve")
+                    .font(Theme.title)
+                    .foregroundStyle(Theme.textPrimary)
                 Text(row.goal)
                     .font(Theme.body(11.5))
-                    .foregroundStyle(Theme.inkSecondary)
+                    .foregroundStyle(Theme.textSecondary)
                     .lineLimit(2)
+                Text(row.jobID)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.textTertiary)
+                    .textSelection(.enabled)
             }
             Spacer()
-            // Trust rule 6: VERIFIED only from the shared proof classifier,
+            // Trust rule 6: Verified only from the shared proof classifier,
             // read from the LIVE row (never the sheet-open snapshot).
             if liveRow.receipt?.verified == .valid {
-                StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
-                    .help(GlossaryText.phraseVerifiedByDrGate)
+                StatusChip(text: Lexicon.proofVerified, color: Theme.success, strong: true)
+                    .help(Lexicon.verifiedHelp)
             } else if liveRow.receipt?.verified == .invalid {
-                StatusChip(text: GlossaryText.proofWord(.invalid), color: Theme.danger, filled: true)
+                StatusChip(text: Lexicon.proofInvalid, color: Theme.danger, strong: true,
+                           textColor: Theme.dangerText)
                     .help(liveRow.receipt?.error ?? "the signed receipt did not validate")
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 20)
         .padding(.vertical, 12)
     }
 
-    // MARK: Two keys
+    // MARK: Two sign-offs
 
     @ViewBuilder private var twoKeyBand: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Theme.sectionTitle("TWO-KEY COMPLETION (Binnacle)")
+                Theme.sectionTitle("TWO SIGN-OFFS")
                 Spacer()
                 // The honesty label the design requires: these are report's
-                // RECORDED facts; a fresh verdict --receipt on a JOB ref is
-                // a registered Rust-side gap (CONTRACTS.md).
-                Text("recorded by report --json \u{00B7} fresh verdict on JOB refs is a registered Rust gap")
+                // RECORDED facts; a fresh re-run for a run is a registered
+                // CLI gap (CONTRACTS.md).
+                Text("from the recorded report \u{2014} the app can\u{2019}t re-run checks (registered CLI gap)")
                     .font(Theme.body(9))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
             }
             keyLine(
-                glyph: "\u{26BF}",
-                title: "Key 1 \u{00B7} deterministic marker",
+                title: "Checks passed \u{2014} signed record",
                 present: gate.markerKeyPresent,
                 detail: markerDetail)
             keyLine(
-                glyph: "\u{2696}",
-                title: "Key 2 \u{00B7} semantic judgment",
+                title: "Judge\u{2019}s call",
                 present: gate.judgmentKeyPresent,
                 detail: judgmentDetail)
             if let judgment = evidence.report?.semantic?.judgment, let summary = judgment.summary {
                 Text("\u{201C}\(summary)\u{201D}")
-                    .font(Theme.body(11))
+                    .font(Theme.small)
                     .italic()
-                    .foregroundStyle(Theme.inkSecondary)
+                    .foregroundStyle(Theme.textSecondary)
                     .textSelection(.enabled)
                     .padding(.leading, 22)
             }
@@ -141,10 +145,10 @@ struct PromoteSheet: View {
 
     private var markerDetail: String {
         guard let receipt = evidence.report?.receipt else {
-            return "no receipt block recorded"
+            return "no signed record found"
         }
         var parts = ["status \(receipt.status)"]
-        if receipt.contained == true { parts.append("contained") }
+        if receipt.contained == true { parts.append("sandboxed") }
         if let backend = receipt.sandboxBackend { parts.append(backend) }
         if let error = receipt.signatureValidationError { parts.append("signature: \(error)") }
         return parts.joined(separator: " \u{00B7} ")
@@ -157,43 +161,52 @@ struct PromoteSheet: View {
         return judgment.decision
     }
 
-    private func keyLine(glyph: String, title: String, present: Bool, detail: String) -> some View {
+    private func keyLine(title: String, present: Bool, detail: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
-            Text(glyph)
-                .font(Theme.body(12))
-                .foregroundStyle(present ? Theme.verified : Theme.warn)
+            Text(present ? "\u{2713}" : "\u{25CB}")
+                .font(Theme.body(12, weight: .bold))
+                .foregroundStyle(present ? Theme.success : Theme.warn)
             VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(Theme.body(11, weight: .semibold))
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.textPrimary)
                 Text(detail)
                     .font(Theme.body(10.5))
-                    .foregroundStyle(present ? Theme.inkSecondary : Theme.warn)
+                    .foregroundStyle(present ? Theme.textSecondary : Theme.warn)
                     .textSelection(.enabled)
             }
         }
     }
 
-    // MARK: Contract table
+    // MARK: What done means
 
     @ViewBuilder private var contractBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Theme.sectionTitle("CONTRACT \u{00B7} frozen acceptance.yaml")
+            HStack(spacing: 6) {
+                Theme.sectionTitle("WHAT DONE MEANS")
+                Text("frozen acceptance.yaml")
+                    .font(Theme.monoS)
+                    .foregroundStyle(Theme.textTertiary)
+            }
             if let contract = evidence.report?.contract {
                 HStack(spacing: 6) {
                     if let approved = contract.approvedSHA256 {
                         Text("sha256 \(String(approved.prefix(12)))\u{2026}")
-                            .font(Theme.mono(10))
-                            .foregroundStyle(Theme.inkSecondary)
+                            .font(Theme.monoS)
+                            .foregroundStyle(Theme.textSecondary)
                     }
                     if let matches = contract.matchesApprovedDigest {
-                        StatusChip(
-                            text: matches ? "matches authority.json" : "DIGEST MISMATCH",
-                            color: matches ? Theme.verified : Theme.danger,
-                            filled: !matches)
+                        if matches {
+                            StatusChip(text: "matches the approved version", color: Theme.success)
+                        } else {
+                            StatusChip(text: "CHANGED SINCE APPROVAL", color: Theme.danger,
+                                       strong: true, textColor: Theme.dangerText)
+                                .help("sha256 approved \(contract.approvedSHA256 ?? "-") \u{00B7} current \(contract.currentSHA256 ?? "-")")
+                        }
                     }
                     if let network = evidence.status?.job?.job.policy?.execution?.gate?.network {
-                        StatusChip(text: "net: \(network)", color: Theme.inkSecondary)
+                        StatusChip(text: network == "deny" ? "network: not allowed" : "network: \(network)",
+                                   color: Theme.textSecondary)
                     }
                 }
                 checkTable(contract)
@@ -215,7 +228,7 @@ struct PromoteSheet: View {
     /// deterministic_checks): status, duration, expandable clipped output
     /// where the ledger recorded any. Pairing is positional BUT verified on
     /// check identity (kind): a recorded list that is not a same-order
-    /// mirror of the frozen contract (reordered, or from another contract
+    /// mirror of the frozen definition (reordered, or from another
     /// revision) degrades that row to the unpaired "not recorded" glyph
     /// rather than showing a result against the wrong check.
     @ViewBuilder private func checkTable(_ contract: JobReportEnvelope.Contract) -> some View {
@@ -229,31 +242,30 @@ struct PromoteSheet: View {
                 HStack(spacing: 6) {
                     Text(result == nil ? "\u{25CB}" : (result!.passed ? "\u{2713}" : "\u{2717}"))
                         .font(Theme.body(11, weight: .bold))
-                        .foregroundStyle(result == nil ? Theme.inkTertiary
-                            : (result!.passed ? Theme.verified : Theme.danger))
+                        .foregroundStyle(result == nil ? Theme.textTertiary
+                            : (result!.passed ? Theme.success : Theme.dangerText))
+                        .help(result == nil ? "not recorded" : "")
                     Text(check.kind)
                         .font(Theme.mono(10.5))
-                        .foregroundStyle(Theme.ink)
+                        .foregroundStyle(Theme.textPrimary)
                     Text(check.subject)
                         .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.inkSecondary)
+                        .foregroundStyle(Theme.textSecondary)
                         .lineLimit(1)
                     if check.mustPass {
-                        StatusChip(text: "must pass", color: Theme.inkSecondary)
+                        StatusChip(text: "must pass", color: Theme.textSecondary)
                     }
                     Spacer()
                     if let duration = result?.durationMS {
                         Text(String(format: "%.1fs", Double(duration) / 1000))
-                            .font(Theme.mono(10))
-                            .foregroundStyle(Theme.inkTertiary)
+                            .font(Theme.monoS)
+                            .foregroundStyle(Theme.textTertiary)
                     }
                     if result?.stdout != nil || result?.stderr != nil {
                         Button(expandedCheck == index ? "hide output" : "output \u{25B8}") {
                             expandedCheck = expandedCheck == index ? nil : index
                         }
-                        .buttonStyle(.tactile)
-                        .font(Theme.body(9.5))
-                        .foregroundStyle(Theme.accent)
+                        .buttonStyle(.themeText(size: 9.5))
                     }
                 }
                 if expandedCheck == index, let result {
@@ -261,7 +273,7 @@ struct PromoteSheet: View {
                         if let stdout = result.stdout, !stdout.isEmpty {
                             Text(stdout)
                                 .font(Theme.mono(9.5))
-                                .foregroundStyle(Theme.inkSecondary)
+                                .foregroundStyle(Theme.textSecondary)
                                 .textSelection(.enabled)
                                 .lineLimit(14)
                         }
@@ -272,70 +284,73 @@ struct PromoteSheet: View {
                                 .textSelection(.enabled)
                                 .lineLimit(8)
                         }
-                        Text("clipped \u{2014} recorded by the gate, not re-run here")
+                        Text("clipped \u{2014} recorded when the checks ran, not re-run here")
                             .font(Theme.body(9))
-                            .foregroundStyle(Theme.inkTertiary)
+                            .foregroundStyle(Theme.textTertiary)
                     }
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.paper, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .background(Theme.well,
+                                in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.border, lineWidth: 1))
                 }
             }
         }
     }
 
-    // MARK: Receipt chips
+    // MARK: Proof
 
     @ViewBuilder private var receiptBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Theme.sectionTitle("RECEIPT")
+            Theme.sectionTitle("PROOF")
             HStack(spacing: 6) {
                 if let receipt = liveRow.receipt {
                     StatusChip(
-                        text: "proof \(GlossaryText.proofWord(receipt.verified))",
-                        color: receipt.verified == .valid ? Theme.verified
-                            : receipt.verified == .invalid ? Theme.danger : Theme.inkTertiary)
+                        text: Lexicon.proofWord(receipt.verified),
+                        color: receipt.verified == .valid ? Theme.success
+                            : receipt.verified == .invalid ? Theme.danger : Theme.textTertiary,
+                        strong: receipt.verified == .valid || receipt.verified == .invalid,
+                        textColor: receipt.verified == .invalid ? Theme.dangerText : nil)
                     if let error = receipt.error {
                         Text(error)
-                            .font(Theme.body(10))
-                            .foregroundStyle(Theme.danger)
+                            .font(Theme.monoS)
+                            .foregroundStyle(Theme.dangerText)
                             .textSelection(.enabled)
                     }
                 } else {
-                    Text("no receipt on the rollup row")
+                    Text("no proof recorded for this run")
                         .font(Theme.body(10.5))
                         .foregroundStyle(Theme.warn)
                 }
                 if let gateCounts = liveRow.gate {
-                    StatusChip(text: GlossaryText.gateCounts(gateCounts), color: Theme.inkSecondary)
-                        .help("From the signed acceptance marker, attempt \(gateCounts.attempt)")
+                    StatusChip(text: GlossaryText.gateCounts(gateCounts), color: Theme.textSecondary)
+                        .help("From the signed record of check results, attempt \(gateCounts.attempt)")
                 }
             }
-            Text("real finish re-validates the receipt fail-closed before AND after the atomic rename; any drift refuses with no operator override, by design")
+            Text("Approving re-validates the proof before and after the files move; any drift refuses \u{2014} there is no override, by design.")
                 .font(Theme.body(9.5))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .cardChrome()
     }
 
-    // MARK: Candidate (dry-run preview)
+    // MARK: Result preview (dry-run)
 
     @ViewBuilder private var candidateBand: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Theme.sectionTitle("CANDIDATE \u{00B7} preview before mutate")
+                Theme.sectionTitle("RESULT PREVIEW \u{2014} NOTHING MOVES YET")
                 Spacer()
                 Button("Refresh preview") {
                     Task { await coordinator.loadPreview() }
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(10))
-                .foregroundStyle(Theme.accent)
+                .buttonStyle(.themeStandard(compact: true))
                 .disabled(exportPathMissing)
                 .help(exportPathMissing
-                    ? "Enter an export destination first \u{2014} there is no default path."
+                    ? "Enter an export folder first \u{2014} there is no default."
                     : "Re-runs finish --dry-run --json for the selected destination.")
             }
             CommandLineView(command: coordinator.dryRunCommandLine)
@@ -343,7 +358,7 @@ struct PromoteSheet: View {
                previewedFor != coordinator.destination {
                 // The shown plan was computed for a DIFFERENT destination:
                 // say so instead of silently pairing it with the new flags.
-                Text("this preview was computed for a different destination \u{2014} Refresh preview before trusting it")
+                Text("This preview was computed for a different destination \u{2014} refresh before trusting it.")
                     .font(Theme.body(10, weight: .medium))
                     .foregroundStyle(Theme.warn)
             }
@@ -352,16 +367,16 @@ struct PromoteSheet: View {
                 ProgressView().controlSize(.small)
             case .unsupported(let words):
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("promote preview requires the M2 binary")
+                    Text("Result preview needs a newer CLI.")
                         .font(Theme.body(11, weight: .semibold))
                         .foregroundStyle(Theme.warn)
                     Text(words)
-                        .font(Theme.mono(10))
-                        .foregroundStyle(Theme.inkSecondary)
+                        .font(Theme.monoS)
+                        .foregroundStyle(Theme.textSecondary)
                         .textSelection(.enabled)
-                    Text("PROMOTE below still runs the real fail-closed finish; only the staged-file preview is missing.")
-                        .font(Theme.body(10))
-                        .foregroundStyle(Theme.inkTertiary)
+                    Text("Approve below still runs the real fail-closed apply; only this file list is missing.")
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.textTertiary)
                 }
             case .refused(let refusal):
                 RefusalView(refusal: refusal)
@@ -389,34 +404,36 @@ struct PromoteSheet: View {
     /// rendered as a normal plan — "0 files · +0 −0" would be a lie.
     @ViewBuilder private func blockedPlanView(_ plan: FinishPlanEnvelope) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Image(systemName: "xmark.octagon")
-                    .foregroundStyle(Theme.danger)
-                Text("finish plan blocked \u{2014} nothing will promote")
-                    .font(Theme.body(11.5, weight: .semibold))
-                    .foregroundStyle(Theme.danger)
-            }
+            Text("Blocked \u{2014} nothing will be applied")
+                .font(Theme.body(11.5, weight: .semibold))
+                .foregroundStyle(Theme.dangerText)
             if let error = plan.receipt?.error {
                 Text(error)
                     .font(Theme.mono(10.5))
-                    .foregroundStyle(Theme.danger)
+                    .foregroundStyle(Theme.textPrimary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("the binary reported status \u{201C}blocked\u{201D} without a receipt error message")
+                Text("The CLI reported \u{201C}blocked\u{201D} without an error message.")
                     .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.danger)
+                    .foregroundStyle(Theme.dangerText)
             }
             ForEach(plan.nextActions, id: \.self) { action in
                 Text("next: \(action)")
-                    .font(Theme.mono(10))
+                    .font(Theme.monoS)
                     .foregroundStyle(Theme.accent)
                     .textSelection(.enabled)
             }
-            Text("real finish would refuse the same way; there is no override")
+            Text("Approving would refuse the same way; there is no override.")
                 .font(Theme.body(9.5))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.danger.opacity(0.06),
+                    in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+            .strokeBorder(Theme.danger.opacity(0.35), lineWidth: 1))
     }
 
     @ViewBuilder private func planView(_ plan: FinishPlanEnvelope) -> some View {
@@ -424,53 +441,54 @@ struct PromoteSheet: View {
             if let diffstat = plan.diffstat {
                 Text("\(diffstat.filesChanged ?? plan.staged.count) files \u{00B7} +\(diffstat.added ?? 0) \u{2212}\(diffstat.removed ?? 0)")
                     .font(Theme.body(11, weight: .medium))
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.textPrimary)
+                    .monospacedDigit()
             }
             ForEach(Array(plan.staged.prefix(40).enumerated()), id: \.offset) { _, file in
                 HStack(spacing: 8) {
                     Text(file.path)
-                        .font(Theme.mono(10))
-                        .foregroundStyle(Theme.ink)
+                        .font(Theme.monoS)
+                        .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer()
                     Text("\(file.bytes) B")
                         .font(Theme.mono(9.5))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .foregroundStyle(Theme.textTertiary)
                     Text(String(file.sha256.prefix(8)))
                         .font(Theme.mono(9.5))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .foregroundStyle(Theme.textTertiary)
                 }
             }
             if plan.staged.count > 40 {
                 Text("\u{2026} \(plan.staged.count - 40) more staged files")
-                    .font(Theme.body(10))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .font(Theme.caption)
+                    .foregroundStyle(Theme.textTertiary)
             }
             if !plan.irreversibleSteps.isEmpty {
                 HStack(spacing: 6) {
                     Text("IRREVERSIBLE:")
                         .font(Theme.body(10, weight: .bold))
-                        .foregroundStyle(Theme.danger)
+                        .foregroundStyle(Theme.dangerText)
                     Text(plan.irreversibleSteps.joined(separator: ", "))
                         .font(Theme.mono(10.5))
-                        .foregroundStyle(Theme.danger)
+                        .foregroundStyle(Theme.dangerText)
                 }
             }
-            Text("report-only: real finish re-validates and re-stages from scratch")
+            Text("Preview only \u{2014} approving re-validates and re-stages from scratch.")
                 .font(Theme.body(9.5))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
         }
     }
 
-    // MARK: Destination
+    // MARK: Where the result goes
 
     @ViewBuilder private var destinationBand: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Theme.sectionTitle("DESTINATION")
+            Theme.sectionTitle("WHERE THE RESULT GOES")
             destinationRadio(
                 selected: isApply,
-                title: "Apply to the working tree",
+                title: "Apply to the project",
                 subtitle: "undoable afterwards: deadreckon undo"
             ) {
                 coordinator.destination = .apply(autostash: applyAutostash, cleanup: applyCleanup)
@@ -485,27 +503,30 @@ struct PromoteSheet: View {
             }
             destinationRadio(
                 selected: !isApply,
-                title: "Export to a directory (--dest)",
+                title: "Export to a folder",
                 subtitle: nil
             ) {
                 // No invented default: the operator names the destination or
-                // PROMOTE stays disabled with the missing fact named below.
+                // Approve stays disabled with the missing fact named below.
                 coordinator.destination = .export(path: exportPath)
             }
             if !isApply {
-                TextField("/path/to/export", text: $exportPath)
-                    .textFieldStyle(.plain)
-                    .font(Theme.mono(11))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .frame(maxWidth: 320)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .strokeBorder(Theme.hairline, lineWidth: 1))
-                    .padding(.leading, 22)
-                    .onChange(of: exportPath) { _, path in
-                        coordinator.destination = .export(path: path)
-                    }
+                HStack(spacing: 6) {
+                    Text("--dest")
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.textTertiary)
+                    TextField("/path/to/export", text: $exportPath)
+                        .textFieldStyle(.plain)
+                        .font(Theme.monoM)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .frame(maxWidth: 320)
+                        .inputChrome()
+                        .onChange(of: exportPath) { _, path in
+                            coordinator.destination = .export(path: path)
+                        }
+                }
+                .padding(.leading, 22)
             }
         }
         .padding(12)
@@ -518,8 +539,9 @@ struct PromoteSheet: View {
         return false
     }
 
-    /// Export selected but no destination typed yet: PROMOTE and the preview
-    /// stay disabled with this fact named (no invented default path).
+    /// Export selected but no destination typed yet: Approve and the
+    /// preview stay disabled with this fact named (no invented default
+    /// path).
     private var exportPathMissing: Bool {
         !isApply && exportPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -549,15 +571,15 @@ struct PromoteSheet: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: selected ? "largecircle.fill.circle" : "circle")
-                    .foregroundStyle(selected ? Theme.accent : Theme.inkTertiary)
+                    .foregroundStyle(selected ? Theme.accent : Theme.textTertiary)
                     .font(.system(size: 12))
                 Text(title)
                     .font(Theme.body(11.5, weight: .medium))
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.textPrimary)
                 if let subtitle {
                     Text(subtitle)
-                        .font(Theme.body(10))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.textTertiary)
                 }
                 Spacer()
             }
@@ -576,19 +598,19 @@ struct PromoteSheet: View {
             case .running:
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("running finish \u{2014} validate, stage, revalidate, rename, revalidate\u{2026}")
+                    Text("applying \u{2014} validate, stage, revalidate, move, revalidate\u{2026}")
                         .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.inkSecondary)
+                        .foregroundStyle(Theme.textSecondary)
                 }
             case .succeeded(let envelope):
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.seal")
-                            .foregroundStyle(Theme.verified)
-                        Text("promoted \u{00B7} \(envelope.status ?? "completed")"
+                            .foregroundStyle(Theme.success)
+                        Text("Approved \u{00B7} \(envelope.status ?? "completed")"
                             + (envelope.delivery?.stagedFileCount.map { " \u{00B7} \($0) files" } ?? ""))
                             .font(Theme.body(11.5, weight: .medium))
-                            .foregroundStyle(Theme.ink)
+                            .foregroundStyle(Theme.textPrimary)
                     }
                     // The envelope's own next actions, verbatim (trust rule
                     // 2): an apply success offers `deadreckon undo`; an
@@ -596,13 +618,13 @@ struct PromoteSheet: View {
                     // never asserts an affordance the binary did not offer.
                     ForEach(envelope.nextActions, id: \.self) { action in
                         Text("next: \(action)")
-                            .font(Theme.mono(10))
+                            .font(Theme.monoS)
                             .foregroundStyle(Theme.accent)
                             .textSelection(.enabled)
                     }
                     Text(successLifecycleLine(envelope))
-                        .font(Theme.body(10))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.textTertiary)
                 }
             case .refused(let refusal):
                 RefusalView(refusal: refusal)
@@ -616,52 +638,57 @@ struct PromoteSheet: View {
             CommandLineView(command: coordinator.finishCommandLine)
 
             HStack(spacing: 8) {
-                Button("Close") { dismiss() }
-                    .buttonStyle(.tactile)
+                Button(dismissTitle) { dismiss() }
+                    .buttonStyle(.themeStandard)
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 // No dismiss() first: the router's .sheet(item:) swaps the
                 // presented content on identity change. dismiss()-then-set
                 // in the same tick can race the dismissal animation and
                 // swallow the follow-up sheet on some macOS versions.
-                Button("Send back + note\u{2026}") {
+                Button("Send back\u{2026}") {
                     onSendBack()
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(11, weight: .medium))
-                Button("Kill\u{2026}") {
+                .buttonStyle(.themeStandard)
+                // §A0 Discard note: Stop is enabled only for a non-terminal
+                // row — a finished run has nothing left to stop.
+                Button("Stop\u{2026}") {
                     onKill()
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(11, weight: .medium))
-                .foregroundStyle(Theme.danger)
+                .buttonStyle(.themeQuietDanger)
+                .disabled(liveRow.projection.phase == .terminal)
+                .help(liveRow.projection.phase == .terminal
+                    ? "This run already finished \u{2014} there is nothing to stop"
+                    : "Stop this run \u{2014} asks first, then force-quits; full details in the confirm")
                 promoteButton
             }
             if let reason = promoteDisabledReason {
-                Text("promote disabled: \(reason)")
-                    .font(Theme.body(10))
+                Text("Approve disabled: \(reason)")
+                    .font(Theme.caption)
                     .foregroundStyle(Theme.warn)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 20)
         .padding(.vertical, 12)
     }
 
-    private var promoteButton: some View {
-        Button {
-            Task { await coordinator.promote(gate: gate) }
-        } label: {
-            Text("PROMOTE \u{2014} finish \(row.jobID)")
-                .font(Theme.body(12, weight: .semibold))
-                .foregroundStyle(Theme.onFill)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 7)
-                .background(promoteEnabled ? Theme.verified : Theme.inkTertiary, in: Capsule())
+    /// Sheet-dismiss word: "Cancel" before dispatch, "Close" after a result.
+    private var dismissTitle: String {
+        switch coordinator.promotion {
+        case .idle, .running: return "Cancel"
+        case .succeeded, .refused, .failed: return "Close"
         }
-        .buttonStyle(.tactile)
+    }
+
+    private var promoteButton: some View {
+        Button("Approve") {
+            Task { await coordinator.promote(gate: gate) }
+        }
+        .buttonStyle(.themePrimary)
         .disabled(!promoteEnabled)
         .keyboardShortcut(.defaultAction)
+        .help("deadreckon finish \(row.jobID) --yes --json")
     }
 
     private var promoteEnabled: Bool {
@@ -675,26 +702,26 @@ struct PromoteSheet: View {
     /// destination the operator has not typed yet.
     private var promoteDisabledReason: String? {
         if let reason = gate.disabledReason { return reason }
-        if exportPathMissing { return "no export destination entered (--dest has no default)" }
+        if exportPathMissing { return "no export folder entered \u{2014} there is no default" }
         return nil
     }
 
-    /// The lifecycle hint under a promote success. "one-command rollback"
-    /// is claimed ONLY when `deadreckon undo` appears among the envelope's
-    /// own next actions (apply destinations); an export success gets no
-    /// rollback claim, because the binary offers none (trust rule 2).
+    /// The lifecycle hint under an approve success. The undo claim is made
+    /// ONLY when `deadreckon undo` appears among the envelope's own next
+    /// actions (apply destinations); an export success gets no rollback
+    /// claim, because the binary offers none (trust rule 2).
     private func successLifecycleLine(_ envelope: MutationEnvelope) -> String {
         let offersUndo = envelope.nextActions.contains { $0.contains("deadreckon undo") }
-        return (offersUndo ? "one-command rollback: deadreckon undo \u{00B7} " : "")
-            + "the row updates from the files, not from this sheet"
+        return (offersUndo ? "Undo with one command: deadreckon undo \u{00B7} " : "")
+            + "the run updates from its files, not from this sheet"
     }
     // Section titles render through Theme.sectionTitle (the one shared
     // kerned-uppercase style).
 }
 
-/// The send-back sheet (Quarterdeck's middle button, G9): a follow-up goal
-/// plus the operator's note, recorded as typed provenance on the parent run.
-/// Not promoted, not killed — sent back with a receipt of why.
+/// The send-back sheet (G9): a follow-up goal plus your note, recorded as
+/// typed provenance on the parent run. Not approved, not stopped — sent
+/// back with a receipt of why.
 struct SendBackSheet: View {
     let row: FleetRow
     @Environment(\.dismiss) private var dismiss
@@ -709,37 +736,41 @@ struct SendBackSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Send back \(row.jobID)")
-                    .font(Theme.display(18))
-                    .foregroundStyle(Theme.ink)
-                Text("queues a continuation Job under the parent's frozen contract; your note lands as typed provenance the next agentic turn can read")
+                Text("Send back")
+                    .font(Theme.title)
+                    .foregroundStyle(Theme.textPrimary)
+                Text(row.goal)
+                    .font(Theme.body(11.5))
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(2)
+                Text(row.jobID)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.textTertiary)
+                    .textSelection(.enabled)
+                Text("Starts a follow-up run with the same definition of done. Your note is recorded and the agent reads it first.")
                     .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Theme.sectionTitle("FOLLOW-UP GOAL")
+                Theme.sectionTitle("WHAT TO DO NEXT")
                 TextEditor(text: $coordinator.goal)
                     .font(Theme.body(12))
                     .scrollContentBackground(.hidden)
                     .padding(6)
                     .frame(height: 56)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Theme.hairline, lineWidth: 1))
+                    .inputChrome()
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Theme.sectionTitle("OPERATOR NOTE (--note, recorded on the parent)")
+                Theme.sectionTitle("YOUR NOTE \u{2014} RECORDED ON THE RUN")
                 TextEditor(text: $coordinator.note)
                     .font(Theme.body(12))
                     .scrollContentBackground(.hidden)
                     .padding(6)
                     .frame(height: 72)
-                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Theme.hairline, lineWidth: 1))
+                    .inputChrome()
             }
 
             CommandLineView(command: coordinator.commandLine)
@@ -752,12 +783,12 @@ struct SendBackSheet: View {
             case .queued(let envelope):
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark.circle")
-                        .foregroundStyle(Theme.verified)
-                    Text("queued \(envelope.id ?? "")"
-                        + " \u{00B7} contract \(envelope.extend?.contract ?? "?")"
+                        .foregroundStyle(Theme.success)
+                    Text("Follow-up started \(envelope.id ?? "")"
+                        + " \u{00B7} done-definition \(envelope.extend?.contract ?? "?")"
                         + " \u{00B7} note \(envelope.extend?.noteRecorded == true ? "recorded" : "not recorded")")
-                        .font(Theme.body(11))
-                        .foregroundStyle(Theme.inkSecondary)
+                        .font(Theme.small)
+                        .foregroundStyle(Theme.textSecondary)
                         .textSelection(.enabled)
                 }
             case .refused(let refusal):
@@ -772,39 +803,37 @@ struct SendBackSheet: View {
                     if coordinator.mayHaveQueued {
                         // The explicit fresh confirmation after an ambiguous
                         // failure: the operator re-arms only after checking
-                        // the fleet (which updates from the files).
-                        Button("I checked the fleet \u{2014} re-arm Send back") {
+                        // the runs (which update from the files).
+                        Button("I checked my runs \u{2014} enable Send back again") {
                             coordinator.rearmAfterPossibleQueue()
                         }
-                        .buttonStyle(.tactile)
-                        .font(Theme.body(10.5, weight: .medium))
-                        .foregroundStyle(Theme.accent)
+                        .buttonStyle(.themeText(size: 10.5))
                     }
                 }
             }
 
             HStack {
                 Spacer()
-                Button("Close") { dismiss() }
-                    .buttonStyle(.tactile)
+                Button(dismissTitle) { dismiss() }
+                    .buttonStyle(.themeStandard)
                     .keyboardShortcut(.cancelAction)
-                Button {
+                Button("Send back") {
                     Task { await coordinator.submit() }
-                } label: {
-                    Text("Send back")
-                        .font(Theme.body(12, weight: .semibold))
-                        .foregroundStyle(Theme.onFill)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(coordinator.canSubmit ? Theme.accent : Theme.inkTertiary,
-                                    in: Capsule())
                 }
-                .buttonStyle(.tactile)
+                .buttonStyle(.themePrimary)
                 .disabled(!coordinator.canSubmit)
             }
         }
         .padding(20)
         .frame(width: 560)
-        .background(Theme.paper)
+        .background(Theme.windowBg)
+    }
+
+    /// Sheet-dismiss word: "Cancel" before dispatch, "Close" after a result.
+    private var dismissTitle: String {
+        switch coordinator.state {
+        case .idle, .running: return "Cancel"
+        case .queued, .refused, .failed: return "Close"
+        }
     }
 }

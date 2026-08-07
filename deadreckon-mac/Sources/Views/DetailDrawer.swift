@@ -1,14 +1,14 @@
 import DeadreckonKit
 import SwiftUI
 
-/// The bottom DRAWER (P5): Terminal (supervisor.out/err plain-text tails) |
-/// Raw events | Job events (torn-tail badge + integrity chip). Execution
+/// The bottom CONSOLE (P5): Terminal (supervisor.out/err plain-text tails) |
+/// Raw events | Run log (partial-line badge + integrity chip). Execution
 /// surfaces live adjacent to evidence, not in a separate window.
 struct DetailDrawerView: View {
     enum Tab: String, CaseIterable {
         case terminal = "Terminal"
         case rawEvents = "Raw events"
-        case jobEvents = "Job events"
+        case jobEvents = "Run log"
     }
 
     @ObservedObject var detail: JobDetailStore
@@ -24,28 +24,18 @@ struct DetailDrawerView: View {
                     HStack(spacing: 4) {
                         Image(systemName: shown ? "chevron.down" : "chevron.up")
                             .font(.system(size: 9, weight: .semibold))
-                        Theme.sectionTitle("DRAWER", size: 9.5)
+                        Theme.sectionTitle("CONSOLE")
                     }
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.tactile)
 
                 if shown {
                     ForEach(Tab.allCases, id: \.self) { candidate in
-                        Button {
+                        TabButton(title: candidate.rawValue, active: tab == candidate) {
                             tab = candidate
-                        } label: {
-                            Text(candidate.rawValue)
-                                .font(Theme.body(10.5, weight: tab == candidate ? .semibold : .regular))
-                                .foregroundStyle(tab == candidate ? Theme.ink : Theme.inkSecondary)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(
-                                    tab == candidate ? Theme.card : .clear,
-                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                         }
-                        .buttonStyle(.tactile)
                     }
                 }
                 Spacer()
@@ -55,32 +45,34 @@ struct DetailDrawerView: View {
             .padding(.vertical, 6)
 
             if shown {
-                Divider().overlay(Theme.hairline)
+                Divider().overlay(Theme.border)
                 content
                     .frame(height: 180)
             }
         }
-        .background(Theme.card)
+        .background(Theme.panel)
     }
 
     /// The visible integrity claim over job-events.jsonl: contiguity or the
-    /// tailer's own failure words, plus the torn-tail badge. Always shown,
-    /// drawer open or not.
+    /// tailer's own failure words, plus the partial-line badge. Always
+    /// shown, console open or not. Display words from Lexicon; the Kit's
+    /// own labels stay byte-identical for tests.
     @ViewBuilder private var integrityChip: some View {
         HStack(spacing: 5) {
             if detail.jobEventsTornTail {
-                StatusChip(text: "torn tail", color: Theme.inkTertiary)
-                    .help("Unterminated final line retained and retried; an in-flight append, never corruption (TAILING.md).")
+                StatusChip(text: "partial line", color: Theme.textTertiary)
+                    .help("An unterminated final line, kept and retried \u{2014} an in-flight write, not corruption.")
             }
             switch detail.integrity {
             case .none:
-                StatusChip(text: detail.integrity.label, color: Theme.inkTertiary)
+                StatusChip(text: Lexicon.integrityWord(detail.integrity), color: Theme.textTertiary)
             case .contiguous:
-                StatusChip(text: detail.integrity.label, color: Theme.verified)
-                    .help("Strict sequence 1..N verified continuously against job-events.jsonl.")
-            case .corrupt:
-                StatusChip(text: detail.integrity.label, color: Theme.danger, filled: true)
-                    .help("The strict ledger failed verification; rendering unknown, never a guessed state.")
+                StatusChip(text: Lexicon.integrityWord(detail.integrity), color: Theme.success)
+                    .help("Sequence 1..N verified continuously against job-events.jsonl.")
+            case .corrupt(let reason):
+                StatusChip(text: Lexicon.integrityWord(detail.integrity), color: Theme.danger,
+                           strong: true, textColor: Theme.dangerText)
+                    .help("The strict ledger failed verification; showing unknown, never a guess. \(reason)")
             }
         }
     }
@@ -91,7 +83,7 @@ struct DetailDrawerView: View {
             HStack(spacing: 0) {
                 terminalPane(title: "supervisor.out", text: detail.supervisorOut,
                              truncated: detail.supervisorOutTruncated)
-                Divider().overlay(Theme.hairline)
+                Divider().overlay(Theme.border)
                 terminalPane(title: "supervisor.err", text: detail.supervisorErr,
                              truncated: detail.supervisorErrTruncated)
             }
@@ -115,7 +107,7 @@ struct DetailDrawerView: View {
             HStack(spacing: 6) {
                 Text(title)
                     .font(Theme.mono(9))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                 if truncated {
                     // The documented ceiling (CONTRACTS.md): the pane keeps
                     // the trailing ~256 KB; the full file stays on disk.
@@ -132,12 +124,12 @@ struct DetailDrawerView: View {
                         if lines.isEmpty {
                             Text("(empty)")
                                 .font(Theme.mono(9.5))
-                                .foregroundStyle(Theme.inkTertiary)
+                                .foregroundStyle(Theme.textTertiary)
                         }
                         ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
                             Text(line.isEmpty ? " " : line)
                                 .font(Theme.mono(9.5))
-                                .foregroundStyle(Theme.inkSecondary)
+                                .foregroundStyle(Theme.textSecondary)
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .id(index)
@@ -177,7 +169,7 @@ struct DetailDrawerView: View {
                     ForEach(Array(detail.rawEventLines.enumerated()), id: \.offset) { index, line in
                         Text(line)
                             .font(Theme.mono(9))
-                            .foregroundStyle(Theme.inkSecondary)
+                            .foregroundStyle(Theme.textSecondary)
                             .textSelection(.enabled)
                             .lineLimit(1)
                             .id(base + index)
@@ -185,7 +177,7 @@ struct DetailDrawerView: View {
                     if detail.rawEventLines.isEmpty {
                         Text("(no events yet)")
                             .font(Theme.mono(9.5))
-                            .foregroundStyle(Theme.inkTertiary)
+                            .foregroundStyle(Theme.textTertiary)
                     }
                 }
                 .padding(10)
@@ -204,12 +196,12 @@ struct DetailDrawerView: View {
                 if case .contiguous(let count) = detail.integrity {
                     Text("last sequence \(count)")
                         .font(Theme.mono(9.5))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .foregroundStyle(Theme.textTertiary)
                 }
             }
-            Text("The strictly-sequenced Job lifecycle ledger (job-events.jsonl): sequence 1..N with no gaps, fsynced before the projection checkpoint. This chip is the app continuously verifying that contract; a gap renders the failure, never a guessed state.")
+            Text("The run\u{2019}s strict lifecycle ledger (`job-events.jsonl`): sequence 1..N, no gaps. The app verifies it continuously; a gap shows as a failure, never a guess.")
                 .font(Theme.body(10))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
             if let issue = detail.projectionIssue {
                 Text(issue)
                     .font(Theme.body(9.5))
@@ -219,7 +211,7 @@ struct DetailDrawerView: View {
             if let projection = detail.projection {
                 Text("projection: phase \(projection.phase.rawValue) \u{00B7} last_sequence \(projection.lastSequence) \u{00B7} lease epoch \(projection.currentLeaseEpoch) \u{00B7} attempts \(projection.attemptCount)")
                     .font(Theme.mono(9.5))
-                    .foregroundStyle(Theme.inkSecondary)
+                    .foregroundStyle(Theme.textSecondary)
                     .textSelection(.enabled)
                 ForEach(projection.caveats, id: \.self) { caveat in
                     Text("caveat: \(caveat)")
@@ -235,7 +227,7 @@ struct DetailDrawerView: View {
                 // the header; this line never re-derives it.
                 Text("lease: owner \(lease.ownerID) \u{00B7} epoch \(lease.epoch) \u{00B7} pid \(lease.pid) \u{00B7} heartbeat \(ActivityPaneView.time(lease.heartbeatAt)) \u{00B7} expires \(ActivityPaneView.time(lease.expiresAt))")
                     .font(Theme.mono(9.5))
-                    .foregroundStyle(Theme.inkSecondary)
+                    .foregroundStyle(Theme.textSecondary)
                     .textSelection(.enabled)
             }
             Spacer()

@@ -155,7 +155,7 @@ final class AttentionCenterTests: XCTestCase {
             .decode(NotifyRecord.self, from: Data(line.utf8)) else { return XCTFail() }
         let intent = AttentionDerivation.intent(from: row, owningJobID: "job-9")
         XCTAssertEqual(intent?.body, "run run-9 paused at cap")
-        XCTAssertEqual(intent?.title, "Paused at cap")
+        XCTAssertEqual(intent?.title, "Paused at a limit")
         // paused_at_cap rows carry no job_id; the owning job of the tailed
         // run root fills in so Open can route.
         XCTAssertEqual(intent?.jobID, "job-9")

@@ -22,8 +22,8 @@ struct CommandPalette: View {
             VStack(spacing: 0) {
                 HStack(spacing: 10) {
                     Image(systemName: "magnifyingglass")
-                        .foregroundStyle(Theme.inkTertiary)
-                    TextField("Filter by goal, id, or provider", text: $query)
+                        .foregroundStyle(Theme.textTertiary)
+                    TextField("Search runs \u{2014} goal, id, or agent", text: $query)
                         .textFieldStyle(.plain)
                         .font(Theme.body(15))
                         .focused($focused)
@@ -35,7 +35,7 @@ struct CommandPalette: View {
                             query = ""
                         } label: {
                             Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(Theme.inkTertiary)
+                                .foregroundStyle(Theme.textTertiary)
                         }
                         .buttonStyle(.tactile)
                         .accessibilityLabel("Clear filter")
@@ -43,12 +43,12 @@ struct CommandPalette: View {
                 }
                 .padding(14)
 
-                Divider().overlay(Theme.hairline)
+                Divider().overlay(Theme.border)
 
                 if matches.isEmpty {
-                    Text(store.queue.isEmpty ? "No jobs in the fleet" : "No rows match")
+                    Text(store.queue.isEmpty ? "No runs yet" : "No matches")
                         .font(Theme.body(12))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .foregroundStyle(Theme.textTertiary)
                         .padding(16)
                 } else {
                     ScrollView {
@@ -62,7 +62,7 @@ struct CommandPalette: View {
                     .frame(maxHeight: 320)
                 }
 
-                Divider().overlay(Theme.hairline)
+                Divider().overlay(Theme.border)
 
                 HStack(spacing: 12) {
                     Text("\u{23CE} open")
@@ -70,13 +70,16 @@ struct CommandPalette: View {
                     Spacer()
                 }
                 .font(Theme.body(10))
-                .foregroundStyle(Theme.inkTertiary)
+                .foregroundStyle(Theme.textTertiary)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
             }
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Theme.hairline))
-            .shadow(color: Theme.overlayShadow, radius: 30, y: 10)
+            .background(Theme.windowBg,
+                        in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
+                .strokeBorder(Theme.border, lineWidth: 1))
+            // The one permitted shadow: overlays only (DESIGN.md §4).
+            .shadow(color: Theme.overlayShadow, radius: 24, y: 8)
             .frame(maxWidth: 620)
             .padding(.top, 56)
             .padding(.horizontal, 40)
@@ -125,54 +128,54 @@ private struct PaletteRow: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 10) {
-                Theme.sectionTitle(item.section.title)
+                Theme.sectionTitle(Lexicon.sectionTitle(item.section))
                     .frame(width: 130, alignment: .leading)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(goal)
                         .font(Theme.body(12, weight: .medium))
-                        .foregroundStyle(Theme.ink)
+                        .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
                     HStack(spacing: 5) {
                         Text(id)
-                            .font(Theme.mono(10))
+                            .font(Theme.monoS)
                         if let provider = item.row?.provider {
                             Text("\u{00B7}")
                             ProviderIcon(provider: provider, size: 12)
-                            Text(provider).font(Theme.body(10))
+                            Text(Lexicon.agentName(provider) ?? provider).font(Theme.caption)
                         }
                     }
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                 }
                 Spacer()
                 if item.needsDecision {
-                    StatusChip(text: "decision needed", color: Theme.warn)
+                    StatusChip(text: Lexicon.needsYou, color: Theme.warn)
                 }
                 if item.row?.receipt?.verified == .valid {
-                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified)
+                    StatusChip(text: Lexicon.proofVerified, color: Theme.success, strong: true)
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
-            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
             .background(
-                hovering ? Theme.cardHover : Color.clear,
-                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                hovering ? Theme.panelHover : Color.clear,
+                in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
             .onHover { hovering = $0 }
         }
-        .buttonStyle(.tactileCard)
+        .buttonStyle(.tactile)
     }
 
     private var goal: String {
         switch item.kind {
         case .job(let row): return row.goal
-        case .quarantined(let inner): return inner.goal ?? "unreadable row"
+        case .quarantined(let inner): return inner.goal ?? Lexicon.unreadableEntry
         }
     }
 
     private var id: String {
         switch item.kind {
         case .job(let row): return row.jobID
-        case .quarantined(let inner): return inner.jobID ?? "unknown id"
+        case .quarantined(let inner): return inner.jobID ?? Lexicon.unknownID
         }
     }
 }

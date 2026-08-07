@@ -2,25 +2,26 @@ import DeadreckonKit
 import SwiftUI
 
 /// The menubar popover (design A2, revised by operator decision 4: the
-/// popover carries write affordances, not triage only). Quick-steer is
-/// inline for steerable jobs — eligibility checked lazily per row via
+/// popover carries write affordances, not triage only). Guide is inline
+/// for eligible runs — eligibility checked lazily per row via
 /// `status --json` steerable{} with the envelope's reason when disabled.
-/// Kill / Promote / Send back are items that open the app window DIRECTLY
-/// onto the respective confirmation sheet: a destructive verb always gets
-/// its full evidence surface; the popover never fires one itself.
+/// Stop / Review & Approve / Send back are items that open the app window
+/// DIRECTLY onto the respective confirmation sheet: a destructive verb
+/// always gets its full evidence surface; the popover never fires one
+/// itself.
 struct MenuBarPopover: View {
     @ObservedObject var store: FleetStore
     @ObservedObject var router: WriteSurfaceRouter
-    /// Deep-links: Inspect (and an underway row tap) open the main window
-    /// directly onto the job's workbench via `.openJob`, whose
-    /// pending-while-loading resolution GateQueueView already owns.
+    /// Deep-links: Open (and a running row tap) open the main window
+    /// directly onto the run's view via `.openJob`, whose
+    /// pending-while-loading resolution MainWindowView already owns.
     @ObservedObject var shell: ShellModel
     let openMainWindow: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerLine
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     sections
@@ -28,11 +29,11 @@ struct MenuBarPopover: View {
                 .padding(8)
             }
             .frame(maxHeight: 380)
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
             footer
         }
         .frame(width: 360)
-        .background(Theme.paper)
+        .background(Theme.sidebarBg)
         // A just-summoned popover must not ride the 10 s menubar-only
         // cadence into the ten-second triage budget: refresh immediately.
         // FleetStore's in-flight/queued coalescing makes this safe against
@@ -43,7 +44,7 @@ struct MenuBarPopover: View {
         // has been version-fragile historically (onAppear/task firing only
         // on the first open on some macOS builds). This bridge observes the
         // hosting panel's own show/key notifications (the
-        // WindowVisibilityObserver pattern from JobDetailView), so every
+        // WindowVisibilityObserver pattern from RunDetailView), so every
         // open refreshes regardless; the coalescing absorbs the overlap
         // when both paths fire.
         .background(PopoverOpenObserver {
@@ -55,7 +56,7 @@ struct MenuBarPopover: View {
         HStack {
             Text(statusLine)
                 .font(Theme.body(11, weight: .medium))
-                .foregroundStyle(Theme.inkSecondary)
+                .foregroundStyle(Theme.textSecondary)
             Spacer()
         }
         .padding(.horizontal, 12)
@@ -64,9 +65,9 @@ struct MenuBarPopover: View {
 
     private var statusLine: String {
         switch store.fleet {
-        case .loading: return "Reading the fleet"
-        case .unavailable: return "Fleet unavailable"
-        case .loaded(let queue): return queue.summaryLine
+        case .loading: return "reading your runs\u{2026}"
+        case .unavailable: return "can\u{2019}t read your runs"
+        case .loaded(let queue): return Lexicon.summaryLine(queue)
         }
     }
 
@@ -80,16 +81,21 @@ struct MenuBarPopover: View {
             .filter { !$0.needsDecision }
 
         if !decisions.isEmpty {
-            sectionHeader("NEEDS DECISION")
-            ForEach(decisions.prefix(4)) { item in
+            sectionHeader("NEEDS YOU")
+            // One accent primary per surface (DESIGN.md §5): only the top
+            // decision's Review & Approve carries the accent; the rows
+            // beneath keep standard chrome.
+            let shown = Array(decisions.prefix(4))
+            ForEach(shown) { item in
                 if let row = item.row {
                     PopoverDecisionRow(item: item, row: row, router: router,
-                                       shell: shell, openMainWindow: openMainWindow)
+                                       shell: shell, openMainWindow: openMainWindow,
+                                       isPrimary: item.id == shown.first?.id)
                 }
             }
         }
         if !underway.isEmpty {
-            sectionHeader("UNDERWAY")
+            sectionHeader("RUNNING")
             ForEach(underway.prefix(5)) { item in
                 if let row = item.row {
                     PopoverUnderwayRow(item: item, row: row, router: router,
@@ -110,20 +116,20 @@ struct MenuBarPopover: View {
     @ViewBuilder private var emptyStateLine: some View {
         switch store.fleet {
         case .loading:
-            Text("reading the fleet")
-                .font(Theme.body(11))
-                .foregroundStyle(Theme.inkTertiary)
+            Text("reading your runs\u{2026}")
+                .font(Theme.small)
+                .foregroundStyle(Theme.textTertiary)
                 .padding(8)
         case .unavailable(let reason):
-            Text("fleet unavailable \u{2014} \(reason)")
-                .font(Theme.body(11))
+            Text("can\u{2019}t read your runs \u{2014} \(reason)")
+                .font(Theme.small)
                 .foregroundStyle(Theme.warn)
                 .lineLimit(3)
                 .padding(8)
         case .loaded:
-            Text(store.queue.isEmpty ? "fleet quiet" : "nothing needs you right now")
-                .font(Theme.body(11))
-                .foregroundStyle(Theme.inkTertiary)
+            Text(store.queue.isEmpty ? "all quiet" : "nothing needs you right now")
+                .font(Theme.small)
+                .foregroundStyle(Theme.textTertiary)
                 .padding(8)
         }
     }
@@ -134,31 +140,28 @@ struct MenuBarPopover: View {
             .padding(.top, 6)
     }
 
-    /// The Bridge footer (design A2): the supervisor fact from the Harbor
-    /// poll, then Open / Start Job / Quit. The mock's "spend today" line is
+    /// The footer (design A2): the service fact from the health poll, then
+    /// Open deadreckon / New Goal / Quit. The mock's "spend today" line is
     /// deliberately dropped: per-day spend is not derivable from the rollup
-    /// heads and would need fleet-wide spend tails (documented in
+    /// heads and would need spend tails across every run (documented in
     /// CONTRACTS.md).
     private var footer: some View {
         VStack(alignment: .leading, spacing: 0) {
             supervisorLine
-            Divider().overlay(Theme.hairline)
+            Divider().overlay(Theme.border)
             HStack(spacing: 10) {
-                Button("Open") { openMainWindow() }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(11, weight: .medium))
+                Button("Open deadreckon") { openMainWindow() }
+                    .buttonStyle(.themeStandard(compact: true))
                     .keyboardShortcut("o")
-                Button("Start Job") {
+                Button("New Goal") {
                     openMainWindow()
-                    router.pending = .layCourse
+                    router.pending = .newGoal
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(11, weight: .medium))
+                .buttonStyle(.themeStandard(compact: true))
                 .keyboardShortcut("n")
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(11))
+                    .buttonStyle(.themeStandard(compact: true))
                     .keyboardShortcut("q")
             }
             .padding(.horizontal, 12)
@@ -168,17 +171,15 @@ struct MenuBarPopover: View {
 
     private var supervisorLine: some View {
         HStack(spacing: 5) {
-            Circle()
-                .fill(supervisorColor)
-                .frame(width: 6, height: 6)
+            StateDot(color: supervisorColor)
             Text(supervisorText)
                 .font(Theme.body(10.5))
-                .foregroundStyle(Theme.inkSecondary)
+                .foregroundStyle(Theme.textSecondary)
             Spacer()
             if let refreshed = store.lastRefreshed {
-                Text("updated \(QueueRowView.relativeTime(refreshed))")
+                Text("updated \(Lexicon.relativeTime(refreshed))")
                     .font(Theme.body(10))
-                    .foregroundStyle(Theme.inkTertiary)
+                    .foregroundStyle(Theme.textTertiary)
                     .monospacedDigit()
             }
         }
@@ -187,18 +188,14 @@ struct MenuBarPopover: View {
     }
 
     private var supervisorText: String {
-        switch store.harbor.supervisor {
-        case .running: return "supervisor running"
-        case .stopped: return "supervisor stopped"
-        case .unknown: return "supervisor unknown"
-        }
+        Lexicon.serviceWord(store.harbor.supervisor)
     }
 
     private var supervisorColor: Color {
         switch store.harbor.supervisor {
-        case .running: return Theme.verified
+        case .running: return Theme.success
         case .stopped: return Theme.warn
-        case .unknown: return Theme.inkTertiary
+        case .unknown: return Theme.textTertiary
         }
     }
 }
@@ -211,64 +208,66 @@ private struct PopoverDecisionRow: View {
     @ObservedObject var router: WriteSurfaceRouter
     @ObservedObject var shell: ShellModel
     let openMainWindow: () -> Void
+    /// True only for the top decision row — the popover's one accent
+    /// primary (DESIGN.md §5/§6).
+    var isPrimary = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
+                RunStateDot(item: item)
                 if let provider = row.provider {
                     ProviderIcon(provider: provider, size: 14)
                         .help(provider)
                 }
                 Text(row.goal)
                     .font(Theme.body(11.5, weight: .medium))
-                    .foregroundStyle(Theme.ink)
+                    .foregroundStyle(Theme.textPrimary)
                     .lineLimit(1)
                 Spacer()
                 if row.receipt?.verified == .valid {
-                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
-                } else {
-                    StatusChip(text: GlossaryText.statusWord(row.status), color: Theme.warn)
+                    StatusChip(text: Lexicon.proofVerified, color: Theme.success, strong: true)
+                        .help(Lexicon.verifiedHelp)
                 }
             }
+            // The same row anatomy as the sidebar (§B3): the plain state
+            // word under the goal.
+            Text(Lexicon.rowStateWord(item))
+                .font(Theme.caption)
+                .foregroundStyle(Theme.textSecondary)
+                .lineLimit(1)
             HStack(spacing: 8) {
                 if item.section == .atTheGate {
-                    Button("Promote\u{2026}") {
+                    Button("Review & Approve\u{2026}") {
                         openMainWindow()
                         router.pending = .promote(row)
                     }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(10.5, weight: .semibold))
-                    .foregroundStyle(Theme.verified)
-                    .help("Opens the Binnacle sheet — the full evidence surface. The popover never promotes directly.")
+                    .buttonStyle(ThemeButtonStyle(kind: isPrimary ? .primary : .standard,
+                                                  compact: true))
+                    .help("Opens the full review sheet \u{2014} the popover never approves directly.")
                 }
                 if row.projection.phase == .terminal {
                     Button("Send back\u{2026}") {
                         openMainWindow()
                         router.pending = .sendBack(row)
                     }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.accent)
+                    .buttonStyle(.themeStandard(compact: true))
                 } else {
-                    Button("Kill\u{2026}") {
+                    Button("Stop\u{2026}") {
                         openMainWindow()
                         router.pending = .kill(row)
                     }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.danger)
-                    .help("Opens the kill confirmation with the real semantics. The popover never kills directly.")
+                    .buttonStyle(ThemeButtonStyle(kind: .quietDanger, compact: true))
+                    .help("Opens the stop confirmation \u{2014} the popover never stops a run directly.")
                 }
-                Button("Inspect") {
-                    // Deep-link onto THIS job's workbench, not whatever the
+                Button("Open") {
+                    // Deep-link onto THIS run's view, not whatever the
                     // NavigationStack last showed (design A2's per-row
-                    // Inspect, the exemplar's two-click inspect path).
+                    // Open, the exemplar's two-click inspect path).
                     openMainWindow()
                     shell.request = .openJob(row.jobID)
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(10.5))
-                .foregroundStyle(Theme.inkSecondary)
+                .buttonStyle(.themeStandard(compact: true))
                 Spacer()
             }
         }
@@ -277,8 +276,8 @@ private struct PopoverDecisionRow: View {
     }
 }
 
-/// An underway row: live facts plus inline quick-steer (decision 4). The
-/// steer field appears on expand; eligibility is fetched lazily from
+/// A running row: live facts plus inline guide (decision 4). The guide
+/// field appears on expand; eligibility is fetched lazily from
 /// `status --json` steerable{}, and a later verb refusal stays authoritative
 /// over that display (trust rule 4).
 private struct PopoverUnderwayRow: View {
@@ -305,55 +304,53 @@ private struct PopoverUnderwayRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            // The row tap IS the inspect path (design A2): the window opens
-            // directly onto this job's workbench.
+            // The row tap IS the open path (design A2): the window opens
+            // directly onto this run's view.
             Button {
                 inspect()
             } label: {
                 HStack(spacing: 6) {
+                    RunStateDot(item: item)
                     if let provider = row.provider {
                         ProviderIcon(provider: provider, size: 14)
                             .help(provider)
                     }
                     Text(row.goal)
                         .font(Theme.body(11.5, weight: .medium))
-                        .foregroundStyle(Theme.ink)
+                        .foregroundStyle(Theme.textPrimary)
                         .lineLimit(1)
                     Spacer()
-                    StatusChip(text: GlossaryText.phaseWord(row.projection.phase),
-                               color: Theme.inkSecondary)
+                    Text(Lexicon.rowStateWord(item))
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.textSecondary)
+                        .lineLimit(1)
                 }
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.tactileCard)
-            .help("Open the workbench on this job")
+            .buttonStyle(.tactile)
+            .help("Open this run")
             HStack(spacing: 8) {
                 if let spend = row.spend {
-                    Text(GlossaryText.spendLine(spend))
-                        .font(Theme.body(10))
-                        .foregroundStyle(Theme.inkSecondary)
+                    Text(Lexicon.spendLine(spend))
+                        .font(Theme.caption)
+                        .foregroundStyle(Theme.textSecondary)
                         .monospacedDigit()
                 }
-                Button(expanded ? "close steer" : "Steer\u{2026}") {
+                Button(expanded ? "close" : "Guide\u{2026}") {
                     expanded.toggle()
                     if expanded, quickSteer.eligibility == .unknown {
                         Task { await quickSteer.checkEligibility() }
                     }
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(10.5))
-                .foregroundStyle(Theme.accent)
-                Button("Kill\u{2026}") {
+                .buttonStyle(.themeStandard(compact: true))
+                Button("Stop\u{2026}") {
                     openMainWindow()
                     router.pending = .kill(row)
                 }
-                .buttonStyle(.tactile)
-                .font(Theme.body(10.5))
-                .foregroundStyle(Theme.danger)
-                Button("Inspect") { inspect() }
-                    .buttonStyle(.tactile)
-                    .font(Theme.body(10.5))
-                    .foregroundStyle(Theme.inkSecondary)
+                .buttonStyle(ThemeButtonStyle(kind: .quietDanger, compact: true))
+                .help("Opens the stop confirmation \u{2014} the popover never stops a run directly.")
+                Button("Open") { inspect() }
+                    .buttonStyle(.themeStandard(compact: true))
                 Spacer()
             }
             if expanded {
@@ -374,17 +371,17 @@ private struct PopoverUnderwayRow: View {
         case .unknown, .checking:
             HStack(spacing: 5) {
                 ProgressView().controlSize(.mini)
-                Text("checking steerable{} via status --json\u{2026}")
-                    .font(Theme.body(10))
-                    .foregroundStyle(Theme.inkTertiary)
+                Text("checking if the run can take guidance\u{2026}")
+                    .font(Theme.caption)
+                    .foregroundStyle(Theme.textTertiary)
             }
         case .ineligible(let reason):
-            Text("steer unavailable \u{2014} \(reason)")
-                .font(Theme.body(10))
-                .foregroundStyle(Theme.inkTertiary)
+            Text("guide unavailable \u{2014} \(Lexicon.guideReason(reason))")
+                .font(Theme.caption)
+                .foregroundStyle(Theme.textTertiary)
         case .unavailable(let words):
-            Text("eligibility unknown \u{2014} \(words)")
-                .font(Theme.body(10))
+            Text("can\u{2019}t tell yet \u{2014} \(words)")
+                .font(Theme.caption)
                 .foregroundStyle(Theme.warn)
                 .lineLimit(2)
         case .eligible:
@@ -395,19 +392,15 @@ private struct PopoverUnderwayRow: View {
 
     private var steerField: some View {
         HStack(spacing: 6) {
-            TextField("advisory note for the next turn\u{2026}", text: $note)
+            TextField("Guide the agent\u{2026}", text: $note)
                 .textFieldStyle(.plain)
-                .font(Theme.body(11))
+                .font(Theme.small)
                 .padding(.horizontal, 7)
                 .padding(.vertical, 4)
-                .background(Theme.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Theme.hairline, lineWidth: 1))
+                .inputChrome()
                 .onSubmit { submit() }
-            Button("Steer") { submit() }
-                .buttonStyle(.tactile)
-                .font(Theme.body(10.5, weight: .semibold))
-                .foregroundStyle(Theme.accent)
+            Button("Send") { submit() }
+                .buttonStyle(.themeStandard(compact: true))
                 .disabled(note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
@@ -419,23 +412,23 @@ private struct PopoverUnderwayRow: View {
         case .submitting:
             ProgressView().controlSize(.mini)
         case .queued(let facts):
-            Text("queued #\(facts.inboxSeq) \u{00B7} \(facts.delivery ?? "next turn") \u{00B7} delivery shows in the workbench")
-                .font(Theme.body(10))
-                .foregroundStyle(Theme.inkSecondary)
+            Text("queued #\(facts.inboxSeq) \u{2014} delivers at the next turn; status shows in the run view")
+                .font(Theme.caption)
+                .foregroundStyle(Theme.textSecondary)
         case .delivered(let facts, let turn):
-            Text("delivered #\(facts.inboxSeq)\(turn.map { " on turn \($0)" } ?? "")")
-                .font(Theme.body(10))
-                .foregroundStyle(Theme.verified)
+            Text("guidance delivered #\(facts.inboxSeq)\(turn.map { " on turn \($0)" } ?? "")")
+                .font(Theme.caption)
+                .foregroundStyle(Theme.success)
         case .refused(let refusal):
             // The refusal downgrades the control (trust rule 4).
             Text("refused: \(refusal.message)")
-                .font(Theme.body(10))
-                .foregroundStyle(Theme.danger)
+                .font(Theme.caption)
+                .foregroundStyle(Theme.dangerText)
                 .lineLimit(3)
                 .textSelection(.enabled)
         case .envelopeFree(let words):
             Text(words)
-                .font(Theme.body(10))
+                .font(Theme.caption)
                 .foregroundStyle(Theme.warn)
                 .lineLimit(2)
         }
@@ -454,7 +447,7 @@ private struct PopoverUnderwayRow: View {
 /// Bridges the MenuBarExtra(.window) panel's own lifecycle into SwiftUI:
 /// fires `onOpen` when the hosting panel becomes key or de-occludes (each
 /// popover summon), independent of whether SwiftUI unmounts the content
-/// between opens. Same NSViewRepresentable pattern as JobDetailView's
+/// between opens. Same NSViewRepresentable pattern as RunDetailView's
 /// WindowVisibilityObserver.
 private struct PopoverOpenObserver: NSViewRepresentable {
     let onOpen: () -> Void

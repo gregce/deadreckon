@@ -4,9 +4,9 @@ import SwiftUI
 
 /// Shared shell state between the AppKit menu bar, the notification router,
 /// and the SwiftUI window content (APP-5). Two responsibilities only:
-/// pending navigation requests (consumed by GateQueueView, which owns the
+/// pending navigation requests (consumed by MainWindowView, which owns the
 /// NavigationStack) and the currently-open workbench item (published by
-/// GateQueueView so menu enablement can follow the same facts the buttons
+/// MainWindowView so menu enablement can follow the same facts the buttons
 /// use). No fleet facts live here; the FleetStore stays the read model.
 @MainActor
 final class ShellModel: ObservableObject {
@@ -26,7 +26,7 @@ final class ShellModel: ObservableObject {
         case focusSteer
     }
 
-    /// Consumed by GateQueueView. openJob/reviewAtGate stay pending while
+    /// Consumed by MainWindowView. openJob/reviewAtGate stay pending while
     /// the fleet is still loading, then resolve or drop once it is loaded.
     @Published var request: Request?
 

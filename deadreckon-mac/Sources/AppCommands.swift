@@ -2,10 +2,10 @@ import AppKit
 import DeadreckonKit
 import SwiftUI
 
-/// The real main-menu bar (APP-5): File > New Job, View > Gate Queue /
-/// Search, and a Job menu whose enabled states follow the SAME durable facts
-/// the on-screen buttons use — re-read from the LIVE FleetStore row, never
-/// the navigation-time snapshot. Every destructive item routes to its
+/// The real main-menu bar (APP-5): File > New Goal, View > Overview /
+/// Search, and a Run menu whose enabled states follow the SAME durable
+/// facts the on-screen buttons use — re-read from the LIVE FleetStore row,
+/// never the navigation-time snapshot. Every destructive item routes to its
 /// confirmation sheet; nothing in a menu fires a verb directly.
 struct DeadreckonCommands: Commands {
     @ObservedObject var fleet: FleetStore
@@ -22,21 +22,21 @@ struct DeadreckonCommands: Commands {
         }
 
         CommandGroup(replacing: .newItem) {
-            Button("New Job\u{2026}") {
+            Button("New Goal\u{2026}") {
                 showMainWindow()
-                router.pending = .layCourse
+                router.pending = .newGoal
             }
             .keyboardShortcut("n", modifiers: .command)
         }
 
         CommandGroup(before: .toolbar) {
-            Button("Gate Queue") {
+            Button("Overview") {
                 showMainWindow()
                 shell.request = .gateQueue
             }
             .keyboardShortcut("1", modifiers: .command)
 
-            Button("Search Fleet") {
+            Button("Search Runs\u{2026}") {
                 showMainWindow()
                 shell.request = .search
             }
@@ -45,21 +45,22 @@ struct DeadreckonCommands: Commands {
             Divider()
         }
 
-        CommandMenu("Job") {
-            // Same eligibility as the workbench rudder's visibility: a job
-            // open and not terminal. The field's steerable{} gate (and any
-            // verb refusal after it) stays authoritative — this only focuses.
-            Button("Steer") {
+        CommandMenu("Run") {
+            // Same eligibility as the guide bar's visibility: a run open
+            // and not terminal. The field's steerable{} gate (and any verb
+            // refusal after it) stays authoritative — this only focuses.
+            Button("Guide\u{2026}") {
                 showMainWindow()
                 shell.request = .focusSteer
             }
+            .keyboardShortcut("g", modifiers: .command)
             .disabled(!(liveOpenedRow.map { $0.projection.phase != .terminal } ?? false))
 
-            // Same facts as the workbench decision bar and the row context
-            // menu: Kill for non-terminal rows, Promote for terminal rows
-            // (the Binnacle's PromoteGate stays the real guard). Guarded:
-            // both route to their confirmation sheets.
-            Button("Kill\u{2026}") {
+            // Same facts as the decision bar and the row context menu: Stop
+            // for non-terminal rows, Review & Approve for terminal rows
+            // (the review sheet's PromoteGate stays the real guard).
+            // Guarded: both route to their confirmation sheets.
+            Button("Stop\u{2026}") {
                 if let row = liveOpenedRow {
                     showMainWindow()
                     router.pending = .kill(row)
@@ -68,7 +69,7 @@ struct DeadreckonCommands: Commands {
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(!(liveOpenedRow.map { $0.projection.phase != .terminal } ?? false))
 
-            Button("Promote\u{2026}") {
+            Button("Review & Approve\u{2026}") {
                 if let row = liveOpenedRow {
                     showMainWindow()
                     router.pending = .promote(row)

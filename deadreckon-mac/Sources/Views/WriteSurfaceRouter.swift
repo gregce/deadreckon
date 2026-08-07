@@ -8,14 +8,14 @@ import SwiftUI
 @MainActor
 final class WriteSurfaceRouter: ObservableObject {
     enum PendingSurface: Identifiable, Equatable {
-        case layCourse
+        case newGoal
         case kill(FleetRow)
         case promote(FleetRow)
         case sendBack(FleetRow)
 
         var id: String {
             switch self {
-            case .layCourse: return "lay-course"
+            case .newGoal: return "new-goal"
             case .kill(let row): return "kill-\(row.jobID)"
             case .promote(let row): return "promote-\(row.jobID)"
             case .sendBack(let row): return "send-back-\(row.jobID)"
@@ -26,31 +26,28 @@ final class WriteSurfaceRouter: ObservableObject {
     @Published var pending: PendingSurface?
 }
 
-/// Shared verbatim rendering for a typed machine refusal (trust rule 2):
-/// message and try lines exactly as the binary said them, selectable, with
-/// NO override control. The try lines are the only recovery affordances.
+/// The refusal card (DESIGN.md §5, trust rule 2): title in plain words,
+/// the binary's message verbatim in mono, each try line as a `try:` label +
+/// mono accent text — exactly as the binary said them, selectable, with NO
+/// override control. The try lines are the only recovery affordances.
 struct RefusalView: View {
     let refusal: ErrorEnvelope
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                Image(systemName: "xmark.octagon")
-                    .foregroundStyle(Theme.danger)
-                Text("\(refusal.verb) refused (exit \(refusal.code))")
-                    .font(Theme.body(11, weight: .semibold))
-                    .foregroundStyle(Theme.danger)
-            }
+            Text("\(refusal.verb) refused (exit \(refusal.code))")
+                .font(Theme.body(13, weight: .semibold))
+                .foregroundStyle(Theme.dangerText)
             Text(refusal.message)
-                .font(Theme.mono(11))
-                .foregroundStyle(Theme.ink)
+                .font(Theme.monoM)
+                .foregroundStyle(Theme.textPrimary)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
             ForEach(refusal.tryLines, id: \.self) { line in
                 HStack(spacing: 5) {
                     Text("try:")
                         .font(Theme.body(10, weight: .semibold))
-                        .foregroundStyle(Theme.inkTertiary)
+                        .foregroundStyle(Theme.textTertiary)
                     Text(line)
                         .font(Theme.mono(10.5))
                         .foregroundStyle(Theme.accent)
@@ -61,27 +58,29 @@ struct RefusalView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.danger.opacity(0.06),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
             .strokeBorder(Theme.danger.opacity(0.35), lineWidth: 1))
     }
 }
 
-/// The literal CLI line a sheet is about to run (design 2.4.3), displayed
-/// verbatim and selectable.
+/// The command well (DESIGN.md §5): the literal CLI line a surface is about
+/// to run, verbatim and selectable. This is the home of CLI truth; UI words
+/// never leak into it and its words never get translated.
 struct CommandLineView: View {
     let command: String
 
     var body: some View {
         Text(command)
-            .font(Theme.mono(10.5))
-            .foregroundStyle(Theme.inkSecondary)
+            .font(Theme.monoL)
+            .foregroundStyle(Theme.textSecondary)
             .textSelection(.enabled)
             .padding(.horizontal, 10)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Theme.hairline, lineWidth: 1))
+            .background(Theme.well,
+                        in: RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Theme.controlRadius, style: .continuous)
+                .strokeBorder(Theme.border, lineWidth: 1))
     }
 }
