@@ -165,6 +165,42 @@ final class LaunchProtocolTests: XCTestCase {
                        "no re-dispatch without a fresh preview")
     }
 
+    /// Success disarms too: Start is Return-bound in the sheet, so a
+    /// preview left .ready after a successful launch would replay the same
+    /// plan file into a DUPLICATE paid Job with one keypress. After
+    /// .launched the preview drops and a second execute dispatches nothing
+    /// until a fresh preview lands.
+    func testSecondExecuteAfterSuccessDispatchesNothing() async throws {
+        let cli = FakeCLI()
+        cli.scriptStdout("start", previewFixture)
+        let controller = LayCourseController(cli: cli)
+        controller.request = StartRequest(goal: "add retry queue")
+        await controller.runPreview()
+        controller.acknowledgement.typedAmount = "60"
+
+        cli.scriptStdout("start", launchFixture())
+        await controller.execute()
+        defer {
+            if let path = controller.lastPlanFileURL?.path {
+                try? FileManager.default.removeItem(atPath: path)
+            }
+        }
+        guard case .launched = controller.execution else {
+            return XCTFail("the first execute should launch: \(controller.execution)")
+        }
+        guard case .idle = controller.preview else {
+            return XCTFail("success must drop the armed preview: \(controller.preview)")
+        }
+
+        let callsBefore = cli.calls.count
+        await controller.execute()
+        XCTAssertEqual(cli.calls.count, callsBefore,
+                       "one launch per previewed plan; a second Start (Return) must not replay it")
+        guard case .launched = controller.execution else {
+            return XCTFail("the queued acknowledgment stays visible: \(controller.execution)")
+        }
+    }
+
     /// The in-flight guard: a double-click on Start enqueues two execute
     /// tasks; the second must not launch a second real Job.
     func testInFlightExecuteGuardDispatchesOnce() async throws {

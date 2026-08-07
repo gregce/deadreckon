@@ -500,7 +500,7 @@ struct QueueRowView: View {
                 if let receipt = row.receipt {
                     switch receipt.verified {
                     case .valid:
-                        StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
+                        StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
                             .help(GlossaryText.phraseVerifiedByDrGate)
                     case .invalid:
                         StatusChip(text: GlossaryText.proofWord(.invalid), color: Theme.danger, filled: true)

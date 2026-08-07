@@ -24,9 +24,7 @@ struct DetailDrawerView: View {
                     HStack(spacing: 4) {
                         Image(systemName: shown ? "chevron.down" : "chevron.up")
                             .font(.system(size: 9, weight: .semibold))
-                        Text("DRAWER")
-                            .font(Theme.body(9.5, weight: .bold))
-                            .kerning(0.6)
+                        Theme.sectionTitle("DRAWER", size: 9.5)
                     }
                     .foregroundStyle(Theme.inkTertiary)
                     .contentShape(Rectangle())
@@ -105,7 +103,15 @@ struct DetailDrawerView: View {
     }
 
     private func terminalPane(title: String, text: String, truncated: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // Rendered as line rows in a LazyVStack (the raw-events pane's
+        // pattern), not one 256 KB Text: SwiftUI re-laying out a
+        // quarter-megabyte Text on every 2 s append stutters the drawer
+        // with a chatty supervisor. The store trims at line boundaries, so
+        // splitting is cheap; head-trims are rare (only at the ceiling), so
+        // index identity stays stable across ordinary appends.
+        let lines = text.isEmpty
+            ? [] : text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        return VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Text(title)
                     .font(Theme.mono(9))
@@ -122,17 +128,30 @@ struct DetailDrawerView: View {
             .padding(.vertical, 4)
             ScrollViewReader { proxy in
                 ScrollView {
-                    Text(text.isEmpty ? "(empty)" : text)
-                        .font(Theme.mono(9.5))
-                        .foregroundStyle(text.isEmpty ? Theme.inkTertiary : Theme.inkSecondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .padding(.bottom, 8)
-                        .id("tail")
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        if lines.isEmpty {
+                            Text("(empty)")
+                                .font(Theme.mono(9.5))
+                                .foregroundStyle(Theme.inkTertiary)
+                        }
+                        ForEach(Array(lines.enumerated()), id: \.offset) { index, line in
+                            Text(line.isEmpty ? " " : line)
+                                .font(Theme.mono(9.5))
+                                .foregroundStyle(Theme.inkSecondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .id(index)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: text.count) { _ in
-                    proxy.scrollTo("tail", anchor: .bottom)
+                    // Tail-convention always-follow (terminal semantics; the
+                    // Activity pane is the pinned-aware reading surface).
+                    // `lines` is the latest body pass's split of this text.
+                    if !lines.isEmpty { proxy.scrollTo(lines.count - 1, anchor: .bottom) }
                 }
             }
         }

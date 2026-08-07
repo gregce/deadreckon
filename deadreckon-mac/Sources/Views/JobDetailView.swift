@@ -313,7 +313,7 @@ struct DetailHeaderView: View {
                 // classifier; proof-invalid is its own state (rule 5).
                 switch receipt.verified {
                 case .valid:
-                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
+                    StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
                         .help(GlossaryText.phraseVerifiedByDrGate)
                 case .invalid:
                     StatusChip(text: GlossaryText.proofWord(.invalid), color: Theme.danger, filled: true)

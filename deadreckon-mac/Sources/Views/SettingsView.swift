@@ -61,7 +61,7 @@ struct SettingsView: View {
 
     private var generalCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Startup")
+            settingsGroupTitle("Startup")
             Toggle(isOn: $launchAtLogin) {
                 settingLabel(
                     "Launch at login",
@@ -94,7 +94,7 @@ struct SettingsView: View {
 
             Divider().overlay(Theme.hairline)
 
-            sectionTitle("Appearance")
+            settingsGroupTitle("Appearance")
             Text("deadreckon follows the system appearance. Every color is a light/dark dynamic pair; there is no separate theme setting.")
                 .font(Theme.body(11))
                 .foregroundStyle(Theme.inkSecondary)
@@ -108,7 +108,7 @@ struct SettingsView: View {
 
     private var notificationsCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Notifications")
+            settingsGroupTitle("Notifications")
             Toggle(isOn: masterBinding) {
                 settingLabel(
                     "Notify me when a job needs attention",
@@ -138,7 +138,7 @@ struct SettingsView: View {
             // operator must be able to SEE that silence.
             if !attention.issues.isEmpty {
                 Divider().overlay(Theme.hairline)
-                sectionTitle("Notify tail trouble")
+                settingsGroupTitle("Notify tail trouble")
                 ForEach(attention.issues.sorted(by: { $0.key < $1.key }), id: \.key) { jobID, reason in
                     VStack(alignment: .leading, spacing: 2) {
                         Text(jobID)
@@ -204,7 +204,7 @@ struct SettingsView: View {
 
     private var infoCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            sectionTitle("Read-only facts")
+            settingsGroupTitle("Read-only facts")
 
             infoRow("App version", appVersion)
             infoRow("Binary reports", fleet.binaryVersion ?? "not read yet",
@@ -227,7 +227,7 @@ struct SettingsView: View {
 
             Divider().overlay(Theme.hairline)
 
-            sectionTitle("Schema handshake")
+            settingsGroupTitle("Schema handshake")
             infoRow("Status", schemaHandshakeStatus,
                     detail: "The committed binary has no surface reporting the home's schema version yet (registered Rust-side gap). Until it lands, doctor --json is the honest health signal.")
         }
@@ -290,11 +290,11 @@ struct SettingsView: View {
 
     // MARK: - Shared chrome
 
-    private func sectionTitle(_ text: String) -> some View {
-        Text(text)
-            .font(Theme.body(11, weight: .bold))
-            .kerning(0.5)
-            .foregroundStyle(Theme.inkTertiary)
+    /// Settings' deliberate 11pt sub-scale of the shared section-title
+    /// token — named distinctly so it cannot shadow `Theme.sectionTitle`,
+    /// and delegating to it so the metric lives in one place.
+    private func settingsGroupTitle(_ text: String) -> some View {
+        Theme.sectionTitle(text, size: 11, kerning: 0.5)
     }
 
     private func settingLabel(_ title: String, detail: String) -> some View {

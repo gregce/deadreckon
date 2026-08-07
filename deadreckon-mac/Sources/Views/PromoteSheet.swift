@@ -90,7 +90,7 @@ struct PromoteSheet: View {
             // Trust rule 6: VERIFIED only from the shared proof classifier,
             // read from the LIVE row (never the sheet-open snapshot).
             if liveRow.receipt?.verified == .valid {
-                StatusChip(text: GlossaryText.verdictVerified, color: Theme.verified, filled: true)
+                StatusChip(text: GlossaryText.verdictVerified, color: Theme.verifiedFill, filled: true)
                     .help(GlossaryText.phraseVerifiedByDrGate)
             } else if liveRow.receipt?.verified == .invalid {
                 StatusChip(text: GlossaryText.proofWord(.invalid), color: Theme.danger, filled: true)

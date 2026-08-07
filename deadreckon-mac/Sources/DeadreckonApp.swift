@@ -71,6 +71,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // defers it while the rows provider is empty); the seen-set keeps
         // relaunches from re-firing anything.
         attention.start()
+        // Crowded-menu-bar rescue: on a full menu bar macOS silently hides
+        // overflow status items (no API opts out), and a hidden item makes
+        // an LSUIElement app completely unreachable. Once the MenuBarExtra
+        // has settled, check whether our status-bar window actually made it
+        // on screen; if not, open the fleet window so launching the app
+        // always lands the operator somewhere real.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.mainWindow?.isVisible != true else { return }
+            if !Self.statusItemIsOnScreen() {
+                self.showMainWindow()
+            }
+        }
+    }
+
+    /// True when a status-bar-level window owned by this process is
+    /// actually on screen. Own-process window info needs no screen
+    /// recording permission; layer 25 is the status bar.
+    private static func statusItemIsOnScreen() -> Bool {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID)
+            as? [[String: Any]]
+        else {
+            // Indeterminate: do not force a window the operator did not ask
+            // for on machines where the item is probably fine.
+            return true
+        }
+        let pid = Int32(ProcessInfo.processInfo.processIdentifier)
+        return windows.contains { window in
+            (window["kCGWindowOwnerPID"] as? Int32) == pid
+                && (window["kCGWindowLayer"] as? Int) == 25
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
