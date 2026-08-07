@@ -149,6 +149,16 @@ public final class JobDetailStore: ObservableObject {
     @Published public private(set) var currentRunID: String?
     @Published public private(set) var isOpen = false
 
+    /// APP-4: typed steer_delivered events observed in this attempt's events
+    /// tail, for the queued -> delivered chip (SteerDeliveryTracker matches
+    /// on queued_at). Per-run, reset with the scrollback.
+    ///
+    /// NOTE deliberately absent: no terminal-job-event surface lives here.
+    /// Kill resolution belongs to KillCoordinator's dispatch-primed
+    /// sheet-scoped tail alone — one resolution source, so no future caller
+    /// can bind kill state to this store's full-history, per-attempt tail.
+    @Published public private(set) var steerDeliveries: [SteerDeliveredFact] = []
+
     public let jobID: String
     public let scope: String
     public let goal: String
@@ -266,6 +276,7 @@ public final class JobDetailStore: ObservableObject {
         supervisorErrTruncated = false
         integrity = .none
         jobEventsTornTail = false
+        steerDeliveries = []
     }
 
     // MARK: - One tick (public for deterministic tests)
@@ -356,6 +367,7 @@ public final class JobDetailStore: ObservableObject {
         changes = nil
         patches = [:]
         patchIssues = [:]
+        steerDeliveries = []
     }
 
     // MARK: - File polls
@@ -496,6 +508,12 @@ public final class JobDetailStore: ObservableObject {
                     lastEventTimestamp = record.timestamp
                     if record.event.kind == "error" {
                         newestErrorMessage = record.event.message
+                    }
+                    if record.event.kind == "steer_delivered" {
+                        steerDeliveries.append(SteerDeliveredFact(
+                            turn: record.event.turn,
+                            queuedAtRaw: record.event.queuedAt,
+                            preview: record.event.preview))
                     }
                     activity.append(ActivityEntry(
                         ordinal: ordinal, timestamp: record.timestamp, line: record.activityLine))

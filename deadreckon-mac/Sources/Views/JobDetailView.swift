@@ -134,7 +134,7 @@ struct JobWorkbenchView: View {
         self.fleet = fleet
         _detail = StateObject(wrappedValue: JobDetailStore(
             jobID: row.jobID, scope: row.scope, goal: row.goal,
-            cli: DeadreckonCLIClient()))
+            cli: WriteCLI.client))
     }
 
     var body: some View {
@@ -422,97 +422,188 @@ struct SpineBandView: View {
     }
 }
 
-/// The Rudder (P6) and Kill as HONEST placeholders: eligibility comes from
-/// `status --json steerable{}` (G6), but the verbs are APP-4's — submit and
-/// Kill are disabled and say so. 'Open in Terminal' IS live now.
+/// The Rudder (P6), live (APP-4): eligibility comes from `status --json`
+/// steerable{} (G6, widened in M1 to any provider while Executing); submit
+/// runs `steer <id> "note" --json`; the queued chip renders the envelope's
+/// inbox_seq and flips to delivered only when the typed steer_delivered
+/// event appears in the events tail. A verb refusal after `steerable: true`
+/// is authoritative and downgrades the control (trust rule 4). Kill /
+/// Promote / Send back route to their confirmation sheets.
 struct SteerBarView: View {
     let row: FleetRow
     @ObservedObject var detail: JobDetailStore
+    @EnvironmentObject private var router: WriteSurfaceRouter
+    @StateObject private var steer: SteerCoordinator
     @State private var draft = ""
     @State private var copiedNote = false
 
+    init(row: FleetRow, detail: JobDetailStore) {
+        self.row = row
+        self.detail = detail
+        _steer = StateObject(
+            wrappedValue: SteerCoordinator(targetID: row.jobID, cli: WriteCLI.client))
+    }
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text("\u{27E9} RUDDER")
-                .font(Theme.body(9.5, weight: .bold))
-                .foregroundStyle(Theme.inkTertiary)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text("\u{27E9} RUDDER")
+                    .font(Theme.body(9.5, weight: .bold))
+                    .foregroundStyle(Theme.inkTertiary)
 
-            TextField(steerPrompt, text: $draft)
-                .textFieldStyle(.plain)
-                .font(Theme.body(11.5))
-                .disabled(true)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(Theme.paper, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .strokeBorder(Theme.hairline, lineWidth: 1))
+                TextField(steerPrompt, text: $draft)
+                    .textFieldStyle(.plain)
+                    .font(Theme.body(11.5))
+                    .disabled(!steerEnabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Theme.paper, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Theme.hairline, lineWidth: 1))
+                    .onSubmit { submitSteer() }
 
-            Button("Steer") {}
-                .buttonStyle(.tactile)
-                .font(Theme.body(11, weight: .medium))
-                .disabled(true)
-                .help("Steer submit arrives with APP-4. \(steerReason)")
-
-            Button("Kill\u{2026}") {}
-                .buttonStyle(.tactile)
-                .font(Theme.body(11, weight: .medium))
-                .foregroundStyle(Theme.inkTertiary)
-                .disabled(true)
-                .help("Kill arrives with APP-4. Real mechanics: CancelRequested, SIGTERM to the process group, 2s grace, SIGKILL, supervisor-proven Cancelled.")
-
-            Button {
-                // Async: the AppleScript roundtrip (and its first-run TCC
-                // Automation prompt) must not block the main thread.
-                let command = "deadreckon attach \(row.jobID)"
-                Task {
-                    let result = await TerminalLauncher.launch(command: command)
-                    copiedNote = (result == .copiedToPasteboard)
-                }
-            } label: {
-                Label("Open in Terminal", systemImage: "terminal")
+                Button("Steer") { submitSteer() }
+                    .buttonStyle(.tactile)
                     .font(Theme.body(11, weight: .medium))
-            }
-            .buttonStyle(.tactile)
-            .help("deadreckon attach \(row.jobID)")
+                    .disabled(!steerEnabled
+                        || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help(steerEnabled
+                        ? steer.commandLine(note: draft.isEmpty ? "<note>" : draft)
+                        : "Not steerable: \(ineligibleReason)")
 
-            if copiedNote {
-                Text("Automation denied \u{2014} command copied to clipboard")
-                    .font(Theme.body(10))
-                    .foregroundStyle(Theme.warn)
+                decisionButtons
+
+                Button {
+                    // Async: the AppleScript roundtrip (and its first-run TCC
+                    // Automation prompt) must not block the main thread.
+                    let command = "deadreckon attach \(row.jobID)"
+                    Task {
+                        let result = await TerminalLauncher.launch(command: command)
+                        copiedNote = (result == .copiedToPasteboard)
+                    }
+                } label: {
+                    Label("Open in Terminal", systemImage: "terminal")
+                        .font(Theme.body(11, weight: .medium))
+                }
+                .buttonStyle(.tactile)
+                .help("deadreckon attach \(row.jobID)")
+
+                if copiedNote {
+                    Text("Automation denied \u{2014} command copied to clipboard")
+                        .font(Theme.body(10))
+                        .foregroundStyle(Theme.warn)
+                }
             }
+            steerStateLine
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
+        // The delivered flip rides the events tail (typed steer_delivered
+        // rows surfaced by JobDetailStore), never a timer or a guess.
+        .onChange(of: detail.steerDeliveries) { _, deliveries in
+            steer.observe(deliveries: deliveries)
+        }
     }
 
-    /// The eligibility fact, in the binary's vocabulary. A refusal from the
-    /// verb stays authoritative over this display (trust rule 4).
-    private var steerPrompt: String {
-        guard let eligibility = detail.status?.currentSteerable else {
-            return "steer: no run attempt yet \u{00B7} submit arrives with APP-4"
+    /// Workbench decision verbs, contextual on durable facts. Destructive
+    /// verbs always open their full confirmation sheet.
+    @ViewBuilder private var decisionButtons: some View {
+        if row.projection.phase == .terminal {
+            Button("Promote\u{2026}") { router.pending = .promote(row) }
+                .buttonStyle(.tactile)
+                .font(Theme.body(11, weight: .medium))
+                .foregroundStyle(Theme.verified)
+                .help("Opens the Binnacle: two keys, contract, receipt, candidate preview.")
+            Button("Send back\u{2026}") { router.pending = .sendBack(row) }
+                .buttonStyle(.tactile)
+                .font(Theme.body(11, weight: .medium))
+                .help("extend \(row.jobID) with your note recorded as provenance")
+        } else {
+            Button("Kill\u{2026}") { router.pending = .kill(row) }
+                .buttonStyle(.tactile)
+                .font(Theme.body(11, weight: .medium))
+                .foregroundStyle(Theme.danger)
+                .help("Opens the kill confirmation: CancelRequested, SIGTERM to the process group, 2s grace, SIGKILL, supervisor-proven Cancelled.")
         }
-        if eligibility.steerable {
-            return "steerable \u{00B7} submit arrives with APP-4"
-        }
-        return "steer unavailable \u{2014} \(reasonWords(eligibility.reason)) \u{00B7} APP-4"
     }
 
-    private var steerReason: String {
+    /// The queued/delivered/refused line under the bar, from the tracker.
+    @ViewBuilder private var steerStateLine: some View {
+        switch steer.tracker.phase {
+        case .idle:
+            EmptyView()
+        case .submitting:
+            HStack(spacing: 5) {
+                ProgressView().controlSize(.mini)
+                Text("queueing steer\u{2026}")
+                    .font(Theme.body(10))
+                    .foregroundStyle(Theme.inkTertiary)
+            }
+        case .queued(let facts):
+            HStack(spacing: 6) {
+                StatusChip(text: "queued #\(facts.inboxSeq)", color: Theme.accent)
+                Text(facts.delivery ?? "next turn boundary")
+                    .font(Theme.body(10))
+                    .foregroundStyle(Theme.inkTertiary)
+            }
+        case .delivered(let facts, let turn):
+            HStack(spacing: 6) {
+                StatusChip(text: "delivered #\(facts.inboxSeq)", color: Theme.verified)
+                Text(turn.map { "turn \($0) \u{00B7} from the typed steer_delivered event" }
+                    ?? "from the typed steer_delivered event")
+                    .font(Theme.body(10))
+                    .foregroundStyle(Theme.inkTertiary)
+            }
+        case .refused(let refusal):
+            RefusalView(refusal: refusal)
+        case .envelopeFree(let words):
+            Text("no machine envelope landed: \(words)")
+                .font(Theme.body(10))
+                .foregroundStyle(Theme.warn)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func submitSteer() {
+        let note = draft
+        guard steerEnabled,
+              !note.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        Task {
+            await steer.submit(note: note)
+            // Replay the deliveries already observed by the store: a typed
+            // steer_delivered event tailed while the envelope was in flight
+            // must still flip the chip (onChange never re-fires for an
+            // unchanged array; the tracker also buffers, this is belt and
+            // braces at the view seam).
+            steer.observe(deliveries: detail.steerDeliveries)
+            if case .queued = steer.tracker.phase { draft = "" }
+        }
+    }
+
+    /// Display eligibility from the status envelope; the tracker's refused
+    /// state additionally downgrades the control (trust rule 4).
+    private var steerEnabled: Bool {
+        if case .refused = steer.tracker.phase { return false }
+        return detail.status?.currentSteerable?.steerable == true
+    }
+
+    private var ineligibleReason: String {
         guard let eligibility = detail.status?.currentSteerable else {
-            return "No run attempt yet."
+            return "no run attempt yet"
         }
         return eligibility.steerable
-            ? "The run reports steerable right now."
-            : "Not steerable: \(reasonWords(eligibility.reason))."
+            ? "steerable"
+            : QuickSteerController.reasonWords(eligibility.reason)
     }
 
-    private func reasonWords(_ reason: SteerIneligibleReason?) -> String {
-        switch reason {
-        case .driverFenced: return "driver fenced"
-        case .notExecuting: return "not executing"
-        case .providerNotSteerable: return "provider not steerable"
-        case .unknown, nil: return GlossaryText.unknownState
+    private var steerPrompt: String {
+        guard let eligibility = detail.status?.currentSteerable else {
+            return "steer: no run attempt yet"
         }
+        if eligibility.steerable {
+            return "advisory note for the run\u{2019}s next turn\u{2026}"
+        }
+        return "steer unavailable \u{2014} \(QuickSteerController.reasonWords(eligibility.reason))"
     }
 }
 

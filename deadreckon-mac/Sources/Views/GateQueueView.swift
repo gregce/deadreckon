@@ -8,8 +8,10 @@ import SwiftUI
 /// estimates, predicts, or overrides.
 struct GateQueueView: View {
     @ObservedObject var store: FleetStore
+    /// APP-4: every write surface (queue rows, workbench, popover) opens its
+    /// confirmation sheet through this router.
+    @ObservedObject var router: WriteSurfaceRouter
     @State private var path: [QueueItem] = []
-    @State private var layCourseShown = false
     @State private var paletteShown = false
 
     var body: some View {
@@ -18,7 +20,7 @@ struct GateQueueView: View {
                 Theme.paper.ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    QueueHeaderView(store: store, onLayCourse: { layCourseShown = true },
+                    QueueHeaderView(store: store, onLayCourse: { router.pending = .layCourse },
                                     onPalette: { paletteShown = true })
                     Divider().overlay(Theme.hairline)
                     content
@@ -34,10 +36,24 @@ struct GateQueueView: View {
             }
             .navigationDestination(for: QueueItem.self) { item in
                 JobDetailView(fleet: store, item: item)
+                    .environmentObject(router)
             }
         }
-        .sheet(isPresented: $layCourseShown) {
-            LayCoursePlaceholderSheet()
+        .sheet(item: $router.pending) { surface in
+            switch surface {
+            case .layCourse:
+                LayCourseSheet()
+            case .kill(let row):
+                KillSheet(row: row)
+            case .promote(let row):
+                PromoteSheet(
+                    row: row,
+                    fleet: store,
+                    onSendBack: { router.pending = .sendBack(row) },
+                    onKill: { router.pending = .kill(row) })
+            case .sendBack(let row):
+                SendBackSheet(row: row)
+            }
         }
         .background(shortcutButtons)
     }
@@ -45,7 +61,7 @@ struct GateQueueView: View {
     /// Hidden buttons so the shortcuts work regardless of focus.
     private var shortcutButtons: some View {
         Group {
-            Button("") { layCourseShown = true }
+            Button("") { router.pending = .layCourse }
                 .keyboardShortcut("n", modifiers: .command)
             Button("") { paletteShown.toggle() }
                 .keyboardShortcut("k", modifiers: .command)
@@ -85,16 +101,32 @@ struct GateQueueView: View {
                     ForEach(queue.items(in: section)) { item in
                         QueueRowView(
                             item: item,
-                            leaseStaleConfirmed: store.confirmedStaleLeaseJobIDs.contains(item.id)
-                        ) {
-                            path.append(item)
-                        }
+                            leaseStaleConfirmed: store.confirmedStaleLeaseJobIDs.contains(item.id),
+                            onOpen: { path.append(item) })
+                            .contextMenu { rowContextMenu(item) }
                     }
                 }
             }
             .padding(16)
             .frame(maxWidth: Theme.queueWidth)
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// APP-4 row verbs, contextual on durable facts: Promote for gate rows,
+    /// Send back for terminal rows, Kill for live ones. Each opens its full
+    /// confirmation sheet — no verb fires from the menu itself.
+    @ViewBuilder private func rowContextMenu(_ item: QueueItem) -> some View {
+        if let row = item.row {
+            if item.section == .atTheGate {
+                Button("Promote\u{2026}") { router.pending = .promote(row) }
+            }
+            if row.projection.phase == .terminal {
+                Button("Send back + note\u{2026}") { router.pending = .sendBack(row) }
+            } else {
+                Button("Kill\u{2026}") { router.pending = .kill(row) }
+            }
+            Button("Inspect") { path.append(item) }
         }
     }
 }
@@ -140,7 +172,7 @@ struct QueueHeaderView: View {
                     .background(Theme.accent.opacity(0.10), in: Capsule())
             }
             .buttonStyle(.tactile)
-            .help("Start a voyage (Command-N; sheet lands in APP-4)")
+            .help("Start a voyage (Command-N): preview before launch, the plan is the decision")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
@@ -567,7 +599,7 @@ struct EmptyFleetView: View {
             Text("No jobs in the fleet")
                 .font(Theme.display(18))
                 .foregroundStyle(Theme.ink)
-            Text("Start a job from the CLI today; it will surface here and queue for your decision at the gate. The Lay Course sheet arrives in APP-4.")
+            Text("Lay a course (Command-N) or start from the CLI; either way the job surfaces here from the durable files and queues for your decision at the gate.")
                 .font(Theme.body(12))
                 .foregroundStyle(Theme.inkSecondary)
                 .multilineTextAlignment(.center)
@@ -613,39 +645,5 @@ struct HarborStripView: View {
     }
 }
 
-// MARK: - Placeholders (APP-4 arrives later)
-
-/// APP-4 placeholder for Command-N: names what is coming and teaches the
-/// CLI path that works today.
-struct LayCoursePlaceholderSheet: View {
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Lay Course")
-                .font(Theme.display(20))
-                .foregroundStyle(Theme.ink)
-            Text("The guided start sheet (goal, contract, provider, caps — preview before launch) arrives in APP-4. Until then, start from the CLI:")
-                .font(Theme.body(12))
-                .foregroundStyle(Theme.inkSecondary)
-                .frame(maxWidth: 380, alignment: .leading)
-
-            Text("deadreckon start \"your goal\"")
-                .font(Theme.mono(12))
-                .foregroundStyle(Theme.ink)
-                .textSelection(.enabled)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .cardChrome()
-
-            HStack {
-                Spacer()
-                Button("Close") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-        }
-        .padding(22)
-        .frame(width: 440)
-        .background(Theme.paper)
-    }
-}
+// The APP-2/APP-3 LayCoursePlaceholderSheet was replaced by the real
+// LayCourseSheet (LayCourseSheet.swift) in APP-4.

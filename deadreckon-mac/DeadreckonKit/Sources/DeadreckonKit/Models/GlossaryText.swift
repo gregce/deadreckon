@@ -141,4 +141,24 @@ public enum GlossaryText {
     public static func gateCounts(_ gate: FleetRow.Gate) -> String {
         "\(gate.nPassed)/\(gate.nTotal) checks"
     }
+
+    // MARK: Job event words (B1: glossary user words, never raw enum names)
+
+    /// User words for a job-events.jsonl kind (the kill sheet's terminal
+    /// line). Underscores spaced for the known vocabulary — one mechanical
+    /// translation in one place, so "budget_exhausted" can never reach the
+    /// UI raw; `.unknown` renders the honest unknown-state words. Note this
+    /// deliberately does NOT route through `verdictVerified`: a verified
+    /// terminal EVENT word is lowercase "verified" — the VERIFIED chip
+    /// stays with the proof classifier alone (trust rule 6).
+    public static func jobEventWord(_ kind: JobEventKind) -> String {
+        if kind == .unknown { return unknownState }
+        return kind.rawValue.replacingOccurrences(of: "_", with: " ")
+    }
+
+    /// User words for a provider probe status (Lay Course route rows).
+    public static func providerProbeWord(_ status: ProviderProbeStatus) -> String {
+        if status == .unknown { return unknownState }
+        return status.rawValue
+    }
 }
