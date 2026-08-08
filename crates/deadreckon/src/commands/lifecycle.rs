@@ -4096,23 +4096,38 @@ pub(crate) fn cleanup_command(args: CleanupCommandRequest) -> Result<()> {
 
     let candidates = cleanup_candidates(&paths, all, completed, stale)?;
     if candidates.is_empty() {
-        print!(
-            "{}",
-            cleanup_no_candidates_surface(completed, all)
-                .render_plain(!completion_hints_enabled(false))
-        );
+        let surface = cleanup_no_candidates_surface(completed, all);
+        if let Some(verb) = machine_json::active() {
+            machine_json::emit_success(
+                verb,
+                "no-candidates",
+                &surface,
+                json!({
+                    "runs": Vec::<Value>::new(),
+                    "completed_filter": completed,
+                    "all_scopes": all,
+                }),
+            )?;
+            return Ok(());
+        }
+        print!("{}", surface.render_plain(!completion_hints_enabled(false)));
         return Ok(());
     }
 
-    println!("{}", ui_heading("cleanup candidates:"));
-    for candidate in &candidates {
-        println!(
-            "  {} {} {} {}",
-            ui::pad_visible(&ui_id(run_prefix(&candidate.state.run_id)), 8),
-            ui::pad_visible(&ui_status(candidate.state.status.to_string()), 10),
-            ui::pad_visible(&ui_status(&candidate.reason), 16),
-            one_line(&candidate.state.goal, 72)
-        );
+    // The armed stdout stream is one JSON envelope; the human candidate
+    // listing would corrupt it, and the aggregate envelope carries the same
+    // per-run facts.
+    if machine_json::active().is_none() {
+        println!("{}", ui_heading("cleanup candidates:"));
+        for candidate in &candidates {
+            println!(
+                "  {} {} {} {}",
+                ui::pad_visible(&ui_id(run_prefix(&candidate.state.run_id)), 8),
+                ui::pad_visible(&ui_status(candidate.state.status.to_string()), 10),
+                ui::pad_visible(&ui_status(&candidate.reason), 16),
+                one_line(&candidate.state.goal, 72)
+            );
+        }
     }
     if !no_confirm {
         if !io::stdin().is_terminal() {
@@ -4624,22 +4639,42 @@ fn print_cleanup_results(results: &[CleanupRunResult]) {
             format!("{} removed", result.removed.len()),
         ));
     }
-    print!(
-        "{}",
-        VerdictSurface::must_new(
-            VerdictKind::Completed,
-            "cleanup",
-            Some(&subject),
-            ExplanationPanel::new(
-                "DeadReckon removed the selected temporary run worktrees and branches.",
-                "Cleanup completed across multiple runs; inspect status before starting another destructive cleanup.",
-                evidence,
-            ),
-            vec![("Recommended", primary.as_str())],
-            vec![("Secondary", secondary.as_str())],
-        )
-        .render_plain(!completion_hints_enabled(false))
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Completed,
+        "cleanup",
+        Some(&subject),
+        ExplanationPanel::new(
+            "DeadReckon removed the selected temporary run worktrees and branches.",
+            "Cleanup completed across multiple runs; inspect status before starting another destructive cleanup.",
+            evidence,
+        ),
+        vec![("Recommended", primary.as_str())],
+        vec![("Secondary", secondary.as_str())],
     );
+    if let Some(verb) = machine_json::active() {
+        let runs = results
+            .iter()
+            .map(|result| {
+                json!({
+                    "run_id": result.run_id,
+                    "removed": result.removed,
+                    "kept_branch": result.keep_branch,
+                    "run_status": run_status_label(result.status),
+                })
+            })
+            .collect::<Vec<_>>();
+        let _ = machine_json::emit_success(
+            verb,
+            &subject,
+            &surface,
+            json!({
+                "runs": runs,
+                "removed_total": removed_count,
+            }),
+        );
+        return;
+    }
+    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
 }
 
 fn cleanup_result_surface(result: &CleanupRunResult) -> VerdictSurface {

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <title>deadreckon menubar template glyph (filled / live)</title>
+  <desc>
+    Optional exactness asset (SETTINGS-SCREENS-SPEC.md §I2). The same 45°
+    diamond as the app icon's mark: miter points, half-diagonal 7, centered
+    at (8,8). Template rendering: black shape, alpha-only — macOS tints it.
+    This file is the FILLED variant (live/attention states). The IDLE
+    variant is the identical path with fill="none" stroke="#000"
+    stroke-width="1.5" (points then inset to half-diagonal 6.25 so the
+    stroke stays inside the canvas). v1 ships SF Symbols diamond/diamond.fill
+    instead; export this to a template PDF only if pixel-true kinship with
+    the app icon is wanted.
+  </desc>
+  <path d="M8 1 L15 8 L8 15 L1 8 Z" fill="#000000"/>
+</svg>

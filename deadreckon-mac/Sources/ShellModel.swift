@@ -24,6 +24,9 @@ final class ShellModel: ObservableObject {
         /// Focus the workbench rudder field (Job > Steer). The field's
         /// steerable{} gating stays authoritative.
         case focusSteer
+        /// Show the Library browser in the window center (View > Library,
+        /// SETTINGS-SCREENS-SPEC §R3).
+        case library
     }
 
     /// Consumed by MainWindowView. openJob/reviewAtGate stay pending while

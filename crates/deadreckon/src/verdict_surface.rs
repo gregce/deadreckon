@@ -20,6 +20,7 @@ pub const TERMINAL_OUTCOME_SURFACE_VERBS: &[&str] = &[
     "detect",
     "providers",
     "update",
+    "supervisor",
     "list",
     "library",
     "finish",

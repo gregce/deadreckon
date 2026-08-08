@@ -67,6 +67,13 @@ public final class CLIRunner {
     private let process = Process()
     private let stdoutPipe = Pipe()
     private let stderrPipe = Pipe()
+    /// Payload written to the child's stdin after launch (nil keeps the
+    /// null device). REDACTION RULE (SETTINGS spec rule 4): these bytes are
+    /// the secret path for `config set-key` — they are written to the child
+    /// and released, and must never be echoed into any transcript, log,
+    /// error description, or display string. No code in this file reads
+    /// them back for any purpose but the one write.
+    private let stdinPayload: Data?
     private let queue = DispatchQueue(label: "com.itavero.deadreckon.cli-runner")
 
     private var stdoutBuffer = CLILineBuffer()
@@ -83,10 +90,12 @@ public final class CLIRunner {
 
     public let events: AsyncStream<CLIRunnerEvent>
 
-    public init(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String]) {
+    public init(binary: URL, arguments: [String], workingDirectory: String,
+                environment: [String: String], stdin: Data? = nil) {
         var streamContinuation: AsyncStream<CLIRunnerEvent>.Continuation?
         events = AsyncStream { streamContinuation = $0 }
         continuation = streamContinuation
+        stdinPayload = stdin
 
         process.executableURL = binary
         process.arguments = arguments
@@ -94,7 +103,33 @@ public final class CLIRunner {
         process.environment = Self.mergedEnvironment(environment)
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-        process.standardInput = FileHandle.nullDevice
+        // nil stdin keeps the historical null device; a payload gets a pipe
+        // written after launch (feedStdin).
+        if stdin == nil {
+            process.standardInput = FileHandle.nullDevice
+        } else {
+            process.standardInput = Pipe()
+        }
+    }
+
+    /// Write the stdin payload to the launched child and close the pipe so
+    /// the child sees EOF (`config set-key` reads to EOF). A child that
+    /// exited before the write is tolerated: the write error is swallowed
+    /// WITHOUT capturing the payload into any error path (redaction rule),
+    /// and F_SETNOSIGPIPE keeps a closed pipe from signalling the app.
+    private static func feedStdin(_ payload: Data, into pipe: Pipe) {
+        let handle = pipe.fileHandleForWriting
+        _ = fcntl(handle.fileDescriptor, F_SETNOSIGPIPE, 1)
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { try? handle.close() }
+            do {
+                try handle.write(contentsOf: payload)
+            } catch {
+                // Deliberately silent: the only context this error could
+                // carry is the secret payload's destination; the child's
+                // own exit/refusal is the observable outcome.
+            }
+        }
     }
 
     /// `launched` is confined to `queue` (written in launch, read here and
@@ -129,6 +164,9 @@ public final class CLIRunner {
             }
             launched = true
             keepAliveWhileRunning = self
+            if let payload = stdinPayload, let pipe = process.standardInput as? Pipe {
+                Self.feedStdin(payload, into: pipe)
+            }
         }
     }
 
@@ -152,11 +190,11 @@ public final class CLIRunner {
 
     /// Run to completion and return stdout (JSON modes). Kills the child and
     /// throws on timeout.
-    public static func run(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String], timeout: TimeInterval) async throws -> String {
-        try await runDetailed(binary: binary, arguments: arguments, workingDirectory: workingDirectory, environment: environment, timeout: timeout).stdout
+    public static func run(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String], timeout: TimeInterval, stdin: Data? = nil) async throws -> String {
+        try await runDetailed(binary: binary, arguments: arguments, workingDirectory: workingDirectory, environment: environment, timeout: timeout, stdin: stdin).stdout
     }
 
-    public static func runDetailed(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String], timeout: TimeInterval) async throws -> CLIRunResult {
+    public static func runDetailed(binary: URL, arguments: [String], workingDirectory: String, environment: [String: String], timeout: TimeInterval, stdin: Data? = nil) async throws -> CLIRunResult {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             let stdoutPipe = Pipe()
@@ -167,7 +205,15 @@ public final class CLIRunner {
             process.environment = mergedEnvironment(environment)
             process.standardOutput = stdoutPipe
             process.standardError = stderrPipe
-            process.standardInput = FileHandle.nullDevice
+            let stdinPipe: Pipe?
+            if stdin == nil {
+                stdinPipe = nil
+                process.standardInput = FileHandle.nullDevice
+            } else {
+                let pipe = Pipe()
+                stdinPipe = pipe
+                process.standardInput = pipe
+            }
 
             let lock = NSLock()
             var resumed = false
@@ -204,6 +250,9 @@ public final class CLIRunner {
                 try? stderrPipe.fileHandleForWriting.close()
                 resumeOnce(.failure(CLIRunnerError.launchFailed(error.localizedDescription)))
                 return
+            }
+            if let payload = stdin, let pipe = stdinPipe {
+                feedStdin(payload, into: pipe)
             }
 
             let pid = process.processIdentifier

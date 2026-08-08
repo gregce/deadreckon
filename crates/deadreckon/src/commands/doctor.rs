@@ -14,20 +14,41 @@ pub(crate) async fn doctor_command(json_output: bool, live: bool, repair: bool) 
     } else {
         Vec::new()
     };
+    // `--repair --json` reports what each repair attempted and how it ended;
+    // without `--repair` the payload stays exactly the read-only report.
+    let repairs = repair.then(|| repair_attempt_summary(&repair_findings));
     let source = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let report = build_doctor_report(&paths, source, true, live, repair_findings).await?;
     let surface = doctor_verdict_surface(&report);
     if json_output {
+        let mut payload = doctor_json_payload(&paths, &report, &surface);
+        if let (Some(object), Some(repairs)) = (payload.as_object_mut(), repairs) {
+            object.insert("repairs".to_string(), Value::Array(repairs));
+        }
         println!(
             "{}",
-            serde_json::to_string_pretty(
-                &surface.add_to_json(doctor_json_payload(&paths, &report, &surface))
-            )?
+            serde_json::to_string_pretty(&surface.add_to_json(payload))?
         );
         return Ok(());
     }
     println!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
+}
+
+/// Each `--repair` action as `{attempted, result, detail}`: the same three
+/// bounded repairs the prose findings report, in the order they ran. Repairs
+/// never gain authority from `--json`; this only serializes their outcome.
+fn repair_attempt_summary(repair_findings: &[DoctorFinding]) -> Vec<Value> {
+    repair_findings
+        .iter()
+        .map(|finding| {
+            json!({
+                "attempted": finding.subject,
+                "result": finding.status,
+                "detail": finding.detail,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]

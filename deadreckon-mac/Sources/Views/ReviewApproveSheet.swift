@@ -14,22 +14,31 @@ struct ReviewApproveSheet: View {
     /// not the row snapshot captured at sheet-open (a long-lived sheet's
     /// enablement would otherwise derive from facts no longer on disk).
     @ObservedObject var fleet: FleetStore
-    /// Routes Send back / Stop to their own confirmation sheets.
+    /// Routes Send back / Stop / Undo to their own confirmation sheets.
     let onSendBack: () -> Void
     let onKill: () -> Void
+    let onUndo: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var coordinator: PromoteCoordinator
     @StateObject private var evidence: JobDetailStore
+    /// §R1: [Undo…] renders only where the apply-success envelope's own
+    /// next actions offered `deadreckon undo` AND this probe confirmed the
+    /// binary speaks `undo --json`. Against the vendored 0.8.4 binary the
+    /// probe reports missing and today's selectable command text stands —
+    /// the honest gap stays visible, never a dead control.
+    @StateObject private var undoCapability = VerbCapabilityProbe(
+        cli: WriteCLI.client, verb: ["undo"])
     @State private var exportPath = ""
     @State private var expandedCheck: Int?
 
     init(row: FleetRow, fleet: FleetStore, onSendBack: @escaping () -> Void,
-         onKill: @escaping () -> Void) {
+         onKill: @escaping () -> Void, onUndo: @escaping () -> Void) {
         self.row = row
         self.fleet = fleet
         self.onSendBack = onSendBack
         self.onKill = onKill
+        self.onUndo = onUndo
         _coordinator = StateObject(
             wrappedValue: PromoteCoordinator(jobID: row.jobID, cli: WriteCLI.client))
         // The evidence engine: report --json for the two sign-offs and the
@@ -622,9 +631,24 @@ struct ReviewApproveSheet: View {
                             .foregroundStyle(Theme.accent)
                             .textSelection(.enabled)
                     }
-                    Text(successLifecycleLine(envelope))
-                        .font(Theme.caption)
-                        .foregroundStyle(Theme.textTertiary)
+                    HStack(spacing: 8) {
+                        Text(successLifecycleLine(envelope))
+                            .font(Theme.caption)
+                            .foregroundStyle(Theme.textTertiary)
+                        // §R1: the advertised undo stops being dead text —
+                        // but only where the envelope offered it AND the
+                        // binary speaks `undo --json` (capability probe).
+                        if envelopeOffersUndo(envelope), undoCapability.isArmed {
+                            Button("Undo\u{2026}") { onUndo() }
+                                .buttonStyle(.themeStandard(compact: true))
+                                .help("deadreckon undo \(row.jobID) --no-confirm --json")
+                        }
+                    }
+                    .task {
+                        if envelopeOffersUndo(envelope) {
+                            await undoCapability.probe()
+                        }
+                    }
                 }
             case .refused(let refusal):
                 RefusalView(refusal: refusal)
@@ -706,13 +730,17 @@ struct ReviewApproveSheet: View {
         return nil
     }
 
-    /// The lifecycle hint under an approve success. The undo claim is made
-    /// ONLY when `deadreckon undo` appears among the envelope's own next
-    /// actions (apply destinations); an export success gets no rollback
-    /// claim, because the binary offers none (trust rule 2).
+    /// The honest-claim rule (trust rule 2): undo is offered ONLY when
+    /// `deadreckon undo` appears among the envelope's own next actions
+    /// (apply destinations); an export success gets no rollback claim,
+    /// because the binary offers none.
+    private func envelopeOffersUndo(_ envelope: MutationEnvelope) -> Bool {
+        envelope.nextActions.contains { $0.contains("deadreckon undo") }
+    }
+
+    /// The lifecycle hint under an approve success.
     private func successLifecycleLine(_ envelope: MutationEnvelope) -> String {
-        let offersUndo = envelope.nextActions.contains { $0.contains("deadreckon undo") }
-        return (offersUndo ? "Undo with one command: deadreckon undo \u{00B7} " : "")
+        (envelopeOffersUndo(envelope) ? "Undo with one command: deadreckon undo \u{00B7} " : "")
             + "the run updates from its files, not from this sheet"
     }
     // Section titles render through Theme.sectionTitle (the one shared

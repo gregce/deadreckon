@@ -15,6 +15,10 @@ final class FakeCLI: FleetCLIRunning {
     private let lock = NSLock()
     private var scripts: [String: Script] = [:]
     private(set) var calls: [[String]] = []
+    /// stdin payload per call, aligned with `calls` (nil for the read
+    /// verbs). Lets the secret-over-stdin tests prove the bytes reached
+    /// the CLI seam without ever putting them in argv.
+    private(set) var stdins: [Data?] = []
     private(set) var terminateCalls: [TimeInterval] = []
 
     func script(_ leadingArgument: String, _ script: Script) {
@@ -33,9 +37,10 @@ final class FakeCLI: FleetCLIRunning {
         return calls.filter { $0.first == leading }.count
     }
 
-    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+    func run(arguments: [String], timeout: TimeInterval, stdin: Data?) async throws -> CLIRunResult {
         lock.lock()
         calls.append(arguments)
+        stdins.append(stdin)
         let script = scripts[arguments.first ?? ""]
         lock.unlock()
         switch script {
@@ -92,7 +97,7 @@ final class GatedCLI: FleetCLIRunning, @unchecked Sendable {
         parked.forEach { $0.resume() }
     }
 
-    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+    func run(arguments: [String], timeout: TimeInterval, stdin: Data?) async throws -> CLIRunResult {
         lock.lock()
         calls.append(arguments)
         if !immediate.isEmpty {

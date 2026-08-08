@@ -127,6 +127,20 @@ reloads the current definition. To stop it without removing the definition:
 deadreckon supervisor stop
 ```
 
+Each lifecycle verb accepts `--json`: `install`, `start`, and `stop` answer
+with one `{"kind":"supervisor","action":...,"result":...,"service_state":...,
+"unit_path":...}` envelope, and every refusal (not installed, stale unit,
+unmanaged unit) lands as a `{"kind":"error",...}` envelope with the exit code
+preserved. `supervisor status --json` stays a read-only evidence report and
+carries the typed two-source health truth: `service`
+(`running|stopped|not_installed`, the service-manager account),
+`home_checkpoint` (`present|absent|stale`, this home's live instance
+checkpoint), and one `verdict` word
+(`healthy|degraded|foreign_home|down`) with the mismatch fact verbatim in
+`verdict_reason`. A supervisor that the manager reports running while this
+`DEADRECKON_HOME` has no matching checkpoint reports `foreign_home` instead
+of refusing.
+
 The service definitions and lifecycle commands are implemented and tested
 without invoking the host service manager in the test suite. A live
 machine-restart drill is still an operator acceptance step; do not infer that
@@ -348,6 +362,7 @@ deadreckon init --provider openai --api-key "$OPENAI_API_KEY" --sandbox auto --m
 Inspect or edit config:
 
 ```bash
+deadreckon config show
 deadreckon config get defaults.provider
 deadreckon config provider
 deadreckon config provider cli:codex
@@ -355,8 +370,19 @@ deadreckon config model
 deadreckon config model gpt-5.1-codex --provider cli:codex
 deadreckon config set defaults.max_spend 15
 deadreckon config set defaults.sandbox auto
-deadreckon config set providers.anthropic.api_key "$ANTHROPIC_API_KEY"
+deadreckon config unset defaults.model
+printf '%s' "$ANTHROPIC_API_KEY" | deadreckon config set-key anthropic
+deadreckon config unset-key anthropic
 ```
+
+API keys enter through stdin (`set-key`), never through argv, so they stay
+out of shell history and process listings; `config set providers.<route>.api_key`
+refuses and points at `set-key`. Every config surface reports a stored key
+only as `configured`. `show`, `set`, `unset`, `set-key`, and `unset-key`
+take `--json` and emit one machine envelope for scripts and GUI callers;
+`config show --json` is the complete effective configuration — every setting
+with set-vs-default provenance, every provider entry with secrets redacted,
+and the config file path.
 
 ## Keyless Smoke Run
 

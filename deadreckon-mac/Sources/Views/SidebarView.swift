@@ -516,6 +516,9 @@ private struct SidebarFooterView: View {
     var body: some View {
         let summary = FleetHealth.summarize(store: store, attention: attention)
         Button {
+            // §S0 deep link: the health footer lands on Settings > Health.
+            UserDefaults.standard.set(SettingsSection.health.rawValue,
+                                      forKey: "settings.section")
             openSettings()
         } label: {
             VStack(alignment: .leading, spacing: 2) {

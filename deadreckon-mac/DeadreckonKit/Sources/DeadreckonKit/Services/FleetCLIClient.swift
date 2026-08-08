@@ -8,7 +8,11 @@ public protocol FleetCLIRunning: AnyObject {
     /// Runs `deadreckon <arguments>` to completion. Throws
     /// `FleetCLIError.binaryUnavailable` when no trusted binary exists;
     /// a nonzero exit is an outcome in the result, not an error.
-    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult
+    /// `stdin` (nil for every read verb) is the secret-over-stdin path for
+    /// `config set-key`: the bytes go to the child and nowhere else — no
+    /// conformer may echo them into a transcript, log, or error (SETTINGS
+    /// spec rule 4).
+    func run(arguments: [String], timeout: TimeInterval, stdin: Data?) async throws -> CLIRunResult
 
     /// SIGTERM every in-flight child (SIGKILL after `patience`); returns how
     /// many children were signaled. Quit-time teardown calls this so no
@@ -20,6 +24,13 @@ public protocol FleetCLIRunning: AnyObject {
     /// polls this after the SIGTERM sweep so the process outlives its
     /// children (or the SIGKILL escalation) instead of orphaning them.
     var inFlightCount: Int { get }
+}
+
+public extension FleetCLIRunning {
+    /// The historical no-stdin form every read surface uses.
+    func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+        try await run(arguments: arguments, timeout: timeout, stdin: nil)
+    }
 }
 
 public enum FleetCLIError: Error, LocalizedError, Equatable {
@@ -48,7 +59,7 @@ public final class DeadreckonCLIClient: FleetCLIRunning {
         self.environment = environment
     }
 
-    public func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+    public func run(arguments: [String], timeout: TimeInterval, stdin: Data?) async throws -> CLIRunResult {
         let binary: URL
         do {
             binary = try BinaryLocator.locate()
@@ -58,9 +69,13 @@ public final class DeadreckonCLIClient: FleetCLIRunning {
                 locatorError?.errorDescription ?? String(describing: error))
         }
 
+        // stdin rides straight into the child (CLIRunner writes and
+        // releases it); it is never retained here and never appears in any
+        // failure words this method can throw.
         let runner = CLIRunner(
             binary: binary, arguments: arguments,
-            workingDirectory: workingDirectory, environment: environment)
+            workingDirectory: workingDirectory, environment: environment,
+            stdin: stdin)
         try runner.launch()
 
         lock.lock()

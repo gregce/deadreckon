@@ -55,14 +55,23 @@ the restart-capable per-user service. Use `deadreckon config provider` and
 
 const CONFIG_HELP: &str = "\
 Subcommands:
+  deadreckon config show
   deadreckon config get defaults.provider
   deadreckon config set defaults.max_spend 15
+  deadreckon config unset defaults.model
+  deadreckon config set-key anthropic < key.txt
+  deadreckon config unset-key anthropic
   deadreckon config provider
   deadreckon config provider cli:codex
   deadreckon config remove-provider anthropic
   deadreckon config remove-provider
   deadreckon config model
   deadreckon config model gpt-5.1-codex --provider cli:codex
+
+API keys are secrets: `set-key` reads the key from stdin so it never lands
+in shell history or process argv, and every surface reports it only as
+`configured`. `show --json`, `set --json`, and `unset --json` emit one
+machine envelope for GUI and script callers.
 
 Lifecycle:
   Configure once, then `deadreckon start \"goal\"`. Direct run/orchestrate flags override these defaults.";
@@ -1523,7 +1532,6 @@ pub(crate) enum Commands {
         live: bool,
         #[arg(
             long,
-            conflicts_with = "json",
             help = "Repair the active shell install, receipt, and managed supervisor binding"
         )]
         repair: bool,
@@ -1806,6 +1814,8 @@ pub(crate) enum Commands {
         overwrite: bool,
         #[arg(long, help = "Keep temporary branches")]
         keep_branch: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Completed Run Actions",
@@ -2100,6 +2110,8 @@ pub(crate) enum Commands {
             help = "Skip confirmation when reverting a verified applied Job or chain delivery"
         )]
         no_confirm: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
     },
     #[command(
         next_help_heading = "Cleanup And Recovery",
@@ -2805,6 +2817,11 @@ pub(crate) enum AcceptancePreset {
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCommand {
+    #[command(about = "Show the complete effective configuration, secrets redacted")]
+    Show {
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
     #[command(about = "Print one config value")]
     Get {
         #[arg(help = "Dotted key, for example defaults.provider")]
@@ -2816,6 +2833,32 @@ pub(crate) enum ConfigCommand {
         key: String,
         #[arg(help = "TOML value or plain string")]
         value: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(about = "Remove one config value")]
+    Unset {
+        #[arg(help = "Dotted key, for example defaults.model")]
+        key: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(
+        name = "set-key",
+        about = "Store a provider API key read from stdin, never from argv"
+    )]
+    SetKey {
+        #[arg(help = "Provider route the key belongs to, for example anthropic")]
+        provider: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
+    },
+    #[command(name = "unset-key", about = "Remove a provider's stored API key")]
+    UnsetKey {
+        #[arg(help = "Provider route to clear, for example anthropic")]
+        provider: String,
+        #[arg(long, help = "Emit machine-readable JSON")]
+        json: bool,
     },
     #[command(about = "Show or set the default provider route")]
     Provider {
@@ -3016,16 +3059,25 @@ pub(crate) enum SupervisorCommand {
         release_token_sha256: String,
     },
     #[command(about = "Install or update the per-user supervisor service")]
-    Install,
+    Install {
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
+    },
     #[command(about = "Enable and start the installed per-user supervisor service")]
-    Start,
+    Start {
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
+    },
     #[command(about = "Show the installed per-user supervisor service state")]
     Status {
         #[arg(long, help = "Print typed machine-readable service evidence")]
         json: bool,
     },
     #[command(about = "Disable and stop the per-user supervisor service")]
-    Stop,
+    Stop {
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
+    },
 }
 
 pub(crate) struct RunCommandArgs {

@@ -17,10 +17,53 @@ final class MutationRunnerTests: XCTestCase {
             .extendJob(parentID: "j1", goal: "again", note: "why"),
             .startPreview(StartRequest(goal: "g")),
             .startExecute(planFilePath: "/tmp/plan.json", spendAcknowledged: false),
+            .configSet(key: "defaults.max_spend", value: "25"),
+            .configUnset(key: "defaults.model"),
+            .configSetKey(route: "anthropic"),
+            .configUnsetKey(route: "anthropic"),
+            .supervisorInstall,
+            .supervisorStart,
+            .supervisorStop,
+            .doctorRepair,
         ]
         for verb in verbs {
             XCTAssertTrue(verb.arguments.contains("--json"), "\(verb) must always speak JSON")
         }
+    }
+
+    /// The settings verbs, argv exact (SETTINGS spec §P, shipped grammar).
+    /// Config values are operator-typed, so they ride after `--`.
+    func testSettingsVerbArgvShapes() {
+        XCTAssertEqual(PlannedVerb.configSet(key: "defaults.max_spend", value: "25").arguments,
+                       ["config", "set", "--json", "--", "defaults.max_spend", "25"])
+        // A value shaped like a flag reaches clap as literal text.
+        XCTAssertEqual(PlannedVerb.configSet(key: "defaults.model", value: "-weird").arguments,
+                       ["config", "set", "--json", "--", "defaults.model", "-weird"])
+        XCTAssertEqual(PlannedVerb.configUnset(key: "defaults.model").arguments,
+                       ["config", "unset", "--json", "--", "defaults.model"])
+        XCTAssertEqual(PlannedVerb.configSetKey(route: "anthropic").arguments,
+                       ["config", "set-key", "--json", "--", "anthropic"])
+        XCTAssertEqual(PlannedVerb.configUnsetKey(route: "anthropic").arguments,
+                       ["config", "unset-key", "--json", "--", "anthropic"])
+        XCTAssertEqual(PlannedVerb.supervisorInstall.arguments,
+                       ["supervisor", "install", "--json"])
+        XCTAssertEqual(PlannedVerb.supervisorStart.arguments,
+                       ["supervisor", "start", "--json"])
+        XCTAssertEqual(PlannedVerb.supervisorStop.arguments,
+                       ["supervisor", "stop", "--json"])
+        XCTAssertEqual(PlannedVerb.doctorRepair.arguments,
+                       ["doctor", "--repair", "--json"])
+    }
+
+    /// The redaction rule in the type system: configSetKey carries the
+    /// ROUTE only — there is no case parameter for the secret, so no argv,
+    /// no literal command line, and no Equatable dump can ever contain it.
+    func testConfigSetKeyArgvAndCommandLineCarryOnlyTheRoute() {
+        let verb = PlannedVerb.configSetKey(route: "anthropic")
+        XCTAssertEqual(verb.arguments, ["config", "set-key", "--json", "--", "anthropic"])
+        let runner = MutationRunner(cli: FakeCLI())
+        XCTAssertEqual(runner.literalCommandLine(for: verb),
+                       "deadreckon config set-key --json -- anthropic")
     }
 
     func testKillArgvCarriesExplicitEscalateOnly() {
@@ -173,7 +216,7 @@ final class MutationRunnerTests: XCTestCase {
 
     func testBinaryUnavailableComesBackAsEnvelopeFreeWords() async {
         final class UnavailableCLI: FleetCLIRunning {
-            func run(arguments: [String], timeout: TimeInterval) async throws -> CLIRunResult {
+            func run(arguments: [String], timeout: TimeInterval, stdin: Data?) async throws -> CLIRunResult {
                 throw FleetCLIError.binaryUnavailable("no trusted binary")
             }
             func terminateInFlight(patience: TimeInterval) -> Int { 0 }

@@ -165,6 +165,7 @@ pub(crate) fn try_current_attempt_state(
 ///   - the verdict sidecar is SKIPPED, not written best-effort: the run root
 ///     belongs to the job's driver, so inspection must leave it byte-identical
 ///     (`paths.cache` reads `null` in the envelope to say so).
+///
 /// Every path that re-runs checks or writes run-root artifacts — including
 /// `verdict <job> --rerun-checks`, which maps onto this same attempt run —
 /// still goes through the fence and keeps its typed public refusal.

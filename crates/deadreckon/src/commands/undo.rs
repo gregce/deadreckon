@@ -587,6 +587,22 @@ fn print_undo_result(
     undo_revision: &str,
     already_complete: bool,
 ) {
+    if let Some(verb) = machine_json::active() {
+        let _ = machine_json::emit_success(
+            verb,
+            job_id,
+            &job_undo_surface(job_id, authority, undo_revision, already_complete),
+            json!({
+                "undo_kind": "job-delivery",
+                "destination": authority.destination,
+                "target_ref": authority.target_ref,
+                "reverted_revision": authority.resulting_revision,
+                "undo_revision": undo_revision,
+                "already_undone": already_complete,
+            }),
+        );
+        return;
+    }
     let status = if already_complete {
         "already undone"
     } else {
@@ -596,6 +612,51 @@ fn print_undo_result(
     println!("  destination: {}", authority.destination.display());
     println!("  reverted: {}", authority.resulting_revision);
     println!("  undo revision: {undo_revision}");
+}
+
+/// The verified-Job undo outcome as one `VerdictSurface`, so the machine
+/// envelope carries the same facts the prose lines print: what was reverted
+/// and where. (The prose path above predates the surface and stays
+/// byte-identical without `--json`.)
+fn job_undo_surface(
+    job_id: &str,
+    authority: &AppliedDeliveryAuthority,
+    undo_revision: &str,
+    already_complete: bool,
+) -> VerdictSurface {
+    let id = run_prefix(job_id);
+    let primary = format!("deadreckon show {id}");
+    let (kind, what) = if already_complete {
+        (
+            VerdictKind::Noop,
+            "DeadReckon found the verified Job delivery already reverted and made no new Git change.",
+        )
+    } else {
+        (
+            VerdictKind::Completed,
+            "DeadReckon reverted the verified applied Job delivery with one exact revert commit.",
+        )
+    };
+    VerdictSurface::must_new(
+        kind,
+        "undo",
+        Some(&id),
+        ExplanationPanel::new(
+            what,
+            "Undo only reverts the one receipt-bound applied delivery; inspect the destination before making another Git change.",
+            vec![
+                ("job".to_string(), id.clone()),
+                (
+                    "destination".to_string(),
+                    authority.destination.display().to_string(),
+                ),
+                ("reverted".to_string(), authority.resulting_revision.clone()),
+                ("undo revision".to_string(), undo_revision.to_string()),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
+    )
 }
 
 #[cfg(test)]
@@ -930,6 +991,52 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn job_undo_success_envelope_reports_what_was_reverted_and_where() {
+        let fixture = Fixture::new(true);
+        let authority =
+            applied_delivery_authority(&fixture.paths, &fixture.view(), &fixture.receipt)
+                .expect("authority");
+
+        let envelope = machine_json::success_envelope(
+            "undo",
+            &fixture.job_id,
+            &job_undo_surface(&fixture.job_id, &authority, "feedface", false),
+            json!({
+                "undo_kind": "job-delivery",
+                "destination": authority.destination,
+                "target_ref": authority.target_ref,
+                "reverted_revision": authority.resulting_revision,
+                "undo_revision": "feedface",
+                "already_undone": false,
+            }),
+        );
+
+        assert_eq!(envelope["kind"], "undo");
+        assert_eq!(envelope["id"], fixture.job_id.as_str());
+        assert_eq!(envelope["status"], "completed");
+        assert_eq!(envelope["undo_kind"], "job-delivery");
+        assert_eq!(
+            envelope["destination"],
+            json!(authority.destination),
+            "{envelope}"
+        );
+        assert_eq!(
+            envelope["reverted_revision"].as_str(),
+            Some(authority.resulting_revision.as_str())
+        );
+        assert_eq!(envelope["undo_revision"], "feedface");
+        assert_eq!(
+            envelope["next_actions"][0],
+            format!("deadreckon show {}", run_prefix(&fixture.job_id)).as_str()
+        );
+
+        // The idempotent retry is the honest no-op word, not a second
+        // mutation claim.
+        let already = job_undo_surface(&fixture.job_id, &authority, "feedface", true);
+        assert_eq!(already.kind.as_str(), "no-op");
     }
 
     #[test]

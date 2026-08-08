@@ -44,7 +44,7 @@ struct DetailCenterTabsView: View {
             case .changes: ChangesView(detail: detail)
             case .checks: ContractChecksView(row: row, detail: detail)
             case .docs: DocsView(detail: detail)
-            case .recorder: FlightView(detail: detail)
+            case .recorder: FlightView(row: row, detail: detail)
             }
         }
         // The DONE MEANS strip can land here on .checks; the Changes lazy
@@ -952,11 +952,18 @@ struct ChangesView: View {
 
 // MARK: - Recorder
 
-/// The recorder: checkpoint cards from the manifest tree. PREVIEW facts
-/// only — the rewind-apply verb has no machine envelope yet and its
-/// affordance says so.
+/// The recorder: checkpoint cards from the manifest tree. [Rewind…] arms
+/// via a capability probe (SETTINGS-SCREENS-SPEC §R1): the vendored 0.8.4
+/// binary speaks `rewind --json`, so the probe arms it; an older binary
+/// degrades to the probe's honest words — no hardcoded gap label. The flow
+/// is preview-first, always (RewindSheet).
 struct FlightView: View {
+    let row: FleetRow
     @ObservedObject var detail: JobDetailStore
+
+    @EnvironmentObject private var router: WriteSurfaceRouter
+    @StateObject private var rewindCapability = VerbCapabilityProbe(
+        cli: WriteCLI.client, verb: ["rewind"])
 
     var body: some View {
         ScrollView {
@@ -999,6 +1006,7 @@ struct FlightView: View {
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .task { await rewindCapability.probe() }
     }
 
     private func checkpointCard(_ checkpoint: CheckpointManifestDoc) -> some View {
@@ -1015,18 +1023,46 @@ struct FlightView: View {
                     .font(Theme.mono(9.5))
                     .foregroundStyle(Theme.textTertiary)
             }
-            Text("turn \(checkpoint.deadreckonTurn) \u{00B7} \(checkpoint.trigger) \u{00B7} \(checkpoint.fileCount) files")
+            Text("turn \(checkpoint.deadreckonTurn) \u{00B7} \(Lexicon.checkpointTrigger(checkpoint.trigger)) \u{00B7} \(checkpoint.fileCount) file\(checkpoint.fileCount == 1 ? "" : "s")")
                 .font(Theme.body(9.5))
                 .foregroundStyle(Theme.textSecondary)
-            Button("Rewind\u{2026}") {}
-                .buttonStyle(.plain)
-                .font(Theme.body(9.5, weight: .medium))
-                .foregroundStyle(Theme.textTertiary)
-                .disabled(true)
-                .help("Rewind isn't available from the app yet (no machine envelope in this CLI version) \u{2014} use deadreckon in Terminal.")
+            rewindAffordance(checkpoint)
         }
         .padding(8)
         .cardChrome()
+    }
+
+    /// Armed by the capability probe, never a dead control: when the
+    /// binary's rewind speaks --json the button routes to the preview-first
+    /// RewindSheet; otherwise the degraded words carry the probe's own
+    /// finding + the Terminal escape hatch.
+    @ViewBuilder private func rewindAffordance(_ checkpoint: CheckpointManifestDoc) -> some View {
+        switch rewindCapability.state {
+        case .armed:
+            Button("Rewind\u{2026}") {
+                router.pending = .rewind(
+                    row,
+                    runID: detail.currentRunID ?? row.jobID,
+                    checkpoint: checkpoint)
+            }
+            .buttonStyle(.themeStandard(compact: true))
+            .help("Preview first \u{2014} deadreckon rewind \(detail.currentRunID ?? row.jobID) --to-checkpoint \(checkpoint.checkpointID) --preview --json")
+        case .unknown, .probing:
+            disabledRewind(help: "checking whether this CLI's rewind speaks a machine envelope\u{2026}")
+        case .missing:
+            disabledRewind(help: "This CLI\u{2019}s rewind lists no --json envelope \u{2014} use deadreckon rewind in Terminal.")
+        case .failed(let words):
+            disabledRewind(help: words)
+        }
+    }
+
+    private func disabledRewind(help: String) -> some View {
+        Button("Rewind\u{2026}") {}
+            .buttonStyle(.plain)
+            .font(Theme.body(9.5, weight: .medium))
+            .foregroundStyle(Theme.textTertiary)
+            .disabled(true)
+            .help(help)
     }
 }
 
