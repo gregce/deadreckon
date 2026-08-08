@@ -55,6 +55,21 @@ struct OrderedCandidateManifest {
     prepared_at: chrono::DateTime<Utc>,
 }
 
+/// Read-only evidence needed to decide whether a stranded per-node graph can
+/// be finalized from its already-landed candidate. Constructing this value
+/// validates the durable manifest, clean Git HEAD, complete application ledger,
+/// Plan task bindings, and every recorded child acceptance marker. It never
+/// acquires a lease or changes Job, Plan, Run, or candidate state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct OrderedCandidateSalvageInspection {
+    pub(crate) workspace: PathBuf,
+    pub(crate) initial_revision: String,
+    pub(crate) head_revision: String,
+    pub(crate) head_tree: String,
+    pub(crate) completed_application_count: usize,
+    pub(crate) completed_applications: Vec<deadreckon_core::plan::OrderedCandidateApplicationEvent>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DriverKind {
@@ -923,6 +938,155 @@ fn validate_ordered_candidate_manifest(
         ))));
     }
     Ok(manifest.workspace.clone())
+}
+
+pub(crate) fn inspect_ordered_candidate_for_salvage(
+    paths: &DeadreckonPaths,
+    job: &deadreckon_protocol::Job,
+    authority: &deadreckon_protocol::JobAuthority,
+) -> Result<OrderedCandidateSalvageInspection> {
+    let manifest = load_ordered_candidate_manifest(paths, job.job_id.as_ref())?;
+    let workspace = validate_ordered_candidate_manifest(paths, job, authority, &manifest)?;
+    let events = deadreckon_core::plan::read_ordered_candidate_application_events(
+        paths,
+        job.job_id.as_ref(),
+    )?;
+    let fold = deadreckon_core::plan::fold_ordered_candidate_application_events(
+        &events,
+        &manifest.initial_revision,
+    )?;
+    if let Some(pending) = fold.pending.as_ref() {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate for Job {} has unfinished application {}",
+            job.job_id, pending.application_id
+        ))));
+    }
+
+    let root_plan = deadreckon_core::load_plan(paths, job.job_id.as_ref())?;
+    let root_owner = resolve_plan_owner(paths, &root_plan)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate for Job {} has no durable Plan owner",
+            job.job_id
+        )))
+    })?;
+    if root_plan.plan_id != job.job_id.as_ref()
+        || root_plan.owner_job_id.as_deref() != Some(job.job_id.as_ref())
+        || root_owner.job.job_id != job.job_id
+        || root_owner.root_plan_id != root_plan.plan_id
+    {
+        return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "ordered candidate for Job {} is not bound to its owned Plan",
+            job.job_id
+        ))));
+    }
+    validate_owned_plan_if_present(
+        paths,
+        &root_plan.plan_id,
+        job.job_id.as_ref(),
+        &root_plan.plan_id,
+    )?;
+
+    let mut completed_bindings = BTreeSet::new();
+    for application in &fold.completed {
+        let candidate_after_revision =
+            application
+                .candidate_after_revision
+                .as_deref()
+                .ok_or_else(|| {
+                    CliError::Core(DeadreckonError::InvalidInput(format!(
+                        "ordered candidate application {} has no completed revision",
+                        application.application_id
+                    )))
+                })?;
+        super::plan::verify_ordered_candidate_application_result(
+            paths,
+            &workspace,
+            application,
+            candidate_after_revision,
+            false,
+        )?;
+        let application_plan = deadreckon_core::load_plan(paths, &application.plan_id)?;
+        let application_owner = resolve_plan_owner(paths, &application_plan)?.ok_or_else(|| {
+            CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate application {} has no durable Plan owner",
+                application.application_id
+            )))
+        })?;
+        if application_owner.job.job_id != job.job_id
+            || application_owner.root_plan_id != root_plan.plan_id
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate application {} crosses its owned Plan tree",
+                application.application_id
+            ))));
+        }
+        validate_owned_plan_if_present(
+            paths,
+            &application_plan.plan_id,
+            job.job_id.as_ref(),
+            &root_plan.plan_id,
+        )?;
+        let task = application_plan
+            .tasks
+            .iter()
+            .find(|task| {
+                task.index as usize == application.task_index && task.task_id == application.task_id
+            })
+            .ok_or_else(|| {
+                CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "ordered candidate application {} names an unknown Plan task",
+                    application.application_id
+                )))
+            })?;
+        if task.status != deadreckon_core::PlanTaskStatus::Completed
+            || task.child_run_id.as_deref() != Some(application.run_id.as_str())
+            || !completed_bindings.insert((
+                application.plan_id.clone(),
+                application.task_index,
+                application.task_id.clone(),
+                application.run_id.clone(),
+            ))
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "ordered candidate application {} no longer matches its completed Plan task",
+                application.application_id
+            ))));
+        }
+    }
+    for task in root_plan
+        .tasks
+        .iter()
+        .filter(|task| task.status == deadreckon_core::PlanTaskStatus::Completed)
+    {
+        let Some(run_id) = task.child_run_id.as_deref() else {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "completed Plan task {} has no Run binding",
+                task.task_id
+            ))));
+        };
+        if !completed_bindings.contains(&(
+            root_plan.plan_id.clone(),
+            task.index as usize,
+            task.task_id.clone(),
+            run_id.into(),
+        )) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "completed Plan task {} has no ordered candidate application",
+                task.task_id
+            ))));
+        }
+    }
+
+    let head_revision = git_stdout(&workspace, &["rev-parse", "HEAD^{commit}"])?;
+    let head_tree = git_stdout(&workspace, &["rev-parse", "HEAD^{tree}"])?;
+    Ok(OrderedCandidateSalvageInspection {
+        workspace,
+        initial_revision: manifest.initial_revision,
+        head_revision,
+        head_tree,
+        completed_application_count: fold.completed.len(),
+        completed_applications: fold.completed,
+    })
 }
 
 fn persist_ordered_candidate_manifest(
@@ -2809,21 +2973,12 @@ fn reconcile_plan_task_run_links(
         })
         .collect::<Vec<_>>();
     for (plan_id, task_id, task_index, task_attempt, run_id) in prepared {
-        if plan_id != plan.plan_id && plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
+        if plan_id != plan.plan_id || plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
             continue;
         }
         let Ok(state) = deadreckon_core::load_run(paths, &run_id) else {
             continue;
         };
-        link_plan_task_run_fenced(
-            paths,
-            token,
-            &state,
-            &plan_id,
-            &task_id,
-            task_index,
-            task_attempt,
-        )?;
         let mut linked_plan = deadreckon_core::load_plan(paths, &plan_id)?;
         if linked_plan.owner_job_id.as_deref() != Some(token.job_id.as_ref()) {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -2833,22 +2988,59 @@ fn reconcile_plan_task_run_links(
         let task = linked_plan
             .tasks
             .get_mut(task_index as usize)
-            .filter(|task| task.task_id == task_id)
+            .filter(|task| task.index == task_index && task.task_id == task_id)
             .ok_or_else(|| {
                 CliError::Core(DeadreckonError::InvalidInput(format!(
                     "prepared Plan task {plan_id}/{task_id} disappeared before recovery"
                 )))
             })?;
-        if task
-            .child_run_id
-            .as_deref()
-            .is_some_and(|existing| existing != run_id)
-        {
+        // `child_run_id` is the result that currently counts. Historical
+        // ChildLaunchPrepared facts are still useful ownership evidence, but a
+        // failed attempt must not conflict with (or replace) a later successful
+        // retry. Only restore a missing pointer from the exact attempt that can
+        // currently be authoritative for this task.
+        let current_attempt = match task.status {
+            deadreckon_core::PlanTaskStatus::Failed | deadreckon_core::PlanTaskStatus::Killed => {
+                task.attempts.last().map(|attempt| attempt.attempt)
+            }
+            deadreckon_core::PlanTaskStatus::Skipped => None,
+            deadreckon_core::PlanTaskStatus::Pending
+            | deadreckon_core::PlanTaskStatus::Running
+            | deadreckon_core::PlanTaskStatus::Completed => Some(task.attempts_used() + 1),
+        };
+        let recorded_attempt = task.attempts.iter().any(|attempt| {
+            attempt.attempt == task_attempt && attempt.run_id.as_deref() == Some(run_id.as_str())
+        });
+        let is_current_attempt = current_attempt == Some(task_attempt)
+            && (!matches!(
+                task.status,
+                deadreckon_core::PlanTaskStatus::Failed | deadreckon_core::PlanTaskStatus::Killed
+            ) || recorded_attempt);
+        if !is_current_attempt && !recorded_attempt {
             return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                "prepared Plan task {plan_id}/{task_id} already points to another Run"
+                "prepared Plan task {plan_id}/{task_id} attempt {task_attempt} is not retained by the exact Plan task attempt"
             ))));
         }
-        if task.child_run_id.is_none() {
+        if is_current_attempt
+            && task
+                .child_run_id
+                .as_deref()
+                .is_some_and(|existing| existing != run_id)
+        {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "prepared Plan task {plan_id}/{task_id} attempt {task_attempt} disagrees with its current Run"
+            ))));
+        }
+        link_plan_task_run_fenced(
+            paths,
+            token,
+            &state,
+            &plan_id,
+            &task_id,
+            task_index,
+            task_attempt,
+        )?;
+        if task.child_run_id.is_none() && is_current_attempt {
             task.child_run_id = Some(run_id.clone());
             deadreckon_core::save_owned_plan_fenced(paths, token, &linked_plan)?;
             let already_discovered = deadreckon_core::read_plan_events(paths, &plan_id)?
@@ -10925,6 +11117,244 @@ mod tests {
         assert!(error.to_string().contains("has no fenced launch record"));
     }
 
+    #[test]
+    fn plan_task_recovery_preserves_failed_attempt_before_successful_retry() {
+        use deadreckon_core::plan::{PlanTaskStatus, TaskAttempt};
+
+        let (_temp, paths, root, _child) = owned_plan_fixture();
+        let owner = deadreckon_core::LeaseOwner {
+            owner_id: "plan-retry-recovery-test".to_string(),
+            boot_id: "plan-retry-recovery-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &JobId(root.plan_id.clone()),
+            &owner,
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("claim owning Job")
+        .token();
+        let task = root.tasks[0].clone();
+        let job = deadreckon_core::load_job(&paths, &root.plan_id).expect("Job");
+
+        let first_run_id = plan_task_run_id(&root.plan_id, &root.plan_id, &task.task_id, 1);
+        prepare_plan_task_run_fenced(
+            &paths,
+            &token,
+            &root.plan_id,
+            &task.task_id,
+            task.index,
+            1,
+            &first_run_id,
+        )
+        .expect("prepare failed first attempt");
+        deadreckon_core::create_owned_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: task.goal.clone(),
+                cwd: job.source_cwd.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some(first_run_id.clone()),
+                codebase: None,
+            },
+            deadreckon_core::RunOwnership::plan_task(
+                root.plan_id.clone(),
+                root.plan_id.clone(),
+                task.task_id.clone(),
+                task.index,
+                1,
+            ),
+        )
+        .expect("failed first attempt Run");
+
+        let second_run_id = plan_task_run_id(&root.plan_id, &root.plan_id, &task.task_id, 2);
+        prepare_plan_task_run_fenced(
+            &paths,
+            &token,
+            &root.plan_id,
+            &task.task_id,
+            task.index,
+            2,
+            &second_run_id,
+        )
+        .expect("prepare successful retry");
+        deadreckon_core::create_owned_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: task.goal.clone(),
+                cwd: job.source_cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some(second_run_id.clone()),
+                codebase: None,
+            },
+            deadreckon_core::RunOwnership::plan_task(
+                root.plan_id.clone(),
+                root.plan_id.clone(),
+                task.task_id.clone(),
+                task.index,
+                2,
+            ),
+        )
+        .expect("successful retry Run");
+
+        let mut completed = deadreckon_core::load_plan(&paths, &root.plan_id).expect("Plan");
+        completed.tasks[0].attempts.push(TaskAttempt::failed(
+            1,
+            Some(first_run_id.clone()),
+            Some("first attempt failed".to_string()),
+            0.0,
+        ));
+        completed.tasks[0].status = PlanTaskStatus::Completed;
+        completed.tasks[0].child_run_id = None;
+        deadreckon_core::save_owned_plan_fenced(&paths, &token, &completed)
+            .expect("save crash-partial completed Plan");
+
+        reconcile_plan_task_run_links(&paths, &token, &completed)
+            .expect("recovery links both attempts and restores the retry");
+        let recovered = deadreckon_core::load_plan(&paths, &root.plan_id).expect("recovered Plan");
+        assert_eq!(
+            recovered.tasks[0].child_run_id.as_deref(),
+            Some(second_run_id.as_str()),
+            "the superseded failed attempt must not replace the successful retry"
+        );
+
+        let history = deadreckon_core::read_job_history(&paths.job_events(&root.plan_id))
+            .expect("recovered history");
+        for (attempt, run_id) in [(1, &first_run_id), (2, &second_run_id)] {
+            let links = history
+                .events()
+                .iter()
+                .filter(|event| {
+                    plan_task_event_matches(
+                        event,
+                        JobEventKind::ChildLinked,
+                        &root.plan_id,
+                        &task.task_id,
+                        task.index,
+                        attempt,
+                    ) && event
+                        .detail
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(run_id.as_str())
+                })
+                .count();
+            assert_eq!(links, 1, "attempt {attempt} must be linked exactly once");
+        }
+
+        let event_count = history.events().len();
+        reconcile_plan_task_run_links(&paths, &token, &recovered)
+            .expect("retry recovery is idempotent");
+        assert_eq!(
+            deadreckon_core::read_job_history(&paths.job_events(&root.plan_id))
+                .expect("idempotent history")
+                .events()
+                .len(),
+            event_count,
+            "replaying recovery must not append duplicate links or discoveries"
+        );
+        assert_eq!(
+            deadreckon_core::load_plan(&paths, &root.plan_id)
+                .expect("idempotent Plan")
+                .tasks[0]
+                .child_run_id
+                .as_deref(),
+            Some(second_run_id.as_str())
+        );
+    }
+
+    #[test]
+    fn plan_task_recovery_filters_the_exact_plan_identity() {
+        let (_temp, paths, root, child) = owned_plan_fixture();
+        let owner = deadreckon_core::LeaseOwner {
+            owner_id: "plan-identity-recovery-test".to_string(),
+            boot_id: "plan-identity-recovery-boot".to_string(),
+            pid: std::process::id(),
+            process_group: std::process::id(),
+        };
+        let token = deadreckon_core::claim_job_lease(
+            &paths,
+            &JobId(root.plan_id.clone()),
+            &owner,
+            Utc::now(),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("claim owning Job")
+        .token();
+        let child_task = child.tasks[0].clone();
+        let run_id = plan_task_run_id(&root.plan_id, &child.plan_id, &child_task.task_id, 1);
+        prepare_plan_task_run_fenced(
+            &paths,
+            &token,
+            &child.plan_id,
+            &child_task.task_id,
+            child_task.index,
+            1,
+            &run_id,
+        )
+        .expect("prepare nested Plan task");
+        let job = deadreckon_core::load_job(&paths, &root.plan_id).expect("Job");
+        deadreckon_core::create_owned_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: child_task.goal.clone(),
+                cwd: job.source_cwd,
+                sandbox: "none".to_string(),
+                provider: Some("smoke".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some(run_id.clone()),
+                codebase: None,
+            },
+            deadreckon_core::RunOwnership::plan_task(
+                root.plan_id.clone(),
+                child.plan_id.clone(),
+                child_task.task_id.clone(),
+                child_task.index,
+                1,
+            ),
+        )
+        .expect("nested Plan task Run");
+
+        reconcile_plan_task_run_links(&paths, &token, &root)
+            .expect("root recovery ignores another exact Plan identity");
+        let history = deadreckon_core::read_job_history(&paths.job_events(&root.plan_id))
+            .expect("root recovery history");
+        assert!(!history.events().iter().any(|event| {
+            plan_task_event_matches(
+                event,
+                JobEventKind::ChildLinked,
+                &child.plan_id,
+                &child_task.task_id,
+                child_task.index,
+                1,
+            )
+        }));
+
+        reconcile_plan_task_run_links(&paths, &token, &child)
+            .expect("nested Plan recovery links its own exact task");
+        assert_eq!(
+            deadreckon_core::load_plan(&paths, &child.plan_id)
+                .expect("recovered nested Plan")
+                .tasks[0]
+                .child_run_id
+                .as_deref(),
+            Some(run_id.as_str())
+        );
+    }
+
     struct ParentRepairAuthorityFixture {
         _temp: tempfile::TempDir,
         paths: DeadreckonPaths,
@@ -13415,6 +13845,46 @@ mod tests {
             prepare_ordered_candidate(&paths, &job, &authority, &token)
                 .expect("recover exact initial candidate"),
             candidate
+        );
+
+        let mut first_skipped = deadreckon_core::plan::PlanTask::new(
+            0,
+            "no landing",
+            "skip this node",
+            deadreckon_core::plan::PlanRole::Child,
+            None,
+        );
+        first_skipped.status = deadreckon_core::PlanTaskStatus::Skipped;
+        let mut second_skipped = deadreckon_core::plan::PlanTask::new(
+            1,
+            "still no landing",
+            "skip this node too",
+            deadreckon_core::plan::PlanRole::Child,
+            None,
+        );
+        second_skipped.status = deadreckon_core::PlanTaskStatus::Skipped;
+        let mut plan = deadreckon_core::plan::Plan::new(
+            job.goal.clone(),
+            deadreckon_core::plan::PlanMode::FullPlan,
+            vec![first_skipped, second_skipped],
+            deadreckon_core::plan::PlanProviders::default(),
+            Some(job.scope.clone()),
+            "test",
+        )
+        .expect("owned Plan");
+        plan.plan_id = job.job_id.as_ref().to_string();
+        plan.owner_job_id = Some(job.job_id.as_ref().to_string());
+        deadreckon_core::save_plan(&paths, &plan).expect("owned Plan state");
+        record_owned_plan(&paths, &plan.plan_id, &plan).expect("protected owned Plan definition");
+        let inspection = inspect_ordered_candidate_for_salvage(&paths, &job, &authority)
+            .expect("read-only candidate inspection");
+        assert_eq!(inspection.workspace, candidate);
+        assert_eq!(inspection.initial_revision, inspection.head_revision);
+        assert_eq!(inspection.completed_application_count, 0);
+        assert!(inspection.completed_applications.is_empty());
+        assert_eq!(
+            inspection.head_tree,
+            git_stdout(&candidate, &["rev-parse", "HEAD^{tree}"]).expect("candidate tree")
         );
 
         let history =

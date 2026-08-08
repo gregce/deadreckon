@@ -1126,11 +1126,10 @@ async fn supervise_one_job(
                 paths,
                 &token,
                 JobEventKind::Failed,
-                StopReason::CorruptHistory,
+                StopReason::SupervisorFailure,
                 json!({
-                    "reason": format!(
-                        "could not safely recover a crash-partial advanced root artifact: {error}"
-                    )
+                    "reason": "supervisor could not safely recover a crash-partial advanced root artifact",
+                    "recovery_error": error.to_string(),
                 }),
             )?;
             return Ok(());
@@ -3379,26 +3378,26 @@ async fn reconcile_child_exit(
                 | super::graph_job::PendingDriverRecovery::Recovered,
             ) => {}
             Err(error) => {
+                let driver_exit = exit_detail(&exit);
                 append_attempt_stopped(
                     paths,
                     token,
-                    StopReason::CorruptHistory,
+                    StopReason::SupervisorFailure,
                     json!({
-                        "exit": exit_detail(&exit),
-                        "reason": format!(
-                            "could not safely recover a crash-partial advanced root artifact: {error}"
-                        ),
+                        "exit": driver_exit,
+                        "reason": "advanced job driver exited and supervisor recovery also failed",
+                        "recovery_error": error.to_string(),
                     }),
                 )?;
                 append_terminal_event(
                     paths,
                     token,
                     JobEventKind::Failed,
-                    StopReason::CorruptHistory,
+                    StopReason::SupervisorFailure,
                     json!({
-                        "reason": format!(
-                            "could not safely recover a crash-partial advanced root artifact: {error}"
-                        ),
+                        "exit": driver_exit,
+                        "reason": "advanced job driver exited and supervisor recovery also failed",
+                        "recovery_error": error.to_string(),
                     }),
                 )?;
                 return Ok(ChildReconciliation::Finished);
@@ -9899,6 +9898,65 @@ mod tests {
                     .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
                     .count(),
                 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn advanced_driver_exit_keeps_recovery_error_secondary_without_claiming_corrupt_history()
+    {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = graph_fixture(&temp, deadreckon_core::plan::PlanStatus::Forked);
+        let token = claim_started_attempt(&paths, &job, 1);
+        let mut plan = deadreckon_core::load_plan(&paths, job.job_id.as_ref()).expect("Plan");
+        plan.root_goal = "tampered after approval".to_string();
+        deadreckon_core::plan::save_plan(&paths, &plan).expect("mismatched crash-partial Plan");
+
+        let decision = reconcile_child_exit(
+            &paths,
+            &job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: true,
+            },
+            1,
+            1,
+        )
+        .await
+        .expect("classify recovery failure");
+        assert_eq!(decision, ChildReconciliation::Finished);
+
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("failed view");
+        assert_eq!(
+            view.projection.stop_reason,
+            Some(StopReason::SupervisorFailure)
+        );
+        let history = read_job_history(&paths.job_events(job.job_id.as_ref())).expect("history");
+        let stopped = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::AttemptStopped)
+            .expect("attempt stopped");
+        let failed = history
+            .events()
+            .iter()
+            .find(|event| event.kind == JobEventKind::Failed)
+            .expect("terminal failure");
+        for event in [stopped, failed] {
+            assert_eq!(
+                event.detail["reason"],
+                "advanced job driver exited and supervisor recovery also failed"
+            );
+            assert_eq!(event.detail["exit"]["adopted"], true);
+            assert!(
+                event
+                    .detail
+                    .get("recovery_error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|error| error.contains("does not match durable Graph Job")),
+                "recovery error must remain structured secondary detail: {:?}",
+                event.detail
             );
         }
     }

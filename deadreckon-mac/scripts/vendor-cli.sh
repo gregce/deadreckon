@@ -33,6 +33,7 @@ fi
 # local-only build when the x86_64 Rust target is not installed
 # (rustup target add x86_64-apple-darwin).
 ARCHS=(${=DEADRECKON_VENDOR_ARCHS:-arm64 x86_64})
+OFFICIAL="${DEADRECKON_VENDOR_OFFICIAL:-0}"
 
 typeset -A TRIPLES
 TRIPLES[arm64]=aarch64-apple-darwin
@@ -41,9 +42,23 @@ TRIPLES[x86_64]=x86_64-apple-darwin
 mkdir -p "$BIN_DIR"
 
 COMMIT="$(git -C "$CLI_SRC" rev-parse HEAD)"
-VERSION="$(git -C "$CLI_SRC" describe --tags --always 2>/dev/null || echo dev)"
+SOURCE_DIRTY=false
+if [[ -n "$(git -C "$CLI_SRC" status --porcelain --untracked-files=normal)" ]]; then
+  SOURCE_DIRTY=true
+fi
 
-echo "Vendoring deadreckon $VERSION ($COMMIT) from $CLI_SRC for: ${ARCHS[*]}"
+if [[ "$OFFICIAL" == 1 ]]; then
+  if [[ "$SOURCE_DIRTY" == true ]]; then
+    echo "error: official vendoring requires a clean source checkout" >&2
+    exit 1
+  fi
+  if [[ "${#ARCHS[@]}" -ne 2 ]] || [[ " ${ARCHS[*]} " != *" arm64 "* ]] || [[ " ${ARCHS[*]} " != *" x86_64 "* ]]; then
+    echo "error: official vendoring requires exactly arm64 and x86_64" >&2
+    exit 1
+  fi
+fi
+
+echo "Vendoring deadreckon from $COMMIT (dirty=$SOURCE_DIRTY) for: ${ARCHS[*]}"
 
 # Signing happens BEFORE the sha256 pin: codesign rewrites the binary, so a
 # pin taken over unsigned bytes fails BinaryLocator's integrity check the
@@ -54,6 +69,10 @@ echo "Vendoring deadreckon $VERSION ($COMMIT) from $CLI_SRC for: ${ARCHS[*]}"
 # do not commit that manifest for a release).
 SIGN_IDENTITY="${DEADRECKON_SIGN_IDENTITY:-Developer ID Application: Gregory Ceccarelli (4GRQMF5T5U)}"
 VENDOR_SIGN="${DEADRECKON_VENDOR_SIGN:-1}"
+if [[ "$OFFICIAL" == 1 && "$VENDOR_SIGN" != 1 ]]; then
+  echo "error: official vendoring cannot disable Developer ID signing" >&2
+  exit 1
+fi
 
 # The per-arch destination for the vendored dr-gate. The lookup name is
 # fixed ("dr-gate") and the CLI validates a THIN Mach-O of its own arch, so
@@ -65,6 +84,8 @@ GATE_DESTS[x86_64]="$ROOT/Resources/libexec/deadreckon/dr-gate"
 
 typeset -A SHAS
 typeset -A GATE_SHAS
+typeset -A SOURCE_NAMES
+VERSION=""
 for arch in "${ARCHS[@]}"; do
   triple="${TRIPLES[$arch]}"
   # One cargo invocation for both binaries: dr-gate must carry the SAME
@@ -76,6 +97,16 @@ for arch in "${ARCHS[@]}"; do
   cp "$CLI_SRC/target/$triple/release/$CRATE" "$BIN_DIR/deadreckon_darwin_$arch"
   cp "$CLI_SRC/target/$triple/release/dr-gate" "$gate_dest"
   chmod +x "$BIN_DIR/deadreckon_darwin_$arch" "$gate_dest"
+  built_version="$("$BIN_DIR/deadreckon_darwin_$arch" --version | awk 'NR == 1 { print $2 }')"
+  if [[ -z "$built_version" ]]; then
+    echo "error: vendored $arch binary did not report a version" >&2
+    exit 1
+  fi
+  if [[ -n "$VERSION" && "$VERSION" != "$built_version" ]]; then
+    echo "error: vendored architectures report different versions ($VERSION vs $built_version)" >&2
+    exit 1
+  fi
+  VERSION="$built_version"
   if [[ "$VENDOR_SIGN" == 1 ]]; then
     for vendored in "$BIN_DIR/deadreckon_darwin_$arch" "$gate_dest"; do
       codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$vendored"
@@ -86,6 +117,7 @@ for arch in "${ARCHS[@]}"; do
   fi
   SHAS[$arch]="$(shasum -a 256 "$BIN_DIR/deadreckon_darwin_$arch" | cut -d' ' -f1)"
   GATE_SHAS[$arch]="$(shasum -a 256 "$gate_dest" | cut -d' ' -f1)"
+  SOURCE_NAMES[$arch]="local-source-$triple"
 done
 
 # A partial-arch run (DEADRECKON_VENDOR_ARCHS) must not silently drop the
@@ -141,8 +173,21 @@ done
 # decoder ignores unknown manifest keys).
 {
   echo '{'
+  echo '  "schemaVersion": 1,'
   echo "  \"cliVersion\": \"$VERSION\","
+  echo "  \"releaseVersion\": \"$VERSION\","
   echo "  \"gitCommit\": \"$COMMIT\","
+  echo "  \"sourceDirty\": $SOURCE_DIRTY,"
+  if (( PARTIAL )); then
+    echo '  "complete": false,'
+  else
+    echo '  "complete": true,'
+  fi
+  if [[ "$VENDOR_SIGN" == 1 ]]; then
+    echo '  "signed": true,'
+  else
+    echo '  "signed": false,'
+  fi
   echo '  "sha256": {'
   first=true
   for arch in "${OUT_ARCHS[@]}"; do
@@ -158,6 +203,15 @@ done
     $first || echo ','
     first=false
     printf '    "%s": "%s"' "$arch" "${GATE_SHAS[$arch]}"
+  done
+  echo ''
+  echo '  },'
+  echo '  "sourceArchives": {'
+  first=true
+  for arch in "${ARCHS[@]}"; do
+    $first || echo ','
+    first=false
+    printf '    "%s": {"name": "%s", "sha256": "%s"}' "$arch" "${SOURCE_NAMES[$arch]}" "${SHAS[$arch]}"
   done
   echo ''
   echo '  }'

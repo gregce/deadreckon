@@ -55,7 +55,6 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
                 .render_plain(!completion_hints_enabled(no_hints)),
         });
     }
-    append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
     let strategy = parse_merge_strategy(&plan, &strategy, prefer_child, no_hints)?;
     if let PlanMergeStrategy::PreferChild(chosen) = strategy
         && !plan.tasks.iter().any(|task| task.index == chosen)
@@ -82,7 +81,14 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
         ));
     }
     let repair_mode = parse_merge_repair_mode(&plan, &repair_mode, no_hints)?;
-    let mut merge = compose_plan_merge_working(&paths, &plan, strategy)?;
+    // Persist MergeStarted only after every operator argument has been
+    // validated. A typo is not an interrupted merge and must not leave the
+    // recovery surface claiming that composition began.
+    append_plan_event(&paths, &plan.plan_id, PlanEventKind::MergeStarted)?;
+    let mut merge = match compose_plan_merge_working(&paths, &plan, strategy) {
+        Ok(merge) => merge,
+        Err(error) => return record_and_return_merge_failure(&paths, &mut plan, error),
+    };
     let unresolved_conflicts = merge.unresolved_conflicts();
     if !unresolved_conflicts.is_empty() {
         let repair_context = MergeRepairContext::final_merge(&paths, &plan);
@@ -204,24 +210,20 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
             }
         }
     }
-    let merged_run = create_merged_plan_run(&paths, &plan, no_gate)?;
-    plan.status = PlanStatus::Merged;
-    plan.merged_at = Some(Utc::now());
-    plan.merged_run_id = Some(merged_run.run_id.clone());
-    save_plan(&paths, &plan)?;
-    append_plan_event(
-        &paths,
-        &plan.plan_id,
-        PlanEventKind::MergeCompleted {
-            merged_run_id: merged_run.run_id.clone(),
-        },
-    )?;
-    append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
-    let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
-    write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts)?;
-    let doc_provider = select_plan_doc_provider(&paths, &plan, None)?;
-    let defaults = config_defaults(&paths)?;
-    let _manifest = maybe_with_cli_wait_status(
+    // Documentation and the result manifest are part of a usable merged
+    // result. Keep the Plan non-terminal until all of them exist; a failure in
+    // any one step is recorded as a merge failure instead of producing the
+    // contradictory "PlanCompleted, then error" history older releases could
+    // leave behind.
+    let doc_provider = match select_plan_doc_provider(&paths, &plan, None) {
+        Ok(provider) => provider,
+        Err(error) => return record_and_return_merge_failure(&paths, &mut plan, error),
+    };
+    let defaults = match config_defaults(&paths) {
+        Ok(defaults) => defaults,
+        Err(error) => return record_and_return_merge_failure(&paths, &mut plan, error),
+    };
+    if let Err(error) = maybe_with_cli_wait_status(
         !quiet,
         "consolidating plan docs",
         refresh_plan_docs(
@@ -235,12 +237,54 @@ pub(crate) async fn merge_command(args: MergeCommandArgs) -> Result<()> {
             },
         ),
     )
-    .await?;
-    materialize_plan_docs_to_working(&paths, &plan, &library_dir, None)?;
+    .await
+    {
+        return record_and_return_merge_failure(&paths, &mut plan, error);
+    }
+    let merged_run = match create_merged_plan_run(&paths, &plan, no_gate) {
+        Ok(run) => run,
+        Err(error) => return record_and_return_merge_failure(&paths, &mut plan, error),
+    };
+    plan.merged_at = Some(Utc::now());
+    plan.merged_run_id = Some(merged_run.run_id.clone());
+    let library_dir = paths.library_dir(&merged_run.scope, &merged_run.run_id);
+    if let Err(error) = write_plan_merge_manifest(&paths, &library_dir, &plan, &merge.conflicts) {
+        return record_and_return_merge_failure(&paths, &mut plan, error);
+    }
+    if let Err(error) = materialize_plan_docs_to_working(&paths, &plan, &library_dir, None) {
+        return record_and_return_merge_failure(&paths, &mut plan, error);
+    }
+    plan.status = PlanStatus::Merged;
+    // From this point the result itself is complete. Do not rewrite it to
+    // Failed merely because a trailing lifecycle write fails; that would
+    // destroy the primary truth needed by retry/reconciliation.
+    save_plan(&paths, &plan)?;
+    append_plan_event(
+        &paths,
+        &plan.plan_id,
+        PlanEventKind::MergeCompleted {
+            merged_run_id: merged_run.run_id.clone(),
+        },
+    )?;
+    append_plan_event(&paths, &plan.plan_id, PlanEventKind::PlanCompleted)?;
     if !quiet && completion_surface {
         print_merge_finished(&paths, &plan, &merged_run, &library_dir, no_hints);
     }
     Ok(())
+}
+
+fn record_and_return_merge_failure<T>(
+    paths: &DeadreckonPaths,
+    plan: &mut Plan,
+    primary: CliError,
+) -> Result<T> {
+    let primary_message = primary.to_string();
+    match record_plan_merge_failure(paths, plan, &primary_message) {
+        Ok(()) => Err(primary),
+        Err(record_error) => Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+            "{primary_message}; additionally, DeadReckon could not persist the merge failure: {record_error}"
+        )))),
+    }
 }
 
 fn merge_unavailable_plan_surface(paths: &DeadreckonPaths, plan: &Plan) -> VerdictSurface {

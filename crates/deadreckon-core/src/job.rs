@@ -261,7 +261,14 @@ impl JobView {
         let mut attempts = Vec::new();
         let mut missing_attempts = Vec::new();
         for run_id in &projection.child_run_ids {
-            match RunView::load(paths, &job.scope, run_id) {
+            // A Job's scope describes the parent request, not necessarily the
+            // scope chosen for each child attempt. Resolve the durable child
+            // identity first, then load its evidence from the scope recorded
+            // in that child's state. Otherwise graph Jobs falsely report every
+            // child that was launched under a derived scope as missing.
+            match crate::state::load_run(paths, run_id)
+                .and_then(|state| RunView::load(paths, &state.scope, &state.run_id))
+            {
                 Ok(view) => attempts.push(view),
                 Err(_) => missing_attempts.push(run_id.clone()),
             }
@@ -1454,6 +1461,41 @@ mod tests {
         let view = JobView::load(&paths, "job-1").expect("job view");
         let direct = crate::RunView::load(&paths, &state.scope, &state.run_id).expect("run view");
         assert_eq!(view.attempts, vec![direct]);
+        assert!(view.missing_attempts.is_empty());
+    }
+
+    #[test]
+    fn job_view_loads_linked_attempt_from_its_own_scope() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path());
+        let child_project = temp.path().join("child-project");
+        fs::create_dir(&child_project).expect("child project");
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "derived child attempt".to_string(),
+                cwd: child_project,
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "deadreckon".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let identity = job();
+        assert_ne!(identity.scope, state.scope, "fixture needs distinct scopes");
+        write_job(&paths, &identity).expect("job");
+        append_job_event(&paths, &event(1, "created", JobEventKind::Created)).expect("created");
+        let mut linked = event(2, "linked-derived", JobEventKind::ChildLinked);
+        linked.detail = json!({ "run_id": state.run_id });
+        append_job_event(&paths, &linked).expect("linked");
+
+        let view = JobView::load(&paths, "job-1").expect("job view");
+        assert_eq!(view.attempts.len(), 1);
+        assert_eq!(view.attempts[0].id.scope, state.scope);
         assert!(view.missing_attempts.is_empty());
     }
 

@@ -92,7 +92,7 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "supervisor",
-        marks: [P, F, F, F, P, P],
+        marks: [P, N, P, P, P, P],
     },
     VerbFriendliness {
         verb: "run",
@@ -120,6 +120,10 @@ pub const FRIENDLINESS_CONTRACT: &[VerbFriendliness] = &[
     },
     VerbFriendliness {
         verb: "merge",
+        marks: [P, P, P, P, P, P],
+    },
+    VerbFriendliness {
+        verb: "salvage",
         marks: [P, P, P, P, P, P],
     },
     VerbFriendliness {

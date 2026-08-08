@@ -173,6 +173,13 @@ pub(crate) const VERB_REF_SPECS: &[VerbRefSpec] = &[
             .union(RefKinds::PLAN)
             .union(RefKinds::CHAIN),
     },
+    // Salvage is a recovery operation over the immutable evidence of one
+    // terminal failed Graph Job. Runs and legacy Plan identities cannot carry
+    // the authority, ordered-candidate ledger, and Job history it verifies.
+    VerbRefSpec {
+        verb: "salvage",
+        accepts: RefKinds::JOB,
+    },
     // export/apply accept a plan because they map it onto its merged result run.
     VerbRefSpec {
         verb: "export",
@@ -272,6 +279,9 @@ pub(crate) fn refusal_for(kind: RefKind, verb: &str, reference: &str) -> CliErro
         }
         ("steer", _) => {
             format!("{reference} is a {noun}; steering targets one executing run")
+        }
+        ("salvage", _) => {
+            format!("{reference} is a {noun}; salvage requires a failed Graph Job")
         }
         _ => format!("{reference} is a {noun}, not a run"),
     };

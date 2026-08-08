@@ -1741,6 +1741,15 @@ async fn main_inner() -> Result<()> {
                 keep_branch,
             })
         }
+        Commands::Salvage {
+            job_id,
+            output,
+            dry_run,
+            json,
+        } => {
+            machine_json::arm("salvage", json);
+            commands::salvage::salvage_command(&job_id, output.as_deref(), dry_run, json)
+        }
         Commands::Extend {
             parent_run_id,
             new_goal,
@@ -2415,6 +2424,14 @@ const COMMAND_HELP_CATALOG: &[CommandHelpEntry] = &[
         purpose: "remove stale or completed worktrees",
         audience: CommandAudience::Primary,
         top_group: Some(TopHelpGroup::Control),
+        all_group: Some(HelpAllGroup::ContinueRecover),
+    },
+    CommandHelpEntry {
+        display: "salvage",
+        clap_name: Some("salvage"),
+        purpose: "export a stranded verified-candidate result",
+        audience: CommandAudience::Advanced,
+        top_group: None,
         all_group: Some(HelpAllGroup::ContinueRecover),
     },
     CommandHelpEntry {
@@ -8017,8 +8034,18 @@ fn compose_merge_sources<T, S, C>(
         .collect::<Result<Vec<_>>>()?;
     reject_artifact_hierarchy_collisions(&inventories)?;
 
-    remove_if_exists(merge_dir)?;
-    fs::create_dir_all(merge_dir)?;
+    // Compose beside the canonical directory and publish only after every
+    // source artifact has copied successfully. A failed leaf copy must not
+    // destroy the last coherent merge candidate or expose a partial new one.
+    let merge_parent = merge_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(merge_parent)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".deadreckon-merge-staging-")
+        .tempdir_in(merge_parent)?;
+    let staging_dir = staging.path();
     let mut seen: BTreeMap<PathBuf, (S, ArtifactFileFingerprint)> = BTreeMap::new();
     let mut conflicts = Vec::new();
     for (source, inventory) in sources.iter().zip(inventories) {
@@ -8033,7 +8060,11 @@ fn compose_merge_sources<T, S, C>(
                 Some((_, previous)) if previous == &artifact.fingerprint => continue,
                 Some((previous, _)) => decide_conflict(&artifact.relative, previous, &current),
                 None => {
-                    copy_merge_file(&artifact.artifact_path, &merge_dir.join(&artifact.relative))?;
+                    copy_composed_merge_file(
+                        &artifact.artifact_path,
+                        &staging_dir.join(&artifact.relative),
+                        staging_dir,
+                    )?;
                     seen.insert(artifact.relative, (current, artifact.fingerprint));
                     continue;
                 }
@@ -8041,7 +8072,11 @@ fn compose_merge_sources<T, S, C>(
             match decision {
                 ComposeMergeDecision::KeepExisting => {}
                 ComposeMergeDecision::UseCurrent => {
-                    copy_merge_file(&artifact.artifact_path, &merge_dir.join(&artifact.relative))?;
+                    copy_composed_merge_file(
+                        &artifact.artifact_path,
+                        &staging_dir.join(&artifact.relative),
+                        staging_dir,
+                    )?;
                     seen.insert(artifact.relative, (current, artifact.fingerprint));
                 }
                 ComposeMergeDecision::RecordConflict {
@@ -8050,9 +8085,10 @@ fn compose_merge_sources<T, S, C>(
                 } => {
                     conflicts.push(conflict);
                     if use_current {
-                        copy_merge_file(
+                        copy_composed_merge_file(
                             &artifact.artifact_path,
-                            &merge_dir.join(&artifact.relative),
+                            &staging_dir.join(&artifact.relative),
+                            staging_dir,
                         )?;
                         seen.insert(artifact.relative, (current, artifact.fingerprint));
                     }
@@ -8060,7 +8096,44 @@ fn compose_merge_sources<T, S, C>(
             }
         }
     }
+    publish_composed_merge_dir(staging_dir, merge_dir)?;
     Ok(conflicts)
+}
+
+/// Replace the canonical composed tree only after its sibling staging tree is
+/// complete. Moving the prior tree aside first lets a failed publication put
+/// it back byte-for-byte; symbolic links are moved as links and never followed.
+fn publish_composed_merge_dir(staging_dir: &Path, merge_dir: &Path) -> Result<()> {
+    let merge_parent = merge_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::symlink_metadata(merge_dir) {
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            fs::rename(staging_dir, merge_dir)?;
+            return Ok(());
+        }
+        Err(source) => return Err(source.into()),
+        Ok(_) => {}
+    }
+
+    let previous_root = tempfile::Builder::new()
+        .prefix(".deadreckon-merge-previous-")
+        .tempdir_in(merge_parent)?;
+    let previous = previous_root.path().join("previous");
+    fs::rename(merge_dir, &previous)?;
+    if let Err(publish_error) = fs::rename(staging_dir, merge_dir) {
+        if let Err(restore_error) = fs::rename(&previous, merge_dir) {
+            return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                "merge publication failed ({publish_error}) and the prior merge could not be restored ({restore_error})"
+            ))));
+        }
+        return Err(publish_error.into());
+    }
+    // `previous_root` removes the displaced tree on drop. Publication has
+    // already committed at this point, so cleanup cannot turn success into a
+    // contradictory merge failure.
+    Ok(())
 }
 
 fn reject_artifact_hierarchy_collisions(inventories: &[Vec<MergeableRunArtifact>]) -> Result<()> {
@@ -10354,6 +10427,11 @@ fn copy_merge_file(source: &Path, dest: &Path) -> Result<()> {
     copy_artifact_path(source, dest).map_err(CliError::from)
 }
 
+fn copy_composed_merge_file(source: &Path, dest: &Path, merge_root: &Path) -> Result<()> {
+    deadreckon_core::artifacts::copy_artifact_path_beneath(source, dest, merge_root)
+        .map_err(CliError::from)
+}
+
 fn skip_plan_apply_file(relative: &Path) -> bool {
     skip_plan_merge_file(relative) || relative == Path::new("deadreckon-plan-manifest.json")
 }
@@ -10723,8 +10801,9 @@ mod plan_artifact_boundary_tests {
     use tempfile::TempDir;
 
     use super::{
-        clear_plan_result_deliverables, compose_roots, copy_repair_library_to_working,
-        git_nul_paths, git_status, stage_plan_result_changes,
+        ComposeFileSource, ComposeMergeDecision, clear_plan_result_deliverables,
+        compose_merge_sources, compose_roots, copy_repair_library_to_working, git_nul_paths,
+        git_status, stage_plan_result_changes,
     };
 
     fn write_file(root: &Path, relative: &str, body: &str) {
@@ -10760,6 +10839,83 @@ mod plan_artifact_boundary_tests {
         assert!(!merge.join(".specstory").exists());
         assert!(!merge.join("target").exists());
         assert!(!merge.join(".deadreckon").exists());
+    }
+
+    #[test]
+    fn plan_composition_creates_deep_destination_ancestors() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        write_file(
+            &source,
+            "src/core/runtime/providers/agent.js",
+            "deep result\n",
+        );
+
+        let merge = temp.path().join("merge");
+        write_file(&merge, "sentinel.txt", "prior merge\n");
+        let result = compose_roots(&[("source".to_string(), source)], &merge).expect("compose");
+
+        assert!(result.conflicts.is_empty());
+        assert!(!merge.join("sentinel.txt").exists());
+        assert_eq!(
+            fs::read_to_string(merge.join("src/core/runtime/providers/agent.js"))
+                .expect("deep merged result"),
+            "deep result\n"
+        );
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("temp root")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".deadreckon-merge-previous-")),
+            "successful composition left the prior canonical tree behind"
+        );
+    }
+
+    #[test]
+    fn failed_composition_preserves_the_prior_canonical_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        write_file(&source, "a-first.txt", "copied before failure\n");
+        write_file(&source, "z-removed.txt", "removed after inventory\n");
+        let merge = temp.path().join("merge");
+        write_file(&merge, "sentinel.txt", "prior coherent merge\n");
+        let sources = vec![ComposeFileSource {
+            root: source,
+            data: (),
+            prefix_error: "merge source prefix error",
+        }];
+
+        let error = compose_merge_sources::<(), (), ()>(
+            &merge,
+            &sources,
+            |_data, relative, artifact, _fingerprint| {
+                if relative == Path::new("z-removed.txt") {
+                    fs::remove_file(artifact).expect("remove after inventory");
+                }
+            },
+            |_relative, _previous, _current| ComposeMergeDecision::KeepExisting,
+        )
+        .expect_err("copy failure must abort composition");
+
+        assert!(error.to_string().contains("z-removed.txt"), "{error}");
+        assert_eq!(
+            fs::read_to_string(merge.join("sentinel.txt")).expect("prior merge"),
+            "prior coherent merge\n"
+        );
+        assert!(!merge.join("a-first.txt").exists());
+        assert!(
+            fs::read_dir(temp.path())
+                .expect("temp root")
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".deadreckon-merge-staging-")),
+            "failed composition left a staging tree"
+        );
     }
 
     #[cfg(unix)]

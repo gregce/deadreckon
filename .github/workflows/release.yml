@@ -353,6 +353,85 @@ jobs:
             target/distrib/**
             dist-manifest-${{ matrix.target }}.json
 
+  build-mac-app:
+    name: build signed notarized universal macOS app
+    if: needs.release-policy.outputs.build_artifacts == 'true'
+    needs:
+      - release-policy
+      - build-local-artifacts
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install XcodeGen
+        shell: bash
+        run: brew install xcodegen
+      - name: Download finalized signed macOS CLI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-local-*-apple-darwin
+          # Keep the downloaded dist manifests outside the checkout so the
+          # official app script can independently enforce a clean source tree.
+          path: ${{ runner.temp }}/deadreckon-mac-input
+          merge-multiple: true
+      - name: Hydrate app resources from exact release archive bytes
+        shell: bash
+        run: |
+          if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+            echo "::error::macOS app release checkout became dirty before hydration"
+            git status --short
+            exit 1
+          fi
+          node release/macos-app.mjs hydrate \
+            --dir "$RUNNER_TEMP/deadreckon-mac-input/target/distrib" \
+            --app-root deadreckon-mac \
+            --version "${{ needs.release-policy.outputs.version }}" \
+            --commit "$GITHUB_SHA"
+      - name: Import Apple Developer ID certificate
+        shell: bash
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PWD: ${{ secrets.APPLE_CERT_PWD }}
+        run: |
+          cert="$RUNNER_TEMP/developer-id-app.p12"
+          keychain="$RUNNER_TEMP/deadreckon-app-signing.keychain-db"
+          echo "$APPLE_CERT_P12" | base64 -D > "$cert"
+          security create-keychain -p "" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "" "$keychain"
+          security import "$cert" -k "$keychain" -P "$APPLE_CERT_PWD" -T /usr/bin/codesign
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$keychain"
+      - name: Test, sign, notarize, staple, and trust-bind app
+        timeout-minutes: 60
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PWD: ${{ secrets.APPLE_APP_PWD }}
+        run: |
+          release_version="${{ needs.release-policy.outputs.version }}"
+          app_version="${release_version%%-rc.*}"
+          export DEADRECKON_RELEASE_MODE=official
+          export DEADRECKON_CLI_VERSION="$release_version"
+          export DEADRECKON_APP_VERSION="$app_version"
+          export DEADRECKON_RELEASE_COMMIT="$GITHUB_SHA"
+          export DEADRECKON_APP_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          export DEADRECKON_APP_DIST="$GITHUB_WORKSPACE/target/distrib"
+          deadreckon-mac/scripts/release-app.sh
+      - name: Upload signed notarized app
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-mac-app
+          if-no-files-found: error
+          path: |
+            target/distrib/deadreckon-mac.zip
+            target/distrib/trust/macos-universal-apple-darwin-app.json
+
   build-global-artifacts:
     name: build installers and Homebrew formula
     if: needs.release-policy.outputs.build_artifacts == 'true'
@@ -409,6 +488,7 @@ jobs:
       - release-policy
       - build-local-artifacts
       - build-global-artifacts
+      - build-mac-app
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -431,6 +511,13 @@ jobs:
         with:
           name: dist-global
           path: .
+      - name: Download signed notarized macOS app
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-mac-app
+          # The app artifact's least common upload root is target/distrib, so
+          # restore it there (ZIP at the root, trust JSON under trust/).
+          path: target/distrib
       - name: Generate and verify archive-member manifest
         run: |
           node release/evaluator-sidecars.mjs manifest \
@@ -554,9 +641,12 @@ jobs:
           gh attestation verify <artifact> --repo gregce/deadreckon
           ```
 
-          macOS artifacts are Developer ID signed and notarized. Every artifact
-          is checksummed and attested. The release manifest records signing,
-          notarization, checksum, package-manager, and attestation policy status.
+          macOS CLI archives and the universal `deadreckon.app` are Developer ID
+          signed and notarized; the app also carries a stapled ticket and embeds
+          the exact signed arm64 and x86_64 CLI release bytes. Every artifact is
+          checksummed and attested. The release manifest records signing,
+          notarization, stapling, checksum, package-manager, and attestation
+          policy status.
           EOF
           if [ "${{ needs.release-policy.outputs.requires_windows_signing }}" = "true" ]; then
             printf '\nWindows artifacts are Authenticode signed.\n' >> "$notes"

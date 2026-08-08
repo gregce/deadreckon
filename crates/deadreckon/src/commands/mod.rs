@@ -24,6 +24,7 @@ pub(crate) mod providers;
 pub(crate) mod reference;
 pub(crate) mod report;
 pub(crate) mod run;
+pub(crate) mod salvage;
 pub(crate) mod seams;
 pub(crate) mod start;
 pub(crate) mod steer;

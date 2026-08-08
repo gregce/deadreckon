@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 #[cfg(test)]
@@ -609,6 +609,81 @@ pub fn copy_artifact_path(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
+/// Copy one leaf beneath an already-created destination root without ever
+/// following a destination ancestor outside that root.
+///
+/// Callers that materialize an inventory know the trusted root. Walking the
+/// relative parent components from that root closes the ambiguity in the
+/// general leaf copier: an intermediate file or symbolic link is a collision,
+/// not a directory to traverse or replace.
+pub fn copy_artifact_path_beneath(
+    source: &Path,
+    target: &Path,
+    destination_root: &Path,
+) -> Result<()> {
+    let root_metadata = fs::symlink_metadata(destination_root).with_path(destination_root)?;
+    if !root_metadata.file_type().is_dir() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "artifact destination root is not a directory: {}",
+            destination_root.display()
+        )));
+    }
+    let relative = target.strip_prefix(destination_root).map_err(|_| {
+        DeadreckonError::InvalidInput(format!(
+            "artifact destination {} is outside {}",
+            target.display(),
+            destination_root.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "artifact destination must be a leaf beneath {}",
+            destination_root.display()
+        )));
+    }
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "artifact destination contains an unsafe component: {}",
+            target.display()
+        )));
+    }
+
+    let mut directory = destination_root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            match component {
+                Component::Normal(name) => directory.push(name),
+                Component::CurDir
+                | Component::ParentDir
+                | Component::RootDir
+                | Component::Prefix(_) => unreachable!("components were validated above"),
+            }
+            ensure_directory_component_beneath(&directory)?;
+        }
+    }
+    copy_artifact_path(source, target)
+}
+
+fn ensure_directory_component_beneath(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(DeadreckonError::InvalidInput(format!(
+            "artifact destination ancestor is not a directory: {}",
+            path.display()
+        ))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).with_path(path)
+        }
+        Err(source) => Err(DeadreckonError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Remove an artifact leaf without following symbolic links.
 ///
 /// Directories are accepted for callers replacing a prior hierarchy, but a
@@ -704,13 +779,30 @@ fn ensure_copy_destination_root(path: &Path) -> Result<()> {
 }
 
 fn ensure_directory_target(path: &Path) -> Result<()> {
+    // `copy_artifact_path` is a leaf-level primitive, so its target parent may
+    // be more than one directory below the already-created copy root. Build
+    // the chain one component at a time instead of using `create_dir_all`:
+    // every existing component is inspected with `symlink_metadata`, and a
+    // symbolic link is replaced as a link rather than followed outside the
+    // destination hierarchy.
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
         Ok(_) => {
             remove_copy_target(path)?;
             fs::create_dir(path).with_path(path)
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        Err(source)
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            if let Some(parent) = path.parent()
+                && parent != path
+                && !parent.as_os_str().is_empty()
+            {
+                ensure_directory_target(parent)?;
+            }
             fs::create_dir(path).with_path(path)
         }
         Err(source) => Err(DeadreckonError::Io {
@@ -836,8 +928,8 @@ mod tests {
     };
 
     use super::{
-        FileDeltaStatus, copy_artifact_path, copy_deliverable_tree, copy_promotable_tree,
-        copy_tree, diff_snapshots, diff_working_trees, inventory_files,
+        FileDeltaStatus, copy_artifact_path, copy_artifact_path_beneath, copy_deliverable_tree,
+        copy_promotable_tree, copy_tree, diff_snapshots, diff_working_trees, inventory_files,
         inventory_recoverable_files_for_state, patches_from_diff, restore_snapshot, snapshot_diff,
         snapshot_working,
     };
@@ -1323,6 +1415,113 @@ mod tests {
         assert_eq!(
             fs::read_to_string(target.join("preserved.txt")).expect("preserved remains"),
             "preserved\n"
+        );
+    }
+
+    #[test]
+    fn artifact_copy_creates_every_missing_destination_ancestor() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        let target = destination.join("src/core/runtime/agent.js");
+        fs::write(&source, "deep result\n").expect("source");
+        fs::create_dir(&destination).expect("destination root");
+
+        copy_artifact_path_beneath(&source, &target, &destination).expect("deep artifact copy");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("copied result"),
+            "deep result\n"
+        );
+    }
+
+    #[test]
+    fn rooted_artifact_copy_refuses_a_file_ancestor_without_touching_siblings() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&destination).expect("destination");
+        fs::write(&source, "nested result\n").expect("source");
+        fs::write(destination.join("src"), "stale file\n").expect("file ancestor");
+        fs::write(destination.join("preserved.txt"), "preserved\n").expect("sibling");
+
+        let target = destination.join("src/core/agent.js");
+        let error = copy_artifact_path_beneath(&source, &target, &destination)
+            .expect_err("file ancestor must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("artifact destination ancestor is not a directory"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("src")).expect("file ancestor"),
+            "stale file\n"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("preserved.txt")).expect("preserved sibling"),
+            "preserved\n"
+        );
+    }
+
+    #[test]
+    fn rooted_artifact_copy_rejects_a_lexical_parent_escape() {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside.txt");
+        fs::write(&source, "escaped result\n").expect("source");
+        fs::write(&outside, "preserved\n").expect("outside sentinel");
+        fs::create_dir(&destination).expect("destination root");
+
+        let target = destination.join("../outside.txt");
+        let error = copy_artifact_path_beneath(&source, &target, &destination)
+            .expect_err("parent escape must be refused");
+
+        assert!(error.to_string().contains("unsafe component"), "{error}");
+        assert_eq!(
+            fs::read_to_string(outside).expect("outside sentinel"),
+            "preserved\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_artifact_copy_never_follows_a_symlinked_destination_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source.txt");
+        let destination = temp.path().join("destination");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&destination).expect("destination");
+        fs::create_dir(&outside).expect("outside");
+        fs::create_dir(outside.join("core")).expect("outside descendant");
+        fs::write(&source, "contained result\n").expect("source");
+        fs::write(outside.join("preserved.txt"), "outside\n").expect("outside sentinel");
+        symlink(&outside, destination.join("src")).expect("destination symlink");
+
+        let target = destination.join("src/core/agent.js");
+        let error = copy_artifact_path_beneath(&source, &target, &destination)
+            .expect_err("symlink ancestor must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("artifact destination ancestor is not a directory"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("preserved.txt")).expect("outside sentinel"),
+            "outside\n"
+        );
+        assert!(!outside.join("core/agent.js").exists());
+        assert!(
+            fs::symlink_metadata(destination.join("src"))
+                .expect("destination symlink")
+                .file_type()
+                .is_symlink()
         );
     }
 
