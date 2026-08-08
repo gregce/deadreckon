@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.5 — Results that survive — 2026-08-08
+
+- Graph recovery now reconciles the exact Plan, task index, retry attempt, and
+  child Run that produced the current result. A failed first attempt can no
+  longer displace its successful retry, terminal Job truth is no longer hidden
+  by a nested Plan, and operational recovery errors are not mislabeled as
+  corrupt history.
+- Final Plan composition now creates deep artifact paths beneath a protected
+  staging root, rejects symlink and lexical escapes, publishes atomically, and
+  records failures before claiming a merged result. The new `salvage` command
+  can validate a stranded failed Graph Job's complete ordered-candidate ledger,
+  child receipts, Git history, and frozen control artifacts, then export that
+  exact result to a new directory without rewriting the failed Job.
+- Official releases now build and test the universal macOS app from the exact
+  signed arm64 and x86_64 CLI archives. The release lane verifies all embedded
+  bytes and architectures, signs the outer app, notarizes and staples it, then
+  includes its trust record in checksums, the SBOM, the release manifest,
+  GitHub attestations, and the published release assets.
+
 ## 0.8.4 — Contracts that hold — 2026-08-06
 
 - Definition-of-done compilation now derives network requirements from the
