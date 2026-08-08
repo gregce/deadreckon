@@ -1,10 +1,10 @@
 {
-  "cliVersion": "v0.8.4-18-g46ee1f9",
-  "gitCommit": "46ee1f91e1c68ed6778709acabd3ad5df61405a7",
+  "cliVersion": "v0.8.4-19-g585df9d",
+  "gitCommit": "585df9dc1e2970ef8a445cfd3e05d5682cdcc916",
   "sha256": {
-    "arm64": "96b2e814c0ab259576007dc22e23afe6651315358c77c49b8e0aa789536fa273"
+    "arm64": "ff954e492eaf44841c26ea967140aa4cfb084a1888f3755989d68450ad5f29b1"
   },
   "gateSha256": {
-    "arm64": "ffef645c5c8b81f4337d2e8dfa8e7c461de403e412c6feac814ce2cce067b2f7"
+    "arm64": "31e15f0fe4bf5083db959e3ae36ed1487031cbe68de0d1f670d664dab90b3e15"
   }
 }
