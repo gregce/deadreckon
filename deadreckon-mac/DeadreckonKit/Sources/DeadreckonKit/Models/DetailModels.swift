@@ -661,6 +661,9 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
         /// kept as the raw string because it is the correlator against the
         /// steer envelope's queued_at (SteerDeliveryTracker).
         public let queuedAt: String?
+        /// spend_delta rows carry the turn's wall clock (additive decode;
+        /// legacy ledgers without the field decode unchanged).
+        public let wallTimeSeconds: Double?
 
         enum CodingKeys: String, CodingKey {
             case kind, turn
@@ -673,6 +676,7 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
             case totalCostUSD = "total_cost_usd"
             case message, path
             case queuedAt = "queued_at"
+            case wallTimeSeconds = "wall_time_seconds"
         }
 
         public init(kind: String, turn: Int? = nil, toolName: String? = nil,
@@ -680,7 +684,8 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
                     preview: String? = nil, inputTokens: Int? = nil,
                     outputTokens: Int? = nil, costUSD: Double? = nil,
                     totalCostUSD: Double? = nil, message: String? = nil,
-                    path: String? = nil, queuedAt: String? = nil) {
+                    path: String? = nil, queuedAt: String? = nil,
+                    wallTimeSeconds: Double? = nil) {
             self.kind = kind
             self.turn = turn
             self.toolName = toolName
@@ -694,6 +699,7 @@ public struct RunEventRecord: Codable, Equatable, Sendable {
             self.message = message
             self.path = path
             self.queuedAt = queuedAt
+            self.wallTimeSeconds = wallTimeSeconds
         }
     }
 
@@ -830,6 +836,129 @@ public struct CheckpointManifestDoc: Codable, Equatable, Sendable {
         try container.encode(trigger, forKey: .trigger)
         try container.encode(fullAnchor, forKey: .fullAnchor)
         try container.encode([JSONValue](), forKey: .files)
+    }
+}
+
+// MARK: - Trace drill-down (VIZ-DRILLDOWN-SPEC §K11)
+
+/// The full tool exchange behind one retained `traces.jsonl` line, decoded
+/// ON EXPANSION (pure; held only while the drill is open). Lenient by
+/// design: any missing branch yields nils, never a throw — `decode` returns
+/// nil only when the line is not a JSON object at all (the view then shows
+/// the raw line verbatim, never a guess).
+public struct TraceDetailDoc: Equatable, Sendable {
+    public struct FlightRow: Equatable, Sendable, Identifiable {
+        public let id: String
+        public let toolName: String?
+        /// shell | edit | …, verbatim.
+        public let toolCategory: String?
+        /// completed | failed, verbatim.
+        public let status: String?
+        public let summary: String?
+        // Decoded from the flight row's embedded `raw` item JSON when present:
+        public let command: String?
+        public let aggregatedOutput: String?
+        /// The built-in loop's tool traces record stderr as its own stream;
+        /// it renders as its own well — streams are never merged silently.
+        public let stderrOutput: String?
+        public let exitCode: Int?
+        public let changedPaths: [String]
+    }
+
+    public let provider: String?
+    public let model: String?
+    public let binary: String?
+    public let durationMS: Int?
+    public let exitCode: Int?
+    public let sandboxBackend: String?
+    /// Verbatim when present — a degradation fact, never dropped.
+    public let sandboxWarning: String?
+    public let workspaceAccess: String?
+    public let stdoutPath: String?
+    /// The last element of `detail.trace.args` (the prompt on CLI subagents).
+    public let promptArg: String?
+    public let flightRows: [FlightRow]
+
+    public static func decode(rawTraceLine: String) -> TraceDetailDoc? {
+        guard let data = rawTraceLine.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return nil
+        }
+        let detail = object["detail"] as? [String: Any]
+        let trace = detail?["trace"] as? [String: Any]
+        let args = trace?["args"] as? [Any]
+        var rows: [FlightRow] = []
+        for (index, rawRow) in ((trace?["flight_rows"] as? [[String: Any]]) ?? []).enumerated() {
+            var command: String?
+            var output: String?
+            var exit: Int?
+            var changed: [String] = []
+            if let rawItem = rawRow["raw"] as? String,
+               let itemData = rawItem.data(using: .utf8),
+               let embedded = (try? JSONSerialization.jsonObject(with: itemData)) as? [String: Any],
+               let item = embedded["item"] as? [String: Any] {
+                command = item["command"] as? String
+                output = item["aggregated_output"] as? String
+                exit = (item["exit_code"] as? NSNumber)?.intValue
+                for change in (item["changes"] as? [[String: Any]]) ?? [] {
+                    if let path = change["path"] as? String { changed.append(path) }
+                }
+            }
+            rows.append(FlightRow(
+                id: (rawRow["id"] as? String) ?? "row-\(index)",
+                toolName: rawRow["tool_name"] as? String,
+                toolCategory: rawRow["tool_category"] as? String,
+                status: rawRow["status"] as? String,
+                summary: rawRow["summary"] as? String,
+                command: command,
+                aggregatedOutput: output,
+                stderrOutput: nil,
+                exitCode: exit,
+                changedPaths: changed))
+        }
+        // The built-in loop's tool traces (`event: tool.*`) carry the
+        // exchange directly on `detail` — command / stdout / stderr /
+        // status_code — with no `trace` envelope. Map that recorded shape
+        // into one flight row so the drill renders the exchange instead of
+        // an empty block. Every field verbatim; absent -> nil.
+        if rows.isEmpty, trace == nil, let detail,
+           detail["command"] != nil || detail["stdout"] != nil || detail["stderr"] != nil {
+            let stdout = detail["stdout"] as? String
+            let stderr = detail["stderr"] as? String
+            rows.append(FlightRow(
+                id: (detail["tool_call_id"] as? String) ?? "tool",
+                toolName: object["event"] as? String,
+                toolCategory: nil,
+                status: nil,
+                summary: nil,
+                command: detail["command"] as? String,
+                aggregatedOutput: (stdout?.isEmpty ?? true) ? nil : stdout,
+                stderrOutput: (stderr?.isEmpty ?? true) ? nil : stderr,
+                exitCode: (detail["status_code"] as? NSNumber)?.intValue,
+                changedPaths: []))
+        }
+        return TraceDetailDoc(
+            provider: detail?["provider"] as? String,
+            model: detail?["model"] as? String,
+            binary: trace?["binary"] as? String,
+            durationMS: (trace?["duration_ms"] as? NSNumber)?.intValue
+                ?? (object["latency_ms"] as? NSNumber)?.intValue,
+            exitCode: (trace?["exit_code"] as? NSNumber)?.intValue,
+            sandboxBackend: trace?["sandbox_backend"] as? String,
+            sandboxWarning: trace?["sandbox_warning"] as? String,
+            workspaceAccess: trace?["workspace_access"] as? String,
+            stdoutPath: trace?["stdout_path"] as? String,
+            promptArg: args?.last as? String,
+            flightRows: rows)
+    }
+
+    /// True when the decode found nothing renderable — the view then shows
+    /// the raw line verbatim instead of an empty expansion (never a blank
+    /// block where evidence exists).
+    public var isEmpty: Bool {
+        provider == nil && model == nil && binary == nil && durationMS == nil
+            && exitCode == nil && sandboxBackend == nil && sandboxWarning == nil
+            && workspaceAccess == nil && promptArg == nil && flightRows.isEmpty
     }
 }
 

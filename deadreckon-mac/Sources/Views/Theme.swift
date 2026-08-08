@@ -146,6 +146,33 @@ enum Theme {
     private static func rgb(_ r: Int, _ g: Int, _ b: Int) -> Color {
         Color(red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255)
     }
+
+    // MARK: Chart tokens (VIZ-DRILLDOWN-SPEC §V0) — the only inks a chart
+    // mark may wear. No categorical palette exists: identity is carried by
+    // position and printed labels, never hue. Accent appears on exactly one
+    // datum per chart: the newest datum of a LIVE run.
+
+    enum Chart {
+        /// At-rest bars, ticks (≥3:1 on panel — graphics-safe, always
+        /// beside printed values).
+        static let markQuiet = Theme.textTertiary
+        /// Line strokes (5.8:1 on panel).
+        static let markLine = Theme.textSecondary
+        /// Area washes — a wash, never a block.
+        static let markFill = Theme.textSecondary.opacity(0.08)
+        /// Hairline, SOLID, never dashed.
+        static let gridline = Theme.border
+        /// Budget-cap hairline + caption label.
+        static let capRule = Theme.textTertiary
+        /// ONLY the newest datum of a live run.
+        static let liveDatum = Theme.accent
+        /// Failed/error marks (fixed meaning, never decoration).
+        static let fail = Theme.danger
+        /// Brush selection band.
+        static let brushFill = Theme.well
+        /// Brush edges.
+        static let brushEdge = Theme.borderHover
+    }
 }
 
 /// Provider badge iconography (DESIGN.md §2): a 12–16px rounded-rect tile

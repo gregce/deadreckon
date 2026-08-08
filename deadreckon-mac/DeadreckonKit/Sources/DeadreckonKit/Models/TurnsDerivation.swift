@@ -21,14 +21,21 @@ public struct TurnModel: Equatable, Sendable, Identifiable {
         public let timestamp: Date
         public let kind: EntryKind
         public let text: String
+        /// The verbatim ledger line this entry decoded from — retained for
+        /// trace-kind entries under the raw-retention ceiling (K10) so the
+        /// tool-I/O drill can decode the full exchange on demand. nil past
+        /// the ceiling: the drill then names the ledger file on disk.
+        public var raw: String?
 
         public var id: Int { ordinal }
 
-        public init(ordinal: Int, timestamp: Date, kind: EntryKind, text: String) {
+        public init(ordinal: Int, timestamp: Date, kind: EntryKind, text: String,
+                    raw: String? = nil) {
             self.ordinal = ordinal
             self.timestamp = timestamp
             self.kind = kind
             self.text = text
+            self.raw = raw
         }
     }
 
@@ -37,17 +44,23 @@ public struct TurnModel: Equatable, Sendable, Identifiable {
     public var inputTokens: Int
     public var outputTokens: Int
     public var costUSD: Double
+    /// Accumulated from the events ledger's spend_delta rows'
+    /// `wall_time_seconds` (exactly as costUSD accumulates); 0 on legacy
+    /// ledgers without the field — the view renders that as an honest dash.
+    public var wallSeconds: Double
     public var entries: [Entry]
 
     public var id: Int { turn }
 
     public init(turn: Int, startedAt: Date? = nil, inputTokens: Int = 0,
-                outputTokens: Int = 0, costUSD: Double = 0, entries: [Entry] = []) {
+                outputTokens: Int = 0, costUSD: Double = 0,
+                wallSeconds: Double = 0, entries: [Entry] = []) {
         self.turn = turn
         self.startedAt = startedAt
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.costUSD = costUSD
+        self.wallSeconds = wallSeconds
         self.entries = entries
     }
 }
@@ -61,16 +74,39 @@ public enum TurnsDerivation {
     public struct Accumulator: Equatable, Sendable {
         private var byTurn: [Int: TurnModel] = [:]
         private var ordinal = 0
+        /// Trace entries currently holding their raw line, in arrival order
+        /// (K10 ceiling: newest `traceRawCeiling` trace lines keep raw;
+        /// older entries' raw drops to nil and the drill names the ledger).
+        private var traceRawRefs: [(turn: Int, ordinal: Int)] = []
+        private let traceRawCeiling: Int
 
-        public init() {}
+        public init(traceRawCeiling: Int = 1_000) {
+            self.traceRawCeiling = traceRawCeiling
+        }
+
+        public static func == (lhs: Accumulator, rhs: Accumulator) -> Bool {
+            lhs.byTurn == rhs.byTurn && lhs.ordinal == rhs.ordinal
+                && lhs.traceRawRefs.map(\.ordinal) == rhs.traceRawRefs.map(\.ordinal)
+                && lhs.traceRawCeiling == rhs.traceRawCeiling
+        }
+
+        /// Backwards-compatible fold without trace raw lines (raw = nil).
+        /// Disfavored so an empty-literal `traces: []` resolves to the
+        /// raw-carrying primary; both are semantically identical there.
+        @_disfavoredOverload
+        public mutating func fold(events: [RunEventRecord], traces: [TraceRow]) -> [TurnModel] {
+            fold(events: events, traces: traces.map { (row: $0, raw: nil) })
+        }
 
         /// Fold new rows and return the full ordered turn list. Events
         /// without a turn number (unknown kinds) are dropped from the
         /// grouping — they still appear in the Activity feed, which renders
-        /// the raw ledger. Token usage and spend accumulate from the events
-        /// ledger (token_usage_delta / spend_delta); trace rows land as
-        /// entries with their event word and latency.
-        public mutating func fold(events: [RunEventRecord], traces: [TraceRow]) -> [TurnModel] {
+        /// the raw ledger. Token usage, spend, and wall time accumulate from
+        /// the events ledger (token_usage_delta / spend_delta); trace rows
+        /// land as entries with their event word and latency, carrying their
+        /// verbatim source line under the raw-retention ceiling.
+        public mutating func fold(events: [RunEventRecord],
+                                  traces: [(row: TraceRow, raw: String?)]) -> [TurnModel] {
             var touched: Set<Int> = []
 
             for record in events {
@@ -97,6 +133,7 @@ public enum TurnsDerivation {
                     turnModel.outputTokens += record.event.outputTokens ?? 0
                 case "spend_delta":
                     turnModel.costUSD += record.event.costUSD ?? 0
+                    turnModel.wallSeconds += record.event.wallTimeSeconds ?? 0
                 case "error":
                     turnModel.entries.append(TurnModel.Entry(
                         ordinal: ordinal, timestamp: record.timestamp, kind: .error,
@@ -115,14 +152,29 @@ public enum TurnsDerivation {
             }
 
             for trace in traces {
-                var turnModel = byTurn[trace.turn] ?? TurnModel(turn: trace.turn)
+                var turnModel = byTurn[trace.row.turn] ?? TurnModel(turn: trace.row.turn)
                 ordinal += 1
-                let latency = trace.latencyMS.map { " \($0)ms" } ?? ""
+                let latency = trace.row.latencyMS.map { " \($0)ms" } ?? ""
                 turnModel.entries.append(TurnModel.Entry(
-                    ordinal: ordinal, timestamp: trace.timestamp, kind: .trace,
-                    text: "\(trace.event)\(latency)"))
-                byTurn[trace.turn] = turnModel
-                touched.insert(trace.turn)
+                    ordinal: ordinal, timestamp: trace.row.timestamp, kind: .trace,
+                    text: "\(trace.row.event)\(latency)", raw: trace.raw))
+                if trace.raw != nil {
+                    traceRawRefs.append((turn: trace.row.turn, ordinal: ordinal))
+                }
+                byTurn[trace.row.turn] = turnModel
+                touched.insert(trace.row.turn)
+            }
+
+            // K10 ceiling: the OLDEST trace entries lose their raw copy (the
+            // parsed entry itself stays; the ledger on disk stays whole).
+            while traceRawRefs.count > traceRawCeiling {
+                let dropped = traceRawRefs.removeFirst()
+                if var turnModel = byTurn[dropped.turn],
+                   let index = turnModel.entries.firstIndex(where: { $0.ordinal == dropped.ordinal }) {
+                    turnModel.entries[index].raw = nil
+                    byTurn[dropped.turn] = turnModel
+                    touched.insert(dropped.turn)
+                }
             }
 
             // Within a turn, entries interleave by timestamp (stable on ties
@@ -142,7 +194,15 @@ public enum TurnsDerivation {
 
     /// One-shot grouping over full ledgers (kept for tests and callers that
     /// hold complete histories); identical semantics to a single fold.
+    @_disfavoredOverload
     public static func group(events: [RunEventRecord], traces: [TraceRow]) -> [TurnModel] {
+        var accumulator = Accumulator()
+        return accumulator.fold(events: events, traces: traces)
+    }
+
+    /// One-shot grouping carrying trace raw lines (K4 overload).
+    public static func group(events: [RunEventRecord],
+                             traces: [(row: TraceRow, raw: String?)]) -> [TurnModel] {
         var accumulator = Accumulator()
         return accumulator.fold(events: events, traces: traces)
     }

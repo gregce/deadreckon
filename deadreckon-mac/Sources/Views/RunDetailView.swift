@@ -37,6 +37,10 @@ struct RunSurfaceView: View {
     @StateObject private var detail: JobDetailStore
     @State private var drawerShown = false
     @State private var tab: DetailCenterTabsView.Tab = .activity
+    /// The one drill-jump channel (§G1): setting it switches the center
+    /// tab; the receiving pane consumes it (expand/scroll/brush) and
+    /// clears it. Pure view plumbing; no store involvement.
+    @State private var drill: DrillTarget?
 
     init(row: FleetRow, fleet: FleetStore) {
         self.row = row
@@ -48,15 +52,15 @@ struct RunSurfaceView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            RunHeaderView(row: currentRow, detail: detail, fleet: fleet)
+            RunHeaderView(row: currentRow, detail: detail, fleet: fleet, drill: $drill)
             Divider().overlay(Theme.border)
-            PlanBandView(row: currentRow, detail: detail)
+            PlanBandView(row: currentRow, detail: detail, drill: $drill)
             Divider().overlay(Theme.border)
             NowBandView(detail: detail)
             Divider().overlay(Theme.border)
             DoneMeansStrip(row: currentRow, detail: detail) { tab = .checks }
             Divider().overlay(Theme.border)
-            DetailCenterTabsView(row: currentRow, detail: detail, tab: $tab)
+            DetailCenterTabsView(row: currentRow, detail: detail, tab: $tab, drill: $drill)
             // The guide bar is the live run's tool; a terminal run's header
             // carries the review actions instead (§D6).
             if currentRow.projection.phase != .terminal {
@@ -68,6 +72,16 @@ struct RunSurfaceView: View {
         }
         .onAppear { detail.open() }
         .onDisappear { detail.close() }
+        // A drill jump lands on its owning tab first; the pane then
+        // consumes the target and clears it (§G1).
+        .onChange(of: drill) { _, target in
+            switch target {
+            case .turn, .activityWindow: tab = .activity
+            case .changesFile: tab = .changes
+            case .recordedCheck: tab = .checks
+            case nil: break
+            }
+        }
         // The retained window keeps this view alive across window close
         // (the AppDelegate retains the window), so onDisappear alone cannot
         // bound the tails: a closed window must not keep the 2s tail + CLI
@@ -152,6 +166,7 @@ struct RunHeaderView: View {
     let row: FleetRow
     @ObservedObject var detail: JobDetailStore
     @ObservedObject var fleet: FleetStore
+    @Binding var drill: DrillTarget?
     @EnvironmentObject private var router: WriteSurfaceRouter
     @State private var copiedNote = false
 
@@ -295,8 +310,31 @@ struct RunHeaderView: View {
                     .help("From the signed record of check results, attempt \(gate.attempt)")
             }
             Spacer(minLength: 0)
+            // V1: the burn strip augments the printed meter with the one
+            // thing the number cannot say — the SHAPE of the burn. In a
+            // narrow header the strip drops before any text fact does.
+            if showBurnStrip {
+                ViewThatFits(in: .horizontal) {
+                    SpendBurnStrip(
+                        series: detail.spendSeries,
+                        live: row.projection.phase != .terminal
+                    ) { turn in
+                        drill = .turn(turn)
+                    }
+                    Color.clear.frame(width: 0, height: 0)
+                }
+            }
         }
         .lineLimit(1)
+    }
+
+    /// §V1 empty/sparse law: fewer than 2 points is a dot pretending to be
+    /// a line; an all-zero series draws only against a cap (a zero line
+    /// against nothing answers nothing). A stopped spend feed freezes the
+    /// strip exactly where the ledger stopped — the warn chip is the voice.
+    private var showBurnStrip: Bool {
+        detail.spendSeries.points.count >= 2
+            && (detail.spendSeries.maxTotalUSD > 0 || detail.spendSeries.capUSD != nil)
     }
 
     private var stateWord: String {
@@ -390,19 +428,31 @@ struct RunHeaderView: View {
 /// verbatim), or the five-stage lifecycle fallback derived from
 /// `projection.phase` when the run hasn't posted a plan. Step grammar:
 /// completed = success check, current = breathing accent (the live
-/// marker), planned = quiet, failed = danger x.
+/// marker), planned = quiet, failed = danger x. Under each real step: the
+/// DERIVED elapsed caption (V5 — deliberately not a chart; the numbers,
+/// set consistently, are the visualization). Click a step -> phase popover
+/// (D5).
 struct PlanBandView: View {
     let row: FleetRow
     @ObservedObject var detail: JobDetailStore
+    @Binding var drill: DrillTarget?
+
+    @State private var openPhaseID: Int?
+    @State private var openStageIndex: Int?
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
             Theme.sectionTitle("PLAN")
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 16) {
+                HStack(alignment: .top, spacing: 16) {
                     if let state = detail.runState {
-                        ForEach(state.phases, id: \.id.raw) { phase in
-                            planStep(phase, currentID: state.currentPhaseID)
+                        let marks = PhaseDurations.derive(
+                            phases: state.phases, runStartedAt: state.startedAt,
+                            currentPhaseID: state.currentPhaseID, status: state.status,
+                            now: Date())
+                        ForEach(Array(state.phases.enumerated()), id: \.element.id.raw) { index, phase in
+                            planStep(phase, index: index, state: state,
+                                     mark: index < marks.count ? marks[index] : .none)
                         }
                     } else {
                         fallbackSteps
@@ -425,23 +475,89 @@ struct PlanBandView: View {
         .background(Theme.panel)
     }
 
-    // One real pipeline step, status words from the file verbatim.
-    private func planStep(_ phase: RunStateDoc.Phase, currentID: Int) -> some View {
-        let current = phase.id.raw == currentID && phase.status == "executing"
-        return HStack(spacing: 5) {
-            stepGlyph(status: phase.status, current: current)
-            Text("\(phase.id.raw)")
-                .font(Theme.mono(9.5))
-                .foregroundStyle(Theme.textTertiary)
-            Text(phase.name)
-                .font(Theme.body(11, weight: current ? .semibold : .regular))
-                .foregroundStyle(stepNameColor(status: phase.status, current: current))
-                .lineLimit(1)
+    // One real pipeline step, status words from the file verbatim; the
+    // derived duration caption beneath (no accent — the breathing dot is
+    // the live marker).
+    private func planStep(_ phase: RunStateDoc.Phase, index: Int,
+                          state: RunStateDoc, mark: PhaseDurations.Mark) -> some View {
+        let current = phase.id.raw == state.currentPhaseID && phase.status == "executing"
+        return Button {
+            openPhaseID = phase.id.raw
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    stepGlyph(status: phase.status, current: current,
+                              live: row.projection.phase != .terminal)
+                    Text("\(phase.id.raw)")
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.textTertiary)
+                    Text(phase.name)
+                        .font(Theme.body(11, weight: current ? .semibold : .regular))
+                        .foregroundStyle(stepNameColor(status: phase.status, current: current))
+                        .lineLimit(1)
+                }
+                durationCaption(mark)
+            }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.tactile)
         .help("\(phase.name) \u{00B7} \(phase.status)")
+        .popover(isPresented: phaseBinding(phase.id.raw), arrowEdge: .bottom) {
+            PhaseDetail(
+                name: phase.name, status: phase.status, updatedAt: phase.updatedAt,
+                mark: mark,
+                onViewActivity: {
+                    openPhaseID = nil
+                    drill = .activityWindow(phaseWindow(index: index, state: state))
+                })
+                .presentationBackground(Theme.panel)
+        }
     }
 
-    @ViewBuilder private func stepGlyph(status: String, current: Bool) -> some View {
+    @ViewBuilder private func durationCaption(_ mark: PhaseDurations.Mark) -> some View {
+        switch mark {
+        case .completed(let seconds):
+            captionText(Self.durationWords(seconds))
+        case .current(let seconds):
+            captionText("\(Self.durationWords(seconds))\u{2026}")
+        case .none:
+            EmptyView()
+        }
+    }
+
+    private func captionText(_ text: String) -> some View {
+        Text(text)
+            .font(Theme.mono(9))
+            .monospacedDigit()
+            .foregroundStyle(Theme.textTertiary)
+            .padding(.leading, 15)
+            .help("derived from the phase\u{2019}s status-change stamps (updated_at), not a recorded duration")
+    }
+
+    private func phaseBinding(_ id: Int) -> Binding<Bool> {
+        Binding(get: { openPhaseID == id },
+                set: { openPhaseID = $0 ? id : nil })
+    }
+
+    /// The phase's stamp window (D5): previous stamp ... this stamp, the
+    /// executing phase extending to now.
+    private func phaseWindow(index: Int, state: RunStateDoc) -> ClosedRange<Date> {
+        let lower = index == 0 ? state.startedAt : state.phases[index - 1].updatedAt
+        let phase = state.phases[index]
+        let executing = phase.id.raw == state.currentPhaseID && phase.status == "executing"
+        let upper = executing ? Date() : phase.updatedAt
+        return min(lower, upper) ... max(lower, upper)
+    }
+
+    /// `2m41s`-style words for the derived captions.
+    static func durationWords(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        if total >= 3600 { return String(format: "%dh%02dm", total / 3600, (total % 3600) / 60) }
+        if total >= 60 { return String(format: "%dm%02ds", total / 60, total % 60) }
+        return "\(total)s"
+    }
+
+    @ViewBuilder private func stepGlyph(status: String, current: Bool, live: Bool) -> some View {
         switch status {
         case "completed":
             Text("\u{2713}")
@@ -452,7 +568,15 @@ struct PlanBandView: View {
                 .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(Theme.danger)
         case "executing":
-            BreathingDot(color: Theme.accent)
+            // Accent = live, and only THE step the run is on (DESIGN.md §6).
+            // Real ledgers keep stale "executing" rows the writer stopped
+            // updating (provider/sandbox), and a finished run's file never
+            // rewrites them — those read as quiet positions, never as life.
+            if current, live {
+                BreathingDot(color: Theme.accent)
+            } else {
+                StateDot(color: Theme.textTertiary)
+            }
         default:
             StateDot(color: Theme.textTertiary)
         }
@@ -480,11 +604,31 @@ struct PlanBandView: View {
         let position = lifecyclePosition
         ForEach(Array(Self.lifecycleStages.enumerated()), id: \.offset) { index, name in
             let mark = stageMark(index: index, position: position)
-            HStack(spacing: 5) {
-                fallbackGlyph(mark)
-                Text(name)
-                    .font(Theme.body(11, weight: markIsCurrent(mark) ? .semibold : .regular))
-                    .foregroundStyle(fallbackNameColor(mark))
+            Button {
+                openStageIndex = index
+            } label: {
+                HStack(spacing: 5) {
+                    fallbackGlyph(mark)
+                    Text(name)
+                        .font(Theme.body(11, weight: markIsCurrent(mark) ? .semibold : .regular))
+                        .foregroundStyle(fallbackNameColor(mark))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.tactile)
+            // The lifecycle fallback is a position, not a schedule: the
+            // popover carries only the stage word and the durable
+            // projection phase — no stamps exist, so no duration, ever.
+            .popover(isPresented: Binding(get: { openStageIndex == index },
+                                          set: { openStageIndex = $0 ? index : nil }),
+                     arrowEdge: .bottom) {
+                PhaseDetail(
+                    name: name,
+                    status: Lexicon.statusWord(row.status),
+                    updatedAt: nil,
+                    mark: .none,
+                    onViewActivity: nil)
+                    .presentationBackground(Theme.panel)
             }
         }
     }

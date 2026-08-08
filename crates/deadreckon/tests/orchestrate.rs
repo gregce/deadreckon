@@ -1323,7 +1323,11 @@ fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
         .expect("source before")
         .tree_hash();
     let paths = DeadreckonPaths::from_home(temp.path().join("home"));
-    write_start_ready_setup(&paths, &launch);
+    // The done contract belongs to the PROJECT being launched: `start --from`
+    // roots contract lookup at the --from directory, so the contract lives in
+    // the source fixture while the caller's cwd (empty-launch) holds no
+    // .deadreckon of its own — the app's cwd=home discipline.
+    write_start_ready_setup(&paths, &source);
     let service = characterization_service(&paths);
 
     let preview = service
@@ -1401,7 +1405,7 @@ fn assert_full_plan_from_preview_contract_authority_and_driver_agree() {
     );
     assert_eq!(
         fs::read_to_string(root.join("acceptance.yaml")).expect("frozen acceptance"),
-        fs::read_to_string(launch.join(".deadreckon/acceptance.yaml")).expect("launch acceptance"),
+        fs::read_to_string(source.join(".deadreckon/acceptance.yaml")).expect("source acceptance"),
         "the accepted contract must be frozen with the resolved-source Job"
     );
 

@@ -703,6 +703,8 @@ public struct TraceRow             // one traces.jsonl line (detail deliberately
 public struct FlightManifestDoc    // flight-manifest.json subset (sessions)
 public struct CheckpointManifestDoc // checkpoints/<id>/manifest.json subset; fileCount only
 public struct DocEntry             // one file under <working_dir>/.deadreckon/docs
+public struct TraceDetailDoc       // VIZ WAVE 2 K11 (see that section): on-demand decode of
+                                   // one retained traces.jsonl line into the full exchange
 ```
 
 Invariants:
@@ -779,6 +781,8 @@ public final class JobDetailStore: ObservableObject {
     // Documented ceilings (see the bounded-copies invariant below):
     public static let rawEventLineCeiling: Int            // 2000 trailing raw drawer lines
     public static let supervisorTextCeiling: Int          // ~256 KB per supervisor pane
+    public static let rawInspectorCeiling: Int            // 4000 newest ActivityEntry.raw (VIZ WAVE 2, K10)
+    public static let traceRawCeiling: Int                // 1000 newest trace-entry raws (VIZ WAVE 2, K10)
 
     // Published: status/statusIssue, report/reportIssue, projection/projectionIssue,
     // lease, runState, spine, activity, rawEventLines/rawEventsDropped,
@@ -1976,3 +1980,211 @@ scratch home). Contracts added or corroborated:
   live: finish applied 7 files; undo reverted them with a typed
   `undo_kind: job-delivery` envelope). Both resolve binary-side; no app
   change may paper over them (trust rule 2).
+
+## VIZ WAVE 2 — visualization + drill-down on the goal-run surfaces (as built)
+
+Authority: `design/VIZ-DRILLDOWN-SPEC.md` (companion to DESIGN.md §V0 chart
+tokens and the one-accent law). Library decision as specced: Swift Charts for
+every plotted chart (imported ONLY in `Sources/Views/RunCharts.swift`),
+SwiftUI Canvas for the architecture map, zero third-party chart dependencies.
+Charts render recorded rows only — no smoothing, no interpolation past the
+last record, no extension to "now", no forecast, no chart animation; every
+plotted value is also printed; drill-down is reading, never authority.
+
+### Chart derivations (Models/ChartSeries.swift — pure, Sendable, tested)
+
+```swift
+public struct SpendSeries          // K1: retained fold of spend.jsonl LOOP rows only
+                                   // (narrator rows never enter — split ledger, TAILING.md).
+                                   // Point carries turn/timestamp/delta/total/tokens/model/
+                                   // provider/wallSeconds/estimated/subscription verbatim;
+                                   // capUSD = last non-nil loop cap; ceiling 5,000 points,
+                                   // OLDEST dropped WITH droppedPoints (the shape needs the
+                                   // tail; the header prints the head regardless).
+                                   // fold(a+b) == fold(a);fold(b), tested.
+public struct DensitySeries        // K2: incremental event-stamp fold; presentation applies
+                                   // the sparse law: absent (0 events) | ticks (<12 events
+                                   // or <60s span — one honest tick per row, no y encoding)
+                                   // | bins on the fixed nice ladder (1,2,5,10,15,30s,1,2,
+                                   // 5,10,30m,1h, then doubling) chosen so span ≤ 72 bins;
+                                   // zero-count bins render as zero (absence is a fact);
+                                   // error + turn_started stamps routed to their own series;
+                                   // stamp ceiling 200,000 with droppedStamps, domain start
+                                   // pinned honest. Rebin (width step) rebuilds once from
+                                   // retained stamps; incremental == one-shot, tested.
+public enum TurnScale              // K4: shared maxima (max in+out tokens, max wallSeconds)
+                                   // so every Turns row draws against the same scale.
+public enum CheckDurations         // K5: rows keyed by the EXACT (kind, command, cwd)
+                                   // triple; showBars only when 2+ rows carry a duration (a
+                                   // lone duration is a number, not a comparison); history
+                                   // is newest-first per-attempt with nil result where the
+                                   // attempt has no matching record — absence stated.
+public enum PhaseDurations         // K6: elapsed-per-phase DERIVED from status-change
+                                   // stamps (updated_at deltas; phase 0 baselines on
+                                   // started_at) — completed/current/none, PER PHASE:
+                                   // planned/pending/stale-executing rows (the shape real
+                                   // ledgers carry before the work phases) mark .none but
+                                   // their real stamps stay the chain's baseline, so later
+                                   // completed phases still measure; non-monotonic stamps,
+                                   // completions after a failed/unknown phase -> .none and
+                                   // the chain stops guessing (never a negative); the
+                                   // current phase ticks with now ONLY while the run
+                                   // status word is "executing" (killed/failed freeze).
+public struct CheckpointTimeline   // K9: scrubber ticks (checkpoint stamps, fullAnchor) +
+                                   // session START marks only (sessions carry no end stamp
+                                   // — no span is ever drawn); domain runStartedAt…last
+                                   // RECORDED stamp, clamped inside recorded stamps, nil
+                                   // when nothing is recorded.
+```
+
+### Architecture graph (Models/ArchitectureGraph.swift)
+
+```swift
+public struct ArchitectureGraphDoc // K7: narrative/architecture-graph.json decode — scope
+                                   // ("run"|"plan") is the presentation tier switch; nodes/
+                                   // edges/groups/layout/legend all verbatim; lenient
+                                   // decode (absent arrays -> []); sourceFileCount =
+                                   // source_window.files.count when present (the honest
+                                   // total behind the truncated file-node list).
+public enum GraphStyleToken        // primary/success/warning/danger/muted; unknown token
+                                   // preserved verbatim, renders muted.
+public enum GraphLayoutDerivation  // deterministic layered layout: column = BFS min-depth
+                                   // over layout.root_ids, row = weight desc then id asc;
+                                   // unreachable nodes land in a final overflow column
+                                   // (drawn, never dropped); > 40 nodes -> .tooLarge and
+                                   // the Canvas refuses (never a hairball). No physics.
+```
+
+### Trace drill-down (Models/DetailModels.swift)
+
+```swift
+public struct TraceDetailDoc       // K11: on-demand decode of ONE retained traces.jsonl
+                                   // line into the full tool exchange: provider/model/
+                                   // binary/duration/exit/sandbox(+warning verbatim)/
+                                   // workspace/stdout_path/promptArg (last args element) +
+                                   // flight rows with command/aggregated_output/exit_code/
+                                   // changed paths decoded from each row's embedded raw
+                                   // item JSON. TWO recorded shapes decode: the codex CLI's
+                                   // detail.trace envelope, and the built-in loop's tool
+                                   // traces (event tool.*, detail.command/stdout/stderr/
+                                   // status_code, top-level latency_ms) — the latter maps
+                                   // to one flight row with stderr as its OWN stream
+                                   // (stderrOutput; streams never merged) and no invented
+                                   // status word. Lenient: missing branches -> nils; nil
+                                   // only when the line is not a JSON object; `isEmpty`
+                                   // flags a factless doc so the view shows the raw line
+                                   // verbatim instead of an empty expansion. Pure; decoded
+                                   // on expansion, held only while expanded.
+// RunEventRecord.Detail gains wallTimeSeconds ("wall_time_seconds", additive
+// decode — spend_delta rows carry it; legacy ledgers decode unchanged).
+```
+
+### TurnsDerivation additions (Models/TurnsDerivation.swift)
+
+- `TurnModel.wallSeconds: Double` accumulates from spend_delta rows' wall
+  clock exactly as costUSD accumulates (0 on legacy ledgers — rendered as an
+  honest dash, never a guess).
+- `TurnModel.Entry.raw: String?` — the verbatim ledger line for trace-kind
+  entries under the trace-raw ceiling; the parsed entry itself is never
+  dropped.
+- `Accumulator.fold(events:traces:[(row: TraceRow, raw: String?)])` is the
+  primary fold; the raw-less `[TraceRow]` overload stays (disfavored so empty
+  literals resolve; identical semantics with raw = nil). `Accumulator(
+  traceRawCeiling:)` bounds retained trace raws: the OLDEST entries' raw
+  drops to nil first, tested.
+
+### JobDetailStore additions (K8 + K10, additive)
+
+```swift
+@Published spendSeries: SpendSeries       // fed off-main in the stage-2 hop from the spend poll
+@Published density: DensitySeries         // fed off-main from the events poll (stamp+kind pairs)
+@Published archGraph: ArchitectureGraphDoc?   // plan path first, else run path (below)
+@Published archGraphIssue: String?        // exists-but-undecodable; last good doc KEPT
+public static let rawInspectorCeiling = 4_000  // newest Activity entries keeping raw (K10)
+public static let traceRawCeiling = 1_000      // newest trace entries keeping raw (K10)
+```
+
+- **Graph read paths (the only new reads):** `home/plans/<jobID>/narrative/
+  architecture-graph.json` first (driver jobs), else `<runRoot>/narrative/
+  architecture-graph.json`; mtime-cached exactly like the checkpoints cache
+  (unchanged mtime on the same path skips the read, tested); absent -> nil
+  doc + nil issue (honest silence); exists-but-undecodable -> keep the last
+  good doc + verbatim issue (the projection.json pattern, tested). Reads run
+  in the stage-2 detached hop; still zero writes, still nothing near
+  gate-keys/.
+- **Series folds run off-main** in the same stage-2 hop as the decode
+  (value-typed accumulators captured before, assigned after; pollOnce stays
+  serialized so no lost folds); per-tick cost stays O(new rows). Series and
+  graph state reset per attempt in buildRunTailers and on close(), tested.
+- **K10 raw-retention ceilings** (beside rawEventLineCeiling, same honesty
+  grammar): `ActivityEntry.raw` keeps the newest 4,000 verbatim event lines
+  (the parsed scrollback itself stays unbounded — the ceiling bounds only
+  duplicated raw bytes; older rows' drill names events.jsonl on disk);
+  trace entries keep the newest 1,000 raw lines (~11 KB each live; the drill
+  past the ceiling names traces.jsonl). Both tested.
+
+### Views (Sources, app target — views + shell only)
+
+`Theme.Chart` (§V0 tokens: markQuiet/markLine/markFill/gridline/capRule/
+liveDatum/fail/brushFill/brushEdge — the only inks a mark may wear; no
+categorical palette exists; accent on exactly one datum per chart: the newest
+datum of a LIVE run). `RunCharts.swift` (SpendBurnStrip V1: step-interpolated
+area+line over loop points, cap RuleMark, ring end-dot, axes hidden — the
+text meter is the axis; absent under 2 points or capless all-zero series; a
+stopped spend feed freezes it beside the existing warn chip. ActivityDensityStrip
+V2: ladder bins / sparse ticks, error rules in fail ink, turn ticks bottom
+lane, HH:mm:ss domain captions with the hover value printed in the caption
+center; hover + drag-brush are one explicit overlay layer — an explicit
+DragGesture translated through the ChartProxy, because attaching both
+chartXSelection(value:) and (range:) leaves the range gesture dead — band
+drawn in brushFill/brushEdge, click-without-drag clears.
+CheckpointScrubber V8: checkpoint RuleMarks (full anchors heavier), session
+START ticks, degenerate single-stamp fallback, click = index into the card
+list. TokenMicroBar/DurationMicroBar/CheckDurationBar V3/V4: plain rectangles
+against Kit maxima, accessibilityHidden — their numbers are printed on the
+row). `DrillViews.swift` (the one grammar §G: DrillTarget enum + RunSurfaceView
+plumbing — rows expand INLINE, band data opens anchored POPOVERS with
+DrillPopoverChrome, jumps are mono accent JumpLines that switch the center
+tab; SpendPointDetail D3, EventRawInspector D4 — pretty print is a VIEW of
+the same bytes, raw toggle + copy carry the untouched line, past-ceiling rows
+name the ledger; ToolIOView D1 level 2 — fact line, per-flight-row command/
+output wells, changed-path jumps into Changes, undecodable raw shown verbatim;
+CheckEvidenceView D2 — absorbs the old CheckResultDetail: command well, cwd,
+duration, must-pass, outputs with copy, newest-first per-attempt history
+matched on the exact triple with "not recorded" where true; PhaseDetail D5
+with the derived-stamps caveat printed always; GraphNodeDetail D7).
+`StoryMapView.swift` (V7 MAP in the Story tab, after the deterministic body
+and NEVER inside/below the unverified overlay: run-scope stars render as the
+Tier-1 evidence strip — chips in the graph's own style tokens, source-window
+file total, +N more into Changes; plan-scope DAGs render as the Tier-2
+layered Canvas — token-tinted node chips, 1px gridline cubics, edge words on
+hover, the file's own legend and warnings verbatim, layout.kind verbatim as
+caption; > 40 nodes refuses to the strip with the count printed; no
+pan/zoom/drag). RunDetailView (burn strip far right of the facts line,
+dropping FIRST via ViewThatFits in narrow headers; PLAN band grows derived
+duration captions + step popovers, fallback lifecycle steps show position
+words only — no stamps, no durations, ever; the accent breathing dot marks
+ONLY the current executing step of a LIVE run — stale "executing" rows and
+terminal runs' phases read as quiet positions, never as life). DetailCenterTabs (Activity: the
+density strip replaces the old header sparkbar — REDESIGN-SPEC §A3.3's
+sparkbar is superseded by VIZ-DRILLDOWN §V2, the header keeps the event
+count; brush chip `HH:mm–HH:mm · N shown ✕` composes AND with search; stream
+rows expand to the raw inspector. Turns: micro-bar column + in/out legend +
+trace-entry tool I/O + per-turn activity-window jump. Checks: recorded rows
+expand to full evidence with duration bars behind the 2+ floor; live rows
+get the same expansion minus history and keep their not-evidence label.
+Changes: D6 nits only — expanded header shows the full path selectable +
+copy path; loadPatch and issue rendering untouched; `.changesFile` targets
+reuse the existing lazy load. Recorder: the facts + scrubber are a FIXED
+band above the scrolling cards — an index that scrolled itself out of view
+on use would lose the position it exists to give (§G rule 2: bands must not
+reflow); clicking a tick scrolls + flashes the card border 250ms).
+
+Non-goals honored (spec): no fleet/Overview charts (V6 argued out — the
+bounded-tails contract forbids per-row series and triage rows answer with
+words; revisit only if a future Rust rollup carries a compact per-run series
+in `list --json`), no new CLI verb, no pan/zoom, no sheet-surface charts, no
+change to write flows or trust rules. **Cross-run navigation from graph
+nodes (D7) is a registered non-goal:** run/task/provider nodes carry facts
+only — this app drills one run; a cross-run jump would be a new navigation
+class (possible WAVE 3), not faked now.

@@ -602,6 +602,174 @@ final class JobDetailStoreTests: XCTestCase {
         store.close()
     }
 
+    // MARK: - K8: chart series + architecture graph
+
+    func testSpendSeriesAndDensitySurviveAcrossTicks() async throws {
+        try writeProjection()
+        try writeRunState()
+        let store = makeStore()
+        store.open()
+        try append("spend.jsonl", in: runRoot,
+                   #"{"timestamp": "2026-08-06T10:00:00Z", "turn": 1, "provider": "p", "model": "m", "input_tokens": 10, "output_tokens": 5, "cost_usd": 1.0, "total_cost_usd": 1.0, "cap_usd": 25.0, "kind": "loop"}"# + "\n")
+        try append("events.jsonl", in: runRoot,
+                   #"{"timestamp": "2026-08-06T10:00:01Z", "run_id": "run-new", "event": {"kind": "turn_started", "turn": 1}}"# + "\n")
+        await store.pollOnce()
+        XCTAssertEqual(store.spendSeries.points.count, 1)
+        XCTAssertEqual(store.density.eventCount, 1)
+
+        try append("spend.jsonl", in: runRoot,
+                   #"{"timestamp": "2026-08-06T10:01:00Z", "turn": 2, "provider": "p", "model": "m", "input_tokens": 10, "output_tokens": 5, "cost_usd": 2.0, "total_cost_usd": 3.0, "kind": "loop"}"# + "\n")
+        try append("spend.jsonl", in: runRoot,
+                   #"{"timestamp": "2026-08-06T10:01:05Z", "turn": 2, "provider": "p", "model": "m", "input_tokens": 4, "output_tokens": 2, "cost_usd": 0.05, "total_cost_usd": 0.05, "kind": "narrator"}"# + "\n")
+        try append("events.jsonl", in: runRoot,
+                   #"{"timestamp": "2026-08-06T10:01:02Z", "run_id": "run-new", "event": {"kind": "error", "turn": 2, "message": "boom"}}"# + "\n")
+        await store.pollOnce()
+        XCTAssertEqual(store.spendSeries.points.map(\.totalUSD), [1.0, 3.0],
+                       "the series folds incrementally across ticks; narrator rows never enter")
+        XCTAssertEqual(store.spendSeries.capUSD, 25.0)
+        XCTAssertEqual(store.density.eventCount, 2)
+        XCTAssertEqual(store.density.errorStamps.count, 1)
+        XCTAssertEqual(store.density.turnStamps.count, 1)
+        store.close()
+    }
+
+    func testChartSeriesResetPerAttempt() async throws {
+        try writeProjection(runIDs: ["run-old"])
+        let oldRoot = home.appendingPathComponent("runstate").appendingPathComponent(scope)
+            .appendingPathComponent("runs").appendingPathComponent("run-old")
+        try write("spend.jsonl", in: oldRoot,
+                  #"{"timestamp": "2026-08-06T09:00:00Z", "turn": 1, "provider": "p", "model": "m", "input_tokens": 1, "output_tokens": 1, "cost_usd": 1.0, "total_cost_usd": 1.0, "kind": "loop"}"# + "\n")
+        try write("events.jsonl", in: oldRoot,
+                  #"{"timestamp": "2026-08-06T09:00:00Z", "run_id": "run-old", "event": {"kind": "turn_started", "turn": 1}}"# + "\n")
+        let store = makeStore()
+        store.open()
+        await store.pollOnce()
+        XCTAssertEqual(store.spendSeries.points.count, 1)
+        XCTAssertEqual(store.density.eventCount, 1)
+
+        try writeProjection(runIDs: ["run-old", "run-new"], attemptCount: 2)
+        try writeRunState()
+        await store.pollOnce()
+        XCTAssertEqual(store.spendSeries.points.count, 0, "series are per attempt")
+        XCTAssertEqual(store.density.eventCount, 0)
+        store.close()
+    }
+
+    private var graphJSON: String {
+        """
+        {"version": 1, "graph_id": "arch-run", "scope": "run", "target_id": "\(runID)",
+         "generated_at": "2026-08-06T10:00:00Z",
+         "nodes": [{"id": "run:x", "label": "run x", "kind": "run", "status": "completed",
+                    "weight": 5, "evidence": [], "style_token": "success"}],
+         "edges": [], "groups": [],
+         "layout": {"kind": "layered-tree", "root_ids": ["run:x"], "warnings": []},
+         "legend": []}
+        """
+    }
+
+    func testArchGraphReadsRunScopeAndPlanScopeWins() async throws {
+        try writeProjection()
+        try writeRunState()
+        try write("narrative/architecture-graph.json", in: runRoot, graphJSON)
+        let store = makeStore()
+        store.open()
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-run")
+        XCTAssertNil(store.archGraphIssue)
+
+        // A plan-scope graph appears (driver job): it wins over run scope.
+        let planDir = home.appendingPathComponent("plans").appendingPathComponent(jobID)
+        try write("narrative/architecture-graph.json", in: planDir,
+                  graphJSON.replacingOccurrences(of: "arch-run", with: "arch-plan")
+                      .replacingOccurrences(of: "\"scope\": \"run\"", with: "\"scope\": \"plan\""))
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-plan", "the plan path is read first")
+        store.close()
+    }
+
+    func testArchGraphMtimeCacheSkipsUnchangedFiles() async throws {
+        try writeProjection()
+        try writeRunState()
+        let graphURL = runRoot.appendingPathComponent("narrative")
+            .appendingPathComponent("architecture-graph.json")
+        try write("narrative/architecture-graph.json", in: runRoot, graphJSON)
+        // A whole-second mtime survives the filesystem roundtrip exactly.
+        let mtime = Date(timeIntervalSince1970: 1_754_000_000)
+        try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: graphURL.path)
+        let store = makeStore()
+        store.open()
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-run")
+
+        // Rewrite the content but restore the mtime: an unchanged mtime on
+        // the same path must skip the read entirely (the checkpoints-cache
+        // pattern), so the old doc stays.
+        try write("narrative/architecture-graph.json", in: runRoot,
+                  graphJSON.replacingOccurrences(of: "arch-run", with: "arch-rewritten"))
+        try FileManager.default.setAttributes([.modificationDate: mtime], ofItemAtPath: graphURL.path)
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-run", "unchanged mtime skips the read")
+
+        // A moved mtime re-reads.
+        try FileManager.default.setAttributes(
+            [.modificationDate: mtime.addingTimeInterval(5)], ofItemAtPath: graphURL.path)
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-rewritten")
+        store.close()
+    }
+
+    func testCorruptArchGraphKeepsLastGoodDocAndSurfacesTheIssue() async throws {
+        try writeProjection()
+        try writeRunState()
+        try write("narrative/architecture-graph.json", in: runRoot, graphJSON)
+        let store = makeStore()
+        store.open()
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-run")
+
+        try write("narrative/architecture-graph.json", in: runRoot, "{ torn mid-write")
+        await store.pollOnce()
+        XCTAssertEqual(store.archGraph?.graphID, "arch-run",
+                       "the last good doc holds through a torn write")
+        XCTAssertNotNil(store.archGraphIssue, "the decode failure is surfaced verbatim")
+
+        try write("narrative/architecture-graph.json", in: runRoot, graphJSON)
+        await store.pollOnce()
+        XCTAssertNil(store.archGraphIssue, "a successful re-read clears the issue")
+        store.close()
+    }
+
+    func testArchGraphAbsentIsHonestSilence() async throws {
+        try writeProjection()
+        try writeRunState()
+        let store = makeStore()
+        store.open()
+        await store.pollOnce()
+        XCTAssertNil(store.archGraph)
+        XCTAssertNil(store.archGraphIssue, "no graph file -> silence, not a placeholder")
+        store.close()
+    }
+
+    func testActivityRawRetentionCeilingDropsOldestRaws() async throws {
+        try writeProjection()
+        try writeRunState()
+        let store = makeStore()
+        store.open()
+        var lines = ""
+        let total = JobDetailStore.rawInspectorCeiling + 50
+        for turn in 1...total {
+            lines += #"{"timestamp": "2026-08-06T10:00:00Z", "run_id": "run-new", "event": {"kind": "turn_started", "turn": \#(turn)}}"# + "\n"
+        }
+        try append("events.jsonl", in: runRoot, lines)
+        await store.pollOnce()
+        XCTAssertEqual(store.activity.count, total, "the parsed scrollback stays unbounded")
+        XCTAssertNil(store.activity.first?.raw, "the oldest entries lose only their raw copy")
+        XCTAssertNotNil(store.activity.last?.raw)
+        XCTAssertEqual(store.activity.filter { $0.raw != nil }.count,
+                       JobDetailStore.rawInspectorCeiling)
+        store.close()
+    }
+
     func testSupervisorTextIsBoundedWithTruncationHonesty() async throws {
         try writeProjection()
         let store = makeStore()

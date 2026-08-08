@@ -56,6 +56,16 @@ public final class JobDetailStore: ObservableObject {
     /// A turns fold larger than this (first open of a long history) runs off
     /// the main actor so the workbench does not stall.
     static let mainThreadFoldLimit = 1_500
+    /// The newest this-many Activity entries keep their verbatim raw line
+    /// for the inline raw-record inspector (VIZ-DRILLDOWN-SPEC K10); older
+    /// entries' raw drops to nil and the drill names events.jsonl on disk.
+    /// The parsed scrollback itself stays unbounded — this ceiling bounds
+    /// only duplicated raw bytes.
+    public static let rawInspectorCeiling = 4_000
+    /// The newest this-many trace entries keep their verbatim ledger line
+    /// for the tool-I/O drill (trace lines are large — ~11 KB each — but
+    /// arrive ~2/turn; 1,000 covers a 500-turn run at ~11 MB worst case).
+    public static let traceRawCeiling = 1_000
 
     // MARK: Read-model surface
 
@@ -63,6 +73,9 @@ public final class JobDetailStore: ObservableObject {
         public let ordinal: Int
         public let timestamp: Date?
         public let line: String
+        /// The verbatim events.jsonl line, retained for the newest
+        /// `rawInspectorCeiling` entries (K10); nil past the ceiling.
+        public internal(set) var raw: String?
         public var id: Int { ordinal }
     }
 
@@ -129,6 +142,16 @@ public final class JobDetailStore: ObservableObject {
     @Published public private(set) var flightIssue: String?
     @Published public private(set) var turns: [TurnModel] = []
     @Published public private(set) var spendMeter = SpendMeter()
+    /// K1: the burn-strip series (loop rows only, folded off-main).
+    @Published public private(set) var spendSeries = SpendSeries()
+    /// K2: the Activity density series (event stamps, folded off-main).
+    @Published public private(set) var density = DensitySeries()
+    /// K7/K8: the narrative architecture graph — plan-scope
+    /// (`plans/<jobID>/…`) preferred over run-scope; mtime-cached read.
+    @Published public private(set) var archGraph: ArchitectureGraphDoc?
+    /// Set when a graph file exists but did not decode this poll; the last
+    /// good doc is KEPT (the projection.json pattern).
+    @Published public private(set) var archGraphIssue: String?
     @Published public private(set) var flight = FlightState()
     @Published public private(set) var narrative = NarrativePane()
     @Published public private(set) var liveChecks: [AcceptanceProgressRow] = []
@@ -192,8 +215,17 @@ public final class JobDetailStore: ObservableObject {
     // ledger rows queue here and fold into the persistent turns accumulator;
     // the newest event timestamp and error message are running values.
     private var pendingTurnEvents: [RunEventRecord] = []
-    private var pendingTurnTraces: [TraceRow] = []
-    private var turnsAccumulator = TurnsDerivation.Accumulator()
+    private var pendingTurnTraces: [(row: TraceRow, raw: String?)] = []
+    private var turnsAccumulator = TurnsDerivation.Accumulator(
+        traceRawCeiling: JobDetailStore.traceRawCeiling)
+    /// K2 fold state; the fold itself runs in the stage-2 detached hop.
+    private var densityAccumulator = DensitySeries.Accumulator()
+    /// Index below which Activity entries have already had raw trimmed
+    /// (K10): the trim walk never rescans the unbounded scrollback.
+    private var activityRawTrimIndex = 0
+    /// Mtime cache for the architecture-graph read (the checkpoints-cache
+    /// pattern): an unchanged mtime on the same path skips the read.
+    private var archGraphCache: (path: String, mtime: Date)?
     private var lastEventTimestamp: Date?
     private var newestErrorMessage: String?
     private var steerInboxCache: (size: UInt64, count: Int)?
@@ -273,7 +305,14 @@ public final class JobDetailStore: ObservableObject {
         launchPlanCeilings = nil
         pendingTurnEvents = []
         pendingTurnTraces = []
-        turnsAccumulator = TurnsDerivation.Accumulator()
+        turnsAccumulator = TurnsDerivation.Accumulator(traceRawCeiling: Self.traceRawCeiling)
+        densityAccumulator = DensitySeries.Accumulator()
+        spendSeries = SpendSeries()
+        density = DensitySeries()
+        archGraph = nil
+        archGraphIssue = nil
+        archGraphCache = nil
+        activityRawTrimIndex = 0
         lastEventTimestamp = nil
         newestErrorMessage = nil
         steerInboxCache = nil
@@ -390,7 +429,10 @@ public final class JobDetailStore: ObservableObject {
         // Fresh attempt, fresh scrollback: the ledgers are per run.
         pendingTurnEvents = []
         pendingTurnTraces = []
-        turnsAccumulator = TurnsDerivation.Accumulator()
+        turnsAccumulator = TurnsDerivation.Accumulator(traceRawCeiling: Self.traceRawCeiling)
+        densityAccumulator = DensitySeries.Accumulator()
+        activityRawTrimIndex = 0
+        archGraphCache = nil
         lastEventTimestamp = nil
         newestErrorMessage = nil
         steerInboxCache = nil
@@ -404,6 +446,10 @@ public final class JobDetailStore: ObservableObject {
         flightIssue = nil
         turns = []
         spendMeter = SpendMeter()
+        spendSeries = SpendSeries()
+        density = DensitySeries()
+        archGraph = nil
+        archGraphIssue = nil
         flight = FlightState()
         narrative = NarrativePane()
         liveChecks = []
@@ -458,10 +504,15 @@ public final class JobDetailStore: ObservableObject {
     private func gatherTickReads() async -> DetailTickReads {
         let root = runRoot
         let runID = currentRunID
+        let home = self.home
+        let jobID = self.jobID
         let needsLaunchPlan = runID != nil && launchPlanCeilings?.runID != runID
         let priorLaunchPlan = launchPlanCeilings
         let priorCheckpointsCache = checkpointsCache
         let priorSteerCache = steerInboxCache
+        let priorArchGraphCache = archGraphCache
+        let priorSpendSeries = spendSeries
+        let priorDensityAccumulator = densityAccumulator
         let jobEventsTailer = self.jobEventsTailer
         let eventsTailer = self.eventsTailer
         let tracesTailer = self.tracesTailer
@@ -517,6 +568,25 @@ public final class JobDetailStore: ObservableObject {
             }
             reads.supervisorOut = supervisorOutTailer?.poll()
             reads.supervisorErr = supervisorErrTailer?.poll()
+            // Chart-series folds ride the same off-main hop (K8): only the
+            // @Published assignment happens back on the main actor.
+            if let spend = reads.spend, !spend.records.isEmpty {
+                var series = priorSpendSeries
+                series.fold(spend.records)
+                reads.spendSeriesUpdate = series
+            }
+            if let events = reads.events {
+                let pairs = events.rows.compactMap { row in
+                    row.record.map { (timestamp: $0.timestamp, kind: $0.event.kind) }
+                }
+                if !pairs.isEmpty {
+                    var accumulator = priorDensityAccumulator
+                    let series = accumulator.fold(pairs)
+                    reads.densityUpdate = (accumulator: accumulator, series: series)
+                }
+            }
+            reads.archGraph = Self.readArchGraph(
+                home: home, jobID: jobID, runRoot: root, cache: priorArchGraphCache)
             return reads
         }.value
     }
@@ -551,6 +621,27 @@ public final class JobDetailStore: ObservableObject {
         if let events = reads.events { applyEvents(events) }
         if let traces = reads.traces { applyTraces(traces) }
         if let spend = reads.spend { applySpend(spend) }
+        if let series = reads.spendSeriesUpdate { spendSeries = series }
+        if let densityUpdate = reads.densityUpdate {
+            densityAccumulator = densityUpdate.accumulator
+            density = densityUpdate.series
+        }
+        switch reads.archGraph {
+        case .unchanged:
+            break
+        case .absent:
+            // Honest absence: no MAP section (silence, not placeholder).
+            archGraph = nil
+            archGraphIssue = nil
+            archGraphCache = nil
+        case .value(let doc, let cache):
+            archGraph = doc
+            archGraphIssue = nil
+            archGraphCache = cache
+        case .unreadable(let reason):
+            // Keep the last good doc; say why (the projection.json pattern).
+            archGraphIssue = reason
+        }
         if let flightEvents = reads.flightEvents { applyFlightEvents(flightEvents) }
         if let snapshots = reads.snapshots { applySnapshots(snapshots) }
         if let progress = reads.progress { applyProgress(progress) }
@@ -579,14 +670,17 @@ public final class JobDetailStore: ObservableObject {
                         preview: record.event.preview))
                 }
                 activity.append(ActivityEntry(
-                    ordinal: ordinal, timestamp: record.timestamp, line: record.activityLine))
+                    ordinal: ordinal, timestamp: record.timestamp,
+                    line: record.activityLine, raw: row.line))
             } else {
                 // A schema-conformant ledger line we cannot model yet:
                 // show the raw fact rather than dropping or guessing.
-                activity.append(ActivityEntry(ordinal: ordinal, timestamp: nil, line: row.line))
+                activity.append(ActivityEntry(
+                    ordinal: ordinal, timestamp: nil, line: row.line, raw: row.line))
             }
         }
         trimRawEventLines()
+        trimActivityRaws()
     }
 
     private func trimRawEventLines() {
@@ -596,9 +690,18 @@ public final class JobDetailStore: ObservableObject {
         rawEventsDropped += overflow
     }
 
+    /// K10: only the newest `rawInspectorCeiling` entries keep their raw
+    /// copy; the walk starts where the last trim stopped (never a rescan).
+    private func trimActivityRaws() {
+        while activity.count - activityRawTrimIndex > Self.rawInspectorCeiling {
+            activity[activityRawTrimIndex].raw = nil
+            activityRawTrimIndex += 1
+        }
+    }
+
     private func applyTraces(_ payload: DetailTracesPayload) {
         if let corrupt = payload.corrupt { tracesIssue = corrupt }
-        pendingTurnTraces.append(contentsOf: payload.rows)
+        pendingTurnTraces.append(contentsOf: payload.rows.map { ($0.row, $0.raw) })
     }
 
     private func applySpend(_ payload: DetailSpendPayload) {
@@ -731,9 +834,12 @@ public final class JobDetailStore: ObservableObject {
             return DetailTracesPayload(corrupt: reason, rows: [])
         case .lines(let lines):
             let decoder = DeadreckonJSON.decoder()
-            let rows = lines.compactMap { line -> TraceRow? in
-                guard let data = line.data(using: .utf8) else { return nil }
-                return try? decoder.decode(TraceRow.self, from: data)
+            let rows = lines.compactMap { line -> DetailTracesPayload.Row? in
+                guard let data = line.data(using: .utf8),
+                      let row = try? decoder.decode(TraceRow.self, from: data) else { return nil }
+                // The source line rides along so trace entries can retain
+                // their verbatim ledger line for the tool-I/O drill (K10).
+                return DetailTracesPayload.Row(row: row, raw: line)
             }
             return DetailTracesPayload(corrupt: nil, rows: rows)
         }
@@ -851,6 +957,44 @@ public final class JobDetailStore: ObservableObject {
             return (values, (mtime, values))
         }
         return (values, nil)
+    }
+
+    /// K8: the architecture-graph read. Plan scope
+    /// (`plans/<jobID>/narrative/architecture-graph.json`, driver jobs)
+    /// wins over run scope (`<runRoot>/narrative/architecture-graph.json`);
+    /// an unchanged mtime on the same path skips the read entirely.
+    nonisolated private static func readArchGraph(
+        home: URL, jobID: String, runRoot: URL?,
+        cache: (path: String, mtime: Date)?
+    ) -> DetailTickReads.GraphRead {
+        let planURL = home.appendingPathComponent("plans")
+            .appendingPathComponent(jobID)
+            .appendingPathComponent("narrative")
+            .appendingPathComponent("architecture-graph.json")
+        var candidates = [planURL]
+        if let runRoot {
+            candidates.append(runRoot.appendingPathComponent("narrative")
+                .appendingPathComponent("architecture-graph.json"))
+        }
+        for url in candidates {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+                continue
+            }
+            let mtime = attributes[.modificationDate] as? Date
+            if let cache, let mtime, cache.path == url.path, cache.mtime == mtime {
+                return .unchanged
+            }
+            guard let data = try? Data(contentsOf: url) else {
+                return .unreadable("architecture-graph.json exists but could not be read this poll")
+            }
+            do {
+                let doc = try DeadreckonJSON.decoder().decode(ArchitectureGraphDoc.self, from: data)
+                return .value(doc, cache: mtime.map { (url.path, $0) })
+            } catch {
+                return .unreadable("architecture-graph.json did not decode: \(error.localizedDescription)")
+            }
+        }
+        return .absent
     }
 
     nonisolated private static func listDocs(workingDir: String?) -> [DocEntry] {
@@ -1152,6 +1296,14 @@ private enum JSONReadOutcome<T> {
 
 /// One stage-2 hop's gathered values (see JobDetailStore.gatherTickReads).
 private struct DetailTickReads {
+    /// Architecture-graph read outcome (K8): unchanged = mtime cache hit.
+    enum GraphRead {
+        case unchanged
+        case absent
+        case value(ArchitectureGraphDoc, cache: (path: String, mtime: Date)?)
+        case unreadable(String)
+    }
+
     var hasRunRoot = false
     var runState: RunStateDoc?
     var launchPlanCeilings: (runID: String, spendUSD: Double?, wallSeconds: Double?)?
@@ -1167,6 +1319,9 @@ private struct DetailTickReads {
     var events: DetailEventsPayload?
     var traces: DetailTracesPayload?
     var spend: DetailSpendPayload?
+    var spendSeriesUpdate: SpendSeries?
+    var densityUpdate: (accumulator: DensitySeries.Accumulator, series: DensitySeries)?
+    var archGraph: GraphRead = .unchanged
     var flightEvents: DetailFlightPayload?
     var snapshots: DetailSnapshotsPayload?
     var progress: DetailProgressPayload?
@@ -1187,8 +1342,15 @@ private struct DetailEventsPayload {
 }
 
 private struct DetailTracesPayload {
+    struct Row {
+        let row: TraceRow
+        /// The verbatim source line (rides into the turns accumulator for
+        /// the K10 trace-raw retention).
+        let raw: String?
+    }
+
     var corrupt: String?
-    var rows: [TraceRow] = []
+    var rows: [Row] = []
 }
 
 private struct DetailSpendPayload {
