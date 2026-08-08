@@ -6,6 +6,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 const OFFICIAL_REPO = "gregce/deadreckon";
+const MACOS_APP_TARGET = "universal-apple-darwin-app";
+const MACOS_APP_ARCHIVE = "deadreckon-mac.zip";
+const MACOS_APP_TRUST_STATUS = "macos-universal-apple-darwin-app.json";
+const MACOS_APP_MEMBERS = {
+  deadreckon_arm64: "deadreckon.app/Contents/Resources/bin/deadreckon_darwin_arm64",
+  dr_gate_arm64: "deadreckon.app/Contents/Resources/bin/dr-gate",
+  deadreckon_x86_64: "deadreckon.app/Contents/Resources/bin/deadreckon_darwin_x86_64",
+  dr_gate_x86_64: "deadreckon.app/Contents/Resources/libexec/deadreckon/dr-gate",
+};
+const MAX_ARCHIVE_MEMBER_BYTES = 128 * 1024 * 1024;
 const TARGETS = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
@@ -394,6 +404,7 @@ function preflight(localArgs = args) {
 }
 
 function writeSbom(localArgs = args) {
+  const dir = required(localArgs.dir, "--dir");
   const out = required(localArgs.out, "--out");
   const metadata = cargoMetadata();
   const created = new Date().toISOString();
@@ -407,6 +418,32 @@ function writeSbom(localArgs = args) {
     licenseDeclared: pkg.license ?? "NOASSERTION",
     copyrightText: "NOASSERTION",
   }));
+  const files = releaseFiles(dir, { includeChecksums: false, includeManifest: false }).map(
+    (entry, index) => ({
+      fileName: entry.name,
+      SPDXID: `SPDXRef-ReleaseArtifact-${index + 1}-${safeId(entry.name)}`,
+      checksums: [
+        {
+          algorithm: "SHA256",
+          checksumValue: sha256(path.join(dir, entry.relative)),
+        },
+      ],
+      licenseConcluded: "NOASSERTION",
+      copyrightText: "NOASSERTION",
+    }),
+  );
+  const relationships = [
+    ...packages.map((pkg) => ({
+      spdxElementId: "SPDXRef-DOCUMENT",
+      relationshipType: "DESCRIBES",
+      relatedSpdxElement: pkg.SPDXID,
+    })),
+    ...files.map((file) => ({
+      spdxElementId: "SPDXRef-DOCUMENT",
+      relationshipType: "DESCRIBES",
+      relatedSpdxElement: file.SPDXID,
+    })),
+  ];
   fs.writeFileSync(
     out,
     `${JSON.stringify(
@@ -421,6 +458,8 @@ function writeSbom(localArgs = args) {
           creators: ["Tool: deadreckon-release-trust"],
         },
         packages,
+        files,
+        relationships,
       },
       null,
       2,
@@ -471,6 +510,7 @@ function writeManifest(localArgs = args) {
         },
         policies: {
           macos_signing_required: lane.requires_macos_signing,
+          macos_app_required: lane.requires_macos_signing,
           windows_signing_required: lane.requires_windows_signing,
           attestation_required: lane.requires_attestation,
         },
@@ -542,11 +582,12 @@ function verifyManifest(localArgs = args) {
       throw new Error(`trust status for target ${target} is not checksummed`);
     }
   }
-  verifyArtifactTrustStatus(manifest, trust);
+  verifyArtifactTrustStatus(manifest, trust, dir, relativeByName);
   writeJson({ ok: true, artifacts: manifest.artifacts.length });
 }
 
-function verifyArtifactTrustStatus(manifest, trust) {
+function verifyArtifactTrustStatus(manifest, trust, dir, relativeByName) {
+  let macosAppSeen = false;
   for (const artifact of manifest.artifacts) {
     const target = releaseTargetForName(artifact.name);
     if (artifact.target !== target) {
@@ -557,9 +598,13 @@ function verifyArtifactTrustStatus(manifest, trust) {
     if (target === null) {
       continue;
     }
+    if (target === MACOS_APP_TARGET) {
+      macosAppSeen = true;
+    }
     const targetTrust = trust.get(target) ?? null;
+    const macosTarget = target.endsWith("apple-darwin") || target === MACOS_APP_TARGET;
     const signingRequired =
-      (target.endsWith("apple-darwin") && manifest.policies?.macos_signing_required === true) ||
+      (macosTarget && manifest.policies?.macos_signing_required === true) ||
       (target.endsWith("windows-msvc") && manifest.policies?.windows_signing_required === true);
     if (signingRequired && targetTrust === null) {
       throw new Error(
@@ -577,7 +622,7 @@ function verifyArtifactTrustStatus(manifest, trust) {
           `release signing policy for target ${target} requires trust field signed=true`,
         );
       }
-      if (target.endsWith("apple-darwin") && expected.notarized !== true) {
+      if (macosTarget && expected.notarized !== true) {
         throw new Error(
           `release signing policy for target ${target} requires trust field notarized=true`,
         );
@@ -595,7 +640,228 @@ function verifyArtifactTrustStatus(manifest, trust) {
         );
       }
     }
+    if (target === MACOS_APP_TARGET) {
+      const appExpected = {
+        stapled: Boolean(targetTrust?.stapled),
+        release_version: targetTrust?.release_version ?? null,
+        app_version: targetTrust?.app_version ?? null,
+      };
+      if (signingRequired && appExpected.stapled !== true) {
+        throw new Error(
+          `release signing policy for target ${target} requires trust field stapled=true`,
+        );
+      }
+      if (appExpected.release_version !== manifest.version) {
+        throw new Error(
+          `macOS app trust proves release ${displayValue(appExpected.release_version)}, expected ${displayValue(manifest.version)}`,
+        );
+      }
+      if (targetTrust?.source_commit !== manifest.commit) {
+        throw new Error(
+          `macOS app trust proves commit ${displayValue(targetTrust?.source_commit)}, expected ${displayValue(manifest.commit)}`,
+        );
+      }
+      for (const [field, value] of Object.entries(appExpected)) {
+        if (artifact[field] !== value) {
+          throw new Error(
+            `release-manifest trust mismatch for target ${target}, artifact ${artifact.name}, field ${field}: manifest ${displayValue(artifact[field])}, checksummed trust ${displayValue(value)}`,
+          );
+        }
+      }
+      const relative = relativeByName.get(artifact.name);
+      if (relative === undefined) {
+        throw new Error(`macOS app artifact ${artifact.name} has no release file`);
+      }
+      verifyMacosAppArchive(path.join(dir, relative), targetTrust, dir, relativeByName);
+    }
   }
+  if (manifest.policies?.macos_app_required === true && !macosAppSeen) {
+    throw new Error(`official release is missing required ${MACOS_APP_ARCHIVE}`);
+  }
+}
+
+function verifyMacosAppArchive(archive, trust, dir, relativeByName) {
+  if (trust?.target !== MACOS_APP_TARGET || trust?.artifact !== MACOS_APP_ARCHIVE) {
+    throw new Error("macOS app trust status does not name the official app artifact");
+  }
+  const archiveDigest = sha256(archive);
+  if (trust.archive_sha256 !== archiveDigest) {
+    throw new Error(
+      `macOS app trust archive sha256 ${displayValue(trust.archive_sha256)} does not match ${archiveDigest}`,
+    );
+  }
+  const archiveBytes = fs.statSync(archive).size;
+  if (trust.archive_bytes !== archiveBytes) {
+    throw new Error(
+      `macOS app trust archive bytes ${displayValue(trust.archive_bytes)} does not match ${archiveBytes}`,
+    );
+  }
+  if (
+    JSON.stringify([...(trust.architectures ?? [])].sort()) !==
+    JSON.stringify(["arm64", "x86_64"])
+  ) {
+    throw new Error("macOS app trust must prove exactly arm64 and x86_64 architectures");
+  }
+  if (trust.bundle_identifier !== "com.itavero.deadreckon") {
+    throw new Error("macOS app trust has the wrong bundle identifier");
+  }
+  if (!/^\d+\.\d+\.\d+$/.test(trust.app_version ?? "")) {
+    throw new Error("macOS app trust has no valid app version");
+  }
+  if (trust.app_version !== trust.release_version?.split("-rc.")[0]) {
+    throw new Error("macOS app marketing version does not match its release version");
+  }
+
+  extractUniqueZipMember(archive, "deadreckon.app/Contents/MacOS/deadreckon");
+  extractUniqueZipMember(archive, "deadreckon.app/Contents/Info.plist");
+
+  const resourceManifest = JSON.parse(
+    extractUniqueZipMember(
+      archive,
+      "deadreckon.app/Contents/Resources/bin/manifest.json",
+    ).toString("utf8"),
+  );
+  if (
+    resourceManifest.schemaVersion !== 1 ||
+    resourceManifest.complete !== true ||
+    resourceManifest.signed !== true ||
+    resourceManifest.sourceDirty !== false
+  ) {
+    throw new Error("packaged macOS app resource manifest is not release eligible");
+  }
+  if (
+    resourceManifest.releaseVersion !== trust.release_version ||
+    resourceManifest.cliVersion !== trust.release_version ||
+    resourceManifest.gitCommit !== trust.source_commit
+  ) {
+    throw new Error("packaged macOS app resource manifest disagrees with app trust evidence");
+  }
+
+  const expectedKeys = Object.keys(MACOS_APP_MEMBERS).sort();
+  if (JSON.stringify(Object.keys(trust.embedded_binaries ?? {}).sort()) !== JSON.stringify(expectedKeys)) {
+    throw new Error("macOS app trust must pin every embedded CLI and dr-gate binary");
+  }
+  const expectedArchitectures = ["arm64", "x86_64"];
+  for (const field of ["sha256", "gateSha256", "sourceArchives"]) {
+    if (
+      JSON.stringify(Object.keys(resourceManifest[field] ?? {}).sort()) !==
+      JSON.stringify(expectedArchitectures)
+    ) {
+      throw new Error(`packaged macOS app manifest ${field} must cover exactly arm64 and x86_64`);
+    }
+  }
+  for (const [name, member] of Object.entries(MACOS_APP_MEMBERS)) {
+    const bytes = extractUniqueZipMember(archive, member);
+    const digest = sha256Bytes(bytes);
+    if (trust.embedded_binaries[name] !== digest) {
+      throw new Error(`macOS app trust sha256 for ${name} does not match the packaged bytes`);
+    }
+  }
+
+  const sources = {
+    arm64: {
+      archive: "deadreckon-aarch64-apple-darwin.tar.xz",
+      target: "aarch64-apple-darwin",
+      cli: MACOS_APP_MEMBERS.deadreckon_arm64,
+      gate: MACOS_APP_MEMBERS.dr_gate_arm64,
+    },
+    x86_64: {
+      archive: "deadreckon-x86_64-apple-darwin.tar.xz",
+      target: "x86_64-apple-darwin",
+      cli: MACOS_APP_MEMBERS.deadreckon_x86_64,
+      gate: MACOS_APP_MEMBERS.dr_gate_x86_64,
+    },
+  };
+  for (const [arch, source] of Object.entries(sources)) {
+    const recorded = resourceManifest.sourceArchives?.[arch];
+    if (recorded?.name !== source.archive || !/^[a-f0-9]{64}$/.test(recorded?.sha256 ?? "")) {
+      throw new Error(`packaged macOS app has no valid ${arch} source archive proof`);
+    }
+    const relative = relativeByName.get(source.archive);
+    if (relative === undefined) {
+      throw new Error(`macOS app source archive ${source.archive} is missing from the release`);
+    }
+    const sourceArchive = path.join(dir, relative);
+    if (sha256(sourceArchive) !== recorded.sha256) {
+      throw new Error(`macOS app source archive proof for ${arch} does not match the release archive`);
+    }
+    const payload = `deadreckon-${source.target}`;
+    const sourceCli = extractUniqueTarMember(sourceArchive, `${payload}/deadreckon`);
+    const sourceGate = extractUniqueTarMember(sourceArchive, `${payload}/dr-gate`);
+    const packagedCliDigest = sha256Bytes(extractUniqueZipMember(archive, source.cli));
+    const packagedGateDigest = sha256Bytes(extractUniqueZipMember(archive, source.gate));
+    if (resourceManifest.sha256[arch] !== packagedCliDigest) {
+      throw new Error(`packaged macOS app manifest has the wrong ${arch} CLI sha256`);
+    }
+    if (resourceManifest.gateSha256[arch] !== packagedGateDigest) {
+      throw new Error(`packaged macOS app manifest has the wrong ${arch} dr-gate sha256`);
+    }
+    if (sha256Bytes(sourceCli) !== packagedCliDigest) {
+      throw new Error(`packaged macOS app ${arch} CLI differs from the signed release archive`);
+    }
+    if (sha256Bytes(sourceGate) !== packagedGateDigest) {
+      throw new Error(`packaged macOS app ${arch} dr-gate differs from the signed release archive`);
+    }
+  }
+}
+
+function extractUniqueZipMember(archive, member) {
+  const members = archiveText("unzip", ["-Z1", archive], archive)
+    .split(/\r?\n/)
+    .filter(Boolean);
+  assertSafeArchiveMembers(archive, members);
+  if (members.filter((entry) => entry === member).length !== 1) {
+    throw new Error(`${path.basename(archive)} must contain exactly one ${member}`);
+  }
+  return archiveBytes("unzip", ["-p", archive, member], archive);
+}
+
+function extractUniqueTarMember(archive, member) {
+  const members = archiveText("tar", ["-tf", archive], archive)
+    .split(/\r?\n/)
+    .filter(Boolean);
+  assertSafeArchiveMembers(archive, members);
+  if (members.filter((entry) => entry === member).length !== 1) {
+    throw new Error(`${path.basename(archive)} must contain exactly one ${member}`);
+  }
+  return archiveBytes("tar", ["-xOf", archive, member], archive);
+}
+
+function assertSafeArchiveMembers(archive, members) {
+  for (const member of members) {
+    const normalized = member.replaceAll("\\", "/");
+    if (normalized.startsWith("/") || normalized.split("/").includes("..")) {
+      throw new Error(`${path.basename(archive)} contains unsafe member ${member}`);
+    }
+  }
+}
+
+function archiveText(commandName, values, archive) {
+  const output = spawnSync(commandName, values, {
+    encoding: "utf8",
+    maxBuffer: MAX_ARCHIVE_MEMBER_BYTES,
+  });
+  if (output.status !== 0) {
+    throw new Error(`${commandName} failed for ${path.basename(archive)}: ${output.stderr}`);
+  }
+  return output.stdout;
+}
+
+function archiveBytes(commandName, values, archive) {
+  const output = spawnSync(commandName, values, {
+    encoding: null,
+    maxBuffer: MAX_ARCHIVE_MEMBER_BYTES,
+  });
+  if (output.status !== 0) {
+    throw new Error(
+      `${commandName} failed for ${path.basename(archive)}: ${Buffer.from(output.stderr ?? []).toString("utf8")}`,
+    );
+  }
+  return Buffer.from(output.stdout);
+}
+
+function sha256Bytes(bytes) {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 function displayValue(value) {
@@ -693,12 +959,16 @@ function artifactRecord(dir, entry, lane, trust) {
     signed: Boolean(targetTrust?.signed),
     signature_kind: targetTrust?.signature_kind ?? null,
     notarized: Boolean(targetTrust?.notarized),
+    stapled: target === MACOS_APP_TARGET ? Boolean(targetTrust?.stapled) : false,
+    release_version: target === MACOS_APP_TARGET ? targetTrust?.release_version ?? null : null,
+    app_version: target === MACOS_APP_TARGET ? targetTrust?.app_version ?? null : null,
     attested: lane.requires_attestation,
     sbom: entry.name.endsWith(".spdx.json") ? entry.name : null,
   };
 }
 
 function releaseTargetForName(name) {
+  if (name === MACOS_APP_ARCHIVE) return MACOS_APP_TARGET;
   return TARGETS.find((candidate) => name.includes(candidate)) ?? null;
 }
 
@@ -706,6 +976,7 @@ function artifactKind(file) {
   if (file === "SHA256SUMS" || file.endsWith("/SHA256SUMS")) return "checksums";
   if (file.endsWith(".spdx.json")) return "sbom";
   if (isTrustStatusAsset(path.basename(file), file)) return "trust-status";
+  if (path.basename(file) === MACOS_APP_ARCHIVE) return "macos-app";
   if (file.endsWith(".rb")) return "homebrew-formula";
   if (file.endsWith(".sh") || file.endsWith(".ps1")) return "installer";
   if (file.endsWith(".zip") || file.endsWith(".tar.xz") || file.endsWith(".tar.gz") || file.endsWith(".tgz")) {
@@ -751,6 +1022,7 @@ function readTrustStatus(dir) {
 }
 
 function trustStatusTargetFromName(name) {
+  if (name === MACOS_APP_TRUST_STATUS) return MACOS_APP_TARGET;
   for (const target of TARGETS) {
     if (name === `macos-${target}.json` || name === `windows-${target}.json`) {
       return target;

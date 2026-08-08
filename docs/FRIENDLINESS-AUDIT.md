@@ -69,12 +69,6 @@ verb.
 | `start` | One-command rollback | pass | Launched worktree runs point at cleanup/abandon paths. |
 | `start` | One verdict + ONE primary action | pass | Start preview and lifecycle launch surfaces use VerdictSurface; JSON goldens assert `primary_action` parity. |
 | `start` | Lifecycle hint | pass | Successful launches print attach/status/kill/finish commands. |
-| `supervisor` | Auto-detect, don't ask | pass | The command detects the supported per-user service manager, current binary, state home, and existing managed definition. |
-| `supervisor` | Preview before mutate | fail | `install`, `start`, and `stop` are explicit operator actions, but there is no dry-run rendering or confirmation path yet. |
-| `supervisor` | Refuse with try: | fail | Common stale and missing-unit errors name recovery commands, but not every platform and service-manager failure uses the canonical `try:` surface. |
-| `supervisor` | One-command rollback | fail | `stop` reverses activation but retains the managed definition; this slice has no uninstall or restore-previous-definition command. |
-| `supervisor` | One verdict + ONE primary action | pass | Each lifecycle command reports one service state and one next command without presenting competing recommendations. |
-| `supervisor` | Lifecycle hint | pass | Install points to start, status points to install when absent, and stop explains how to restart. |
 | `run` | Auto-detect, don't ask | pass | Defaults resolve provider, source mode, and done criteria without prompts when explicit. |
 | `run` | Preview before mutate | pass | Worktree/in-place/high-spend paths preview or require confirmation. |
 | `run` | Refuse with try: | pass | Common provider/source/safety refusals end with `try:` guidance. |
@@ -117,6 +111,12 @@ verb.
 | `merge` | One-command rollback | pass | Promotion results are library entries until explicitly applied/exported. |
 | `merge` | One verdict + ONE primary action | pass | Merge completion, conflict, repair, and invalid-option paths render one primary action. |
 | `merge` | Lifecycle hint | pass | Output points at finish/apply/export. |
+| `salvage` | Auto-detect, don't ask | pass | A Job prefix resolves through the shared reference layer; the command derives its frozen Plan, candidate, ledger, receipts, and acceptance contract without prompts. |
+| `salvage` | Preview before mutate | pass | `--dry-run` validates the complete evidence chain and reports the candidate revision and tree before any output directory is created. |
+| `salvage` | Refuse with try: | pass | Wrong-kind, active, successful, incomplete, changed-evidence, and existing-output refusals name a concrete inspection or retry command. |
+| `salvage` | One-command rollback | pass | Recovery publishes only to a new isolated directory and leaves the failed Job untouched, so removing that one output directory fully reverses the export. |
+| `salvage` | One verdict + ONE primary action | pass | Human and JSON reports expose one status and one `next_action`: export after a dry-run, then acceptance-check after export. |
+| `salvage` | Lifecycle hint | pass | A successful export is explicitly `exported_unverified` and points to the frozen acceptance check needed before use. |
 | `chain` | Auto-detect, don't ask | pass | Course closed this: the effortless path auto-detects continuation (verified same-task history resolves to a follow-up run with zero questions); explicit `chain` step lists are operator-authored input, not an ask. |
 | `chain` | Preview before mutate | pass | Plan/run/apply modes preview or confirm state changes. |
 | `chain` | Refuse with try: | pass | Chain refusals include scoped recovery commands. |

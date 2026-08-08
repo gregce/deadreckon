@@ -261,7 +261,10 @@ fn release_workflow_restores_artifacts_at_their_recorded_repository_paths() {
     let local_downloads = workflow
         .split("uses: actions/download-artifact@v4")
         .skip(1)
-        .filter(|step| step.contains("pattern: dist-local-*"))
+        .filter(|step| {
+            step.lines()
+                .any(|line| line.trim() == "pattern: dist-local-*")
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         2,
@@ -1098,6 +1101,7 @@ fn release_manifest_covers_artifacts_and_checksums() {
         r#"{"target":"aarch64-apple-darwin","signed":true,"signature_kind":"Developer ID Application","notarized":true}"#,
     )
     .expect("mac trust");
+    write_fake_macos_app_release(&distrib, "1.2.3-rc.1", &"a".repeat(40));
 
     assert_release_trust_success([
         "sbom",
@@ -1125,7 +1129,7 @@ fn release_manifest_covers_artifacts_and_checksums() {
         "--repo",
         "gregce/deadreckon",
         "--commit",
-        "abc123",
+        &"a".repeat(40),
         "--out",
         distrib
             .join("release-manifest.json")
@@ -1193,6 +1197,24 @@ fn release_manifest_covers_artifacts_and_checksums() {
         }),
         "{manifest:#?}"
     );
+    let app = artifacts
+        .iter()
+        .find(|artifact| artifact["name"] == "deadreckon-mac.zip")
+        .expect("macOS app artifact");
+    assert_eq!(Some("macos-app"), app["kind"].as_str());
+    assert_eq!(Some("universal-apple-darwin-app"), app["target"].as_str());
+    assert_eq!(Some(true), app["signed"].as_bool());
+    assert_eq!(Some(true), app["notarized"].as_bool());
+    assert_eq!(Some(true), app["stapled"].as_bool());
+    let sbom = read_json(&distrib.join("release.spdx.json"));
+    assert!(
+        sbom["files"]
+            .as_array()
+            .expect("SBOM files")
+            .iter()
+            .any(|file| file["fileName"] == "deadreckon-mac.zip"),
+        "{sbom:#?}"
+    );
 }
 
 #[test]
@@ -1239,6 +1261,7 @@ fn nested_ci_trust_status_survives_flat_public_verification() {
     let duplicate_trust = distrib.join("dist-global/target/distrib/trust");
     fs::create_dir_all(&duplicate_trust).expect("duplicate trust directory");
     fs::write(duplicate_trust.join(trust_name), trust).expect("identical duplicate trust status");
+    write_fake_macos_app_release(&distrib, "0.8.0", &"a".repeat(40));
 
     assert_release_trust_success([
         "checksums",
@@ -1256,7 +1279,7 @@ fn nested_ci_trust_status_survives_flat_public_verification() {
         "--repo",
         "gregce/deadreckon",
         "--commit",
-        "abc123",
+        &"a".repeat(40),
         "--out",
         distrib
             .join("release-manifest.json")
@@ -1301,6 +1324,15 @@ fn nested_ci_trust_status_survives_flat_public_verification() {
         public.join(windows_trust_name),
     )
     .expect("flatten Windows trust status");
+    for name in [
+        "deadreckon-x86_64-apple-darwin.tar.xz",
+        "deadreckon-mac.zip",
+        "macos-x86_64-apple-darwin.json",
+        "macos-universal-apple-darwin-app.json",
+    ] {
+        let source = find_release_test_asset(&distrib, name);
+        fs::copy(source, public.join(name)).expect("flatten macOS app release asset");
+    }
     fs::copy(distrib.join("SHA256SUMS"), public.join("SHA256SUMS")).expect("flatten checksums");
     fs::copy(
         distrib.join("release-manifest.json"),
@@ -1696,6 +1728,69 @@ fn release_workflow_codesigns_packaged_apple_artifacts_after_dist_build() {
             && signer.contains("\"submit\""),
         "{signer}"
     );
+}
+
+#[test]
+fn release_workflow_builds_and_trusts_the_universal_macos_app_from_signed_archives() {
+    let workflow = release_workflow();
+    let app_job = workflow
+        .split_once("  build-mac-app:")
+        .and_then(|(_, tail)| tail.split_once("\n  build-global-artifacts:"))
+        .map(|(job, _)| job)
+        .expect("build-mac-app job");
+    for needle in [
+        "- build-local-artifacts",
+        "pattern: dist-local-*-apple-darwin",
+        "runner.temp }}/deadreckon-mac-input",
+        "git status --porcelain --untracked-files=normal",
+        "node release/macos-app.mjs hydrate",
+        "deadreckon-mac/scripts/release-app.sh",
+        r#"app_version="${release_version%%-rc.*}""#,
+        r#"DEADRECKON_CLI_VERSION="$release_version""#,
+        r#"DEADRECKON_APP_VERSION="$app_version""#,
+        "DEADRECKON_RELEASE_MODE=official",
+        "target/distrib/deadreckon-mac.zip",
+        "target/distrib/trust/macos-universal-apple-darwin-app.json",
+    ] {
+        assert!(app_job.contains(needle), "{needle} missing from app job");
+    }
+    let hydrate = app_job.find("macos-app.mjs hydrate").expect("hydrate step");
+    let release = app_job
+        .find("scripts/release-app.sh")
+        .expect("release app step");
+    assert!(
+        hydrate < release,
+        "signed archive hydration must precede app signing"
+    );
+
+    let trust_job = workflow
+        .split_once("  release-trust-artifacts:")
+        .and_then(|(_, tail)| tail.split_once("\n  attest-release-artifacts:"))
+        .map(|(job, _)| job)
+        .expect("release trust job");
+    assert!(trust_job.contains("- build-mac-app"), "{trust_job}");
+    assert!(trust_job.contains("name: dist-mac-app"), "{trust_job}");
+    let app_download = trust_job
+        .split("uses: actions/download-artifact@v4")
+        .find(|step| step.contains("name: dist-mac-app"))
+        .expect("macOS app artifact download");
+    let app_download_with = app_download.split("- name:").next().unwrap_or(app_download);
+    assert!(
+        app_download_with.contains("path: target/distrib"),
+        "app artifact is rooted at target/distrib when uploaded: {app_download_with}"
+    );
+
+    let ci = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+        .expect("read CI workflow");
+    for needle in [
+        "Swift tests + universal app build (macOS)",
+        "node --test release/macos-app.test.mjs",
+        "swift test --package-path deadreckon-mac/DeadreckonKit",
+        "ARCHS=\"arm64 x86_64\"",
+        "-verify_arch arm64 x86_64",
+    ] {
+        assert!(ci.contains(needle), "{needle} missing from CI workflow");
+    }
 }
 
 #[test]
@@ -2620,6 +2715,203 @@ fn verify_manifest_rejects_dot_slash_prefixed_archive_members() {
         "--checksums",
         sums.to_str().expect("utf8 path"),
     ]);
+}
+
+fn write_fake_macos_app_release(distrib: &Path, release_version: &str, commit: &str) {
+    let scratch = distrib
+        .parent()
+        .expect("distrib parent")
+        .join("macos-app-fixture");
+    let source_payloads = scratch.join("sources");
+    fs::create_dir_all(&source_payloads).expect("macOS source payloads");
+    fs::create_dir_all(distrib.join("trust")).expect("macOS trust directory");
+
+    let mut source_archives = serde_json::Map::new();
+    let mut cli_hashes = serde_json::Map::new();
+    let mut gate_hashes = serde_json::Map::new();
+    let mut embedded = serde_json::Map::new();
+    for (arch, target) in [
+        ("arm64", "aarch64-apple-darwin"),
+        ("x86_64", "x86_64-apple-darwin"),
+    ] {
+        let payload_name = format!("deadreckon-{target}");
+        let payload = source_payloads.join(&payload_name);
+        fs::create_dir_all(&payload).expect("macOS archive payload");
+        fs::write(payload.join("deadreckon"), format!("cli-{target}")).expect("fake macOS CLI");
+        fs::write(payload.join("dr-gate"), format!("gate-{target}")).expect("fake macOS gate");
+        let archive_name = format!("{payload_name}.tar.xz");
+        let archive = find_release_test_asset_optional(distrib, &archive_name)
+            .unwrap_or_else(|| distrib.join(&archive_name));
+        let output = Command::new("tar")
+            .args(["-cJf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source_payloads)
+            .arg(&payload_name)
+            .output()
+            .expect("create fake macOS release archive");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let archive_sha =
+            deadreckon_core::flight::sha256_file(&archive).expect("source archive sha256");
+        source_archives.insert(
+            arch.to_string(),
+            serde_json::json!({
+                "name": archive_name,
+                "sha256": archive_sha
+                    .strip_prefix("sha256:")
+                    .expect("prefixed source archive sha256"),
+            }),
+        );
+        if find_release_test_asset_optional(distrib, &format!("macos-{target}.json")).is_none() {
+            fs::write(
+                distrib.join("trust").join(format!("macos-{target}.json")),
+                format!(
+                    "{{\"target\":\"{target}\",\"signed\":true,\"signature_kind\":\"Developer ID Application\",\"notarized\":true}}"
+                ),
+            )
+            .expect("fake macOS archive trust");
+        }
+    }
+
+    let app_stage = scratch.join("app-stage");
+    let contents = app_stage.join("deadreckon.app/Contents");
+    fs::create_dir_all(contents.join("MacOS")).expect("app executable directory");
+    fs::create_dir_all(contents.join("Resources/bin")).expect("app bin directory");
+    fs::create_dir_all(contents.join("Resources/libexec/deadreckon"))
+        .expect("app libexec directory");
+    fs::write(contents.join("MacOS/deadreckon"), "universal-app").expect("fake app executable");
+    fs::write(
+        contents.join("Info.plist"),
+        format!(
+            "<plist><dict><key>CFBundleShortVersionString</key><string>{}</string></dict></plist>",
+            release_version.split("-rc.").next().expect("base version")
+        ),
+    )
+    .expect("fake app Info.plist");
+
+    for (arch, cli_relative, gate_relative, cli_key, gate_key) in [
+        (
+            "arm64",
+            "Resources/bin/deadreckon_darwin_arm64",
+            "Resources/bin/dr-gate",
+            "deadreckon_arm64",
+            "dr_gate_arm64",
+        ),
+        (
+            "x86_64",
+            "Resources/bin/deadreckon_darwin_x86_64",
+            "Resources/libexec/deadreckon/dr-gate",
+            "deadreckon_x86_64",
+            "dr_gate_x86_64",
+        ),
+    ] {
+        let target = if arch == "arm64" {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        };
+        let cli = contents.join(cli_relative);
+        let gate = contents.join(gate_relative);
+        fs::write(&cli, format!("cli-{target}")).expect("embedded fake CLI");
+        fs::write(&gate, format!("gate-{target}")).expect("embedded fake gate");
+        let cli_sha = deadreckon_core::flight::sha256_file(&cli)
+            .expect("embedded CLI sha256")
+            .strip_prefix("sha256:")
+            .expect("prefixed embedded CLI sha256")
+            .to_string();
+        let gate_sha = deadreckon_core::flight::sha256_file(&gate)
+            .expect("embedded gate sha256")
+            .strip_prefix("sha256:")
+            .expect("prefixed embedded gate sha256")
+            .to_string();
+        cli_hashes.insert(arch.to_string(), JsonValue::String(cli_sha.clone()));
+        gate_hashes.insert(arch.to_string(), JsonValue::String(gate_sha.clone()));
+        embedded.insert(cli_key.to_string(), JsonValue::String(cli_sha));
+        embedded.insert(gate_key.to_string(), JsonValue::String(gate_sha));
+    }
+
+    let app_manifest = serde_json::json!({
+        "schemaVersion": 1,
+        "cliVersion": release_version,
+        "releaseVersion": release_version,
+        "gitCommit": commit,
+        "sourceDirty": false,
+        "complete": true,
+        "signed": true,
+        "sha256": cli_hashes,
+        "gateSha256": gate_hashes,
+        "sourceArchives": source_archives,
+    });
+    fs::write(
+        contents.join("Resources/bin/manifest.json"),
+        serde_json::to_vec_pretty(&app_manifest).expect("encode app manifest"),
+    )
+    .expect("write app manifest");
+
+    let app_archive = distrib.join("deadreckon-mac.zip");
+    let output = Command::new("zip")
+        .args(["-qr"])
+        .arg(&app_archive)
+        .arg("deadreckon.app")
+        .current_dir(&app_stage)
+        .output()
+        .expect("create fake app ZIP");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trust = serde_json::json!({
+        "schema_version": 1,
+        "target": "universal-apple-darwin-app",
+        "artifact": "deadreckon-mac.zip",
+        "signed": true,
+        "signature_kind": "Developer ID Application",
+        "notarized": true,
+        "stapled": true,
+        "bundle_identifier": "com.itavero.deadreckon",
+        "release_version": release_version,
+        "app_version": release_version.split("-rc.").next().expect("app version"),
+        "source_commit": commit,
+        "architectures": ["arm64", "x86_64"],
+        "archive_sha256": deadreckon_core::flight::sha256_file(&app_archive)
+            .expect("app archive sha256")
+            .strip_prefix("sha256:")
+            .expect("prefixed app archive sha256"),
+        "archive_bytes": fs::metadata(&app_archive).expect("app archive metadata").len(),
+        "embedded_binaries": embedded,
+    });
+    fs::write(
+        distrib
+            .join("trust")
+            .join("macos-universal-apple-darwin-app.json"),
+        serde_json::to_vec_pretty(&trust).expect("encode app trust"),
+    )
+    .expect("write app trust");
+}
+
+fn find_release_test_asset(root: &Path, name: &str) -> PathBuf {
+    find_release_test_asset_optional(root, name)
+        .unwrap_or_else(|| panic!("release fixture asset {name} not found"))
+}
+
+fn find_release_test_asset_optional(root: &Path, name: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir(root).expect("read release fixture directory") {
+        let entry = entry.expect("release fixture entry");
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_release_test_asset_optional(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn write_fake_static_elf(path: &Path, machine: u16, with_interp: bool) {

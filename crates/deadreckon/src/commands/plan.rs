@@ -3375,11 +3375,12 @@ fn git_revisions_in_range(
         .collect())
 }
 
-fn verify_ordered_candidate_application_result(
+pub(crate) fn verify_ordered_candidate_application_result(
     paths: &DeadreckonPaths,
     candidate_git_root: &Path,
     event: &deadreckon_core::plan::OrderedCandidateApplicationEvent,
     candidate_after_revision: &str,
+    require_current_head: bool,
 ) -> Result<()> {
     use deadreckon_core::plan::ApplyStrategy;
 
@@ -3420,11 +3421,25 @@ fn verify_ordered_candidate_application_result(
     )?;
     let observed_head = git_stdout(candidate_git_root, &["rev-parse", "HEAD^{commit}"])?;
     let dirty = git_stdout(candidate_git_root, &["status", "--porcelain"])?;
+    let head_binding_valid = if require_current_head {
+        observed_head == candidate_after_revision
+    } else {
+        git_status(
+            candidate_git_root,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                candidate_after_revision,
+                &observed_head,
+            ],
+        )
+        .is_ok()
+    };
     if observed_base != event.child_base_revision
         || observed_base != event.candidate_before_revision
         || observed_child != event.child_result_revision
         || marker_sha256 != event.validated_marker_sha256
-        || observed_head != candidate_after_revision
+        || !head_binding_valid
         || !dirty.trim().is_empty()
     {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -3546,7 +3561,7 @@ pub(crate) fn reconcile_prepared_ordered_candidate_application(
     if head == prepared.candidate_before_revision {
         return Ok(());
     }
-    verify_ordered_candidate_application_result(paths, candidate_git_root, &prepared, &head)?;
+    verify_ordered_candidate_application_result(paths, candidate_git_root, &prepared, &head, true)?;
     let completed = deadreckon_core::plan::OrderedCandidateApplicationEvent::completed(
         &prepared,
         head,
@@ -3698,6 +3713,7 @@ fn apply_node(paths: &DeadreckonPaths, plan: &Plan, task_index: usize, run_id: &
             &preflight.candidate_git_root,
             &prepared,
             &after,
+            true,
         )?;
         let completed = deadreckon_core::plan::OrderedCandidateApplicationEvent::completed(
             &prepared,

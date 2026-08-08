@@ -459,6 +459,18 @@ Cleanup removes temporary run worktrees and branches for abandoned, stale, or
 completed worktree runs. It does not delete plan state, promoted library
 artifacts, or directories exported with `deadreckon export`.";
 
+const SALVAGE_HELP: &str = "\
+Lifecycle:
+  deadreckon salvage <failed-job-id> --dry-run --json
+  deadreckon salvage <failed-job-id> --output ./recovered-result
+  deadreckon acceptance check --spec ./recovered-result/.deadreckon/acceptance.yaml --against ./recovered-result
+
+Salvage is a fail-closed recovery export for a terminal failed Graph Job whose
+children were already applied to its durable ordered candidate. It validates
+the candidate ledger and child receipts, copies into a new directory, and
+leaves the failed Job unchanged. The export is explicitly unverified until its
+frozen acceptance pack is rerun. It never overwrites a destination.";
+
 const EXTEND_HELP: &str = "\
 Follow-up launcher for completed runs. In a TTY, `deadreckon start \"goal\"`
 can offer this path when the current project already has completed history.
@@ -1814,6 +1826,30 @@ pub(crate) enum Commands {
         overwrite: bool,
         #[arg(long, help = "Keep temporary branches")]
         keep_branch: bool,
+        #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
+        json: bool,
+    },
+    #[command(
+        next_help_heading = "Cleanup And Recovery",
+        about = "Recover a stranded Graph result without rewriting the failed Job",
+        after_help = SALVAGE_HELP
+    )]
+    Salvage {
+        #[arg(help = "Terminal failed Graph Job id or unique prefix")]
+        job_id: String,
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_unless_present = "dry_run",
+            help = "New directory for the recovered result; existing paths are refused"
+        )]
+        output: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with = "output",
+            help = "Validate salvage evidence and report the candidate without copying"
+        )]
+        dry_run: bool,
         #[arg(long, help = "Emit machine-readable JSON result and error envelopes")]
         json: bool,
     },

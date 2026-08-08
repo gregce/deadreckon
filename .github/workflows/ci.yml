@@ -58,3 +58,44 @@ jobs:
       - name: Assemble and verify the Windows release ZIP
         shell: pwsh
         run: node --test release/evaluator-sidecars.test.mjs
+
+  mac-app:
+    name: Swift tests + universal app build (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install XcodeGen
+        shell: bash
+        run: brew install xcodegen
+      - name: Test macOS release hydration
+        shell: bash
+        run: node --test release/macos-app.test.mjs
+      - name: Test DeadreckonKit
+        shell: bash
+        run: swift test --package-path deadreckon-mac/DeadreckonKit
+      - name: Build clean-checkout universal app
+        shell: bash
+        working-directory: deadreckon-mac
+        run: |
+          # Vendored release binaries are intentionally absent from a clean
+          # checkout. This gate proves the Swift app compiles universally;
+          # the release lane separately hydrates both signed architectures and
+          # verifies their exact bytes before and after app packaging.
+          xcodegen generate
+          xcodebuild \
+            -project deadreckon.xcodeproj \
+            -scheme deadreckon \
+            -configuration Release \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS="arm64 x86_64" \
+            clean build
+          lipo \
+            build/DerivedData/Build/Products/Release/deadreckon.app/Contents/MacOS/deadreckon \
+            -verify_arch arm64 x86_64

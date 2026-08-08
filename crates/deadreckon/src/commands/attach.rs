@@ -46,6 +46,15 @@ pub(crate) async fn attach_command(args: AttachCommandArgs) -> Result<()> {
     )?;
     let state = match resolved {
         super::reference::ResolvedRef::Job(job) => {
+            // A terminal non-verified Job is the lifecycle truth. Its owned
+            // Plan can still contain six completed children (or even an
+            // interrupted MergeStarted), but presenting that nested Plan as
+            // "ready to merge" masks why the Job actually stopped.
+            if job.projection.is_terminal()
+                && job.projection.outcome != Some(deadreckon_protocol::JobOutcome::Verified)
+            {
+                return super::job::print_job_status_after_attach(&job, args.json);
+            }
             if let Ok(state) = load_run(&paths, job.job.job_id.as_ref()) {
                 state
             } else {
