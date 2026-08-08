@@ -19,6 +19,9 @@ struct DetailCenterTabsView: View {
     let row: FleetRow
     @ObservedObject var detail: JobDetailStore
     @Binding var tab: Tab
+    /// The drill-jump channel (§G1): RunSurfaceView switches the tab; the
+    /// owning pane consumes the target and clears it.
+    @Binding var drill: DrillTarget?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,12 +42,19 @@ struct DetailCenterTabsView: View {
             Divider().overlay(Theme.border)
 
             switch tab {
-            case .activity: ActivityPaneView(detail: detail)
-            case .story: NarrativePaneView(detail: detail)
-            case .changes: ChangesView(detail: detail)
-            case .checks: ContractChecksView(row: row, detail: detail)
-            case .docs: DocsView(detail: detail)
-            case .recorder: FlightView(row: row, detail: detail)
+            case .activity:
+                ActivityPaneView(detail: detail, live: live, drill: $drill)
+            case .story:
+                NarrativePaneView(detail: detail, drill: $drill,
+                                  openChangesTab: { tab = .changes })
+            case .changes:
+                ChangesView(detail: detail, drill: $drill)
+            case .checks:
+                ContractChecksView(row: row, detail: detail, drill: $drill)
+            case .docs:
+                DocsView(detail: detail)
+            case .recorder:
+                FlightView(row: row, detail: detail)
             }
         }
         // The DONE MEANS strip can land here on .checks; the Changes lazy
@@ -62,6 +72,10 @@ struct DetailCenterTabsView: View {
         }
         return tab.rawValue
     }
+
+    private var live: Bool {
+        row.projection.phase != .terminal
+    }
 }
 
 // MARK: - Story
@@ -72,6 +86,8 @@ struct DetailCenterTabsView: View {
 /// appears on an evidence surface or anywhere near a decision.
 struct NarrativePaneView: View {
     @ObservedObject var detail: JobDetailStore
+    @Binding var drill: DrillTarget?
+    let openChangesTab: () -> Void
 
     var body: some View {
         ScrollView {
@@ -85,6 +101,13 @@ struct NarrativePaneView: View {
                         .font(Theme.body(12))
                         .foregroundStyle(Theme.textTertiary)
                 }
+
+                // V7: MAP is deterministic evidence — after the snapshot
+                // body, never inside or below the unverified overlay.
+                StoryMapSection(
+                    detail: detail,
+                    openChangesTab: openChangesTab,
+                    openChangesFile: { drill = .changesFile($0) })
 
                 if let overlay = detail.narrative.latestSnapshot, overlay.isUnverifiedOverlay {
                     overlayBlock(overlay)
@@ -206,8 +229,10 @@ struct NarrativePaneView: View {
 /// Live tail of events.jsonl with the Turns grouping one toggle away
 /// (§D5): Stream is the unbounded scrollback plus text search — the two
 /// things attach's 1000-event cap cannot give (design 1.4); Turns is the
-/// traces.jsonl grouping. Header right: the activity sparkbar (per-turn
-/// entry counts) + the event count.
+/// traces.jsonl grouping. Between header and body: the event-density strip
+/// (V2), brushable — a drag selects a time window that filters the Stream,
+/// composing AND with the text search. Rows expand inline to the raw
+/// record inspector (D4).
 struct ActivityPaneView: View {
     enum Mode: String, CaseIterable {
         case stream = "Stream"
@@ -215,6 +240,8 @@ struct ActivityPaneView: View {
     }
 
     @ObservedObject var detail: JobDetailStore
+    let live: Bool
+    @Binding var drill: DrillTarget?
     @State private var mode: Mode = .stream
     @State private var query = ""
     /// Whether the operator is at (or near) the tail: tracked by the
@@ -224,16 +251,43 @@ struct ActivityPaneView: View {
     /// (Console.app/Terminal behavior; the drawer's terminal panes stay
     /// tail-convention always-follow).
     @State private var pinnedToTail = true
+    /// The density strip's brush window (V2). Filters the Stream; the chip
+    /// survives a switch to Turns and re-applies on return.
+    @State private var brush: ClosedRange<Date>?
+    @State private var expandedEvents: Set<Int> = []
+    /// A `.turn(n)` drill landing: consumed by TurnsListView.
+    @State private var pendingTurn: Int?
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().overlay(Theme.border)
+            // V2: the density strip renders in both modes and brushes the
+            // Stream (it replaces the old header sparkbar).
+            ActivityDensityStrip(series: detail.density, live: live, brush: $brush)
 
             switch mode {
             case .stream: streamBody
-            case .turns: TurnsListView(detail: detail)
+            case .turns: TurnsListView(detail: detail, drill: $drill, expandTurn: $pendingTurn)
             }
+        }
+        .onAppear { consumeDrill() }
+        .onChange(of: drill) { _, _ in consumeDrill() }
+    }
+
+    /// §G1 consumption: land the jump, then clear it.
+    private func consumeDrill() {
+        switch drill {
+        case .turn(let turn):
+            mode = .turns
+            pendingTurn = turn
+            drill = nil
+        case .activityWindow(let window):
+            mode = .stream
+            brush = window
+            drill = nil
+        default:
+            break
         }
     }
 
@@ -255,7 +309,7 @@ struct ActivityPaneView: View {
                     .font(Theme.body(11))
             }
             Spacer()
-            sparkbar
+            brushChip
             Text("\(detail.activity.count) events")
                 .font(Theme.body(10))
                 .foregroundStyle(Theme.textTertiary)
@@ -265,22 +319,17 @@ struct ActivityPaneView: View {
         .padding(.vertical, 5)
     }
 
-    /// Per-turn entry counts as quiet bars (§D5 grammar: border-colored
-    /// bars, the current turn accent). Counts, not prose.
-    @ViewBuilder private var sparkbar: some View {
-        if !detail.turns.isEmpty {
-            let recent = Array(detail.turns.suffix(30))
-            let maxCount = max(recent.map { $0.entries.count }.max() ?? 1, 1)
-            HStack(alignment: .bottom, spacing: 2) {
-                ForEach(recent) { turn in
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(turn.id == recent.last?.id ? Theme.accent : Theme.border)
-                        .frame(width: 3,
-                               height: max(2, CGFloat(turn.entries.count) / CGFloat(maxCount) * 14))
-                        .help("turn \(turn.turn): \(turn.entries.count) entries")
-                }
+    /// The active brush window as a neutral chip + its clear button.
+    @ViewBuilder private var brushChip: some View {
+        if let brush {
+            HStack(spacing: 3) {
+                StatusChip(
+                    text: "\(RunChartTime.hm(brush.lowerBound))\u{2013}\(RunChartTime.hm(brush.upperBound)) \u{00B7} \(filtered.count) shown",
+                    color: Theme.textSecondary)
+                Button("\u{2715}") { self.brush = nil }
+                    .buttonStyle(.themeText(size: 10))
+                    .help("clear the time window")
             }
-            .accessibilityHidden(true)
         }
     }
 
@@ -313,17 +362,8 @@ struct ActivityPaneView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 2) {
                         ForEach(filtered) { entry in
-                            HStack(alignment: .top, spacing: 8) {
-                                Text(Self.time(entry.timestamp))
-                                    .font(Theme.mono(9.5))
-                                    .foregroundStyle(Theme.textTertiary)
-                                    .frame(width: 58, alignment: .leading)
-                                Text(entry.line)
-                                    .font(Theme.mono(10.5))
-                                    .foregroundStyle(Theme.textSecondary)
-                                    .textSelection(.enabled)
-                            }
-                            .id(entry.id)
+                            eventRow(entry)
+                                .id(entry.id)
                         }
                         // The tail sentinel: instantiated by the LazyVStack
                         // only when the bottom is on screen, so its
@@ -337,7 +377,8 @@ struct ActivityPaneView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .onChange(of: detail.activity.count) { _ in
-                    if query.isEmpty, pinnedToTail, let last = detail.activity.last {
+                    if query.isEmpty, brush == nil, pinnedToTail,
+                       let last = detail.activity.last {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
@@ -345,9 +386,55 @@ struct ActivityPaneView: View {
         }
     }
 
+    /// One stream row: the fact line stays selectable; the trailing
+    /// chevron expands the raw record inspector inline (D4).
+    private func eventRow(_ entry: JobDetailStore.ActivityEntry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(Self.time(entry.timestamp))
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.textTertiary)
+                    .frame(width: 58, alignment: .leading)
+                Text(entry.line)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.textSecondary)
+                    .textSelection(.enabled)
+                Spacer(minLength: 4)
+                Button {
+                    if expandedEvents.contains(entry.id) {
+                        expandedEvents.remove(entry.id)
+                    } else {
+                        expandedEvents.insert(entry.id)
+                    }
+                } label: {
+                    Image(systemName: expandedEvents.contains(entry.id)
+                        ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                        .frame(width: 16, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("show the raw ledger record")
+            }
+            if expandedEvents.contains(entry.id) {
+                EventRawInspector(timestamp: entry.timestamp, raw: entry.raw)
+                    .padding(.leading, 66)
+                    .padding(.trailing, 8)
+            }
+        }
+    }
+
+    /// Brush window AND text search, composed.
     private var filtered: [JobDetailStore.ActivityEntry] {
-        guard !query.isEmpty else { return detail.activity }
-        return detail.activity.filter { $0.line.localizedCaseInsensitiveContains(query) }
+        var entries = detail.activity
+        if let brush {
+            entries = entries.filter { entry in
+                entry.timestamp.map { brush.contains($0) } ?? false
+            }
+        }
+        guard !query.isEmpty else { return entries }
+        return entries.filter { $0.line.localizedCaseInsensitiveContains(query) }
     }
 
     private static let formatter: DateFormatter = {
@@ -364,37 +451,77 @@ struct ActivityPaneView: View {
 // MARK: - Turns
 
 /// traces.jsonl turn grouping with interleaved tool calls, collapsible
-/// (design B2 TURNS pane): ledgers, not a chat buffer.
+/// (design B2 TURNS pane): ledgers, not a chat buffer. Each row carries the
+/// token/duration micro-bars against the shared TurnScale (V3 — the row
+/// list IS the chart); trace entries expand to the full tool I/O (D1
+/// level 2).
 struct TurnsListView: View {
     @ObservedObject var detail: JobDetailStore
+    @Binding var drill: DrillTarget?
+    /// A `.turn(n)` drill landing: expand + scroll, then clear.
+    @Binding var expandTurn: Int?
+
     @State private var expanded: Set<Int> = []
+    @State private var expandedEntries: Set<Int> = []
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                if let issue = detail.tracesIssue {
-                    Text("turn feed stopped: \(issue)")
-                        .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.dangerText)
-                        .textSelection(.enabled)
-                        .padding(4)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    if let issue = detail.tracesIssue {
+                        Text("turn feed stopped: \(issue)")
+                            .font(Theme.body(10.5))
+                            .foregroundStyle(Theme.dangerText)
+                            .textSelection(.enabled)
+                            .padding(4)
+                    }
+                    if detail.turns.isEmpty {
+                        Text("No turns recorded yet.")
+                            .font(Theme.body(12))
+                            .foregroundStyle(Theme.textTertiary)
+                            .padding(4)
+                    } else {
+                        legendRow
+                    }
+                    let scale = TurnScale.derive(turns: detail.turns)
+                    ForEach(detail.turns.reversed()) { turn in
+                        turnCard(turn, scale: scale)
+                            .id("turn-\(turn.turn)")
+                    }
                 }
-                if detail.turns.isEmpty {
-                    Text("No turns recorded yet.")
-                        .font(Theme.body(12))
-                        .foregroundStyle(Theme.textTertiary)
-                        .padding(4)
-                }
-                ForEach(detail.turns.reversed()) { turn in
-                    turnCard(turn)
-                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .onAppear { consumePendingTurn(proxy: proxy) }
+            .onChange(of: expandTurn) { _, _ in consumePendingTurn(proxy: proxy) }
         }
     }
 
-    private func turnCard(_ turn: TurnModel) -> some View {
+    private func consumePendingTurn(proxy: ScrollViewProxy) {
+        guard let turn = expandTurn else { return }
+        expanded.insert(turn)
+        withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo("turn-\(turn)", anchor: .top)
+        }
+        expandTurn = nil
+    }
+
+    /// The micro-bar key, printed once (a legend, not per-row labels).
+    private var legendRow: some View {
+        HStack(spacing: 4) {
+            Spacer()
+            Rectangle().fill(Theme.Chart.markQuiet).frame(width: 7, height: 5)
+            Text("in")
+            Text("\u{00B7}")
+            Rectangle().fill(Theme.Chart.markLine).frame(width: 7, height: 5)
+            Text("out")
+        }
+        .font(Theme.body(10))
+        .foregroundStyle(Theme.textTertiary)
+        .accessibilityHidden(true)
+    }
+
+    private func turnCard(_ turn: TurnModel, scale: (maxTokens: Int, maxWallSeconds: Double)) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
                 if expanded.contains(turn.turn) {
@@ -416,9 +543,25 @@ struct TurnsListView: View {
                             .foregroundStyle(Theme.textTertiary)
                     }
                     Spacer()
+                    // V3: the fixed-width micro-mark column — every row
+                    // draws against the same Kit-derived maxima, so turns
+                    // compare at a glance. The printed numbers beside them
+                    // are the table twin.
+                    VStack(alignment: .leading, spacing: 2) {
+                        TokenMicroBar(inTokens: turn.inputTokens,
+                                      outTokens: turn.outputTokens,
+                                      maxTokens: scale.maxTokens)
+                        DurationMicroBar(seconds: turn.wallSeconds,
+                                         maxSeconds: scale.maxWallSeconds)
+                    }
                     Text("in \(Self.tokens(turn.inputTokens)) out \(Self.tokens(turn.outputTokens))")
                         .font(Theme.mono(9.5))
                         .foregroundStyle(Theme.textTertiary)
+                    Text(turn.wallSeconds > 0 ? Self.duration(turn.wallSeconds) : "\u{2014}")
+                        .font(Theme.mono(9.5))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.textTertiary)
+                        .frame(width: 46, alignment: .trailing)
                     if turn.costUSD > 0 {
                         Text(String(format: "$%.3f", turn.costUSD))
                             .font(Theme.mono(9.5))
@@ -435,16 +578,15 @@ struct TurnsListView: View {
             if expanded.contains(turn.turn) {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(turn.entries) { entry in
-                        HStack(alignment: .top, spacing: 8) {
-                            Text(ActivityPaneView.time(entry.timestamp))
-                                .font(Theme.mono(9))
-                                .foregroundStyle(Theme.textTertiary)
-                                .frame(width: 54, alignment: .leading)
-                            Text(entry.text)
-                                .font(Theme.mono(10))
-                                .foregroundStyle(entryColor(entry.kind))
-                                .textSelection(.enabled)
+                        entryRow(entry)
+                    }
+                    // The turn's window in the actual ledger, filtered —
+                    // not a paraphrase.
+                    if let started = turn.startedAt {
+                        JumpLine(title: "activity in this turn", size: 9.5) {
+                            drill = .activityWindow(started ... windowEnd(for: turn, started: started))
                         }
+                        .padding(.top, 2)
                     }
                 }
                 .padding(.leading, 18)
@@ -454,6 +596,69 @@ struct TurnsListView: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .cardChrome()
+    }
+
+    /// One interleaved entry; trace entries expand inline to the full tool
+    /// exchange (D1 level 2).
+    private func entryRow(_ entry: TurnModel.Entry) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(ActivityPaneView.time(entry.timestamp))
+                    .font(Theme.mono(9))
+                    .foregroundStyle(Theme.textTertiary)
+                    .frame(width: 54, alignment: .leading)
+                Text(entry.text)
+                    .font(Theme.mono(10))
+                    .foregroundStyle(entryColor(entry.kind))
+                    .textSelection(.enabled)
+                if entry.kind == .trace {
+                    Spacer(minLength: 4)
+                    Button {
+                        if expandedEntries.contains(entry.ordinal) {
+                            expandedEntries.remove(entry.ordinal)
+                        } else {
+                            expandedEntries.insert(entry.ordinal)
+                        }
+                    } label: {
+                        Image(systemName: expandedEntries.contains(entry.ordinal)
+                            ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Theme.textTertiary)
+                            .frame(width: 16, height: 14)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("show the full tool exchange")
+                }
+            }
+            if entry.kind == .trace, expandedEntries.contains(entry.ordinal) {
+                ToolIOView(raw: entry.raw, ledgerPath: tracesLedgerPath) { path in
+                    drill = .changesFile(path)
+                }
+                .padding(.leading, 62)
+                .padding(.trailing, 8)
+            }
+        }
+    }
+
+    /// The turn's honest upper bound: the next turn's start, else this
+    /// turn's last recorded entry, else its own start — never "now".
+    private func windowEnd(for turn: TurnModel, started: Date) -> Date {
+        if let next = detail.turns.first(where: { $0.turn > turn.turn })?.startedAt {
+            return max(next, started)
+        }
+        let lastEntry = turn.entries.map(\.timestamp).max()
+        return max(lastEntry ?? started, started)
+    }
+
+    private var tracesLedgerPath: String {
+        guard let runID = detail.currentRunID else { return "traces.jsonl" }
+        return DeadreckonHome.url()
+            .appendingPathComponent("runstate")
+            .appendingPathComponent(detail.scope)
+            .appendingPathComponent("runs")
+            .appendingPathComponent(runID)
+            .appendingPathComponent("traces.jsonl").path
     }
 
     private func entryColor(_ kind: TurnModel.EntryKind) -> Color {
@@ -467,6 +672,14 @@ struct TurnsListView: View {
     static func tokens(_ count: Int) -> String {
         count >= 1000 ? String(format: "%.1fk", Double(count) / 1000) : "\(count)"
     }
+
+    static func duration(_ seconds: Double) -> String {
+        if seconds >= 60 {
+            let total = Int(seconds.rounded())
+            return "\(total / 60)m \(total % 60)s"
+        }
+        return String(format: "%.1fs", seconds)
+    }
 }
 
 // MARK: - Checks (first-class)
@@ -479,6 +692,10 @@ struct TurnsListView: View {
 struct ContractChecksView: View {
     let row: FleetRow
     @ObservedObject var detail: JobDetailStore
+    @Binding var drill: DrillTarget?
+
+    @State private var expandedChecks: Set<Int> = []
+    @State private var expandedLive: Set<Int> = []
 
     var body: some View {
         ScrollView {
@@ -501,6 +718,19 @@ struct ContractChecksView: View {
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .onAppear { consumeDrill() }
+        .onChange(of: drill) { _, _ in consumeDrill() }
+        .onChange(of: detail.report) { _, _ in consumeDrill() }
+    }
+
+    /// `.recordedCheck` landing (§G1): expand the matching recorded row.
+    private func consumeDrill() {
+        guard case .recordedCheck(let kind, let command) = drill,
+              let checks = detail.report?.deterministicChecks else { return }
+        if let index = checks.firstIndex(where: { $0.kind == kind && $0.command == command }) {
+            expandedChecks.insert(index)
+        }
+        drill = nil
     }
 
     @ViewBuilder private var contractBand: some View {
@@ -589,35 +819,61 @@ struct ContractChecksView: View {
                     .font(Theme.body(10))
                     .foregroundStyle(Theme.textTertiary)
             }
-            ForEach(Array(detail.liveChecks.enumerated()), id: \.offset) { _, progressRow in
-                liveRow(progressRow)
+            ForEach(Array(detail.liveChecks.enumerated()), id: \.offset) { index, progressRow in
+                liveRow(progressRow, index: index)
             }
         }
     }
 
-    @ViewBuilder private func liveRow(_ progressRow: AcceptanceProgressRow) -> some View {
-        HStack(alignment: .top, spacing: 6) {
-            Text(glyph(progressRow))
-                .font(Theme.body(10, weight: .bold))
-                .foregroundStyle(color(progressRow))
-                .frame(width: 12)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: 6) {
+    /// One live-band row: expandable to the same full evidence component
+    /// as recorded rows, minus history (D2) — display data, never evidence.
+    @ViewBuilder private func liveRow(_ progressRow: AcceptanceProgressRow, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Button {
+                guard progressRow.result != nil else { return }
+                if expandedLive.contains(index) {
+                    expandedLive.remove(index)
+                } else {
+                    expandedLive.insert(index)
+                }
+            } label: {
+                HStack(alignment: .top, spacing: 6) {
+                    if progressRow.result != nil {
+                        Image(systemName: expandedLive.contains(index)
+                            ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(Theme.textTertiary)
+                    }
+                    Text(glyph(progressRow))
+                        .font(Theme.body(10, weight: .bold))
+                        .foregroundStyle(color(progressRow))
+                        .frame(width: 12)
                     Text("\(progressRow.index)/\(progressRow.total)")
                         .font(Theme.mono(9.5))
                         .foregroundStyle(Theme.textTertiary)
                     Text(progressRow.result?.kind ?? progressRow.status)
                         .font(Theme.mono(10))
                         .foregroundStyle(Theme.textPrimary)
+                    if let detailText = progressRow.result?.detail, !detailText.isEmpty {
+                        Text(detailText)
+                            .font(Theme.body(9.5))
+                            .foregroundStyle(progressRow.result?.passed == false
+                                ? Theme.dangerText : Theme.textTertiary)
+                            .lineLimit(1)
+                    }
                     if let duration = progressRow.result?.durationMS {
                         Text(String(format: "%.1fs", Double(duration) / 1000))
                             .font(Theme.mono(9.5))
                             .foregroundStyle(Theme.textTertiary)
                     }
+                    Spacer(minLength: 0)
                 }
-                if let result = progressRow.result {
-                    CheckResultDetail(result: result)
-                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if expandedLive.contains(index), let result = progressRow.result {
+                CheckEvidenceView(result: result)
+                    .padding(.leading, 18)
             }
         }
     }
@@ -715,25 +971,12 @@ struct ContractChecksView: View {
                         .font(Theme.body(10))
                         .foregroundStyle(Theme.textTertiary)
                 }
-                ForEach(Array(report.deterministicChecks.enumerated()), id: \.offset) { _, check in
-                    VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 6) {
-                            Text(check.passed ? "\u{2713}" : "\u{2717}")
-                                .font(Theme.body(10, weight: .bold))
-                                .foregroundStyle(check.passed ? Theme.success : Theme.danger)
-                                .frame(width: 12)
-                            Text(check.kind)
-                                .font(Theme.mono(10))
-                                .foregroundStyle(Theme.textPrimary)
-                            if let duration = check.durationMS {
-                                Text(String(format: "%.1fs", Double(duration) / 1000))
-                                    .font(Theme.mono(9.5))
-                                    .foregroundStyle(Theme.textTertiary)
-                            }
-                        }
-                        CheckResultDetail(result: check)
-                            .padding(.leading, 18)
-                    }
+                // V4: duration bars against the shared maximum, only when
+                // 2+ results carry a duration (a lone duration is a number,
+                // not a comparison). The printed seconds stay — table twin.
+                let durations = CheckDurations.derive(results: report.deterministicChecks)
+                ForEach(Array(report.deterministicChecks.enumerated()), id: \.offset) { index, check in
+                    recordedCheckRow(check, index: index, report: report, durations: durations)
                 }
                 Text("Recorded when the checks ran (`report --json`). The app can\u{2019}t re-run checks for a run today \u{2014} a registered CLI gap.")
                     .font(Theme.body(9))
@@ -751,60 +994,62 @@ struct ContractChecksView: View {
             }
         }
     }
-}
 
-/// One check result's detail with expandable clipped output when present.
-struct CheckResultDetail: View {
-    let result: AcceptanceProgressRow.CheckResult
-    @State private var outputShown = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            if !result.detail.isEmpty {
-                Text(result.detail)
-                    .font(Theme.body(9.5))
-                    .foregroundStyle(result.passed ? Theme.textTertiary : Theme.danger)
-                    .lineLimit(3)
-                    .textSelection(.enabled)
-            }
-            if hasOutput {
-                Button(outputShown ? "hide output" : "show output") {
-                    outputShown.toggle()
-                }
-                .buttonStyle(.themeText(size: 9))
-                if outputShown {
-                    if let stdout = result.stdout, !stdout.isEmpty {
-                        clipped(stdout, label: "stdout")
-                    }
-                    if let stderr = result.stderr, !stderr.isEmpty {
-                        clipped(stderr, label: "stderr")
-                    }
-                }
-            }
-        }
-    }
-
-    private var hasOutput: Bool {
-        !(result.stdout ?? "").isEmpty || !(result.stderr ?? "").isEmpty
-    }
-
-    private func clipped(_ text: String, label: String) -> some View {
+    /// One recorded check row (D2): the row is the drill — click expands to
+    /// the full evidence (command/cwd/outputs + per-attempt history).
+    private func recordedCheckRow(
+        _ check: AcceptanceProgressRow.CheckResult, index: Int,
+        report: JobReportEnvelope,
+        durations: (rows: [CheckDurations.Row], maxMS: Int, showBars: Bool)
+    ) -> some View {
         VStack(alignment: .leading, spacing: 1) {
-            Text("\(label) (clipped when recorded)")
-                .font(Theme.body(8.5))
-                .foregroundStyle(Theme.textTertiary)
-            ScrollView(.horizontal) {
-                Text(text)
-                    .font(Theme.mono(9))
-                    .foregroundStyle(Theme.textSecondary)
-                    .textSelection(.enabled)
+            Button {
+                if expandedChecks.contains(index) {
+                    expandedChecks.remove(index)
+                } else {
+                    expandedChecks.insert(index)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: expandedChecks.contains(index)
+                        ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(Theme.textTertiary)
+                    Text(check.passed ? "\u{2713}" : "\u{2717}")
+                        .font(Theme.body(10, weight: .bold))
+                        .foregroundStyle(check.passed ? Theme.success : Theme.danger)
+                        .frame(width: 12)
+                    Text(check.kind)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.textPrimary)
+                    if !check.detail.isEmpty {
+                        Text(check.detail)
+                            .font(Theme.body(9.5))
+                            .foregroundStyle(check.passed ? Theme.textTertiary : Theme.dangerText)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    if let duration = check.durationMS {
+                        Text(String(format: "%.1fs", Double(duration) / 1000))
+                            .font(Theme.mono(9.5))
+                            .monospacedDigit()
+                            .foregroundStyle(Theme.textTertiary)
+                        if durations.showBars {
+                            CheckDurationBar(durationMS: duration,
+                                             maxMS: durations.maxMS,
+                                             passed: check.passed)
+                        }
+                    }
+                }
+                .contentShape(Rectangle())
             }
-            .frame(maxHeight: 120)
+            .buttonStyle(.plain)
+            if expandedChecks.contains(index) {
+                CheckEvidenceView(result: check, attempts: report.attempts)
+                    .padding(.leading, 18)
+                    .padding(.top, 2)
+            }
         }
-        .padding(6)
-        .background(Theme.well, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
-            .strokeBorder(Theme.border, lineWidth: 1))
     }
 }
 
@@ -814,50 +1059,79 @@ struct CheckResultDetail: View {
 /// loaded on demand via `--patch --file` with truncation honesty.
 struct ChangesView: View {
     @ObservedObject var detail: JobDetailStore
+    @Binding var drill: DrillTarget?
     @State private var expandedPath: String?
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    if let changes = detail.changes {
-                        Text("\u{0394} \(changes.filesChanged) files \u{00B7} +\(changes.added) \u{2212}\(changes.removed)")
-                            .font(Theme.body(11, weight: .medium))
-                            .foregroundStyle(Theme.textPrimary)
-                            .monospacedDigit()
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        if let changes = detail.changes {
+                            Text("\u{0394} \(changes.filesChanged) files \u{00B7} +\(changes.added) \u{2212}\(changes.removed)")
+                                .font(Theme.body(11, weight: .medium))
+                                .foregroundStyle(Theme.textPrimary)
+                                .monospacedDigit()
+                        }
+                        Spacer()
+                        Button {
+                            Task { await detail.refreshChanges() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 10))
+                        }
+                        .buttonStyle(.tactile)
+                        .help("Refresh the diff \u{2014} show --diff --json")
                     }
-                    Spacer()
-                    Button {
-                        Task { await detail.refreshChanges() }
-                    } label: {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 10))
+
+                    if let issue = detail.changesIssue {
+                        Text(issue)
+                            .font(Theme.body(10.5))
+                            .foregroundStyle(Theme.warn)
+                            .textSelection(.enabled)
+                    } else if detail.changes == nil {
+                        Text("Reading the run diff \u{2026}")
+                            .font(Theme.body(10.5))
+                            .foregroundStyle(Theme.textTertiary)
+                    } else if detail.changes?.files.isEmpty == true {
+                        Text("No source changes recorded.")
+                            .font(Theme.body(10.5))
+                            .foregroundStyle(Theme.textTertiary)
                     }
-                    .buttonStyle(.tactile)
-                    .help("Refresh the diff \u{2014} show --diff --json")
-                }
 
-                if let issue = detail.changesIssue {
-                    Text(issue)
-                        .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.warn)
-                        .textSelection(.enabled)
-                } else if detail.changes == nil {
-                    Text("Reading the run diff \u{2026}")
-                        .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.textTertiary)
-                } else if detail.changes?.files.isEmpty == true {
-                    Text("No source changes recorded.")
-                        .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.textTertiary)
+                    ForEach(detail.changes?.files ?? [], id: \.path) { file in
+                        fileRow(file)
+                            .id(file.path)
+                    }
                 }
-
-                ForEach(detail.changes?.files ?? [], id: \.path) { file in
-                    fileRow(file)
-                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .onAppear { consumeDrill(proxy: proxy) }
+            .onChange(of: drill) { _, _ in consumeDrill(proxy: proxy) }
+            .onChange(of: detail.changes) { _, _ in consumeDrill(proxy: proxy) }
         }
+    }
+
+    /// `.changesFile` landing (§G1): select + expand + trigger the
+    /// existing lazy patch load — no new fetch path. Waits for the diff
+    /// list when the jump raced the on-demand `show --diff` read; jump
+    /// paths from trace exchanges are absolute worktree paths, so suffix
+    /// matching bridges them to the diff's repo-relative paths.
+    private func consumeDrill(proxy: ScrollViewProxy) {
+        guard case .changesFile(let target) = drill else { return }
+        guard let files = detail.changes?.files else { return }
+        let match = files.first { $0.path == target }
+            ?? files.first { target.hasSuffix("/" + $0.path) || $0.path.hasSuffix(target) }
+        if let match {
+            expandedPath = match.path
+            if detail.patches[match.path] == nil {
+                Task { await detail.loadPatch(path: match.path) }
+            }
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(match.path, anchor: .top)
+            }
+        }
+        drill = nil
     }
 
     @ViewBuilder private func fileRow(_ file: DiffSummaryModel.FileDelta) -> some View {
@@ -902,6 +1176,16 @@ struct ChangesView: View {
     }
 
     @ViewBuilder private func patchBody(path: String) -> some View {
+        // D6: the expanded header shows the FULL path (the collapsed row
+        // may middle-truncate with no recourse) + a copy affordance.
+        HStack(spacing: 6) {
+            Text(path)
+                .font(Theme.mono(10))
+                .foregroundStyle(Theme.textPrimary)
+                .textSelection(.enabled)
+            CopyTextButton(text: path, label: "copy path")
+            Spacer(minLength: 0)
+        }
         if let patch = detail.patches[path] {
             VStack(alignment: .leading, spacing: 3) {
                 if let note = patch.note {
@@ -964,9 +1248,17 @@ struct FlightView: View {
     @EnvironmentObject private var router: WriteSurfaceRouter
     @StateObject private var rewindCapability = VerbCapabilityProbe(
         cli: WriteCLI.client, verb: ["rewind"])
+    /// The card briefly flashed by a scrubber click (border swap, 250ms).
+    @State private var flashedCheckpointID: String?
+    /// A scrubber click's landing card, consumed inside the card scroller.
+    @State private var scrollTarget: String?
 
     var body: some View {
-        ScrollView {
+        // The facts + scrubber stay a FIXED band above the scrolling cards:
+        // the scrubber is chart-as-index (§G rule 2 — bands must not
+        // reflow), and an index that scrolls itself out of view on use
+        // loses the position it exists to give.
+        VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
                 if let issue = detail.flightIssue {
                     Text("recorder feed stopped: \(issue)")
@@ -994,17 +1286,57 @@ struct FlightView: View {
                         .foregroundStyle(Theme.textTertiary)
                 }
 
-                if detail.flight.checkpoints.isEmpty {
-                    Text("No checkpoints captured yet.")
-                        .font(Theme.body(10.5))
-                        .foregroundStyle(Theme.textTertiary)
-                }
-                ForEach(detail.flight.checkpoints.reversed(), id: \.checkpointID) { checkpoint in
-                    checkpointCard(checkpoint)
+                // V8: the scrubber — chart-as-index over the recorded
+                // stamps; it scrubs the eye, never the run.
+                let timeline = CheckpointTimeline.derive(
+                    checkpoints: detail.flight.checkpoints,
+                    sessions: detail.flight.manifest?.sessions ?? [],
+                    runStartedAt: detail.runState?.startedAt)
+                if !timeline.ticks.isEmpty {
+                    CheckpointScrubber(
+                        timeline: timeline,
+                        live: row.projection.phase != .terminal
+                    ) { checkpointID in
+                        scrollTarget = checkpointID
+                        flashedCheckpointID = checkpointID
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                if flashedCheckpointID == checkpointID {
+                                    flashedCheckpointID = nil
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
+            Divider().overlay(Theme.border)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        if detail.flight.checkpoints.isEmpty {
+                            Text("No checkpoints captured yet.")
+                                .font(Theme.body(10.5))
+                                .foregroundStyle(Theme.textTertiary)
+                        }
+                        ForEach(detail.flight.checkpoints.reversed(), id: \.checkpointID) { checkpoint in
+                            checkpointCard(checkpoint)
+                                .id(checkpoint.checkpointID)
+                        }
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .onChange(of: scrollTarget) { _, target in
+                    guard let target else { return }
+                    withAnimation(.easeOut(duration: 0.25)) {
+                        proxy.scrollTo(target, anchor: .center)
+                    }
+                    scrollTarget = nil
+                }
+            }
         }
         .task { await rewindCapability.probe() }
     }
@@ -1029,7 +1361,7 @@ struct FlightView: View {
             rewindAffordance(checkpoint)
         }
         .padding(8)
-        .cardChrome()
+        .cardChrome(hovering: flashedCheckpointID == checkpoint.checkpointID)
     }
 
     /// Armed by the capability probe, never a dead control: when the

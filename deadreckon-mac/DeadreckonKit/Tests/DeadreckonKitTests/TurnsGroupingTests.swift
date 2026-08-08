@@ -105,6 +105,55 @@ final class TurnsGroupingTests: XCTestCase {
         XCTAssertEqual(turns.map(\.turn), [7])
         XCTAssertEqual(turns[0].entries.map(\.text), ["provider_exchange"])
     }
+
+    // MARK: - K4: wall time + trace raw retention
+
+    func testWallSecondsAccumulateFromSpendDeltas() {
+        let json = #"{"timestamp": "2026-08-06T10:00:03Z", "run_id": "r", "event": {"kind": "spend_delta", "turn": 3, "cost_usd": 0.12, "wall_time_seconds": 50.7}}"#
+        let decoded = try! DeadreckonJSON.decoder().decode(RunEventRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.event.wallTimeSeconds ?? 0, 50.7, accuracy: 0.001)
+
+        let events = [
+            event("turn_started", turn: 3, at: 0),
+            decoded,
+            event("spend_delta", turn: 3, at: 5, cost: 0.08),   // no wall field: legacy row
+        ]
+        let turns = TurnsDerivation.group(events: events, traces: [])
+        XCTAssertEqual(turns[0].wallSeconds, 50.7, accuracy: 0.001,
+                       "wall time accumulates exactly as costUSD does; absent fields add nothing")
+    }
+
+    func testLegacyEventsWithoutWallFieldDecodeUnchanged() {
+        let json = #"{"timestamp": "2026-08-06T10:00:03Z", "run_id": "r", "event": {"kind": "spend_delta", "turn": 1, "cost_usd": 0.5}}"#
+        let decoded = try! DeadreckonJSON.decoder().decode(RunEventRecord.self, from: Data(json.utf8))
+        XCTAssertNil(decoded.event.wallTimeSeconds)
+        let turns = TurnsDerivation.group(events: [decoded], traces: [])
+        XCTAssertEqual(turns[0].wallSeconds, 0, "legacy ledgers derive an honest zero, not a guess")
+    }
+
+    func testTraceRawLinesRideOntoTraceEntries() {
+        let line = #"{"timestamp": "2026-08-06T10:00:00Z", "turn": 1, "event": "llm.complete"}"#
+        let traces: [(row: TraceRow, raw: String?)] = [
+            (row: TraceRow(timestamp: base, turn: 1, event: "llm.complete", latencyMS: 900),
+             raw: line)
+        ]
+        let turns = TurnsDerivation.group(events: [], traces: traces)
+        XCTAssertEqual(turns[0].entries[0].raw, line, "the verbatim source line rides the entry")
+        XCTAssertEqual(turns[0].entries[0].kind, .trace)
+    }
+
+    func testTraceRawCeilingDropsTheOldestRawsOnly() {
+        var accumulator = TurnsDerivation.Accumulator(traceRawCeiling: 2)
+        let traces: [(row: TraceRow, raw: String?)] = (1...4).map { index in
+            (row: TraceRow(timestamp: base.addingTimeInterval(Double(index)), turn: 1,
+                           event: "llm.complete", latencyMS: nil),
+             raw: "line-\(index)")
+        }
+        let turns = accumulator.fold(events: [], traces: traces)
+        XCTAssertEqual(turns[0].entries.count, 4, "the parsed entries themselves are never dropped")
+        XCTAssertEqual(turns[0].entries.map(\.raw), [nil, nil, "line-3", "line-4"],
+                       "only the newest raws survive the ceiling; the ledger on disk stays whole")
+    }
 }
 
 /// Integrity-chip derivation over JSONLTailer's jobEvents verdicts.
