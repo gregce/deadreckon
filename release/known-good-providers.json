@@ -1,32 +1,29 @@
 {
   "schema_version": 3,
-  "recorded_at": "2026-08-06T20:10:57Z",
-  "source_commit": "ecb741b6715660affb67cce31782a0011299bd86",
-  "deadreckon_version": "0.8.4",
+  "recorded_at": "2026-08-08T23:27:33Z",
+  "source_commit": "6b6e80c8754ee4201d9bd18026f5e5c0a459dddb",
+  "deadreckon_version": "0.8.5",
   "bundle": {
   "schema_version": 1,
-  "package_version": "0.8.4",
-  "bundle_build_id": "deadreckon-bundle-build-id-sha256:9d50fe9efcc25586c85a329df38bfecc755f6e723a7c3e3600201b271e27027b",
+  "package_version": "0.8.5",
+  "bundle_build_id": "deadreckon-bundle-build-id-sha256:a341f5d73ba8a87822408f2f4a5e468f1adf383c46474ffaff12fca312f66509",
   "binaries": {
     "deadreckon": {
-      "sha256": "483585f0850a3547889852c2d3ff1fe55d9c19d0720b3738ca317083e9936bf2",
-      "bytes": 23156032
+      "sha256": "1e6a15c847a9a0d0b771d6e195d88e2d4114558de049bb61a935ade386111752",
+      "bytes": 23635360
     },
     "dr-gate": {
-      "sha256": "2f9c512f10ac37118a809b2fe91200ffdc10e18a3db5982dc366a37b7be5da76",
-      "bytes": 2257520
+      "sha256": "16d363fdcd363a18434abff778f2c889fe2a06a3763e4d73b6ee224597cde0d0",
+      "bytes": 2257568
     },
     "dr-capture": {
-      "sha256": "4e51cedf55622cdfc039db41685e8ce5866c2c9fa91891889c8fa71951ce7f33",
-      "bytes": 7638448
+      "sha256": "84ee98c776fe9b10f92a8c2ac933d8c137f7ac7aa80afa50eabd34928b9a16f1",
+      "bytes": 7671504
     }
   }
 },
   "providers": [
-    {"route":"cli:claude-code","binary_version":"2.1.223 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.223 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"17d3edf9911b4911a35ef9c66788e798","operator":"gdc"},
-    {"route":"cli:codex","binary_version":"codex-cli 0.146.1","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.146.1","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"13ea829d9d034392a888cec7ab07f305","operator":"gdc"},
-    {"route":"cli:codex-server","binary_version":"codex-cli 0.146.1","reviewer_route":"cli:codex-server","reviewer_binary_version":"codex-cli 0.146.1","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"4f73b62c2aa447839d0be0e394d588bc","operator":"gdc"},
-    {"route":"cli:copilot","binary_version":"GitHub Copilot CLI 1.0.78.","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.146.1","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"81812f4f60994df1a635eb73ca89ccdc","operator":"gdc"},
-    {"route":"cli:opencode","binary_version":"1.18.14","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.146.1","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"a270efde67a444f39145f007e6dce212","operator":"gdc"}
+    {"route":"cli:claude-code","binary_version":"2.1.226 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.226 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"840f7ff897d843678d6b26e3234dd63c","operator":"gdc"},
+    {"route":"cli:codex","binary_version":"codex-cli 0.147.0","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.147.0","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"4d81922186e04e1b890e7762f4093c28","operator":"gdc"}
   ]
 }
