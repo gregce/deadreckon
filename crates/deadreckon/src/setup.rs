@@ -290,9 +290,10 @@ fn selection_for_route(
         if let Some(hint) = selection.install_hint.clone() {
             selection.try_lines.push(hint);
         } else if let Some(provider) = selection.provider.as_deref() {
-            selection.try_lines.push(format!(
-                "deadreckon config set providers.{provider}.api_key <KEY>"
-            ));
+            // Keys ride stdin, never argv: set-key is the sanctioned entry.
+            selection
+                .try_lines
+                .push(format!("deadreckon config set-key {provider}"));
         }
         if require_usable_route {
             let provider_label = selection

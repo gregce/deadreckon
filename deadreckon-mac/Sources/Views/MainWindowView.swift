@@ -21,6 +21,11 @@ struct MainWindowView: View {
     /// Set by the fresh-install invitation: the next New Goal sheet opens
     /// with the folder chooser armed (§B4).
     @State private var newGoalArmsChooser = false
+    /// The Library browser fills the center while no run is selected
+    /// (SETTINGS-SCREENS-SPEC §R3); Escape and ⌘1 return to the Overview.
+    @State private var libraryShown = false
+    /// Session-scoped "Set up later" for the first-run panel (§R2).
+    @State private var setupDismissed = false
 
     var body: some View {
         ZStack {
@@ -34,6 +39,10 @@ struct MainWindowView: View {
             // The transparent-titlebar window (fullSizeContentView): the
             // ground must paint up behind the traffic lights too.
             .background(Theme.windowBg.ignoresSafeArea())
+            // The one accent is also the control tint: AppKit-owned
+            // switches/checkboxes/radios otherwise render system blue — a
+            // foreign hue in the committed world. Sheets inherit it.
+            .tint(Theme.accent)
 
             // The window-level overlay layer: the palette renders ABOVE the
             // split view, so Command-K from any state shows a visible
@@ -45,12 +54,15 @@ struct MainWindowView: View {
             }
         }
         // Layered Escape: the palette consumes it first while shown;
-        // otherwise Escape steps back to the Overview.
+        // otherwise Escape steps back toward the Overview (run first, then
+        // the Library).
         .onExitCommand {
             if paletteShown {
                 paletteShown = false
             } else if selection != nil {
                 selection = nil
+            } else if libraryShown {
+                libraryShown = false
             }
         }
         .sheet(item: $router.pending, onDismiss: { newGoalArmsChooser = false }) { surface in
@@ -64,9 +76,14 @@ struct MainWindowView: View {
                     row: row,
                     fleet: store,
                     onSendBack: { router.pending = .sendBack(row) },
-                    onKill: { router.pending = .kill(row) })
+                    onKill: { router.pending = .kill(row) },
+                    onUndo: { router.pending = .undo(row) })
             case .sendBack(let row):
                 SendBackSheet(row: row)
+            case .rewind(let row, let runID, let checkpoint):
+                RewindSheet(row: row, runID: runID, checkpoint: checkpoint)
+            case .undo(let row):
+                UndoSheet(row: row)
             }
         }
         .background(shortcutButtons)
@@ -99,6 +116,11 @@ struct MainWindowView: View {
         if let item = liveSelection {
             RunDetailView(fleet: store, item: item)
                 .environmentObject(router)
+        } else if libraryShown {
+            LibraryView(store: store, onOpenRun: { item in
+                libraryShown = false
+                selection = item
+            })
         } else {
             OverviewView(
                 store: store,
@@ -108,7 +130,9 @@ struct MainWindowView: View {
                 onNewGoal: { armed in
                     newGoalArmsChooser = armed
                     router.pending = .newGoal
-                })
+                },
+                onLibrary: { libraryShown = true },
+                setupDismissed: $setupDismissed)
         }
     }
 
@@ -117,6 +141,11 @@ struct MainWindowView: View {
         switch request {
         case .gateQueue:
             selection = nil
+            libraryShown = false
+            shell.request = nil
+        case .library:
+            selection = nil
+            libraryShown = true
             shell.request = nil
         case .search:
             paletteShown = true

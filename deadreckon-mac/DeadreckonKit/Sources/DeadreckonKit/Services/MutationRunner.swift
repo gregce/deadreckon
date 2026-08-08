@@ -93,6 +93,60 @@ public enum PlannedVerb: Equatable, Sendable {
     /// Read-only (no --yes): a missing contract is a normal exit-0
     /// "default_gate" envelope, never a refusal.
     case defDoneShow(directory: String?)
+    /// `config set KEY VALUE --json`. The key is app-authored (the binary's
+    /// validated key set); the VALUE is operator-typed, so both ride after
+    /// the `--` terminator. Secret keys (providers.<route>.api_key) are
+    /// refused by the binary toward set-key — this case cannot carry one
+    /// usefully by construction.
+    case configSet(key: String, value: String)
+    /// `config unset KEY --json`. Removing an absent key is a binary-side
+    /// no-op envelope, never a refusal.
+    case configUnset(key: String)
+    /// `config set-key ROUTE --json` — the secret NEVER rides this enum
+    /// (Equatable, displayable): argv carries only the route, and the key
+    /// bytes travel exclusively through the dispatch call's stdin parameter
+    /// (SETTINGS spec rule 4).
+    case configSetKey(route: String)
+    /// `config unset-key ROUTE --json` (the shipped removal form).
+    case configUnsetKey(route: String)
+    /// `supervisor install --json`: writes the managed per-user unit only;
+    /// enable/start stays a separate verb.
+    case supervisorInstall
+    /// `supervisor start --json`: enable + start the installed unit.
+    case supervisorStart
+    /// `supervisor stop --json`: disable + unload; the unit is retained.
+    case supervisorStop
+    /// `doctor --repair --json`: the binary's three bounded repairs, with
+    /// their outcomes serialized in the report's repairs[] rows. Repairs
+    /// gain no authority from the app — this only dispatches and renders.
+    case doctorRepair
+    /// `rewind RUN --to-checkpoint C --preview --json`: read-only preview —
+    /// the binary materializes the checkpoint into a preview directory and
+    /// reports the files that would change WITHOUT touching the workspace.
+    /// Both ids are file/envelope truth (checkpoint manifests, run
+    /// resolution), never operator-typed text.
+    case rewindPreview(runID: String, checkpoint: String)
+    /// `rewind RUN --to-checkpoint C --apply --json`: the hash-guarded
+    /// apply. The guard is the CLI's, not the app's: a drifted file refuses
+    /// binary-side ("refusing rewind because {path} has unrelated edits")
+    /// and the refusal renders verbatim. Preview-first is enforced by the
+    /// RewindCoordinator — this case is only reachable from a previewed
+    /// state.
+    case rewindApply(runID: String, checkpoint: String)
+    /// `undo ID --no-confirm --json`. The shipped binary REQUIRES
+    /// `--no-confirm` for a non-interactive Job undo (undo.rs: "non-
+    /// interactive Job undo requires --no-confirm"); the sheet's destructive
+    /// confirm click IS that confirmation, exactly as the finish sheet's
+    /// Approve is `--yes`. The vendored 0.8.4 binary predates `undo --json`
+    /// entirely, so the affordance is capability-gated (VerbCapabilityProbe)
+    /// and never renders against it.
+    case undo(id: String)
+    /// `try --json`: the keyless local smoke proof (first-run §R2 "prove
+    /// it"). Runs a real tiny run in a throwaway workspace inside
+    /// DEADRECKON_HOME — state-changing, so it rides the one dispatcher —
+    /// and emits a bare proof document, NOT a kind-scaffold envelope. Its
+    /// trust words ("untrusted local smoke diagnostic") render verbatim.
+    case tryProof
 
     public var verbWord: String {
         switch self {
@@ -102,6 +156,12 @@ public enum PlannedVerb: Equatable, Sendable {
         case .extendJob: return "extend"
         case .startPreview, .startExecute: return "start"
         case .defDoneDeclare, .defDoneShow: return "def-done"
+        case .configSet, .configUnset, .configSetKey, .configUnsetKey: return "config"
+        case .supervisorInstall, .supervisorStart, .supervisorStop: return "supervisor"
+        case .doctorRepair: return "doctor"
+        case .rewindPreview, .rewindApply: return "rewind"
+        case .undo: return "undo"
+        case .tryProof: return "try"
         }
     }
 
@@ -181,6 +241,33 @@ public enum PlannedVerb: Equatable, Sendable {
                 argv.append(contentsOf: ["--dir", directory])
             }
             return argv
+        case .configSet(let key, let value):
+            // The value is operator-typed: `--` first so "-5" or a pasted
+            // "--flag" reaches clap as literal text.
+            return ["config", "set", "--json", "--", key, value]
+        case .configUnset(let key):
+            return ["config", "unset", "--json", "--", key]
+        case .configSetKey(let route):
+            // argv carries ONLY the route; the secret rides stdin.
+            return ["config", "set-key", "--json", "--", route]
+        case .configUnsetKey(let route):
+            return ["config", "unset-key", "--json", "--", route]
+        case .supervisorInstall:
+            return ["supervisor", "install", "--json"]
+        case .supervisorStart:
+            return ["supervisor", "start", "--json"]
+        case .supervisorStop:
+            return ["supervisor", "stop", "--json"]
+        case .doctorRepair:
+            return ["doctor", "--repair", "--json"]
+        case .rewindPreview(let runID, let checkpoint):
+            return ["rewind", runID, "--to-checkpoint", checkpoint, "--preview", "--json"]
+        case .rewindApply(let runID, let checkpoint):
+            return ["rewind", runID, "--to-checkpoint", checkpoint, "--apply", "--json"]
+        case .undo(let id):
+            return ["undo", id, "--no-confirm", "--json"]
+        case .tryProof:
+            return ["try", "--json"]
         }
     }
 
@@ -194,6 +281,18 @@ public enum PlannedVerb: Equatable, Sendable {
         // binary's own cumulative authoring budget.
         case .startPreview, .startExecute, .defDoneDeclare: return 300
         case .defDoneShow: return 60
+        // Config writes are one TOML round-trip.
+        case .configSet, .configUnset, .configSetKey, .configUnsetKey: return 60
+        // Supervisor lifecycle shells out to launchctl/systemctl.
+        case .supervisorInstall, .supervisorStart, .supervisorStop: return 120
+        // Repair may reinstall the service and rewrite the receipt.
+        case .doctorRepair: return 300
+        // Rewind materializes a full checkpoint tree into the preview dir.
+        case .rewindPreview, .rewindApply: return 300
+        // Undo is one snapshot restore or one exact revert commit.
+        case .undo: return 120
+        // The smoke proof runs a real tiny run; the row shows elapsed time.
+        case .tryProof: return 600
         }
     }
 
@@ -227,9 +326,15 @@ public final class MutationRunner {
     /// Run the verb to completion and classify its machine output. A locator
     /// failure (no trusted binary) or launch failure comes back as an
     /// envelope-free result carrying the failure's own words.
-    public func run(_ verb: PlannedVerb) async -> MutationResult {
+    ///
+    /// `stdin` is the secret-over-stdin path (`configSetKey` only): the
+    /// bytes go to the child through the CLI seam and are never retained,
+    /// logged, or echoed by this runner — the verb's argv (and therefore
+    /// every command well and transcript) carries only the route.
+    public func run(_ verb: PlannedVerb, stdin: Data? = nil) async -> MutationResult {
         do {
-            let result = try await cli.run(arguments: verb.arguments, timeout: verb.timeout)
+            let result = try await cli.run(
+                arguments: verb.arguments, timeout: verb.timeout, stdin: stdin)
             return MutationResult.classify(
                 stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode)
         } catch {

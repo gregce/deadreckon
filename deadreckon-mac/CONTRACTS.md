@@ -1616,18 +1616,19 @@ Invariants (each tested in AttentionCenterTests):
   NOT rendered — per-day spend is not derivable from the rollup's
   cumulative heads and would need fleet-wide spend tails, which the
   bounded-tails contract forbids for a footer.
-- **App icon:** real AppIcon set generated (flat anchor on deep blue,
-  1024 master + all standard macOS sizes) from `scripts/app-icon.svg` via
-  rsvg-convert; regenerate with
-  `rsvg-convert -w <size> -h <size> scripts/app-icon.svg -o icon_<n>.png`.
-  Menubar glyphs remain SF Symbols template images. Glyph identity across
-  the five states (VALIDATE fix pass): `.attention` keeps the helm and
-  puts the decision count BESIDE it (the helm is the identity the operator
-  scans for in exactly the state that needs finding; a bare "N.circle"
-  read as a different app), `.idle`/`.loading` are the helm (anchor text
-  fallback where the symbol is missing), and `.live`'s helm-to-sailboat
-  shape swap is a DELIBERATE divergence kept as the running-state marker —
-  recorded here so it reads as intent, not drift.
+- **App icon (SETTINGS-SCREENS-SPEC §I, supersedes the anchor):** the
+  AppIcon set is the committed diamond brand mark — charcoal instrument
+  face (`panel` #1D1C1A), 10-unit `border` machined edge, 45° diamond
+  split into two flat facets (`accent` lit / `accentDown` shade), no
+  gradients or shadows. Master `design/icon.svg`; every slot rendered at
+  its exact pixel size via `scripts/render-appicon.sh` (rsvg-convert) —
+  never downscaled from one raster. Verified against renders: at 16px the
+  mark reads as one solid orange diamond on a charcoal tile; the facet
+  reads from 32px; the edge from 128px. Menubar glyphs remain the SF
+  Symbols diamond family (idle `diamond`, live/attention `diamond.fill` —
+  DESIGN §8); `design/menubar-diamond-template.svg` is the optional
+  pixel-true template asset, deliberately NOT shipped in v1 (the SF
+  family is faithful — spec §I2).
 
 Wiring: AppDelegate owns the adapter and the AttentionCenter
 (`rowsProvider` = the loaded queue's rows; empty while loading, which the
@@ -1637,3 +1638,341 @@ chip) and SettingsView (per-job issue rows) so `issues` always has an
 operator-visible surface. AttentionCenter tails are read-only; the
 quit-time SIGTERM sweep continues to cover only CLI children (fleet +
 shared write client).
+
+## SETTINGS Implementer A — config/service/doctor envelopes + the settings window (as built)
+
+Built against the LANDED Rust envelopes (crates/deadreckon/src/main.rs
+`config_*_command`, commands/supervisor_service.rs, commands/doctor.rs).
+Where SETTINGS-SCREENS-SPEC §P guessed a shape, the shipped serializer won
+and the corrections are recorded here (spec rule: reconcile toward
+shipped). The vendored 0.8.4 binary predates the config envelopes and the
+v4 status report, so every armed surface has a live degraded path.
+
+### Four settings laws (restated as contracts, each tested)
+
+1. **Capability probe, decode-or-degrade.** Every envelope-gated surface
+   probes at open (`config show --json` / `supervisor status --json` /
+   `doctor --json`) and either arms from the decoded envelope or renders
+   the failure words VERBATIM with the CLI escape hatch named. No
+   hardcoded gap labels; when the binary grows the envelope the surface
+   arms itself with zero label edits. (ConfigStoreTests probe tests pin
+   the live 0.8.4 clap prose; ServiceControllerTests pin the live
+   checkpoint-absent prose refusal.)
+2. **Write-then-re-read, never optimistic.** Every settings mutation is
+   one MutationRunner verb; the store then RE-READS the read surface
+   before anything renders a value. The write's own echo never paints the
+   UI (tested: a lagging re-read wins over the set's echoed value).
+3. **The stdin redaction rule.** API keys travel exclusively as the
+   dispatch call's `stdin: Data?` through `FleetCLIRunning.run(arguments:
+   timeout:stdin:)` -> `CLIRunner` (pipe written after launch, closed for
+   EOF, `F_SETNOSIGPIPE`, write errors swallowed WITHOUT capturing the
+   payload). `PlannedVerb.configSetKey(route:)` has no secret parameter
+   BY CONSTRUCTION — no argv, command well, transcript, log, or Equatable
+   dump can carry key bytes. Key state renders only from `config show`'s
+   structural redaction ("configured" marker). Pinned in
+   ConfigStoreTests.testNoAPIKeyByteEverLandsInAnyModelOrCommand and
+   CLIRunnerStdinTests (real-child round trip).
+4. **The app never renders raw config.toml.** The ADVANCED disclosure and
+   every value row come from the envelope's redacted document/`settings`
+   map; raw file bytes could carry key material, so the degraded state
+   (older binary) shows NO value rows — banner + terminal handoff only.
+   This is a deliberate narrowing of spec §S1's "read-only value rows
+   from the raw file well" sketch, in favor of spec rule 4.
+
+### New PlannedVerb cases (Services/MutationRunner.swift)
+
+```swift
+case configSet(key: String, value: String) // config set --json -- KEY VALUE (value operator-typed)
+case configUnset(key: String)              // config unset --json -- KEY
+case configSetKey(route: String)           // config set-key --json -- ROUTE (secret via stdin ONLY)
+case configUnsetKey(route: String)         // config unset-key --json -- ROUTE (the shipped removal form)
+case supervisorInstall                     // supervisor install --json
+case supervisorStart                       // supervisor start --json
+case supervisorStop                        // supervisor stop --json
+case doctorRepair                          // doctor --repair --json (flag conflict lifted Rust-side)
+// timeouts: config 60s, supervisor 120s, repair 300s
+// MutationRunner.run(_:stdin:) — stdin passthrough, never retained/logged
+```
+
+### Envelope decode contracts (Models/MutationEnvelopes.swift), spec §P -> shipped
+
+- `VerdictBlock` — the shared `verdict{kind,label,subject,
+  recommended_command,explanation,evidence[[k,v]]}` every armed G1 success
+  envelope carries (verdict_surface.rs `add_to_json`); words render
+  verbatim.
+- `ConfigShowEnvelope` (§P1 CORRECTED): kind "config" + `action:"show"`
+  discriminator (not a bespoke kind); the map is `settings` (not
+  `values`) with `{value, source:"set"|"default"}` provenance and pinned
+  built-in defaults serialized (null = "unset, decided contextually");
+  there is NO separate `keys` map — key state is structural redaction
+  inside `providers` (`api_key` slots read the literal marker
+  "configured"); `file` is the complete REDACTED document;
+  `config_exists`, `provider_override_files`, fallback ride along.
+- `ConfigWriteEnvelope` (§P2/§P3 CORRECTED): kind is ALWAYS "config"
+  (never "config_set"/"config_set_key"); discriminator `action` in
+  set|unset|set-key|unset-key; `id` = dotted key or route. set facts
+  `{key,value,previous,config_path}`; unset `{key,removed}` (absent key =
+  exit-0 no-op envelope, status "no-op"); set-key
+  `{provider,stored,keychain_or_file:"file"}`; unset-key
+  `{provider,removed,keychain_or_file}`. No field can carry key material.
+  Refusals are the shared `{kind:"error",verb:"config"}` envelope
+  (argv-secret attempts refuse toward set-key/unset-key).
+- `ServiceStatusReport` (§P4 CORRECTED): `supervisor status --json` is a
+  BARE typed document (schema_version 4), NOT a kind-scaffold envelope.
+  v4 adds the two-source truth: `service` running|stopped|not_installed,
+  `home_checkpoint` present|absent|stale, `verdict`
+  healthy|degraded|foreign_home|down (NOT the spec's guessed
+  running/stale/... vocabulary), `verdict_reason` (most specific verbatim
+  fact), `checkpoint{generation,instance_id,boot_id,pid,
+  process_start_identity,started_at,binary,deadreckon_home,
+  bundle_build_id,binary_sha256}`, `current_boot_id`,
+  `boot_identity_source`, `test_override`. There is NO launchd label or
+  unit path on status (those ride the lifecycle envelopes). v3 reports
+  (older binary) decode with the typed fields nil and classify from
+  installed+loaded/active; the pre-v4 checkpoint-absent case is a PROSE
+  refusal on stderr (exit 1, live-pinned) and degrades to verdict
+  Unknown + words verbatim. The app's display verdict
+  (`ServiceController.displayVerdict`) types on the shipped words:
+  healthy->Running, foreign_home->"Running for a different home",
+  degraded+stale-unit->Outdated, degraded->Degraded(+reason quoted),
+  down->Stopped/Not installed by `service`, manager unsupported->
+  Unsupported. Two sources are never averaged into a guess.
+- `SupervisorLifecycleEnvelope` (§P6 CORRECTED): kind "supervisor" with
+  `id`/`action` = install|start|stop (not "supervisor_install"); the path
+  field is `unit_path` (platform-neutral, not plist_path); `result` in
+  installed|already-installed|updated|started|stopped|already-stopped;
+  `service_state` is a post-action observation that may be "unknown"
+  (unreadable manager never turns a completed mutation into a refusal).
+  Resolution discipline: the sheet resolves on this envelope, then the
+  section re-polls `status` before repainting (tested). Unmanaged-unit
+  conflicts refuse with the shared error envelope, rendered verbatim —
+  no force affordance exists.
+- `DoctorReportEnvelope` (§P5 CORRECTED): the real doctor document
+  (kind "doctor", findings[{status,subject,detail,action?}] in the
+  binary's triage order, config_present, sandboxes[{backend,available,
+  path,note}], binary_health{...live-corroborated fields...}, seams) plus
+  `repairs[{attempted,result,detail}]` under `--repair --json`. There is
+  NO per-finding `repairable` flag — §S6's documented fallback ships: ONE
+  section-level [Repair…] gated on `repairAvailable`
+  (`repairable_receipt` || `repairable_active_installation` || a failed
+  "supervisor service" finding). `rawJSON` retains the exact bytes for
+  the raw-report disclosure. Repairs gain no authority app-side.
+
+### New Kit engines (fake-runner tested)
+
+```swift
+@MainActor public final class ConfigStore: ObservableObject      // Capability probe + writes + re-read; saveKey(route:secret:) is the only secret entry point
+@MainActor public final class ServiceController: ObservableObject // status poll + DisplayVerdict + install/start/stop dispatch + post-write re-poll
+@MainActor public final class DoctorStore: ObservableObject       // doctor --json retention + doctor --repair --json + repairAvailable probe
+```
+
+`FleetCLIRunning` requirement is now `run(arguments:timeout:stdin:)`; the
+historical two-argument form is a protocol-extension convenience (every
+read caller unchanged). `CLIRunner` init and `run`/`runDetailed` accept
+`stdin: Data?` (nil = null device, unchanged behavior).
+
+### Settings window (Sources/Views/SettingsView.swift + SettingsSystemSections.swift)
+
+§S0 as built: 840×600 two-pane window; 200px sidebar (General / Agents &
+Keys / Service / Notifications / Binaries / Health; selection = well +
+borderHover, accent never selection); `@AppStorage("settings.section")`
+deep link (sidebar health footer writes "health" before openSettings; the
+only navigation state). The Info tab dissolved into Binaries (nothing
+lost: app version, vendored manifest + sha rows, CLI reports,
+DEADRECKON_BIN override, dr-gate pins + doctor's protocol/compat facts,
+installed CLIs with roles in plain words + update_command wells
+[the guided self-update handoff], conflicts verbatim [group absent when
+zero], handshake + DEADRECKON_HOME). Service: one verdict word + evidence
+disclosure (both sources quoted) + state-dependent buttons; the ONE typed
+confirm in Settings is Stop ("stop" arms, stroke warn->success) —
+install/start are constructive plain confirms. Health: doctor's verdict
+words + findings table (binary order, expandable) + section-level
+Repair + raw JSON disclosure. Notifications: prior content restyled,
+behavior unchanged; launch-at-login + dark-only note live in General's
+Startup card.
+
+## SETTINGS Implementer B — dispositions, first-run, Library (as built)
+
+SETTINGS-SCREENS-SPEC §R1/§R2/§R3 against the vendored 0.8.4 binary, with
+every §P7 guess reconciled toward the SHIPPED Rust serializers before any
+Swift decoder was written (spec rule 2). Live corroboration 2026-08-07:
+`library list --json` and `try --json` are real at 0.8.4; `rewind --json`
+exists but its refusals are prose (the arming is in the concurrent Rust
+batch); `undo` predates `--json` entirely (clap exit 2, pinned).
+
+### New PlannedVerb cases (Services/MutationRunner.swift)
+
+```swift
+case rewindPreview(runID:checkpoint:) // rewind RUN --to-checkpoint C --preview --json (read-only binary-side)
+case rewindApply(runID:checkpoint:)   // rewind RUN --to-checkpoint C --apply --json (hash-guarded)
+case undo(id: String)                 // undo ID --no-confirm --json
+case tryProof                         // try --json (state-changing: writes a scratch run under HOME)
+// timeouts: rewind 300s (materializes a checkpoint tree), undo 120s, try 600s
+```
+
+RECONCILED toward shipped: the spec's `deadreckon undo {id} --json`
+spelling is insufficient — undo.rs REFUSES non-interactive Job undo
+without `--no-confirm` ("non-interactive Job undo requires --no-confirm"),
+so the app's argv always carries it and the UndoSheet's destructive
+confirm click IS that confirmation (the finish `--yes` pattern). Both
+rewind ids are envelope/file truth (checkpoint manifests, resolved run
+id), never operator-typed, so no `--` terminator is involved.
+
+### Envelope decode contracts (Models/DispositionEnvelopes.swift)
+
+- `RewindEnvelope` (§P7 CORRECTED): the `rewind --json` success payload is
+  BESPOKE (predates G1 — no kind scaffold): `{run_id, mode:
+  "preview"|"apply", target{kind: turn|provider_event|checkpoint, id},
+  checkpoint_id, preview_dir, files: [path], primary_action, verdict{…}}`.
+  `files` is a plain path array — there is NO per-file change word and NO
+  per-file hash-guard state in the shipped payload; the spec's sketched
+  `{path, change, hash_guard}` rows do not exist. The hash guard runs
+  binary-side at apply time and a drifted file arrives as a refusal
+  quoting "refusing rewind because {path} has unrelated edits", rendered
+  verbatim. Refusals: armed binaries emit the shared `{kind:"error",
+  verb:"rewind"}` envelope; the vendored 0.8.4 binary emits prose on
+  stderr (exit 1, live-pinned) which classifies envelope-free and renders
+  the established "The CLI answered without a machine envelope (exit N);
+  it said:" pattern.
+- `UndoEnvelope`: the armed G1 scaffold (kind "undo", id, status
+  "completed"|"no-op", next_actions, try_lines, primary_action, verdict)
+  plus `undo_kind`-discriminated facts — "run-snapshot"
+  {restored_turn, snapshot, workspace} · "job-delivery" {destination,
+  target_ref, reverted_revision, undo_revision, already_undone} · "chain"
+  {undone_steps, workspace}. Absent facts stay nil, never guessed.
+- `LibraryListEnvelope` (real, live-corroborated): kind "library_list",
+  id "current-scope"|"all-scopes", status, artifacts[]{manifest{run_id,
+  scope, goal, promoted_at, source_working_dir, provenance_hash,
+  schema_version, payload_files?, payload_bytes?}, path,
+  materialized_count}, next_actions, try_lines. payload_* are integers
+  and ABSENT on schema_version-1 manifests (absent stays nil; the row
+  omits the size facts). One undecodable artifact row costs exactly that
+  row (`unreadableCount`), siblings survive — the fleet quarantine
+  discipline.
+- `TryProofEnvelope` (real, live-corroborated): a BARE document, not a
+  kind-scaffold envelope: `{run_id, trust, trusted_job_receipt, gate,
+  proof, story, lineage, next}`. Trust-words contract: `trust`
+  ("untrusted local smoke diagnostic") and `gate` ("local smoke gate
+  evidence only; not a trusted Job receipt") ALWAYS render verbatim — the
+  proof row never claims more than the binary claimed, and
+  `trusted_job_receipt` is the binary's own boolean.
+
+### Verb-flag capability probe (Services/DispositionCoordinators.swift)
+
+`VerbCapabilityProbe`: whether the located binary's verb speaks `--json`
+is probed by reading the verb's own `--help` (read-only, no side effects)
+for the literal `--json` token — clap generates the listing from the real
+flag set, so the token's presence IS the capability fact. No hardcoded gap
+labels (FULL-DRIVE finding 6): when a newer binary lands, the affordance
+arms itself with zero label edits. As probed at 0.8.4 (pinned in tests):
+rewind arms, undo does not — so the Recorder's [Rewind…] is LIVE against
+the vendored binary and [Undo…] never renders against it.
+
+### Coordinators (Services/DispositionCoordinators.swift, fake-tested)
+
+- `RewindCoordinator` — preview-first is STRUCTURAL: `apply()` dispatches
+  only from a `.previewed` phase (tested: apply from idle reaches no
+  binary); `loadPreview()` fires once per sheet open. Preview/apply each
+  classify into previewed/applied (decoded envelope), refused (typed,
+  verbatim), or envelope-free (exit + words verbatim — the 0.8.4 path).
+- `UndoCoordinator` — one dispatch per sheet: any terminal phase disarms
+  re-dispatch (tested); resolution only from the decoded envelope.
+- `TryController` — `try --json` through the one dispatcher (600s);
+  running state carries `startedAt` (the row shows elapsed time — the
+  proof legitimately takes minutes); failed proofs may be re-run.
+- `LibraryStore` — `library list [--all] --json`, decode-or-degrade;
+  client-side filter over goal/scope/run id (`library search` has no
+  --json — live — and stays CLI). DEFAULT SCOPE IS --all (documented
+  decision): the app's CLI client does not run from a project directory,
+  so "current scope" resolves to nothing from the app's seat; the
+  [This project | All projects] toggle stays for operators who care.
+- `SetupDerivation` — pure §R2 completeness: incomplete iff any KNOWN
+  fact says so (doctor `config_present == false`, zero provider probe
+  rows, service positively "not installed"). Unknown facts never summon
+  the panel (a broken probe falls toward the standard empty state);
+  service stopped/degraded is Settings remediation, not first-run.
+
+### Views (Sources, app target)
+
+- `RewindSheet` (560, WriteSurfaceRouter case `.rewind(row, runID,
+  checkpoint)`): opens straight into the preview dispatch; checkpoint
+  facts from the manifest the card showed; FILES THAT WOULD CHANGE as
+  plain mono paths (the shipped payload's whole truth) + the guard caption
+  ("the guard is the CLI's, not the app's"); [Rewind Run] destructive
+  confirm arms only from a successful preview; applied facts render the
+  envelope's own verdict evidence verbatim; the Recorder re-reads from
+  files (no optimism). The Recorder tab's [Rewind…] arms via the
+  capability probe; runID = `detail.currentRunID ?? row.jobID`
+  (Single-shape: run id == job id).
+- `UndoSheet` (520, router case `.undo(row)`): §R1 words; command well
+  `deadreckon undo <id> --no-confirm --json`; resolution from the
+  UndoEnvelope's undo_kind facts + next actions verbatim. The [Undo…]
+  affordance renders ONLY in the ReviewApproveSheet's apply-success band,
+  gated on BOTH the envelope's own `deadreckon undo` next-action offer
+  (the existing honest-claim rule) AND the undo capability probe — the
+  advertised undo stops being dead text on an armed binary and never
+  becomes a dead control on 0.8.4. Undo-ability is never guessed for
+  older rows (it is not a durable rollup fact).
+- First-run (§R2): `FirstRunGate` + `FirstRunPanel` replace the
+  empty-fleet center while setup is incomplete — ONE panel, five rows
+  (CLI verified/override/failed from BinaryLocator+manifest; Agent radio
+  from the live providers probe with failed probes visible-disabled +
+  try lines verbatim; Key row only for api: routes — armed config:
+  SecureField + stdin-backed save + structural-redaction chip; degraded:
+  Terminal handoff command well, never a dead control; Service verdict
+  word + [Install & start…] chaining §S3's two confirms into ONE sheet
+  listing both command wells, refusals stop the chain; Prove it =
+  TryController with elapsed time + trust words verbatim). Footer [Start
+  your first goal] (the surface's one primary) gates on rows 1–2 green
+  only; "Set up later" dismisses for the session. A landed config write
+  re-probes doctor + providers so the panel can yield the moment every
+  row is green; it never returns once runs exist (the gate only renders
+  on an empty fleet).
+- `LibraryView` (§R3): main-window center (View > Library ⌘L via
+  ShellModel `.library`, or the quiet "Library →" in RECENTLY FINISHED;
+  Escape/⌘1 return to Overview). Header count + scope toggle + filter
+  field; 40px rows (goal · plain project name with full scope tooltip ·
+  promoted relative time · size facts when present · run id mono);
+  hover/context Reveal in Finder + Copy run id; a row whose run id still
+  resolves in the fleet opens that run; empty and degraded states per
+  spec.
+- Discard (§A0/§R1): unchanged — the Review sheet still has NO Discard
+  control; the registered gap stands until the binary speaks a Job-level
+  discard envelope.
+
+## SETTINGS validation pass (2026-08-07, live against v0.8.4-18-g46ee1f9)
+
+Evidence: `design/validation/settings-*.png` (seeded scratch home: mock
+provider route, stdin-stored fake key, one verified-at-gate run, one
+judge-uncertain run, one legacy `try` run; supervisor installed for the
+scratch home). Contracts added or corroborated:
+
+- **Redaction, live-probed:** `config show --json` after `config set-key`
+  never emits stored key bytes — the providers entry AND the whole
+  redacted `file` document carry only the "configured" marker (grep over
+  the raw envelope: zero hits). The text-only `config get
+  providers.<route>.api_key` DOES print the stored key in Terminal —
+  binary-side behavior outside the app's surface (the app never
+  dispatches `config get`; PlannedVerb has no case for it). Recorded as a
+  Rust-side observation, not an app hole.
+- **Control tint:** the window roots (`MainWindowView`, `SettingsView`,
+  `MenuBarPopover`) set `.tint(Theme.accent)` so AppKit-owned
+  switches/checkboxes/radios speak the one accent instead of system blue
+  (DESIGN §2's single-accent discipline; sheets inherit the tint from
+  their presenting root).
+- **Checkpoint trigger words:** `Lexicon.checkpointTrigger` maps the
+  manifest's snake_case `CheckpointTrigger` to plain words ("provider
+  checkpoint" et al.) on the Recorder card and RewindSheet fact lines;
+  unknown raw words pass verbatim. File counts pluralize.
+- **Known Rust-side integration gaps (app renders both honestly):**
+  (1) `rewind` on a Job-owned run refuses "…is a job, not a run" — the
+  ref resolver suppresses the run match when run id == job id, so the
+  armed [Rewind…] on Job rows currently lands in the typed-refusal
+  rendering (verbatim, with try lines); the happy preview path is real
+  and validated against a legacy run. (2) the shipped `finish --yes`
+  apply-success envelope's `next_actions` offers cleanup/show but NOT
+  `deadreckon undo`, so the honest-claim-gated [Undo…] never renders even
+  though `undo --no-confirm --json` is armed and round-trips (validated
+  live: finish applied 7 files; undo reverted them with a typed
+  `undo_kind: job-delivery` envelope). Both resolve binary-side; no app
+  change may paper over them (trust rule 2).

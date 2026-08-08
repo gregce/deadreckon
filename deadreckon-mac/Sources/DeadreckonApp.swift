@@ -179,9 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let mainWindow else { return }
         NSApp.setActivationPolicy(.regular)
         // An LSUIElement app that flips to .regular gets the generic Dock
-        // tile unless the icon is set at runtime. APP-5 filled the AppIcon
-        // set (flat anchor on deep blue; master SVG in scripts/app-icon.svg,
-        // rendered via rsvg-convert), so this resolves the real icon.
+        // tile unless the icon is set at runtime. The AppIcon set is the
+        // committed diamond brand mark (master SVG in design/icon.svg,
+        // rendered per-size via scripts/render-appicon.sh — SETTINGS spec
+        // §I), so this resolves the real icon.
         NSApp.applicationIconImage = NSImage(named: "AppIcon")
         mainWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

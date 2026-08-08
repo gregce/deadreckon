@@ -91,8 +91,9 @@ use deadreckon_protocol::{
     FlightEvent, FlightEventKind, RunEvent, RunEventKind, SpendRecord, TraceRecord,
 };
 use deadreckon_providers::registry::{
-    DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage, ModelCatalogOverride,
-    ProbeStatus, ProviderDescriptor, ProviderProbeOptions, ProviderProbeResult, ProviderRegistry,
+    AuthKind, DescriptorKind, IngestCwdMatch, IngestDescriptor, IngestStorage,
+    ModelCatalogOverride, ProbeStatus, ProviderDescriptor, ProviderProbeOptions,
+    ProviderProbeResult, ProviderRegistry,
 };
 use deadreckon_providers::taxonomy::normalize_tool_category;
 use deadreckon_providers::{
@@ -1014,8 +1015,8 @@ async fn main_inner() -> Result<()> {
                     &DeadreckonPaths::discover(),
                     false,
                 )?;
-                commands::supervisor_service::supervisor_service_install_command()?;
-                commands::supervisor_service::supervisor_service_start_command()
+                commands::supervisor_service::supervisor_service_install_command(false)?;
+                commands::supervisor_service::supervisor_service_start_command(false)
             } else {
                 commands::init::init_command(
                     provider,
@@ -1158,17 +1159,21 @@ async fn main_inner() -> Result<()> {
                 launch_id,
                 &release_token_sha256,
             ),
-            SupervisorCommand::Install => {
-                commands::supervisor_service::supervisor_service_install_command()
+            SupervisorCommand::Install { json } => {
+                machine_json::arm("supervisor", json);
+                commands::supervisor_service::supervisor_service_install_command(json)
             }
-            SupervisorCommand::Start => {
-                commands::supervisor_service::supervisor_service_start_command()
+            SupervisorCommand::Start { json } => {
+                machine_json::arm("supervisor", json);
+                commands::supervisor_service::supervisor_service_start_command(json)
             }
             SupervisorCommand::Status { json } => {
+                machine_json::arm("supervisor", json);
                 commands::supervisor_service::supervisor_service_status_command(json)
             }
-            SupervisorCommand::Stop => {
-                commands::supervisor_service::supervisor_service_stop_command()
+            SupervisorCommand::Stop { json } => {
+                machine_json::arm("supervisor", json);
+                commands::supervisor_service::supervisor_service_stop_command(json)
             }
         },
         Commands::Run {
@@ -1609,6 +1614,10 @@ async fn main_inner() -> Result<()> {
             .await
         }
         Commands::Doctor { json, live, repair } => {
+            // Doctor keeps its own report payload, but arming gives `--json`
+            // refusals the shared error envelope and keeps nested repair
+            // prose (supervisor install/start) off the machine stdout stream.
+            machine_json::arm("doctor", json);
             commands::doctor::doctor_command(json, live, repair).await
         }
         Commands::Seams { command } => commands::seams::seams_command(command).await,
@@ -1718,16 +1727,20 @@ async fn main_inner() -> Result<()> {
             force,
             overwrite,
             keep_branch,
-        } => commands::lifecycle::cleanup_command(commands::lifecycle::CleanupCommandRequest {
-            run_id,
-            all,
-            completed,
-            stale,
-            no_confirm,
-            escalate: force,
-            overwrite,
-            keep_branch,
-        }),
+            json,
+        } => {
+            machine_json::arm("cleanup", json);
+            commands::lifecycle::cleanup_command(commands::lifecycle::CleanupCommandRequest {
+                run_id,
+                all,
+                completed,
+                stale,
+                no_confirm,
+                escalate: force,
+                overwrite,
+                keep_branch,
+            })
+        }
         Commands::Extend {
             parent_run_id,
             new_goal,
@@ -1890,7 +1903,11 @@ async fn main_inner() -> Result<()> {
             run,
             turn,
             no_confirm,
-        } => undo_command(id.or(run).as_deref(), turn, no_confirm),
+            json,
+        } => {
+            machine_json::arm("undo", json);
+            undo_command(id.or(run).as_deref(), turn, no_confirm)
+        }
         Commands::Rewind {
             run_id,
             to_turn,
@@ -1902,6 +1919,9 @@ async fn main_inner() -> Result<()> {
             json,
         } => {
             ui::set_plain_output(plain);
+            // The `--json` success surface predates G1; arming makes every
+            // fail-closed refusal land as the shared machine error envelope.
+            machine_json::arm("rewind", json);
             rewind_command(
                 &run_id,
                 &RewindCliOptions {
@@ -3279,6 +3299,22 @@ async fn resolve_provider_catalog_override_for_run(
 fn config_command(command: ConfigCommand) -> Result<()> {
     let paths = DeadreckonPaths::discover();
     match command {
+        ConfigCommand::Show { json } => {
+            machine_json::arm("config", json);
+            config_show_command(&paths)?;
+        }
+        ConfigCommand::Unset { key, json } => {
+            machine_json::arm("config", json);
+            config_unset_command(&paths, &key)?;
+        }
+        ConfigCommand::SetKey { provider, json } => {
+            machine_json::arm("config", json);
+            config_set_key_command(&paths, &provider)?;
+        }
+        ConfigCommand::UnsetKey { provider, json } => {
+            machine_json::arm("config", json);
+            config_unset_key_command(&paths, &provider)?;
+        }
         ConfigCommand::Get { key } => {
             let root = load_config_value(&paths)?;
             match get_toml_path(&root, &key) {
@@ -3292,16 +3328,9 @@ fn config_command(command: ConfigCommand) -> Result<()> {
                 }
             }
         }
-        ConfigCommand::Set { key, value } => {
-            fs::create_dir_all(paths.home())?;
-            let mut root = load_config_value(&paths)?;
-            set_toml_path(&mut root, &key, parse_config_value(&value));
-            fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
-            print!(
-                "{}",
-                config_set_surface(&paths, &key, &value)
-                    .render_plain(!completion_hints_enabled(false))
-            );
+        ConfigCommand::Set { key, value, json } => {
+            machine_json::arm("config", json);
+            config_set_command(&paths, &key, &value)?;
         }
         ConfigCommand::Provider { provider } => match provider {
             Some(provider) => {
@@ -3395,6 +3424,668 @@ fn config_command(command: ConfigCommand) -> Result<()> {
         },
     }
     Ok(())
+}
+
+/// The value shape one validated config key accepts. `config set` refuses a
+/// value outside the shape instead of writing TOML the readers would then
+/// silently ignore (the historical failure mode of the free-form surface).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigValueKind {
+    Text,
+    Boolean,
+    PositiveNumber,
+    PositiveInteger,
+    SandboxBackend,
+    MotionPolicy,
+    Any,
+}
+
+impl ConfigValueKind {
+    const fn expectation(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Boolean => "true or false",
+            Self::PositiveNumber => "a number greater than zero",
+            Self::PositiveInteger => "a whole number greater than zero",
+            Self::SandboxBackend => "one of auto, sandbox-exec, bwrap, docker, none",
+            Self::MotionPolicy => "one of full, reduced, off",
+            Self::Any => "a TOML value",
+        }
+    }
+}
+
+/// Every non-secret key `config set`/`config unset` accepts inside the
+/// validated namespaces. This is the exact key set the binary reads back
+/// (`config_defaults`, notify config), so the Mac app can enumerate it and a
+/// typo refuses instead of writing a key nothing consumes. Keys outside the
+/// validated namespaces (for example `[seams]`) stay free-form TOML exactly
+/// as before.
+const CONFIG_SETTING_KEYS: &[(&str, ConfigValueKind)] = &[
+    ("default_provider", ConfigValueKind::Text),
+    ("defaults.provider", ConfigValueKind::Text),
+    ("defaults.model", ConfigValueKind::Text),
+    ("defaults.reviewer_provider", ConfigValueKind::Text),
+    ("defaults.reviewer_model", ConfigValueKind::Text),
+    ("defaults.max_spend", ConfigValueKind::PositiveNumber),
+    (
+        "defaults.cli_max_wall_seconds",
+        ConfigValueKind::PositiveNumber,
+    ),
+    (
+        "defaults.done_contract_max_wall_seconds",
+        ConfigValueKind::PositiveNumber,
+    ),
+    ("defaults.sandbox", ConfigValueKind::SandboxBackend),
+    ("defaults.start_attach", ConfigValueKind::Boolean),
+    ("defaults.prevent_sleep", ConfigValueKind::Text),
+    ("defaults.plain", ConfigValueKind::Boolean),
+    ("defaults.doc_provider", ConfigValueKind::Text),
+    ("defaults.doc_skill", ConfigValueKind::Text),
+    ("defaults.doc_subskills", ConfigValueKind::Any),
+    (
+        "defaults.doc_polish_token_budget",
+        ConfigValueKind::PositiveInteger,
+    ),
+    (
+        "defaults.doc_polish_budget_cap_usd",
+        ConfigValueKind::PositiveNumber,
+    ),
+    ("start.confirm_contract", ConfigValueKind::Boolean),
+    ("ui.motion", ConfigValueKind::MotionPolicy),
+    (
+        "ui.input_latency_budget_ms",
+        ConfigValueKind::PositiveInteger,
+    ),
+    ("notify.enabled", ConfigValueKind::Boolean),
+    ("notify.native", ConfigValueKind::Boolean),
+    ("notify.command", ConfigValueKind::Text),
+    ("notify.on", ConfigValueKind::Any),
+];
+
+/// Non-secret per-provider entry fields (`providers.<route>.<field>`).
+/// `api_key` is deliberately absent: secret material never rides argv, so
+/// `config set`/`config unset` refuse it toward `set-key`/`unset-key`.
+const CONFIG_PROVIDER_FIELDS: &[(&str, ConfigValueKind)] = &[
+    ("kind", ConfigValueKind::Text),
+    ("api_key_env", ConfigValueKind::Text),
+    ("base_url", ConfigValueKind::Text),
+    ("model", ConfigValueKind::Text),
+    ("input_cost_per_million", ConfigValueKind::PositiveNumber),
+    ("output_cost_per_million", ConfigValueKind::PositiveNumber),
+    ("binary", ConfigValueKind::Text),
+    ("extra_args", ConfigValueKind::Any),
+];
+
+/// Built-in effective value used when a key is absent from config.toml.
+/// Only defaults pinned as constants in code are claimed here; `None` means
+/// "unset — decided contextually at use time".
+fn config_builtin_default(key: &str) -> Value {
+    match key {
+        "defaults.max_spend" => json!(10.0),
+        "defaults.cli_max_wall_seconds" => json!(36_000.0),
+        "defaults.sandbox" => json!("auto"),
+        "defaults.doc_skill" => json!("run-narrator"),
+        "defaults.doc_polish_token_budget" => json!(DEFAULT_DOC_POLISH_TOKEN_BUDGET),
+        "defaults.doc_subskills" => json!(
+            DEFAULT_DOC_SUBSKILLS
+                .iter()
+                .map(|skill| (*skill).to_string())
+                .collect::<Vec<_>>()
+        ),
+        _ => Value::Null,
+    }
+}
+
+/// How a dotted key is handled by the validated set/unset surface.
+enum ConfigKeyClass {
+    /// A registered scalar with its value shape.
+    Setting(ConfigValueKind),
+    /// A secret slot: refused here, owned by `set-key`/`unset-key`.
+    ProviderSecret { provider: String },
+    /// Outside the validated namespaces: free-form TOML, unchanged behavior.
+    FreeForm,
+}
+
+fn classify_config_key(key: &str) -> Result<ConfigKeyClass> {
+    if let Some((_, kind)) = CONFIG_SETTING_KEYS
+        .iter()
+        .find(|(candidate, _)| *candidate == key)
+    {
+        return Ok(ConfigKeyClass::Setting(*kind));
+    }
+    let mut parts = key.split('.');
+    let namespace = parts.next().unwrap_or_default();
+    if namespace == "providers" {
+        let (Some(provider), Some(field), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "config key {key} does not name a provider entry field; use providers.<route>.<field> with a field from: {}",
+                    config_provider_field_list()
+                ),
+                "deadreckon config show",
+            )));
+        };
+        if provider.trim().is_empty() {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!("config key {key} names an empty provider route"),
+                "deadreckon config show",
+            )));
+        }
+        if field == "api_key" {
+            return Ok(ConfigKeyClass::ProviderSecret {
+                provider: provider.to_string(),
+            });
+        }
+        if let Some((_, kind)) = CONFIG_PROVIDER_FIELDS
+            .iter()
+            .find(|(candidate, _)| *candidate == field)
+        {
+            return Ok(ConfigKeyClass::Setting(*kind));
+        }
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "unknown provider entry field {field} in config key {key}; valid fields: {}",
+                config_provider_field_list()
+            ),
+            "deadreckon config show",
+        )));
+    }
+    if matches!(namespace, "defaults" | "start" | "ui" | "notify") || key == "default_provider" {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "unknown config key {key}; settable keys: {}",
+                config_setting_key_list()
+            ),
+            "deadreckon config show",
+        )));
+    }
+    Ok(ConfigKeyClass::FreeForm)
+}
+
+fn config_setting_key_list() -> String {
+    CONFIG_SETTING_KEYS
+        .iter()
+        .map(|(key, _)| *key)
+        .chain(["providers.<route>.<field>"])
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn config_provider_field_list() -> String {
+    CONFIG_PROVIDER_FIELDS
+        .iter()
+        .map(|(field, _)| *field)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse and shape-check one value for a validated key. Text keys coerce the
+/// raw argument to a string (so `config set defaults.model 4o` stores "4o"),
+/// everything else must parse to the declared shape.
+fn checked_config_value(key: &str, kind: ConfigValueKind, raw: &str) -> Result<toml::Value> {
+    let parsed = parse_config_value(raw);
+    let refusal = |detail: &str| {
+        CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "config key {key} expects {}; got {detail}",
+                kind.expectation()
+            ),
+            &format!("deadreckon config set {key} <value>"),
+        ))
+    };
+    match kind {
+        ConfigValueKind::Any => Ok(parsed),
+        ConfigValueKind::Text => Ok(toml::Value::String(
+            parsed
+                .as_str()
+                .map_or_else(|| raw.to_string(), ToString::to_string),
+        )),
+        ConfigValueKind::Boolean => match parsed {
+            toml::Value::Boolean(_) => Ok(parsed),
+            _ => Err(refusal(&format!("`{raw}`"))),
+        },
+        ConfigValueKind::PositiveNumber => match parsed {
+            toml::Value::Float(value) if value.is_finite() && value > 0.0 => Ok(parsed),
+            toml::Value::Integer(value) if value > 0 => Ok(parsed),
+            _ => Err(refusal(&format!("`{raw}`"))),
+        },
+        ConfigValueKind::PositiveInteger => match parsed {
+            toml::Value::Integer(value) if value > 0 => Ok(parsed),
+            _ => Err(refusal(&format!("`{raw}`"))),
+        },
+        ConfigValueKind::SandboxBackend => match parsed.as_str() {
+            Some("auto" | "sandbox-exec" | "bwrap" | "docker" | "none") => Ok(parsed),
+            _ => Err(refusal(&format!("`{raw}`"))),
+        },
+        ConfigValueKind::MotionPolicy => match parsed.as_str() {
+            Some("full" | "reduced" | "off") => Ok(parsed),
+            _ => Err(refusal(&format!("`{raw}`"))),
+        },
+    }
+}
+
+/// The one redaction rule for config surfaces: every `api_key` slot anywhere
+/// in the tree reads `"configured"`. Redaction is structural, not value
+/// based, so no code path can print stored key bytes.
+const CONFIG_SECRET_MARKER: &str = "configured";
+
+fn redact_api_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "api_key" {
+                    *entry = Value::String(CONFIG_SECRET_MARKER.to_string());
+                } else {
+                    redact_api_keys(entry);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_api_keys(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Config.toml as redacted JSON: the complete document with every secret
+/// slot replaced by the marker.
+fn redacted_config_json(root: &toml::Value) -> Result<Value> {
+    let mut value = serde_json::to_value(root)?;
+    redact_api_keys(&mut value);
+    Ok(value)
+}
+
+/// Print one config verdict surface as prose, or as the shared G1 machine
+/// envelope when the invocation armed `--json`.
+fn emit_config_surface(id: &str, surface: &VerdictSurface, facts: Value) -> Result<()> {
+    if let Some(verb) = machine_json::active() {
+        machine_json::emit_success(verb, id, surface, facts)?;
+        return Ok(());
+    }
+    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
+    Ok(())
+}
+
+/// `config show`: the complete effective configuration as one surface —
+/// every registered setting with its set-vs-default provenance, every
+/// provider entry with secrets redacted, the raw (redacted) document, and
+/// where overrides come from.
+fn config_show_command(paths: &DeadreckonPaths) -> Result<()> {
+    let root = load_config_value(paths)?;
+    let config_exists = paths.config_path().is_file();
+
+    let mut settings = serde_json::Map::new();
+    let mut set_keys = Vec::new();
+    for (key, _) in CONFIG_SETTING_KEYS {
+        let file_value = get_toml_path(&root, key);
+        let (value, source) = match file_value {
+            Some(value) => (serde_json::to_value(value)?, "set"),
+            None => (config_builtin_default(key), "default"),
+        };
+        if source == "set" {
+            set_keys.push((*key).to_string());
+        }
+        settings.insert(
+            (*key).to_string(),
+            json!({ "value": value, "source": source }),
+        );
+    }
+
+    let mut providers = serde_json::Map::new();
+    let mut provider_summaries = Vec::new();
+    if let Some(entries) = get_toml_path(&root, "providers").and_then(toml::Value::as_table) {
+        for (name, entry) in entries {
+            let mut value = serde_json::to_value(entry)?;
+            redact_api_keys(&mut value);
+            let key_state = if entry.get("api_key").is_some() {
+                "api_key configured"
+            } else if entry.get("api_key_env").is_some() {
+                "api_key from env"
+            } else {
+                "no api_key"
+            };
+            provider_summaries.push((name.clone(), key_state.to_string()));
+            providers.insert(name.clone(), value);
+        }
+    }
+
+    let fallback = get_toml_path(&root, "fallback")
+        .map(serde_json::to_value)
+        .transpose()?
+        .unwrap_or(Value::Array(Vec::new()));
+
+    let overrides_dir = paths.home().join("providers.d");
+    let mut override_files = match fs::read_dir(&overrides_dir) {
+        Ok(entries) => entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".toml"))
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    override_files.sort();
+
+    let mut evidence = vec![
+        (
+            "config".to_string(),
+            paths.config_path().display().to_string(),
+        ),
+        (
+            "set keys".to_string(),
+            if set_keys.is_empty() {
+                "none — every setting is at its default".to_string()
+            } else {
+                set_keys.join(", ")
+            },
+        ),
+    ];
+    if provider_summaries.is_empty() {
+        evidence.push(("providers".to_string(), "none configured".to_string()));
+    } else {
+        for (name, key_state) in &provider_summaries {
+            evidence.push((format!("providers.{name}"), key_state.clone()));
+        }
+    }
+    if !override_files.is_empty() {
+        evidence.push(("providers.d".to_string(), override_files.join(", ")));
+    }
+
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Completed,
+        "config",
+        Some("show"),
+        ExplanationPanel::new(
+            format!(
+                "DeadReckon read the effective configuration from {}.",
+                paths.config_path().display()
+            ),
+            "Settings absent from the file fall back to built-in defaults; provider API keys are reported only as configured, never shown.",
+            evidence,
+        ),
+        vec![("Recommended", "deadreckon config provider")],
+        vec![
+            ("Secondary", "deadreckon providers list"),
+            ("Secondary", "deadreckon doctor"),
+        ],
+    );
+    emit_config_surface(
+        "show",
+        &surface,
+        json!({
+            "action": "show",
+            "config_path": paths.config_path().display().to_string(),
+            "config_exists": config_exists,
+            "settings": Value::Object(settings),
+            "providers": Value::Object(providers),
+            "fallback": fallback,
+            "provider_overrides_dir": overrides_dir.display().to_string(),
+            "provider_override_files": override_files,
+            "file": redacted_config_json(&root)?,
+        }),
+    )
+}
+
+/// `config set`: the historical free-form write, now validated for the
+/// namespaces the binary reads back and fenced against secret material.
+fn config_set_command(paths: &DeadreckonPaths, key: &str, value: &str) -> Result<()> {
+    let stored = match classify_config_key(key)? {
+        ConfigKeyClass::Setting(kind) => checked_config_value(key, kind, value)?,
+        ConfigKeyClass::ProviderSecret { provider } => {
+            return Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "providers.{provider}.api_key is secret material and never rides the command line"
+                ),
+                &format!("deadreckon config set-key {provider}"),
+            )));
+        }
+        ConfigKeyClass::FreeForm => parse_config_value(value),
+    };
+    fs::create_dir_all(paths.home())?;
+    let mut root = load_config_value(paths)?;
+    let previous = get_toml_path(&root, key)
+        .map(serde_json::to_value)
+        .transpose()?;
+    set_toml_path(&mut root, key, stored.clone());
+    fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+    emit_config_surface(
+        key,
+        &config_set_surface(paths, key, value),
+        json!({
+            "action": "set",
+            "key": key,
+            "value": serde_json::to_value(&stored)?,
+            "previous": previous.unwrap_or(Value::Null),
+            "config_path": paths.config_path().display().to_string(),
+        }),
+    )
+}
+
+/// `config unset`: remove one validated (or free-form) non-secret key.
+/// Removing an absent key is an honest no-op, not an error.
+fn config_unset_command(paths: &DeadreckonPaths, key: &str) -> Result<()> {
+    if let ConfigKeyClass::ProviderSecret { provider } = classify_config_key(key)? {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!(
+                "providers.{provider}.api_key is secret material; clear it with the key surface"
+            ),
+            &format!("deadreckon config unset-key {provider}"),
+        )));
+    }
+    fs::create_dir_all(paths.home())?;
+    let mut root = load_config_value(paths)?;
+    let removed = remove_toml_path(&mut root, key);
+    if removed {
+        fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+    }
+    let surface = config_unset_surface(paths, key, removed);
+    emit_config_surface(
+        key,
+        &surface,
+        json!({
+            "action": "unset",
+            "key": key,
+            "removed": removed,
+            "config_path": paths.config_path().display().to_string(),
+        }),
+    )
+}
+
+fn config_unset_surface(paths: &DeadreckonPaths, key: &str, removed: bool) -> VerdictSurface {
+    let (kind, what, why) = if removed {
+        (
+            VerdictKind::Completed,
+            format!("DeadReckon removed config key {key}."),
+            "The key is gone from the config file; the built-in default now applies.",
+        )
+    } else {
+        (
+            VerdictKind::Noop,
+            format!("Config key {key} was already absent."),
+            "Nothing was written; the built-in default already applies.",
+        )
+    };
+    VerdictSurface::must_new(
+        kind,
+        "config",
+        Some(key),
+        ExplanationPanel::new(
+            what,
+            why,
+            vec![
+                ("config", paths.config_path().display().to_string()),
+                ("key", key.to_string()),
+                ("removed", removed.to_string()),
+            ],
+        ),
+        vec![("Recommended", "deadreckon config show")],
+        vec![("Secondary", "deadreckon doctor")],
+    )
+}
+
+/// Read the API key for `config set-key` from stdin — never argv, never any
+/// environment surface. The returned string is the trimmed single-line key.
+fn read_api_key_from_stdin(provider: &str) -> Result<String> {
+    if io::stdin().is_terminal() {
+        eprintln!(
+            "Paste the API key for {provider} and press Enter (read from stdin; never echoed into any DeadReckon surface):"
+        );
+    }
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("no API key arrived on stdin for provider {provider}"),
+            &format!("printf '%s' \"$KEY\" | deadreckon config set-key {provider}"),
+        )));
+    }
+    if key.lines().count() > 1 {
+        return Err(CliError::Core(deadreckon_core::user_error(
+            &format!("the API key for provider {provider} must be a single line"),
+            &format!("printf '%s' \"$KEY\" | deadreckon config set-key {provider}"),
+        )));
+    }
+    Ok(key.to_string())
+}
+
+/// The routes `set-key` accepts: registered API-key routes, plus any
+/// hand-configured `[providers.<route>]` entry already in config.toml.
+fn require_api_key_capable_provider(paths: &DeadreckonPaths, provider: &str) -> Result<()> {
+    let registry = ProviderRegistry::with_overrides(paths.home())?;
+    if let Some(descriptor) = registry.get(provider) {
+        return match descriptor.auth.kind {
+            AuthKind::ApiKey => Ok(()),
+            AuthKind::Subscription => Err(CliError::Core(deadreckon_core::user_error(
+                &format!(
+                    "provider {provider} authenticates through its own CLI login, not an API key"
+                ),
+                &format!("deadreckon providers check {provider}"),
+            ))),
+            AuthKind::None => Err(CliError::Core(deadreckon_core::user_error(
+                &format!("provider {provider} takes no API key"),
+                &format!("deadreckon providers check {provider}"),
+            ))),
+        };
+    }
+    let root = load_config_value(paths)?;
+    if get_toml_path(&root, &format!("providers.{provider}")).is_some() {
+        return Ok(());
+    }
+    let mut api_key_routes = registry
+        .iter()
+        .filter(|descriptor| descriptor.auth.kind == AuthKind::ApiKey)
+        .map(|descriptor| descriptor.id.clone())
+        .collect::<Vec<_>>();
+    api_key_routes.sort();
+    Err(CliError::Core(deadreckon_core::user_error(
+        &format!(
+            "unknown provider {provider}; API-key routes: {}",
+            api_key_routes.join(", ")
+        ),
+        "deadreckon providers list --all",
+    )))
+}
+
+/// `config set-key <provider>`: store a provider API key read from stdin.
+/// The envelope reports only `{provider, stored, keychain_or_file}` — the
+/// key bytes never appear in argv, prose, or any machine envelope.
+fn config_set_key_command(paths: &DeadreckonPaths, provider: &str) -> Result<()> {
+    require_api_key_capable_provider(paths, provider)?;
+    let key = read_api_key_from_stdin(provider)?;
+    fs::create_dir_all(paths.home())?;
+    let mut root = load_config_value(paths)?;
+    set_toml_path(
+        &mut root,
+        &format!("providers.{provider}.api_key"),
+        toml::Value::String(key),
+    );
+    fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Completed,
+        "config",
+        Some(&format!("set-key {provider}")),
+        ExplanationPanel::new(
+            format!("DeadReckon stored an API key for provider {provider} from stdin."),
+            "The key never rode the command line and every surface reports it only as configured.",
+            vec![
+                ("provider", provider.to_string()),
+                ("storage", "config file".to_string()),
+                ("config", paths.config_path().display().to_string()),
+                ("api_key", CONFIG_SECRET_MARKER.to_string()),
+            ],
+        ),
+        vec![(
+            "Recommended",
+            format!("deadreckon providers check {provider}"),
+        )],
+        vec![("Secondary", "deadreckon config show")],
+    );
+    emit_config_surface(
+        provider,
+        &surface,
+        json!({
+            "action": "set-key",
+            "provider": provider,
+            "stored": true,
+            "keychain_or_file": "file",
+            "config_path": paths.config_path().display().to_string(),
+        }),
+    )
+}
+
+/// `config unset-key <provider>`: remove a stored provider API key.
+fn config_unset_key_command(paths: &DeadreckonPaths, provider: &str) -> Result<()> {
+    fs::create_dir_all(paths.home())?;
+    let mut root = load_config_value(paths)?;
+    let removed = remove_toml_path(&mut root, &format!("providers.{provider}.api_key"));
+    if removed {
+        fs::write(paths.config_path(), toml::to_string_pretty(&root)?)?;
+    }
+    let (kind, what, why) = if removed {
+        (
+            VerdictKind::Completed,
+            format!("DeadReckon removed the stored API key for provider {provider}."),
+            "The provider now authenticates through its api_key_env variable or not at all.",
+        )
+    } else {
+        (
+            VerdictKind::Noop,
+            format!("Provider {provider} had no stored API key."),
+            "Nothing was written; there was no key to remove.",
+        )
+    };
+    let surface = VerdictSurface::must_new(
+        kind,
+        "config",
+        Some(&format!("unset-key {provider}")),
+        ExplanationPanel::new(
+            what,
+            why,
+            vec![
+                ("provider", provider.to_string()),
+                ("removed", removed.to_string()),
+                ("config", paths.config_path().display().to_string()),
+            ],
+        ),
+        vec![(
+            "Recommended",
+            format!("deadreckon providers check {provider}"),
+        )],
+        vec![("Secondary", "deadreckon config show")],
+    );
+    emit_config_surface(
+        provider,
+        &surface,
+        json!({
+            "action": "unset-key",
+            "provider": provider,
+            "removed": removed,
+            "keychain_or_file": "file",
+            "config_path": paths.config_path().display().to_string(),
+        }),
+    )
 }
 
 fn config_provider_setup_selection(
@@ -12822,38 +13513,45 @@ fn undo_command(run: Option<&str>, turn: Option<u32>, no_confirm: bool) -> Resul
     )?;
     let id = run_prefix(&state.run_id);
     let primary = format!("deadreckon show {id}");
-    print!(
-        "{}",
-        VerdictSurface::must_new(
-            VerdictKind::Completed,
-            "undo",
-            Some(&id),
-            ExplanationPanel::new(
-                format!("DeadReckon restored the run workspace to snapshot turn {target_turn}."),
-                "The snapshot restore completed; inspect the run state before resuming or making another recovery move.",
-                vec![
-                    ("run".to_string(), id.clone()),
-                    ("turn".to_string(), target_turn.to_string()),
-                    (
-                        "snapshot".to_string(),
-                        restore_state
-                            .run_root
-                            .join("snapshots")
-                            .join(format!("turn-{target_turn}"))
-                            .display()
-                            .to_string(),
-                    ),
-                    (
-                        "workspace".to_string(),
-                        restore_state.working_dir.display().to_string(),
-                    ),
-                ],
-            ),
-            vec![("Recommended", primary.as_str())],
-            Vec::<(&str, &str)>::new(),
-        )
-        .render_plain(!completion_hints_enabled(false))
+    let snapshot = restore_state
+        .run_root
+        .join("snapshots")
+        .join(format!("turn-{target_turn}"));
+    let surface = VerdictSurface::must_new(
+        VerdictKind::Completed,
+        "undo",
+        Some(&id),
+        ExplanationPanel::new(
+            format!("DeadReckon restored the run workspace to snapshot turn {target_turn}."),
+            "The snapshot restore completed; inspect the run state before resuming or making another recovery move.",
+            vec![
+                ("run".to_string(), id.clone()),
+                ("turn".to_string(), target_turn.to_string()),
+                ("snapshot".to_string(), snapshot.display().to_string()),
+                (
+                    "workspace".to_string(),
+                    restore_state.working_dir.display().to_string(),
+                ),
+            ],
+        ),
+        vec![("Recommended", primary.as_str())],
+        Vec::<(&str, &str)>::new(),
     );
+    if let Some(verb) = machine_json::active() {
+        machine_json::emit_success(
+            verb,
+            &state.run_id,
+            &surface,
+            json!({
+                "undo_kind": "run-snapshot",
+                "restored_turn": target_turn,
+                "snapshot": snapshot,
+                "workspace": restore_state.working_dir,
+            }),
+        )?;
+        return Ok(());
+    }
+    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
 }
 

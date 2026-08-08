@@ -619,3 +619,570 @@ public struct FinishPlanEnvelope: Codable, Equatable, Sendable {
         nextActions = try container.decodeIfPresent([String].self, forKey: .nextActions) ?? []
     }
 }
+
+// MARK: - Shared verdict block (verdict_surface.rs verdict_json, as shipped)
+
+/// The `verdict` object every armed G1 success envelope carries
+/// (`VerdictSurface::add_to_json`): the one-surface-object rule means prose
+/// and JSON come from the same VerdictSurface, so `label`/`explanation`/
+/// `evidence` are the binary's own words and render verbatim, never
+/// paraphrased. `evidence` rows are `[key, value]` string pairs.
+public struct VerdictBlock: Codable, Equatable, Sendable {
+    public let kind: String
+    public let label: String
+    public let subject: String?
+    public let recommendedCommand: String?
+    public let explanation: String?
+    public let evidence: [[String]]
+
+    enum CodingKeys: String, CodingKey {
+        case kind, label, subject, explanation, evidence
+        case recommendedCommand = "recommended_command"
+    }
+
+    public init(kind: String, label: String, subject: String? = nil,
+                recommendedCommand: String? = nil, explanation: String? = nil,
+                evidence: [[String]] = []) {
+        self.kind = kind
+        self.label = label
+        self.subject = subject
+        self.recommendedCommand = recommendedCommand
+        self.explanation = explanation
+        self.evidence = evidence
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decode(String.self, forKey: .kind)
+        label = try container.decode(String.self, forKey: .label)
+        subject = try container.decodeIfPresent(String.self, forKey: .subject)
+        recommendedCommand = try container.decodeIfPresent(String.self, forKey: .recommendedCommand)
+        explanation = try container.decodeIfPresent(String.self, forKey: .explanation)
+        evidence = try container.decodeIfPresent([[String]].self, forKey: .evidence) ?? []
+    }
+
+    /// Evidence as (key, value) tuples; rows that are not 2-element pairs
+    /// are dropped rather than guessed at.
+    public var evidencePairs: [(String, String)] {
+        evidence.compactMap { row in
+            guard row.count == 2 else { return nil }
+            return (row[0], row[1])
+        }
+    }
+}
+
+// MARK: - config show --json (spec §P1, reconciled with the SHIPPED shape)
+
+/// The complete effective configuration (`config_show_command`, main.rs).
+/// SHIPPED shape differs from the spec's §P1 guess and this decoder follows
+/// the binary: the map is `settings` (not `values`) with per-key
+/// `{value, source: "set"|"default"}` provenance; there is no separate
+/// `keys` map — key state lives structurally redacted inside `providers`
+/// (`api_key` slots read the literal marker "configured", never bytes);
+/// `file` is the complete REDACTED document (the app never reads
+/// config.toml itself — raw bytes could carry secrets).
+public struct ConfigShowEnvelope: Equatable, Sendable {
+    public struct Setting: Codable, Equatable, Sendable {
+        public let value: JSONValue
+        public let source: String
+
+        public var isSet: Bool { source == "set" }
+
+        public init(value: JSONValue, source: String) {
+            self.value = value
+            self.source = source
+        }
+    }
+
+    public let kind: String
+    public let status: String?
+    public let configPath: String
+    public let configExists: Bool
+    public let settings: [String: Setting]
+    /// Redacted provider entries keyed by route id. Every `api_key` slot
+    /// inside is the literal marker string, by the binary's structural
+    /// redaction — no code path can surface stored key bytes.
+    public let providers: [String: JSONValue]
+    public let fallback: JSONValue?
+    public let providerOverrideFiles: [String]
+    /// The complete redacted config document, pretty-printable for the
+    /// ADVANCED disclosure. Secrets are already the marker string.
+    public let file: JSONValue?
+    public let nextActions: [String]
+    public let tryLines: [String]
+    public let verdict: VerdictBlock?
+
+    /// Fail-closed: anything that is not a `kind:"config"` show envelope
+    /// returns nil and the surface degrades with the raw words.
+    public init?(data: Data) {
+        struct Raw: Codable {
+            let kind: String
+            let id: String?
+            let status: String?
+            let action: String?
+            let configPath: String?
+            let configExists: Bool?
+            let settings: [String: Setting]?
+            let providers: [String: JSONValue]?
+            let fallback: JSONValue?
+            let providerOverrideFiles: [String]?
+            let file: JSONValue?
+            let nextActions: [String]?
+            let tryLines: [String]?
+            let verdict: VerdictBlock?
+
+            enum CodingKeys: String, CodingKey {
+                case kind, id, status, action, settings, providers, fallback, file, verdict
+                case configPath = "config_path"
+                case configExists = "config_exists"
+                case providerOverrideFiles = "provider_override_files"
+                case nextActions = "next_actions"
+                case tryLines = "try_lines"
+            }
+        }
+        guard let raw = try? DeadreckonJSON.decoder().decode(Raw.self, from: data),
+              raw.kind == "config", raw.action == "show",
+              let configPath = raw.configPath else { return nil }
+        kind = raw.kind
+        status = raw.status
+        self.configPath = configPath
+        configExists = raw.configExists ?? false
+        settings = raw.settings ?? [:]
+        providers = raw.providers ?? [:]
+        fallback = raw.fallback
+        providerOverrideFiles = raw.providerOverrideFiles ?? []
+        file = raw.file
+        nextActions = raw.nextActions ?? []
+        tryLines = raw.tryLines ?? []
+        verdict = raw.verdict
+    }
+
+    /// Key state for one route, from the redacted provider entry: true when
+    /// an `api_key` slot exists (serialized as the redaction marker). The
+    /// UI renders only configured / not configured — never material.
+    public func keyConfigured(route: String) -> Bool {
+        guard case .object(let entry)? = providers[route] else { return false }
+        return entry["api_key"] != nil
+    }
+
+    /// Whether the route authenticates through an environment variable
+    /// (`api_key_env`) rather than a stored key.
+    public func keyFromEnvironment(route: String) -> Bool {
+        guard case .object(let entry)? = providers[route] else { return false }
+        if case .string? = entry["api_key_env"] { return true }
+        return false
+    }
+
+    /// The plain display string for a setting's effective value; nil when
+    /// the key is absent AND has no pinned built-in default (the binary
+    /// serializes those as null: "unset — decided contextually at use time").
+    public func displayValue(_ key: String) -> String? {
+        guard let setting = settings[key] else { return nil }
+        return Self.display(setting.value)
+    }
+
+    public static func display(_ value: JSONValue) -> String? {
+        switch value {
+        case .null: return nil
+        case .bool(let flag): return flag ? "true" : "false"
+        case .string(let text): return text
+        case .number(let number):
+            if number == number.rounded(), abs(number) < 1_000_000_000 {
+                return String(Int(number))
+            }
+            return String(number)
+        case .array(let items):
+            return items.compactMap(display).joined(separator: ", ")
+        case .object:
+            return nil
+        }
+    }
+}
+
+// MARK: - config set / unset / set-key / unset-key --json (spec §P2/§P3, shipped)
+
+/// One config write acknowledgment. SHIPPED: `kind` is always "config"
+/// (not the spec's guessed "config_set" family); the discriminator is
+/// `action` ("set" | "unset" | "set-key" | "unset-key"); `id` is the dotted
+/// key or the provider route. set-key facts are exactly
+/// `{provider, stored: true, keychain_or_file: "file"}` — the envelope
+/// NEVER echoes key material, and this decoder has no field that could
+/// carry it.
+public struct ConfigWriteEnvelope: Equatable, Sendable {
+    public let kind: String
+    public let id: String?
+    public let status: String?
+    public let action: String
+    public let key: String?
+    public let value: JSONValue?
+    public let previous: JSONValue?
+    public let removed: Bool?
+    public let provider: String?
+    public let stored: Bool?
+    public let keychainOrFile: String?
+    public let configPath: String?
+    public let nextActions: [String]
+    public let tryLines: [String]
+    public let verdict: VerdictBlock?
+
+    public init?(data: Data) {
+        struct Raw: Codable {
+            let kind: String
+            let id: String?
+            let status: String?
+            let action: String?
+            let key: String?
+            let value: JSONValue?
+            let previous: JSONValue?
+            let removed: Bool?
+            let provider: String?
+            let stored: Bool?
+            let keychainOrFile: String?
+            let configPath: String?
+            let nextActions: [String]?
+            let tryLines: [String]?
+            let verdict: VerdictBlock?
+
+            enum CodingKeys: String, CodingKey {
+                case kind, id, status, action, key, value, previous, removed
+                case provider, stored, verdict
+                case keychainOrFile = "keychain_or_file"
+                case configPath = "config_path"
+                case nextActions = "next_actions"
+                case tryLines = "try_lines"
+            }
+        }
+        guard let raw = try? DeadreckonJSON.decoder().decode(Raw.self, from: data),
+              raw.kind == "config",
+              let action = raw.action,
+              ["set", "unset", "set-key", "unset-key"].contains(action) else { return nil }
+        kind = raw.kind
+        id = raw.id
+        status = raw.status
+        self.action = action
+        key = raw.key
+        value = raw.value
+        previous = raw.previous
+        removed = raw.removed
+        provider = raw.provider
+        stored = raw.stored
+        keychainOrFile = raw.keychainOrFile
+        configPath = raw.configPath
+        nextActions = raw.nextActions ?? []
+        tryLines = raw.tryLines ?? []
+        verdict = raw.verdict
+    }
+}
+
+// MARK: - supervisor status --json (spec §P4, reconciled with the SHIPPED v4 report)
+
+/// `ServiceRunState` (supervisor_service.rs, snake_case): source one of the
+/// two-source health truth — the service manager's account.
+public enum ServiceRunWord: String, ForgivingStringEnum, CaseIterable {
+    case running
+    case stopped
+    case notInstalled = "not_installed"
+    case unknown
+}
+
+/// `HomeCheckpointState`: source two — this home's live instance checkpoint.
+public enum HomeCheckpointWord: String, ForgivingStringEnum, CaseIterable {
+    case present
+    case absent
+    case stale
+    case unknown
+}
+
+/// `SupervisorHealthVerdict`: one honest word over both sources. SHIPPED
+/// vocabulary is healthy | degraded | foreign_home | down — NOT the spec's
+/// guessed running/stopped/... list; the app types on the shipped words and
+/// derives display language in the Lexicon.
+public enum ServiceHealthWord: String, ForgivingStringEnum, CaseIterable {
+    case healthy
+    case degraded
+    case foreignHome = "foreign_home"
+    case down
+    case unknown
+}
+
+/// The v4 `SupervisorServiceStatusReport`, decoded fail-closed. SHIPPED:
+/// this is a BARE typed document (schema_version discriminated), not a
+/// kind-scaffold envelope. v3 reports (older binaries) decode too — the
+/// typed two-source fields are simply absent and the verdict derivation
+/// degrades honestly. The checkpoint-absent refusal on pre-v4 binaries is
+/// prose on stderr (exit 1) and never reaches this decoder.
+public struct ServiceStatusReport: Codable, Equatable, Sendable {
+    public struct Checkpoint: Codable, Equatable, Sendable {
+        public let generation: Int?
+        public let instanceID: String?
+        public let bootID: String?
+        public let pid: Int?
+        public let processStartIdentity: String?
+        public let startedAt: Date?
+        public let binary: String?
+        public let deadreckonHome: String?
+        public let bundleBuildID: String?
+        public let binarySha256: String?
+
+        enum CodingKeys: String, CodingKey {
+            case generation, pid, binary
+            case instanceID = "instance_id"
+            case bootID = "boot_id"
+            case processStartIdentity = "process_start_identity"
+            case startedAt = "started_at"
+            case deadreckonHome = "deadreckon_home"
+            case bundleBuildID = "bundle_build_id"
+            case binarySha256 = "binary_sha256"
+        }
+    }
+
+    public let schemaVersion: Int
+    public let manager: String
+    public let installed: SupervisorInstallState
+    public let loaded: Bool?
+    public let enabled: String?
+    public let active: String?
+    /// v4 typed two-source truth; nil on a v3 report.
+    public let service: ServiceRunWord?
+    public let homeCheckpoint: HomeCheckpointWord?
+    public let verdict: ServiceHealthWord?
+    /// The most specific verbatim fact behind any verdict other than
+    /// healthy. Rendered verbatim, never paraphrased.
+    public let verdictReason: String?
+    public let checkpoint: Checkpoint?
+    public let currentBootID: String?
+    public let bootIdentitySource: String?
+    public let testOverride: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case manager, installed, loaded, enabled, active, service, verdict, checkpoint
+        case schemaVersion = "schema_version"
+        case homeCheckpoint = "home_checkpoint"
+        case verdictReason = "verdict_reason"
+        case currentBootID = "current_boot_id"
+        case bootIdentitySource = "boot_identity_source"
+        case testOverride = "test_override"
+    }
+
+    public init?(data: Data) {
+        guard let decoded = try? DeadreckonJSON.decoder().decode(
+            ServiceStatusReport.self, from: data) else { return nil }
+        self = decoded
+    }
+}
+
+// MARK: - supervisor install|start|stop --json (spec §P6, shipped)
+
+/// One supervisor lifecycle acknowledgment
+/// (`emit_supervisor_lifecycle_success`). SHIPPED: `kind` is "supervisor"
+/// with `id`/`action` naming the verb (not the spec's guessed
+/// "supervisor_install" family); the plist/unit path field is `unit_path`;
+/// `result` is the outcome word (installed | already-installed | updated |
+/// started | stopped | already-stopped); `service_state` is a post-action
+/// observation and may be "unknown" when the manager was unreadable — the
+/// section re-polls `status` before repainting either way.
+public struct SupervisorLifecycleEnvelope: Equatable, Sendable {
+    public let kind: String
+    public let action: String
+    public let result: String?
+    public let status: String?
+    public let serviceState: String?
+    public let unitPath: String?
+    public let deadreckonHome: String?
+    public let binary: String?
+    public let nextActions: [String]
+    public let tryLines: [String]
+    public let verdict: VerdictBlock?
+
+    public init?(data: Data) {
+        struct Raw: Codable {
+            let kind: String
+            let id: String?
+            let status: String?
+            let action: String?
+            let result: String?
+            let serviceState: String?
+            let unitPath: String?
+            let deadreckonHome: String?
+            let binary: String?
+            let nextActions: [String]?
+            let tryLines: [String]?
+            let verdict: VerdictBlock?
+
+            enum CodingKeys: String, CodingKey {
+                case kind, id, status, action, result, binary, verdict
+                case serviceState = "service_state"
+                case unitPath = "unit_path"
+                case deadreckonHome = "deadreckon_home"
+                case nextActions = "next_actions"
+                case tryLines = "try_lines"
+            }
+        }
+        guard let raw = try? DeadreckonJSON.decoder().decode(Raw.self, from: data),
+              raw.kind == "supervisor",
+              let action = raw.action ?? raw.id else { return nil }
+        kind = raw.kind
+        self.action = action
+        result = raw.result
+        status = raw.status
+        serviceState = raw.serviceState
+        unitPath = raw.unitPath
+        deadreckonHome = raw.deadreckonHome
+        binary = raw.binary
+        nextActions = raw.nextActions ?? []
+        tryLines = raw.tryLines ?? []
+        verdict = raw.verdict
+    }
+}
+
+// MARK: - doctor --json / doctor --repair --json (spec §P5, shipped)
+
+/// The full doctor document (`doctor_json_payload` + the `repairs` rows
+/// `--repair` adds). SHIPPED: there is NO per-finding `repairable` flag —
+/// the section-level repair capability derives from
+/// `binary_health.repairable_receipt` / `repairable_active_installation`
+/// and a failed "supervisor service" finding (§S6's documented fallback).
+/// `rawJSON` retains the exact bytes for the raw-report disclosure.
+public struct DoctorReportEnvelope: Equatable, Sendable {
+    public struct Finding: Codable, Equatable, Sendable {
+        public let status: String
+        public let subject: String
+        public let detail: String
+        public let action: String?
+
+        public init(status: String, subject: String, detail: String, action: String? = nil) {
+            self.status = status
+            self.subject = subject
+            self.detail = detail
+            self.action = action
+        }
+    }
+
+    public struct Sandbox: Codable, Equatable, Sendable {
+        public let backend: String
+        public let available: Bool
+        public let path: String?
+        public let note: String?
+    }
+
+    public struct Installation: Codable, Equatable, Sendable {
+        public let canonicalPath: String
+        public let locations: [String]
+        public let roles: [String]
+        public let channel: String
+        public let version: String?
+        public let sha256: String?
+        public let probeError: String?
+        public let updateCommand: String?
+
+        enum CodingKeys: String, CodingKey {
+            case locations, roles, channel, version, sha256
+            case canonicalPath = "canonical_path"
+            case probeError = "probe_error"
+            case updateCommand = "update_command"
+        }
+    }
+
+    public struct BinaryHealth: Codable, Equatable, Sendable {
+        public let currentPath: String?
+        public let currentVersion: String?
+        public let pathSelected: String?
+        public let installations: [Installation]
+        public let conflicts: [String]
+        public let advisories: [String]
+        public let gateHelperCompatible: Bool?
+        public let gateHelperPath: String?
+        public let gateProtocolVersion: Int?
+        public let bundleBuildID: String?
+        public let repairableReceipt: Bool?
+        public let repairableActiveInstallation: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case installations, conflicts, advisories
+            case currentPath = "current_path"
+            case currentVersion = "current_version"
+            case pathSelected = "path_selected"
+            case gateHelperCompatible = "gate_helper_compatible"
+            case gateHelperPath = "gate_helper_path"
+            case gateProtocolVersion = "gate_protocol_version"
+            case bundleBuildID = "bundle_build_id"
+            case repairableReceipt = "repairable_receipt"
+            case repairableActiveInstallation = "repairable_active_installation"
+        }
+    }
+
+    /// One `--repair` outcome row: `{attempted, result, detail}`, in run
+    /// order. Repairs gain no authority from the envelope — these are
+    /// serialized outcomes only.
+    public struct Repair: Codable, Equatable, Sendable {
+        public let attempted: String
+        public let result: String
+        public let detail: String
+    }
+
+    public let kind: String
+    public let status: String?
+    public let configPresent: Bool?
+    public let configPath: String?
+    public let home: String?
+    public let sandboxes: [Sandbox]
+    public let binaryHealth: BinaryHealth?
+    public let findings: [Finding]
+    public let repairs: [Repair]
+    public let nextActions: [String]
+    public let verdict: VerdictBlock?
+    /// The exact document bytes, for the raw-report disclosure (the
+    /// evidence floor under every derived row).
+    public let rawJSON: String
+
+    public init?(data: Data) {
+        struct Raw: Codable {
+            let kind: String
+            let status: String?
+            let configPresent: Bool?
+            let configPath: String?
+            let home: String?
+            let sandboxes: [Sandbox]?
+            let binaryHealth: BinaryHealth?
+            let findings: [Finding]?
+            let repairs: [Repair]?
+            let nextActions: [String]?
+            let verdict: VerdictBlock?
+
+            enum CodingKeys: String, CodingKey {
+                case kind, status, home, sandboxes, findings, repairs, verdict
+                case configPresent = "config_present"
+                case configPath = "config_path"
+                case binaryHealth = "binary_health"
+                case nextActions = "next_actions"
+            }
+        }
+        guard let raw = try? DeadreckonJSON.decoder().decode(Raw.self, from: data),
+              raw.kind == "doctor" else { return nil }
+        kind = raw.kind
+        status = raw.status
+        configPresent = raw.configPresent
+        configPath = raw.configPath
+        home = raw.home
+        sandboxes = raw.sandboxes ?? []
+        binaryHealth = raw.binaryHealth
+        findings = raw.findings ?? []
+        repairs = raw.repairs ?? []
+        nextActions = raw.nextActions ?? []
+        verdict = raw.verdict
+        rawJSON = String(decoding: data, as: UTF8.self)
+    }
+
+    /// §S6 capability probe for the section-level [Repair…]: SHIPPED
+    /// signals only — repairable binary-health facts, or a failed
+    /// supervisor service finding (doctor's own repair covers exactly
+    /// these three).
+    public var repairAvailable: Bool {
+        if binaryHealth?.repairableReceipt == true { return true }
+        if binaryHealth?.repairableActiveInstallation == true { return true }
+        return findings.contains { $0.subject == "supervisor service" && $0.status == "failed" }
+    }
+
+    public var failedCount: Int { findings.filter { $0.status == "failed" }.count }
+    public var warningCount: Int { findings.filter { $0.status == "warning" }.count }
+}

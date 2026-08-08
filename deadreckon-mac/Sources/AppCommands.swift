@@ -42,6 +42,12 @@ struct DeadreckonCommands: Commands {
             }
             .keyboardShortcut("k", modifiers: .command)
 
+            Button("Library") {
+                showMainWindow()
+                shell.request = .library
+            }
+            .keyboardShortcut("l", modifiers: .command)
+
             Divider()
         }
 

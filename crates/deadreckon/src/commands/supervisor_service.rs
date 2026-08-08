@@ -13,15 +13,17 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use deadreckon::verdict_surface::{ExplanationPanel, VerdictKind, VerdictSurface};
 use deadreckon_core::{
     ChildTerminator, DeadreckonError, DeadreckonPaths, HeadTailBuffer, LockGuard,
     TerminationOutcome, acquire_lock, boot_identities_match, boot_identity, process_start_identity,
     spawn_grouped,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
-use super::super::{CliError, Result};
+use super::super::{CliError, Result, machine_json};
 
 const LAUNCHD_LABEL: &str = "com.deadreckon.supervisor";
 const SYSTEMD_UNIT: &str = "deadreckon-supervisor.service";
@@ -32,7 +34,10 @@ const SERVICE_LOCK_TASK: &str = "supervisor-service";
 const SERVICE_LOCK_OWNER: &str = "durable-supervisor-service";
 const SERVICE_INSTANCE_DIR: &str = "supervisor";
 const SERVICE_INSTANCE_FILE: &str = "instance.json";
-const SERVICE_STATUS_SCHEMA: u32 = 3;
+// v4 adds the typed two-source health truth (`service`, `home_checkpoint`,
+// `verdict`, `verdict_reason`): observable degraded states now serialize as a
+// report with one honest verdict word instead of refusing in prose.
+const SERVICE_STATUS_SCHEMA: u32 = 4;
 const SERVICE_MANAGER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVICE_MANAGER_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const SERVICE_MANAGER_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -231,6 +236,62 @@ enum ServiceInstallationState {
     Current,
 }
 
+/// Source one of the two-source health truth: what the host service manager
+/// reports for the managed unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ServiceRunState {
+    Running,
+    Stopped,
+    NotInstalled,
+}
+
+impl ServiceRunState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::NotInstalled => "not_installed",
+        }
+    }
+}
+
+/// Source two of the two-source health truth: the live instance checkpoint
+/// under this DEADRECKON_HOME. `Present` means a checkpoint exists and its
+/// identity validates against this binary, home, and (when the manager
+/// reports the service running) the current boot and live process. `Stale`
+/// means a checkpoint exists but fails that validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum HomeCheckpointState {
+    Present,
+    Absent,
+    Stale,
+}
+
+/// One honest word over both sources. The surrounding report fields are the
+/// evidence; `verdict_reason` carries the most specific verbatim fact behind
+/// any word other than `healthy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SupervisorHealthVerdict {
+    Healthy,
+    Degraded,
+    ForeignHome,
+    Down,
+}
+
+impl SupervisorHealthVerdict {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::ForeignHome => "foreign_home",
+            Self::Down => "down",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BootIdentitySource {
@@ -269,6 +330,15 @@ pub(crate) struct SupervisorServiceStatusReport {
     loaded: Option<bool>,
     enabled: Option<String>,
     active: Option<String>,
+    /// Two-source health, source one: the service-manager truth.
+    service: ServiceRunState,
+    /// Two-source health, source two: this home's instance checkpoint.
+    home_checkpoint: HomeCheckpointState,
+    /// One honest word over both sources; the other fields are its evidence.
+    verdict: SupervisorHealthVerdict,
+    /// The most specific verbatim fact behind any verdict other than
+    /// `healthy`.
+    verdict_reason: Option<String>,
     checkpoint: Option<ServiceInstanceCheckpoint>,
     current_boot_id: String,
     boot_identity_source: BootIdentitySource,
@@ -305,6 +375,19 @@ pub(crate) fn validate_supervisor_service_live_evidence(
         return Err(invalid_input(
             "supervisor status does not describe a current managed service unit",
         ));
+    }
+    // The report serializes degraded and foreign-home observations instead of
+    // refusing; live-reboot evidence stays fail-closed on the typed verdict.
+    if report.verdict != SupervisorHealthVerdict::Healthy {
+        return Err(invalid_input(format!(
+            "supervisor status verdict is {}; only a healthy supervisor can prove a live reboot{}",
+            report.verdict.as_str(),
+            report
+                .verdict_reason
+                .as_deref()
+                .map(|reason| format!(" ({reason})"))
+                .unwrap_or_default()
+        )));
     }
     let manager_ready = match report.manager {
         ServiceManager::Launchd => {
@@ -531,8 +614,8 @@ pub(crate) fn repair_supervisor_service() -> Result<String> {
     }
     let prior_instance = before.instance().cloned();
 
-    supervisor_service_install_command()?;
-    supervisor_service_start_command()?;
+    supervisor_service_install_command(false)?;
+    supervisor_service_start_command(false)?;
     let deadline = std::time::Instant::now() + supervisor_readiness_timeout();
     loop {
         match supervisor_service_preflight() {
@@ -586,6 +669,24 @@ fn service_preflight_from_status(
                 .map(SupervisorServiceInstance::from),
         };
     }
+    // A stale checkpoint is observable status, but it can never admit durable
+    // work: the recorded instance identity does not describe this binary,
+    // home, boot, or live process.
+    if report.home_checkpoint == HomeCheckpointState::Stale {
+        return SupervisorServicePreflight::SetupRequired {
+            reason: format!(
+                "the current supervisor service has no valid live instance identity: {}",
+                report
+                    .verdict_reason
+                    .as_deref()
+                    .unwrap_or("its instance checkpoint is stale")
+            ),
+            last_instance: report
+                .checkpoint
+                .as_ref()
+                .map(SupervisorServiceInstance::from),
+        };
+    }
     let manager_ready = match report.manager {
         ServiceManager::Launchd => {
             report.loaded == Some(true) && report.enabled.as_deref() == Some("enabled")
@@ -596,7 +697,10 @@ fn service_preflight_from_status(
         }
         ServiceManager::Unsupported => false,
     };
-    if manager_ready && let Some(checkpoint) = report.checkpoint.as_ref() {
+    if manager_ready
+        && report.home_checkpoint == HomeCheckpointState::Present
+        && let Some(checkpoint) = report.checkpoint.as_ref()
+    {
         SupervisorServicePreflight::Ready {
             instance: SupervisorServiceInstance::from(checkpoint),
         }
@@ -665,7 +769,7 @@ pub(crate) fn supervisor_requires_service_singleton(
     !(once && requested_job_id.is_some())
 }
 
-pub(crate) fn supervisor_service_install_command() -> Result<()> {
+pub(crate) fn supervisor_service_install_command(json: bool) -> Result<()> {
     let context = ServiceContext::discover()?;
     let unit_path = context.unit_path();
     let rendered = render_service(&context)?;
@@ -705,14 +809,50 @@ pub(crate) fn supervisor_service_install_command() -> Result<()> {
             return Err(unmanaged_conflict_error(&unit_path));
         }
     };
-    println!(
-        "supervisor service {action}: {}\nnext: deadreckon supervisor start",
-        unit_path.display()
-    );
+    if json {
+        let (kind, result, what_happened) = match outcome {
+            InstallDecision::Create => (
+                VerdictKind::Completed,
+                "installed",
+                "DeadReckon installed the per-user supervisor service unit.",
+            ),
+            InstallDecision::Unchanged => (
+                VerdictKind::Noop,
+                "already-installed",
+                "The per-user supervisor service unit already pins this binary and state directory.",
+            ),
+            InstallDecision::ReplaceManaged => (
+                VerdictKind::Completed,
+                "updated",
+                "DeadReckon updated the managed per-user supervisor service unit.",
+            ),
+            InstallDecision::RefuseUnmanaged => unreachable!("refused above"),
+        };
+        return emit_supervisor_lifecycle_success(
+            &context,
+            "install",
+            result,
+            kind,
+            observed_service_run_state(&context),
+            what_happened.to_string(),
+            "Install writes the managed unit only; the service is enabled and started by `deadreckon supervisor start`.",
+            ("Recommended", "deadreckon supervisor start"),
+            ("Secondary", "deadreckon supervisor status --json"),
+        );
+    }
+    // Nested lifecycle callers (doctor --repair --json) run this with
+    // `json: false` while another verb's machine envelope owns stdout; the
+    // human line must not pollute that single-object stream.
+    if machine_json::active().is_none() {
+        println!(
+            "supervisor service {action}: {}\nnext: deadreckon supervisor start",
+            unit_path.display()
+        );
+    }
     Ok(())
 }
 
-pub(crate) fn supervisor_service_start_command() -> Result<()> {
+pub(crate) fn supervisor_service_start_command(json: bool) -> Result<()> {
     let context = ServiceContext::discover()?;
     require_current_managed_unit(&context)?;
     match context.platform {
@@ -735,11 +875,27 @@ pub(crate) fn supervisor_service_start_command() -> Result<()> {
             )?;
         }
     }
-    println!(
-        "supervisor service started\nstate: {}\nbinary: {}",
-        context.deadreckon_home.display(),
-        context.binary.display()
-    );
+    if json {
+        return emit_supervisor_lifecycle_success(
+            &context,
+            "start",
+            "started",
+            VerdictKind::Completed,
+            observed_service_run_state(&context),
+            "DeadReckon enabled and started the per-user supervisor service.".to_string(),
+            "The service manager now owns the supervisor process and restarts it after a machine restart.",
+            ("Recommended", "deadreckon supervisor status --json"),
+            ("Secondary", "deadreckon supervisor stop"),
+        );
+    }
+    // Same one-envelope-stream rule as install for nested callers.
+    if machine_json::active().is_none() {
+        println!(
+            "supervisor service started\nstate: {}\nbinary: {}",
+            context.deadreckon_home.display(),
+            context.binary.display()
+        );
+    }
     Ok(())
 }
 
@@ -938,13 +1094,13 @@ fn build_service_status_report(
     boot: BootIdentityObservation,
 ) -> Result<SupervisorServiceStatusReport> {
     validate_manager_runtime(context.platform, posture, &runtime)?;
-    if let Some(checkpoint) = checkpoint.as_ref() {
-        validate_checkpoint_identity(context, &runtime, checkpoint, &boot.current_boot_id)?;
-    } else if runtime.is_running() {
-        return Err(invalid_input(
-            "service manager reports the supervisor running, but its instance checkpoint is absent",
-        ));
-    }
+    let health = classify_two_source_health(
+        context,
+        posture,
+        &runtime,
+        checkpoint.as_ref(),
+        &boot.current_boot_id,
+    );
     Ok(SupervisorServiceStatusReport {
         schema_version: SERVICE_STATUS_SCHEMA,
         manager: match context.platform {
@@ -955,11 +1111,117 @@ fn build_service_status_report(
         loaded: runtime.loaded,
         enabled: runtime.enabled,
         active: runtime.active,
+        service: health.service,
+        home_checkpoint: health.home_checkpoint,
+        verdict: health.verdict,
+        verdict_reason: health.verdict_reason,
         checkpoint,
         current_boot_id: boot.current_boot_id,
         boot_identity_source: boot.source,
         test_override: boot.test_override,
     })
+}
+
+struct TwoSourceHealth {
+    service: ServiceRunState,
+    home_checkpoint: HomeCheckpointState,
+    verdict: SupervisorHealthVerdict,
+    verdict_reason: Option<String>,
+}
+
+/// The typed two-source health truth behind `supervisor status --json`.
+///
+/// Supervisor health has two independent sources: the service manager's
+/// account of the managed unit, and this home's live instance checkpoint. A
+/// disagreement between them (live probe: "running but foreign home") is an
+/// observable state, not a broken invariant, so it classifies into one honest
+/// verdict word with the mismatch fact rendered verbatim instead of refusing.
+/// Classification is read-only: it never mutates the manager or the
+/// checkpoint.
+fn classify_two_source_health(
+    context: &ServiceContext,
+    posture: MachineRestartPosture,
+    runtime: &ServiceManagerRuntime,
+    checkpoint: Option<&ServiceInstanceCheckpoint>,
+    current_boot_id: &str,
+) -> TwoSourceHealth {
+    let service = if runtime.is_running() {
+        ServiceRunState::Running
+    } else if matches!(
+        posture,
+        MachineRestartPosture::NotInstalled | MachineRestartPosture::Unsupported
+    ) {
+        ServiceRunState::NotInstalled
+    } else {
+        ServiceRunState::Stopped
+    };
+    let (home_checkpoint, checkpoint_fault, foreign_checkpoint_home) = match checkpoint {
+        None => (HomeCheckpointState::Absent, None, false),
+        Some(checkpoint) => {
+            match validate_checkpoint_identity(context, runtime, checkpoint, current_boot_id) {
+                Ok(()) => (HomeCheckpointState::Present, None, false),
+                Err(fault) => (
+                    HomeCheckpointState::Stale,
+                    Some(fault.to_string()),
+                    checkpoint.deadreckon_home != context.deadreckon_home,
+                ),
+            }
+        }
+    };
+    let (verdict, verdict_reason) = match (service, home_checkpoint) {
+        (ServiceRunState::Running, HomeCheckpointState::Present) => {
+            if posture != MachineRestartPosture::InstalledCurrent {
+                (
+                    SupervisorHealthVerdict::Degraded,
+                    Some(
+                        "the installed DeadReckon supervisor service points at a different binary or state directory"
+                            .to_string(),
+                    ),
+                )
+            } else if runtime.enabled.as_deref() != Some("enabled") {
+                (
+                    SupervisorHealthVerdict::Degraded,
+                    Some(
+                        "the supervisor is running but not enabled to start again after a machine restart"
+                            .to_string(),
+                    ),
+                )
+            } else {
+                (SupervisorHealthVerdict::Healthy, None)
+            }
+        }
+        (ServiceRunState::Running, HomeCheckpointState::Absent) => (
+            SupervisorHealthVerdict::ForeignHome,
+            Some(
+                "service manager reports the supervisor running, but its instance checkpoint is absent"
+                    .to_string(),
+            ),
+        ),
+        (ServiceRunState::Running, HomeCheckpointState::Stale) if foreign_checkpoint_home => {
+            (SupervisorHealthVerdict::ForeignHome, checkpoint_fault)
+        }
+        (ServiceRunState::Running, HomeCheckpointState::Stale) => {
+            (SupervisorHealthVerdict::Degraded, checkpoint_fault)
+        }
+        (ServiceRunState::NotInstalled, _) => (
+            SupervisorHealthVerdict::Down,
+            Some(checkpoint_fault.unwrap_or_else(|| {
+                "the DeadReckon supervisor service is not installed".to_string()
+            })),
+        ),
+        (ServiceRunState::Stopped, _) => (
+            SupervisorHealthVerdict::Down,
+            Some(checkpoint_fault.unwrap_or_else(|| {
+                "the service manager reports the supervisor stopped".to_string()
+            })),
+        ),
+    };
+    TwoSourceHealth {
+        service,
+        home_checkpoint,
+        verdict,
+        verdict_reason,
+    }
 }
 
 fn validate_manager_runtime(
@@ -1021,6 +1283,13 @@ fn unsupported_service_status_report(
         loaded: None,
         enabled: None,
         active: None,
+        service: ServiceRunState::NotInstalled,
+        home_checkpoint: HomeCheckpointState::Absent,
+        verdict: SupervisorHealthVerdict::Down,
+        verdict_reason: Some(
+            "machine-restart durability is available only on macOS launchd and Linux systemd"
+                .to_string(),
+        ),
         checkpoint: None,
         current_boot_id: boot.current_boot_id,
         boot_identity_source: boot.source,
@@ -1127,9 +1396,23 @@ fn validate_checkpoint_identity(
     Ok(())
 }
 
-pub(crate) fn supervisor_service_stop_command() -> Result<()> {
+pub(crate) fn supervisor_service_stop_command(json: bool) -> Result<()> {
     let context = ServiceContext::discover()?;
     if !require_any_managed_unit(&context)? {
+        if json {
+            return emit_supervisor_lifecycle_success(
+                &context,
+                "stop",
+                "already-stopped",
+                VerdictKind::Noop,
+                ServiceRunState::NotInstalled.as_str(),
+                "No per-user supervisor service unit is installed, so there is nothing to stop."
+                    .to_string(),
+                "Stop disables and unloads the managed unit; an absent unit is already stopped.",
+                ("Recommended", "deadreckon supervisor install"),
+                ("Secondary", "deadreckon supervisor status --json"),
+            );
+        }
         println!("supervisor service already stopped (not installed)");
         return Ok(());
     }
@@ -1168,10 +1451,87 @@ pub(crate) fn supervisor_service_stop_command() -> Result<()> {
             }
         }
     }
+    if json {
+        return emit_supervisor_lifecycle_success(
+            &context,
+            "stop",
+            "stopped",
+            VerdictKind::Completed,
+            observed_service_run_state(&context),
+            "DeadReckon disabled and stopped the per-user supervisor service.".to_string(),
+            "The managed unit is retained; `deadreckon supervisor start` re-enables it.",
+            ("Recommended", "deadreckon supervisor start"),
+            ("Secondary", "deadreckon supervisor status --json"),
+        );
+    }
     println!(
         "supervisor service stopped\nunit retained: {}\nrestart: deadreckon supervisor start",
         context.unit_path().display()
     );
+    Ok(())
+}
+
+/// Post-action service-manager observation for lifecycle envelopes. A
+/// completed mutation must not turn into a refusal because the follow-up
+/// read-only query failed, so an unreadable manager reports `unknown`.
+fn observed_service_run_state(context: &ServiceContext) -> &'static str {
+    match query_service_manager_runtime(context) {
+        Ok(runtime) if runtime.is_running() => ServiceRunState::Running.as_str(),
+        Ok(_) => ServiceRunState::Stopped.as_str(),
+        Err(_) => "unknown",
+    }
+}
+
+/// The shared G1 success envelope for one supervisor lifecycle action. Prose
+/// callers never reach this: the `--json` flag decides, so nested lifecycle
+/// calls (guided `start` setup, `doctor` repair, `init --supervisor`) keep
+/// their historical prose byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn emit_supervisor_lifecycle_success(
+    context: &ServiceContext,
+    action: &'static str,
+    result: &'static str,
+    kind: VerdictKind,
+    service_state: &str,
+    what_happened: String,
+    why_this_verdict: &str,
+    primary: (&'static str, &'static str),
+    secondary: (&'static str, &'static str),
+) -> Result<()> {
+    let unit_path = context.unit_path();
+    let surface = VerdictSurface::must_new(
+        kind,
+        "supervisor",
+        Some(action),
+        ExplanationPanel::new(
+            what_happened,
+            why_this_verdict,
+            [
+                ("unit".to_string(), unit_path.display().to_string()),
+                (
+                    "state".to_string(),
+                    context.deadreckon_home.display().to_string(),
+                ),
+                ("binary".to_string(), context.binary.display().to_string()),
+                ("service".to_string(), service_state.to_string()),
+            ],
+        ),
+        [primary],
+        [secondary],
+    );
+    machine_json::emit_success(
+        machine_json::active().unwrap_or("supervisor"),
+        action,
+        &surface,
+        json!({
+            "action": action,
+            "result": result,
+            "service_state": service_state,
+            "unit_path": unit_path.display().to_string(),
+            "deadreckon_home": context.deadreckon_home.display().to_string(),
+            "binary": context.binary.display().to_string(),
+        }),
+    )?;
     Ok(())
 }
 
@@ -2275,19 +2635,40 @@ mod tests {
         assert_eq!(report.loaded, Some(true));
         assert_eq!(report.enabled.as_deref(), Some("enabled"));
         assert_eq!(report.active, None);
+        assert_eq!(report.service, ServiceRunState::Running);
+        assert_eq!(report.home_checkpoint, HomeCheckpointState::Present);
+        assert_eq!(report.verdict, SupervisorHealthVerdict::Healthy);
+        assert_eq!(report.verdict_reason, None);
         assert_eq!(
             render_human_service_status(&context, "current", &runtime),
             "supervisor service: loaded, enabled\nunit: current\npath: /Users/test/Library/LaunchAgents/com.deadreckon.supervisor.plist\nstate: /Users/test/Dead Reckon State\nbinary: /opt/Dead Reckon/bin/deadreckon"
         );
-        let error = build_service_status_report(
+        // A running manager without a checkpoint in this home is the live
+        // "running but foreign home" probe: it reports, it does not refuse.
+        let foreign = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
             None,
             boot("boot-a"),
         )
-        .expect_err("a running manager requires a checkpoint");
-        assert!(error.to_string().contains("checkpoint is absent"));
+        .expect("running manager without a home checkpoint is observable");
+        assert_eq!(foreign.service, ServiceRunState::Running);
+        assert_eq!(foreign.home_checkpoint, HomeCheckpointState::Absent);
+        assert_eq!(foreign.verdict, SupervisorHealthVerdict::ForeignHome);
+        assert!(
+            foreign
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("checkpoint is absent")
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&foreign)
+                .expect_err("a foreign-home verdict cannot become live evidence")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[cfg(unix)]
@@ -2637,11 +3018,14 @@ mod tests {
         )
         .expect("boot-change evidence");
 
+        assert_eq!(report.service, ServiceRunState::Stopped);
+        assert_eq!(report.home_checkpoint, HomeCheckpointState::Present);
+        assert_eq!(report.verdict, SupervisorHealthVerdict::Down);
         let checkpoint = report.checkpoint.expect("checkpoint");
         assert_eq!(checkpoint.boot_id, "boot-before");
         assert_eq!(report.current_boot_id, "boot-after");
 
-        let error = build_service_status_report(
+        let prior_boot = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             ServiceManagerRuntime {
@@ -2652,8 +3036,23 @@ mod tests {
             Some(checkpoint),
             boot("boot-after"),
         )
-        .expect_err("a running manager cannot use a prior-boot checkpoint");
-        assert!(error.to_string().contains("does not match current boot"));
+        .expect("a running manager with a prior-boot checkpoint is observable");
+        assert_eq!(prior_boot.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(prior_boot.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            prior_boot
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not match current boot")
+        );
+        assert!(!service_preflight_from_status(&prior_boot).is_ready());
+        assert!(
+            validate_supervisor_service_live_evidence(&prior_boot)
+                .expect_err("a prior-boot checkpoint cannot become live evidence")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2684,7 +3083,7 @@ mod tests {
         validate_supervisor_service_live_evidence(&report)
             .expect("legacy checkpoint remains valid live evidence");
 
-        let error = build_service_status_report(
+        let prior_boot = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
@@ -2700,8 +3099,22 @@ mod tests {
                 test_override: false,
             },
         )
-        .expect_err("different boot seconds must fail closed");
-        assert!(error.to_string().contains("does not match current boot"));
+        .expect("different boot seconds are observable status");
+        assert_eq!(prior_boot.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(prior_boot.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            prior_boot
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not match current boot")
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&prior_boot)
+                .expect_err("different boot seconds must fail closed")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2729,7 +3142,7 @@ mod tests {
         validate_supervisor_service_live_evidence(&report)
             .expect("session UUID is valid live evidence");
 
-        let error = build_service_status_report(
+        let legacy_time = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
@@ -2745,8 +3158,22 @@ mod tests {
                 test_override: false,
             },
         )
-        .expect_err("legacy time identity cannot prove the current UUID session");
-        assert!(error.to_string().contains("does not match current boot"));
+        .expect("legacy time identity is observable status");
+        assert_eq!(legacy_time.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(legacy_time.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            legacy_time
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not match current boot")
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&legacy_time)
+                .expect_err("legacy time identity cannot prove the current UUID session")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2759,31 +3186,55 @@ mod tests {
         };
         let mut reused = checkpoint(&context, 2, "reused", "boot-a");
         reused.process_start_identity = "different-process-start".to_string();
-        let error = build_service_status_report(
+        let reused_report = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime.clone(),
             Some(reused),
             boot("boot-a"),
         )
-        .expect_err("PID reuse must fail closed");
+        .expect("PID reuse is observable status");
+        assert_eq!(reused_report.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(reused_report.verdict, SupervisorHealthVerdict::Degraded);
         assert!(
-            error
-                .to_string()
+            reused_report
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
                 .contains("different process-start identity")
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&reused_report)
+                .expect_err("PID reuse must fail closed")
+                .to_string()
+                .contains("only a healthy supervisor")
         );
 
         let mut dead = checkpoint(&context, 3, "dead", "boot-a");
         dead.pid = u32::MAX;
-        let error = build_service_status_report(
+        let dead_report = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
             Some(dead),
             boot("boot-a"),
         )
-        .expect_err("dead checkpoint PID must fail closed");
-        assert!(error.to_string().contains("is not live"));
+        .expect("a dead checkpoint PID is observable status");
+        assert_eq!(dead_report.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(dead_report.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            dead_report
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("is not live")
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&dead_report)
+                .expect_err("dead checkpoint PID must fail closed")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2798,16 +3249,28 @@ mod tests {
         stale.bundle_build_id =
             "deadreckon-bundle-build-id-sha256:stale-in-place-binary".to_string();
 
-        let error = build_service_status_report(
+        let report = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
             Some(stale),
             boot("boot-a"),
         )
-        .expect_err("same-path stale supervisor build must fail closed");
-        assert!(error.to_string().contains("restart the managed supervisor"));
-        assert!(error.to_string().contains("stale-in-place-binary"));
+        .expect("a same-path stale supervisor build is observable status");
+        assert_eq!(report.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(report.verdict, SupervisorHealthVerdict::Degraded);
+        let reason = report.verdict_reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("restart the managed supervisor"),
+            "{reason}"
+        );
+        assert!(reason.contains("stale-in-place-binary"), "{reason}");
+        assert!(
+            validate_supervisor_service_live_evidence(&report)
+                .expect_err("same-path stale supervisor build must fail closed")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2821,16 +3284,28 @@ mod tests {
         let mut stale = checkpoint(&context, 5, "stale-digest", "boot-a");
         stale.binary_sha256 = "different-executable-sha256".to_string();
 
-        let error = build_service_status_report(
+        let report = build_service_status_report(
             &context,
             MachineRestartPosture::InstalledCurrent,
             runtime,
             Some(stale),
             boot("boot-a"),
         )
-        .expect_err("same-path stale executable bytes must fail closed");
-        assert!(error.to_string().contains("executable digest"));
-        assert!(error.to_string().contains("restart the managed supervisor"));
+        .expect("same-path stale executable bytes are observable status");
+        assert_eq!(report.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(report.verdict, SupervisorHealthVerdict::Degraded);
+        let reason = report.verdict_reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("executable digest"), "{reason}");
+        assert!(
+            reason.contains("restart the managed supervisor"),
+            "{reason}"
+        );
+        assert!(
+            validate_supervisor_service_live_evidence(&report)
+                .expect_err("same-path stale executable bytes must fail closed")
+                .to_string()
+                .contains("only a healthy supervisor")
+        );
     }
 
     #[test]
@@ -2898,11 +3373,15 @@ mod tests {
                 "checkpoint",
                 "current_boot_id",
                 "enabled",
+                "home_checkpoint",
                 "installed",
                 "loaded",
                 "manager",
                 "schema_version",
+                "service",
                 "test_override",
+                "verdict",
+                "verdict_reason",
             ]
             .into_iter()
             .collect()
@@ -2910,6 +3389,10 @@ mod tests {
         assert_eq!(value["boot_identity_source"], "test_override");
         assert_eq!(value["test_override"], true);
         assert_eq!(value["schema_version"], SERVICE_STATUS_SCHEMA);
+        assert_eq!(value["service"], "running");
+        assert_eq!(value["home_checkpoint"], "present");
+        assert_eq!(value["verdict"], "healthy");
+        assert_eq!(value["verdict_reason"], serde_json::Value::Null);
         assert!(
             validate_supervisor_service_live_evidence(&report)
                 .expect_err("test override cannot become live evidence")
@@ -2962,6 +3445,143 @@ mod tests {
             serde_json::from_value::<SupervisorServiceStatusReport>(value).is_err(),
             "unknown status fields must be rejected"
         );
+    }
+
+    #[test]
+    fn two_source_health_matrix_is_typed_with_verbatim_reasons() {
+        let context = context(ServicePlatform::Launchd);
+        let running = ServiceManagerRuntime {
+            loaded: Some(true),
+            enabled: Some("enabled".to_string()),
+            active: None,
+        };
+        let valid = checkpoint(&context, 1, "matrix-instance", "boot-a");
+
+        let healthy = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &running,
+            Some(&valid),
+            "boot-a",
+        );
+        assert_eq!(healthy.service, ServiceRunState::Running);
+        assert_eq!(healthy.home_checkpoint, HomeCheckpointState::Present);
+        assert_eq!(healthy.verdict, SupervisorHealthVerdict::Healthy);
+        assert_eq!(healthy.verdict_reason, None);
+
+        // Running with no checkpoint in this home: the manager serves a
+        // supervisor, but not this DEADRECKON_HOME.
+        let foreign_absent = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &running,
+            None,
+            "boot-a",
+        );
+        assert_eq!(foreign_absent.home_checkpoint, HomeCheckpointState::Absent);
+        assert_eq!(foreign_absent.verdict, SupervisorHealthVerdict::ForeignHome);
+
+        // Running with a checkpoint recorded for another state home.
+        let mut foreign = valid.clone();
+        foreign.deadreckon_home = PathBuf::from("/Users/test/Another State Home");
+        let foreign_home = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &running,
+            Some(&foreign),
+            "boot-a",
+        );
+        assert_eq!(foreign_home.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(foreign_home.verdict, SupervisorHealthVerdict::ForeignHome);
+        assert!(
+            foreign_home
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not match the current DEADRECKON_HOME")
+        );
+
+        // Running with a same-home checkpoint from other executable bytes.
+        let mut stale = valid.clone();
+        stale.binary_sha256 = "different-executable-sha256".to_string();
+        let degraded = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &running,
+            Some(&stale),
+            "boot-a",
+        );
+        assert_eq!(degraded.home_checkpoint, HomeCheckpointState::Stale);
+        assert_eq!(degraded.verdict, SupervisorHealthVerdict::Degraded);
+
+        // Running and current, but not enabled for the next machine restart.
+        let disabled = ServiceManagerRuntime {
+            loaded: Some(true),
+            enabled: Some("disabled".to_string()),
+            active: None,
+        };
+        let not_enabled = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &disabled,
+            Some(&valid),
+            "boot-a",
+        );
+        assert_eq!(not_enabled.home_checkpoint, HomeCheckpointState::Present);
+        assert_eq!(not_enabled.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            not_enabled
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not enabled")
+        );
+
+        // Running behind a stale unit definition.
+        let stale_unit = classify_two_source_health(
+            &context,
+            MachineRestartPosture::StaleManagedUnit,
+            &running,
+            Some(&valid),
+            "boot-a",
+        );
+        assert_eq!(stale_unit.verdict, SupervisorHealthVerdict::Degraded);
+        assert!(
+            stale_unit
+                .verdict_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("different binary or state directory")
+        );
+
+        // Stopped and not-installed are both down; the service field keeps
+        // the distinction.
+        let stopped = ServiceManagerRuntime {
+            loaded: Some(false),
+            enabled: Some("enabled".to_string()),
+            active: None,
+        };
+        let down_stopped = classify_two_source_health(
+            &context,
+            MachineRestartPosture::InstalledCurrent,
+            &stopped,
+            Some(&valid),
+            "boot-a",
+        );
+        assert_eq!(down_stopped.service, ServiceRunState::Stopped);
+        assert_eq!(down_stopped.home_checkpoint, HomeCheckpointState::Present);
+        assert_eq!(down_stopped.verdict, SupervisorHealthVerdict::Down);
+
+        let down_absent = classify_two_source_health(
+            &context,
+            MachineRestartPosture::NotInstalled,
+            &ServiceManagerRuntime::default(),
+            None,
+            "boot-a",
+        );
+        assert_eq!(down_absent.service, ServiceRunState::NotInstalled);
+        assert_eq!(down_absent.home_checkpoint, HomeCheckpointState::Absent);
+        assert_eq!(down_absent.verdict, SupervisorHealthVerdict::Down);
     }
 
     #[test]

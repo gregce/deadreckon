@@ -4091,6 +4091,82 @@ fn confirm_start_spend_cap(max_spend: Option<f64>, i_know_its_a_lot: bool) -> Re
     }
 }
 
+/// The spend cap frozen into a durable Job's policy. The approved launch
+/// plan is the money authority: the replay execute leg (`start --plan F
+/// --yes`) carries no `--max-spend`, and falling back to the config default
+/// silently froze a policy that disagreed with the acknowledged plan ceiling
+/// — live-found as `list --json` reporting the enforced cap ($10 default)
+/// while the frozen plan the operator approved said $25. Precedence:
+/// explicit flag (the replay path has already clamped the plan to it), then
+/// the frozen plan ceiling (the value `confirm_start_spend_cap` acknowledged
+/// on replay), then the config default, then the $10 floor. On the direct
+/// path the plan ceiling is built from the same flag/default chain, so this
+/// changes nothing there.
+fn job_policy_spend_cap_usd(
+    explicit_max_spend: Option<f64>,
+    launch_plan: &commands::course::LaunchPlan,
+    config_default: Option<f64>,
+) -> f64 {
+    explicit_max_spend
+        .or(launch_plan.budget.ceiling_usd)
+        .or(config_default)
+        .unwrap_or(10.0)
+}
+
+#[cfg(test)]
+mod job_policy_spend_cap_tests {
+    use super::job_policy_spend_cap_usd;
+    use crate::commands;
+
+    fn plan_with_ceiling(ceiling_usd: Option<f64>) -> commands::course::LaunchPlan {
+        let mut plan = commands::course::trivial_operator_plan(
+            "prove the frozen ceiling is the money authority",
+            commands::course::CourseShape::Single,
+            "start",
+        );
+        plan.budget.ceiling_usd = ceiling_usd;
+        plan
+    }
+
+    /// The live-found disagreement: preview approved `--max-spend 25`,
+    /// replay executed without the flag, and the Job policy froze at the
+    /// $10 config default while the plan (and its spend acknowledgment)
+    /// said $25 — so `list --json` reported a cap the operator never chose.
+    #[test]
+    fn replay_execute_leg_freezes_the_acknowledged_plan_ceiling() {
+        let plan = plan_with_ceiling(Some(25.0));
+        assert_eq!(job_policy_spend_cap_usd(None, &plan, Some(10.0)), 25.0);
+    }
+
+    /// A config default larger than the approved ceiling must not widen the
+    /// policy either: the frozen plan outranks the config in both directions.
+    #[test]
+    fn config_default_cannot_widen_the_approved_ceiling() {
+        let plan = plan_with_ceiling(Some(25.0));
+        assert_eq!(job_policy_spend_cap_usd(None, &plan, Some(100.0)), 25.0);
+    }
+
+    /// An explicit flag still wins — the replay path has already clamped
+    /// the plan ceiling to it, so the two can never disagree.
+    #[test]
+    fn explicit_flag_outranks_plan_and_config() {
+        let plan = plan_with_ceiling(Some(25.0));
+        assert_eq!(
+            job_policy_spend_cap_usd(Some(30.0), &plan, Some(10.0)),
+            30.0
+        );
+    }
+
+    /// Without a frozen ceiling the historical chain is unchanged: config
+    /// default, then the $10 floor.
+    #[test]
+    fn config_default_then_floor_without_a_frozen_ceiling() {
+        let plan = plan_with_ceiling(None);
+        assert_eq!(job_policy_spend_cap_usd(None, &plan, Some(12.0)), 12.0);
+        assert_eq!(job_policy_spend_cap_usd(None, &plan, None), 10.0);
+    }
+}
+
 fn emit_start_read_only_result(
     decision: &StartLaunchDecision,
     args: &StartCommandArgs,
@@ -4197,8 +4273,8 @@ fn require_start_supervisor_service(mut prompter: Option<&mut dyn StartPrompter>
     }
 
     commands::providers::reconcile_receipt_for_current_binary(&DeadreckonPaths::discover(), false)?;
-    commands::supervisor_service::supervisor_service_install_command()?;
-    commands::supervisor_service::supervisor_service_start_command()?;
+    commands::supervisor_service::supervisor_service_install_command(false)?;
+    commands::supervisor_service::supervisor_service_start_command(false)?;
 
     let deadline =
         std::time::Instant::now() + commands::supervisor_service::supervisor_readiness_timeout();
@@ -4718,7 +4794,8 @@ async fn dispatch_start_command(
             let paths = DeadreckonPaths::discover();
             let cwd = std::env::current_dir()?;
             let defaults = config_defaults(&paths)?;
-            let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+            let max_spend_usd =
+                job_policy_spend_cap_usd(args.max_spend, &launch_plan, defaults.max_spend);
             let max_wall_seconds = commands::job::checked_job_wall_seconds(
                 defaults.cli_max_wall_seconds.unwrap_or(36_000.0),
             )?;
@@ -4870,7 +4947,7 @@ async fn dispatch_advanced_start_job(
     let paths = DeadreckonPaths::discover();
     let cwd = std::env::current_dir()?;
     let defaults = config_defaults(&paths)?;
-    let max_spend_usd = args.max_spend.or(defaults.max_spend).unwrap_or(10.0);
+    let max_spend_usd = job_policy_spend_cap_usd(args.max_spend, &launch_plan, defaults.max_spend);
     let max_wall_seconds =
         commands::job::checked_job_wall_seconds(defaults.cli_max_wall_seconds.unwrap_or(36_000.0))?;
     let sandbox_requested = defaults.sandbox.unwrap_or_else(|| "auto".to_string());

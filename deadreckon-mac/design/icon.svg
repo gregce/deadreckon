@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>deadreckon app icon</title>
+  <desc>
+    The committed world at 1024px: dark charcoal instrument face, hard-line
+    geometry, the one warm orange spent on the brand mark. Two hues — charcoal
+    (field #1D1C1A + hairline edge #32302C) and orange (#E2703A lit facet,
+    #D0662F shade facet). Flat fills only: no gradients, no shadows, no gloss.
+    Geometry (DESIGN.md §8, SETTINGS-SCREENS-SPEC.md §I):
+      tile   824×824 at (100,100), corner radius 185 (macOS icon grid)
+      edge   10-unit inner stroke, outer edge flush with the tile edge
+      mark   45° diamond, half-diagonal 270, centered at (512,512),
+             split along the vertical diagonal into two flat facets
+    16px survival: the facet values are ~8% apart in luminance, so at small
+    sizes the mark reads as one solid orange diamond on a charcoal tile; the
+    edge line disappears politely. Render every AppIcon slot from this file
+    at its exact pixel size — never downscale a single raster.
+  </desc>
+
+  <!-- Instrument face -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#1D1C1A"/>
+
+  <!-- Machined edge: outer edge of this stroke sits flush at the tile edge -->
+  <rect x="105" y="105" width="814" height="814" rx="180"
+        fill="none" stroke="#32302C" stroke-width="10"/>
+
+  <!-- Brand mark: full diamond in the shade value first (no seam at any
+       raster size), then the lit facet over its left half. -->
+  <path d="M512 242 L782 512 L512 782 L242 512 Z" fill="#D0662F"/>
+  <path d="M512 242 L512 782 L242 512 Z" fill="#E2703A"/>
+</svg>

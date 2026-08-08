@@ -153,6 +153,12 @@ verb.
 | `update` | One-command rollback | pass | Shell updates write backups and native channels print native rollback paths. |
 | `update` | One verdict + ONE primary action | pass | Native, shell, check, source, and failure update paths render one VerdictSurface primary command. |
 | `update` | Lifecycle hint | pass | Success points at doctor. |
+| `supervisor` | Auto-detect, don't ask | pass | Platform (launchd/systemd), binary, and state home are discovered; lifecycle verbs never prompt. |
+| `supervisor` | Preview before mutate | n-a | install/start/stop are explicit single-purpose mutations; `status` is read-only. |
+| `supervisor` | Refuse with try: | pass | Not-installed, stale, and unmanaged-unit refusals name the unit path and the exact lifecycle command; unmanaged units are never overwritten. |
+| `supervisor` | One-command rollback | pass | `supervisor stop` reverses `start` and retains the unit; `install` rewrites only the managed unit. |
+| `supervisor` | One verdict + ONE primary action | pass | install/start/stop `--json` envelopes ride one VerdictSurface with a single `Recommended` command; `supervisor_surface.rs` guards the round trip. |
+| `supervisor` | Lifecycle hint | pass | Each verb points at the next lifecycle step (`start`, `status --json`, or `install`). |
 | `list` | Auto-detect, don't ask | pass | Defaults to current project scope and latest inventory. |
 | `list` | Preview before mutate | n-a | Read-only listing. |
 | `list` | Refuse with try: | pass | Scope/ref errors point at `--all` or show commands. |

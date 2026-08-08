@@ -11,7 +11,10 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 const SUPERVISOR_INSTANCE_SCHEMA: u64 = 3;
-const SUPERVISOR_STATUS_SCHEMA: u64 = 3;
+// v4 carries the typed two-source health truth (service / home_checkpoint /
+// verdict / verdict_reason) alongside the existing manager and checkpoint
+// evidence.
+const SUPERVISOR_STATUS_SCHEMA: u64 = 4;
 // Keep the hermetic service fixture aligned with production's bounded
 // readiness window. A debug integration-test binary is large, and both
 // install and serve hash its exact bytes before readiness can be trusted.
@@ -246,6 +249,9 @@ impl SupervisorServiceFixture {
         );
         assert_eq!(report["installed"], "current", "{report}");
         assert_eq!(report["checkpoint"]["pid"], expected_pid, "{report}");
+        assert_eq!(report["service"], "running", "{report}");
+        assert_eq!(report["home_checkpoint"], "present", "{report}");
+        assert_eq!(report["verdict"], "healthy", "{report}");
         #[cfg(target_os = "macos")]
         {
             assert_eq!(report["manager"], "launchd", "{report}");
@@ -326,7 +332,7 @@ case "$*" in
   "--user is-enabled deadreckon-supervisor.service")
     printf '%s\n' enabled
     ;;
-  "--user daemon-reload"|"--user enable deadreckon-supervisor.service"|"--user restart deadreckon-supervisor.service"|"--user disable deadreckon-supervisor.service"|"--user stop deadreckon-supervisor.service")
+  "--user daemon-reload"|"--user enable deadreckon-supervisor.service"|"--user restart deadreckon-supervisor.service"|"--user disable deadreckon-supervisor.service"|"--user disable --now deadreckon-supervisor.service"|"--user stop deadreckon-supervisor.service")
     ;;
   *)
     printf 'unexpected systemctl fixture command: %s\n' "$*" >&2

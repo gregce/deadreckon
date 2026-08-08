@@ -3654,20 +3654,30 @@ pub(crate) fn chain_undo_command(
     chain.status = ChainStatus::Undone;
     save_chain(paths, &chain)?;
     let id = chain_prefix(&chain.chain_id);
-    print!(
-        "{}",
-        chain_transition_surface(
-            paths,
-            &chain,
-            VerdictKind::Noop,
-            "DeadReckon reverted the applied chain commits and marked the chain undone.",
-            "There is no active chain work to advance, so inspection is the safest next command.",
-            vec![("undone steps".to_string(), undo_count.to_string())],
-            format!("deadreckon chain show {id}"),
-            vec![format!("deadreckon chain redo {id}")],
-        )
-        .render_plain(!completion_hints_enabled(false))
+    let surface = chain_transition_surface(
+        paths,
+        &chain,
+        VerdictKind::Noop,
+        "DeadReckon reverted the applied chain commits and marked the chain undone.",
+        "There is no active chain work to advance, so inspection is the safest next command.",
+        vec![("undone steps".to_string(), undo_count.to_string())],
+        format!("deadreckon chain show {id}"),
+        vec![format!("deadreckon chain redo {id}")],
     );
+    if let Some(verb) = machine_json::active() {
+        machine_json::emit_success(
+            verb,
+            &chain.chain_id,
+            &surface,
+            json!({
+                "undo_kind": "chain",
+                "undone_steps": undo_count,
+                "workspace": chain.cwd,
+            }),
+        )?;
+        return Ok(());
+    }
+    print!("{}", surface.render_plain(!completion_hints_enabled(false)));
     Ok(())
 }
 

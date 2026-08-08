@@ -14,6 +14,12 @@ struct OverviewView: View {
     /// Opens the New Goal sheet; `true` arms the folder chooser (the
     /// fresh-install invitation).
     let onNewGoal: (_ armFolderChooser: Bool) -> Void
+    /// Shows the Library browser in the center (§R3).
+    let onLibrary: () -> Void
+    /// Session-scoped "Set up later" for the first-run panel (§R2): the
+    /// panel returns on next launch only while setup is incomplete and the
+    /// fleet is still empty.
+    @Binding var setupDismissed: Bool
 
     var body: some View {
         Group {
@@ -30,7 +36,10 @@ struct OverviewView: View {
                 UnavailableView(reason: reason)
             case .loaded(let queue):
                 if queue.isEmpty {
-                    EmptyFleetView { onNewGoal(true) }
+                    // The one setup panel (§R2) while setup is incomplete;
+                    // the standard empty state otherwise — FirstRunGate
+                    // probes and decides.
+                    FirstRunGate(onNewGoal: onNewGoal, dismissed: $setupDismissed)
                 } else {
                     overview(queue)
                 }
@@ -127,7 +136,15 @@ struct OverviewView: View {
         let items = Array(queue.items(in: .wrecked).prefix(5))
         if !items.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
-                Theme.sectionTitle("RECENTLY FINISHED")
+                HStack(spacing: 8) {
+                    Theme.sectionTitle("RECENTLY FINISHED")
+                    Spacer()
+                    // §R3: the quiet doorway to the promoted-artifact
+                    // inventory.
+                    Button("Library \u{2192}") { onLibrary() }
+                        .buttonStyle(.themeText(size: 10.5))
+                        .help("Approved results, promoted \u{2014} View > Library (\u{2318}L)")
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(items) { item in
                         FinishedRow(item: item, onOpen: onOpen)

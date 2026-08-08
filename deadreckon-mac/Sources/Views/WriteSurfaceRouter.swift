@@ -12,6 +12,14 @@ final class WriteSurfaceRouter: ObservableObject {
         case kill(FleetRow)
         case promote(FleetRow)
         case sendBack(FleetRow)
+        /// Rewind the run to a provider checkpoint (SETTINGS-SCREENS-SPEC
+        /// §R1): preview first, always. `runID` is the current attempt's
+        /// resolved run id (Single-shape: the job id itself).
+        case rewind(FleetRow, runID: String, checkpoint: CheckpointManifestDoc)
+        /// Undo an in-place approval (§R1): offered only where the finish
+        /// envelope's own next actions advertised `deadreckon undo`, and
+        /// only when the capability probe confirmed `undo --json`.
+        case undo(FleetRow)
 
         var id: String {
             switch self {
@@ -19,6 +27,9 @@ final class WriteSurfaceRouter: ObservableObject {
             case .kill(let row): return "kill-\(row.jobID)"
             case .promote(let row): return "promote-\(row.jobID)"
             case .sendBack(let row): return "send-back-\(row.jobID)"
+            case .rewind(let row, _, let checkpoint):
+                return "rewind-\(row.jobID)-\(checkpoint.checkpointID)"
+            case .undo(let row): return "undo-\(row.jobID)"
             }
         }
     }

@@ -332,6 +332,78 @@ enum Lexicon {
         }
     }
 
+    // MARK: Settings (SETTINGS-SCREENS-SPEC §S0–S6)
+
+    /// §S3 verdict row: one honest word per typed service state. The
+    /// committed lexicon renders `supervisor` as "service" everywhere
+    /// (REDESIGN §A0); the foreign-home state is FULL-DRIVE B5a's typed
+    /// state. The degraded word always renders WITH the binary's
+    /// verdict_reason quoted beside it — the word alone is not the story.
+    static func serviceVerdictWord(_ verdict: ServiceController.DisplayVerdict) -> String {
+        switch verdict {
+        case .running: return "Running"
+        case .stopped: return "Stopped"
+        case .notInstalled: return "Not installed"
+        case .outdated: return "Outdated"
+        case .runningForeignHome: return "Running for a different home"
+        case .degraded: return "Degraded"
+        case .unsupported: return "Unsupported"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    /// Recorder checkpoint triggers (flight.rs CheckpointTrigger,
+    /// snake_case): the plain words for the checkpoint card's fact line —
+    /// spec §R1's "provider checkpoint". Unknown words pass verbatim
+    /// (machine truth, never dropped).
+    static func checkpointTrigger(_ raw: String) -> String {
+        switch raw {
+        case "provider_tool": return "provider checkpoint"
+        case "file_quiet": return "quiet-file checkpoint"
+        case "provider_exit": return "provider exit"
+        case "manual": return "manual"
+        default: return raw
+        }
+    }
+
+    /// §S1 General rows: plain label + caption per config key. The key
+    /// itself renders in mono beneath the label (machine truth, never
+    /// translated); these are the human words above it.
+    static func configRowLabel(_ key: String) -> String {
+        switch key {
+        case "defaults.provider": return "Agent"
+        case "defaults.model": return "Model"
+        case "defaults.max_spend": return "Spend cap"
+        case "defaults.cli_max_wall_seconds": return "Time limit"
+        case "defaults.sandbox": return "Sandbox"
+        case "defaults.prevent_sleep": return "Prevent sleep"
+        case "defaults.reviewer_provider": return "Reviewer agent"
+        case "defaults.reviewer_model": return "Reviewer model"
+        default: return key
+        }
+    }
+
+    static let spendCapCaption =
+        "New runs start with this budget unless the goal sets one. $10 when unset."
+    static let timeLimitCaption = "10h (36,000s) when unset."
+    static let preventSleepCaption =
+        "Keeps the Mac awake while a run works (`caffeinate`)."
+    static let serviceCaption =
+        "The service claims queued runs, supervises them, and records proven cleanup. "
+        + "The CLI calls it the `supervisor`. Plists are written only by the CLI \u{2014} "
+        + "the app never touches launchd files."
+    static let keyOverStdinCaption =
+        "The key travels over stdin \u{2014} it never appears in the command line, "
+        + "in logs, or in this window again."
+    static let subscriptionRouteCaption =
+        "Signs in with its own CLI \u{2014} no key stored here."
+    static let reviewerRolesCaption =
+        "The judge\u{2019}s sign-off runs on this route when set; the main agent\u{2019}s "
+        + "route otherwise."
+    static let drGateCaption =
+        "The app never invokes dr-gate; it is the harness\u{2019}s proof signer. Shown "
+        + "because you should be able to see every binary you\u{2019}re trusting."
+
     // MARK: Relative time (one formatter, one word for "now")
 
     private static let relativeFormatter: RelativeDateTimeFormatter = {

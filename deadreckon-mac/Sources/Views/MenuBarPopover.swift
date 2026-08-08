@@ -34,6 +34,8 @@ struct MenuBarPopover: View {
         }
         .frame(width: 360)
         .background(Theme.sidebarBg)
+        // One accent as the control tint (matches the window roots).
+        .tint(Theme.accent)
         // A just-summoned popover must not ride the 10 s menubar-only
         // cadence into the ten-second triage budget: refresh immediately.
         // FleetStore's in-flight/queued coalescing makes this safe against
