@@ -10895,6 +10895,9 @@ storage = "jsonl"
             "rebuildable binary",
         )
         .expect("SwiftPM artifact");
+        std::fs::create_dir_all(repository.join(".next/export")).expect("Next.js output");
+        std::fs::write(repository.join(".next/export/404.html"), "generated page")
+            .expect("Next.js artifact");
 
         let raw_changed = changed_files_since_snapshot(&state, 0).expect("raw changes");
         let deliverable =
@@ -10909,6 +10912,12 @@ storage = "jsonl"
                 .iter()
                 .all(|path| !path.ends_with(".build/debug/Cloudwing")),
             "disposable build output must be pruned before changed-file and provenance scanning"
+        );
+        assert!(
+            raw_changed
+                .iter()
+                .all(|path| !path.ends_with(".next/export/404.html")),
+            "Next.js build output must be pruned before changed-file and provenance scanning"
         );
         assert_eq!(
             deliverable
@@ -10946,6 +10955,10 @@ storage = "jsonl"
         assert!(
             !state.run_root.join("snapshots/turn-1/.build").exists(),
             "disposable build output must never enter turn snapshots"
+        );
+        assert!(
+            !state.run_root.join("snapshots/turn-1/.next").exists(),
+            "Next.js build output must never enter turn snapshots"
         );
 
         commit_worktree_turn(&state, 1, "cli_subagent").expect("sanitized first turn");
