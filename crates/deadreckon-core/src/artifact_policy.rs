@@ -13,8 +13,8 @@ pub enum WorkspacePathClass {
 }
 
 const EVIDENCE_ONLY_ROOTS: [&str; 1] = [".specstory"];
-const DISPOSABLE_RUNTIME_ROOTS: [&str; 3] = ["target", "node_modules", ".build"];
-const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 10] = [
+const DISPOSABLE_RUNTIME_ROOTS: [&str; 4] = ["target", "node_modules", ".build", ".next"];
+const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 12] = [
     ":(glob,exclude)**/.specstory",
     ":(glob,exclude)**/.specstory/**",
     ":(glob,exclude)**/.deadreckon",
@@ -25,6 +25,8 @@ const DELIVERY_GIT_EXCLUDE_PATHSPECS: [&str; 10] = [
     ":(glob,exclude)**/node_modules/**",
     ":(glob,exclude)**/.build",
     ":(glob,exclude)**/.build/**",
+    ":(glob,exclude)**/.next",
+    ":(glob,exclude)**/.next/**",
 ];
 
 pub const fn evidence_only_roots() -> &'static [&'static str] {
@@ -179,6 +181,10 @@ mod tests {
             WorkspacePathClass::RuntimeOnly
         );
         assert_eq!(
+            classify_workspace_path(Path::new(".next/server/app.js")),
+            WorkspacePathClass::RuntimeOnly
+        );
+        assert_eq!(
             classify_workspace_path(Path::new(".deadreckon/.specstory/session.md")),
             WorkspacePathClass::EvidenceOnly
         );
@@ -193,6 +199,9 @@ mod tests {
         assert!(is_recoverable_workspace_path(Path::new(".git/index")));
         assert!(!is_recoverable_workspace_path(Path::new(
             ".build/debug/App"
+        )));
+        assert!(!is_recoverable_workspace_path(Path::new(
+            ".next/server/app.js"
         )));
         assert!(is_checkpointable_workspace_path(Path::new(
             ".specstory/history/session.md"
@@ -226,6 +235,7 @@ mod tests {
             "target/debug",
             "web/node_modules/pkg",
             ".build/debug",
+            ".next/server",
         ] {
             fs::create_dir_all(root.join(directory)).expect("directory");
         }
@@ -236,6 +246,7 @@ mod tests {
             "target/debug/output",
             "web/node_modules/pkg/index.js",
             ".build/debug/app",
+            ".next/server/app.js",
         ] {
             fs::write(root.join(file), "fixture\n").expect("file");
         }
@@ -265,6 +276,10 @@ mod tests {
         assert_eq!(
             runtime_output_root(Path::new("apps/game/.build/debug/App")),
             Some(Path::new("apps/game/.build").to_path_buf())
+        );
+        assert_eq!(
+            runtime_output_root(Path::new("apps/web/.next/server/app.js")),
+            Some(Path::new("apps/web/.next").to_path_buf())
         );
         assert_eq!(runtime_output_root(Path::new(".git/index")), None);
         assert_eq!(runtime_output_root(Path::new("src/lib.rs")), None);
