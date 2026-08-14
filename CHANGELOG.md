@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.8.6 — Runs that finish — 2026-08-13
+
+- Next.js build output is now treated as disposable runtime state. Checkpoints
+  no longer race transient `.next` locks or ask trusted Git staging to preserve
+  ignored framework output, while user-authored application files remain
+  deliverable.
+- Failed attempts now clear child-process authority and terminalize their
+  backing Runs before Jobs exhaust retries. Status and attach therefore report
+  one coherent terminal result instead of retaining a dead PID under an
+  `executing` child Run.
+- Acceptance authoring now grants full network authority to dependency and
+  browser installation checks, explicitly provisions Playwright browsers in
+  the strict gate's isolated home, and teaches generated contracts the same
+  rule. Next.js production builds and browser-driven proofs can run from a
+  clean verifier environment instead of relying on operator caches.
+- The macOS disposable sandbox now lets contained processes signal only their
+  own descendants. Next.js can clean up build workers without gaining signal
+  authority over unrelated host processes.
+- Doctor can safely advance its managed shell alias when the existing symlink
+  is proven by the durable install receipt, reconcile that receipt in the same
+  repair, and restart the pinned supervisor on the rebuilt bundle. Arbitrary
+  or merely byte-identical symlink targets remain refused.
+
 ## 0.8.5 — Results that survive — 2026-08-08
 
 - Graph recovery now reconciles the exact Plan, task index, retry attempt, and
