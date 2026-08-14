@@ -1,29 +1,29 @@
 {
   "schema_version": 3,
-  "recorded_at": "2026-08-14T03:29:46Z",
-  "source_commit": "5d83dfc7db87595970cf714582f66af470f33c5c",
+  "recorded_at": "2026-08-14T14:26:22Z",
+  "source_commit": "206dd6ab55d448604434b08fe78f995065e6103c",
   "deadreckon_version": "0.8.6",
   "bundle": {
   "schema_version": 1,
   "package_version": "0.8.6",
-  "bundle_build_id": "deadreckon-bundle-build-id-sha256:e62a2565c456c427353532404b150fd1722f6188b0c1df25f046888af1ca177d",
+  "bundle_build_id": "deadreckon-bundle-build-id-sha256:38669f2c2f23057117e9d177fcf17554a868140f1f300e6cdba53a1fbd3d5bb5",
   "binaries": {
     "deadreckon": {
-      "sha256": "1d43d64674355231b5abfd5660a8ee155605a06ab9d42c77064278cb2820834b",
+      "sha256": "fc134d484f8de3d3cba097c38e617a1f9c4030de13f8a153d2f3b02063905b84",
       "bytes": 23651888
     },
     "dr-gate": {
-      "sha256": "df058469264a9e0ca1dad7d7c1e00125373a89a916286243d4a988f8a5b3f168",
+      "sha256": "7e8bb40b6bd5bb14a3b95851c1917f7696371947c181ccecc09ca48046f710a3",
       "bytes": 2257568
     },
     "dr-capture": {
-      "sha256": "c425012faf3bbfa1e6c1c196cbea2ed807d774cf43e9f6e58ac58baed8eb2090",
+      "sha256": "8d080c68a09fca66bd4e7156b077f68682799d4284518e7acc00098b2a8e22df",
       "bytes": 7671504
     }
   }
 },
   "providers": [
-    {"route":"cli:claude-code","binary_version":"2.1.232 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.232 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"e1c39799ece540f2aedfa64b072a2e72","operator":"gdc"},
-    {"route":"cli:codex","binary_version":"codex-cli 0.147.0","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.147.0","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"eb0ac9ba71024b6b80f738222ebbcded","operator":"gdc"}
+    {"route":"cli:claude-code","binary_version":"2.1.232 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.232 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"ddc56683357a4ae89f6c7e09b4635bfd","operator":"gdc"},
+    {"route":"cli:codex","binary_version":"codex-cli 0.147.0","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.147.0","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"4eefe39da75743f6be5e6ec8b824d17b","operator":"gdc"}
   ]
 }
