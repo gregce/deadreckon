@@ -5024,7 +5024,7 @@ fn classify_persisted_attempt(
     attempts_exhausted: bool,
 ) -> Result<()> {
     let exit_detail = exit_detail(&exit);
-    let state = match load_run(paths, job.job_id.as_ref()) {
+    let mut state = match load_run(paths, job.job_id.as_ref()) {
         Ok(state) => state,
         Err(error) => {
             append_attempt_stopped(
@@ -5291,6 +5291,15 @@ fn classify_persisted_attempt(
             } else {
                 StopReason::FatalProvider
             };
+            if attempts_exhausted {
+                state.status = deadreckon_core::RunStatus::Failed;
+                state.child_pids.clear();
+                state.failure_reason.get_or_insert_with(|| {
+                    "attempt limit reached before the child produced completed evidence".to_string()
+                });
+                state.updated_at = Utc::now();
+                deadreckon_core::save_state(&state)?;
+            }
             append_attempt_stopped(
                 paths,
                 token,
@@ -12276,6 +12285,41 @@ mod tests {
                 .events()
                 .iter()
                 .any(|event| event.kind == JobEventKind::RetryScheduled)
+        );
+    }
+
+    #[test]
+    fn exhausted_leaf_terminalizes_its_resumable_run_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 1);
+        executing_attempt(&paths, &job);
+        let token = claim_started_attempt(&paths, &job, 1);
+
+        classify_persisted_attempt(
+            &paths,
+            &job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: false,
+            },
+            true,
+        )
+        .expect("terminal attempt-limit classification");
+
+        let state = load_run(&paths, job.job_id.as_ref()).expect("terminalized run");
+        assert_eq!(state.status, RunStatus::Failed);
+        assert!(state.child_pids.is_empty());
+        assert!(
+            state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("attempt limit"))
+        );
+        let view = JobView::load(&paths, job.job_id.as_ref()).expect("terminal job");
+        assert_eq!(
+            view.projection.outcome,
+            Some(deadreckon_protocol::JobOutcome::RetryExhausted)
         );
     }
 

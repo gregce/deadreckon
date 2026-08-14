@@ -423,16 +423,15 @@ fn repair_active_shell_installation(paths: &DeadreckonPaths) -> Result<String> {
             super::providers::channel_native_update_command(channel),
         )));
     }
-    let selected_metadata = fs::symlink_metadata(selected)?;
-    if !selected_metadata.file_type().is_file() {
+    let Some(_entry_kind) = classify_managed_shell_entry(paths, selected)? else {
         return Err(CliError::Core(deadreckon_core::user_error(
             &format!(
-                "PATH-selected shell entry at {} is not a regular installer-owned binary; refusing to replace it",
+                "PATH-selected shell entry at {} is neither a regular installer-owned binary nor a receipt-backed alias; refusing to replace it",
                 selected.display()
             ),
             "replace the custom alias yourself, then rerun deadreckon doctor",
         )));
-    }
+    };
 
     let (selected_version, selected_probe_error) = probe_deadreckon_version(selected);
     if let Some(selected_version) = selected_version.as_deref()
@@ -457,11 +456,13 @@ fn repair_active_shell_installation(paths: &DeadreckonPaths) -> Result<String> {
         )));
     }
 
-    let backup = replace_shell_binary_with_alias(
+    let (backup, entry_kind) = replace_shell_binary_with_alias(
         &health.current_path,
         selected,
         &paths.home().join("install-repair-backups"),
+        paths,
     )?;
+    reconcile_receipt_after_shell_repair(paths, &health.current_path, selected, &entry_kind)?;
     Ok(format!(
         "PATH now resolves {} to the explicitly invoked DeadReckon {} {}; previous binary backed up at {}",
         selected.display(),
@@ -469,6 +470,71 @@ fn repair_active_shell_installation(paths: &DeadreckonPaths) -> Result<String> {
         health.current_path.display(),
         backup.display()
     ))
+}
+
+/// A prior successful repair leaves the managed shell entry as a symlink to
+/// the executable recorded in the durable install receipt. Requiring those
+/// independently maintained paths to resolve to the same target lets a later
+/// repair advance that alias without treating an arbitrary user symlink as
+/// DeadReckon-owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedShellEntry {
+    RegularFile,
+    #[cfg(unix)]
+    ReceiptBackedAlias {
+        prior_target: PathBuf,
+    },
+}
+
+fn reconcile_receipt_after_shell_repair(
+    paths: &DeadreckonPaths,
+    current: &Path,
+    selected: &Path,
+    entry_kind: &ManagedShellEntry,
+) -> Result<()> {
+    #[cfg(unix)]
+    if let ManagedShellEntry::ReceiptBackedAlias { prior_target } = entry_kind {
+        let receipt = deadreckon_core::install_receipt::detect_receipt(current);
+        if let Err(error) = deadreckon_core::install_receipt::write_receipt(paths, &receipt) {
+            restore_receipt_backed_alias(selected, prior_target)?;
+            return Err(error.into());
+        }
+    }
+    #[cfg(windows)]
+    let _ = (paths, current, selected, entry_kind);
+    Ok(())
+}
+
+fn classify_managed_shell_entry(
+    paths: &DeadreckonPaths,
+    selected: &Path,
+) -> Result<Option<ManagedShellEntry>> {
+    let metadata = fs::symlink_metadata(selected)?;
+    if metadata.file_type().is_file() {
+        return Ok(Some(ManagedShellEntry::RegularFile));
+    }
+    #[cfg(unix)]
+    if metadata.file_type().is_symlink() {
+        return receipt_backed_shell_alias(paths, selected);
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn receipt_backed_shell_alias(
+    paths: &DeadreckonPaths,
+    selected: &Path,
+) -> Result<Option<ManagedShellEntry>> {
+    let Some(receipt) = read_receipt(paths)? else {
+        return Ok(None);
+    };
+    Ok(
+        (canonical_binary_path(selected) == canonical_binary_path(&receipt.binary_path)).then_some(
+            ManagedShellEntry::ReceiptBackedAlias {
+                prior_target: receipt.binary_path,
+            },
+        ),
+    )
 }
 
 fn version_is_newer(candidate: &str, current: &str) -> bool {
@@ -506,14 +572,18 @@ fn repair_backup_dir(root: &Path) -> PathBuf {
     ))
 }
 
-fn backup_binary(source: &Path, backup_root: &Path) -> Result<PathBuf> {
+fn backup_binary(
+    source: &Path,
+    backup_root: &Path,
+    entry_kind: &ManagedShellEntry,
+) -> Result<PathBuf> {
     let backup_dir = repair_backup_dir(backup_root);
     fs::create_dir_all(&backup_dir)?;
     let backup = backup_dir.join(deadreckon_binary_name());
-    let metadata = fs::symlink_metadata(source)?;
-    if metadata.file_type().is_file() {
+    if managed_shell_entry_is_backupable(entry_kind) {
+        let target_metadata = fs::metadata(source)?;
         fs::copy(source, &backup)?;
-        fs::set_permissions(&backup, metadata.permissions())?;
+        fs::set_permissions(&backup, target_metadata.permissions())?;
     } else {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
             "PATH-selected DeadReckon is not a regular installer-owned file: {}",
@@ -523,11 +593,25 @@ fn backup_binary(source: &Path, backup_root: &Path) -> Result<PathBuf> {
     Ok(backup)
 }
 
+#[cfg(unix)]
+fn managed_shell_entry_is_backupable(entry_kind: &ManagedShellEntry) -> bool {
+    matches!(
+        entry_kind,
+        ManagedShellEntry::RegularFile | ManagedShellEntry::ReceiptBackedAlias { .. }
+    )
+}
+
+#[cfg(windows)]
+fn managed_shell_entry_is_backupable(entry_kind: &ManagedShellEntry) -> bool {
+    matches!(entry_kind, ManagedShellEntry::RegularFile)
+}
+
 fn replace_shell_binary_with_alias(
     current: &Path,
     selected: &Path,
     backup_root: &Path,
-) -> Result<PathBuf> {
+    paths: &DeadreckonPaths,
+) -> Result<(PathBuf, ManagedShellEntry)> {
     let current = std::fs::canonicalize(current)?;
     if !current.is_file() {
         return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
@@ -542,7 +626,13 @@ fn replace_shell_binary_with_alias(
         )))
     })?;
     fs::create_dir_all(parent)?;
-    let backup = backup_binary(selected, backup_root)?;
+    let entry_kind = classify_managed_shell_entry(paths, selected)?.ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "PATH-selected DeadReckon is not an installer-owned entry: {}",
+            selected.display()
+        )))
+    })?;
+    let backup = backup_binary(selected, backup_root, &entry_kind)?;
     let temporary = parent.join(format!(
         ".deadreckon-repair-{}-{}",
         std::process::id(),
@@ -553,7 +643,28 @@ fn replace_shell_binary_with_alias(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    Ok(backup)
+    Ok((backup, entry_kind))
+}
+
+#[cfg(unix)]
+fn restore_receipt_backed_alias(selected: &Path, prior_binary: &Path) -> Result<()> {
+    let parent = selected.parent().ok_or_else(|| {
+        CliError::Core(DeadreckonError::InvalidInput(format!(
+            "PATH-selected DeadReckon has no parent directory: {}",
+            selected.display()
+        )))
+    })?;
+    let temporary = parent.join(format!(
+        ".deadreckon-repair-rollback-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    create_binary_alias(prior_binary, &temporary)?;
+    if let Err(error) = replace_binary_alias(&temporary, selected) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -729,6 +840,7 @@ fn inspect_deadreckon_binaries(paths: &DeadreckonPaths) -> Result<DeadreckonBina
         !same_binary_identity(selected, &current_path)
             && detect_channel(selected) == Channel::Shell
             && is_managed_shell_binary_path(selected)
+            && matches!(classify_managed_shell_entry(paths, selected), Ok(Some(_)))
     });
 
     Ok(DeadreckonBinaryHealth {
@@ -1724,13 +1836,16 @@ timeout_ms = 1234
         fs::set_permissions(&current, fs::Permissions::from_mode(0o755)).expect("current mode");
         fs::set_permissions(&selected, fs::Permissions::from_mode(0o755)).expect("selected mode");
 
-        let backup = replace_shell_binary_with_alias(
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let (backup, entry_kind) = replace_shell_binary_with_alias(
             &current,
             &selected,
             &temp.path().join("repair-backups"),
+            &paths,
         )
         .expect("repair");
 
+        assert_eq!(entry_kind, ManagedShellEntry::RegularFile);
         assert_eq!(fs::read(&backup).expect("backup bytes"), b"old binary");
         assert!(
             fs::symlink_metadata(&selected)
@@ -1747,10 +1862,58 @@ timeout_ms = 1234
 
     #[cfg(unix)]
     #[test]
+    fn shell_install_repair_advances_a_receipt_backed_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let current = temp.path().join("source/deadreckon");
+        let prior = temp.path().join("prior/deadreckon");
+        let selected = temp.path().join("shell/bin/deadreckon");
+        for path in [&current, &prior, &selected] {
+            fs::create_dir_all(path.parent().expect("binary parent")).expect("binary parent");
+        }
+        fs::write(&current, b"new binary").expect("current");
+        fs::write(&prior, b"prior binary").expect("prior");
+        symlink(&prior, &selected).expect("managed alias");
+        let receipt = deadreckon_core::install_receipt::detect_receipt(&prior);
+        deadreckon_core::install_receipt::write_receipt(&paths, &receipt).expect("install receipt");
+
+        let (backup, entry_kind) = replace_shell_binary_with_alias(
+            &current,
+            &selected,
+            &temp.path().join("repair-backups"),
+            &paths,
+        )
+        .expect("repair receipt-backed alias");
+
+        assert!(matches!(
+            &entry_kind,
+            ManagedShellEntry::ReceiptBackedAlias { .. }
+        ));
+        assert_eq!(fs::read(&backup).expect("backup bytes"), b"prior binary");
+        assert_eq!(
+            fs::canonicalize(&selected).expect("selected canonical"),
+            fs::canonicalize(&current).expect("current canonical")
+        );
+        reconcile_receipt_after_shell_repair(&paths, &current, &selected, &entry_kind)
+            .expect("reconcile receipt after managed alias repair");
+        let reconciled = read_receipt(&paths)
+            .expect("read reconciled receipt")
+            .expect("reconciled receipt");
+        assert_eq!(
+            fs::canonicalize(reconciled.binary_path).expect("receipt canonical"),
+            fs::canonicalize(&current).expect("current canonical")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shell_install_repair_refuses_an_existing_custom_alias() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
         let current = temp.path().join("current-deadreckon");
         let custom = temp.path().join("custom-deadreckon");
         let selected = temp.path().join("bin/deadreckon");
@@ -1763,14 +1926,41 @@ timeout_ms = 1234
             &current,
             &selected,
             &temp.path().join("repair-backups"),
+            &paths,
         )
         .expect_err("custom alias must be refused");
 
-        assert!(
-            error
-                .to_string()
-                .contains("not a regular installer-owned file")
-        );
+        assert!(error.to_string().contains("not an installer-owned entry"));
         assert_eq!(fs::read_link(&selected).expect("alias retained"), custom);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_install_repair_refuses_an_identical_copy_outside_the_receipt_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("temp");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let receipt_target = temp.path().join("receipt/deadreckon");
+        let custom_target = temp.path().join("custom/deadreckon");
+        let selected = temp.path().join("shell/bin/deadreckon");
+        for path in [&receipt_target, &custom_target, &selected] {
+            fs::create_dir_all(path.parent().expect("binary parent")).expect("binary parent");
+        }
+        fs::write(&receipt_target, b"identical bytes").expect("receipt target");
+        fs::write(&custom_target, b"identical bytes").expect("custom target");
+        symlink(&custom_target, &selected).expect("custom alias");
+        let receipt = deadreckon_core::install_receipt::detect_receipt(&receipt_target);
+        deadreckon_core::install_receipt::write_receipt(&paths, &receipt).expect("install receipt");
+
+        assert_eq!(
+            classify_managed_shell_entry(&paths, &selected).expect("classification"),
+            None,
+            "matching bytes are not ownership proof for a different symlink target"
+        );
+        assert_eq!(
+            fs::read_link(&selected).expect("alias retained"),
+            custom_target
+        );
     }
 }
