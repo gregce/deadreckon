@@ -13593,18 +13593,33 @@ async fn resume_loaded_command_with_mode(
             no_docs,
         },
     };
-    let outcome = if let Some(candidate) = parent_repair {
+    let outcome_result = if let Some(candidate) = parent_repair {
         with_cli_wait_status(
             &wait_label,
             deadreckon_runtime::run_parent_repair_turn_loop(&mut state, &router, config, candidate),
         )
-        .await?
+        .await
     } else {
-        with_cli_wait_status(&wait_label, run_turn_loop(&mut state, &router, config)).await?
+        with_cli_wait_status(&wait_label, run_turn_loop(&mut state, &router, config)).await
     };
     state.child_pids.clear();
-    save_state(&state)?;
-    lock.release()?;
+    let save_result = save_state(&state);
+    let release_result = lock.release();
+    let outcome = match outcome_result {
+        Ok(outcome) => {
+            save_result?;
+            release_result?;
+            outcome
+        }
+        Err(error) => {
+            // A failed resumable turn must not leave a dead driver PID or a
+            // held run lock behind. Preserve the original turn failure while
+            // making a best effort to persist and release cleanup state.
+            let _ = save_result;
+            let _ = release_result;
+            return Err(CliError::Core(error));
+        }
+    };
     print_exit_summary_card(&state, &outcome, plain, true);
     commands::lifecycle::fire_lifecycle_notification(paths, &state, &outcome).await;
     Ok(())

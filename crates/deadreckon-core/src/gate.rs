@@ -1380,6 +1380,33 @@ pub fn acceptance_capabilities_from_yaml(raw: &str) -> Result<AcceptanceCapabili
 /// placed in frozen helper files, without turning goal wording into authority.
 pub fn infer_acceptance_network_access(text: &str) -> AcceptanceNetworkAccess {
     let lower = text.to_ascii_lowercase();
+    // Strict gates run with an empty, disposable home directory. Explicit
+    // dependency installation therefore needs outbound authority even when a
+    // later check only talks to localhost; it cannot rely on the operator's
+    // package-manager cache as hidden input.
+    let dependency_install = [
+        "npm ci",
+        "npm install",
+        "pnpm install",
+        "pnpm fetch",
+        "yarn install",
+        "bun install",
+        "pip install",
+        "pip3 install",
+        "uv sync",
+        "poetry install",
+        "bundle install",
+        "cargo fetch",
+        "cargo install",
+        "go mod download",
+        "dotnet restore",
+        "npx --yes",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if dependency_install {
+        return AcceptanceNetworkAccess::Full;
+    }
     let loopback = ["127.0.0.1", "localhost", "::1", "[::1]"]
         .iter()
         .any(|needle| lower.contains(needle));
@@ -3700,6 +3727,12 @@ mod tests {
         )
         .expect("outbound contract");
         assert_eq!(outbound, super::AcceptanceNetworkAccess::Full);
+
+        let dependency_install = super::required_acceptance_network_access_from_yaml(
+            "capabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: \"npm ci && npm run build\"\n",
+        )
+        .expect("dependency installation contract");
+        assert_eq!(dependency_install, super::AcceptanceNetworkAccess::Full);
     }
 
     #[test]

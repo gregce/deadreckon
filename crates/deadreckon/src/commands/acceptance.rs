@@ -2170,6 +2170,7 @@ Declare environmental authority at the top level when a check needs networking:
 - `capabilities: {{ network: loopback }}` for local servers, sockets, localhost, 127.0.0.1, or ::1
 - `capabilities: {{ network: full }}` only when the accepted check must reach a live external service
 - omit capabilities (or use `network: deny`) when checks need no network
+Dependency installation commands such as `npm ci`, `npm install`, `pnpm install`, `yarn install`, or `pip install` require `capabilities: {{ network: full }}` because the strict gate uses an empty isolated package-manager home. A localhost browser test that also installs dependencies therefore requires `full`, not `loopback`.
 Prefer a frozen local fixture over `network: full` whenever the result can be made deterministic. A networked product does not by itself grant network authority; an executable check must require it.
 
 Derive the contract from the Run goal, not only the acceptance request. The request refines the goal; it does not replace it.
