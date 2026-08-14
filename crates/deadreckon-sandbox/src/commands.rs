@@ -498,7 +498,10 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
         }
     }
     let default_posture = if spec.workspace_access == WorkspaceAccess::Disposable {
-        "(deny default)\n(allow process*)\n(allow mach-lookup)\n(allow sysctl-read)"
+        // Build tools routinely supervise worker subprocesses. Permit signals
+        // only to descendants created inside this sandbox; sibling and host
+        // processes remain outside that authority.
+        "(deny default)\n(allow process*)\n(allow signal (target children))\n(allow mach-lookup)\n(allow sysctl-read)"
     } else {
         "(allow default)"
     };
@@ -755,6 +758,11 @@ mod tests {
 
         assert!(profile.contains("(deny default)"), "{profile}");
         assert!(!profile.contains("(allow default)"), "{profile}");
+        assert!(
+            profile.contains("(allow signal (target children))"),
+            "{profile}"
+        );
+        assert!(!profile.lines().any(|line| line == "(allow signal)"));
         assert!(profile.contains("(subpath \"/work/project\")"), "{profile}");
         let write_policy = profile
             .split_once("(allow file-write*")
