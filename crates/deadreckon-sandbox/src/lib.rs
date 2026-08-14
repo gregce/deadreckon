@@ -598,6 +598,42 @@ printf docker-boundary-ok"#,
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn disposable_sandbox_can_signal_its_children_but_not_host_siblings() {
+        if which::which("sandbox-exec").is_err() {
+            return;
+        }
+        let mut sibling = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("host sibling");
+        let temp = TempDir::new().expect("tempdir");
+        let work = temp.path().join("work");
+        std::fs::create_dir_all(&work).expect("work");
+        let mut spec = shell_spec();
+        spec.backend = SandboxBackend::SandboxExec;
+        spec.cwd = work.clone();
+        spec.write_allowlist.push(work);
+        spec.workspace_access = WorkspaceAccess::Disposable;
+        spec.env
+            .insert("HOST_SIBLING_PID".to_string(), sibling.id().to_string());
+        spec.args = vec![
+            OsString::from("-c"),
+            OsString::from(
+                "sleep 30 & owned=$!; kill -TERM \"$owned\"; wait \"$owned\" 2>/dev/null || true; if kill -TERM \"$HOST_SIBLING_PID\" 2>/dev/null; then exit 42; fi",
+            ),
+        ];
+
+        let output = run(spec).await.expect("sandbox run");
+        let sibling_survived = sibling.try_wait().expect("host sibling status").is_none();
+        let _ = sibling.kill();
+        let _ = sibling.wait();
+
+        assert_eq!(output.status_code, Some(0), "{output:?}");
+        assert!(sibling_survived, "sandbox signalled a host sibling");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn sandbox_allows_declared_loopback_without_full_network() {
         if which::which("sandbox-exec").is_err() || which::which("curl").is_err() {
             return;
