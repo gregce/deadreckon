@@ -1401,6 +1401,7 @@ pub fn infer_acceptance_network_access(text: &str) -> AcceptanceNetworkAccess {
         "go mod download",
         "dotnet restore",
         "npx --yes",
+        "playwright install",
     ]
     .iter()
     .any(|needle| lower.contains(needle));
@@ -3733,6 +3734,12 @@ mod tests {
         )
         .expect("dependency installation contract");
         assert_eq!(dependency_install, super::AcceptanceNetworkAccess::Full);
+
+        let browser_install = super::required_acceptance_network_access_from_yaml(
+            "capabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: \"npx playwright install chromium && npx playwright test\"\n",
+        )
+        .expect("browser installation contract");
+        assert_eq!(browser_install, super::AcceptanceNetworkAccess::Full);
     }
 
     #[test]

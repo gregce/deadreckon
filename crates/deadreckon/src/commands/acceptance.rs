@@ -2171,6 +2171,7 @@ Declare environmental authority at the top level when a check needs networking:
 - `capabilities: {{ network: full }}` only when the accepted check must reach a live external service
 - omit capabilities (or use `network: deny`) when checks need no network
 Dependency installation commands such as `npm ci`, `npm install`, `pnpm install`, `yarn install`, or `pip install` require `capabilities: {{ network: full }}` because the strict gate uses an empty isolated package-manager home. A localhost browser test that also installs dependencies therefore requires `full`, not `loopback`.
+Browser automation must also provision its browser inside the check. The strict gate's isolated home has no operator Playwright or Cypress cache, so run an explicit installer such as `npx playwright install chromium` in the same shell check before launching the browser, and declare `network: full`.
 Prefer a frozen local fixture over `network: full` whenever the result can be made deterministic. A networked product does not by itself grant network authority; an executable check must require it.
 
 Derive the contract from the Run goal, not only the acceptance request. The request refines the goal; it does not replace it.
@@ -3393,7 +3394,7 @@ fn acceptance_pack_draft(pack: AcceptancePack, cwd: &Path) -> AcceptanceDraft {
             "name: browser acceptance pack\nchecks:\n  - kind: shell\n    command: \"node .deadreckon/acceptance/browser-smoke.mjs\"\n    cwd: \"{working_dir}\"\n"
         }
         AcceptancePack::Playwright => {
-            "name: playwright acceptance pack\ncapabilities:\n  network: loopback\nchecks:\n  - kind: shell\n    command: \"npm run build --if-present && (npm run preview --if-present -- --host 127.0.0.1 > .deadreckon/acceptance/preview.log 2>&1 & pid=$!; trap 'kill $pid 2>/dev/null || true' EXIT; sleep 3; DEADRECKON_BASE_URL=${DEADRECKON_BASE_URL:-http://127.0.0.1:4173} npx --yes playwright test .deadreckon/acceptance/playwright-smoke.spec.mjs --reporter=line)\"\n    cwd: \"{working_dir}\"\n"
+            "name: playwright acceptance pack\ncapabilities:\n  network: full\nchecks:\n  - kind: shell\n    command: \"npm run build --if-present && npx --yes playwright install chromium && (npm run preview --if-present -- --host 127.0.0.1 > .deadreckon/acceptance/preview.log 2>&1 & pid=$!; trap 'kill $pid 2>/dev/null || true' EXIT; sleep 3; DEADRECKON_BASE_URL=${DEADRECKON_BASE_URL:-http://127.0.0.1:4173} npx --yes playwright test .deadreckon/acceptance/playwright-smoke.spec.mjs --reporter=line)\"\n    cwd: \"{working_dir}\"\n"
         }
         AcceptancePack::Vite => {
             "name: vite acceptance pack\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/package.json\"\n  - kind: shell\n    command: \"npm run build --if-present\"\n    cwd: \"{working_dir}\"\n  - kind: shell\n    command: \"node .deadreckon/acceptance/browser-smoke.mjs dist\"\n    cwd: \"{working_dir}\"\n"
@@ -4526,6 +4527,37 @@ let package = Package(
             "{prompt}"
         );
         assert!(prompt.contains("Prefer a frozen local fixture"), "{prompt}");
+    }
+
+    #[test]
+    fn acceptance_prompt_and_pack_provision_browser_in_isolated_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prompt = acceptance_agent_prompt(
+            AcceptanceAgentMode::Draft,
+            "verify the rendered application",
+            Some("build a local web application"),
+            dir.path(),
+            None,
+            None,
+        )
+        .expect("prompt");
+
+        assert!(
+            prompt.contains("isolated home has no operator Playwright or Cypress cache"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("npx playwright install chromium"),
+            "{prompt}"
+        );
+
+        let pack = acceptance_pack_draft(AcceptancePack::Playwright, dir.path());
+        assert!(pack.yaml.contains("network: full"), "{}", pack.yaml);
+        assert!(
+            pack.yaml.contains("npx --yes playwright install chromium"),
+            "{}",
+            pack.yaml
+        );
     }
 
     #[test]
