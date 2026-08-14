@@ -501,7 +501,11 @@ pub(crate) fn sandbox_exec_profile(spec: &SandboxSpec) -> Result<String> {
         // Build tools routinely supervise worker subprocesses. Permit signals
         // only to descendants created inside this sandbox; sibling and host
         // processes remain outside that authority.
-        "(deny default)\n(allow process*)\n(allow signal (target children))\n(allow mach-lookup)\n(allow sysctl-read)"
+        // Headless Chromium initializes through read-only CoreFoundation
+        // shared memory, one power-management user client, and a PID-scoped
+        // rendezvous service. Keep each exception filtered so browser checks
+        // do not gain general IPC, IOKit, or Mach registration authority.
+        "(deny default)\n(allow process*)\n(allow signal (target children))\n(allow mach-lookup)\n(allow mach-register (global-name-prefix \"org.chromium.\"))\n(allow sysctl-read)\n(allow ipc-posix-shm-read-data\n    (ipc-posix-name \"apple.shm.notification_center\")\n    (ipc-posix-name-prefix \"apple.cfprefs.\"))\n(allow iokit-open-user-client\n    (iokit-user-client-class \"RootDomainUserClient\"))"
     } else {
         "(allow default)"
     };
@@ -763,6 +767,25 @@ mod tests {
             "{profile}"
         );
         assert!(!profile.lines().any(|line| line == "(allow signal)"));
+        assert!(
+            profile.contains("(allow mach-register (global-name-prefix \"org.chromium.\"))"),
+            "{profile}"
+        );
+        assert!(!profile.lines().any(|line| line == "(allow mach-register)"));
+        assert!(
+            profile.contains("(ipc-posix-name \"apple.shm.notification_center\")"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("(ipc-posix-name-prefix \"apple.cfprefs.\")"),
+            "{profile}"
+        );
+        assert!(!profile.lines().any(|line| line == "(allow ipc-posix-shm*)"));
+        assert!(
+            profile.contains("(iokit-user-client-class \"RootDomainUserClient\")"),
+            "{profile}"
+        );
+        assert!(!profile.lines().any(|line| line == "(allow iokit*)"));
         assert!(profile.contains("(subpath \"/work/project\")"), "{profile}");
         let write_policy = profile
             .split_once("(allow file-write*")
