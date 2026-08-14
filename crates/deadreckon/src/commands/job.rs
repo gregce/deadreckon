@@ -1325,6 +1325,23 @@ fn terminate_guarded_process(
                     record.process.pid
                 )))
             })?;
+        let require_termination = |outcome| {
+            if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
+                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
+                    "could not stop guarded evaluator {}: {reason}",
+                    record.process.pid
+                ))));
+            }
+            Ok(())
+        };
+        if record.process.pgid.is_some() {
+            // A running record has already completed the one-way transition
+            // to its owned process group. One group sweep is sufficient and
+            // avoids re-signalling the unreaped group leader after it exits.
+            return require_termination(
+                deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace),
+            );
+        }
         // The prepared -> running transition changes the target from a raw
         // child to a process-group leader. Sweep group, raw PID, then group
         // again so cancellation cannot lose that transition race.
@@ -1333,12 +1350,7 @@ fn terminate_guarded_process(
             deadreckon_core::RawPidTerminator::new(record.process.pid).terminate(grace),
             deadreckon_core::ProcessGroupTerminator::new(pgid).terminate(grace),
         ] {
-            if let deadreckon_core::TerminationOutcome::Failed(reason) = outcome {
-                return Err(CliError::Core(DeadreckonError::InvalidInput(format!(
-                    "could not stop guarded evaluator {}: {reason}",
-                    record.process.pid
-                ))));
-            }
+            require_termination(outcome)?;
         }
         Ok(())
     }

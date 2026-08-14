@@ -28,6 +28,10 @@
   after a host sleep, scheduler stall, or control-lock delay. Epoch, owner,
   boot, and process-start identity checks still fence every stale or competing
   supervisor, and ordinary writes remain forbidden until renewal succeeds.
+- Running provider records now terminate their established process group once,
+  while only prepared records use the three-step transition-race sweep. macOS
+  no longer mistakes a second signal to an already terminated, unreaped group
+  for failed cleanup, and provider descendants are still reaped as one group.
 
 ## 0.8.5 — Results that survive — 2026-08-08
 
