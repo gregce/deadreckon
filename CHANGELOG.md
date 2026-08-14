@@ -16,8 +16,10 @@
   rule. Next.js production builds and browser-driven proofs can run from a
   clean verifier environment instead of relying on operator caches.
 - The macOS disposable sandbox now lets contained processes signal only their
-  own descendants. Next.js can clean up build workers without gaining signal
-  authority over unrelated host processes.
+  own descendants and grants headless Chromium narrowly filtered access to its
+  Apple preferences, power-management, and PID-scoped rendezvous primitives.
+  Next.js can clean up build workers and browser proofs can launch without
+  gaining broad signal, IPC, IOKit, or Mach authority over the host.
 - Doctor can safely advance its managed shell alias when the existing symlink
   is proven by the durable install receipt, reconcile that receipt in the same
   repair, and restart the pinned supervisor on the rebuilt bundle. Arbitrary
