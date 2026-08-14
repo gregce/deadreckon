@@ -24,6 +24,10 @@
   is proven by the durable install receipt, reconcile that receipt in the same
   repair, and restart the pinned supervisor on the rebuilt bundle. Arbitrary
   or merely byte-identical symlink targets remain refused.
+- A supervisor that remains the exact recorded process can renew its Job lease
+  after a host sleep, scheduler stall, or control-lock delay. Epoch, owner,
+  boot, and process-start identity checks still fence every stale or competing
+  supervisor, and ordinary writes remain forbidden until renewal succeeds.
 
 ## 0.8.5 — Results that survive — 2026-08-08
 

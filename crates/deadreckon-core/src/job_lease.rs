@@ -151,12 +151,7 @@ pub fn claim_job_lease(
         Some(lease)
             if lease.epoch == durable_epoch
                 && lease.expires_at <= now
-                && lease
-                    .process_start_identity
-                    .as_deref()
-                    .is_some_and(|expected| {
-                        process_start_identity(lease.pid).as_deref() == Some(expected)
-                    }) =>
+                && exact_lease_owner_is_live(lease) =>
         {
             return Err(lease_error(
                 job_id,
@@ -226,15 +221,30 @@ pub fn heartbeat_job_lease(
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> Result<JobLease> {
-    let expires_at = lease_expiry(now, ttl)?;
+    // Preserve invalid-TTL refusal before any potentially blocking I/O.
+    lease_expiry(now, ttl)?;
     let lock_path = paths.job_dir(token.job_id.as_ref()).join(JOB_CONTROL_LOCK);
     let lock = open_job_control_lock(&lock_path)?;
     FileExt::lock_exclusive(&lock).with_path(&lock_path)?;
 
     let mut lease = load_job_lease(paths, &token.job_id)?;
-    validate_token(&lease, token, now)?;
-    lease.heartbeat_at = now;
-    lease.expires_at = expires_at;
+    let current_process = lease.pid == std::process::id();
+    // Production supervisors pass a timestamp sampled before this blocking
+    // lock. Never persist that stale instant after a host sleep or lock stall.
+    // Deterministic callers with a synthetic owner retain their supplied time.
+    let mut renewed_at = if current_process {
+        now.max(Utc::now())
+    } else {
+        now
+    };
+    validate_heartbeat_token(&lease, token, renewed_at)?;
+    if current_process {
+        // An expired renewal proves process-start identity. Sample once more
+        // after that blocking probe so the new TTL starts after all checks.
+        renewed_at = renewed_at.max(Utc::now());
+    }
+    lease.heartbeat_at = renewed_at;
+    lease.expires_at = lease_expiry(renewed_at, ttl)?;
     atomic_write_json(&paths.job_lease(token.job_id.as_ref()), &lease)?;
     Ok(lease)
 }
@@ -590,6 +600,20 @@ fn validate_owner(owner: &LeaseOwner) -> Result<()> {
 }
 
 fn validate_token(lease: &JobLease, token: &LeaseToken, now: DateTime<Utc>) -> Result<()> {
+    validate_token_identity(lease, token)?;
+    if lease.expires_at <= now {
+        return Err(lease_error(
+            &token.job_id,
+            &format!(
+                "lease epoch {} expired at {}",
+                lease.epoch, lease.expires_at
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_identity(lease: &JobLease, token: &LeaseToken) -> Result<()> {
     if lease.job_id != token.job_id
         || lease.owner_id != token.owner_id
         || lease.epoch != token.epoch
@@ -603,16 +627,36 @@ fn validate_token(lease: &JobLease, token: &LeaseToken, now: DateTime<Utc>) -> R
             ),
         ));
     }
-    if lease.expires_at <= now {
-        return Err(lease_error(
-            &token.job_id,
-            &format!(
-                "lease epoch {} expired at {}",
-                lease.epoch, lease.expires_at
-            ),
-        ));
-    }
     Ok(())
+}
+
+fn validate_heartbeat_token(
+    lease: &JobLease,
+    token: &LeaseToken,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    validate_token_identity(lease, token)?;
+    if lease.expires_at > now {
+        return Ok(());
+    }
+    let exact_owner_is_live = lease.pid == std::process::id() && exact_lease_owner_is_live(lease);
+    if exact_owner_is_live {
+        return Ok(());
+    }
+    Err(lease_error(
+        &token.job_id,
+        &format!(
+            "lease epoch {} expired at {}",
+            lease.epoch, lease.expires_at
+        ),
+    ))
+}
+
+fn exact_lease_owner_is_live(lease: &JobLease) -> bool {
+    lease
+        .process_start_identity
+        .as_deref()
+        .is_some_and(|expected| process_start_identity(lease.pid).as_deref() == Some(expected))
 }
 
 fn lease_expiry(now: DateTime<Utc>, ttl: Duration) -> Result<DateTime<Utc>> {
@@ -680,6 +724,7 @@ mod tests {
 
     use chrono::{DateTime, TimeDelta, Utc};
     use deadreckon_protocol::{JobEvent, JobEventKind, JobEventSequence, JobId, JobSchemaVersion};
+    use fs2::FileExt;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -689,7 +734,9 @@ mod tests {
         create_fenced_job_json_and_append_event, heartbeat_job_lease, load_job_lease,
         replace_fenced_job_json_and_append_event,
     };
-    use crate::job::{load_job_projection, read_job_history};
+    use crate::job::{
+        JOB_CONTROL_LOCK, load_job_projection, open_job_control_lock, read_job_history,
+    };
     use crate::paths::DeadreckonPaths;
 
     fn at(value: &str) -> DateTime<Utc> {
@@ -1333,5 +1380,151 @@ mod tests {
         assert_eq!(after.last_sequence, before.last_sequence);
         assert_eq!(renewed.heartbeat_at, now + TimeDelta::seconds(2));
         assert_eq!(renewed.expires_at, now + TimeDelta::seconds(17));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_owner_heartbeat_samples_time_after_a_lock_stall_past_expiry() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-heartbeat-lock-stall".to_string());
+        let claim = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner(
+                "supervisor-current",
+                &crate::boot_identity(),
+                std::process::id(),
+            ),
+            Utc::now(),
+            Duration::from_millis(50),
+        )
+        .expect("claim");
+        assert!(claim.lease.process_start_identity.is_some());
+
+        let lock_path = paths.job_dir(job_id.as_ref()).join(JOB_CONTROL_LOCK);
+        let lock = open_job_control_lock(&lock_path).expect("open control lock");
+        lock.lock_exclusive().expect("hold control lock");
+
+        let token = claim.token();
+        let submitted_at = Utc::now();
+        let heartbeat = thread::spawn(move || {
+            heartbeat_job_lease(&paths, &token, submitted_at, Duration::from_secs(1))
+        });
+        thread::sleep(Duration::from_millis(150));
+        let release_floor = Utc::now();
+        drop(lock);
+
+        let renewed = heartbeat
+            .join()
+            .expect("heartbeat thread")
+            .expect("renewal");
+        assert_eq!(renewed.epoch, claim.lease.epoch);
+        assert!(renewed.heartbeat_at >= release_floor);
+        assert_eq!(
+            renewed.expires_at,
+            renewed.heartbeat_at + TimeDelta::seconds(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_heartbeat_refuses_a_different_live_process() {
+        use std::process::Command;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-heartbeat-foreign-process".to_string());
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .expect("live foreign owner");
+        let claim = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-foreign", &crate::boot_identity(), child.id()),
+            Utc::now() - TimeDelta::seconds(2),
+            Duration::from_secs(1),
+        )
+        .expect("claim");
+        assert!(claim.lease.process_start_identity.is_some());
+
+        let error =
+            heartbeat_job_lease(&paths, &claim.token(), Utc::now(), Duration::from_secs(15))
+                .expect_err("another process must not renew the expired live owner");
+        assert!(error.to_string().contains("expired at"), "{error}");
+
+        child.kill().expect("stop foreign owner");
+        child.wait().expect("reap foreign owner");
+    }
+
+    #[test]
+    fn heartbeat_refuses_an_old_token_after_reclaim() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-heartbeat-stale-epoch".to_string());
+        let now = at("2026-07-29T00:00:00Z");
+        let stale = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-stale", "boot-a", u32::MAX),
+            now,
+            Duration::from_secs(1),
+        )
+        .expect("first claim")
+        .token();
+        claim_job_lease(
+            &paths,
+            &job_id,
+            &owner("supervisor-current", "boot-a", u32::MAX - 1),
+            now + TimeDelta::seconds(2),
+            Duration::from_secs(15),
+        )
+        .expect("reclaim");
+
+        let error = heartbeat_job_lease(
+            &paths,
+            &stale,
+            now + TimeDelta::seconds(3),
+            Duration::from_secs(15),
+        )
+        .expect_err("a reclaimed epoch must fence the old heartbeat token");
+        assert!(error.to_string().contains("stale lease token"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_exact_live_owner_cannot_commit_an_ordinary_fenced_event() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let job_id = JobId("job-expired-event-stays-fenced".to_string());
+        let now = Utc::now();
+        let claim = claim_job_lease(
+            &paths,
+            &job_id,
+            &owner(
+                "supervisor-current",
+                &crate::boot_identity(),
+                std::process::id(),
+            ),
+            now - TimeDelta::seconds(2),
+            Duration::from_secs(1),
+        )
+        .expect("claim");
+        let event = JobEvent {
+            schema_version: JobSchemaVersion::CURRENT,
+            job_id,
+            sequence: JobEventSequence::new(2).expect("sequence"),
+            event_id: "expired-owner-event".to_string(),
+            causation_id: "expired-owner-event".to_string(),
+            timestamp: now,
+            lease_epoch: claim.lease.epoch,
+            kind: JobEventKind::AttemptStarted,
+            detail: json!({}),
+        };
+
+        let error = append_fenced_job_event(&paths, &claim.token(), now, &event)
+            .expect_err("only heartbeat renewal may recover an exact live expired owner");
+        assert!(error.to_string().contains("expired at"), "{error}");
     }
 }

@@ -162,14 +162,14 @@ impl LeaseHeartbeatGuard {
                             return Ok(());
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let now = Utc::now();
-                            match heartbeat_job_lease(&paths, &token, now, ttl) {
+                            match heartbeat_job_lease(&paths, &token, Utc::now(), ttl) {
                                 Ok(lease) => authority_expires_at = lease.expires_at,
                                 Err(error) => {
+                                    let observed_at = Utc::now();
                                     if heartbeat_failure_is_retryable(
                                         &error,
                                         authority_expires_at,
-                                        now,
+                                        observed_at,
                                     ) {
                                         continue;
                                     }
