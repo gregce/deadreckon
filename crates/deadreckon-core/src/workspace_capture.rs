@@ -2413,6 +2413,60 @@ mod tests {
         capture_workspace_strict_bounded, freeze_workspace_capture_policy,
         materialize_capture_plan,
     };
+
+    #[test]
+    fn late_project_ignore_is_not_yet_a_verified_result_boundary() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("source.txt"), "source\n").expect("source");
+        let policy = freeze_workspace_capture_policy(root).expect("admission policy");
+        std::fs::create_dir_all(root.join("invented-cache")).expect("cache");
+        std::fs::write(root.join("invented-cache/lock"), "volatile\n").expect("lock");
+        std::fs::write(root.join(".gitignore"), "/invented-cache\n").expect("late ignore");
+
+        let capture = capture_workspace_strict(
+            root,
+            &policy,
+            CaptureProjection::Deliverable,
+            CapturePurpose::DeliverableIndex,
+        )
+        .expect("historical capture");
+        assert!(
+            capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("invented-cache/lock")),
+            "the characterization must stay explicit until Holdfast replaces this boundary"
+        );
+    }
+
+    #[test]
+    fn receipt_and_promotion_currently_can_select_different_trees() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("source.txt"), "source\n").expect("source");
+        let frozen = freeze_workspace_capture_policy(root).expect("frozen policy");
+        std::fs::write(root.join("late.txt"), "late\n").expect("late");
+        std::fs::write(root.join(".gitignore"), "/late.txt\n").expect("late ignore");
+
+        let live = freeze_workspace_capture_policy(root).expect("live policy");
+        let receipt_capture = capture_workspace_strict(
+            root,
+            &live,
+            CaptureProjection::Deliverable,
+            CapturePurpose::DeliverableIndex,
+        )
+        .expect("receipt-like live capture");
+        let promotion_capture = capture_workspace_strict(
+            root,
+            &frozen,
+            CaptureProjection::Promotable,
+            CapturePurpose::PromotionCandidate,
+        )
+        .expect("promotion-like frozen capture");
+        assert!(!receipt_capture.entries.iter().any(|entry| entry.relative == Path::new("late.txt")));
+        assert!(promotion_capture.entries.iter().any(|entry| entry.relative == Path::new("late.txt")));
+    }
     use crate::git::run_git;
 
     fn git(root: &Path, args: &[&str]) {

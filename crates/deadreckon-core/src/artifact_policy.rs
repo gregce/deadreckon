@@ -284,4 +284,9 @@ mod tests {
         assert_eq!(runtime_output_root(Path::new(".git/index")), None);
         assert_eq!(runtime_output_root(Path::new("src/lib.rs")), None);
     }
+
+    #[test]
+    fn unknown_framework_output_has_no_builtin_name() {
+        assert_eq!(runtime_output_root(Path::new("invented-cache/lock")), None);
+    }
 }
