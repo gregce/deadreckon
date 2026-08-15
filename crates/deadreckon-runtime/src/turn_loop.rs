@@ -1204,6 +1204,21 @@ async fn run_turn_loop_inner(
             )? {
                 return Ok(RunLoopOutcome::PausedAtCap);
             }
+            if !matches!(&completion_mode, CompletionMode::ParentRepairCandidate(_))
+                && !prepare_result_projection_or_record_needs_review(
+                    state,
+                    turn,
+                    &mut history,
+                    &work_clock,
+                )?
+            {
+                emit_run_completed(
+                    state,
+                    config.event_sender.as_ref(),
+                    RunLoopOutcome::Failed,
+                )?;
+                return Ok(RunLoopOutcome::Failed);
+            }
             let commit_result =
                 commit_finalized_turn_bounded(state, turn, provider_phase_deadline, &run_token);
             if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
@@ -1981,6 +1996,21 @@ async fn run_turn_loop_inner(
                 )? {
                     return Ok(RunLoopOutcome::PausedAtCap);
                 }
+                if !matches!(&completion_mode, CompletionMode::ParentRepairCandidate(_))
+                    && !prepare_result_projection_or_record_needs_review(
+                        state,
+                        turn,
+                        &mut history,
+                        &work_clock,
+                    )?
+                {
+                    emit_run_completed(
+                        state,
+                        config.event_sender.as_ref(),
+                        RunLoopOutcome::Failed,
+                    )?;
+                    return Ok(RunLoopOutcome::Failed);
+                }
                 let commit_result =
                     commit_finalized_turn_bounded(state, turn, provider_phase_deadline, &run_token);
                 if let ControlFlow::Break(outcome) = settle_trusted_git_phase(
@@ -2357,7 +2387,7 @@ const PROVIDER_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const PROVIDER_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 const PROVIDER_UNBOUNDED_WORK_WINDOW: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 const RUNTIME_PHASE_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
-const EVENT_SINK_DRAIN_GRACE: Duration = Duration::from_millis(250);
+const EVENT_SINK_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 async fn wait_for_provider_retry(
     work_expires_at: tokio::time::Instant,
@@ -3635,7 +3665,7 @@ impl EventSinkForwarder {
         if let Some(shutdown) = self.graceful_shutdown.take() {
             let _ = shutdown.send(());
         }
-        if tokio::time::timeout(EVENT_SINK_DRAIN_GRACE, &mut self.handle)
+        if tokio::time::timeout(EVENT_SINK_DRAIN_GRACE.min(cleanup_budget), &mut self.handle)
             .await
             .is_err()
         {
@@ -5441,9 +5471,16 @@ async fn semantic_completion_disposition(
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
 
+    let mut semantic_state = state.clone();
+    if deadreckon_core::result_projection_exists(state) {
+        let candidate = deadreckon_core::result_projection_candidate_path(state);
+        deadreckon_core::validate_result_projection_at(state, &candidate)?;
+        semantic_state.working_dir = candidate;
+    }
+
     let semantic_run =
         match crate::semantic_judge::run_semantic_judge_with_deadline_and_cancellation(
-            state,
+            &semantic_state,
             marker,
             router,
             config.sandbox_backend,
@@ -5595,7 +5632,13 @@ fn seal_achieved_semantic_completion(
         return Ok(SemanticCompletionDisposition::BudgetExhausted);
     }
     let seal_result = (|| -> Result<()> {
-        crate::semantic_judge::validate_semantic_judgment_input(state, marker, judgment)?;
+        let mut semantic_state = state.clone();
+        if deadreckon_core::result_projection_exists(state) {
+            let candidate = deadreckon_core::result_projection_candidate_path(state);
+            deadreckon_core::validate_result_projection_at(state, &candidate)?;
+            semantic_state.working_dir = candidate;
+        }
+        crate::semantic_judge::validate_semantic_judgment_input(&semantic_state, marker, judgment)?;
         let authority_path = paths.job_authority(&state.run_id);
         let raw = std::fs::read(&authority_path).map_err(|source| DeadreckonError::Io {
             path: authority_path.clone(),
@@ -5977,8 +6020,15 @@ async fn acceptance_gate_passed_or_record_failure(
 ) -> Result<DeterministicGateDisposition> {
     let launch_owner = gate_launch_owner_from_environment(state)?;
     work_clock.sync(state);
+    let projected = deadreckon_core::result_projection_exists(state);
+    let mut gate_state = state.clone();
+    if projected {
+        let evaluation = deadreckon_core::result_projection_evaluation_path(state);
+        deadreckon_core::materialize_result_projection(state, &evaluation)?;
+        gate_state.working_dir = evaluation;
+    }
     let gate_phase = run_deterministic_gate_work_phase(
-        state,
+        &gate_state,
         sandbox_backend,
         launch_owner.as_ref(),
         cancellation_token,
@@ -5989,7 +6039,22 @@ async fn acceptance_gate_passed_or_record_failure(
         DeterministicGatePhaseOutcome::Completed {
             result,
             cleanup: ProviderCleanup::Proven | ProviderCleanup::NotApplicable,
-        } => result.and_then(|()| validate_acceptance_marker(state)),
+        } => {
+            let result = result.and_then(|()| {
+                if projected {
+                    deadreckon_core::validate_result_projection_at(state, &gate_state.working_dir)?;
+                    deadreckon_core::validate_result_projection_at(
+                        state,
+                        &deadreckon_core::result_projection_candidate_path(state),
+                    )?;
+                }
+                validate_acceptance_marker(state)
+            });
+            if projected {
+                deadreckon_core::clear_result_projection_evaluation(state)?;
+            }
+            result
+        }
         DeterministicGatePhaseOutcome::Completed {
             cleanup: ProviderCleanup::RetainedAuthority { path, detail },
             ..
@@ -6006,6 +6071,14 @@ async fn acceptance_gate_passed_or_record_failure(
             return Ok(DeterministicGateDisposition::LostContainment);
         }
         DeterministicGatePhaseOutcome::WorkExpired { cleanup } => {
+            if projected
+                && matches!(
+                    &cleanup,
+                    ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+                )
+            {
+                deadreckon_core::clear_result_projection_evaluation(state)?;
+            }
             let outcome = record_runtime_phase_interruption(
                 state,
                 turn,
@@ -6024,6 +6097,14 @@ async fn acceptance_gate_passed_or_record_failure(
             });
         }
         DeterministicGatePhaseOutcome::Cancelled { cleanup } => {
+            if projected
+                && matches!(
+                    &cleanup,
+                    ProviderCleanup::Proven | ProviderCleanup::NotApplicable
+                )
+            {
+                deadreckon_core::clear_result_projection_evaluation(state)?;
+            }
             let outcome = record_runtime_phase_interruption(
                 state,
                 turn,
@@ -6814,7 +6895,11 @@ fn commit_worktree_turn_inner(
     trusted_git_status(&control, &["update-ref", &branch_ref, &trusted_head])?;
     trusted_git_status(&control, &["symbolic-ref", "HEAD", &branch_ref])?;
     sanitize_evidence_only_paths(state, turn, base_sha, &control)?;
-    stage_trusted_delivery_paths(state, &control)?;
+    stage_trusted_delivery_paths(
+        state,
+        &control,
+        label == "finalize_docs" && deadreckon_core::result_projection_exists(state),
+    )?;
     refuse_gitlinks(&control)?;
     if trusted_git_quiet(&control, &["diff", "--cached", "--quiet"])? {
         verify_evidence_only_paths_clean(base_sha, &control)?;
@@ -6842,13 +6927,33 @@ fn commit_worktree_turn_inner(
     verify_evidence_only_paths_clean(base_sha, &control)
 }
 
-fn stage_trusted_delivery_paths(state: &PipelineState, control: &TrustedGitControl) -> Result<()> {
-    let policy = deadreckon_core::require_workspace_capture_policy(state)?;
+fn stage_trusted_delivery_paths(
+    state: &PipelineState,
+    control: &TrustedGitControl,
+    use_result_projection: bool,
+) -> Result<()> {
+    let admission = deadreckon_core::require_workspace_capture_policy(state)?;
+    let policy = if use_result_projection {
+        deadreckon_core::validate_result_projection_at(state, &state.working_dir)?;
+        deadreckon_core::load_result_projection(state)?.policy
+    } else {
+        admission
+    };
+    let projection = if use_result_projection {
+        deadreckon_core::CaptureProjection::ResultCandidate
+    } else {
+        deadreckon_core::CaptureProjection::Deliverable
+    };
+    let purpose = if use_result_projection {
+        deadreckon_core::CapturePurpose::ResultCandidate
+    } else {
+        deadreckon_core::CapturePurpose::DeliverableIndex
+    };
     let capture = deadreckon_core::capture_workspace_strict(
         &state.working_dir,
         &policy,
-        deadreckon_core::CaptureProjection::Deliverable,
-        deadreckon_core::CapturePurpose::DeliverableIndex,
+        projection,
+        purpose,
     )?;
     capture.require_complete("trusted Git delivery staging")?;
     let mut paths = capture
@@ -6878,17 +6983,25 @@ fn stage_trusted_delivery_paths(state: &PipelineState, control: &TrustedGitContr
     }
     let path_vec = paths.into_iter().collect::<Vec<_>>();
     let input = git_path_input(path_vec.iter())?;
-    let output = trusted_git_output_with_input(
-        control,
+    let args: &[&str] = if use_result_projection {
+        &[
+            "--literal-pathspecs",
+            "add",
+            "-A",
+            "-f",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+        ]
+    } else {
         &[
             "--literal-pathspecs",
             "add",
             "-A",
             "--pathspec-from-file=-",
             "--pathspec-file-nul",
-        ],
-        &input,
-    )?;
+        ]
+    };
+    let output = trusted_git_output_with_input(control, args, &input)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -6898,6 +7011,28 @@ fn stage_trusted_delivery_paths(state: &PipelineState, control: &TrustedGitContr
             String::from_utf8_lossy(&output.stderr)
         )))
     }
+}
+
+fn prepare_result_projection_or_record_needs_review(
+    state: &mut PipelineState,
+    turn: u32,
+    history: &mut Vec<String>,
+    work_clock: &RunWorkClock,
+) -> Result<bool> {
+    let paths = paths_for_state(state)?;
+    if paths.job_json(&state.run_id).is_file()
+        && let Err(error) = deadreckon_core::seal_result_projection(state)
+    {
+        record_needs_review(
+            state,
+            turn,
+            history,
+            &format!("the operator-visible result could not be sealed safely: {error}"),
+            work_clock,
+        )?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn trusted_delivery_path(path: &Path) -> bool {
@@ -7794,7 +7929,8 @@ mod tests {
         is_direct_api_provider_kind, load_or_reconstruct_history,
         load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, operator_guidance_frame, persist_parent_repair_candidate,
-        persist_work_boundary, policy_seam_refusal, policy_seam_refusal_message, promote_if_ready,
+        persist_work_boundary, policy_seam_refusal, policy_seam_refusal_message,
+        prepare_result_projection_or_record_needs_review, promote_if_ready,
         provider_failure_disposition, provider_output_name, read_turn_codebase_record,
         record_provider_interruption, record_semantic_judge_accounting, refuse_gitlinks,
         revise_verification, run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop,
@@ -8122,6 +8258,38 @@ mod tests {
         assert_eq!(state.turn, 2);
         assert_eq!(state.failure_reason, Some(gate_failure));
         assert_eq!(state.provider_failure, None);
+    }
+
+    #[test]
+    fn unsafe_result_projection_records_needs_review_instead_of_retryable_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut state) = create_smoke_run(&temp, "seal a bounded result");
+        std::fs::create_dir_all(paths.job_dir(&state.run_id)).expect("job dir");
+        std::fs::write(paths.job_json(&state.run_id), "{}\n").expect("job marker");
+        let mut policy = deadreckon_core::read_workspace_capture_policy(&state.run_root)
+            .expect("capture policy");
+        policy.budgets.max_files = 0;
+        deadreckon_core::write_workspace_capture_policy(&state.run_root, &policy)
+            .expect("bounded policy");
+        let work_clock = RunWorkClock::new(&state).expect("work clock");
+        let mut history = Vec::new();
+
+        assert!(
+            !prepare_result_projection_or_record_needs_review(
+                &mut state,
+                1,
+                &mut history,
+                &work_clock,
+            )
+            .expect("classification")
+        );
+        assert!(
+            state
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:"))
+        );
+        assert!(history.iter().any(|line| line.starts_with("NEEDS_REVIEW:")));
     }
 
     #[test]
@@ -9135,6 +9303,58 @@ timeout_ms = 1000
             remaining.is_empty(),
             "event sink retained process authority after joined shutdown: {remaining:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn event_sink_shutdown_drains_a_queued_event_within_its_cleanup_budget() {
+        let temp = TempDir::new().expect("tempdir");
+        let run_root = temp.path().join("run");
+        let working_dir = temp.path().join("work");
+        let capture = temp.path().join("event-sink-drain.jsonl");
+        std::fs::create_dir_all(run_root.join("gate")).expect("gate");
+        std::fs::create_dir_all(run_root.join("proofs")).expect("proofs");
+        std::fs::create_dir_all(&working_dir).expect("work");
+        let seams = SeamsConfig::with_command(
+            SeamKind::EventSink,
+            SeamCommandConfig {
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "sleep 0.5; cat >> {}; printf '{{\"ok\":true}}\\n'",
+                        sh_quote(&capture)
+                    ),
+                ],
+                timeout_ms: 1_500,
+            },
+        )
+        .expect("event sink seam");
+        let ctx = SeamRunCtx {
+            run_root,
+            working_dir,
+            sandbox_backend: SandboxBackend::None,
+        };
+        let (sender, _) = tokio::sync::broadcast::channel(8);
+        let cancellation = CancellationToken::new();
+        let forwarder = spawn_event_sink_forwarder(
+            seams,
+            ctx,
+            &sender,
+            ProviderPhaseDeadline::from_now(Duration::from_secs(30), Duration::from_secs(2)),
+            &cancellation,
+        );
+        sender
+            .send(deadreckon_protocol::RunEvent {
+                timestamp: chrono::Utc::now(),
+                run_id: "event-sink-drain-test".to_string(),
+                event: RunEventKind::TurnStarted { turn: 1 },
+            })
+            .expect("event sent");
+
+        forwarder.shutdown(Duration::from_secs(2)).await;
+
+        let captured = std::fs::read_to_string(capture).expect("queued event drained");
+        assert!(captured.contains(r#""kind":"turn_started""#));
     }
 
     #[tokio::test]

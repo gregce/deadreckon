@@ -221,6 +221,12 @@ pub fn result_projection_index_at(state: &PipelineState, root: &Path) -> Result<
     index_with_policy(root, &projection.policy)
 }
 
+/// Remove only the controller-owned disposable gate copy. A retained process
+/// authority must be reconciled before callers invoke this cleanup.
+pub fn clear_result_projection_evaluation(state: &PipelineState) -> Result<()> {
+    remove_controller_tree(&result_projection_evaluation_path(state))
+}
+
 fn index_with_policy(root: &Path, policy: &WorkspaceCapturePolicy) -> Result<ArtifactFileIndex> {
     let capture = capture_workspace_strict(
         root,
@@ -287,8 +293,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        load_result_projection, result_projection_candidate_path, result_projection_manifest_path,
-        result_projection_policy_path, seal_result_projection, validate_result_projection_at,
+        clear_result_projection_evaluation, load_result_projection, materialize_result_projection,
+        result_projection_candidate_path, result_projection_evaluation_path,
+        result_projection_manifest_path, result_projection_policy_path, seal_result_projection,
+        validate_result_projection_at,
     };
 
     fn fixture() -> (TempDir, crate::PipelineState) {
@@ -414,5 +422,87 @@ mod tests {
                 .join("source.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn final_local_intent_handles_unknown_framework_outputs_without_a_name_registry() {
+        let (_temp, state) = fixture();
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/.next/\n/.venv/\n/.future-framework-9f3c/\n",
+        )
+        .expect("ignore");
+        for (path, contents) in [
+            (".next/dev/lock", "lock"),
+            (".venv/bin/python", "runtime"),
+            (".future-framework-9f3c/cache.bin", "unknown"),
+            ("dist/app.js", "requested build artifact"),
+        ] {
+            let path = state.working_dir.join(path);
+            fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            fs::write(path, contents).expect("file");
+        }
+
+        let manifest = seal_result_projection(&state).expect("seal");
+        let candidate = result_projection_candidate_path(&state);
+        assert!(!candidate.join(".next").exists());
+        assert!(!candidate.join(".venv").exists());
+        assert!(!candidate.join(".future-framework-9f3c").exists());
+        assert_eq!(
+            fs::read_to_string(candidate.join("dist/app.js")).expect("dist"),
+            "requested build artifact"
+        );
+        assert!(
+            manifest
+                .omissions
+                .iter()
+                .any(|omission| omission.path == std::path::Path::new(".future-framework-9f3c"))
+        );
+    }
+
+    #[test]
+    fn disposable_evaluation_writes_never_flow_back_into_the_sealed_candidate() {
+        let (_temp, state) = fixture();
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/generated-any-name/\n",
+        )
+        .expect("ignore");
+        seal_result_projection(&state).expect("seal");
+        let evaluation = result_projection_evaluation_path(&state);
+        materialize_result_projection(&state, &evaluation).expect("evaluation");
+
+        fs::create_dir_all(evaluation.join("generated-any-name")).expect("generated dir");
+        fs::write(
+            evaluation.join("generated-any-name/output.bin"),
+            "recreated",
+        )
+        .expect("generated output");
+        validate_result_projection_at(&state, &evaluation)
+            .expect("ignored verifier output does not alter selected result");
+        fs::write(evaluation.join("source.txt"), "gate mutated source\n").expect("mutate");
+        assert!(validate_result_projection_at(&state, &evaluation).is_err());
+        validate_result_projection_at(&state, &result_projection_candidate_path(&state))
+            .expect("sealed candidate remained unchanged");
+
+        clear_result_projection_evaluation(&state).expect("cleanup");
+        assert!(!evaluation.exists());
+    }
+
+    #[test]
+    fn aggressive_late_ignore_remains_visible_and_cannot_hide_admission_tracked_source() {
+        let (_temp, state) = fixture();
+        fs::write(state.working_dir.join(".gitignore"), "*\n").expect("ignore everything");
+        fs::write(
+            state.working_dir.join("untracked-required.txt"),
+            "hidden proposal\n",
+        )
+        .expect("untracked");
+
+        seal_result_projection(&state).expect("seal");
+        let candidate = result_projection_candidate_path(&state);
+        assert!(candidate.join(".gitignore").is_file());
+        assert!(candidate.join("source.txt").is_file());
+        assert!(!candidate.join("untracked-required.txt").exists());
     }
 }

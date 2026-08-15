@@ -191,10 +191,11 @@ pub use result_projection::{
     RESULT_PROJECTION_CANDIDATE_DIR, RESULT_PROJECTION_DIR, RESULT_PROJECTION_EVALUATION_DIR,
     RESULT_PROJECTION_MANIFEST_JSON, RESULT_PROJECTION_POLICY_JSON,
     RESULT_PROJECTION_SCHEMA_VERSION, ResultProjectionManifest, SealedResultProjection,
-    load_result_projection, materialize_result_projection, result_projection_candidate_path,
-    result_projection_dir, result_projection_evaluation_path, result_projection_exists,
-    result_projection_index_at, result_projection_manifest_path, result_projection_policy_path,
-    result_projection_sha256, seal_result_projection, validate_result_projection_at,
+    clear_result_projection_evaluation, load_result_projection, materialize_result_projection,
+    result_projection_candidate_path, result_projection_dir, result_projection_evaluation_path,
+    result_projection_exists, result_projection_index_at, result_projection_manifest_path,
+    result_projection_policy_path, result_projection_sha256, seal_result_projection,
+    validate_result_projection_at,
 };
 pub use run_view::{
     Artifact, CheckOutcome, ExchangeRef, Money, ProofBand, RunIdentity, RunView, RunViewDocKind,

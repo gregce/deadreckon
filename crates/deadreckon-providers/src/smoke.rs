@@ -20,7 +20,7 @@ impl ScriptedSmokeProvider {
                 json!({
                     "action": "bash",
                     "tool_call_id": "smoke-bash-1",
-                    "command": "mkdir -p src\nprintf '[package]\\nname = \"working\"\\nversion = \"0.1.0\"\\nedition = \"2024\"\\n\\n[dependencies]\\n\\n[workspace]\\n' > Cargo.toml\nprintf 'fn main() {\\n    println!(\"hello from deadreckon\");\\n}\\n' > src/main.rs\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None.</p></section></body></html>\\n' > implementation-notes.html\ncargo test --manifest-path Cargo.toml"
+                    "command": "mkdir -p src\nprintf '[package]\\nname = \"working\"\\nversion = \"0.1.0\"\\nedition = \"2024\"\\n\\n[dependencies]\\n\\n[workspace]\\n' > Cargo.toml\nprintf 'fn main() {\\n    println!(\"hello from deadreckon\");\\n}\\n' > src/main.rs\nprintf '/target/\\n' > .gitignore\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None.</p></section></body></html>\\n' > implementation-notes.html\ncargo test --manifest-path Cargo.toml"
                 })
                 .to_string(),
                 json!({
@@ -171,5 +171,10 @@ mod tests {
             .await
             .expect("worker response");
         assert!(worker.content.contains("\"tool_call_id\":\"smoke-bash-1\""));
+        assert!(
+            worker
+                .content
+                .contains("printf '/target/\\\\n' > .gitignore")
+        );
     }
 }

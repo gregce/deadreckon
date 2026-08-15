@@ -858,6 +858,7 @@ pub(crate) fn print_job_status_with_facts(
         .map(|delivery| delivery.destination.display().to_string())
         .unwrap_or_else(|| "-".to_string());
     let proof_status = job_proof_status(view);
+    let result_projection = job_result_projection_status(&paths, view);
     let machine_verb = machine_json::active();
     if json_output || machine_verb.is_some() {
         // Glossary user words for the serialized projection enums
@@ -877,6 +878,7 @@ pub(crate) fn print_job_status_with_facts(
                     "status": proof_status,
                     "error": view.verified_receipt_error.as_deref(),
                 },
+                "result_projection": &result_projection,
                 "next_actions": [&next_action],
                 "try_lines": Vec::<String>::new(),
                 "paths": job_status_paths(&paths, view),
@@ -934,6 +936,21 @@ pub(crate) fn print_job_status_with_facts(
         println!();
         println!("  {} {}", ui_muted("proof error:"), error);
     }
+    if let Some(projection) = result_projection.as_object() {
+        println!();
+        if let Some(candidate) = projection.get("candidate").and_then(Value::as_str) {
+            println!("  {} {}", ui_muted("result candidate:"), candidate);
+        }
+        if let Some(digest) = projection.get("projection_sha256").and_then(Value::as_str) {
+            println!("  {} {}", ui_muted("result projection:"), digest);
+        }
+        if let Some(omissions) = projection.get("omissions").and_then(Value::as_array) {
+            println!("  {} {}", ui_muted("omitted paths:"), omissions.len());
+        }
+        if let Some(error) = projection.get("error").and_then(Value::as_str) {
+            println!("  {} {}", ui_muted("projection error:"), error);
+        }
+    }
     println!();
     println!("  {} {}", ui_muted("next:"), ui_command(next_action));
     Ok(())
@@ -958,6 +975,40 @@ fn job_status_paths(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) ->
     json!({
         "job": paths.job_dir(view.job.job_id.as_ref()),
         "source": &view.job.source_cwd,
+    })
+}
+
+fn job_result_projection_status(paths: &DeadreckonPaths, view: &deadreckon_core::JobView) -> Value {
+    let Some(run_id) = view.projection.child_run_ids.last() else {
+        return Value::Null;
+    };
+    let run_root = paths.run_root(&view.job.scope, run_id);
+    let projection_dir = run_root.join(deadreckon_core::RESULT_PROJECTION_DIR);
+    let manifest_path = projection_dir.join(deadreckon_core::RESULT_PROJECTION_MANIFEST_JSON);
+    if !projection_dir.exists() {
+        return Value::Null;
+    }
+    let read = || -> std::result::Result<Value, String> {
+        let raw = fs::read(&manifest_path).map_err(|error| error.to_string())?;
+        let manifest: deadreckon_core::ResultProjectionManifest =
+            serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
+        let projection_sha256 = deadreckon_core::flight::sha256_file(&manifest_path)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "present": true,
+            "candidate": projection_dir.join(deadreckon_core::RESULT_PROJECTION_CANDIDATE_DIR),
+            "projection_sha256": projection_sha256,
+            "tree_sha256": manifest.tree_sha256,
+            "omissions": manifest.omissions,
+            "omissions_truncated": manifest.omissions_truncated,
+        }))
+    };
+    read().unwrap_or_else(|error| {
+        json!({
+            "present": true,
+            "candidate": projection_dir.join(deadreckon_core::RESULT_PROJECTION_CANDIDATE_DIR),
+            "error": error,
+        })
     })
 }
 
@@ -3762,6 +3813,97 @@ mod tests {
         let error = current_job_work_clock(&paths, &view, now)
             .expect_err("corrupt terminal history must fail closed");
         assert!(error.to_string().contains("job history corrupt"), "{error}");
+    }
+
+    #[test]
+    fn status_exposes_the_sealed_candidate_and_omission_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("result.txt"), "result\n").expect("source result");
+        let state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "display the sealed result".to_string(),
+                cwd: source.clone(),
+                sandbox: "sandbox-exec".to_string(),
+                provider: None,
+                skill_name: "test".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(30.0),
+                run_id: Some("status-result-projection".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/.invented-runtime-v41/\n",
+        )
+        .expect("ignore");
+        fs::create_dir_all(state.working_dir.join(".invented-runtime-v41"))
+            .expect("runtime directory");
+        fs::write(
+            state.working_dir.join(".invented-runtime-v41/lock"),
+            "runtime\n",
+        )
+        .expect("runtime output");
+        let manifest = deadreckon_core::seal_result_projection(&state).expect("projection");
+
+        let job_id = JobId("status-result-projection-job".to_string());
+        let view = deadreckon_core::JobView {
+            job: Job {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id: job_id.clone(),
+                scope: state.scope.clone(),
+                goal: state.goal.clone(),
+                shape: JobShape::Single,
+                created_at: Utc::now(),
+                source_cwd: source,
+                launch_plan_sha256: "sha256:launch".to_string(),
+                authority_sha256: "sha256:authority".to_string(),
+                policy: JobPolicy {
+                    max_spend_usd: 1.0,
+                    max_wall_seconds: 30,
+                    max_attempts: 1,
+                    deadline: None,
+                    semantic_judge: SemanticJudgeMode::Required,
+                    execution: None,
+                },
+            },
+            projection: deadreckon_core::JobProjection {
+                schema_version: JobSchemaVersion::CURRENT,
+                job_id,
+                phase: deadreckon_protocol::JobPhase::Terminal,
+                outcome: Some(deadreckon_protocol::JobOutcome::Verified),
+                stop_reason: Some(deadreckon_protocol::StopReason::Verified),
+                last_sequence: 1,
+                current_lease_epoch: 0,
+                attempt_count: 1,
+                child_run_ids: vec![state.run_id.clone()],
+                delivery: None,
+                last_gate_attempt: None,
+                updated_at: Some(Utc::now()),
+                caveats: Vec::new(),
+            },
+            attempts: Vec::new(),
+            missing_attempts: Vec::new(),
+            verified_receipt_error: None,
+        };
+        let status = job_result_projection_status(&paths, &view);
+
+        assert_eq!(status["present"], json!(true));
+        assert_eq!(status["tree_sha256"], json!(manifest.tree_sha256));
+        assert_eq!(
+            status["projection_sha256"],
+            json!(deadreckon_core::result_projection_sha256(&state).expect("projection digest"))
+        );
+        assert!(
+            status["omissions"]
+                .as_array()
+                .is_some_and(|omissions| !omissions.is_empty())
+        );
     }
 
     #[test]

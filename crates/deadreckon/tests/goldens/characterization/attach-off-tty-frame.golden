@@ -13,7 +13,7 @@ status: 0
 |   gate          gate: PASSED 1/1 - validated signed dr-gate receipt                                                  |
 |   working       <TMP>/home/library/repo-<ID8>/<ID32>         |
 |   turns         3                                                                                                    |
-|   tokens        in 1999  out 429                                                                                     |
+|   tokens        in 1999  out 437                                                                                     |
 |   spend         $0.000000 · wall <DURATION> · 3 turns |
 |   gate          gate: PASSED 1/1 - validated signed dr-gate receipt                                                  |
 |   tests modified this run  no                                                                                        |

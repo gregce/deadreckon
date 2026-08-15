@@ -2008,6 +2008,11 @@ fn canonical_marker_bytes_with_parent_repair(
     ))?;
     let campaign_rollup =
         read_optional_bound_bytes(&crate::campaign::rollup_path_at_run_root(run_root))?;
+    let result_projection = read_optional_bound_bytes(
+        &run_root
+            .join(crate::RESULT_PROJECTION_DIR)
+            .join(crate::RESULT_PROJECTION_MANIFEST_JSON),
+    )?;
     let (parent_repair, parent_repair_candidate) = match parent_repair_override {
         Some(bound) => (
             bound.manifest.unwrap_or_default().to_vec(),
@@ -2083,6 +2088,11 @@ fn canonical_marker_bytes_with_parent_repair(
             "parent_repair_candidate",
             &parent_repair_candidate,
         )?;
+    }
+    // Holdfast markers append the exact controller-owned projection manifest.
+    // Its absence preserves the canonical byte sequence for historical runs.
+    if !result_projection.is_empty() {
+        append_canonical_field(&mut bytes, "result_projection", &result_projection)?;
     }
     Ok(bytes)
 }
@@ -3351,6 +3361,31 @@ mod tests {
             super::verify_v2_marker_signature(temp.path(), &marker, &key)
                 .expect("removing the post-sign addition restores the original bytes");
         }
+    }
+
+    #[test]
+    fn mutating_or_removing_a_signed_result_projection_invalidates_the_hmac() {
+        let temp = TempDir::new().expect("tempdir");
+        let projection = temp
+            .path()
+            .join(crate::RESULT_PROJECTION_DIR)
+            .join(crate::RESULT_PROJECTION_MANIFEST_JSON);
+        std::fs::create_dir_all(projection.parent().expect("parent")).expect("projection dir");
+        let original = br#"{"tree_sha256":"sha256:one"}"#;
+        std::fs::write(&projection, original).expect("projection");
+
+        let key = [29_u8; 32];
+        let mut marker = super::v2_test_marker(temp.path());
+        marker.signature =
+            super::v2_marker_signature(temp.path(), &marker, &key).expect("signature");
+        super::verify_v2_marker_signature(temp.path(), &marker, &key).expect("valid");
+
+        std::fs::write(&projection, br#"{"tree_sha256":"sha256:two"}"#).expect("mutate");
+        assert!(super::verify_v2_marker_signature(temp.path(), &marker, &key).is_err());
+        std::fs::write(&projection, original).expect("restore");
+        super::verify_v2_marker_signature(temp.path(), &marker, &key).expect("restored");
+        std::fs::remove_file(&projection).expect("remove");
+        assert!(super::verify_v2_marker_signature(temp.path(), &marker, &key).is_err());
     }
 
     #[test]

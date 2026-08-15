@@ -7,9 +7,15 @@
 - P2 (`fc92e06`) introduced the result-candidate capture boundary: final
   project-local ignore rules may propose omissions, admission-tracked paths
   still win, and host-global ignores and framework-name lists have no say.
-- P3 adds a controller-owned candidate, policy, omission manifest, and exact
+- P3 (`ccb9c55`) adds a controller-owned candidate, policy, omission manifest, and exact
   tree hash. Partial seals, byte/mode/symlink drift, and policy or admission
   changes now fail closed before that candidate can authorize later work.
+- P4–P10 bind that one candidate through trusted Git staging, a disposable
+  deterministic-gate copy, independent semantic evidence, the signed marker
+  and receipt tree, and exact promotion/recovery. Unknown ignored runtime
+  directories stay out without a name registry; admission-tracked and
+  intentionally unignored generated artifacts remain in; unsafe or oversized
+  projections stop as `NEEDS_REVIEW` instead of burning retry attempts.
 
 ## 0.8.6 — Runs that finish — 2026-08-13
 

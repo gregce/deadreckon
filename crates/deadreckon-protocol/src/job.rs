@@ -557,6 +557,8 @@ pub struct CompletionReceipt {
     pub launch_plan_sha256: String,
     pub source_tree_sha256: String,
     pub source_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_projection_sha256: Option<String>,
     pub result_tree_sha256: String,
     pub result_revision: Option<String>,
     pub deterministic_marker_sha256: String,

@@ -1192,6 +1192,7 @@ mod tests {
             launch_plan_sha256: "launch".to_string(),
             source_tree_sha256: "source-tree".to_string(),
             source_revision: Some("source-revision".to_string()),
+            result_projection_sha256: None,
             result_tree_sha256: "result-tree".to_string(),
             result_revision: Some("result-revision".to_string()),
             deterministic_marker_sha256: "marker".to_string(),
