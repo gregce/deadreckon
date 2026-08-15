@@ -5167,6 +5167,13 @@ are proposals only: admission-tracked paths and the policy files themselves
 remain included, while late global excludes, `.git/info/exclude`, and a registry
 of known framework directory names have no authority over the result.
 
+New Jobs receive a controller-owned `result-projection-activation.json` before
+their immutable Job record is published. That activation makes a projected
+candidate mandatory at every new strict completion boundary, including Graph,
+Campaign and parent-repair receipts. A Job admitted before Holdfast has no
+activation record and keeps its frozen historical capture and receipt rules;
+resume never silently reinterprets an active old Job under late ignore rules.
+
 The controller materialises the selected files into a run-owned candidate and
 records an omission manifest. The manifest binds the result policy, selected
 tree and omitted-path evidence. Literal path handling, no-follow copies,
@@ -5187,9 +5194,12 @@ One candidate identity then crosses the whole completion boundary:
 Gate writes stay in the disposable evaluation copy and never enter the sealed
 result. A selected-file mutation, policy drift, candidate/manifest mismatch,
 or unsafe projection becomes `NEEDS_REVIEW`; it cannot silently omit bytes or
-turn a failed definition of done into success. Historical receipts without a
-result projection remain valid through optional versioned fields. The operator
-journey is documented in `docs/HOLDFAST-OPERATOR-ACCEPTANCE.md`.
+turn a failed definition of done into success. Semantic evidence filters old
+turn snapshots through the sealed selection, so ignored worker residue cannot
+leak back into the judge's view. Receipt audit validates the stored candidate
+as well as the published result. Historical receipts without a result
+projection remain valid through optional versioned fields. The operator journey
+is documented in `docs/HOLDFAST-OPERATOR-ACCEPTANCE.md`.
 
 ---
 

@@ -382,18 +382,22 @@ crate: deadreckon-core
   promotion::recover_promotion
   promotion::stage_promotion_preview
   promotion::StagedPreviewFile
+  result_projection::activate_result_projection
   result_projection::clear_result_projection_evaluation
   result_projection::load_result_projection
   result_projection::materialize_result_projection
   result_projection::result_projection_candidate_path
+  result_projection::result_projection_activation_path
   result_projection::result_projection_dir
   result_projection::result_projection_evaluation_path
   result_projection::result_projection_exists
   result_projection::result_projection_index_at
   result_projection::result_projection_manifest_path
   result_projection::result_projection_policy_path
+  result_projection::result_projection_required
   result_projection::result_projection_sha256
   result_projection::ResultProjectionManifest
+  result_projection::RESULT_PROJECTION_ACTIVATION_JSON
   result_projection::RESULT_PROJECTION_CANDIDATE_DIR
   result_projection::RESULT_PROJECTION_DIR
   result_projection::RESULT_PROJECTION_EVALUATION_DIR
@@ -466,6 +470,7 @@ crate: deadreckon-core
   workspace_capture::GeneratedOutputRoot
   workspace_capture::GeneratedOutputSource
   workspace_capture::GitHydrationState
+  workspace_capture::is_result_candidate_tracked_path
   workspace_capture::materialize_capture_entry_with_blob_store
   workspace_capture::materialize_capture_plan
   workspace_capture::materialize_capture_plan_with_blob_store

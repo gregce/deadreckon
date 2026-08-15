@@ -5171,7 +5171,30 @@ fn classify_persisted_attempt(
                 .as_deref()
                 .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:")) =>
         {
-            if let Err(error) = validate_acceptance_marker(&state) {
+            if state.failure_reason.as_deref().is_some_and(|reason| {
+                reason.contains("operator-visible result could not be sealed safely")
+            }) {
+                append_attempt_stopped(
+                    paths,
+                    token,
+                    StopReason::SemanticUnavailable,
+                    json!({
+                        "exit": exit_detail,
+                        "run_status": "failed",
+                        "failure_reason": state.failure_reason,
+                    }),
+                )?;
+                append_terminal_event(
+                    paths,
+                    token,
+                    JobEventKind::NeedsReview,
+                    StopReason::SemanticUnavailable,
+                    json!({
+                        "reason": "the controller could not seal an unambiguous operator-visible result",
+                        "recovery_hint": "inspect the result projection omissions and revise project-local ignore intent"
+                    }),
+                )?;
+            } else if let Err(error) = validate_acceptance_marker(&state) {
                 append_control_event(
                     paths,
                     token,
@@ -12403,6 +12426,52 @@ mod tests {
                 .events()
                 .iter()
                 .all(|event| event.kind != JobEventKind::RetryScheduled)
+        );
+    }
+
+    #[test]
+    fn ambiguous_projection_stops_needs_review_not_retry_exhausted() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, job) = fixture(&temp, 3);
+        executing_attempt(&paths, &job);
+        let mut state = load_run(&paths, job.job_id.as_ref()).expect("attempt state");
+        state.status = RunStatus::Failed;
+        state.failure_reason = Some(
+            "NEEDS_REVIEW: the operator-visible result could not be sealed safely: ambiguous omission"
+                .to_string(),
+        );
+        save_state(&state).expect("needs-review state");
+        let token = claim_started_attempt(&paths, &job, 1);
+        classify_persisted_attempt(
+            &paths,
+            &job,
+            &token,
+            ChildExit {
+                status: None,
+                adopted: false,
+            },
+            false,
+        )
+        .expect("classification");
+
+        let history = deadreckon_core::read_job_history(&paths.job_events(job.job_id.as_ref()))
+            .expect("history");
+        assert_eq!(
+            history.events().last().map(|event| event.kind),
+            Some(JobEventKind::NeedsReview)
+        );
+        assert!(
+            history
+                .events()
+                .iter()
+                .all(|event| event.kind != JobEventKind::RetryScheduled)
+        );
+        assert!(!paths.job_receipt(job.job_id.as_ref()).exists());
+        assert!(
+            history
+                .events()
+                .last()
+                .is_some_and(|event| { event.detail.get("recovery_hint").is_some() })
         );
     }
 

@@ -85,6 +85,17 @@ Expected: the Job reaches a verified/reviewable terminal result without
 `retry_exhausted`. If your configured independent judge is unavailable,
 `needs_review` is acceptable; a repeated staging failure is not.
 
+Confirm that this newly admitted Job opted into Holdfast before inspecting its
+candidate:
+
+```bash
+find "$HOME/.deadreckon" -path "*<job-id>*/result-projection-activation.json" -print
+```
+
+Expected: exactly one controller-owned activation record is printed for this
+Job. Its absence means the Job was admitted by an older binary and is exercising
+historical compatibility rather than the new result boundary.
+
 ## 3. Inspect the sealed result
 
 Locate the manifest without changing it:
@@ -104,6 +115,10 @@ jq '{tree_sha256,included_files,included_bytes,omissions}' <projection-dir>/mani
 
 Expected: all three `test` commands exit 0. The manifest reports the unknown
 runtime tree as an omission and records a non-empty tree digest.
+
+Also inspect `"$holdfast_deadreckon" status <job-id> --json` and
+`"$holdfast_deadreckon" show <job-id> --json`. Both views must report the same
+candidate tree digest, projection digest and omission count.
 
 ## 4. Check that verification did not rewrite the candidate
 
@@ -171,8 +186,10 @@ that lacks the required source.
 Please report:
 
 - the Job ID and final status;
+- whether the Holdfast activation record existed;
 - whether all three step 3 `test` commands exited 0;
 - whether `evaluation` was absent;
+- whether status and show reported the same candidate/projection identity;
 - whether finish validated and omitted `.made-up-runtime-z91`; and
 - whether the hidden-source Job either included `required-source.js` or refused
   verification; and

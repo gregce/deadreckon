@@ -1967,6 +1967,15 @@ fn projection_boundary_allows(
     }
 }
 
+/// Whether an admission-tracked path belongs to the Holdfast result plane.
+///
+/// This is also used for tracked deletions, which have no filesystem entry to
+/// classify during result capture. Evidence-only paths remain private; every
+/// other admission-tracked path follows the same rule as ResultCandidate.
+pub fn is_result_candidate_tracked_path(path: &Path) -> bool {
+    classify_workspace_path(path) != WorkspacePathClass::EvidenceOnly
+}
+
 fn frozen_ignored(sources: &[CompiledIgnoreSource], path: &Path, is_dir: bool) -> bool {
     let mut ignored = false;
     for source in sources {

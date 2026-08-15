@@ -6020,13 +6020,7 @@ async fn acceptance_gate_passed_or_record_failure(
 ) -> Result<DeterministicGateDisposition> {
     let launch_owner = gate_launch_owner_from_environment(state)?;
     work_clock.sync(state);
-    let projected = deadreckon_core::result_projection_exists(state);
-    let mut gate_state = state.clone();
-    if projected {
-        let evaluation = deadreckon_core::result_projection_evaluation_path(state);
-        deadreckon_core::materialize_result_projection(state, &evaluation)?;
-        gate_state.working_dir = evaluation;
-    }
+    let (gate_state, projected) = prepare_gate_evaluation_state(state)?;
     let gate_phase = run_deterministic_gate_work_phase(
         &gate_state,
         sandbox_backend,
@@ -6157,6 +6151,17 @@ async fn acceptance_gate_passed_or_record_failure(
             Ok(DeterministicGateDisposition::Revise)
         }
     }
+}
+
+fn prepare_gate_evaluation_state(state: &PipelineState) -> Result<(PipelineState, bool)> {
+    let projected = deadreckon_core::result_projection_exists(state);
+    let mut gate_state = state.clone();
+    if projected {
+        let evaluation = deadreckon_core::result_projection_evaluation_path(state);
+        deadreckon_core::materialize_result_projection(state, &evaluation)?;
+        gate_state.working_dir = evaluation;
+    }
+    Ok((gate_state, projected))
 }
 
 fn gate_launch_owner_from_environment(state: &PipelineState) -> Result<Option<GateLaunchOwner>> {
@@ -6976,7 +6981,13 @@ fn stage_trusted_delivery_paths(
     paths.extend(
         nul_separated_paths(&indexed.stdout)?
             .into_iter()
-            .filter(|path| trusted_delivery_path(path)),
+            .filter(|path| {
+                if use_result_projection {
+                    deadreckon_core::is_result_candidate_tracked_path(path)
+                } else {
+                    trusted_delivery_path(path)
+                }
+            }),
     );
     if paths.is_empty() {
         return Ok(());
@@ -7021,6 +7032,7 @@ fn prepare_result_projection_or_record_needs_review(
 ) -> Result<bool> {
     let paths = paths_for_state(state)?;
     if paths.job_json(&state.run_id).is_file()
+        && deadreckon_core::result_projection_required(&paths, &state.run_id)?
         && let Err(error) = deadreckon_core::seal_result_projection(state)
     {
         record_needs_review(
@@ -7930,12 +7942,12 @@ mod tests {
         load_tool_policy_from_sandbox_toml, load_trusted_git_control,
         non_deliverable_history_paths, operator_guidance_frame, persist_parent_repair_candidate,
         persist_work_boundary, policy_seam_refusal, policy_seam_refusal_message,
-        prepare_result_projection_or_record_needs_review, promote_if_ready,
-        provider_failure_disposition, provider_output_name, read_turn_codebase_record,
-        record_provider_interruption, record_semantic_judge_accounting, refuse_gitlinks,
-        revise_verification, run_parent_repair_turn_loop, run_sandboxed_work_phase, run_turn_loop,
-        safe_working_path, safe_working_path_with_policy, save_history,
-        seal_achieved_semantic_completion, semantic_completion_disposition,
+        prepare_gate_evaluation_state, prepare_result_projection_or_record_needs_review,
+        promote_if_ready, provider_failure_disposition, provider_output_name,
+        read_turn_codebase_record, record_provider_interruption, record_semantic_judge_accounting,
+        refuse_gitlinks, revise_verification, run_parent_repair_turn_loop,
+        run_sandboxed_work_phase, run_turn_loop, safe_working_path, safe_working_path_with_policy,
+        save_history, seal_achieved_semantic_completion, semantic_completion_disposition,
         should_drain_steer_inbox, snapshot_working_bounded, spawn_event_sink_forwarder,
         wait_for_provider_retry, write_workspace_file_no_follow,
     };
@@ -8266,6 +8278,7 @@ mod tests {
         let (paths, mut state) = create_smoke_run(&temp, "seal a bounded result");
         std::fs::create_dir_all(paths.job_dir(&state.run_id)).expect("job dir");
         std::fs::write(paths.job_json(&state.run_id), "{}\n").expect("job marker");
+        deadreckon_core::activate_result_projection(&paths, &state.run_id).expect("activation");
         let mut policy = deadreckon_core::read_workspace_capture_policy(&state.run_root)
             .expect("capture policy");
         policy.budgets.max_files = 0;
@@ -8290,6 +8303,96 @@ mod tests {
                 .is_some_and(|reason| reason.starts_with("NEEDS_REVIEW:"))
         );
         assert!(history.iter().any(|line| line.starts_with("NEEDS_REVIEW:")));
+    }
+
+    #[test]
+    fn active_pre_holdfast_job_uses_frozen_historical_rules() {
+        let temp = TempDir::new().expect("tempdir");
+        let (paths, mut historical) = create_smoke_run(&temp, "historical result");
+        std::fs::create_dir_all(paths.job_dir(&historical.run_id)).expect("job dir");
+        std::fs::write(paths.job_json(&historical.run_id), "{}\n").expect("historical job");
+        std::fs::write(historical.working_dir.join("late.txt"), "late\n").expect("late");
+        std::fs::write(historical.working_dir.join(".gitignore"), "/late.txt\n").expect("ignore");
+        let clock = RunWorkClock::new(&historical).expect("clock");
+        assert!(
+            prepare_result_projection_or_record_needs_review(
+                &mut historical,
+                1,
+                &mut Vec::new(),
+                &clock,
+            )
+            .expect("historical classification")
+        );
+        assert!(!deadreckon_core::result_projection_exists(&historical));
+
+        let current_temp = TempDir::new().expect("current tempdir");
+        let (current_paths, mut current) = create_smoke_run(&current_temp, "current result");
+        std::fs::create_dir_all(current_paths.job_dir(&current.run_id)).expect("job dir");
+        std::fs::write(current_paths.job_json(&current.run_id), "{}\n").expect("current job");
+        deadreckon_core::activate_result_projection(&current_paths, &current.run_id)
+            .expect("activate");
+        let clock = RunWorkClock::new(&current).expect("clock");
+        assert!(
+            prepare_result_projection_or_record_needs_review(
+                &mut current,
+                1,
+                &mut Vec::new(),
+                &clock,
+            )
+            .expect("current classification")
+        );
+        assert!(deadreckon_core::result_projection_exists(&current));
+    }
+
+    #[test]
+    fn strict_gate_evaluates_clean_candidate_not_live_worker_tree() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "gate clean candidate");
+        std::fs::write(state.working_dir.join("source.txt"), "source\n").expect("source");
+        std::fs::write(state.working_dir.join(".gitignore"), "/.runtime-z91/\n").expect("ignore");
+        std::fs::create_dir_all(state.working_dir.join(".runtime-z91")).expect("runtime");
+        std::fs::write(state.working_dir.join(".runtime-z91/lock"), "live\n").expect("live");
+        std::fs::write(
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+            "required:\n  - shell: \"test -f source.txt && test ! -e .runtime-z91\"\n",
+        )
+        .expect("contract");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        let (gate_state, projected) = prepare_gate_evaluation_state(&state).expect("gate state");
+        assert!(projected);
+        assert!(state.working_dir.join(".runtime-z91").exists());
+        assert!(!gate_state.working_dir.join(".runtime-z91").exists());
+        let checks = deadreckon_core::evaluate_acceptance(&state.run_root, &gate_state.working_dir)
+            .expect("gate");
+        assert!(checks.iter().all(|check| check.passed));
+        deadreckon_core::clear_result_projection_evaluation(&state).expect("cleanup");
+    }
+
+    #[test]
+    fn gate_edit_to_candidate_path_refuses_after_checks() {
+        let temp = TempDir::new().expect("tempdir");
+        let (_paths, state) = create_smoke_run(&temp, "gate cannot edit result");
+        std::fs::write(state.working_dir.join("source.txt"), "source\n").expect("source");
+        std::fs::write(
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+            "required:\n  - shell: \"printf tampered > source.txt\"\n",
+        )
+        .expect("contract");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        let (gate_state, _) = prepare_gate_evaluation_state(&state).expect("gate state");
+        let checks = deadreckon_core::evaluate_acceptance(&state.run_root, &gate_state.working_dir)
+            .expect("gate");
+        assert!(checks.iter().all(|check| check.passed));
+        assert!(
+            deadreckon_core::validate_result_projection_at(&state, &gate_state.working_dir)
+                .is_err()
+        );
+        deadreckon_core::validate_result_projection_at(
+            &state,
+            &deadreckon_core::result_projection_candidate_path(&state),
+        )
+        .expect("candidate unchanged");
+        deadreckon_core::clear_result_projection_evaluation(&state).expect("cleanup");
     }
 
     #[test]
@@ -11729,6 +11832,117 @@ storage = "jsonl"
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn final_git_projection_fixture() -> (TempDir, PipelineState, PathBuf, String) {
+        let temp = TempDir::new().expect("tempdir");
+        let source = temp.path().join("source");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(source.join("src")).expect("src");
+        test_git(&source, &["init", "-q"]);
+        test_git(
+            &source,
+            &["config", "user.email", "fixture@example.invalid"],
+        );
+        test_git(&source, &["config", "user.name", "fixture"]);
+        std::fs::write(source.join("src/keep.rs"), "pub const KEEP: u8 = 1;\n").expect("keep");
+        std::fs::write(source.join("src/delete.rs"), "delete me\n").expect("delete");
+        test_git(&source, &["add", "-A"]);
+        test_git(&source, &["commit", "-q", "-m", "base"]);
+        let base = test_git(&source, &["rev-parse", "HEAD"]);
+        test_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "holdfast-result",
+                worktree.to_str().expect("worktree path"),
+                &base,
+            ],
+        );
+        let mut codebase = CodebaseRecord::fresh();
+        codebase.mode = CodebaseMode::Worktree;
+        codebase.source_path = Some(source.clone());
+        codebase.source_git_root = Some(source);
+        codebase.branch_name = Some("holdfast-result".to_string());
+        codebase.base_ref = Some("master".to_string());
+        codebase.base_sha = Some(base.clone());
+        codebase.worktree_path = Some(worktree.clone());
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "commit exactly the sealed result".to_string(),
+                cwd: worktree.clone(),
+                sandbox: "none".to_string(),
+                provider: Some("codex".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: Some(codebase),
+            },
+        )
+        .expect("run");
+        capture_trusted_turn_head(&state, 1).expect("trusted head");
+        (temp, state, worktree, base)
+    }
+
+    #[test]
+    fn late_ignored_churning_output_never_reaches_git_add() {
+        let (_temp, state, worktree, _base) = final_git_projection_fixture();
+        std::fs::write(worktree.join(".gitignore"), "/.runtime-z91/\n").expect("ignore");
+        std::fs::create_dir_all(worktree.join(".runtime-z91")).expect("runtime");
+        std::fs::write(worktree.join(".runtime-z91/lock"), "one\n").expect("lock");
+        std::fs::write(worktree.join("src/keep.rs"), "pub const KEEP: u8 = 2;\n").expect("change");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        std::fs::write(worktree.join(".runtime-z91/lock"), "two\n").expect("churn");
+        commit_worktree_turn(&state, 1, "finalize_docs").expect("commit");
+        assert!(
+            test_git(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"])
+                .lines()
+                .all(|path| !path.starts_with(".runtime-z91/"))
+        );
+    }
+
+    #[test]
+    fn deleted_tracked_path_is_staged_from_admission_identity() {
+        let (_temp, state, worktree, _base) = final_git_projection_fixture();
+        std::fs::remove_file(worktree.join("src/delete.rs")).expect("delete tracked");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        commit_worktree_turn(&state, 1, "finalize_docs").expect("commit");
+        assert!(
+            !test_git(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"])
+                .lines()
+                .any(|path| path == "src/delete.rs")
+        );
+    }
+
+    #[test]
+    fn final_git_commit_and_candidate_select_the_same_paths() {
+        let (_temp, state, worktree, _base) = final_git_projection_fixture();
+        std::fs::remove_file(worktree.join("src/delete.rs")).expect("delete tracked");
+        std::fs::write(worktree.join("src/added.rs"), "pub const ADDED: u8 = 2;\n").expect("add");
+        std::fs::write(worktree.join(".gitignore"), "/.runtime-z91/\n").expect("ignore");
+        std::fs::create_dir_all(worktree.join(".runtime-z91")).expect("runtime");
+        std::fs::write(worktree.join(".runtime-z91/lock"), "runtime\n").expect("runtime");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        let candidate_paths = deadreckon_core::result_projection_index_at(
+            &state,
+            &deadreckon_core::result_projection_candidate_path(&state),
+        )
+        .expect("candidate index")
+        .files
+        .into_keys()
+        .collect::<std::collections::BTreeSet<_>>();
+        commit_worktree_turn(&state, 1, "finalize_docs").expect("commit");
+        let committed_paths = test_git(&worktree, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .lines()
+            .map(PathBuf::from)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(committed_paths, candidate_paths);
     }
 
     #[test]
