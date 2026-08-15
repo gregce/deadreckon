@@ -1846,7 +1846,16 @@ fn require_filesystem_matches_git_result(
     let output = crate::git::run_git_command(git_root, &mut checkout)?;
     require_git_success(git_root, &output, "materialize signed result tree")?;
 
-    let committed = build_deliverable_file_index(&tree_path)?;
+    // Holdfast must compare the signed Git tree and the live result through
+    // one frozen projection. The legacy deliverable index intentionally drops
+    // lifecycle-looking paths, while ResultCandidate retains admission-tracked
+    // files such as `.deadreckon/acceptance.yaml`; mixing those projections
+    // makes identical results appear different.
+    let committed = if crate::result_projection_exists(state) {
+        crate::result_projection_index_at(state, &tree_path)?
+    } else {
+        build_deliverable_file_index(&tree_path)?
+    };
     let actual = result_deliverable_index(state, artifact_root)?;
     if committed == actual {
         return Ok(());
@@ -3138,6 +3147,52 @@ mod tests {
             )
         );
         validate_completion_receipt(&fixture.paths, &fixture.state).expect("validate");
+    }
+
+    #[test]
+    fn projected_git_result_uses_one_projection_for_tracked_lifecycle_paths() {
+        let fixture = worktree_fixture();
+        let lifecycle = fixture.state.working_dir.join(".deadreckon");
+        fs::create_dir_all(&lifecycle).expect("lifecycle directory");
+        fs::write(lifecycle.join("acceptance.md"), "# Approved contract\n")
+            .expect("acceptance prose");
+        fs::write(
+            lifecycle.join("acceptance.yaml"),
+            "name: approved\nchecks: []\n",
+        )
+        .expect("acceptance contract");
+        git_ok(
+            &fixture.state.working_dir,
+            &[
+                "add",
+                "-f",
+                ".deadreckon/acceptance.md",
+                ".deadreckon/acceptance.yaml",
+            ],
+        );
+        git_ok(
+            &fixture.state.working_dir,
+            &["commit", "-m", "track lifecycle contract"],
+        );
+
+        let policy = crate::freeze_workspace_capture_policy(&fixture.state.working_dir)
+            .expect("admission policy with tracked lifecycle paths");
+        crate::write_workspace_capture_policy(&fixture.state.run_root, &policy)
+            .expect("persist admission policy");
+        crate::activate_result_projection(&fixture.paths, &fixture.state.run_id)
+            .expect("activate projection");
+        crate::seal_result_projection(&fixture.state).expect("seal projection");
+
+        let revision = git_stdout(&fixture.state.working_dir, &["rev-parse", "HEAD"]);
+        let base = git_stdout(&fixture.state.working_dir, &["rev-parse", "HEAD^"]);
+        super::require_filesystem_matches_git_result(
+            &fixture.state,
+            &fixture.state.working_dir,
+            &base,
+            &revision,
+            &fixture.state.working_dir,
+        )
+        .expect("signed Git tree and candidate use the same projection");
     }
 
     #[test]
