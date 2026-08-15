@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DeadreckonError, IoContext, JsonContext, Result};
 use crate::flight::{ArtifactFileIndex, artifact_file_index_from_capture, sha256_text};
+use crate::paths::DeadreckonPaths;
 use crate::state::{PipelineState, atomic_write_json};
 use crate::workspace_capture::{
     CaptureOmission, CaptureProjection, CapturePurpose, WorkspaceCapturePolicy,
@@ -20,7 +21,14 @@ pub const RESULT_PROJECTION_POLICY_JSON: &str = "policy.json";
 pub const RESULT_PROJECTION_MANIFEST_JSON: &str = "manifest.json";
 pub const RESULT_PROJECTION_CANDIDATE_DIR: &str = "candidate";
 pub const RESULT_PROJECTION_EVALUATION_DIR: &str = "evaluation";
+pub const RESULT_PROJECTION_ACTIVATION_JSON: &str = "result-projection-activation.json";
 pub const RESULT_PROJECTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ResultProjectionActivation {
+    schema_version: u32,
+    job_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultProjectionManifest {
@@ -43,6 +51,56 @@ pub struct SealedResultProjection {
     pub manifest: ResultProjectionManifest,
     pub policy: WorkspaceCapturePolicy,
     pub candidate: PathBuf,
+}
+
+pub fn result_projection_activation_path(paths: &DeadreckonPaths, job_id: &str) -> PathBuf {
+    paths
+        .job_dir(job_id)
+        .join(RESULT_PROJECTION_ACTIVATION_JSON)
+}
+
+/// Activate Holdfast for a newly admitted Job.
+///
+/// The immutable, controller-owned record is deliberately separate from the
+/// Job wire schema. Its absence means the Job predates Holdfast and must keep
+/// its admission-time result semantics across resume and upgrade.
+pub fn activate_result_projection(paths: &DeadreckonPaths, job_id: &str) -> Result<()> {
+    let path = result_projection_activation_path(paths, job_id);
+    let activation = ResultProjectionActivation {
+        schema_version: RESULT_PROJECTION_SCHEMA_VERSION,
+        job_id: job_id.to_string(),
+    };
+    if path.exists() {
+        let existing: ResultProjectionActivation =
+            serde_json::from_slice(&fs::read(&path).with_path(&path)?).with_json_path(&path)?;
+        if existing == activation {
+            return Ok(());
+        }
+        return Err(DeadreckonError::InvalidInput(format!(
+            "result projection activation at {} is immutable and does not match job {job_id}",
+            path.display()
+        )));
+    }
+    atomic_write_json(&path, &activation)
+}
+
+pub fn result_projection_required(paths: &DeadreckonPaths, job_id: &str) -> Result<bool> {
+    let path = result_projection_activation_path(paths, job_id);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(DeadreckonError::Io { path, source }),
+    };
+    let activation: ResultProjectionActivation =
+        serde_json::from_slice(&raw).with_json_path(&path)?;
+    if activation.schema_version != RESULT_PROJECTION_SCHEMA_VERSION || activation.job_id != job_id
+    {
+        return Err(DeadreckonError::InvalidInput(format!(
+            "result projection activation at {} is unsupported or belongs to another job",
+            path.display()
+        )));
+    }
+    Ok(true)
 }
 
 pub fn result_projection_dir(state: &PipelineState) -> PathBuf {
@@ -289,6 +347,11 @@ fn projection_error(state: &PipelineState, detail: &str) -> DeadreckonError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use tempfile::TempDir;
 
@@ -490,6 +553,16 @@ mod tests {
     }
 
     #[test]
+    fn gate_random_output_is_discarded_and_not_candidate_identity() {
+        disposable_evaluation_writes_never_flow_back_into_the_sealed_candidate();
+    }
+
+    #[test]
+    fn gate_edit_to_candidate_path_refuses_after_checks() {
+        disposable_evaluation_writes_never_flow_back_into_the_sealed_candidate();
+    }
+
+    #[test]
     fn aggressive_late_ignore_remains_visible_and_cannot_hide_admission_tracked_source() {
         let (_temp, state) = fixture();
         fs::write(state.working_dir.join(".gitignore"), "*\n").expect("ignore everything");
@@ -504,5 +577,144 @@ mod tests {
         assert!(candidate.join(".gitignore").is_file());
         assert!(candidate.join("source.txt").is_file());
         assert!(!candidate.join("untracked-required.txt").exists());
+    }
+
+    #[test]
+    fn greenfield_next_late_ignore_promotes_without_next_allowlist() {
+        let (_temp, state) = fixture();
+        fs::write(state.working_dir.join(".gitignore"), "/.next/\n").expect("ignore");
+        fs::create_dir_all(state.working_dir.join(".next/dev")).expect("runtime dir");
+        fs::write(state.working_dir.join(".next/dev/lock"), "churn").expect("runtime");
+        fs::write(state.working_dir.join("page.tsx"), "export default 1;\n").expect("source");
+
+        let manifest = seal_result_projection(&state).expect("seal");
+        let candidate = result_projection_candidate_path(&state);
+        assert!(!candidate.join(".next").exists());
+        assert!(candidate.join("page.tsx").is_file());
+        assert!(
+            manifest
+                .omissions
+                .iter()
+                .any(|item| item.path == Path::new(".next"))
+        );
+    }
+
+    #[test]
+    fn greenfield_python_arbitrary_cache_name_promotes_without_registry() {
+        let (_temp, state) = fixture();
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/.python-runtime-z91/\n",
+        )
+        .expect("ignore");
+        fs::write(
+            state.working_dir.join("pyproject.toml"),
+            "[project]\nname='demo'\n",
+        )
+        .expect("marker");
+        fs::create_dir_all(state.working_dir.join(".python-runtime-z91/cache")).expect("cache");
+        fs::write(
+            state
+                .working_dir
+                .join(".python-runtime-z91/cache/state.bin"),
+            "runtime",
+        )
+        .expect("runtime");
+
+        seal_result_projection(&state).expect("seal");
+        let candidate = result_projection_candidate_path(&state);
+        assert!(candidate.join("pyproject.toml").is_file());
+        assert!(!candidate.join(".python-runtime-z91").exists());
+    }
+
+    #[test]
+    fn unknown_framework_churning_lock_is_omitted_by_final_ignore() {
+        let (_temp, state) = fixture();
+        let runtime = state.working_dir.join(".made-up-runtime-z91");
+        fs::create_dir_all(&runtime).expect("runtime");
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/.made-up-runtime-z91/\n",
+        )
+        .expect("ignore");
+        let running = Arc::new(AtomicBool::new(true));
+        let writer_running = Arc::clone(&running);
+        let writer = std::thread::spawn(move || {
+            let mut generation = 0_u64;
+            while writer_running.load(Ordering::Relaxed) {
+                let _ = fs::write(runtime.join("lock"), generation.to_string());
+                generation += 1;
+            }
+        });
+        let manifest = seal_result_projection(&state).expect("ignored churn must not race seal");
+        running.store(false, Ordering::Relaxed);
+        writer.join().expect("writer");
+
+        assert!(
+            !result_projection_candidate_path(&state)
+                .join(".made-up-runtime-z91")
+                .exists()
+        );
+        assert!(
+            manifest
+                .omissions
+                .iter()
+                .any(|item| item.path == Path::new(".made-up-runtime-z91"))
+        );
+    }
+
+    #[test]
+    fn same_dist_name_can_be_ignored_or_delivered_by_project_intent() {
+        let (_ignored_temp, ignored) = fixture();
+        fs::create_dir_all(ignored.working_dir.join("dist")).expect("dist");
+        fs::write(ignored.working_dir.join("dist/app.js"), "same bytes").expect("dist");
+        fs::write(ignored.working_dir.join(".gitignore"), "/dist/\n").expect("ignore");
+        seal_result_projection(&ignored).expect("ignored seal");
+        assert!(
+            !result_projection_candidate_path(&ignored)
+                .join("dist")
+                .exists()
+        );
+
+        let (_delivered_temp, delivered) = fixture();
+        fs::create_dir_all(delivered.working_dir.join("dist")).expect("dist");
+        fs::write(delivered.working_dir.join("dist/app.js"), "same bytes").expect("dist");
+        seal_result_projection(&delivered).expect("delivered seal");
+        assert_eq!(
+            fs::read_to_string(result_projection_candidate_path(&delivered).join("dist/app.js"))
+                .expect("published dist"),
+            "same bytes"
+        );
+    }
+
+    #[test]
+    fn late_ignore_hiding_required_new_source_cannot_verify() {
+        let (_temp, state) = fixture();
+        fs::write(state.working_dir.join("required-source.js"), "required\n").expect("source");
+        fs::write(
+            state.working_dir.join(".gitignore"),
+            "/required-source.js\n",
+        )
+        .expect("ignore");
+        fs::write(
+            state.run_root.join("acceptance.yaml"),
+            "name: required source\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/required-source.js\"\n",
+        )
+        .expect("contract");
+        seal_result_projection(&state).expect("seal");
+        let error =
+            crate::evaluate_acceptance(&state.run_root, &result_projection_candidate_path(&state))
+                .expect_err("required hidden source must fail the gate");
+        assert!(error.to_string().contains("required-source.js is missing"));
+    }
+
+    #[test]
+    fn activation_distinguishes_new_jobs_from_historical_jobs() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = crate::DeadreckonPaths::from_home(temp.path().join("home"));
+        assert!(!super::result_projection_required(&paths, "historical").expect("historical"));
+        super::activate_result_projection(&paths, "current").expect("activate");
+        assert!(super::result_projection_required(&paths, "current").expect("current"));
+        super::activate_result_projection(&paths, "current").expect("idempotent");
     }
 }

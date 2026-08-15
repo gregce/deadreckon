@@ -16,6 +16,11 @@
   directories stay out without a name registry; admission-tracked and
   intentionally unignored generated artifacts remain in; unsafe or oversized
   projections stop as `NEEDS_REVIEW` instead of burning retry attempts.
+- New Jobs carry a controller-owned Holdfast activation record, so projected
+  receipts are mandatory for every newly admitted Single, Graph and Campaign
+  result while already-active pre-Holdfast Jobs keep their frozen historical
+  rules. Receipt audit, crash recovery, status/show, tracked deletions and
+  semantic evidence all revalidate the same candidate and omission identity.
 - P11 reasserts Codex's external-sandbox bypass on resumed read-write turns.
   A failed projected gate can now return to the same contained coding session
   and repair its result intent instead of hitting a nested macOS

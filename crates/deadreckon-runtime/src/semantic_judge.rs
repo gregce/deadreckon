@@ -226,10 +226,17 @@ fn build_semantic_evidence_with_baseline(
             path: authority_path,
             source,
         })?;
-    let diff = approved_source.map_or_else(
-        || snapshot_diff(state, 0, state.turn),
-        |source| diff_working_trees(source, &state.working_dir),
-    );
+    let diff = if deadreckon_core::result_projection_exists(state) {
+        let baseline = approved_source
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| state.run_root.join("snapshots").join("turn-0"));
+        projected_diff(state, &baseline)
+    } else {
+        approved_source.map_or_else(
+            || snapshot_diff(state, 0, state.turn),
+            |source| diff_working_trees(source, &state.working_dir),
+        )
+    };
     let (changed_files, diff_text) = match diff {
         Ok(summary) => {
             let changed_files = summary
@@ -300,6 +307,25 @@ fn build_semantic_evidence_with_baseline(
         changed_files,
         caveats,
     })
+}
+
+/// Compare only paths selected by the controller's persisted result policy.
+///
+/// Turn snapshots intentionally retain recoverable worker residue. Once a
+/// result projection is sealed, that broader recovery plane must not leak
+/// late-ignored output into the independent semantic evidence plane.
+fn projected_diff(state: &PipelineState, baseline: &Path) -> Result<deadreckon_core::DiffSummary> {
+    let before = deadreckon_core::result_projection_index_at(state, baseline)?;
+    let after = deadreckon_core::result_projection_index_at(state, &state.working_dir)?;
+    let selected = before
+        .files
+        .keys()
+        .chain(after.files.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut diff = diff_working_trees(baseline, &state.working_dir)?;
+    diff.files.retain(|file| selected.contains(&file.path));
+    Ok(diff)
 }
 
 /// Invoke a fresh provider request. CLI routes receive an empty, temporary
@@ -1197,6 +1223,66 @@ mod tests {
     };
     use deadreckon_providers::ProviderKind;
 
+    fn projected_semantic_fixture() -> (
+        tempfile::TempDir,
+        deadreckon_core::PipelineState,
+        deadreckon_core::AcceptanceMarker,
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = deadreckon_core::DeadreckonPaths::from_home(temp.path().join("home"));
+        let source = temp.path().join("source");
+        fs::create_dir_all(&source).expect("source");
+        let mut state = deadreckon_core::create_run(
+            &paths,
+            deadreckon_core::RunOptions {
+                goal: "ship the selected source without runtime residue".to_string(),
+                cwd: source,
+                sandbox: "sandbox-exec".to_string(),
+                provider: Some("independent-test-judge".to_string()),
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: Some(1.0),
+                max_wall_seconds: Some(60.0),
+                run_id: Some("projected-semantic-fixture".to_string()),
+                codebase: None,
+            },
+        )
+        .expect("run");
+        fs::write(state.working_dir.join("baseline.txt"), "before\n").expect("baseline");
+        deadreckon_core::snapshot_working(&state, 0).expect("turn zero");
+        fs::write(state.working_dir.join("baseline.txt"), "after\n").expect("result");
+        fs::write(state.working_dir.join(".gitignore"), "/.runtime-z91/\n").expect("ignore");
+        fs::create_dir_all(state.working_dir.join(".runtime-z91")).expect("runtime");
+        fs::write(state.working_dir.join(".runtime-z91/lock"), "residue\n").expect("residue");
+        state.turn = 1;
+        deadreckon_core::snapshot_working(&state, 1).expect("turn one");
+        deadreckon_core::seal_result_projection(&state).expect("projection");
+        fs::write(
+            deadreckon_core::acceptance_spec_path_for_run_root(&state.run_root),
+            "name: projected\nchecks:\n  - kind: file_exists\n    path: \"{working_dir}/baseline.txt\"\n",
+        )
+        .expect("contract");
+        let authority_path = paths.job_authority(&state.run_id);
+        fs::create_dir_all(authority_path.parent().expect("authority parent"))
+            .expect("authority parent");
+        fs::write(&authority_path, "{}\n").expect("authority");
+        let marker = deadreckon_core::AcceptanceMarker {
+            schema_version: 2,
+            run_id: state.run_id.clone(),
+            status: "pass".to_string(),
+            produced_by: "dr-gate".to_string(),
+            issuer: "dr-gate".to_string(),
+            proof_kind: deadreckon_core::AcceptanceProofKind::NativeGate,
+            checked_at: chrono::Utc::now(),
+            working_dir: deadreckon_core::result_projection_evaluation_path(&state),
+            contained: true,
+            sandbox_backend: "sandbox-exec".to_string(),
+            signature: "test".to_string(),
+            check_count: 1,
+            checks: Vec::new(),
+        };
+        (temp, state, marker)
+    }
+
     #[test]
     fn semantic_judge_has_no_worker_session_or_write_capability() {
         let process_authority = std::path::Path::new("/tmp/semantic-judge.pid");
@@ -1277,6 +1363,88 @@ mod tests {
             assert!(request.prompt.contains(evidence));
         }
         assert!(request.output_schema.is_some());
+    }
+
+    #[test]
+    fn semantic_judge_reads_candidate_and_projection_omissions() {
+        let (_temp, state, marker) = projected_semantic_fixture();
+        let mut semantic_state = state.clone();
+        semantic_state.working_dir = deadreckon_core::result_projection_candidate_path(&state);
+        let evidence = build_semantic_evidence(&semantic_state, &marker).expect("evidence");
+        let projection = evidence.result_projection.expect("projection evidence");
+        let encoded = serde_json::to_string(&projection.content).expect("projection json");
+        assert!(encoded.contains(".runtime-z91"));
+        assert!(
+            evidence
+                .changed_files
+                .iter()
+                .all(|path| !path.contains(".runtime-z91"))
+        );
+    }
+
+    #[test]
+    fn semantic_input_hash_changes_with_h_or_p() {
+        let (_temp, state, marker) = projected_semantic_fixture();
+        let mut semantic_state = state.clone();
+        semantic_state.working_dir = deadreckon_core::result_projection_candidate_path(&state);
+        let before = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence(&semantic_state, &marker).expect("before evidence"),
+            )
+            .expect("before json"),
+        );
+        fs::write(state.working_dir.join("baseline.txt"), "new candidate\n").expect("change");
+        deadreckon_core::seal_result_projection(&state).expect("reseal");
+        let after = deadreckon_core::flight::sha256_text(
+            &serde_json::to_string(
+                &build_semantic_evidence(&semantic_state, &marker).expect("after evidence"),
+            )
+            .expect("after json"),
+        );
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn live_worker_residue_is_absent_from_semantic_evidence() {
+        let (_temp, state, marker) = projected_semantic_fixture();
+        let mut semantic_state = state.clone();
+        semantic_state.working_dir = deadreckon_core::result_projection_candidate_path(&state);
+        let evidence = build_semantic_evidence(&semantic_state, &marker).expect("evidence");
+        assert!(
+            evidence
+                .changed_files
+                .iter()
+                .all(|path| !path.contains(".runtime-z91"))
+        );
+        assert!(
+            !evidence
+                .source_diff
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("residue")
+        );
+    }
+
+    #[test]
+    fn semantic_judge_mutation_guard_covers_candidate() {
+        let (_temp, state, _marker) = projected_semantic_fixture();
+        let candidate = deadreckon_core::result_projection_candidate_path(&state);
+        let policy = deadreckon_core::load_result_projection(&state)
+            .expect("projection")
+            .policy;
+        let before = semantic_guard_identity_with_policy(&candidate, &policy).expect("before");
+        fs::write(candidate.join("baseline.txt"), "tampered\n").expect("candidate mutation");
+        let after = semantic_guard_identity_with_policy(&candidate, &policy).expect("after");
+        assert_ne!(before, after);
+
+        fs::write(
+            state.working_dir.join(".runtime-z91/lock"),
+            "more residue\n",
+        )
+        .expect("live residue");
+        let after_live = semantic_guard_identity_with_policy(&candidate, &policy).expect("live");
+        assert_eq!(after, after_live);
     }
 
     #[test]

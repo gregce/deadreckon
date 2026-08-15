@@ -944,6 +944,69 @@ mod tests {
         }
     }
 
+    fn projected_strict_fixture() -> Fixture {
+        let fixture = strict_fixture();
+        crate::activate_result_projection(&fixture.paths, &fixture.state.run_id)
+            .expect("activate projection");
+        fs::write(
+            fixture.state.working_dir.join(".gitignore"),
+            "/.unknown-runtime-a17/\n",
+        )
+        .expect("ignore");
+        fs::create_dir_all(fixture.state.working_dir.join(".unknown-runtime-a17/cache"))
+            .expect("runtime dir");
+        fs::write(
+            fixture
+                .state
+                .working_dir
+                .join(".unknown-runtime-a17/cache/state.bin"),
+            "runtime",
+        )
+        .expect("runtime");
+        fs::create_dir_all(fixture.state.working_dir.join("dist")).expect("dist dir");
+        fs::write(fixture.state.working_dir.join("dist/app.js"), "deliver me").expect("dist");
+        crate::seal_result_projection(&fixture.state).expect("projection");
+
+        let authority_path = fixture.paths.job_authority(&fixture.state.run_id);
+        let authority: JobAuthority =
+            serde_json::from_slice(&fs::read(&authority_path).expect("authority"))
+                .expect("authority json");
+        let key = read_gate_key(&fixture.paths, &fixture.state.run_id).expect("gate key");
+        let marker = write_native_acceptance_marker_with_results_and_key(
+            &fixture.state.run_root,
+            fixture.state.run_id.clone(),
+            fixture.state.working_dir.clone(),
+            vec![AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "projected result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("projected marker");
+        let judgment_path = fixture.state.run_root.join(SEMANTIC_JUDGMENT_JSON);
+        let judgment: SemanticJudgment =
+            serde_json::from_slice(&fs::read(&judgment_path).expect("judgment"))
+                .expect("judgment json");
+        seal_boundary_observation(&fixture.paths, &fixture.state, &authority);
+        seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &authority,
+            &marker,
+            &judgment,
+        )
+        .expect("projected receipt");
+        fixture
+    }
+
     fn strict_worktree_fixture() -> Fixture {
         let fixture = strict_fixture();
         let working = fixture.state.working_dir.clone();
@@ -1462,6 +1525,108 @@ mod tests {
         );
         crate::validate_completion_receipt(&fixture.paths, &fixture.state)
             .expect("published receipt remains exact");
+    }
+
+    #[test]
+    fn promotion_payload_is_exact_sealed_candidate() {
+        let mut fixture = projected_strict_fixture();
+        let projection = crate::load_result_projection(&fixture.state).expect("projection");
+        let receipt = crate::validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect("receipt before promotion");
+        assert_eq!(receipt.result_tree_sha256, projection.manifest.tree_sha256);
+        let library = promote_completed_run(&fixture.paths, &mut fixture.state).expect("promote");
+        assert!(!library.join(".unknown-runtime-a17").exists());
+        assert_eq!(
+            fs::read_to_string(library.join("dist/app.js")).expect("dist"),
+            "deliver me"
+        );
+        crate::validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect("same candidate validates after publication");
+    }
+
+    #[test]
+    fn promotion_never_recaptures_live_worker_ignores() {
+        let mut fixture = projected_strict_fixture();
+        let original_p = crate::result_projection_sha256(&fixture.state).expect("P");
+        promote_completed_run_with_hook(&fixture.paths, &mut fixture.state, |checkpoint, _| {
+            if checkpoint == PromotionCheckpoint::CandidateValidated {
+                Err(crash_error(checkpoint))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("interrupt after exact candidate validation");
+        fs::write(fixture.state.working_dir.join(".gitignore"), "\n").expect("rewrite live intent");
+        fs::write(
+            fixture
+                .state
+                .working_dir
+                .join(".unknown-runtime-a17/new.bin"),
+            "new live residue",
+        )
+        .expect("live residue");
+        recover_promotion(&fixture.paths, &mut fixture.state).expect("recover sealed candidate");
+        let library = fixture
+            .paths
+            .library_dir(&fixture.state.scope, &fixture.state.run_id);
+        assert_eq!(
+            crate::result_projection_sha256(&fixture.state).expect("same P"),
+            original_p
+        );
+        assert!(!library.join(".unknown-runtime-a17").exists());
+        assert!(library.join("dist/app.js").is_file());
+    }
+
+    #[test]
+    fn published_tree_rehash_must_equal_receipt_h() {
+        let mut fixture = projected_strict_fixture();
+        let library = promote_completed_run(&fixture.paths, &mut fixture.state).expect("promote");
+        let receipt = crate::validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect("published H");
+        assert_eq!(
+            receipt.result_tree_sha256,
+            crate::load_result_projection(&fixture.state)
+                .expect("projection")
+                .manifest
+                .tree_sha256
+        );
+        fs::write(library.join("dist/app.js"), "tampered").expect("tamper");
+        assert!(crate::validate_completion_receipt(&fixture.paths, &fixture.state).is_err());
+    }
+
+    #[test]
+    fn crash_recovery_retains_candidate_projection_identity() {
+        for crash_point in [
+            PromotionCheckpoint::CandidateValidated,
+            PromotionCheckpoint::PublishedValidated,
+            PromotionCheckpoint::StateSaved,
+        ] {
+            let mut fixture = projected_strict_fixture();
+            let state_path = fixture.state.state_path();
+            let projection_sha256 = crate::result_projection_sha256(&fixture.state).expect("P");
+            let receipt_h = crate::validate_completion_receipt(&fixture.paths, &fixture.state)
+                .expect("receipt")
+                .result_tree_sha256
+                .clone();
+            promote_completed_run_with_hook(&fixture.paths, &mut fixture.state, |checkpoint, _| {
+                if checkpoint == crash_point {
+                    Err(crash_error(checkpoint))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("failpoint");
+            let mut restarted = load_state(&state_path).expect("state");
+            recover_promotion(&fixture.paths, &mut restarted).expect("recover");
+            recover_promotion(&fixture.paths, &mut restarted).expect("idempotent");
+            assert_eq!(
+                crate::result_projection_sha256(&restarted).expect("same P"),
+                projection_sha256
+            );
+            let receipt = crate::validate_completion_receipt(&fixture.paths, &restarted)
+                .expect("recovered receipt");
+            assert_eq!(receipt.result_tree_sha256, receipt_h);
+        }
     }
 
     #[test]

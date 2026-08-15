@@ -3389,6 +3389,20 @@ mod tests {
     }
 
     #[test]
+    fn projection_mutation_invalidates_new_marker_but_not_historical_marker() {
+        let historical = TempDir::new().expect("historical tempdir");
+        let key = [31_u8; 32];
+        let mut historical_marker = super::v2_test_marker(historical.path());
+        historical_marker.signature =
+            super::v2_marker_signature(historical.path(), &historical_marker, &key)
+                .expect("historical signature");
+        super::verify_v2_marker_signature(historical.path(), &historical_marker, &key)
+            .expect("historical marker remains valid without projection bytes");
+
+        mutating_or_removing_a_signed_result_projection_invalidates_the_hmac();
+    }
+
+    #[test]
     fn mutating_or_removing_signed_parent_repair_proof_bytes_invalidates_the_hmac() {
         let temp = TempDir::new().expect("tempdir");
         let proofs = temp.path().join("proofs");

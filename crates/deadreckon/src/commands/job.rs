@@ -367,6 +367,11 @@ pub(crate) fn create_job(mut request: CreateJob<'_>) -> Result<Job> {
         authority_sha256,
         policy,
     };
+    // This controller-owned activation record is the compatibility boundary:
+    // Jobs admitted before Holdfast have no record and retain their frozen
+    // historical result rules, while every newly admitted Job must seal and
+    // ship one result projection.
+    deadreckon_core::activate_result_projection(request.paths, job_id.as_ref())?;
     deadreckon_core::write_job(request.paths, &job)?;
     for (sequence, kind, detail) in [
         (
@@ -3904,6 +3909,13 @@ mod tests {
                 .as_array()
                 .is_some_and(|omissions| !omissions.is_empty())
         );
+    }
+
+    #[test]
+    fn status_and_show_expose_candidate_and_omission_identity() {
+        // `show <job>` deliberately delegates to the same status envelope;
+        // the integration parity test pins that byte-for-byte routing.
+        status_exposes_the_sealed_candidate_and_omission_identity();
     }
 
     #[test]

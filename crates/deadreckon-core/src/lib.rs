@@ -188,6 +188,10 @@ pub use promotion::{
     recover_promotion, stage_promotion_preview,
 };
 pub use result_projection::{
+    RESULT_PROJECTION_ACTIVATION_JSON, activate_result_projection,
+    result_projection_activation_path, result_projection_required,
+};
+pub use result_projection::{
     RESULT_PROJECTION_CANDIDATE_DIR, RESULT_PROJECTION_DIR, RESULT_PROJECTION_EVALUATION_DIR,
     RESULT_PROJECTION_MANIFEST_JSON, RESULT_PROJECTION_POLICY_JSON,
     RESULT_PROJECTION_SCHEMA_VERSION, ResultProjectionManifest, SealedResultProjection,
@@ -223,8 +227,9 @@ pub use workspace_capture::{
     SOURCE_HYDRATION_MANIFEST_JSON, WORKSPACE_BLOBS_DIR, WorkspaceCaptureManifest,
     WorkspaceCapturePlan, WorkspaceCapturePolicy, capture_workspace, capture_workspace_strict,
     ensure_workspace_capture_policy, freeze_git_hydration, freeze_result_projection_policy,
-    freeze_workspace_capture_policy, materialize_capture_entry_with_blob_store,
-    materialize_capture_plan, materialize_capture_plan_with_blob_store, read_capture_manifest,
-    read_workspace_capture_policy, require_frozen_git_hydration, require_workspace_capture_policy,
-    workspace_capture_policy_path, write_capture_manifest, write_workspace_capture_policy,
+    freeze_workspace_capture_policy, is_result_candidate_tracked_path,
+    materialize_capture_entry_with_blob_store, materialize_capture_plan,
+    materialize_capture_plan_with_blob_store, read_capture_manifest, read_workspace_capture_policy,
+    require_frozen_git_hydration, require_workspace_capture_policy, workspace_capture_policy_path,
+    write_capture_manifest, write_workspace_capture_policy,
 };
