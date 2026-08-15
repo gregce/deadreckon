@@ -1,6 +1,6 @@
 # Changelog
 
-## Holdfast (stable) — 2026-08-15
+## 0.8.7 — One result passes and ships — 2026-08-15
 
 - P1 (`e23fd1d`) characterized the live-policy/receipt/promotion projection
   seam and pinned unknown framework output as intentionally unnamed.
