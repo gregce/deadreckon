@@ -1390,6 +1390,20 @@ fn discover_policy_inputs(root: &Path) -> PolicyDiscovery {
     if !root.is_dir() {
         return discovery;
     }
+    // Root policy is the common greenfield case and must not depend on how
+    // quickly an arbitrary generated subtree can consume the bounded walk.
+    // Nested policy files remain bounded discovery inputs below.
+    for (name, kind) in [
+        (".gitignore", FrozenIgnoreKind::Gitignore),
+        (".ignore", FrozenIgnoreKind::Ignore),
+    ] {
+        let relative = Path::new(name);
+        if root.join(relative).is_file()
+            && let Some(source) = frozen_ignore_file(root, relative, kind, &mut discovery.warnings)
+        {
+            discovery.ignores.push(source);
+        }
+    }
     let root_owned = root.to_path_buf();
     let mut builder = WalkBuilder::new(root);
     builder
@@ -1437,6 +1451,9 @@ fn discover_policy_inputs(root: &Path) -> PolicyDiscovery {
         };
         let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
         if matches!(name, ".gitignore" | ".ignore") {
+            if relative.components().count() == 1 {
+                continue;
+            }
             let kind = if name == ".gitignore" {
                 FrozenIgnoreKind::Gitignore
             } else {
@@ -1859,6 +1876,14 @@ fn filter_capture_entry(context: &TraversalContext, entry: &ignore::DirEntry) ->
         record_pruned(context, relative, CaptureOmissionReason::GeneratedOutput);
         return false;
     }
+    if context.projection == CaptureProjection::ResultCandidate
+        && !is_dir
+        && relative
+            .file_name()
+            .is_some_and(|name| matches!(name.to_str(), Some(".gitignore" | ".ignore")))
+    {
+        return true;
+    }
     if frozen_ignored(&context.ignores, entry.path(), is_dir)
         && !ignore_protected_capture_path(context.projection, relative)
     {
@@ -1924,7 +1949,16 @@ fn projection_boundary_allows(
                     && runtime_output_root(relative).is_some())
         }
         CaptureProjection::ResultCandidate => {
-            classify_workspace_path(relative) != WorkspacePathClass::EvidenceOnly
+            match classify_workspace_path(relative) {
+                WorkspacePathClass::EvidenceOnly => false,
+                // A project may intentionally track a lifecycle-looking path
+                // such as `.deadreckon/acceptance.yaml`; admission-tracked
+                // paths remain part of the result. Untracked controller
+                // lifecycle files beside it are run state, not operator
+                // output, and must never enter the sealed candidate.
+                WorkspacePathClass::LifecycleMetadata => tracked_or_parent,
+                WorkspacePathClass::Deliverable | WorkspacePathClass::RuntimeOnly => true,
+            }
         }
         CaptureProjection::WorkspaceGuard => {
             classify_workspace_path(relative) != WorkspacePathClass::RuntimeOnly
@@ -2537,6 +2571,46 @@ mod tests {
     #[test]
     fn tracked_path_wins_over_late_ignore() {
         result_policy_uses_final_local_ignores_and_admission_tracked_paths();
+    }
+
+    #[test]
+    fn result_candidate_keeps_tracked_lifecycle_path_but_drops_controller_siblings() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        init_git_fixture(root);
+        std::fs::create_dir_all(root.join(".deadreckon/docs")).expect("lifecycle directory");
+        std::fs::write(
+            root.join(".deadreckon/acceptance.yaml"),
+            "name: project contract\nchecks: []\n",
+        )
+        .expect("tracked contract");
+        let add = crate::git::run_git(root, &["add", "-f", ".deadreckon/acceptance.yaml"])
+            .expect("git add");
+        assert!(add.status.success());
+        let admission = freeze_workspace_capture_policy(root).expect("admission");
+
+        std::fs::write(root.join(".deadreckon/codebase.json"), "{}\n")
+            .expect("controller lifecycle file");
+        std::fs::write(root.join(".deadreckon/docs/polish.json"), "{}\n")
+            .expect("controller docs file");
+
+        let policy = freeze_result_projection_policy(root, &admission).expect("result policy");
+        let capture = capture_workspace_strict(
+            root,
+            &policy,
+            CaptureProjection::ResultCandidate,
+            CapturePurpose::ResultCandidate,
+        )
+        .expect("capture");
+        let paths = capture
+            .entries
+            .iter()
+            .map(|entry| entry.relative.as_path())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&Path::new(".deadreckon/acceptance.yaml")));
+        assert!(!paths.contains(&Path::new(".deadreckon/codebase.json")));
+        assert!(!paths.contains(&Path::new(".deadreckon/docs/polish.json")));
     }
 
     #[test]

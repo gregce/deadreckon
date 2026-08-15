@@ -20,14 +20,45 @@ provider may change the workspace. The policy records:
 - the capture budgets used by the run.
 
 Tracked files remain recoverable even when an ignore or output rule matches
-them. A provider changing an ignore file does not change the frozen policy for
-that run. This prevents an accidental or hostile ignore rewrite from hiding a
-deliverable or admitting a generated cache into trusted Git staging.
+them. A provider changing an ignore file does not change this admission policy.
+This prevents an accidental or hostile ignore rewrite from hiding an original
+deliverable or changing source hydration, snapshots, checkpoints or provenance.
 
 Older persisted policies are upgraded from their already-frozen tracked-path,
 HEAD, and index fields without consulting live Git. If an active run has no
 policy after provider work may have begun, DeadReckon fails closed instead of
 manufacturing trust from the current workspace.
+
+## What is sealed when work finishes
+
+Strict Jobs have a second, narrower boundary for the operator-visible result.
+After the provider stops and the final documents exist, DeadReckon treats the
+final project-local `.gitignore` and `.ignore` files as an untrusted proposal
+for what should not ship. It never consults late host-global excludes or
+`.git/info/exclude`, and every admission-tracked path still wins over a late
+ignore rule.
+
+DeadReckon materialises the proposed result outside the provider workspace and
+records `result-projection/policy.json`, `manifest.json` and `candidate/` under
+the run root. The manifest binds the admission policy, projection policy,
+omissions, file count, byte count and exact tree digest. This mechanism has no
+list of framework directory names: `.next`, `.venv`, a future tool's cache, or
+any other provider-created output is omitted only when the project's final
+local ignore rules say so. Conversely, an unignored `dist/` remains part of the
+result when it is intentionally deliverable.
+
+That one sealed candidate is the only input to later authority:
+
+1. trusted Git staging uses its exact policy and refuses workspace drift;
+2. the deterministic gate runs on a disposable copy and cannot write back;
+3. the semantic judge sees the sealed candidate and omission manifest;
+4. the signed marker and receipt bind the projection and result-tree digest;
+5. promotion rematerialises the candidate and revalidates the same receipt.
+
+The complete definition of done is unchanged. Ignore rules can propose a file
+set; they cannot waive an acceptance check, semantic review, containment proof,
+receipt validation or exact promotion. An unsafe or oversized projection ends
+as `NEEDS_REVIEW` rather than silently dropping data or consuming retries.
 
 ## How capture remains bounded
 
@@ -42,7 +73,8 @@ walker and policy. The default per-capture limits are:
 | One file | 128 MiB |
 | Traversal time | 10 seconds |
 
-Known output roots are pruned before traversal. An unrecognised subtree is
+Known output roots are pruned before admission-time snapshot and recovery
+traversal. The sealed result projection does not use those names. An unrecognised subtree is
 treated as suspicious generated output when it has at least 2,000 files and
 128 MiB, with at least 60% generated-looking files. DeadReckon stores a bounded
 summary containing its path, file count, byte count, and digest instead of its
@@ -66,6 +98,8 @@ A run leaves the following records under its run root:
 - `checkpoints/<id>/manifest.json`: the equivalent record for flight
   checkpoints; and
 - `workspace-blobs/sha256/`: run-scoped immutable whole-file blobs.
+- `result-projection/{policy.json,manifest.json,candidate/}`: the exact strict
+  Job result selected after provider quiescence.
 
 Snapshots and checkpoints hard-link to a matching content blob when the
 filesystem supports it and fall back to a normal copy otherwise. The manifest
@@ -82,6 +116,11 @@ cd /Users/gdc/deadreckon
 cargo test -p deadreckon-core workspace_capture::tests --lib
 cargo test -p deadreckon-core artifacts::tests --lib
 cargo test -p deadreckon-core flight::tests --lib
+cargo test -p deadreckon-core result_projection::tests --lib
+cargo test -p deadreckon-core \
+  strict_promotion_publishes_the_sealed_projection --lib
+cargo test -p deadreckon-core signed_result_projection --lib
+cargo test -p deadreckon-runtime semantic_judge::tests --lib
 cargo test -p deadreckon-runtime \
   turn_commit_archives_private_artifacts_and_rewrites_provider_commits --lib
 ```
@@ -98,6 +137,11 @@ Observable success is four `test result: ok` summaries. These tests prove that:
   and
 - promotion materialises the same bounded, trusted capture it records and
   rejects later payload tampering.
+- unknown ignored output is excluded without a framework registry while an
+  unignored generated artifact remains deliverable;
+- gate scratch writes cannot mutate the sealed result;
+- marker/receipt tampering invalidates the proof; and
+- strict promotion publishes and revalidates the exact sealed tree.
 
 For a live run, inspect the capture evidence after the first turn:
 

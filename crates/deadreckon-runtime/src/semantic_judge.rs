@@ -41,6 +41,7 @@ const EVIDENCE_DIFF: &str = "source-diff";
 const EVIDENCE_GATE: &str = "deterministic-gate";
 const EVIDENCE_AUTHORITY: &str = "authority";
 const EVIDENCE_NOTES: &str = "implementation-notes";
+const EVIDENCE_RESULT_PROJECTION: &str = "result-projection";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SemanticEvidencePack {
@@ -53,6 +54,8 @@ pub struct SemanticEvidencePack {
     pub deterministic_gate: EvidenceItem,
     pub authority: EvidenceItem,
     pub implementation_notes: EvidenceItem,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_projection: Option<EvidenceItem>,
     pub changed_files: Vec<String>,
     pub caveats: Vec<String>,
 }
@@ -248,6 +251,16 @@ fn build_semantic_evidence_with_baseline(
         }
     };
     let (diff_text, diff_truncated) = truncate_text(&diff_text, MAX_DIFF_BYTES);
+    let result_projection = if deadreckon_core::result_projection_exists(state) {
+        Some(EvidenceItem {
+            id: EVIDENCE_RESULT_PROJECTION.to_string(),
+            content: serde_json::to_value(deadreckon_core::load_result_projection(state)?.manifest)
+                .map_err(json_error("result projection manifest"))?,
+            truncated: false,
+        })
+    } else {
+        None
+    };
 
     Ok(SemanticEvidencePack {
         schema_version: 1,
@@ -283,6 +296,7 @@ fn build_semantic_evidence_with_baseline(
             content: Value::String(notes),
             truncated: notes_truncated,
         },
+        result_projection,
         changed_files,
         caveats,
     })
@@ -884,7 +898,7 @@ fn semantic_provider_request(
              exists, use `revise` when another implementation turn could fix it or `uncertain` \
              when the supplied evidence cannot decide it. Every evidence citation must be one of \
              approved-goal, approved-contract, source-diff, deterministic-gate, authority, \
-             implementation-notes.\n\nEVIDENCE PACK:\n{evidence_json}"
+             implementation-notes, result-projection.\n\nEVIDENCE PACK:\n{evidence_json}"
         ),
         max_output_tokens: 2_048,
         cwd: judge_workspace.map(Path::to_path_buf),
@@ -1037,6 +1051,7 @@ fn validate_evidence_references(coverage: &[GoalCoverage]) -> Result<()> {
         EVIDENCE_GATE,
         EVIDENCE_AUTHORITY,
         EVIDENCE_NOTES,
+        EVIDENCE_RESULT_PROJECTION,
     ]
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -1129,7 +1144,8 @@ fn semantic_output_schema() -> Value {
                                     EVIDENCE_DIFF,
                                     EVIDENCE_GATE,
                                     EVIDENCE_AUTHORITY,
-                                    EVIDENCE_NOTES
+                                    EVIDENCE_NOTES,
+                                    EVIDENCE_RESULT_PROJECTION
                                 ]
                             }
                         }
@@ -1166,13 +1182,14 @@ mod tests {
     use deadreckon_sandbox::SandboxBackend;
 
     use super::{
-        EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, SEMANTIC_CLEANUP_BUDGET,
-        SemanticBudgetExhaustion, SemanticDecision, SemanticJudgeAccounting, SemanticJudgeBudget,
-        SemanticJudgeResult, accounting_from_response, build_semantic_evidence,
-        build_semantic_evidence_against_source, classify_semantic_response, provider_kind_is_cli,
-        semantic_budget_overrun, semantic_cleanup_failure, semantic_guard_identity_with_policy,
-        semantic_output_schema, semantic_phase_deadline, semantic_provider_request,
-        strip_json_fence, validate_evidence_references, validate_semantic_judgment_input,
+        EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE, EVIDENCE_RESULT_PROJECTION,
+        SEMANTIC_CLEANUP_BUDGET, SemanticBudgetExhaustion, SemanticDecision,
+        SemanticJudgeAccounting, SemanticJudgeBudget, SemanticJudgeResult,
+        accounting_from_response, build_semantic_evidence, build_semantic_evidence_against_source,
+        classify_semantic_response, provider_kind_is_cli, semantic_budget_overrun,
+        semantic_cleanup_failure, semantic_guard_identity_with_policy, semantic_output_schema,
+        semantic_phase_deadline, semantic_provider_request, strip_json_fence,
+        validate_evidence_references, validate_semantic_judgment_input,
         validate_semantic_judgment_input_against_source,
     };
     use deadreckon_protocol::{
@@ -1251,7 +1268,12 @@ mod tests {
             SandboxBackend::Docker,
             Some(std::path::Path::new("/tmp/semantic-judge.pid")),
         );
-        for evidence in [EVIDENCE_CONTRACT, EVIDENCE_DIFF, EVIDENCE_GATE] {
+        for evidence in [
+            EVIDENCE_CONTRACT,
+            EVIDENCE_DIFF,
+            EVIDENCE_GATE,
+            EVIDENCE_RESULT_PROJECTION,
+        ] {
             assert!(request.prompt.contains(evidence));
         }
         assert!(request.output_schema.is_some());
@@ -1522,7 +1544,8 @@ mod tests {
                 "source-diff",
                 "deterministic-gate",
                 "authority",
-                "implementation-notes"
+                "implementation-notes",
+                "result-projection"
             ])
         );
         deadreckon_providers::validate_openai_strict_output_schema("semantic-test", &schema)

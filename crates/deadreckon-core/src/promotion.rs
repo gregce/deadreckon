@@ -425,15 +425,22 @@ fn prepare_candidate(
     candidate: &Path,
 ) -> Result<()> {
     remove_temporary_tree(candidate)?;
-    let policy = require_workspace_capture_policy(state)?;
-    let capture = capture_workspace_strict(
-        source,
-        &policy,
-        CaptureProjection::Promotable,
-        CapturePurpose::PromotionCandidate,
-    )?;
-    capture.require_complete("promotion candidate")?;
-    materialize_capture_plan(&capture, candidate)?;
+    let policy = if crate::result_projection_exists(state) {
+        let projection = crate::load_result_projection(state)?;
+        crate::materialize_result_projection(state, candidate)?;
+        projection.policy
+    } else {
+        let policy = require_workspace_capture_policy(state)?;
+        let capture = capture_workspace_strict(
+            source,
+            &policy,
+            CaptureProjection::Promotable,
+            CapturePurpose::PromotionCandidate,
+        )?;
+        capture.require_complete("promotion candidate")?;
+        materialize_capture_plan(&capture, candidate)?;
+        policy
+    };
     write_codebase_record(candidate, codebase)?;
     write_manifest(state, candidate, source_working_dir.to_path_buf(), &policy)
 }
@@ -559,8 +566,12 @@ fn validate_manifest(
         )));
     }
     if manifest.schema_version == 2 {
-        let policy = require_workspace_capture_policy(state)?;
-        let payload = promotable_payload_identity(library_dir, &policy)?;
+        let policy = if crate::result_projection_exists(state) {
+            crate::load_result_projection(state)?.policy
+        } else {
+            require_workspace_capture_policy(state)?
+        };
+        let payload = promotable_payload_identity(state, library_dir, &policy)?;
         if manifest.payload_tree_sha256.as_deref() != Some(payload.tree_sha256.as_str())
             || manifest.capture_policy_sha256.as_deref()
                 != Some(payload.capture_policy_sha256.as_str())
@@ -621,7 +632,7 @@ fn write_manifest(
     policy: &crate::WorkspaceCapturePolicy,
 ) -> Result<()> {
     fs::create_dir_all(library_dir).with_path(library_dir)?;
-    let payload = promotable_payload_identity(library_dir, policy)?;
+    let payload = promotable_payload_identity(state, library_dir, policy)?;
     let manifest = PromotionManifest {
         schema_version: 2,
         run_id: state.run_id.clone(),
@@ -654,15 +665,22 @@ struct PromotablePayloadIdentity {
 }
 
 fn promotable_payload_identity(
+    state: &PipelineState,
     root: &Path,
     policy: &crate::WorkspaceCapturePolicy,
 ) -> Result<PromotablePayloadIdentity> {
-    let capture = capture_workspace_strict(
-        root,
-        policy,
-        CaptureProjection::Promotable,
-        CapturePurpose::PromotionCandidate,
-    )?;
+    let (projection, purpose) = if crate::result_projection_exists(state) {
+        (
+            CaptureProjection::ResultCandidate,
+            CapturePurpose::ResultCandidate,
+        )
+    } else {
+        (
+            CaptureProjection::Promotable,
+            CapturePurpose::PromotionCandidate,
+        )
+    };
+    let capture = capture_workspace_strict(root, policy, projection, purpose)?;
     capture.require_complete("promotion payload verification")?;
     let capture_policy_sha256 = capture.manifest.policy_sha256.clone();
     let mut index = crate::flight::artifact_file_index_from_capture(capture)?;
@@ -1370,6 +1388,80 @@ mod tests {
                 .contains("does not match its trusted capture manifest"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn strict_promotion_publishes_the_sealed_projection_not_live_runtime_output() {
+        let mut fixture = strict_fixture();
+        fs::write(
+            fixture.state.working_dir.join(".gitignore"),
+            "/.unknown-runtime-a17/\n",
+        )
+        .expect("ignore");
+        fs::create_dir_all(fixture.state.working_dir.join(".unknown-runtime-a17/cache"))
+            .expect("runtime dir");
+        fs::write(
+            fixture
+                .state
+                .working_dir
+                .join(".unknown-runtime-a17/cache/state.bin"),
+            "runtime",
+        )
+        .expect("runtime");
+        fs::create_dir_all(fixture.state.working_dir.join("dist")).expect("dist dir");
+        fs::write(fixture.state.working_dir.join("dist/app.js"), "deliver me").expect("dist");
+        crate::seal_result_projection(&fixture.state).expect("projection");
+
+        let authority_path = fixture.paths.job_authority(&fixture.state.run_id);
+        let authority: JobAuthority =
+            serde_json::from_slice(&fs::read(&authority_path).expect("authority"))
+                .expect("authority json");
+        let key = read_gate_key(&fixture.paths, &fixture.state.run_id).expect("gate key");
+        let marker = write_native_acceptance_marker_with_results_and_key(
+            &fixture.state.run_root,
+            fixture.state.run_id.clone(),
+            fixture.state.working_dir.clone(),
+            vec![AcceptanceCheckResult {
+                kind: "file_exists".to_string(),
+                passed: true,
+                must_pass: true,
+                detail: "projected result exists".to_string(),
+                command: None,
+                cwd: None,
+                duration_ms: None,
+                stdout: None,
+                stderr: None,
+            }],
+            &key,
+            AcceptanceContainment::contained("sandbox-exec"),
+        )
+        .expect("projected marker");
+        let judgment_path = fixture.state.run_root.join(SEMANTIC_JUDGMENT_JSON);
+        let judgment: SemanticJudgment =
+            serde_json::from_slice(&fs::read(&judgment_path).expect("judgment"))
+                .expect("judgment json");
+        seal_boundary_observation(&fixture.paths, &fixture.state, &authority);
+        let receipt = seal_completion_receipt(
+            &fixture.paths,
+            &fixture.state,
+            &authority,
+            &marker,
+            &judgment,
+        )
+        .expect("projected receipt");
+        assert_eq!(
+            receipt.result_projection_sha256,
+            Some(crate::result_projection_sha256(&fixture.state).expect("projection digest"))
+        );
+
+        let library = promote_completed_run(&fixture.paths, &mut fixture.state).expect("promotion");
+        assert!(!library.join(".unknown-runtime-a17").exists());
+        assert_eq!(
+            fs::read_to_string(library.join("dist/app.js")).expect("dist"),
+            "deliver me"
+        );
+        crate::validate_completion_receipt(&fixture.paths, &fixture.state)
+            .expect("published receipt remains exact");
     }
 
     #[test]

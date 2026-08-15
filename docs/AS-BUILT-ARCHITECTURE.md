@@ -2,9 +2,9 @@
 
 **Subject:** deadreckon — a long-running, BYOK, sandboxed agentic CLI harness in Rust
 **Frame:** Reference specification for the **production-release** as-built reality at `/Users/gdc/deadreckon/`. Modeled on `/Users/gdc/Downloads/AS-BUILT-ARCHITECTURE.md` (the Printing Press).
-**Last updated:** 2026-08-02 (unified execution-team selection, strict durable
-admission, cumulative Job wall caps, stall prevention and current Soundings
-launch/contract limits)
+**Last updated:** 2026-08-15 (Holdfast controller-sealed result projection,
+unified execution-team selection, strict durable admission, cumulative Job wall
+caps, stall prevention and current Soundings launch/contract limits)
 **Maturity:** production-release posture. Workspace version `0.1.0` pending release tagging. Focused build/test/fmt checks are green for the current slice; broad release/stress verification remains an explicit operator choice.
 
 This document captures the system as built today — what's wired, what's load-bearing, where the seams are. It is both a record of the present and a reference an engineer could use to mentally reconstruct deadreckon from first principles.
@@ -53,6 +53,7 @@ This document captures the system as built today — what's wired, what's load-b
 38. [Binary Module Layout (post-decompose)](#38-binary-module-layout-post-decompose)
 39. [Composable Seams (swap a worker, keep the gate)](#39-composable-seams-swap-a-worker-keep-the-gate)
 46. [Course: Launch Planning and Reshaping](#46-course-launch-planning-and-reshaping)
+60. [Holdfast: One Candidate Passes and Ships](#60-holdfast-one-candidate-passes-and-ships)
 
 ---
 
@@ -4733,17 +4734,28 @@ operator-capture reads and writes, and inherited signing inputs. The completion
 receipt binds the observation digest, and later validation recomputes both the
 observation signature and its current Job/result identities.
 
-Provider output crosses a separate artifact boundary before it can become a
-trusted result. Workspace paths are classified as deliverable,
-evidence-only, lifecycle metadata, or disposable runtime output. Trusted
-copies preserve regular files, executable mode, symlinks, and raw symlink
-targets without following links; special filesystem entries fail closed.
-Rust `target`, JavaScript `node_modules`, and SwiftPM `.build` directories are
-disposable runtime output. DeadReckon omits them from source copies, snapshots,
-provider checkpoints, result capture and evidence inventories.
-Provider-created commits and index state are discarded, then DeadReckon stages
-only deliverable paths and creates its own hook-free commit through a captured
-Git control context outside the provider's authority.
+Provider output crosses two separate artifact boundaries before it can become
+a trusted result. The immutable admission capture still classifies workspace
+paths for source hydration, snapshots, recovery and provenance; known runtime
+roots remain a boundedness optimisation there. At completion, Holdfast freezes
+a distinct result-candidate policy from final project-local `.gitignore` and
+`.ignore` rules while retaining admission-tracked paths and refusing late
+global or `.git/info/exclude` authority. It uses no framework-output registry.
+Trusted copies preserve regular files, executable mode, symlinks, and raw
+symlink targets without following links; special filesystem entries fail
+closed.
+
+The controller materialises one candidate and omission manifest outside the
+provider workspace. Trusted Git stages that selection, the deterministic gate
+runs on a disposable copy, the independent semantic judge receives the same
+candidate plus omission evidence, the marker and receipt bind its tree, and
+promotion rematerialises it exactly. Gate writes never flow back. Ignore rules
+therefore choose neither proof nor success: every acceptance check, semantic
+decision, containment observation, receipt validation and post-publish digest
+still runs. Provider-created commits and index state are discarded, then
+DeadReckon creates its own hook-free commit through captured Git control outside
+the provider's authority. Projection capture or identity failures record
+`NEEDS_REVIEW` instead of silently omitting bytes or retrying the same result.
 
 That Git context captures and validates the original `.git` redirect, run
 worktree path, linked-worktree Git directory, and common Git directory.
@@ -5145,4 +5157,40 @@ The operator-facing reproduction and timeout/retry checks are in
 
 ---
 
-*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-08-02 for Soundings source-true, bounded launch admission (§17, §46, §48, §58 and §59), unified execution-team selection (§17), strict durable contract admission, cumulative active-attempt wall enforcement, process reconciliation, early provider-result persistence, concurrent Git pipe draining and SwiftPM artifact exclusion (§9, §22 and §58). Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*
+## 60. Holdfast: One Candidate Passes and Ships
+
+Holdfast separates the immutable admission capture from the final result
+projection. Admission still protects original tracked paths and bounds ordinary
+turn snapshots. After the provider is quiescent, the controller freezes a new
+result policy from project-local `.gitignore` and `.ignore` files. Those files
+are proposals only: admission-tracked paths and the policy files themselves
+remain included, while late global excludes, `.git/info/exclude`, and a registry
+of known framework directory names have no authority over the result.
+
+The controller materialises the selected files into a run-owned candidate and
+records an omission manifest. The manifest binds the result policy, selected
+tree and omitted-path evidence. Literal path handling, no-follow copies,
+regular-file modes and raw symlink targets preserve the exact filesystem
+identity; special entries and drift fail closed.
+
+One candidate identity then crosses the whole completion boundary:
+
+1. trusted Git stages exactly the selected paths;
+2. the deterministic acceptance gate runs on a disposable materialisation of
+   that candidate;
+3. the independent semantic judge reviews that candidate and its omission
+   evidence;
+4. the signed marker and completion receipt bind the candidate tree and
+   projection digest; and
+5. promotion publishes the same candidate and validates it again afterward.
+
+Gate writes stay in the disposable evaluation copy and never enter the sealed
+result. A selected-file mutation, policy drift, candidate/manifest mismatch,
+or unsafe projection becomes `NEEDS_REVIEW`; it cannot silently omit bytes or
+turn a failed definition of done into success. Historical receipts without a
+result projection remain valid through optional versioned fields. The operator
+journey is documented in `docs/HOLDFAST-OPERATOR-ACCEPTANCE.md`.
+
+---
+
+*This document is canonical for the production-release reality of deadreckon. Future hardening passes (per the robustness rider) and feature passes (per the usability rider) will update sections 6, 9, 11, 13, 14, 18, 22, 31, 32, 37, and 38 in particular. Updated 2026-08-15 for Holdfast's controller-sealed result projection and one-candidate gate/judge/receipt/promotion identity (§58); updated 2026-08-02 for Soundings source-true, bounded launch admission (§17, §46, §48, §58 and §59), unified execution-team selection (§17), strict durable contract admission, cumulative active-attempt wall enforcement, process reconciliation, early provider-result persistence, concurrent Git pipe draining and SwiftPM artifact exclusion (§9, §22 and §58). Updated 2026-07-31 for the public legacy-chain boundary (historical execution and mutation refuse before state change, unsupported policy-rich launch refuses before Job creation, and the characterization binary alone retains the old conductor), Watchkeeper durable run continuation, authenticated operator capture, sandbox-boundary observations, canonical sandbox-wrapper resolution and pre-refresh Git-filter refusal (§58); updated 2026-07-30 for Watchkeeper bounded Graph/Campaign parent repair and tamper-resistant repair lineage (§58), plus result-boundary and recovery hardening (§58: immutable execution policy, trusted Git routing, exact artifact/result/delivery identity, crash-safe promotion and cleanup, crash-atomic guarded launch, same-ID Plan/Campaign ownership and mapping repair, aggregate root-planner budgets, typed terminal recovery, and cancellation precedence); updated 2026-07-29 for Watchkeeper convergence (§58: durable ordinary direct execution, stored-plan fork and supported chains on the same Job scheduler, plus credential-free adversarial evidence); updated 2026-07-28 for Watchkeeper (§58: durable guided Jobs, fenced local supervision, protected HMAC gate, read-only semantic judge, parent receipts and promotion for Single, Graph and Campaign shapes, conditional service posture, and explicit dogfood limits); updated 2026-07-24 for Shakedown (§56: one reference resolver, one `latest`, kind-aware refusals, the cross-verb journey test, list folding, the secondary-action cap); updated 2026-07-16 for Rudder (§51: app-server connection, durable steering, capability-answered approvals, interrupt and degradation rules) and Pennant (§55: descriptor-declared CLI contracts, pointer extraction, Pi and Copilot onboarding, Gemini and OpenCode gaps); updated 2026-07-04 for Logbook (§49: shared RunView read model, snapshot diffs, show/report/history events, verdict/doc/attach projection parity) and Contract (§48: goal-aware compiled done contracts, falsifiability lint, critic/redraft, divergence, review/card/JSON surfacing); updated 2026-07-03 for Helm (§47: mission-control attach, spine/tree/timeline/why/command/motion); updated 2026-06-17 for Orchestrated Narration (§45: every orchestrate/campaign child narrates file-only, parent aggregate stderr line, campaign Narrative view) and the §44 corrections it implies; previously updated 2026-05-31 for Navigable campaign attach, the Decompose binary-module layout, Effortless friendliness, tamper-evident gate behavior, release posture, and plan-result docs. Line numbers are best-effort locators; always cross-check against the code before relying on a specific line.*

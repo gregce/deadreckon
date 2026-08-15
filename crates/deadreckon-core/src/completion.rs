@@ -221,6 +221,16 @@ pub fn seal_completion_receipt(
     let semantic_path = state.run_root.join(SEMANTIC_JUDGMENT_JSON);
     verify_authority_inputs(&job, authority, &authority_path, &launch_path, state)?;
     let result_revision = validate_worktree_result_boundary(state, authority, None)?;
+    if crate::result_projection_exists(state) {
+        crate::validate_result_projection_at(state, &state.working_dir)?;
+        crate::validate_result_projection_at(
+            state,
+            &crate::result_projection_candidate_path(state),
+        )?;
+    }
+    let result_projection_sha256 = crate::result_projection_exists(state)
+        .then(|| crate::result_projection_sha256(state))
+        .transpose()?;
     let result_tree_sha256 = result_tree_hash(state)?;
     let sandbox_observation =
         validate_sandbox_boundary_observation(paths, state, authority, &marker.sandbox_backend)?;
@@ -243,6 +253,7 @@ pub fn seal_completion_receipt(
         launch_plan_sha256: authority.launch_plan_sha256.clone(),
         source_tree_sha256: authority.source_tree_sha256.clone(),
         source_revision: authority.source_revision.clone(),
+        result_projection_sha256,
         result_tree_sha256,
         result_revision: match result_revision {
             Some(revision) => Some(revision),
@@ -672,6 +683,33 @@ fn audit_completion_receipt_inner(
                 }
                 Ok(())
             })
+        },
+    );
+    audit.record(
+        "result_projection_digest",
+        receipt
+            .result_projection_sha256
+            .clone()
+            .unwrap_or_else(|| "historical result projection".to_string()),
+        || {
+            if crate::result_projection_exists(state) {
+                let expected = receipt.result_projection_sha256.as_deref().ok_or_else(|| {
+                    completion_error(
+                        &state.run_id,
+                        "new strict result receipt is missing its projection digest",
+                    )
+                })?;
+                crate::result_projection_sha256(state).and_then(|actual| {
+                    require_digest(expected, &actual, "result projection", &state.run_id)
+                })
+            } else if receipt.result_projection_sha256.is_some() {
+                Err(completion_error(
+                    &state.run_id,
+                    "receipt names a result projection that is no longer present",
+                ))
+            } else {
+                Ok(())
+            }
         },
     );
     audit.record(
@@ -1933,7 +1971,11 @@ fn result_deliverable_index(
     state: &PipelineState,
     root: &Path,
 ) -> Result<crate::flight::ArtifactFileIndex> {
-    let mut index = build_deliverable_file_index(root)?;
+    let mut index = if crate::result_projection_exists(state) {
+        crate::result_projection_index_at(state, root)?
+    } else {
+        build_deliverable_file_index(root)?
+    };
     // Promotion adds DeadReckon's own library manifest after the result was
     // sealed, and finish appends its delivery ledger. Both are lifecycle
     // metadata, not agent output, so the same receipt remains valid before
@@ -4316,6 +4358,7 @@ mod tests {
                 "semantic_judgment_digest",
                 "judgment_achieved",
                 "marker_signature",
+                "result_projection_digest",
                 "result_tree_digest",
                 "receipt_signature",
             ]

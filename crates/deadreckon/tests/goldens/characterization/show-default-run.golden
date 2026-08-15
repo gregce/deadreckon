@@ -1,7 +1,6 @@
 status: 0
 --- stdout ---
-state     : <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/state.js
-            on
+state     : <TMP>/home/runstate/repo-<ID8>/runs/<ID32>/state.json
 launch-dir: <TMP>/repo
 artifact  : <TMP>/home/library/repo-<ID8>/<ID32>
 note: launch-dir is unchanged; completed output lives in artifact
@@ -95,6 +94,7 @@ provenance:
   "tool_call_id": "smoke-bash-1",
   "session_id": "<ID32>",
   "files": [
+    "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/.gitignore",
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.lock",
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/Cargo.toml",
     "<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working/implementation-notes.html",
@@ -136,7 +136,7 @@ traces:
   "event": "tool.bash",
   "latency_ms": "<LATENCY>",
   "detail": {
-    "command": "mkdir -p src\nprintf '[package]\\nname = \"working\"\\nversion = \"0.1.0\"\\nedition = \"2024\"\\n\\n[dependencies]\\n\\n[workspace]\\n' > Cargo.toml\nprintf 'fn main() {\\n    println!(\"hello from deadreckon\");\\n}\\n' > src/main.rs\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None.</p></section></body></html>\\n' > implementation-notes.html\ncargo test --manifest-path Cargo.toml",
+    "command": "mkdir -p src\nprintf '[package]\\nname = \"working\"\\nversion = \"0.1.0\"\\nedition = \"2024\"\\n\\n[dependencies]\\n\\n[workspace]\\n' > Cargo.toml\nprintf 'fn main() {\\n    println!(\"hello from deadreckon\");\\n}\\n' > src/main.rs\nprintf '/target/\\n' > .gitignore\nprintf '<!doctype html>\\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Implementation notes</title></head><body><h1>Implementation notes</h1><section id=\"design-decisions\"><h2>Design decisions</h2><p>Use a tiny Rust binary as the smoke artifact.</p></section><section id=\"deviations\"><h2>Deviations</h2><p>None.</p></section><section id=\"tradeoffs\"><h2>Tradeoffs</h2><p>Keep the smoke project minimal instead of adding dependencies.</p></section><section id=\"open-questions\"><h2>Open questions</h2><p>None.</p></section></body></html>\\n' > implementation-notes.html\ncargo test --manifest-path Cargo.toml",
     "status_code": 0,
     "stderr": "   Compiling working v0.1.0 (<TMP>/home/runstate/repo-<ID8>/runs/<ID32>/working)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in <DURATION>\n     Running unittests src/main.rs (target/debug/deps/working-<HEX>)\n",
     "stdout": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",

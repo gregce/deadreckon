@@ -86,6 +86,12 @@
     "proof_kind": {
       "$ref": "#/definitions/CompletionProofKind"
     },
+    "result_projection_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "result_revision": {
       "type": [
         "string",

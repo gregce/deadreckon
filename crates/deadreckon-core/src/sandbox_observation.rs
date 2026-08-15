@@ -101,7 +101,11 @@ pub fn sandbox_boundary_observation_sha256(
 
 /// Compute the same deliverable tree projection used by strict completion.
 pub fn sandbox_boundary_result_tree_sha256(state: &PipelineState) -> Result<String> {
-    let mut index = build_deliverable_file_index(&state.working_dir)?;
+    let mut index = if crate::result_projection_exists(state) {
+        crate::result_projection_index_at(state, &state.working_dir)?
+    } else {
+        build_deliverable_file_index(&state.working_dir)?
+    };
     if state.promoted_library_dir.as_deref() == Some(state.working_dir.as_path()) {
         index.files.remove(Path::new("manifest.json"));
         index.files.remove(Path::new(".materialized-to"));
@@ -869,6 +873,57 @@ mod tests {
             error
                 .to_string()
                 .contains("approved gate evaluator identity digest changed")
+        );
+    }
+
+    #[test]
+    fn projected_boundary_hash_is_identical_for_live_candidate_and_gate_copy() {
+        let fixture = fixture();
+        fs::write(
+            fixture.state.working_dir.join(".gitignore"),
+            "/.unknown-runtime-q73/\n",
+        )
+        .expect("ignore");
+        fs::create_dir_all(fixture.state.working_dir.join(".unknown-runtime-q73/cache"))
+            .expect("runtime directory");
+        fs::write(
+            fixture
+                .state
+                .working_dir
+                .join(".unknown-runtime-q73/cache/lock"),
+            "live runtime\n",
+        )
+        .expect("runtime output");
+        crate::seal_result_projection(&fixture.state).expect("projection");
+
+        let live = sandbox_boundary_result_tree_sha256(&fixture.state).expect("live hash");
+        let mut candidate_state = fixture.state.clone();
+        candidate_state.working_dir = crate::result_projection_candidate_path(&fixture.state);
+        assert_eq!(
+            live,
+            sandbox_boundary_result_tree_sha256(&candidate_state).expect("candidate hash")
+        );
+
+        let evaluation = crate::result_projection_evaluation_path(&fixture.state);
+        crate::materialize_result_projection(&fixture.state, &evaluation).expect("evaluation");
+        fs::create_dir_all(evaluation.join(".unknown-runtime-q73/cache"))
+            .expect("evaluation runtime directory");
+        fs::write(
+            evaluation.join(".unknown-runtime-q73/cache/gate-output"),
+            "gate runtime\n",
+        )
+        .expect("gate output");
+        let mut evaluation_state = fixture.state.clone();
+        evaluation_state.working_dir = evaluation.clone();
+        assert_eq!(
+            live,
+            sandbox_boundary_result_tree_sha256(&evaluation_state).expect("evaluation hash")
+        );
+
+        fs::write(evaluation.join("result.txt"), "mutated selected result\n").expect("mutate");
+        assert_ne!(
+            live,
+            sandbox_boundary_result_tree_sha256(&evaluation_state).expect("mutated hash")
         );
     }
 

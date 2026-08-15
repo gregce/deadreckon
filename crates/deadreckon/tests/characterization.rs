@@ -492,6 +492,8 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
     {
         normalized = normalized.replace(&src_root, "<SRC>");
     }
+    normalized = normalize_wrapped_kv_paths(&normalized);
+    normalized = normalize_wrapped_hex_identities(&normalized);
     for (pattern, replacement) in [
         // Duration fields must normalize before the hex rules: a float's
         // digit run is also valid hex and would otherwise be half-eaten.
@@ -535,6 +537,40 @@ fn normalize_text(temp: &TempDir, text: &str) -> String {
     collapse_adjacent_build_artifact_lines(&normalized)
 }
 
+fn normalize_wrapped_kv_paths(text: &str) -> String {
+    let mut normalized = text.to_string();
+    for key in ["state", "artifact", "plan"] {
+        let pattern = format!(r"(?m)^({key}\s+: [^\n]*)\n[ \t]+([^\n]+)$");
+        normalized = Regex::new(&pattern)
+            .expect("BUG: wrapped path-row regex must compile")
+            .replace_all(&normalized, "$1$2")
+            .into_owned();
+    }
+    Regex::new(r"(?m)^(source\s+: [^\n]*)\n[ \t]+([^\n]+)$")
+        .expect("BUG: wrapped source-row regex must compile")
+        .replace_all(&normalized, "$1 $2")
+        .into_owned()
+}
+
+fn normalize_wrapped_hex_identities(text: &str) -> String {
+    Regex::new(r"\b([0-9a-f]+)\n[ \t]+([0-9a-f]+)\b")
+        .expect("BUG: wrapped identity regex must compile")
+        .replace_all(text, |captures: &regex::Captures<'_>| {
+            let left = captures.get(1).expect("left identity segment").as_str();
+            let right = captures.get(2).expect("right identity segment").as_str();
+            match left.len() + right.len() {
+                32 => "<ID32>".to_string(),
+                40 => "<HEX>".to_string(),
+                _ => captures
+                    .get(0)
+                    .expect("wrapped identity match")
+                    .as_str()
+                    .to_string(),
+            }
+        })
+        .into_owned()
+}
+
 #[test]
 fn duration_normalization_absorbs_frame_padding_derived_from_raw_width() {
     let temp = fixed_length_tempdir();
@@ -545,6 +581,31 @@ fn duration_normalization_absorbs_frame_padding_derived_from_raw_width() {
     assert_eq!(
         normalize_text(&temp, short),
         "|   spend wall <DURATION> |\n"
+    );
+}
+
+#[test]
+fn wrapped_identity_normalization_removes_random_split_points() {
+    let left = "state: /runs/a\n        bcdef0123456789abcdef0123456789/state.json\n";
+    let right = "state: /runs/abcdef0123456789abcdef0123456789/state.json\n";
+
+    assert_eq!(
+        normalize_wrapped_hex_identities(left),
+        "state: /runs/<ID32>/state.json\n"
+    );
+    assert_eq!(
+        normalize_wrapped_hex_identities(right),
+        "state: /runs/abcdef0123456789abcdef0123456789/state.json\n"
+    );
+}
+
+#[test]
+fn wrapped_path_row_normalization_removes_terminal_width_artifacts() {
+    let wrapped = "state     : /tmp/runs/abc/state.js\n            on\nsource       : /tmp/repo (git @\n               abcdef0)\n";
+
+    assert_eq!(
+        normalize_wrapped_kv_paths(wrapped),
+        "state     : /tmp/runs/abc/state.json\nsource       : /tmp/repo (git @ abcdef0)\n"
     );
 }
 
