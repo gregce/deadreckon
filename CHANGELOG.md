@@ -4,6 +4,12 @@
 
 - P1 (`e23fd1d`) characterized the live-policy/receipt/promotion projection
   seam and pinned unknown framework output as intentionally unnamed.
+- P2 (`fc92e06`) introduced the result-candidate capture boundary: final
+  project-local ignore rules may propose omissions, admission-tracked paths
+  still win, and host-global ignores and framework-name lists have no say.
+- P3 adds a controller-owned candidate, policy, omission manifest, and exact
+  tree hash. Partial seals, byte/mode/symlink drift, and policy or admission
+  changes now fail closed before that candidate can authorize later work.
 
 ## 0.8.6 — Runs that finish — 2026-08-13
 
