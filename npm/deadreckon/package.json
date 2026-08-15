@@ -1,6 +1,6 @@
 {
   "name": "deadreckon",
-  "version": "0.8.6",
+  "version": "0.8.7",
   "description": "Long-running, BYOK, sandboxed agentic CLI harness.",
   "license": "MIT",
   "repository": {
@@ -19,11 +19,11 @@
     "postinstall": "node scripts/postinstall.js"
   },
   "optionalDependencies": {
-    "deadreckon-darwin-arm64": "0.8.6",
-    "deadreckon-darwin-x64": "0.8.6",
-    "deadreckon-linux-arm64": "0.8.6",
-    "deadreckon-linux-x64": "0.8.6",
-    "deadreckon-win32-x64": "0.8.6"
+    "deadreckon-darwin-arm64": "0.8.7",
+    "deadreckon-darwin-x64": "0.8.7",
+    "deadreckon-linux-arm64": "0.8.7",
+    "deadreckon-linux-x64": "0.8.7",
+    "deadreckon-win32-x64": "0.8.7"
   },
   "engines": {
     "node": ">=18"
