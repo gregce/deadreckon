@@ -204,6 +204,7 @@ pub enum CaptureProjection {
     Checkpoint,
     Deliverable,
     Promotable,
+    ResultCandidate,
     WorkspaceGuard,
 }
 
@@ -216,6 +217,7 @@ pub enum CapturePurpose {
     WorkingInventory,
     DeliverableIndex,
     PromotionCandidate,
+    ResultCandidate,
     WorkspaceGuard,
 }
 
@@ -465,6 +467,32 @@ pub fn freeze_workspace_capture_policy(root: &Path) -> Result<WorkspaceCapturePo
         frozen_tracked_paths: hydration.tracked_paths.clone(),
         output_roots,
         budgets: CaptureBudgets::default(),
+        warnings: discovery.warnings,
+        frozen_git_head: hydration.head.clone(),
+        frozen_git_index_sha256: hydration.index_sha256,
+    })
+}
+
+/// Freeze the operator-visible result proposal after provider quiescence.
+///
+/// Only project-local ignore files are read from the final workspace. Git's
+/// tracked-path identity remains the controller-owned admission observation,
+/// and neither host-global rules, `.git/info/exclude`, nor ecosystem output
+/// discovery can become result-selection authority.
+pub fn freeze_result_projection_policy(
+    root: &Path,
+    admission: &WorkspaceCapturePolicy,
+) -> Result<WorkspaceCapturePolicy> {
+    let hydration = require_frozen_git_hydration(admission)?.clone();
+    let discovery = discover_policy_inputs(root);
+    Ok(WorkspaceCapturePolicy {
+        schema_version: WORKSPACE_CAPTURE_POLICY_VERSION,
+        frozen_at: Utc::now(),
+        ignores: discovery.ignores,
+        frozen_git_hydration: Some(hydration.clone()),
+        frozen_tracked_paths: hydration.tracked_paths.clone(),
+        output_roots: Vec::new(),
+        budgets: admission.budgets,
         warnings: discovery.warnings,
         frozen_git_head: hydration.head.clone(),
         frozen_git_index_sha256: hydration.index_sha256,
@@ -1821,11 +1849,12 @@ fn filter_capture_entry(context: &TraversalContext, entry: &ignore::DirEntry) ->
     if tracked || tracked_descendant {
         return true;
     }
-    if context
-        .output_roots
-        .iter()
-        .any(|root| relative == root || relative.starts_with(root))
-        || runtime_output_root(relative).is_some()
+    if context.projection != CaptureProjection::ResultCandidate
+        && (context
+            .output_roots
+            .iter()
+            .any(|root| relative == root || relative.starts_with(root))
+            || runtime_output_root(relative).is_some())
     {
         record_pruned(context, relative, CaptureOmissionReason::GeneratedOutput);
         return false;
@@ -1847,6 +1876,7 @@ fn ignore_protected_capture_path(projection: CaptureProjection, relative: &Path)
         // codebase lineage needed by later lifecycle commands.
         (CaptureProjection::Recoverable, WorkspacePathClass::LifecycleMetadata) => true,
         (CaptureProjection::Promotable, WorkspacePathClass::LifecycleMetadata) => true,
+        (CaptureProjection::ResultCandidate, WorkspacePathClass::LifecycleMetadata) => true,
         // The semantic read-only guard must also see protected evidence and
         // lifecycle paths; an ignore rule is not authority to mutate them.
         (
@@ -1892,6 +1922,9 @@ fn projection_boundary_allows(
                 || (tracked_or_parent
                     && classify_workspace_path(relative) == WorkspacePathClass::RuntimeOnly
                     && runtime_output_root(relative).is_some())
+        }
+        CaptureProjection::ResultCandidate => {
+            classify_workspace_path(relative) != WorkspacePathClass::EvidenceOnly
         }
         CaptureProjection::WorkspaceGuard => {
             classify_workspace_path(relative) != WorkspacePathClass::RuntimeOnly
@@ -2410,9 +2443,101 @@ mod tests {
     use super::{
         CaptureBudgets, CaptureOmissionReason, CaptureProjection, CapturePurpose,
         EncodedWorkspacePath, GeneratedOutputSource, capture_workspace, capture_workspace_strict,
-        capture_workspace_strict_bounded, freeze_workspace_capture_policy,
-        materialize_capture_plan,
+        capture_workspace_strict_bounded, freeze_result_projection_policy,
+        freeze_workspace_capture_policy, materialize_capture_plan,
     };
+
+    fn init_git_fixture(root: &Path) {
+        let output = crate::git::run_git(root, &["init", "-q"]).expect("git init");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn result_policy_uses_final_local_ignores_and_admission_tracked_paths() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        init_git_fixture(root);
+        std::fs::write(root.join("tracked.txt"), "tracked\n").expect("tracked");
+        let add = crate::git::run_git(root, &["add", "tracked.txt"]).expect("git add");
+        assert!(add.status.success());
+        let admission = freeze_workspace_capture_policy(root).expect("admission");
+        std::fs::create_dir_all(root.join("invented-cache")).expect("cache");
+        std::fs::write(root.join("invented-cache/lock"), "volatile\n").expect("lock");
+        std::fs::write(root.join(".gitignore"), "/tracked.txt\n/invented-cache\n").expect("ignore");
+
+        let policy = freeze_result_projection_policy(root, &admission).expect("result policy");
+        let capture = capture_workspace_strict(
+            root,
+            &policy,
+            CaptureProjection::ResultCandidate,
+            CapturePurpose::ResultCandidate,
+        )
+        .expect("capture");
+        assert!(
+            capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("tracked.txt"))
+        );
+        assert!(
+            !capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("invented-cache/lock"))
+        );
+        assert!(
+            capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new(".gitignore"))
+        );
+    }
+
+    #[test]
+    fn result_policy_refuses_late_global_and_git_exclude_authority() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        init_git_fixture(root);
+        std::fs::write(root.join("source.txt"), "source\n").expect("source");
+        let admission = freeze_workspace_capture_policy(root).expect("admission");
+        let git_dir = root.join(".git/info");
+        std::fs::create_dir_all(&git_dir).expect("info");
+        std::fs::write(git_dir.join("exclude"), "/source.txt\n").expect("exclude");
+
+        let result = freeze_result_projection_policy(root, &admission).expect("result");
+        assert!(result.ignores.iter().all(|source| matches!(
+            source.kind,
+            super::FrozenIgnoreKind::Gitignore | super::FrozenIgnoreKind::Ignore
+        )));
+    }
+
+    #[test]
+    fn result_candidate_does_not_consult_runtime_root_names() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".next/server")).expect("output");
+        std::fs::write(root.join(".next/server/app.js"), "deliver me\n").expect("file");
+        let admission = freeze_workspace_capture_policy(root).expect("admission");
+        let policy = freeze_result_projection_policy(root, &admission).expect("result");
+        let capture = capture_workspace_strict(
+            root,
+            &policy,
+            CaptureProjection::ResultCandidate,
+            CapturePurpose::ResultCandidate,
+        )
+        .expect("capture");
+        assert!(
+            capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new(".next/server/app.js"))
+        );
+    }
+
+    #[test]
+    fn tracked_path_wins_over_late_ignore() {
+        result_policy_uses_final_local_ignores_and_admission_tracked_paths();
+    }
 
     #[test]
     fn late_project_ignore_is_not_yet_a_verified_result_boundary() {
@@ -2464,8 +2589,18 @@ mod tests {
             CapturePurpose::PromotionCandidate,
         )
         .expect("promotion-like frozen capture");
-        assert!(!receipt_capture.entries.iter().any(|entry| entry.relative == Path::new("late.txt")));
-        assert!(promotion_capture.entries.iter().any(|entry| entry.relative == Path::new("late.txt")));
+        assert!(
+            !receipt_capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("late.txt"))
+        );
+        assert!(
+            promotion_capture
+                .entries
+                .iter()
+                .any(|entry| entry.relative == Path::new("late.txt"))
+        );
     }
     use crate::git::run_git;
 

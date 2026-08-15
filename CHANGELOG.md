@@ -1,5 +1,10 @@
 # Changelog
 
+## Holdfast (stable) — 2026-08-15
+
+- P1 (`e23fd1d`) characterized the live-policy/receipt/promotion projection
+  seam and pinned unknown framework output as intentionally unnamed.
+
 ## 0.8.6 — Runs that finish — 2026-08-13
 
 - Next.js build output is now treated as disposable runtime state. Checkpoints
