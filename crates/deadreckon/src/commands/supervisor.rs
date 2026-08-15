@@ -8833,14 +8833,18 @@ mod tests {
         .expect("long-running process tree");
         let child_pid = child.id();
         let descendant_deadline = Instant::now() + Duration::from_secs(2);
-        while !descendant_pid_path.is_file() && Instant::now() < descendant_deadline {
+        let descendant_pid = loop {
+            if let Ok(raw) = fs::read_to_string(&descendant_pid_path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < descendant_deadline,
+                "descendant pid was not written before the fixture deadline"
+            );
             thread::sleep(Duration::from_millis(10));
-        }
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .expect("descendant pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric descendant pid");
+        };
         let launch_id = Uuid::new_v4().to_string();
         let metadata = SupervisorChildMetadata {
             process: SupervisedProcess {
