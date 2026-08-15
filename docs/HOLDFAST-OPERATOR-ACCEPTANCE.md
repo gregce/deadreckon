@@ -3,6 +3,18 @@
 Run this after building and installing the candidate binary. It exercises the
 real detached supervisor and a deliberately unknown runtime-output name.
 
+Pin the candidate before leaving the source tree. This prevents a shadowed
+Homebrew or older PATH entry from silently running a different build:
+
+```bash
+holdfast_deadreckon="$(git rev-parse --show-toplevel)/target/release/deadreckon"
+test -x "$holdfast_deadreckon"
+"$holdfast_deadreckon" doctor --json
+```
+
+Expected: doctor is verified and its supervisor checkpoint reports the same
+binary and bundle as `$holdfast_deadreckon`.
+
 ## 1. Prepare a disposable greenfield project
 
 ```bash
@@ -21,17 +33,52 @@ Expected: the commit succeeds and `test ! -e .gitignore` exits 0. The project
 has no ignore policy at admission. The name `.made-up-runtime-z91` used below
 is intentionally not a framework DeadReckon knows.
 
+Define and commit a real deterministic done contract before admission. The
+requested files and ignore rule must be present. Do not require the runtime
+directory to be absent here: the agent must leave it in the mutable workspace
+so the sealed-result boundary—not the agent—proves its omission.
+
+```bash
+mkdir -p .deadreckon
+cat > .deadreckon/acceptance.yaml <<'YAML'
+name: holdfast unknown runtime projection
+checks:
+  - kind: file_exists
+    path: "{working_dir}/app.txt"
+  - kind: content_match
+    path: "{working_dir}/app.txt"
+    pattern: "holdfast works"
+  - kind: file_exists
+    path: "{working_dir}/dist/result.txt"
+  - kind: content_match
+    path: "{working_dir}/dist/result.txt"
+    pattern: "ship me"
+  - kind: content_match
+    path: "{working_dir}/.gitignore"
+    pattern: "/.made-up-runtime-z91/"
+YAML
+git add -f .deadreckon/acceptance.yaml
+git commit -q -m 'add holdfast done contract'
+"$holdfast_deadreckon" def-done show
+```
+
+Expected: `def-done show` displays the five checks above. A pre-run
+`"$holdfast_deadreckon" def-done check` should fail because the requested
+files do not exist yet. Do not accept the unknown-project directory-exists
+fallback: that would test the projection while weakening the definition of
+done.
+
 ## 2. Start one real Job
 
 ```bash
-deadreckon start 'Create app.txt containing exactly "holdfast works", create dist/result.txt containing exactly "ship me", create .made-up-runtime-z91/cache.lock as disposable runtime state, and create a project .gitignore containing /.made-up-runtime-z91/. Declare done only after checking all four files.' --from "$holdfast_project" --yes
+"$holdfast_deadreckon" start 'Create app.txt containing exactly "holdfast works", create dist/result.txt containing exactly "ship me", create .made-up-runtime-z91/cache.lock as disposable runtime state, leave that ignored runtime file present in the working tree, and create a project .gitignore containing /.made-up-runtime-z91/. Declare done only after checking all four files.' --mode run --from "$holdfast_project" --yes --plain
 ```
 
 Copy the printed Job ID, then attach:
 
 ```bash
-deadreckon attach <job-id>
-deadreckon status <job-id>
+"$holdfast_deadreckon" attach <job-id>
+"$holdfast_deadreckon" status <job-id>
 ```
 
 Expected: the Job reaches a verified/reviewable terminal result without
@@ -72,9 +119,9 @@ may print Git's ordinary “not a repository” message and is informational onl
 ## 5. Finish and inspect what ships
 
 ```bash
-deadreckon finish <job-id> --dry-run
-deadreckon finish <job-id>
-deadreckon status <job-id>
+"$holdfast_deadreckon" finish <job-id> --dry-run
+"$holdfast_deadreckon" finish <job-id> --yes
+"$holdfast_deadreckon" status <job-id>
 ```
 
 Expected: the preview and finish validate the receipt. The promoted/library
@@ -95,11 +142,24 @@ git config user.name 'Holdfast operator test'
 printf '%s\n' '# Hidden-source refusal fixture' > README.md
 git add README.md
 git commit -q -m 'operator baseline'
-deadreckon start 'Create required-source.js exporting the string "required", create .gitignore containing /required-source.js, and treat required-source.js as a required delivered source file. Declare done only if the delivered result contains that source file.' --from "$hidden_project" --yes
+mkdir -p .deadreckon
+cat > .deadreckon/acceptance.yaml <<'YAML'
+name: holdfast cannot hide required source
+checks:
+  - kind: file_exists
+    path: "{working_dir}/required-source.js"
+  - kind: content_match
+    path: "{working_dir}/required-source.js"
+    pattern: "required"
+YAML
+git add -f .deadreckon/acceptance.yaml
+git commit -q -m 'add hidden-source done contract'
+"$holdfast_deadreckon" start 'Create required-source.js exporting the string "required", create .gitignore containing /required-source.js, and treat required-source.js as a required delivered source file. Declare done only if the delivered result contains that source file.' --mode run --from "$hidden_project" --yes --plain
 ```
 
-Copy this second Job ID and inspect it with `deadreckon attach <job-id>` and
-`deadreckon status <job-id> --json`.
+Copy this second Job ID and inspect it with
+`"$holdfast_deadreckon" attach <job-id>` and
+`"$holdfast_deadreckon" status <job-id> --json`.
 
 Expected: this Job must not become verified while `required-source.js` is
 omitted. It may revise the ignore rule and then verify with the file included,

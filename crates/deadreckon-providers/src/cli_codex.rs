@@ -114,9 +114,12 @@ impl CliCodexProvider {
         }
     }
 
-    /// Build the argv for one attempt. A resume attempt runs `exec resume <id>`
-    /// and omits `--sandbox` (resume inherits the session's original policy);
-    /// a fresh attempt runs `exec` with the sandbox mode as today.
+    /// Build the argv for one attempt. `codex exec resume` does not accept the
+    /// fresh `--sandbox` option and does not reliably retain a session's
+    /// effective danger-full-access posture. When DeadReckon already provides
+    /// an outer sandbox, resumed read-write turns therefore use Codex's
+    /// explicit external-sandbox bypass instead of attempting a nested host
+    /// sandbox.
     fn build_args(
         &self,
         request: &ProviderRequest,
@@ -154,6 +157,11 @@ impl CliCodexProvider {
                 "--sandbox".to_string(),
                 codex_sandbox_mode(request.sandbox_backend, request.workspace_access).to_string(),
             ]);
+        } else if codex_resume_uses_external_sandbox_bypass(
+            request.sandbox_backend,
+            request.workspace_access,
+        ) {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
         if request.workspace_access == WorkspaceAccess::ReadOnly {
             args.extend(read_only_safe_extra_args(&self.extra_args));
@@ -643,6 +651,22 @@ fn codex_sandbox_mode(
     }
 }
 
+fn codex_resume_uses_external_sandbox_bypass(
+    outer_backend: Option<SandboxBackend>,
+    workspace_access: WorkspaceAccess,
+) -> bool {
+    workspace_access == WorkspaceAccess::ReadWrite
+        && matches!(
+            outer_backend,
+            Some(
+                SandboxBackend::Auto
+                    | SandboxBackend::SandboxExec
+                    | SandboxBackend::Bwrap
+                    | SandboxBackend::Docker
+            )
+        )
+}
+
 fn read_only_safe_extra_args(extra_args: &[String]) -> Vec<String> {
     let mut safe = Vec::with_capacity(extra_args.len());
     let mut skip_next = false;
@@ -770,6 +794,77 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|arg| arg == "resume"), "{args:?}");
+    }
+
+    #[test]
+    fn resumed_codex_reasserts_the_external_sandbox_boundary() {
+        let provider = CliCodexProvider::new(
+            "cli:codex",
+            ProviderEntry {
+                kind: Some(ProviderKind::CliCodex),
+                api_key: None,
+                api_key_env: None,
+                base_url: None,
+                model: Some("gpt-test".to_string()),
+                input_cost_per_million: None,
+                output_cost_per_million: None,
+                binary: Some("codex".to_string()),
+                extra_args: Vec::new(),
+            },
+        );
+        let mut request = ProviderRequest::enforceably_read_only_with_backend(
+            "continue",
+            100,
+            ".",
+            SandboxBackend::SandboxExec,
+        );
+        request.workspace_access = WorkspaceAccess::ReadWrite;
+
+        let args = provider.build_args(
+            &request,
+            &schema_only_capabilities(),
+            Some("session-id"),
+            None,
+            None,
+        );
+
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|arg| arg == "--sandbox"), "{args:?}");
+
+        request.workspace_access = WorkspaceAccess::ReadOnly;
+        let read_only_args = provider.build_args(
+            &request,
+            &schema_only_capabilities(),
+            Some("session-id"),
+            None,
+            None,
+        );
+        assert!(
+            !read_only_args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "{read_only_args:?}"
+        );
+
+        request.workspace_access = WorkspaceAccess::ReadWrite;
+        request.sandbox_backend = None;
+        let uncontained_args = provider.build_args(
+            &request,
+            &schema_only_capabilities(),
+            Some("session-id"),
+            None,
+            None,
+        );
+        assert!(
+            !uncontained_args
+                .iter()
+                .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "{uncontained_args:?}"
+        );
     }
 
     #[test]

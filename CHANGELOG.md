@@ -16,6 +16,10 @@
   directories stay out without a name registry; admission-tracked and
   intentionally unignored generated artifacts remain in; unsafe or oversized
   projections stop as `NEEDS_REVIEW` instead of burning retry attempts.
+- P11 reasserts Codex's external-sandbox bypass on resumed read-write turns.
+  A failed projected gate can now return to the same contained coding session
+  and repair its result intent instead of hitting a nested macOS
+  `sandbox_apply: Operation not permitted` failure until retries exhaust.
 
 ## 0.8.6 — Runs that finish — 2026-08-13
 
