@@ -1673,6 +1673,10 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
             let cwd = cwd
                 .map(|cwd| render_template(working_dir, &cwd))
                 .unwrap_or_else(|| working_dir.to_path_buf());
+            // Shell commands share the `{working_dir}` placeholder with path
+            // and cwd fields so generated checks stay portable across
+            // worktrees. The raw command is kept for evidence and tamper facts.
+            let rendered_command = render_template_string(working_dir, &command);
             let started = Instant::now();
             let output = gate_check_command("sh")
                 // The controller supplies a complete deterministic PATH and
@@ -1681,7 +1685,7 @@ fn evaluate_check(working_dir: &Path, check: AcceptanceCheck) -> Result<Acceptan
                 // compatibility tool because it prefers the Darwin user temp
                 // directory even when TMPDIR is set.
                 .arg("-c")
-                .arg(&command)
+                .arg(&rendered_command)
                 .current_dir(&cwd)
                 .output()
                 .map_err(|source| DeadreckonError::Io {
@@ -1907,7 +1911,11 @@ impl AcceptanceCheck {
 }
 
 fn render_template(working_dir: &Path, value: &str) -> PathBuf {
-    PathBuf::from(value.replace("{working_dir}", &working_dir.to_string_lossy()))
+    PathBuf::from(render_template_string(working_dir, value))
+}
+
+fn render_template_string(working_dir: &Path, value: &str) -> String {
+    value.replace("{working_dir}", &working_dir.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -3964,6 +3972,63 @@ optional:
             .expect_err("required failure");
 
         assert!(err.to_string().contains("acceptance check failed"));
+    }
+
+    #[test]
+    fn shell_check_commands_render_working_dir_placeholder() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = DeadreckonPaths::from_home(temp.path().join("home"));
+        let state = create_run(
+            &paths,
+            RunOptions {
+                goal: "shell-working-dir".to_string(),
+                cwd: std::env::current_dir().expect("cwd"),
+                sandbox: "none".to_string(),
+                provider: None,
+                skill_name: "default-coding".to_string(),
+                max_spend_usd: None,
+                max_wall_seconds: None,
+                run_id: None,
+                codebase: None,
+            },
+        )
+        .expect("run");
+        let script_dir = state.working_dir.join(".deadreckon").join("acceptance");
+        std::fs::create_dir_all(&script_dir).expect("script dir");
+        std::fs::write(script_dir.join("verify.sh"), "echo verified-ok\n").expect("script");
+        std::fs::write(
+            state.run_root.join("acceptance.yaml"),
+            r#"
+checks:
+  - kind: shell
+    command: sh "{working_dir}/.deadreckon/acceptance/verify.sh"
+    cwd: "{working_dir}"
+"#,
+        )
+        .expect("spec");
+
+        let results =
+            super::evaluate_acceptance_checks(&state.run_root, &state.working_dir).expect("checks");
+
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].passed,
+            "placeholder must resolve before sh runs: {:?} / {:?}",
+            results[0].stderr, results[0].detail
+        );
+        assert!(
+            results[0]
+                .stdout
+                .as_deref()
+                .is_some_and(|stdout| stdout.contains("verified-ok"))
+        );
+        assert!(
+            results[0]
+                .command
+                .as_deref()
+                .is_some_and(|command| command.contains("{working_dir}")),
+            "evidence keeps the portable, unrendered command"
+        );
     }
 
     #[test]
