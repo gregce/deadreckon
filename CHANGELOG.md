@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.8 — Shell checks that find their files — 2026-08-20
+
+- Fixed shell acceptance checks so `{working_dir}` renders in the `command`
+  string, not only in `cwd` and path fields. Guided contracts that invoke a
+  verifier under `{working_dir}/.deadreckon/acceptance/` no longer fail with
+  "No such file or directory" on every attempt. Evidence and tamper facts keep
+  the portable unrendered command.
+
 ## 0.8.7 — One result passes and ships — 2026-08-15
 
 - P1 (`e23fd1d`) characterized the live-policy/receipt/promotion projection
