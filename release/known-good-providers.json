@@ -1,29 +1,29 @@
 {
   "schema_version": 3,
-  "recorded_at": "2026-08-15T17:46:31Z",
-  "source_commit": "687ed4bad4872432eec7cf89be266e85f4cced92",
-  "deadreckon_version": "0.8.7",
+  "recorded_at": "2026-08-21T03:44:40Z",
+  "source_commit": "5577928f1f415659c02c07cce2304ed39103dd01",
+  "deadreckon_version": "0.8.8",
   "bundle": {
   "schema_version": 1,
-  "package_version": "0.8.7",
-  "bundle_build_id": "deadreckon-bundle-build-id-sha256:125c9cb6f20f09faa877b91a28498b5da62877f4104e49ba84378d4601b00d98",
+  "package_version": "0.8.8",
+  "bundle_build_id": "deadreckon-bundle-build-id-sha256:7fb6ddcba1cade1eca0738d5a65f76ee83e820e07737883759cfa4ca6d719a75",
   "binaries": {
     "deadreckon": {
-      "sha256": "a0968b91a69ad573fa5428a401ad687d7daa1ac82d6cb3fc7d3c51cabdd620f6",
-      "bytes": 23751056
+      "sha256": "ce91ac72027e9d393f67532cc7bf7ac116ece8f45acf36658ec24818595df9c0",
+      "bytes": 23751072
     },
     "dr-gate": {
-      "sha256": "bca29e0e5ee9863e8fd5b20ff301ce5cf27eb42ccf24f50ca83a38f7a241cb7a",
+      "sha256": "75795dac4dfe6525169bfcb4c0780d83b8f63b443536362087a18e9ff5ac1f3c",
       "bytes": 2274080
     },
     "dr-capture": {
-      "sha256": "ba191a7fdfedfc736b029b3de04d052e1cd2c2a7c8de671718a8a8ecadac3eaa",
+      "sha256": "8160da65c84ede4b367214116bbcdfc4f0adb21ebf4b6bed921f207acf72afde",
       "bytes": 7754160
     }
   }
 },
   "providers": [
-    {"route":"cli:claude-code","binary_version":"2.1.233 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.233 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"ef35f92b8aba4c60ba0871c914d2e135","operator":"gdc"},
-    {"route":"cli:codex","binary_version":"codex-cli 0.147.0","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.147.0","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"5eb0184ec56c498599d9fa5ec4a8af53","operator":"gdc"}
+    {"route":"cli:claude-code","binary_version":"2.1.238 (Claude Code)","reviewer_route":"cli:claude-code","reviewer_binary_version":"2.1.238 (Claude Code)","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"6f6f3bc422ad4eff949c39ae186ce5ff","operator":"gdc"},
+    {"route":"cli:codex","binary_version":"codex-cli 0.148.0","reviewer_route":"cli:codex","reviewer_binary_version":"codex-cli 0.148.0","proof":"worker turn -> deterministic gate -> separate schema-only semantic judgment -> verified receipt -> gate signed -> finish -> cancel/reap","run_id":"5682e8ff4f9e4d04b6623aaf3d485c2c","operator":"gdc"}
   ]
 }
