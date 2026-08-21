@@ -8685,6 +8685,11 @@ mod tests {
         .expect("wall-limited job");
         let token = claim_started_attempt(&paths, &job, 1);
         thread::sleep(Duration::from_millis(150));
+        // Start the stopwatch before the allowance is measured: the finish
+        // path re-polls the wall cap from the attempt's real start, so any
+        // scheduling gap between these lines would otherwise shrink the
+        // observed wait below the approved remainder on a loaded runner.
+        let waited_from = Instant::now();
         let allowance = current_job_work_allowance(&paths, &job, Utc::now())
             .expect("fractional allowance")
             .expect("active allowance");
@@ -8692,7 +8697,6 @@ mod tests {
         assert!(!allowance.remaining.is_zero());
         assert_eq!(allowance.boundary, ActivePolicyBoundary::WallCap);
 
-        let waited_from = Instant::now();
         assert!(
             finish_if_less_than_one_work_second(&paths, &token, &job, allowance)
                 .expect("fractional tail reaches wall cap")
